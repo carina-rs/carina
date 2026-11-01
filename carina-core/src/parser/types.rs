@@ -72,23 +72,22 @@ pub(super) fn parse_type_expr(
     }
 }
 
-/// Snake-case names of the bare custom types built into the DSL, sorted for
-/// deterministic tooling output. Every registered core refinement is accepted
-/// in a type position without a provider.
+/// Constructor-backed bare custom types built into the DSL, keyed by
+/// snake-case name and sorted for deterministic tooling output. Keeping each
+/// declaration preserves its scalar kind for static type lifting.
 ///
-/// Names come from [`crate::schema::builtin_validator_registry`], the same
-/// constructor-backed source used to validate values and reconstruct validators
-/// across process boundaries.
-pub fn builtin_bare_custom_types() -> &'static [String] {
-    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| {
-        let mut names: Vec<_> = crate::schema::builtin_validator_registry()
-            .keys()
-            .map(|(_, identity)| pascal_to_snake(&identity.kind))
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+/// Derived from [`crate::schema::builtin_type_registry`], the same source used
+/// for provider admission and validator reconstruction.
+pub fn builtin_bare_custom_types()
+-> &'static std::collections::BTreeMap<String, crate::schema::AttributeType> {
+    static TYPES: std::sync::OnceLock<
+        std::collections::BTreeMap<String, crate::schema::AttributeType>,
+    > = std::sync::OnceLock::new();
+    TYPES.get_or_init(|| {
+        crate::schema::builtin_type_registry()
+            .iter()
+            .map(|(identity, declaration)| (pascal_to_snake(&identity.kind), declaration.clone()))
+            .collect()
     })
 }
 
@@ -104,7 +103,7 @@ pub(crate) fn resolve_known_bare_custom_type(
     snake: &str,
     config: &ProviderContext,
 ) -> Option<TypeExpr> {
-    if builtin_bare_custom_types().iter().any(|name| name == snake) {
+    if builtin_bare_custom_types().contains_key(snake) {
         return Some(TypeExpr::Simple(snake.to_string()));
     }
     let pascal = snake_to_pascal(snake);
@@ -457,7 +456,7 @@ mod tests {
     #[test]
     fn parse_type_expr_str_accepts_builtins_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());
-        for snake in builtin_bare_custom_types() {
+        for snake in builtin_bare_custom_types().keys() {
             let name = snake_to_pascal(snake);
             assert!(
                 matches!(parse_type_expr_str(&name, &ctx), Some(TypeExpr::Simple(_))),
@@ -467,29 +466,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_bare_custom_types_include_domain_names() {
-        let ctx = loaded_context(Default::default());
-        for (name, snake) in [
-            ("DomainName", "domain_name"),
-            ("WildcardDomainName", "wildcard_domain_name"),
-        ] {
-            assert!(
-                builtin_bare_custom_types()
-                    .iter()
-                    .any(|builtin| builtin == snake),
-                "{snake} must come from the built-in registry"
-            );
-            assert_eq!(
-                parse_type_expr_str(name, &ctx),
-                Some(TypeExpr::Simple(snake.to_string()))
-            );
-        }
-    }
-
-    #[test]
     fn parse_type_expr_str_accepts_every_builtin_validator_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());
-        for (_, identity) in crate::schema::builtin_validator_registry().keys() {
+        for identity in crate::schema::builtin_type_registry().keys() {
             assert!(identity.provider.is_none() && identity.segments.is_empty());
             let name = &identity.kind;
             assert_eq!(

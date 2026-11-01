@@ -957,6 +957,161 @@ fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
 }
 
 #[test]
+fn provider_schema_rejects_conflicting_builtin_bare_declarations() {
+    let identity = TypeIdentity::bare("Email");
+    let declarations = [
+        AttributeType::refined_int(Some(identity.clone()), None),
+        AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        AttributeType::refined_string_with_validator(
+            identity.clone(),
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        ),
+        AttributeType::refined_string_with_validator(
+            identity.clone(),
+            Some("^internal$".to_string()),
+            None,
+            match types::email().raw_shape() {
+                RawShape::String {
+                    validate: Some(validate),
+                    ..
+                } => validate.clone(),
+                _ => unreachable!(),
+            },
+            None,
+        ),
+        AttributeType::enum_(
+            identity,
+            Some(vec!["internal".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+    ];
+    for declaration in declarations {
+        // Both resource and config declarations feed the admission boundary.
+        for in_config in [false, true] {
+            let (resources, config) = if in_config {
+                (
+                    vec![],
+                    ValidatedConfigSchema::validate(BTreeMap::from([(
+                        "email".to_string(),
+                        declaration.clone(),
+                    )]))
+                    .unwrap(),
+                )
+            } else {
+                (
+                    vec![
+                        ResourceSchema::new("test.Contact")
+                            .attribute(
+                                AttributeSchema::optional("email", declaration.clone()).build(),
+                            )
+                            .validate()
+                            .unwrap(),
+                    ],
+                    ValidatedConfigSchema::default(),
+                )
+            };
+            let error =
+                ValidatedProviderSchemaWitness::new(resources, config, ReferenceForms::new())
+                    .expect_err("a provider must not silently redefine a core built-in");
+            let message = error.to_string();
+            assert!(
+                message.contains("Email") && message.contains("built-in"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn provider_schema_accepts_shared_builtin_constructor_declarations() {
+    // Independent constructor calls, as used by aws and awscc, remain valid.
+    let mut schemas = SchemaRegistry::new();
+    for owner in ["aws", "awscc"] {
+        let resources = vec![
+            ResourceSchema::new("test.Contact")
+                .attribute(AttributeSchema::optional("email", types::email()).build())
+                .attribute(AttributeSchema::optional("count", types::positive_int()).build())
+                .validate()
+                .unwrap(),
+        ];
+        let config_types = builtin_type_registry()
+            .iter()
+            .map(|(identity, declaration)| {
+                let wire =
+                    crate::protocol_convert::attribute_type_to_protocol(declaration).unwrap();
+                let decoded = crate::protocol_convert::protocol_to_attribute_type(&wire).unwrap();
+                (identity.kind.clone(), decoded)
+            })
+            .collect();
+        let config = ValidatedConfigSchema::validate(config_types).unwrap();
+        let witness = ValidatedProviderSchemaWitness::new(resources, config, ReferenceForms::new())
+            .expect("providers may reuse the core built-in constructors");
+        schemas
+            .insert_provider_witness(owner, &witness)
+            .expect("shared core declarations and wire-decoded declarations remain loadable");
+    }
+    assert_eq!(schemas.len(), 2);
+}
+
+#[test]
+fn builtin_type_documentation_matches_registry() {
+    let docs = include_str!("../../../site/src/content/reference/dsl/types-and-values.md");
+    let section = docs
+        .split("### Built-in Types\n")
+        .nth(1)
+        .expect("the reference must list every built-in type")
+        .split("\n### ")
+        .next()
+        .unwrap();
+    let documented = section
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("| `")?
+                .split('`')
+                .next()
+                .map(str::to_string)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let registered = builtin_type_registry()
+        .keys()
+        .map(|identity| identity.kind.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        documented, registered,
+        "keep the DSL reference in sync with core built-ins"
+    );
+}
+
+#[test]
+fn domain_and_https_validator_errors_include_escaped_offending_value() {
+    for (validate, invalid) in [
+        (
+            validate_domain_name as fn(&str) -> Result<(), String>,
+            "a\n.example",
+        ),
+        (validate_domain_name, "localhost"),
+        (validate_wildcard_domain_name, "*.a_underscore.example"),
+        (validate_https_url, "https://example.com/\n"),
+        (validate_https_url, "http://example.com"),
+        (validate_https_url, "https://user@example.com"),
+        (validate_https_url, "https://[invalid]"),
+        (validate_https_url, "https://example.com:0"),
+        (validate_https_url, "https://example.com/{proxy}"),
+    ] {
+        let error = validate(invalid).expect_err("invalid fixture");
+        assert!(
+            error.contains(&display_string_literal(invalid)),
+            "{invalid:?}: {error}"
+        );
+    }
+}
+
+#[test]
 fn domain_name_builtins_accept_dns_names() {
     for type_name in ["DomainName", "WildcardDomainName"] {
         let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
@@ -1105,8 +1260,12 @@ fn domain_name_builtins_enforce_label_and_name_length_boundaries() {
             (format!("{}.com", "a".repeat(64)), false),
             (format!("a.{}", "b".repeat(64)), false),
             (format!("a.{}.com", "b".repeat(64)), false),
-            (max_name.clone(), true),
-            (format!("{max_name}."), true),
+            (max_name[..251].to_string(), true),
+            (format!("{}.", &max_name[..251]), true),
+            (max_name[..252].to_string(), prefix.is_empty()),
+            (format!("{}.", &max_name[..252]), prefix.is_empty()),
+            (max_name.clone(), prefix.is_empty()),
+            (format!("{max_name}."), prefix.is_empty()),
             (too_long.clone(), false),
             (format!("{too_long}."), false),
         ] {
@@ -1146,6 +1305,9 @@ fn https_url_builtin_accepts_absolute_https_urls() {
         "https://example.com".to_string(),
         "https://EXAMPLE.com/".to_string(),
         "https://localhost".to_string(),
+        "https://localhost.".to_string(),
+        "https://example.com.".to_string(),
+        "https://EXAMPLE.com.:443/path?q=1#fragment".to_string(),
         "https://a.b-c.example".to_string(),
         "https://xn--bcher-kva.example".to_string(),
         "https://192.0.2.1:443/oidc".to_string(),
@@ -1200,7 +1362,9 @@ fn https_url_builtin_rejects_invalid_urls() {
         "https://@example.com",
         "https://example.com@evil.example",
         "https://.example.com",
-        "https://example.com.",
+        "https://example.com..",
+        "https://.",
+        "https://..",
         "https://example..com",
         "https://-example.com",
         "https://example-.com",
@@ -1243,7 +1407,7 @@ fn https_url_builtin_rejects_invalid_urls() {
         "https://example.com#one#two",
         "https://example.com/<tag>",
         "https://example.com/\"quote",
-        "https://example.com/{path}",
+        "https://example.com/{proxy}",
     ]
     .into_iter()
     .map(str::to_string)
@@ -7268,6 +7432,25 @@ fn assignability_rule_8_rejects_unproven_refined_sources() {
 fn lifted_type_expr_finite_universe_is_reflexive() {
     use crate::parser::{ResourceTypePath, TypeExpr};
 
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional(
+                    "id",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
     let liftable = vec![
         ("String", TypeExpr::String),
         ("Int", TypeExpr::Int),
@@ -7322,7 +7505,7 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
     ];
 
     for (name, type_expr) in liftable {
-        let lifted = crate::validation::lift_type_expr(&type_expr)
+        let lifted = crate::validation::lift_type_expr(&type_expr, &schemas)
             .unwrap_or_else(|| panic!("liftable TypeExpr {name} unexpectedly lifted to None"));
         assert!(
             assignable(&lifted, &lifted),

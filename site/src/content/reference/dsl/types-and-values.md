@@ -344,7 +344,31 @@ arguments {
 }
 ```
 
-Primitive type names are PascalCase (`String`, not `string`). Besides the primitives, built-in types such as `Ipv4Cidr`, `Ipv4Address`, `Ipv6Cidr`, and `Ipv6Address` are always available, and providers register their own dotted types (for example `aws.Arn` or `aws.ec2.Vpc.Id`). An unknown type name is an error.
+Primitive type names are PascalCase (`String`, not `string`). The built-in refinements below are always available. Providers also register their own dotted types (for example `aws.Arn` or `aws.ec2.Vpc.Id`). An unknown type name is an error.
+
+### Built-in Types
+
+| Type | Base | Accepted values |
+| --- | --- | --- |
+| `DomainName` | String | DNS names with at least two labels; at most 253 characters excluding one trailing dot. |
+| `Email` | String | Email addresses with a non-empty local part and a dotted domain. |
+| `HttpResponseStatusCode` | String | Three-digit HTTP status codes in 2XX, 4XX, or 5XX. |
+| `HttpsUrl` | String | Absolute URLs starting with lowercase `https://`, without userinfo. |
+| `Ipv4Address` | String | IPv4 addresses such as `192.0.2.1`. |
+| `Ipv4Cidr` | String | IPv4 CIDR blocks such as `192.0.2.0/24`. |
+| `Ipv6Address` | String | IPv6 addresses such as `2001:db8::1`. |
+| `Ipv6Cidr` | String | IPv6 CIDR blocks such as `2001:db8::/32`. |
+| `PositiveInt` | Int | Integers greater than zero. |
+| `RedirectHost` | String | Redirect hosts of 1–128 characters, allowing `#{host}`. |
+| `RedirectPath` | String | Redirect paths of 1–128 characters starting with `/`, allowing host, port, and path placeholders. |
+| `RedirectPort` | String | Decimal ports in 1–65535, or `#{port}`. |
+| `RedirectProtocol` | String | `HTTP`, `HTTPS`, or `#{protocol}`. |
+| `RedirectQuery` | String | Redirect queries of at most 128 characters, allowing protocol, host, port, path, and query placeholders. |
+| `WildcardDomainName` | String | DomainName values with an optional leftmost `*.`; the full name is at most 253 characters excluding one trailing dot. |
+
+`DomainName` and `WildcardDomainName` accept uppercase letters, punycode, and numeric labels, including a numeric last label and dotted-IPv4-looking strings. Numeric labels deliberately match ACM's domain-name regex. Underscores are rejected, so these types are unsuitable for Route53 record names such as `_acme-challenge` or `_dmarc`.
+
+`HttpsUrl` accepts single-label hosts such as `localhost`, trailing-dot FQDNs such as `https://example.com.`, IPv4 addresses, and bracketed IPv6 addresses. DNS labels have a 63-character limit, but the host has no 253-character cap. RFC 6570 templates such as `{proxy}` are rejected, so use another type for API Gateway HTTP integration URIs that contain templates. Attribute schemas may impose additional length or URL restrictions.
 
 ### Generic Types
 

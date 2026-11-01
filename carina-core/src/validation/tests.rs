@@ -709,16 +709,59 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
     assert!(validate_user_function_ref_types_with_bindings(&matching, &bindings).is_ok());
 }
 
-/// Directional test adapter for the module-boundary relation: `type_expr` is
-/// the source and the schema attribute is the sink.
+/// Explicit String declarations for the legacy identity-relation fixtures.
+fn string_refinement_fixture() -> (LoadedProviderContext, SchemaRegistry) {
+    let mut schemas = SchemaRegistry::new();
+    let mut known = HashSet::new();
+    for (index, (owner, identity)) in [
+        ("test", TypeIdentity::bare("Arn")),
+        ("test", TypeIdentity::bare("AwsAccountId")),
+        ("test", TypeIdentity::bare("IamRoleArn")),
+        ("test", TypeIdentity::bare("IamPolicyArn")),
+        ("test", TypeIdentity::bare("IamOidcProviderArn")),
+        ("test", TypeIdentity::bare("KmsKeyArn")),
+        ("test", TypeIdentity::bare("ResourceId")),
+        ("test", TypeIdentity::bare("VpcId")),
+        ("test", TypeIdentity::bare("SubnetId")),
+        (
+            "aws",
+            TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+        ),
+        (
+            "aws",
+            TypeIdentity::from_schema_type("aws", "ec2.SecurityGroup", "Id"),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        schemas.insert(
+            owner,
+            ResourceSchema::new(format!("fixture{index}"))
+                .attribute(
+                    crate::schema::AttributeSchema::optional(
+                        "value",
+                        AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        known.insert(crate::parser::OwnedTypeIdentity::provider(owner, identity));
+    }
+    (context_with_accepting_custom_type_resolver(known), schemas)
+}
+
+/// Directional test adapter: `type_expr` is the source and the schema is the sink.
 fn lifted_source_is_assignable_to_schema(
     type_expr: &TypeExpr,
     sink: &AttributeType,
     sink_defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    let Some(source) = lift_type_expr(type_expr) else {
-        return true;
-    };
+    let (context, schemas) = string_refinement_fixture();
+    let resolved = resolve_type_expr(type_expr, &context).expect("fixture annotation must resolve");
+    let source = lift_type_expr(&resolved, &schemas).expect("fixture declaration must lift");
     crate::schema::TypeInSchema::schemaless(&source).is_assignable_to(sink.in_schema(sink_defs))
 }
 
@@ -729,9 +772,9 @@ fn schema_source_is_assignable_to_lifted_sink(
     source_defs: &std::collections::BTreeMap<String, AttributeType>,
     type_expr: &TypeExpr,
 ) -> bool {
-    let Some(sink) = lift_type_expr(type_expr) else {
-        return false;
-    };
+    let (context, schemas) = string_refinement_fixture();
+    let resolved = resolve_type_expr(type_expr, &context).expect("fixture annotation must resolve");
+    let sink = lift_type_expr(&resolved, &schemas).expect("fixture declaration must lift");
     source
         .in_schema(source_defs)
         .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
@@ -828,6 +871,106 @@ fn iam_policy_arn_type_expr() -> TypeExpr {
     }
 }
 
+fn refined_int_module_argument_report(annotation: &str, sink: TypeExpr) -> BindingUseReport {
+    let identity = TypeIdentity::new(Some("test"), ["counter"], "Count");
+    let provider_context = context_with_accepting_custom_type_resolver(HashSet::from([
+        crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
+    ]));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("counter")
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "count",
+                    AttributeType::refined_int(Some(identity), None),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse(
+        &format!(
+            "arguments {{ n: {annotation} }}\nlet inner = use {{ source = './inner' }}\ninner {{ m = n }}\n"
+        ),
+        &provider_context,
+    )
+    .unwrap();
+    let signatures = HashMap::from([(
+        "inner".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![crate::parser::ArgumentParameter {
+                name: "m".to_string(),
+                static_type: consumer_type(sink),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &provider_context, &signatures),
+    )
+}
+
+#[test]
+fn positive_int_module_argument_accepts_int_sink() {
+    let report = refined_int_module_argument_report("PositiveInt", TypeExpr::Int);
+    assert!(report.is_ready(), "{report:#?}");
+}
+
+#[test]
+fn positive_int_module_argument_rejects_string_sink_statically() {
+    let report = refined_int_module_argument_report("PositiveInt", TypeExpr::String);
+    assert_eq!(report.findings().len(), 1, "{report:#?}");
+    assert!(
+        report.findings()[0]
+            .error
+            .to_string()
+            .contains("expected String, got PositiveInt")
+    );
+}
+
+#[test]
+fn provider_int_module_argument_accepts_int_sink() {
+    let report = refined_int_module_argument_report("test.counter.Count", TypeExpr::Int);
+    assert!(report.is_ready(), "{report:#?}");
+}
+
+#[test]
+fn provider_int_module_argument_rejects_string_sink_statically() {
+    let report = refined_int_module_argument_report("test.counter.Count", TypeExpr::String);
+    assert_eq!(report.findings().len(), 1, "{report:#?}");
+    assert!(
+        report.findings()[0]
+            .error
+            .to_string()
+            .contains("expected String, got test.counter.Count")
+    );
+}
+
+#[test]
+fn lift_type_expr_preserves_every_builtin_scalar_kind() {
+    for (kind, identity) in crate::schema::builtin_validator_registry().keys() {
+        let expr = TypeExpr::Simple(crate::parser::pascal_to_snake(&identity.kind));
+        let lifted = lift_type_expr(&expr, &SchemaRegistry::new()).unwrap();
+        let expected = match kind {
+            crate::schema::RefinedScalarKind::String => AttributeType::string(),
+            crate::schema::RefinedScalarKind::Int => AttributeType::int(),
+            crate::schema::RefinedScalarKind::Float => AttributeType::float(),
+        };
+        assert!(
+            crate::schema::TypeInSchema::schemaless(&lifted)
+                .is_assignable_to(crate::schema::TypeInSchema::schemaless(&expected)),
+            "{identity} must lift to its constructor's {kind} scalar kind"
+        );
+    }
+}
+
 #[test]
 fn lift_type_expr_maps_schema_identity_directionally() {
     let vpc_id_expr = TypeExpr::SchemaType {
@@ -871,7 +1014,8 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
         TypeExpr::String,
         TypeExpr::Int,
     ])))));
-    let lifted = lift_type_expr(&structured).expect("container types must lift recursively");
+    let lifted = lift_type_expr(&structured, &SchemaRegistry::new())
+        .expect("container types must lift recursively");
     let expected = AttributeType::list(AttributeType::map(AttributeType::union(vec![
         AttributeType::string(),
         AttributeType::int(),
@@ -887,7 +1031,8 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
         TypeExpr::Ref(resource_ref.clone()),
         TypeExpr::DottedUnresolved(resource_ref),
     ] {
-        let handle = lift_type_expr(&type_expr).expect("resource paths lift to typed handles");
+        let handle = lift_type_expr(&type_expr, &SchemaRegistry::new())
+            .expect("resource paths lift to typed handles");
         assert!(
             crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
                 crate::schema::TypeInSchema::schemaless(&AttributeType::string())
@@ -899,8 +1044,11 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
             )
         );
     }
-    let literal = lift_type_expr(&TypeExpr::StringLiteral("x".to_string()))
-        .expect("string literals lift to a closed string set");
+    let literal = lift_type_expr(
+        &TypeExpr::StringLiteral("x".to_string()),
+        &SchemaRegistry::new(),
+    )
+    .expect("string literals lift to a closed string set");
     assert!(
         crate::schema::TypeInSchema::schemaless(&literal).is_assignable_to(
             crate::schema::TypeInSchema::schemaless(&AttributeType::string())
@@ -4939,7 +5087,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     );
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
-    let schemas = SchemaRegistry::new();
+    let (_context, schemas) = string_refinement_fixture();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let err = errors
@@ -5010,7 +5158,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
     ];
     let mut parsed = empty_parsed();
     parsed.compositions = compositions;
-    let schemas = SchemaRegistry::new();
+    let (_context, schemas) = string_refinement_fixture();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -5089,7 +5237,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         );
         parsed.compositions.push(consumer);
     }
-    let schemas = SchemaRegistry::new();
+    let (_context, schemas) = string_refinement_fixture();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -5143,7 +5291,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
         parsed.compositions.push(consumer);
     }
 
-    let schemas = SchemaRegistry::new();
+    let (_context, schemas) = string_refinement_fixture();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let declaration_errors: Vec<_> = errors
@@ -5205,7 +5353,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     );
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
-    let schemas = SchemaRegistry::new();
+    let (_context, schemas) = string_refinement_fixture();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);

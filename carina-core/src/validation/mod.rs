@@ -47,7 +47,10 @@ use crate::static_type::{
 /// string-backed handle kind. The handle's path is retained for BindingIndex's
 /// single declared-type assignability relation; the runtime transport remains
 /// an id string until #3803 lands. Unchecked states never enter this function.
-pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
+/// Built-ins retain their constructor declaration. Provider identities use the
+/// scalar kind declared by every owning schema; missing or conflicting schema
+/// evidence returns `None` instead of guessing a String type.
+pub fn lift_type_expr(type_expr: &TypeExpr, schemas: &SchemaRegistry) -> Option<AttributeType> {
     use crate::schema::StructField;
 
     match type_expr {
@@ -59,24 +62,24 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
         TypeExpr::Int => Some(AttributeType::int()),
         TypeExpr::Float => Some(AttributeType::float()),
         TypeExpr::Duration => Some(AttributeType::duration()),
-        TypeExpr::Simple(name) => Some(AttributeType::refined_string(
-            Some(TypeIdentity::bare(crate::parser::snake_to_pascal(name))),
-            None,
-            None,
-            None,
-        )),
-        TypeExpr::SchemaType { owned } => Some(AttributeType::refined_string(
-            Some(owned.identity().clone()),
-            None,
-            None,
-            None,
-        )),
-        TypeExpr::List(inner) => lift_type_expr(inner).map(AttributeType::list),
-        TypeExpr::Map(inner) => lift_type_expr(inner).map(AttributeType::map),
+        TypeExpr::Simple(name) => crate::parser::builtin_bare_custom_types()
+            .get(name)
+            .cloned(),
+        TypeExpr::SchemaType { owned } => {
+            let mut kinds = owned
+                .provider_names()
+                .map(|owner| schemas.identified_scalar_kind(owner, owned.identity()));
+            let kind = kinds.next()??;
+            kinds
+                .all(|candidate| candidate == Some(kind))
+                .then(|| kind.identified_type(owned.identity().clone()))
+        }
+        TypeExpr::List(inner) => lift_type_expr(inner, schemas).map(AttributeType::list),
+        TypeExpr::Map(inner) => lift_type_expr(inner, schemas).map(AttributeType::map),
         TypeExpr::Struct { fields } => fields
             .iter()
             .map(|(name, field_type)| {
-                lift_type_expr(field_type)
+                lift_type_expr(field_type, schemas)
                     .map(|field_type| StructField::optional(name.clone(), field_type).build())
             })
             .collect::<Option<Vec<_>>>()
@@ -111,7 +114,7 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
         }
         TypeExpr::Union(members) => members
             .iter()
-            .map(lift_type_expr)
+            .map(|member| lift_type_expr(member, schemas))
             .collect::<Option<Vec<_>>>()
             .filter(|members| !members.is_empty())
             .map(AttributeType::union),
@@ -681,10 +684,11 @@ fn declared_value_assignable_to_sink(
     declared_type: &TypeExpr,
     sink: RefSink<'_>,
     config: &ProviderContext,
+    schemas: &SchemaRegistry,
 ) -> Result<(), BindingResolutionError> {
     let resolved =
         resolve_type_expr(declared_type, config).map_err(BindingResolutionError::TypeResolution)?;
-    let Some(source) = lift_type_expr(&resolved) else {
+    let Some(source) = lift_type_expr(&resolved, schemas) else {
         return Ok(());
     };
     let source = crate::schema::TypeInSchema::schemaless(&source);
@@ -696,7 +700,7 @@ fn declared_value_assignable_to_sink(
         } => attr_type.in_schema(defs),
         RefSink::String => crate::schema::TypeInSchema::schemaless(&string_sink),
         RefSink::TypeExpr(type_expr) => {
-            let Some(lifted) = lift_type_expr(type_expr) else {
+            let Some(lifted) = lift_type_expr(type_expr, schemas) else {
                 return Ok(());
             };
             lifted_sink = lifted;
@@ -836,7 +840,7 @@ fn precheck_value_source(
         } => attr_type.in_schema(defs),
         RefSink::String => crate::schema::TypeInSchema::schemaless(&string_sink),
         RefSink::TypeExpr(type_expr) => {
-            let lifted = lift_type_expr(type_expr)?;
+            let lifted = lift_type_expr(type_expr, context.schemas)?;
             lifted_sink = lifted;
             crate::schema::TypeInSchema::schemaless(&lifted_sink)
         }
@@ -891,6 +895,7 @@ fn resolve_value_source_against_sink(
             declared_type,
             sink,
             context.raw_provider_context(),
+            context.schemas,
         );
     }
 
@@ -1742,7 +1747,7 @@ pub fn check_deferred_access_type(
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
         )) => return Ok(()),
     };
-    let Some(actual) = lift_type_expr(&actual) else {
+    let Some(actual) = lift_type_expr(&actual, schemas) else {
         return Ok(());
     };
     let actual = crate::schema::TypeInSchema::schemaless(&actual);
@@ -1877,6 +1882,7 @@ fn prove_integer_operand(
 fn check_integer_result_sink(
     value: &Value,
     sink: Option<RefSink<'_>>,
+    schemas: &SchemaRegistry,
 ) -> Result<(), DeferredAccessTypeError> {
     let integer = AttributeType::int();
     let actual = crate::schema::TypeInSchema::schemaless(&integer);
@@ -1885,7 +1891,7 @@ fn check_integer_result_sink(
             attr_type, defs, ..
         }) => attr_type.in_schema(defs),
         Some(RefSink::TypeExpr(type_expr)) => {
-            let Some(expected) = lift_type_expr(type_expr) else {
+            let Some(expected) = lift_type_expr(type_expr, schemas) else {
                 return Err(DeferredAccessTypeError::TypeMismatch {
                     expected: type_expr.to_string(),
                     actual: "Int".to_string(),
@@ -1947,7 +1953,7 @@ fn check_integer_arithmetic_types_with_sink<'a>(
                 binding_index,
             )
         })
-        .and_then(|()| check_integer_result_sink(candidate, candidate_sink));
+        .and_then(|()| check_integer_result_sink(candidate, candidate_sink, schemas));
         let Err(error) = result else {
             return;
         };
@@ -2608,7 +2614,7 @@ fn composition_ref_error_kind(
         RefType::Typed(source) => {
             let sink = sink
                 .and_then(RefSink::as_type_expr)
-                .and_then(lift_type_expr)?;
+                .and_then(|type_expr| lift_type_expr(type_expr, bindings.schema_registry()))?;
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
             source
                 .is_assignable_to_sink(sink_type)
@@ -2693,9 +2699,13 @@ fn validate_user_function_ref_types_inner<
         });
     }
 
-    fn declared_result_mismatch(source: &TypeExpr, sink: &TypeExpr) -> Option<(String, String)> {
-        let source = lift_type_expr(source)?;
-        let sink = lift_type_expr(sink)?;
+    fn declared_result_mismatch(
+        source: &TypeExpr,
+        sink: &TypeExpr,
+        schemas: &SchemaRegistry,
+    ) -> Option<(String, String)> {
+        let source = lift_type_expr(source, schemas)?;
+        let sink = lift_type_expr(sink, schemas)?;
         let source = crate::schema::TypeInSchema::schemaless(&source);
         let sink = crate::schema::TypeInSchema::schemaless(&sink);
         (!source.is_assignable_to(sink))
@@ -2765,7 +2775,8 @@ fn validate_user_function_ref_types_inner<
             if let (Some(source), Some((sink, context))) = (
                 function.and_then(|function| function.return_type.as_ref()),
                 result_context,
-            ) && let Some((expected, actual)) = declared_result_mismatch(source, sink)
+            ) && let Some((expected, actual)) =
+                declared_result_mismatch(source, sink, bindings.schema_registry())
             {
                 errors.push(format!(
                     "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
@@ -4113,7 +4124,9 @@ fn check_attribute_param_ref(
 ) {
     match bindings.ref_type(path) {
         RefType::Typed(source) => {
-            let Some(sink) = expected_type.and_then(lift_type_expr) else {
+            let Some(sink) = expected_type
+                .and_then(|type_expr| lift_type_expr(type_expr, bindings.schema_registry()))
+            else {
                 return;
             };
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
@@ -4198,7 +4211,7 @@ fn check_export_ref(
             let Some(type_expr) = expected_type else {
                 return;
             };
-            let Some(sink) = lift_type_expr(type_expr) else {
+            let Some(sink) = lift_type_expr(type_expr, bindings.schema_registry()) else {
                 return;
             };
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
@@ -4613,8 +4626,8 @@ pub(crate) fn check_handle_sink(
 
     let source =
         AttributeType::resource_handle(actual.provider.clone(), actual.resource_type.clone());
-    let sink = lift_type_expr(&TypeExpr::Ref(expected.clone()))
-        .expect("TypeExpr::Ref always lifts to a resource handle");
+    let sink =
+        AttributeType::resource_handle(expected.provider.clone(), expected.resource_type.clone());
     if source
         .in_schema(crate::schema::empty_defs_for_schema_walks())
         .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
@@ -4879,7 +4892,7 @@ fn unresolved_bare_type_errors(
     match ty {
         TypeExpr::Simple(name)
             if config.custom_types_loaded()
-                && !crate::parser::builtin_bare_custom_types().contains(name) =>
+                && !crate::parser::builtin_bare_custom_types().contains_key(name) =>
         {
             errors.push(TypeResolutionError::unresolved_custom_type(
                 crate::parser::snake_to_pascal(name),

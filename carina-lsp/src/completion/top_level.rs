@@ -463,7 +463,9 @@ impl CompletionProvider {
         // shared value-completion entry point so module-call values
         // get the same coverage as `exports {}` values (built-ins,
         // binding refs, and structural type candidates).
-        if let Some(attr_type) = carina_core::validation::lift_type_expr(&resolved_type) {
+        if let Some(attr_type) =
+            carina_core::validation::lift_type_expr(&resolved_type, &self.schemas)
+        {
             // Synthetic `attr_type` is built directly from a `TypeExpr`,
             // which never lowers to `AttributeType::Ref`; an empty map is
             // sufficient for compatibility checks that still accept defs.

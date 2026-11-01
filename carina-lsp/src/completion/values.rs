@@ -63,10 +63,11 @@ impl StructuralTypeForCompletion<TypeExpr> {
         &self,
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
+        schemas: &carina_core::schema::SchemaRegistry,
     ) -> bool {
         match self {
             Self::Known(type_expr) => {
-                type_expr_source_is_assignable_to(type_expr, target, target_defs)
+                type_expr_source_is_assignable_to(type_expr, target, target_defs, schemas)
             }
             Self::Unnameable(_type_expr) => true,
         }
@@ -118,10 +119,11 @@ impl<'a> UpstreamCompletionStaticType<'a> {
         self,
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
+        schemas: &carina_core::schema::SchemaRegistry,
     ) -> bool {
         match self {
             Self::Known(type_expr) => {
-                type_expr_source_is_assignable_to(type_expr, target, target_defs)
+                type_expr_source_is_assignable_to(type_expr, target, target_defs, schemas)
             }
             Self::DeclaredUnnameable(_reason) | Self::InferredUnnameable(_reason) => true,
             Self::NotInferable(_reason) => false,
@@ -199,8 +201,9 @@ fn type_expr_source_is_assignable_to(
     source: &TypeExpr,
     sink: &AttributeType,
     sink_defs: &std::collections::BTreeMap<String, AttributeType>,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> bool {
-    let Some(source) = carina_core::validation::lift_type_expr(source) else {
+    let Some(source) = carina_core::validation::lift_type_expr(source, schemas) else {
         return true;
     };
     TypeInSchema::schemaless(&source).is_assignable_to(sink.in_schema(sink_defs))
@@ -446,9 +449,11 @@ impl CompletionProvider {
                 );
                 for (export_name, entry) in exports {
                     let completion_type = structural_type_for_completion(entry);
-                    if !completion_type
-                        .is_candidate_for_target(attr_schema.attr_type(), schema.as_schema().defs())
-                    {
+                    if !completion_type.is_candidate_for_target(
+                        attr_schema.attr_type(),
+                        schema.as_schema().defs(),
+                        &self.schemas,
+                    ) {
                         continue;
                     }
                     let full_ref = format!("{}.{}", binding, export_name);
@@ -521,7 +526,12 @@ impl CompletionProvider {
                     else {
                         return true;
                     };
-                    type_expr_source_is_assignable_to(arg_type_expr, attr_type, target_defs)
+                    type_expr_source_is_assignable_to(
+                        arg_type_expr,
+                        attr_type,
+                        target_defs,
+                        &self.schemas,
+                    )
                 }));
             }
         }
@@ -546,7 +556,7 @@ impl CompletionProvider {
                     &self.schemas,
                     &mut exports_cache,
                 )
-                && !element_type.is_candidate_for_target(attr_type, target_defs)
+                && !element_type.is_candidate_for_target(attr_type, target_defs, &self.schemas)
             {
                 continue;
             }
@@ -1718,7 +1728,7 @@ impl CompletionProvider {
             );
             for (export_name, entry) in exports {
                 let completion_type = structural_type_for_completion(entry);
-                if !completion_type.is_candidate_for_target(target, target_defs) {
+                if !completion_type.is_candidate_for_target(target, target_defs, &self.schemas) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding, export_name);
@@ -1823,7 +1833,8 @@ impl CompletionProvider {
                 let Some(export_ty) = export.static_type.as_ref() else {
                     continue;
                 };
-                if !type_expr_source_is_assignable_to(export_ty, target, target_defs) {
+                if !type_expr_source_is_assignable_to(export_ty, target, target_defs, &self.schemas)
+                {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding_name, export.name);
@@ -2019,7 +2030,7 @@ impl CompletionProvider {
         // Internal registry is snake_case; the LSP surface is PascalCase.
         let mut seen_custom = std::collections::HashSet::new();
         let custom: Vec<CompletionItem> = carina_core::parser::builtin_bare_custom_types()
-            .iter()
+            .keys()
             .cloned()
             .chain(self.custom_type_names.iter().cloned())
             .filter(|name| seen_custom.insert(name.clone()))

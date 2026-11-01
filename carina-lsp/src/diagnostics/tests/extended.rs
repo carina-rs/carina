@@ -12651,6 +12651,37 @@ inner {
 }
 
 #[test]
+fn module_call_positive_int_forwarding_uses_its_scalar_kind() {
+    let main = "let inner = use { source = './inner' }\ninner { m = n }\n";
+    for (sink, expected_error) in [("Int", false), ("String", true)] {
+        let inner = format!("arguments {{ m: {sink} }}\n");
+        let temp = write_tag_key_fixture(&[
+            ("arguments.crn", "arguments { n: PositiveInt }\n"),
+            ("main.crn", main),
+            ("inner/main.crn", &inner),
+        ]);
+        let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            !errors.is_empty(),
+            expected_error,
+            "{sink}: {diagnostics:#?}"
+        );
+        if expected_error {
+            assert!(
+                errors.iter().any(|diagnostic| diagnostic
+                    .message
+                    .contains("expected String, got PositiveInt")),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn module_call_uses_values_resolved_from_sibling_let_bindings() {
     let main = r#"let inner = use { source = './modules/inner' }
 

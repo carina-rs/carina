@@ -2769,7 +2769,7 @@ impl DiagnosticEngine {
     fn check_unknown_type_names(&self, type_expr: &TypeExpr) -> Option<String> {
         match type_expr {
             TypeExpr::Simple(name) => {
-                if carina_core::parser::builtin_bare_custom_types().contains(name) {
+                if carina_core::parser::builtin_bare_custom_types().contains_key(name) {
                     return None;
                 }
                 // The document's provisional parse has no provider context,

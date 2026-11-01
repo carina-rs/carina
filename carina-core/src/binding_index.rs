@@ -443,6 +443,7 @@ fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
 /// callers can distinguish "unknown binding" from "known but unchecked".
 #[derive(Debug)]
 pub struct BindingIndex<'a> {
+    schemas: &'a SchemaRegistry,
     entries: HashMap<String, BindingEntry<'a>>,
     known_names: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
@@ -704,6 +705,7 @@ impl<'a> BindingIndex<'a> {
             }
         }
         Self {
+            schemas: registry,
             entries,
             known_names,
             resource_handles,
@@ -713,6 +715,10 @@ impl<'a> BindingIndex<'a> {
 
     pub fn get(&self, name: &str) -> Option<&BindingEntry<'a>> {
         self.entries.get(name)
+    }
+
+    pub(crate) fn schema_registry(&self) -> &'a SchemaRegistry {
+        self.schemas
     }
 
     pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction> {
@@ -829,9 +835,10 @@ impl<'a> BindingIndex<'a> {
 
                     match attribute.declared_type() {
                         Some(crate::static_type::StaticType::Known(resolved)) => {
-                            let Some(declared) =
-                                crate::validation::lift_type_expr(resolved.type_expr())
-                            else {
+                            let Some(declared) = crate::validation::lift_type_expr(
+                                resolved.type_expr(),
+                                self.schemas,
+                            ) else {
                                 visiting.remove(&key);
                                 return RefType::Unchecked;
                             };
@@ -922,7 +929,8 @@ impl<'a> BindingIndex<'a> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
+                    let Some(declared) = crate::validation::lift_type_expr(type_expr, self.schemas)
+                    else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -960,7 +968,8 @@ impl<'a> BindingIndex<'a> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     }
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
+                    let Some(declared) = crate::validation::lift_type_expr(type_expr, self.schemas)
+                    else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -1030,7 +1039,8 @@ impl<'a> BindingIndex<'a> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
+                    let Some(declared) = crate::validation::lift_type_expr(type_expr, self.schemas)
+                    else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -3215,6 +3225,19 @@ let vpc = aws.ec2.Vpc {
                 parsed.compositions.push(middle);
 
                 let mut registry = SchemaRegistry::new();
+                for named in &universe {
+                    if let Some(TypeExpr::SchemaType { owned }) = &named.declaration {
+                        registry.insert(
+                            owned.provider_names().next().unwrap(),
+                            ResourceSchema::new(named.name)
+                                .attribute(
+                                    AttributeSchema::optional("value", named.attr.clone()).build(),
+                                )
+                                .validate()
+                                .unwrap(),
+                        );
+                    }
+                }
                 registry.insert(
                     "test",
                     (ResourceSchema::new("source.Node").attribute(
@@ -3305,19 +3328,23 @@ let vpc = aws.ec2.Vpc {
         let RefType::Typed(vpc) = index.ref_type("vpc") else {
             panic!("Ref-typed module argument must resolve to a resource handle");
         };
-        let same = crate::validation::lift_type_expr(&TypeExpr::Ref(ResourceTypePath::new(
-            "aws", "ec2.Vpc",
-        )))
+        let same = crate::validation::lift_type_expr(
+            &TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
+            &SchemaRegistry::new(),
+        )
         .expect("Ref must be liftable");
-        let different = crate::validation::lift_type_expr(&TypeExpr::Ref(ResourceTypePath::new(
-            "aws",
-            "ec2.Subnet",
-        )))
+        let different = crate::validation::lift_type_expr(
+            &TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Subnet")),
+            &SchemaRegistry::new(),
+        )
         .expect("Ref must be liftable");
-        let literal_union = crate::validation::lift_type_expr(&TypeExpr::Union(vec![
-            TypeExpr::StringLiteral("dev".to_string()),
-            TypeExpr::StringLiteral("prod".to_string()),
-        ]))
+        let literal_union = crate::validation::lift_type_expr(
+            &TypeExpr::Union(vec![
+                TypeExpr::StringLiteral("dev".to_string()),
+                TypeExpr::StringLiteral("prod".to_string()),
+            ]),
+            &SchemaRegistry::new(),
+        )
         .expect("literal union must be liftable");
 
         for accepted in [AttributeType::string(), same] {

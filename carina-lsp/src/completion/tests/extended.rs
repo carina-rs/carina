@@ -4722,6 +4722,36 @@ fn value_position_filters_literal_union_by_lifted_string_type() {
 }
 
 #[test]
+fn value_position_filters_positive_int_using_its_scalar_kind() {
+    let schema = ResourceSchema::new("counter")
+        .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
+        .attribute(AttributeSchema::optional("label", AttributeType::string()).build())
+        .validate()
+        .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
+    for (attribute, expected) in [("count", true), ("label", false)] {
+        let text =
+            format!("arguments {{\n  n: PositiveInt\n}}\ntest.counter {{\n  {attribute} =\n}}\n");
+        let completions = provider.complete(
+            &create_document(&text),
+            Position {
+                line: 4,
+                character: format!("  {attribute} =").len() as u32,
+            },
+            None,
+        );
+        assert_eq!(
+            completions.iter().any(|item| item.label == "n"),
+            expected,
+            "PositiveInt candidate at {attribute}: {completions:#?}"
+        );
+    }
+}
+
+#[test]
 fn value_position_suppresses_all_builtins() {
     // Builtins are intentionally NOT emitted at the bare value
     // position regardless of target type. Even String-returning

@@ -8807,6 +8807,9 @@ impl fmt::Display for IdentifiedDeclarationKind {
 /// Failure to build one provider's aggregate schema witness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderSchemaValidationError {
+    BuiltinTypeCollision {
+        identity: TypeIdentity,
+    },
     MissingScalarKind {
         identity: TypeIdentity,
     },
@@ -8827,6 +8830,10 @@ pub enum ProviderSchemaValidationError {
 impl fmt::Display for ProviderSchemaValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BuiltinTypeCollision { identity } => write!(
+                formatter,
+                "custom type `{identity}` conflicts with the built-in declaration; use the core types constructor (including its scalar kind and validator) or choose a different identity"
+            ),
             Self::MissingScalarKind { identity } => {
                 write!(
                     formatter,
@@ -8881,6 +8888,13 @@ impl ValidatedProviderSchemaWitness {
             BTreeMap::<TypeIdentity, std::collections::BTreeSet<IdentifiedDeclarationKind>>::new();
 
         for (identity, attribute_type) in &declarations {
+            if let Some(builtin) = builtin_type_registry().get(identity)
+                && !same_builtin_declaration(attribute_type, builtin)
+            {
+                return Err(ProviderSchemaValidationError::BuiltinTypeCollision {
+                    identity: identity.clone(),
+                });
+            }
             let declaration = identified_declaration_kind(attribute_type)
                 .expect("identified declaration walk only yields identified scalar types");
             let scalar_kind =
@@ -11815,91 +11829,114 @@ where
 pub mod types {
     use super::*;
 
+    // Cache core declarations so provider admission can recognize reuse of
+    // these constructors by validator identity, including after wire decoding.
+    // Arbitrary callbacks cannot be compared by their behavior.
     /// Positive integer type
     pub fn positive_int() -> AttributeType {
-        AttributeType::refined_int_with_validator(
-            TypeIdentity::bare("PositiveInt"),
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::Int(n)) = value {
-                    if *n > 0 {
-                        Ok(())
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_int_with_validator(
+                TypeIdentity::bare("PositiveInt"),
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::Int(n)) = value {
+                        if *n > 0 {
+                            Ok(())
+                        } else {
+                            Err("Value must be positive".to_string())
+                        }
                     } else {
-                        Err("Value must be positive".to_string())
+                        Err("Expected integer".to_string())
                     }
-                } else {
-                    Err("Expected integer".to_string())
-                }
-            }),
-        )
+                }),
+            )
+        })
+        .clone()
     }
 
     /// IPv4 CIDR block type (e.g., "10.0.0.0/16")
     pub fn ipv4_cidr() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("Ipv4Cidr"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_ipv4_cidr(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("Ipv4Cidr"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_ipv4_cidr(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
     pub fn ipv4_address() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("Ipv4Address"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_ipv4_address(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("Ipv4Address"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_ipv4_address(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// IPv6 address type (e.g., "2001:db8::1", "::1")
     pub fn ipv6_address() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("Ipv6Address"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_ipv6_address(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("Ipv6Address"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_ipv6_address(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("Ipv6Cidr"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_ipv6_cidr(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("Ipv6Cidr"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_ipv6_cidr(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// CIDR block type that accepts both IPv4 and IPv6 (e.g., "10.0.0.0/16" or "2001:db8::/32")
@@ -11913,61 +11950,78 @@ pub mod types {
     /// requires a non-empty local part, a single `@`, and a domain that
     /// contains at least one dot with non-empty labels.
     pub fn email() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("Email"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_email(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("Email"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_email(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// DNS domain name (e.g., "example.com", "EXAMPLE.Com.").
     ///
     /// Requires at least two ASCII letter/digit/hyphen labels of 1–63 characters,
     /// with no leading or trailing hyphens. Allows one trailing dot, excluded
-    /// from the 253-character name limit. Wildcards are rejected.
+    /// from the 253-character name limit. Wildcards and underscores are rejected,
+    /// so this type is unsuitable for Route53 record names such as
+    /// `_acme-challenge` or `_dmarc`. Punycode and numeric labels (including a
+    /// numeric last label and dotted-IPv4-looking strings) are accepted,
+    /// deliberately matching ACM's domain-name regex.
     pub fn domain_name() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("DomainName"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_domain_name(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("DomainName"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_domain_name(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// DNS domain name with an optional leftmost wildcard (e.g., "*.example.com").
     ///
     /// Accepts everything [`domain_name`] accepts, plus a single `*.` prefix.
-    /// The name after that prefix must be a valid DomainName, including its
-    /// 253-character limit; the wildcard prefix is excluded from that limit.
+    /// The full name, including `*.` but excluding one trailing dot, must be at
+    /// most 253 characters. After removing `*.`, the remaining labels must
+    /// satisfy [`domain_name`].
     pub fn wildcard_domain_name() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("WildcardDomainName"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_wildcard_domain_name(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("WildcardDomainName"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_wildcard_domain_name(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// Absolute HTTPS URL with a DNS, IPv4, or bracketed IPv6 host.
@@ -11975,7 +12029,11 @@ pub mod types {
     /// Requires the lowercase `https://` scheme and forbids userinfo, whitespace,
     /// and control characters. An optional decimal port must be in `1..=65535`.
     /// Paths, queries, and fragments use ASCII URL characters or percent escapes.
-    /// Length caps and restrictions on ports or queries belong to attributes.
+    /// Single-label hosts such as `localhost` and trailing-dot FQDNs are
+    /// accepted; the host has no 253-character cap. Length caps and restrictions
+    /// on ports or queries belong to attributes. RFC 6570 templates such as
+    /// `{proxy}` are rejected, so this type is unsuitable for API Gateway HTTP
+    /// integration URIs that contain templates.
     ///
     /// ```
     /// # use carina_core::schema::validate_https_url;
@@ -11985,19 +12043,23 @@ pub mod types {
     /// assert!(validate_https_url("https://user@example.com").is_err());
     /// ```
     pub fn https_url() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("HttpsUrl"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_https_url(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("HttpsUrl"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_https_url(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// HTTP response status code restricted to 2XX/4XX/5XX (3-digit string).
@@ -12007,19 +12069,23 @@ pub mod types {
     /// actions. A future generic `http_status_code()` covering 1XX–5XX can be
     /// added as a sibling if a non-restricted consumer appears.
     pub fn http_response_status_code() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("HttpResponseStatusCode"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_http_response_status_code(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("HttpResponseStatusCode"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_http_response_status_code(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// ELBv2 redirect protocol restricted to `HTTP`, `HTTPS`, or `#{protocol}`.
@@ -12031,19 +12097,23 @@ pub mod types {
     /// assert!(validate_redirect_protocol("#{path}").is_err());
     /// ```
     pub fn redirect_protocol() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("RedirectProtocol"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_protocol(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("RedirectProtocol"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_redirect_protocol(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// ELBv2 redirect host, including wildcards and `#{host}`.
@@ -12054,19 +12124,23 @@ pub mod types {
     /// assert!(validate_redirect_host("#{path}").is_err());
     /// ```
     pub fn redirect_host() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("RedirectHost"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_host(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("RedirectHost"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_redirect_host(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// ELBv2 redirect port restricted to `1..=65535` or `#{port}`.
@@ -12077,19 +12151,23 @@ pub mod types {
     /// assert!(validate_redirect_port("#{path}").is_err());
     /// ```
     pub fn redirect_port() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("RedirectPort"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_port(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("RedirectPort"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_redirect_port(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// ELBv2 redirect path, including wildcards and ELBv2 redirect placeholders.
@@ -12100,19 +12178,23 @@ pub mod types {
     /// assert!(validate_redirect_path("relative").is_err());
     /// ```
     pub fn redirect_path() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("RedirectPath"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_path(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("RedirectPath"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_redirect_path(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 
     /// ELBv2 redirect query string, including ELBv2 redirect placeholders.
@@ -12123,19 +12205,23 @@ pub mod types {
     /// assert!(validate_redirect_query(&"a".repeat(129)).is_err());
     /// ```
     pub fn redirect_query() -> AttributeType {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("RedirectQuery"),
-            None,
-            None,
-            legacy_validator(|value| {
-                if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_query(s.expose_plaintext())
-                } else {
-                    Err("Expected string".to_string())
-                }
-            }),
-            None,
-        )
+        static TYPE: OnceLock<AttributeType> = OnceLock::new();
+        TYPE.get_or_init(|| {
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("RedirectQuery"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    if let Value::Concrete(ConcreteValue::String(s)) = value {
+                        validate_redirect_query(s.expose_plaintext())
+                    } else {
+                        Err("Expected string".to_string())
+                    }
+                }),
+                None,
+            )
+        })
+        .clone()
     }
 }
 
@@ -12157,18 +12243,25 @@ impl fmt::Display for RefinedScalarKind {
     }
 }
 
-/// Return the validators for every core-owned identified refinement.
-///
-/// The registry is built from the same constructors providers use, so schema
-/// construction and process-boundary reconstruction cannot drift onto two
-/// hand-maintained identity lists. DSL type names are derived from this registry
-/// by [`crate::parser::builtin_bare_custom_types`].
-pub fn builtin_validator_registry()
--> &'static HashMap<(RefinedScalarKind, TypeIdentity), CustomValidator> {
-    static REGISTRY: OnceLock<HashMap<(RefinedScalarKind, TypeIdentity), CustomValidator>> =
-        OnceLock::new();
+impl RefinedScalarKind {
+    /// Lift an identity using its declared scalar shape, without guessing from
+    /// its name. Value constraints remain owned by the schema declaration.
+    pub(crate) fn identified_type(self, identity: TypeIdentity) -> AttributeType {
+        match self {
+            Self::String => AttributeType::refined_string(Some(identity), None, None, None),
+            Self::Int => AttributeType::refined_int(Some(identity), None),
+            Self::Float => AttributeType::refined_float(Some(identity), None),
+        }
+    }
+}
+
+/// Constructor-backed declarations for every core-owned refinement.
+/// Parser recognition, static lifting, provider admission, and validator
+/// reconstruction all derive from these declarations.
+pub fn builtin_type_registry() -> &'static HashMap<TypeIdentity, AttributeType> {
+    static REGISTRY: OnceLock<HashMap<TypeIdentity, AttributeType>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let builtins = [
+        [
             types::positive_int(),
             types::ipv4_cidr(),
             types::ipv4_address(),
@@ -12184,9 +12277,85 @@ pub fn builtin_validator_registry()
             types::redirect_port(),
             types::redirect_path(),
             types::redirect_query(),
-        ];
+        ]
+        .into_iter()
+        .map(|declaration| {
+            let identity = crate::provider::identified_custom_type_identity(&declaration)
+                .expect("built-in must have an identity");
+            (identity.clone(), declaration)
+        })
+        .collect()
+    })
+}
+
+fn same_builtin_declaration(declaration: &AttributeType, builtin: &AttributeType) -> bool {
+    let callbacks_match = |actual: Option<&CustomValidator>, expected: Option<&CustomValidator>| {
+        actual
+            .zip(expected)
+            .is_some_and(|(actual, expected)| Arc::ptr_eq(actual, expected))
+    };
+    match (declaration.raw_shape(), builtin.raw_shape()) {
+        (
+            RawShape::String {
+                pattern: a_pattern,
+                length: a_length,
+                validate: a_validate,
+                to_dsl: a_dsl,
+                ..
+            },
+            RawShape::String {
+                pattern: b_pattern,
+                length: b_length,
+                validate: b_validate,
+                to_dsl: b_dsl,
+                ..
+            },
+        ) => {
+            a_pattern == b_pattern
+                && a_length == b_length
+                && a_dsl == b_dsl
+                && callbacks_match(a_validate, b_validate)
+        }
+        (
+            RawShape::Int {
+                range: a_range,
+                validate: a_validate,
+                ..
+            },
+            RawShape::Int {
+                range: b_range,
+                validate: b_validate,
+                ..
+            },
+        ) => a_range == b_range && callbacks_match(a_validate, b_validate),
+        (
+            RawShape::Float {
+                range: a_range,
+                validate: a_validate,
+                ..
+            },
+            RawShape::Float {
+                range: b_range,
+                validate: b_validate,
+                ..
+            },
+        ) => a_range == b_range && callbacks_match(a_validate, b_validate),
+        _ => false,
+    }
+}
+
+/// Return the validators for every core-owned identified refinement.
+///
+/// Derived from [`builtin_type_registry`], alongside the DSL declarations in
+/// [`crate::parser::builtin_bare_custom_types`], so construction, static lifting,
+/// and process-boundary reconstruction share one set of core types.
+pub fn builtin_validator_registry()
+-> &'static HashMap<(RefinedScalarKind, TypeIdentity), CustomValidator> {
+    static REGISTRY: OnceLock<HashMap<(RefinedScalarKind, TypeIdentity), CustomValidator>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| {
         let mut validators = HashMap::new();
-        for attr_type in builtins {
+        for attr_type in builtin_type_registry().values() {
             let (kind, binding) = match &attr_type.kind {
                 AttrTypeKind::String { binding, .. } => (RefinedScalarKind::String, binding),
                 AttrTypeKind::Int { binding, .. } => (RefinedScalarKind::Int, binding),
@@ -12435,6 +12604,9 @@ pub fn validate_email(email: &str) -> Result<(), String> {
 /// or trailing hyphen. Uppercase letters and a single trailing dot are accepted.
 /// The name excluding that dot must be at most 253 characters. Wildcards,
 /// underscores, empty labels, whitespace, and non-ASCII characters are rejected.
+/// This excludes Route53 record names such as `_acme-challenge` and `_dmarc`.
+/// Punycode is accepted. Numeric labels, including a numeric last label and
+/// dotted-IPv4-looking strings, are deliberately accepted to match ACM's regex.
 ///
 /// ```
 /// # use carina_core::schema::validate_domain_name;
@@ -12444,12 +12616,26 @@ pub fn validate_email(email: &str) -> Result<(), String> {
 /// assert!(validate_domain_name("localhost").is_err());
 /// ```
 pub fn validate_domain_name(name: &str) -> Result<(), String> {
+    validate_domain_name_syntax(name, false).map_err(|error| {
+        format!(
+            "Invalid domain name {}: {error}",
+            display_string_literal(name)
+        )
+    })
+}
+
+fn validate_domain_name_syntax(name: &str, allow_wildcard: bool) -> Result<(), String> {
     let name = name.strip_suffix('.').unwrap_or(name);
     if name.len() > 253 {
         return Err(
             "Domain name must be at most 253 characters excluding a trailing dot".to_string(),
         );
     }
+    let name = if allow_wildcard {
+        name.strip_prefix("*.").unwrap_or(name)
+    } else {
+        name
+    };
     if !name.contains('.') {
         return Err("Domain name must contain at least two labels".to_string());
     }
@@ -12458,8 +12644,9 @@ pub fn validate_domain_name(name: &str) -> Result<(), String> {
 
 /// Validate a [`DomainName`](types::domain_name) with an optional `*.` prefix.
 ///
-/// A wildcard must be the entire leftmost label. After removing it, the name
-/// must satisfy [`validate_domain_name`], including its length and label limits.
+/// A wildcard must be the entire leftmost label. The full name, including `*.`
+/// but excluding one trailing dot, must be at most 253 characters. After
+/// removing `*.`, the remaining labels must satisfy [`validate_domain_name`].
 ///
 /// ```
 /// # use carina_core::schema::validate_wildcard_domain_name;
@@ -12469,7 +12656,12 @@ pub fn validate_domain_name(name: &str) -> Result<(), String> {
 /// assert!(validate_wildcard_domain_name("*.com").is_err());
 /// ```
 pub fn validate_wildcard_domain_name(name: &str) -> Result<(), String> {
-    validate_domain_name(name.strip_prefix("*.").unwrap_or(name))
+    validate_domain_name_syntax(name, true).map_err(|error| {
+        format!(
+            "Invalid wildcard domain name {}: {error}",
+            display_string_literal(name)
+        )
+    })
 }
 
 fn validate_dns_labels(name: &str) -> Result<(), String> {
@@ -12490,7 +12682,8 @@ fn validate_dns_labels(name: &str) -> Result<(), String> {
 /// Validate an absolute URL with the lowercase `https://` scheme.
 ///
 /// DNS labels contain 1–63 ASCII letters, digits, or hyphens, with no leading or
-/// trailing hyphen; a single-label host is allowed, but a trailing dot is not.
+/// trailing hyphen. Single-label hosts such as `localhost` and trailing-dot
+/// FQDNs such as `example.com.` are allowed; the host has no 253-character cap.
 /// Dotted numeric hosts must be standard IPv4 addresses. IPv6 literals must be
 /// bracketed and cannot contain a zone identifier. An optional port is decimal
 /// and in `1..=65535` (leading zeros are allowed).
@@ -12498,7 +12691,14 @@ fn validate_dns_labels(name: &str) -> Result<(), String> {
 /// Optional path, query, and fragment follow RFC 3986 character and percent-escape
 /// syntax. Literal whitespace and control characters are rejected everywhere;
 /// percent-encoded bytes are not decoded. No overall length limit is imposed.
+/// RFC 6570 templates such as `{proxy}` are rejected, so this type is unsuitable
+/// for API Gateway HTTP integration URIs that contain templates.
 pub fn validate_https_url(url: &str) -> Result<(), String> {
+    validate_https_url_syntax(url)
+        .map_err(|error| format!("Invalid HTTPS URL {}: {error}", display_string_literal(url)))
+}
+
+fn validate_https_url_syntax(url: &str) -> Result<(), String> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("HTTPS URL must not contain whitespace or control characters".to_string());
     }
@@ -12528,6 +12728,7 @@ pub fn validate_https_url(url: &str) -> Result<(), String> {
         let (host, port) = authority
             .split_once(':')
             .map_or((authority, None), |(host, port)| (host, Some(port)));
+        let host = host.strip_suffix('.').unwrap_or(host);
         if host.is_empty() {
             return Err("HTTPS URL must have a host".to_string());
         }
