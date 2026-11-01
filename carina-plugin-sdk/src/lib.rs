@@ -18,7 +18,8 @@ pub mod __private;
 #[doc = include_str!("../../site/src/content/providers/writing/schemas.md")]
 pub struct ProviderGuideSchemasPage;
 
-/// The complete provider example from the provider guide, checked against this SDK.
+/// Type-checks the provider guide's provider implementation on the host.
+/// The wasm mock builds cover its target-gated `export_provider!` path.
 #[cfg(doctest)]
 #[doc = include_str!("../../site/src/content/providers/writing/getting-started.md")]
 pub struct ProviderGuideGettingStartedPage;

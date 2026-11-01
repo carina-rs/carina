@@ -11,7 +11,6 @@ wit_bindgen::generate!({
         }
     "#,
     world: "carina:plugin-sdk/aws-credentials-client",
-    pub_export_macro: true,
     with: {
         "carina:provider/aws-credentials@0.1.0": generate,
     },

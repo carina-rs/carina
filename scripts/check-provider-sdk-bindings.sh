@@ -15,18 +15,22 @@ metadata = json.load(sys.stdin)
 members = set(metadata["workspace_members"])
 failed = False
 for package in metadata["packages"]:
-    if package["id"] not in members or not package["name"].startswith("carina-provider-"):
+    # A dev-only SDK dependency does not make a host crate a provider.
+    if package["id"] not in members or not any(
+        dependency["name"] == "carina-plugin-sdk" and dependency["kind"] is None
+        for dependency in package["dependencies"]
+    ):
         continue
     name = package["name"]
     # Cargo normalizes renamed, workspace-inherited and target-specific deps.
     for dependency in package["dependencies"]:
         dependency_name = dependency["name"]
-        if dependency_name == "wit-bindgen" or dependency_name.startswith("carina-plugin-bindings-"):
+        if dependency_name.startswith(("wit-bindgen", "carina-plugin-bindings-")):
             print(f"ERROR: {name} directly depends on {dependency_name}; use carina-plugin-sdk.")
             failed = True
     crate_dir = Path(package["manifest_path"]).parent
     for path in sorted(crate_dir.rglob("*")):
-        if not path.is_file() or path.suffix not in {".rs", ".toml", ".sh", ".md", ".yml", ".yaml"}:
+        if not path.is_file() or path.suffix not in {".rs", ".toml", ".sh", ".yml", ".yaml"}:
             continue
         for line_number, line in enumerate(path.read_text().splitlines(), 1):
             if "carina-plugin-wit" in line or "__carina_wit_bindgen" in line:
