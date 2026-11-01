@@ -297,6 +297,7 @@ pub(crate) struct ApplyStateSaveInputs<S = ModuleSource> {
     schemas: SchemaRegistry,
     planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
     comparisons: ResolvedComparisonTable,
+    references: Option<carina_core::references::ResolvedReferences>,
 }
 
 impl<S: Clone> ApplyStateSaveInputs<S> {
@@ -315,7 +316,16 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             schemas,
             planned_secret_hashes,
             comparisons,
+            references: None,
         })
+    }
+
+    pub(crate) fn with_reference_evidence(
+        mut self,
+        references: Option<carina_core::references::ResolvedReferences>,
+    ) -> Self {
+        self.references = references;
+        self
     }
 
     pub(crate) fn sorted_resources(&self) -> &[ResolvedResource<S>] {
@@ -365,6 +375,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             },
             self.planned_secret_hashes.as_ref(),
             &self.comparisons,
+            self.references.as_ref(),
         )
     }
 }
@@ -1596,6 +1607,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         },
         planned_secret_hashes,
         &comparisons,
+        None,
     )
 }
 
@@ -1603,6 +1615,7 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
     save: ApplyStateSave<'_, S>,
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
     comparisons: &ResolvedComparisonTable,
+    references: Option<&carina_core::references::ResolvedReferences>,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1641,7 +1654,8 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
             .comparison_for(&resource.id)
             .map_err(AppError::from)?;
         let owner_schema = resolved_comparison.owner_schema();
-        let comparison = resolved_comparison.context();
+        let comparison_schema = resolved_comparison.context();
+        let comparison = &comparison_schema.authoring(references, &resource.id);
         let schema = Some(owner_schema.schema().as_schema());
         let mut resource_state = match &planned.source {
             UpsertSource::Complete { state, request } => {
@@ -2347,6 +2361,125 @@ mod apply_state_save_tests {
                 id: actual
             } if actual == id
         ));
+    }
+
+    #[tokio::test]
+    async fn round3_writeback_pairs_reference_lists_with_prepared_identity_evidence() {
+        use carina_core::explicit::ExplicitFields;
+        use carina_core::provider::{InitializedProvider, RawSavedAttrs};
+        use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+        let schema = carina_core::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Rule",
+                        vec![
+                            StructField::optional(
+                                "reference",
+                                AttributeType::reference(
+                                    carina_provider_mock::references::identity(),
+                                    None,
+                                    None,
+                                ),
+                            )
+                            .build(),
+                            StructField::optional("provider_default", AttributeType::string())
+                                .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("mock", schema);
+        let mut provider = ProviderRouter::new();
+        provider.add_provider("mock".into(), InitializedProvider::unavailable(Box::new(
+            carina_provider_mock::MockProvider::new().with_reference_table(serde_json::from_value(serde_json::json!({
+                "alias/live": {"Ok": {"Resolved": "key/a"}}, "key/a": {"Ok": {"Resolved": "key/a"}},
+            })).unwrap()),
+        )));
+        let rules = |key: &str, default: bool| {
+            let mut fields = indexmap::IndexMap::from([(
+                "reference".into(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            )]);
+            if default {
+                fields.insert(
+                    "provider_default".into(),
+                    Value::Concrete(ConcreteValue::String("generated".into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(fields),
+            )]))
+        };
+        let resource = resolved(
+            Resource::with_provider("mock", "keys.Resource", "example", None)
+                .with_attribute("rules", rules("alias/live", false)),
+        );
+        let id = resource.id.clone();
+        let previous =
+            State::existing(id.clone(), resource.resolved_attributes()).with_identifier("id-123");
+        let comparison = provider.comparison_for(&schemas, &id).unwrap();
+        let row = ResourceState::from_provider_state_for_resource_and_schema(
+            &resource,
+            &previous,
+            None,
+            Some(comparison.owner_schema().schema().as_schema()),
+            RowBasis::Imported,
+            None,
+            &comparison.context().observation(),
+        )
+        .unwrap();
+        let prior_explicit = row.explicit.clone();
+        let mut state = StateFile::new();
+        state.upsert_resource(row).unwrap();
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([("rules".into(), rules("key/a", true))]),
+        )
+        .with_identifier("id-123");
+        let current = HashMap::from([(id.clone(), Current::from_state(fresh.clone()))]);
+        let plan_current = carina_core::resource::into_plan_input_current_map(
+            current.clone(),
+            &schemas,
+            &[resource.as_resource().clone()],
+        );
+        let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+            id.clone(),
+            previous.attributes,
+        )]))
+        .lift(&schemas);
+        let references = carina_core::references::ReferencePreparation::default()
+            .prepare(
+                std::slice::from_ref(&resource),
+                &plan_current,
+                &schemas,
+                &saved,
+                &provider,
+            )
+            .await
+            .unwrap();
+        let inputs =
+            ApplyStateSaveInputs::new(vec![resource], Plan::new(), schemas, None, &provider)
+                .unwrap()
+                .with_reference_evidence(Some(references));
+        let mut result = ExecutionResult::empty();
+        result.managed_current = current;
+        let state = inputs.build_state(state, &result).unwrap();
+        let row = state
+            .find_resource("mock", "keys.Resource", "example")
+            .unwrap();
+        assert_eq!(row.explicit, prior_explicit);
+        assert!(matches!(&row.explicit, ExplicitFields::Struct { .. }));
+        assert_eq!(
+            row.persisted_attributes().unwrap().to_values(),
+            fresh.attributes,
+            "canonical identities must not replace provider observation bytes"
+        );
     }
 
     #[test]

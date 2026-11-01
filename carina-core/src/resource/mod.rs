@@ -33,7 +33,7 @@ use subtle::ConstantTimeEq;
 
 use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
-use crate::differ::ComparisonContext;
+use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::effect::MoveAuthority;
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
@@ -58,6 +58,7 @@ pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
 pub(crate) use enum_value::{enum_value_comparison_key, enum_values_equal};
+pub(crate) use ignore_changes::MaskedComparisonAttributes;
 pub(crate) use ignore_changes::value_at_leaf;
 pub use ignore_changes::{
     IgnoreChangeError, ParsedIgnorePath, ParsedIgnorePathSegment, ResolvedIgnoreChanges,
@@ -7374,15 +7375,70 @@ impl<'a> SavedValueViews<'a> {
     pub(crate) fn same(value: &'a Value) -> Self {
         Self::new(value, value)
     }
+
+    pub(crate) fn projected(self) -> &'a Value {
+        self.projected
+    }
 }
 
-pub(crate) fn merge_with_saved(
+/// Borrow either concrete list representation at the comparison seam.
+/// Conversion is local to comparison and never rewrites a payload or state.
+/// Pair identical concrete items before probing other unordered candidates.
+/// Preparation and comparison share this pairing so a reordered echoed
+/// reference never requires resolution merely because another item came first.
+pub(crate) fn match_equal_concrete_items<A: Borrow<Value>, B: Borrow<Value>>(
+    a: &[A],
+    b: &[B],
+) -> (Vec<Option<usize>>, Vec<bool>) {
+    let mut matched_a = vec![None; a.len()];
+    let mut matched_b = vec![false; b.len()];
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (j, candidate) in b.iter().enumerate() {
+        buckets
+            .entry(candidate.borrow().canonical_hash())
+            .or_default()
+            .push(j);
+    }
+    for (i, item) in a.iter().enumerate() {
+        let item = item.borrow();
+        if !matches!(item, Value::Concrete(_)) || !item.is_fully_resolved() {
+            continue;
+        }
+        if let Some(j) = buckets.get(&item.canonical_hash()).and_then(|bucket| {
+            bucket
+                .iter()
+                .copied()
+                .find(|&j| !matched_b[j] && item == b[j].borrow())
+        }) {
+            matched_a[i] = Some(j);
+            matched_b[j] = true;
+        }
+    }
+    (matched_a, matched_b)
+}
+
+pub(crate) fn comparison_list_items(value: &Value) -> Option<std::borrow::Cow<'_, [Value]>> {
+    match value {
+        Value::Concrete(ConcreteValue::List(items)) => Some(std::borrow::Cow::Borrowed(items)),
+        Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(
+            items
+                .iter()
+                .cloned()
+                .map(ConcreteValue::String)
+                .map(Value::Concrete)
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn merge_with_saved<R: ReferenceEquality>(
     desired: &Value,
     saved: SavedValueViews<'_>,
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Value {
     match (desired, saved.projected) {
         (
@@ -7425,14 +7481,14 @@ pub(crate) fn merge_with_saved(
     }
 }
 
-fn merge_maps(
+fn merge_maps<R: ReferenceEquality>(
     desired: &IndexMap<String, Value>,
     projected_saved: &IndexMap<String, Value>,
     raw_saved: &IndexMap<String, Value>,
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Value {
     let prior_children = match prior_explicit {
         ExplicitFields::Struct { children } => Some(children),
@@ -7452,6 +7508,12 @@ fn merge_maps(
             desired.contains_key(key) || !was_authored
         });
     }
+    for key in merged.keys() {
+        if !desired.contains_key(key) {
+            let paths = context.entry_paths(key, attr_type, defs);
+            context.at_paths(&paths).copied_saved();
+        }
+    }
     for (key, desired_value) in desired {
         let merged_value = match projected_saved.get(key) {
             Some(projected_saved_value) => {
@@ -7469,7 +7531,7 @@ fn merge_maps(
                         .unwrap_or(&ExplicitFields::Unrecorded),
                     map_entry_subtype(attr_type, key, defs),
                     defs,
-                    context,
+                    &context.at_paths(&context.entry_paths(key, attr_type, defs)),
                 )
             }
             None => desired_value.clone(),
@@ -7493,19 +7555,55 @@ fn merge_maps(
 /// (or equal scalar), then run the exact same global best-first commit phase.
 /// Hash collisions only add a candidate: [`similarity_score`] remains the
 /// authority before a candidate can be committed.
-pub(crate) fn pair_list_elements<D, S>(
+pub(crate) fn pair_list_elements<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<Option<usize>>
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
-    commit_list_element_pairs(desired.len(), saved.len(), &candidates)
+    if !has_reference_leaves(attr_type, defs) {
+        let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
+        return commit_list_element_pairs(desired.len(), saved.len(), &candidates);
+    }
+    let (mut pairs, matched_saved) = match_equal_concrete_items(desired, saved);
+    let desired_indices = pairs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pair)| pair.is_none().then_some(i))
+        .collect::<Vec<_>>();
+    let saved_indices = matched_saved
+        .iter()
+        .enumerate()
+        .filter_map(|(i, matched)| (!matched).then_some(i))
+        .collect::<Vec<_>>();
+    let remaining_desired = desired_indices
+        .iter()
+        .map(|&i| desired[i].borrow())
+        .collect::<Vec<_>>();
+    let remaining_saved = saved_indices
+        .iter()
+        .map(|&i| saved[i].borrow())
+        .collect::<Vec<_>>();
+    let candidates = list_pair_candidates(
+        &remaining_desired,
+        &remaining_saved,
+        attr_type,
+        defs,
+        &context.with_indices(&context.remap_indices(&desired_indices, &saved_indices)),
+    );
+    for (i, pair) in
+        commit_list_element_pairs(remaining_desired.len(), remaining_saved.len(), &candidates)
+            .into_iter()
+            .enumerate()
+    {
+        pairs[desired_indices[i]] = pair.map(|index| saved_indices[index]);
+    }
+    pairs
 }
 
 /// A stable list-element pairing together with the evidence for that pairing.
@@ -7528,28 +7626,124 @@ pub(crate) enum ListElementPairing {
 /// A match is unique only when the selected saved element is the sole
 /// positive, highest-scoring candidate for that desired element. Global
 /// contention that forces a lower-scoring choice is therefore ambiguous too.
-pub(crate) fn pair_list_elements_with_uniqueness<D, S>(
+pub(crate) fn pair_list_elements_with_uniqueness<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<ListElementPairing>
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
-    let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
-    classify_list_element_pairs(&pairs, saved.len(), &candidates)
+    if !has_reference_leaves(attr_type, defs) {
+        let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
+        let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
+        return classify_list_element_pairs(&pairs, saved.len(), &candidates);
+    }
+    let (exact, matched_saved) = match_equal_concrete_items(desired, saved);
+    let desired_indices = exact
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pair)| pair.is_none().then_some(i))
+        .collect::<Vec<_>>();
+    let saved_indices = matched_saved
+        .iter()
+        .enumerate()
+        .filter_map(|(i, matched)| (!matched).then_some(i))
+        .collect::<Vec<_>>();
+    let remaining_desired = desired_indices
+        .iter()
+        .map(|&i| desired[i].borrow())
+        .collect::<Vec<_>>();
+    let remaining_saved = saved_indices
+        .iter()
+        .map(|&i| saved[i].borrow())
+        .collect::<Vec<_>>();
+    let candidates = list_pair_candidates(
+        &remaining_desired,
+        &remaining_saved,
+        attr_type,
+        defs,
+        &context.with_indices(&context.remap_indices(&desired_indices, &saved_indices)),
+    );
+    let pairs =
+        commit_list_element_pairs(remaining_desired.len(), remaining_saved.len(), &candidates);
+    let mut classified = vec![ListElementPairing::Unmatched; desired.len()];
+    for (i, pairing) in classify_list_element_pairs(&pairs, remaining_saved.len(), &candidates)
+        .into_iter()
+        .enumerate()
+    {
+        classified[desired_indices[i]] = match pairing {
+            ListElementPairing::Unique(index) => ListElementPairing::Unique(saved_indices[index]),
+            other => other,
+        };
+    }
+    for (i, value) in desired.iter().enumerate() {
+        if let Some(index) = exact[i] {
+            // Equal duplicates establish a stable merge pair, but cannot
+            // establish a unique authoring correspondence.
+            classified[i] = if desired
+                .iter()
+                .filter(|item| (*item).borrow() == value.borrow())
+                .count()
+                == 1
+                && saved
+                    .iter()
+                    .filter(|item| (*item).borrow() == value.borrow())
+                    .count()
+                    == 1
+            {
+                ListElementPairing::Unique(index)
+            } else {
+                ListElementPairing::Ambiguous
+            };
+        } else if saved.iter().any(|item| item.borrow() == value.borrow()) {
+            classified[i] = ListElementPairing::Ambiguous;
+        }
+    }
+    classified
 }
 
-fn list_pair_candidates<D, S>(
+/// Reference-bearing list elements need D4 pre-pairing before similarity
+/// probes. Keep ordinary list attribution and its score ordering unchanged.
+fn has_reference_leaves(
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> bool {
+    let mut pending = attr_type.into_iter().collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some(ty) = pending.pop() {
+        if !seen.insert(ty as *const AttributeType) {
+            continue;
+        }
+        match ty.shape_with_defs(defs) {
+            Shape::Reference { .. } => return true,
+            Shape::Struct { .. } => {
+                if let Some(fields) = crate::schema::struct_fields_with_defs(ty, defs) {
+                    pending.extend(fields.iter().map(|field| &field.field_type));
+                }
+            }
+            Shape::List { element_type, .. } => pending.push(element_type),
+            Shape::Map { value, .. } => pending.push(value),
+            Shape::Union => {
+                if let Some(members) = crate::schema::union_members_with_defs(ty, defs) {
+                    pending.extend(members.iter().flatten().map(|member| member.as_attr()));
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn list_pair_candidates<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -7736,12 +7930,12 @@ struct PairCandidates {
     implicit_scores: Vec<usize>,
 }
 
-fn pair_candidates_quadratic<D, S>(
+fn pair_candidates_quadratic<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -7757,7 +7951,7 @@ where
                 saved_value.borrow(),
                 attr_type,
                 defs,
-                context,
+                &context.at_paths(&context.index_paths(desired_index, saved_index)),
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -7788,12 +7982,12 @@ where
 /// but non-universal bucket can still make the worst case quadratic; the
 /// universal-field compression covers the common policy-statement shape while
 /// preserving exactly the same pairing decisions.
-fn pair_candidates_hashed<D, S>(
+fn pair_candidates_hashed<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -7834,6 +8028,12 @@ where
     let mut universal_map_fields: HashMap<&str, HashMap<u64, &Value>> = HashMap::new();
     for (key, value_buckets) in &map_field_buckets {
         let field_type = map_entry_subtype(attr_type, key, defs);
+        // Universal-bucket compression must not invent current/current
+        // reference comparisons. Only unmatched cross-side operands are
+        // prepared, and a field absent from desired needs no identity lookup.
+        if has_reference_leaves(field_type, defs) {
+            continue;
+        }
         let Some(representative) = saved.first().and_then(|saved_value| {
             let Value::Concrete(ConcreteValue::Map(map)) = saved_value.borrow() else {
                 return None;
@@ -7845,12 +8045,22 @@ where
         for (value_hash, bucket) in value_buckets {
             if bucket.len() != saved.len()
                 || !bucket.iter().copied().eq(0..saved.len())
-                || !saved.iter().all(|saved_value| {
+                || !saved.iter().enumerate().all(|(index, saved_value)| {
                     let Value::Concrete(ConcreteValue::Map(map)) = saved_value.borrow() else {
                         return false;
                     };
                     map.get(*key).is_some_and(|value| {
-                        schema_aware_equal(representative, value, field_type, defs, context)
+                        schema_aware_equal(
+                            representative,
+                            value,
+                            field_type,
+                            defs,
+                            &context.at_path(
+                                &context
+                                    .at_path(&context.index_path(index))
+                                    .entry_path(key, attr_type, defs),
+                            ),
+                        )
                     })
                 })
             {
@@ -7864,17 +8074,19 @@ where
     }
 
     let mut universal_values = HashMap::new();
-    if let Some(representative) = saved.first().map(Borrow::borrow) {
+    if !has_reference_leaves(attr_type, defs)
+        && let Some(representative) = saved.first().map(Borrow::borrow)
+    {
         for (value_hash, bucket) in &value_buckets {
             if bucket.len() == saved.len()
                 && bucket.iter().copied().eq(0..saved.len())
-                && saved.iter().all(|saved_value| {
+                && saved.iter().enumerate().all(|(index, saved_value)| {
                     schema_aware_equal(
                         representative,
                         saved_value.borrow(),
                         attr_type,
                         defs,
-                        context,
+                        &context.at_path(&context.index_path(index)),
                     )
                 })
             {
@@ -7908,7 +8120,9 @@ where
                                                 representative,
                                                 field_type,
                                                 defs,
-                                                context,
+                                                &context.at_path(
+                                                    &context.entry_path(key, attr_type, defs),
+                                                ),
                                             )
                                         },
                                     )
@@ -7956,7 +8170,7 @@ where
                 saved[saved_index].borrow(),
                 attr_type,
                 defs,
-                context,
+                &context.at_paths(&context.index_paths(desired_index, saved_index)),
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -7972,11 +8186,11 @@ where
     }
 }
 
-fn pairing_hashes(
+fn pairing_hashes<R: ReferenceEquality>(
     value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<u64> {
     let mut hashes = vec![value.canonical_hash()];
     match value {
@@ -8012,11 +8226,11 @@ fn secret_state_pairing_hash() -> u64 {
     pairing_component_hash(0x08, &RedactedSecretHash::V2_MARKER_PREFIX)
 }
 
-fn append_schema_pairing_hashes(
+fn append_schema_pairing_hashes<R: ReferenceEquality>(
     value: &Value,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
     hashes: &mut Vec<u64>,
     depth: usize,
 ) {
@@ -8025,6 +8239,10 @@ fn append_schema_pairing_hashes(
         return;
     }
     match attr_type.shape_with_defs(defs) {
+        Shape::Reference { .. } => {
+            // Resolved equality must also be considered by multiset pairing.
+            hashes.push(pairing_component_hash(0x09, &0_u8));
+        }
         Shape::String {
             identity, to_dsl, ..
         } => {
@@ -8133,14 +8351,14 @@ fn pairing_component_hash<T: Hash>(tag: u8, value: &T) -> u64 {
 
 /// Merge two lists using projected saved values for value pairing and raw saved values to
 /// corroborate stored-index authoring attribution.
-fn merge_lists(
+fn merge_lists<R: ReferenceEquality>(
     desired: &[Value],
     projected_saved: &[Value],
     raw_saved: &[Value],
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<Value> {
     // `WholeValue` is the explicit whole-value fallback used when a carried row
     // cannot transfer a pending nested removal to a uniquely identified list
@@ -8160,7 +8378,10 @@ fn merge_lists(
 
     let item_type = list_element_type(attr_type, defs);
     let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs, context);
-    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, context);
+    let raw_paths = context.raw_saved_paths();
+    let raw_context = context.raw_saved_pair();
+    let raw_context = raw_context.at_paths(&raw_paths);
+    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, &raw_context);
     let projected_origins = if projected_saved.len() == raw_saved.len() {
         // Projection preserves order when it retains every stored element.
         // Keeping the direct index mapping also preserves the established
@@ -8169,7 +8390,15 @@ fn merge_lists(
             .map(ListElementPairing::Unique)
             .collect()
     } else {
-        pair_list_elements_with_uniqueness(projected_saved, raw_saved, item_type, defs, context)
+        let saved_paths = [context.right_path().into(), raw_paths[1].clone()];
+        let saved_context = context.saved_pair();
+        pair_list_elements_with_uniqueness(
+            projected_saved,
+            raw_saved,
+            item_type,
+            defs,
+            &saved_context.at_paths(&saved_paths),
+        )
     };
 
     projected_pairs
@@ -8210,7 +8439,7 @@ fn merge_lists(
                         authoring,
                         item_type,
                         defs,
-                        context,
+                        &context.at_paths(&context.index_paths(desired_index, projected_index)),
                     )
                 }
                 None => desired[desired_index].clone(),
@@ -8223,12 +8452,12 @@ fn merge_lists(
 /// For Maps: count matching key-value pairs.
 /// For equal scalars: return 1.
 /// Otherwise: return 0.
-fn similarity_score(
+fn similarity_score<R: ReferenceEquality>(
     a: &Value,
     b: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> usize {
     match (a, b) {
         (Value::Concrete(ConcreteValue::Map(am)), Value::Concrete(ConcreteValue::Map(bm))) => am
@@ -8241,7 +8470,7 @@ fn similarity_score(
                             bv,
                             map_entry_subtype(attr_type, k, defs),
                             defs,
-                            context,
+                            &context.at_paths(&context.entry_paths(k, attr_type, defs)),
                         )
                     })
                     .unwrap_or(false)
@@ -11076,6 +11305,22 @@ impl UnschematizedComparisonAttributes {
 }
 
 impl CanonicalComparisonAttributes {
+    /// Secret-grafted apply views retain the authored hash material even when
+    /// provider normalization changed a secret's structural representation.
+    pub(crate) fn canonicalize_preserving_secret_shapes(
+        mut attributes: HashMap<String, Value>,
+        schema: &crate::schema::CompiledResourceSchema,
+    ) -> Self {
+        let secrets = attributes
+            .iter()
+            .filter(|(_, value)| crate::value::contains_secret(value))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        crate::value::canonicalize_state_attribute_map_with_schema(&mut attributes, schema);
+        attributes.extend(secrets);
+        Self { attributes }
+    }
+
     /// Build the state-style canonical comparison view for one resource.
     pub fn canonicalize(
         mut attributes: HashMap<String, Value>,
@@ -11110,20 +11355,6 @@ impl CanonicalComparisonAttributes {
     pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
         self.attributes.get_mut(key)
     }
-
-    pub(crate) fn with_missing_values_from(
-        &self,
-        fallback: &Self,
-        mut include: impl FnMut(&str, &Value) -> bool,
-    ) -> Self {
-        let mut combined = self.clone();
-        for (key, value) in fallback {
-            if !combined.contains_key(key) && include(key, value) {
-                combined.attributes.insert(key.clone(), value.clone());
-            }
-        }
-        combined
-    }
 }
 
 impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
@@ -11145,6 +11376,21 @@ impl IntoIterator for CanonicalComparisonAttributes {
 }
 
 impl<'a> PlanInputDesired<'a> {
+    /// All planning callers use this sole ignore-mask constructor.
+    pub(crate) fn masked_comparison(
+        &self,
+        current: &CanonicalComparisonAttributes,
+        saved: Option<&CanonicalComparisonAttributes>,
+        schema: Option<&crate::schema::CompiledResourceSchema>,
+    ) -> MaskedComparisonAttributes {
+        self.authored.ignore_changes().mask_comparison_attributes(
+            &self.comparison_attributes,
+            current,
+            saved,
+            schema,
+        )
+    }
+
     pub fn authored(&self) -> &'a ResolvedResource {
         self.authored
     }

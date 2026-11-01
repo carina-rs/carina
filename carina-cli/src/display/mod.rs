@@ -6,8 +6,8 @@ use colored::{ColoredString, Colorize};
 
 use carina_core::detail_rows::{
     DetailRow, HistoricalDisplayAttributes, ListOfMapsDiffField, ListOfMapsDiffItem,
-    ListOfMapsDiffItemKind, ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows_by_instance,
-    build_replace_detail_rows_from_display, hidden_unchanged_summary,
+    ListOfMapsDiffItemKind, ListOfMapsDiffModified, MapDiffEntryIR, PlanDisplay,
+    PreparedPlanDisplay, hidden_unchanged_summary,
 };
 #[cfg(test)]
 use carina_core::effect::DeletedInstanceKey;
@@ -327,6 +327,7 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> ProviderResult<()> {
     print!(
         "{}",
@@ -340,9 +341,99 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
             prev_explicit,
             expansion_trace,
             provider,
+            comparisons,
         )?
     );
     Ok(())
+}
+
+/// Render a successful planning outcome according to its typed row request.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn print_planned_plan(
+    planned: &crate::wiring::PlannedPlan,
+    summary: &PlanChangeSummary,
+    schemas: Option<&SchemaRegistry>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
+    prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
+    provider: &ProviderRouter,
+) -> ProviderResult<()> {
+    match planned {
+        crate::wiring::PlannedPlan::Rendered { display, .. } => print_prepared_plan(
+            display,
+            summary,
+            schemas,
+            moved_origins,
+            prev_explicit,
+            expansion_trace,
+            provider,
+        ),
+        crate::wiring::PlannedPlan::Unrendered { plan, .. } => print_plan(
+            plan,
+            summary,
+            DetailLevel::None,
+            &HistoricalDisplayAttributes::for_plan(plan),
+            schemas,
+            moved_origins,
+            prev_explicit,
+            expansion_trace,
+            provider,
+            carina_core::detail_rows::DetailComparisons::RecordedEffects,
+        ),
+    }
+}
+
+/// Print the exact plan that owns these prepared detail rows.
+#[allow(clippy::too_many_arguments)]
+pub fn print_prepared_plan(
+    display: &PreparedPlanDisplay,
+    summary: &PlanChangeSummary,
+    schemas: Option<&SchemaRegistry>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
+    prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
+    provider: &ProviderRouter,
+) -> ProviderResult<()> {
+    print!(
+        "{}",
+        format_prepared_plan(
+            display,
+            summary,
+            schemas,
+            moved_origins,
+            prev_explicit,
+            expansion_trace,
+            provider
+        )?
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn format_prepared_plan(
+    display: &PreparedPlanDisplay,
+    summary: &PlanChangeSummary,
+    schemas: Option<&SchemaRegistry>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
+    prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
+    provider: &ProviderRouter,
+) -> ProviderResult<String> {
+    let detail = match display.detail() {
+        carina_core::detail_rows::DetailLevel::Full => DetailLevel::Full,
+        carina_core::detail_rows::DetailLevel::Explicit => DetailLevel::Explicit,
+        carina_core::detail_rows::DetailLevel::NamesOnly => DetailLevel::None,
+    };
+    format_plan_display(
+        display.view(),
+        summary,
+        detail,
+        schemas,
+        moved_origins,
+        prev_explicit,
+        expansion_trace,
+        provider,
+    )
 }
 
 /// Format a plan as a string for display.
@@ -360,6 +451,31 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
     summary: &PlanChangeSummary,
     detail: DetailLevel,
     historical_display: &D,
+    schemas: Option<&SchemaRegistry>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
+    prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
+    provider: &ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
+) -> ProviderResult<String> {
+    let historical = historical_display.historical_display(plan);
+    format_plan_display(
+        PlanDisplay::unprepared(plan, &historical, comparisons),
+        summary,
+        detail,
+        schemas,
+        moved_origins,
+        prev_explicit,
+        expansion_trace,
+        provider,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_plan_display<S>(
+    display: PlanDisplay<'_, S>,
+    summary: &PlanChangeSummary,
+    detail: DetailLevel,
     schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
@@ -383,11 +499,9 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
         writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
         writeln!(out).unwrap();
 
-        let historical_display = historical_display.historical_display(plan);
         out.push_str(&format_plan_tree(
-            plan,
+            display,
             detail,
-            &historical_display,
             schemas,
             moved_origins,
             prev_explicit,
@@ -567,9 +681,12 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
 
     let historical_display = historical_display.historical_display(plan);
     out.push_str(&format_plan_tree(
-        plan,
+        PlanDisplay::unprepared(
+            plan,
+            &historical_display,
+            carina_core::detail_rows::DetailComparisons::RecordedEffects,
+        ),
         detail,
-        &historical_display,
         None,
         &HashMap::new(),
         None,
@@ -587,12 +704,11 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
 struct TreeRenderContext<'a, S> {
     out: String,
     printed: HashSet<usize>,
-    plan: &'a Plan<S>,
+    display: PlanDisplay<'a, S>,
     dependents: HashMap<usize, Vec<usize>>,
     replacement_create_info: HashMap<usize, ReplaceDisplayInfo<'a>>,
     replacement_delete_indices: HashSet<usize>,
     detail: DetailLevel,
-    historical_display: &'a HistoricalDisplayAttributes,
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     /// Per-resource user-authoring trees, used by `build_detail_rows`
@@ -623,7 +739,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
         }
         self.printed.insert(idx);
 
-        let effect = &self.plan.effects()[idx];
+        let effect = &self.display.plan().effects()[idx];
         let replacement_info = self.replacement_create_info.get(&idx).copied();
         let sigil = replacement_info
             .map(|metadata| Sigil::replacement(metadata.create_before_destroy))
@@ -852,7 +968,8 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 )
                 .unwrap();
                 let abandoned: Vec<_> = self
-                    .plan
+                    .display
+                    .plan()
                     .abandoned_deposed_generations()
                     .filter(|(abandoned_id, _)| *abandoned_id == id)
                     .collect();
@@ -924,7 +1041,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             }
             Effect::DeferredCreate(payload) => {
                 let template = &payload.template;
-                let verb = deferred_for_verb(self.plan, template);
+                let verb = deferred_for_verb(self.display.plan(), template);
                 let display_name = deferred_for_display_name(template, verb);
                 let display_name = display_name.green().bold();
                 writeln!(
@@ -953,7 +1070,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             }
             Effect::DeferredReplace(payload) => {
                 let template = payload.template.as_ref();
-                let verb = deferred_for_verb(self.plan, template);
+                let verb = deferred_for_verb(self.display.plan(), template);
                 let display_name = deferred_for_display_name(template, verb).magenta().bold();
                 writeln!(
                     self.out,
@@ -982,7 +1099,8 @@ impl<'a, S> TreeRenderContext<'a, S> {
         }
 
         if let Some(summary) = self
-            .plan
+            .display
+            .plan()
             .ignored_change_summaries()
             .iter()
             .find(|summary| summary.resource_id() == effect.resource_id())
@@ -1020,35 +1138,19 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
             };
 
-            let detail_rows =
-                if let (Effect::Create(r), Some(replacement)) = (effect, replacement_info) {
-                    let explicit = self.prev_explicit.and_then(|map| map.get(&r.id));
-                    build_replace_detail_rows_from_display(
-                        self.plan,
-                        r,
-                        replacement,
-                        self.historical_display,
-                        self.schemas,
-                        self.detail.to_core(),
-                        explicit,
-                        self.provider,
-                    )?
-                } else {
-                    build_detail_rows_by_instance(
-                        effect,
-                        self.schemas,
-                        self.detail.to_core(),
-                        self.historical_display,
-                        self.prev_explicit,
-                        self.provider,
-                    )?
-                };
+            let detail_rows = self.display.detail_rows(
+                idx,
+                self.detail.to_core(),
+                self.schemas,
+                self.prev_explicit,
+                self.provider,
+            )?;
 
             if !detail_rows.is_empty() {
                 has_displayed_attrs = true;
             }
 
-            for row in &detail_rows {
+            for row in detail_rows.iter() {
                 render_detail_row(&mut self.out, row, effect, &attr_prefix);
             }
         }
@@ -1103,7 +1205,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
     }
 
     fn child_render_items(&self, child_indices: &[usize]) -> Vec<ChildRenderItem> {
-        child_render_items(self.plan.effects(), child_indices)
+        child_render_items(self.display.plan().effects(), child_indices)
     }
 
     fn will_render(&self, item: &ChildRenderItem) -> bool {
@@ -1120,7 +1222,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             return false;
         }
 
-        let Some(effect) = self.plan.effects().get(idx) else {
+        let Some(effect) = self.display.plan().effects().get(idx) else {
             return false;
         };
 
@@ -1150,7 +1252,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 if !self.will_render_effect_tree(*idx)
                     && !self.printed.contains(idx)
                     && matches!(
-                        self.plan.effects().get(*idx),
+                        self.display.plan().effects().get(*idx),
                         Some(Effect::Move { to, .. })
                             if self.update_or_replace_targets.contains(to)
                     )
@@ -1241,15 +1343,15 @@ fn child_prefix_for_parent(
 /// Replace, and Delete effects.
 #[allow(clippy::too_many_arguments)]
 fn format_plan_tree<'a, S>(
-    plan: &Plan<S>,
+    display: PlanDisplay<'a, S>,
     detail: DetailLevel,
-    historical_display: &'a HistoricalDisplayAttributes,
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &'a ProviderRouter,
 ) -> ProviderResult<String> {
+    let plan = display.plan();
     // Build dependency graph from effects
     let graph = build_dependency_graph(plan);
 
@@ -1289,12 +1391,11 @@ fn format_plan_tree<'a, S>(
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
-        plan,
+        display,
         dependents,
         replacement_create_info,
         replacement_delete_indices,
         detail,
-        historical_display,
         schemas,
         moved_origins,
         prev_explicit,

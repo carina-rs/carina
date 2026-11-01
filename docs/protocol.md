@@ -1,20 +1,21 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **18**.
+The current protocol and minimum supported provider protocol are both **19**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
-| 18 | 18 | Per-leaf desired normalization with scoped, exactly-once deferred handles. |
+| 19 | 19 | Per-leaf desired normalization with scoped, exactly-once deferred handles. |
+| 18 | 18 | Typed reference schema leaves and batched plan-time reference resolution. |
 | 17 | 17 | Required list element policy; portable canonical-value uniqueness validation. |
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
 
-## Version 18
+## Version 19
 
-Protocol v18 replaces top-level deferred-name metadata with structural desired
+Protocol v19 replaces top-level deferred-name metadata with structural desired
 value trees. `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both
-18; providers built for earlier protocols must be rebuilt.
+19; providers built for earlier protocols must be rebuilt.
 
 `normalize-desired` receives and returns `list<desired-resource>`. Each record
 has an `id` and `attributes: list<tuple<string, desired-value>>`. The separate
@@ -63,6 +64,21 @@ Missing, duplicate, unknown, foreign or malformed handles, duplicate keys,
 resource-id mismatches and resource-count mismatches produce typed
 errors with resource/attribute/path context. Conversion errors preserve their
 typed source chains; secret payloads are never included in diagnostics.
+
+## Version 18
+
+Protocol v18 adds string-valued reference schema leaves and the initialized
+provider's `resolve-references` export. Requests carry a structured type
+identity and raw string; positional outcomes are a resolved canonical string,
+NotFound, or a typed AccessDenied, Transient, or InvalidReference failure.
+Core rejects batch length mismatches and empty resolved values for every
+provider, native or WASM. Guests
+validate their canonical value shapes. Reference validation remains offline;
+resolution runs only when preparing a planning comparison.
+
+The v18 development snapshot set both protocol constants to 18 and rejected
+older providers before schema or WIT decoding. Providers had to use the
+SDK-owned bindings for the updated WIT world.
 
 ## Version 17
 
@@ -160,7 +176,7 @@ not a create-only change. Adding an element with an authored create-only leaf
 is a create-only change and therefore replaces the resource.
 
 The WIT world is unchanged in v16; the incompatible representation is in the
-schema JSON records. These requirements remain in protocol v18.
+schema JSON records. These requirements remain in protocol v19.
 
 ## Version 15
 
@@ -281,7 +297,7 @@ Protocol v13 makes initialized reference scope, provider-declared reference
 forms, and recoverable create failures explicit transport data.
 
 Version 13 introduced top-level deferred-name metadata for `normalize-desired`.
-Version 18 replaces that record shape with structural, exactly-once handles;
+Version 19 replaces that record shape with structural, exactly-once handles;
 the old deferred-name boundary is no longer accepted.
 
 `initialize` now returns an `initialize-result` containing a closed

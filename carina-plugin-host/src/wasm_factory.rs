@@ -2323,6 +2323,30 @@ pub(crate) mod version_checked_bindings {
             }
         }
 
+        pub(super) async fn call_resolve_references(
+            &self,
+            store: &mut Store<HostState>,
+            requests: &[wit_types::ReferenceRequest],
+        ) -> wasmtime::Result<
+            Result<
+                Vec<Result<wit_types::ReferenceOutcome, wit_types::ReferenceError>>,
+                wit_types::ProviderError,
+            >,
+        > {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_resolve_references(store, requests)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_resolve_references(store, requests)
+                        .await
+                }
+            }
+        }
+
         pub(super) async fn call_validate_custom_type(
             &self,
             store: &mut Store<HostState>,
@@ -6853,6 +6877,42 @@ impl Provider for WasmProvider {
         &self.name
     }
 
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [carina_core::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<
+                Result<
+                    carina_core::references::ReferenceOutcome,
+                    carina_core::references::ReferenceError,
+                >,
+            >,
+        >,
+    > {
+        let encoded: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let carina_core::references::ReferenceRequest { ty, value } = request;
+                version_checked_bindings::wit_types::ReferenceRequest {
+                    ty: wasm_convert::core_type_identity_to_wit(ty),
+                    value: value.clone(),
+                }
+            })
+            .collect();
+        Box::pin(async move {
+            let locked = self.instance.acquire("resolve_references").await?;
+            let result = locked
+                .call("resolve_references", async |bindings, store| {
+                    bindings.call_resolve_references(store, &encoded).await
+                })
+                .await?;
+            let results = result.map_err(wasm_convert::wit_to_core_provider_error)?;
+            Ok(wasm_convert::decode_reference_results(results))
+        })
+    }
+
     fn read(
         &self,
         id: &ResourceId,
@@ -7849,7 +7909,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v18_wit_surface_compiles() {
+    fn protocol_v19_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::ReferenceScopeValues>();

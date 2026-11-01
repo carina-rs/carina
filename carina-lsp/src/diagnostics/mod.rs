@@ -1761,6 +1761,14 @@ impl DiagnosticEngine {
                                 // scalars with the owner-bound lookup. Doing it here as well
                                 // would execute native or bridged callbacks twice per edit.
                                 (
+                                    carina_core::schema::Shape::Reference {
+                                        identity: _identity,
+                                        pattern: _,
+                                        length: _,
+                                    },
+                                    _value,
+                                )
+                                | (
                                     carina_core::schema::Shape::String {
                                         identity: Some(_identity),
                                         ..

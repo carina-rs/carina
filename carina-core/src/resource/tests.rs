@@ -2466,7 +2466,7 @@ fn reference_form_pairing_is_identical_on_both_sides_of_hash_threshold() {
     )]);
     let scope = ReferenceScope::available("aws", "us-east-1", "123456789012")
         .expect("fixture scope is valid");
-    let context = crate::differ::ComparisonContext::for_test(&scope, &forms);
+    let context = crate::differ::ObservationComparison::for_test(&scope, &forms);
 
     for len in [HASH_THRESHOLD - 1, HASH_THRESHOLD] {
         let desired = (0..len)

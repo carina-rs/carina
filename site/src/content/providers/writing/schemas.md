@@ -492,7 +492,7 @@ Carina then rejects deletion and replacement unless the user sets
 `prevent_destroy` to a value that resolves to `false`, for example
 `directives { prevent_destroy = false }`. Resource schemas are
 unprotected by default, so use this builder only where deletion has unusually
-severe consequences. The required boolean is transported in protocol-v18
+severe consequences. The required boolean is transported in protocol-v19
 schema JSON; an older provider that omits it fails during schema loading.
 
 A module argument default that resolves to `false` cannot disable this schema

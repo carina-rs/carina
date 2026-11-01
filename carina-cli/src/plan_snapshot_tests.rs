@@ -56,6 +56,9 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
         prev_explicit,
         expansion_trace,
         &provider,
+        carina_core::detail_rows::DetailComparisons::Planning(
+            &carina_core::references::prepare_empty_for_tests(),
+        ),
     )
     .expect("snapshot plan must have an initialized provider route")
 }
@@ -664,6 +667,7 @@ fn snapshot_state_only_directive_change() {
             Some(&fp.prev_explicit),
             Some(&fp.expansion_trace),
             &provider,
+            fp.references.for_display(),
         )
         .expect("state-only fixture plan must render"),
     );
@@ -3218,4 +3222,53 @@ fn snapshot_module_header_renders_use_source_path_for_real_fixture() {
         "internal `Composition` term must not surface to operators in:\n{}",
         output,
     );
+}
+
+#[test]
+fn round2_saved_plan_matches_existing_nested_and_tags_snapshots() {
+    for fixture in [
+        "nested_map_diff",
+        "map_key_diff",
+        "list_diff_modified_with_unchanged_nested",
+        "list_diff_paired_all_unchanged_dropped",
+        "nested_list_of_maps_all_dropped",
+    ] {
+        let fp = build_plan_from_fixture_name(fixture);
+        let wire = serde_json::to_vec(&carina_core::plan::SavedPlan::from(fp.plan)).unwrap();
+        let saved: carina_core::plan::UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
+        let plan = saved.resolve_with_schemas(&fp.schemas).unwrap();
+        let provider = provider_router_for_plan(&plan);
+        let summary = PlanChangeSummary::new(&plan, &[], &fp.deferred_for_expressions, &[]);
+        let output = format_plan_with_delete_instances(
+            &plan,
+            &summary,
+            DetailLevel::Full,
+            &carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+            Some(&fp.schemas),
+            &HashMap::new(),
+            None,
+            None,
+            &provider,
+            carina_core::detail_rows::DetailComparisons::RecordedEffects,
+        )
+        .unwrap();
+        let expected = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/snapshots")
+                .join(format!(
+                    "carina_cli__plan_snapshot_tests__snapshot_{fixture}.snap"
+                )),
+        )
+        .unwrap();
+        let expected = expected
+            .splitn(3, "---\n")
+            .nth(2)
+            .expect("snapshot body")
+            .trim_end();
+        assert_eq!(
+            strip_ansi(&output).trim_end(),
+            expected,
+            "saved-plan fixture {fixture}"
+        );
+    }
 }

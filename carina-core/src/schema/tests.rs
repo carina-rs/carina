@@ -3049,7 +3049,13 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v16() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v18"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "protocol v{}",
+            carina_provider_protocol::PROTOCOL_VERSION
+        )),
+        "{error}"
+    );
     assert!(error.contains("transform"), "{error}");
 }
 
@@ -3082,7 +3088,13 @@ fn config_schema_admission_enforces_scalar_and_v16_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v18"), "{rendered}");
+    assert!(
+        rendered.contains(&format!(
+            "protocol v{}",
+            carina_provider_protocol::PROTOCOL_VERSION
+        )),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -7436,7 +7448,7 @@ fn resolved_attr_type_never_returns_ref_after_peel() {
     );
     assert!(matches!(
         resolved.as_attr().kind(),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. }
     ));
 
     // Non-Ref input is returned as-is (identity behavior).
@@ -7518,7 +7530,7 @@ fn union_members_ref_free_skips_ref_member_and_keeps_sibling() {
             .expect("String sibling must remain visible")
             .as_attr()
             .kind(),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. }
     ));
 }
 
@@ -7535,7 +7547,7 @@ fn ref_hop_limit_counts_only_the_current_resolution_chain() {
         .expect("an accumulated path must not consume the current chain's hop budget");
     assert!(matches!(
         resolution.attr.kind(),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. }
     ));
     assert_eq!(visited_refs.len(), MAX_REF_PATH_HOPS + 1);
 }
@@ -8566,7 +8578,8 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
             .as_raw_slice()
             .iter()
             .any(contains_unrefined_primitive),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -14747,7 +14760,7 @@ fn select_union_member_retains_only_the_chosen_member_ref_chain() {
         .expect("String value must select Chosen");
     assert!(matches!(
         selected.as_attr().kind(),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. }
     ));
     assert_eq!(visited_refs, vec!["Caller", "Chosen"]);
 }

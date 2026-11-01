@@ -188,7 +188,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource)
 }
 
-/// Render one error chain for protocol-v18 metadata's string-only failure
+/// Render one error chain for protocol-v19 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -216,15 +216,15 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-18 WIT resource records.
+/// Return the honest directive default for protocol-19 WIT resource records.
 ///
-/// Protocol 18 does not transport directives on create, poll-create,
+/// Protocol 19 does not transport directives on create, poll-create,
 /// resume-create, or read-data-source requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
 /// Desired normalization uses a separate record without directive fields.
 /// Delete-request directives are transported separately after host resolution.
 #[doc(hidden)]
-pub fn protocol_18_default_resource_directives() -> proto::Directives {
+pub fn protocol_19_default_resource_directives() -> proto::Directives {
     proto::Directives::default()
 }
 
@@ -803,7 +803,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v18 metadata exports return a bare string rather
+                // Protocol v19 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure
@@ -2273,7 +2273,7 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let directives = helpers::protocol_18_default_resource_directives();
+                    let directives = helpers::protocol_19_default_resource_directives();
                     let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
                     })?;
@@ -2291,7 +2291,7 @@ macro_rules! export_provider {
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let directives = helpers::protocol_18_default_resource_directives();
+                    let directives = helpers::protocol_19_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2323,7 +2323,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_18_default_resource_directives();
+                    let directives = helpers::protocol_19_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2371,7 +2371,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_18_default_resource_directives();
+                    let directives = helpers::protocol_19_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2580,6 +2580,26 @@ macro_rules! export_provider {
                         &value,
                     )
                     .map_err(validate_string_to_provider_error)
+                }
+
+                fn resolve_references(
+                    requests: Vec<wit_types::ReferenceRequest>,
+                ) -> Result<Vec<Result<wit_types::ReferenceOutcome, wit_types::ReferenceError>>, wit_types::ProviderError> {
+                    let requests = requests.into_iter().map(|request| {
+                        let wit_types::ReferenceRequest { ty, value } = request;
+                        proto::ReferenceRequest { ty: wit_to_proto_type_identity(&ty), value }
+                    }).collect();
+                    let results = {
+                        let provider = get_provider().lock().unwrap();
+                        $crate::CarinaProvider::resolve_references(&*provider, requests)
+                    }.map_err(proto_to_wit_provider_error)?;
+                    Ok(results.into_iter().map(|result| match result {
+                        Ok(proto::ReferenceOutcome::Resolved(value)) => Ok(wit_types::ReferenceOutcome::Resolved(value)),
+                        Ok(proto::ReferenceOutcome::NotFound(error)) => Ok(wit_types::ReferenceOutcome::NotFound(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::AccessDenied(error)) => Err(wit_types::ReferenceError::AccessDenied(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::Transient(error)) => Err(wit_types::ReferenceError::Transient(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::InvalidReference(error)) => Err(wit_types::ReferenceError::InvalidReference(proto_to_wit_provider_error(*error))),
+                    }).collect())
                 }
 
                 fn normalize_desired(
@@ -2805,7 +2825,7 @@ mod tests {
 
     #[test]
     fn wit_resource_protocol_directives_are_all_false_without_transport() {
-        let directives = protocol_18_default_resource_directives();
+        let directives = protocol_19_default_resource_directives();
 
         assert!(!directives.force_delete);
         assert!(!directives.create_before_destroy);

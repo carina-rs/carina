@@ -4709,7 +4709,7 @@ fn is_string_compatible_type_on_path<'a>(
         .shape_ref_free()
         .expect("resolve_refs_with_defs_on_path must peel every top-level Ref")
     {
-        Shape::String { .. } | Shape::Enum { .. } => true,
+        Shape::Reference { .. } | Shape::String { .. } | Shape::Enum { .. } => true,
         Shape::Union => {
             let members = crate::schema::union_members_with_defs(resolved_attr, defs)
                 .expect("Shape::Union must expose union members internally");
