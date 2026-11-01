@@ -1753,7 +1753,7 @@ mod tests {
         analysis.into_deps_of().remove(&1).unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_marked_unsatisfiable_when_only_waits_in_flight() {
         let provider = TerminalWaitProvider::new();
 
@@ -1853,7 +1853,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_marked_unsatisfiable_when_failing_sibling_blocks_consumer_inside_wait_subtree() {
         let provider = TerminalWaitProvider::new();
 

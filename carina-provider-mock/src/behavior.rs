@@ -132,8 +132,10 @@ pub struct MockBehavior {
     pub delete_fail_identifier: Option<String>,
     pub delete_timeout_for: Option<ResourceSelector>,
     pub create_delay: Option<SelectedDelay>,
+    pub create_release: Option<PathBuf>,
     pub read_delay: Option<SelectedDelay>,
     pub delete_delay: Option<SelectedDelay>,
+    pub delete_release: Option<PathBuf>,
     pub partial_create: Option<PartialResult>,
     pub partial_update: Option<PartialResult>,
     pub update_delay: Option<Duration>,
@@ -218,8 +220,10 @@ pub fn decode_controls(values: &BTreeMap<String, OsString>) -> DecodedMockContro
             delete_fail_identifier: text("DELETE_FAIL_IDENTIFIER"),
             delete_timeout_for: text("DELETE_TIMEOUT_FOR").map(ResourceSelector::parse),
             create_delay: delay("CREATE_DELAY_MS_FOR", "CREATE_DELAY_MS"),
+            create_release: path("CREATE_RELEASE_PATH"),
             read_delay: delay("READ_DELAY_MS_FOR", "READ_DELAY_MS"),
             delete_delay: delay("DELETE_DELAY_MS_FOR", "DELETE_DELAY_MS"),
+            delete_release: path("DELETE_RELEASE_PATH"),
             partial_create: partial("PARTIAL_CREATE_FOR", "PARTIAL_CREATE_MISSING"),
             partial_update: partial("PARTIAL_UPDATE_FOR", "PARTIAL_UPDATE_MISSING"),
             update_delay: millis("UPDATE_DELAY_MS"),
@@ -279,10 +283,12 @@ mod tests {
             ("DELETE_TIMEOUT_FOR", "test.resource.timeout"),
             ("CREATE_DELAY_MS_FOR", "test.resource.create"),
             ("CREATE_DELAY_MS", "11"),
+            ("CREATE_RELEASE_PATH", "create.release"),
             ("READ_DELAY_MS_FOR", "test.resource.read"),
             ("READ_DELAY_MS", "12"),
             ("DELETE_DELAY_MS_FOR", "test.resource.delete"),
             ("DELETE_DELAY_MS", "13"),
+            ("DELETE_RELEASE_PATH", "delete.release"),
             ("CREATE_READY_PATH", "create.ready"),
             ("READ_READY_PATH", "read.ready"),
             ("DELETE_READY_PATH", "delete.ready"),
@@ -334,6 +340,7 @@ mod tests {
                     address: "test.resource.create".to_owned(),
                     duration: Duration::from_millis(11)
                 }),
+                create_release: Some("create.release".into()),
                 read_delay: Some(SelectedDelay {
                     address: "test.resource.read".to_owned(),
                     duration: Duration::from_millis(12)
@@ -342,6 +349,7 @@ mod tests {
                     address: "test.resource.delete".to_owned(),
                     duration: Duration::from_millis(13)
                 }),
+                delete_release: Some("delete.release".into()),
                 partial_create: Some(PartialResult {
                     selector: ResourceSelector::Any,
                     missing_attributes: vec!["computed".to_owned(), "name".to_owned()]

@@ -2981,7 +2981,7 @@ mod tests {
     async fn destroy_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["slow"])
-            .with_delayed_delete("slow", Duration::from_millis(75));
+            .with_blocked_delete("slow");
         let loaded = load_configuration_with_config(
             fixture.config_path(),
             fixture.provider_context(),
@@ -2998,7 +2998,7 @@ mod tests {
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();
 
-        let error = run_destroy_locked_with_ctx(
+        let destroy = run_destroy_locked_with_ctx(
             validated_config,
             true,
             backend.clone(),
@@ -3010,9 +3010,18 @@ mod tests {
             fixture.provider_context(),
             NonZeroUsize::new(1).unwrap(),
             fixture.cancel_token(),
-        )
-        .await
-        .expect_err("heartbeat lock loss must fail destroy");
+        );
+        tokio::pin!(destroy);
+        tokio::select! {
+            () = fixture.wait_for_blocked_delete() => {},
+            outcome = &mut destroy => panic!("destroy returned before the mock delete blocked: {outcome:?}"),
+        }
+        backend.provider_is_blocked();
+        backend.wait_for_renewal_failure().await;
+        fixture.release_blocked_delete();
+        let error = destroy
+            .await
+            .expect_err("heartbeat lock loss must fail destroy");
 
         assert!(matches!(error, AppError::StateLockLost { .. }));
         assert!(error.to_string().contains("state may be behind the cloud"));
@@ -3055,9 +3064,10 @@ mod tests {
             }
         }
         fixture.prioritize_cleanup_and_release_refresh_drain();
+        // wall-clock-ok: bounds cleanup-priority abandonment of a mock read held for 60s.
         let err = tokio::time::timeout(std::time::Duration::from_secs(1), destroy)
             .await
-            .expect("destroy did not abandon the in-flight managed refresh after cleanup priority")
+            .expect("cleanup priority must abandon the in-flight read")
             .unwrap_err();
 
         assert!(matches!(err, AppError::Interrupted));
@@ -3112,9 +3122,10 @@ mod tests {
             }
         }
         fixture.prioritize_cleanup_and_release_refresh_drain();
+        // wall-clock-ok: bounds cleanup-priority abandonment of a mock read held for 60s.
         let err = tokio::time::timeout(std::time::Duration::from_secs(1), destroy)
             .await
-            .expect("destroy did not abandon the in-flight orphan refresh after cleanup priority")
+            .expect("cleanup priority must abandon the in-flight read")
             .unwrap_err();
 
         assert!(matches!(err, AppError::Interrupted));

@@ -1155,12 +1155,17 @@ struct EpochTicker {
 
 impl EpochTicker {
     fn start(engine: Engine) -> Self {
+        Self::start_with_tick_observer(engine, || {})
+    }
+
+    fn start_with_tick_observer(engine: Engine, on_tick: impl Fn() + Send + 'static) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let flag = shutdown.clone();
         let handle = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(EPOCH_TICK_INTERVAL);
                 engine.increment_epoch();
+                on_tick();
             }
         });
         EpochTicker {
@@ -3892,6 +3897,8 @@ impl<T> ReturnedGuestCreateCall<T> {
 /// [`FailFastSlot::Poisoned`]. Later plan/apply operations receive the original
 /// reason and never continue on a freshly configured instance (carina#3106).
 struct FailFastInstance {
+    #[cfg(any(test, feature = "test-utils"))]
+    observer: Option<PollObserverForTest>,
     slot: Mutex<FailFastSlot>,
     reference_scope: proto::ReferenceScope,
 }
@@ -3903,6 +3910,8 @@ impl FailFastInstance {
             reference_scope,
         } = initialized;
         Self {
+            #[cfg(any(test, feature = "test-utils"))]
+            observer: None,
             slot: Mutex::new(FailFastSlot::Live(Box::new(instance))),
             reference_scope,
         }
@@ -3912,8 +3921,26 @@ impl FailFastInstance {
         &self.reference_scope
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    fn with_observer_for_test(mut self, observer: Option<PollObserverForTest>) -> Self {
+        if let FailFastSlot::Live(live) = self.slot.get_mut() {
+            live.store.set_deadline_observer_for_test(observer.clone());
+        }
+        self.observer = observer;
+        self
+    }
+
     async fn acquire(&self, operation: &'static str) -> ProviderResult<LiveInstanceGuard<'_>> {
-        LiveInstanceGuard::from_slot(self.slot.lock().await, operation)
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(observer) = &self.observer {
+            observer(PollEventForTest::StoreQueued { operation });
+        }
+        let guard = LiveInstanceGuard::from_slot(self.slot.lock().await, operation)?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(observer) = &self.observer {
+            observer(PollEventForTest::StoreAcquired { operation });
+        }
+        Ok(guard)
     }
 }
 
@@ -4285,7 +4312,33 @@ enum CachedComponentAcquisition {
 
 type ProviderConfigCompletions = HashMap<String, Vec<CompletionValue>>;
 
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollEventForTest {
+    StoreQueued {
+        operation: &'static str,
+    },
+    StoreAcquired {
+        operation: &'static str,
+    },
+    GuestCallDeadlineCreated {
+        wall: std::time::Duration,
+    },
+    Sleep {
+        operation: &'static str,
+        delay: std::time::Duration,
+    },
+    Attempt {
+        operation: &'static str,
+    },
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+type PollObserverForTest = Arc<dyn Fn(PollEventForTest) + Send + Sync>;
+
 pub struct WasmProviderFactory {
+    #[cfg(any(test, feature = "test-utils"))]
+    poll_observer: Option<PollObserverForTest>,
     engine: Engine,
     component: Component,
     configured: ConfiguredProvider,
@@ -4640,6 +4693,8 @@ impl WasmProviderFactory {
             http_test_route: None,
             init_instance,
             shared_instances: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            poll_observer: None,
             instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
             _epoch_ticker: epoch_ticker,
         })
@@ -4966,7 +5021,10 @@ impl WasmProviderFactory {
             return Ok(Arc::clone(instance));
         }
         let initialized = self.create_initialized_instance(attributes).await?;
-        let instance = Arc::new(FailFastInstance::new(initialized));
+        let instance = FailFastInstance::new(initialized);
+        #[cfg(any(test, feature = "test-utils"))]
+        let instance = instance.with_observer_for_test(self.poll_observer.clone());
+        let instance = Arc::new(instance);
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
     }
@@ -5110,6 +5168,36 @@ impl WasmProviderFactory {
     {
         self.instantiation_error_mapper = Arc::new(mapper);
         self
+    }
+
+    /// Observe polling decisions without measuring scheduler time.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_poll_observer_for_test(
+        mut self,
+        observer: impl Fn(PollEventForTest) + Send + Sync + 'static,
+    ) -> Self {
+        self.poll_observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Hold the configured store lock while tests enqueue operations. No guest
+    /// call (and hence no guest-call timer) has started while this lock is held.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn hold_configured_instance_for_test(
+        &self,
+        entered: &tokio::sync::Notify,
+        release: &tokio::sync::Notify,
+    ) {
+        let instance = self
+            .shared_instances
+            .lock()
+            .await
+            .get(&None)
+            .cloned()
+            .expect("initialize the default provider before holding its store");
+        let _slot = instance.slot.lock().await;
+        entered.notify_one();
+        release.notified().await;
     }
 
     /// Override the per-guest-call compute and wall-clock budgets.
@@ -5339,6 +5427,8 @@ impl ProviderFactory for WasmProviderFactory {
                 proto::ReferenceScope::Unavailable => InitializeOutcome::unavailable(),
             };
             let provider: Box<dyn Provider> = Box::new(WasmProvider {
+                #[cfg(any(test, feature = "test-utils"))]
+                poll_observer: self.poll_observer.clone(),
                 instance,
                 name: self.configured.label.name.clone(),
                 schema_witness: Arc::clone(&self.schema_witness),
@@ -5377,6 +5467,8 @@ impl ProviderFactory for WasmProviderFactory {
 // -- WasmProvider --
 
 pub struct WasmProvider {
+    #[cfg(any(test, feature = "test-utils"))]
+    poll_observer: Option<PollObserverForTest>,
     instance: Arc<FailFastInstance>,
     name: String,
     schema_witness: Arc<ValidatedProviderSchemaWitness>,
@@ -5617,6 +5709,26 @@ struct OperationBudgets {
 }
 
 impl WasmProvider {
+    #[cfg(any(test, feature = "test-utils"))]
+    fn observe_poll(&self, event: PollEventForTest) {
+        if let Some(observer) = &self.poll_observer {
+            observer(event);
+        }
+    }
+
+    fn poll_sleep(
+        &self,
+        _operation: &'static str,
+        delay: std::time::Duration,
+    ) -> tokio::time::Sleep {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.observe_poll(PollEventForTest::Sleep {
+            operation: _operation,
+            delay,
+        });
+        tokio::time::sleep(delay)
+    }
+
     fn operation_budgets(
         &self,
         id: &ResourceId,
@@ -5703,6 +5815,7 @@ impl WasmProvider {
     }
 
     async fn drive_operation<Progress, Initial, Poll, PollFuture>(
+        &self,
         operation: &'static str,
         id: ResourceId,
         budgets: OperationBudgets,
@@ -5721,10 +5834,12 @@ impl WasmProvider {
             budgets.read_back,
             async move { initial.await.map(OperationProgress::into_step) },
             |pending, finality| {
+                #[cfg(any(test, feature = "test-utils"))]
+                self.observe_poll(PollEventForTest::Attempt { operation });
                 let next = poll(pending, finality);
                 async move { next.await.map(OperationProgress::into_step) }
             },
-            tokio::time::sleep,
+            |delay| self.poll_sleep(operation, delay),
         )
         .await
         .map_err(|error| match error {
@@ -6945,9 +7060,13 @@ impl WasmProvider {
                 .into_step()
             },
             |pending, finality| async move {
+                #[cfg(any(test, feature = "test-utils"))]
+                self.observe_poll(PollEventForTest::Attempt {
+                    operation: "create",
+                });
                 self.call_poll_create(*pending, finality).await.into_step()
             },
-            tokio::time::sleep,
+            |delay| self.poll_sleep("create", delay),
         )
         .await;
         match outcome {
@@ -7007,7 +7126,7 @@ impl WasmProvider {
             |pending, finality| async move {
                 self.poll_resume_state(*pending, finality).await.into_step()
             },
-            tokio::time::sleep,
+            |delay| self.poll_sleep("resume_create", delay),
         )
         .await;
         match outcome {
@@ -7342,7 +7461,7 @@ impl Provider for WasmProvider {
         let budgets = self.operation_budgets(&id, carina_provider_protocol::OperationKind::Update);
         Box::pin(async move {
             let initial = self.call_update(id.clone(), identifier, request);
-            Self::drive_operation("update", id, budgets, initial, |pending, finality| {
+            self.drive_operation("update", id, budgets, initial, |pending, finality| {
                 self.call_poll_update(*pending, finality)
             })
             .await
@@ -7361,7 +7480,7 @@ impl Provider for WasmProvider {
         let budgets = self.operation_budgets(&id, carina_provider_protocol::OperationKind::Delete);
         Box::pin(async move {
             let initial = self.call_delete(id.clone(), identifier, request);
-            Self::drive_operation("delete", id, budgets, initial, |pending, _finality| {
+            self.drive_operation("delete", id, budgets, initial, |pending, _finality| {
                 self.call_poll_delete(*pending)
             })
             .await
@@ -11071,7 +11190,7 @@ mod tests {
         assert!(trap.downcast_ref::<EgressDenied>().is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dns_resolution_respects_connect_timeout() {
         use wasmtime_wasi::p2::Pollable;
         use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
@@ -11268,6 +11387,7 @@ mod tests {
                 match listener.accept() {
                     Ok(connection) => break connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // wall-clock-ok: hang guard for the real loopback server accept.
                         assert!(
                             std::time::Instant::now() < deadline,
                             "server accept timed out"
@@ -11317,6 +11437,7 @@ mod tests {
                 match listener.accept() {
                     Ok(connection) => break connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // wall-clock-ok: hang guard for the real loopback server accept.
                         assert!(
                             std::time::Instant::now() < deadline,
                             "server accept timed out"
@@ -11452,26 +11573,16 @@ mod tests {
     fn test_epoch_ticker_increments_epoch() {
         let config = build_engine_config();
         let engine = Engine::new(&config).unwrap();
-        let ticker = EpochTicker::start(engine.clone());
-
-        // Sleep for 2.5 seconds; the ticker should have incremented at least twice.
-        std::thread::sleep(std::time::Duration::from_millis(2500));
-
-        // Verify by setting a deadline of 1 on a store — if the epoch has
-        // advanced past 1, this deadline is already expired.
-        let mut store = GuestStore::new(
-            &engine,
-            local_provider_label("epoch-test"),
-            GuestNetwork::SchemaOnly,
-            None,
-            build_store_limits(),
-            GuestCallBudget::PRODUCTION,
-        );
-        store.set_epoch_deadline_for_test(1);
-
-        // The epoch should be at least 2 by now, so a deadline of 1 is expired.
-        // We can't easily check the epoch value directly, but we can verify
-        // the ticker didn't crash and drop works cleanly.
+        let (ticked, ticks) = std::sync::mpsc::channel();
+        let ticker = EpochTicker::start_with_tick_observer(engine, move || {
+            let _ = ticked.send(());
+        });
+        for _ in 0..2 {
+            // wall-clock-ok: hang guard for an actual increment from the real epoch ticker thread; no elapsed-speed assertion.
+            ticks
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("epoch ticker must increment the engine");
+        }
         drop(ticker);
     }
 
@@ -12250,6 +12361,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validation_suspends_after_two_timeouts_despite_other_input_successes() {
+        let context = ValidationContextFingerprint::validate_config(
+            &[0; 32],
+            &[("probe".to_string(), wit_types::Value::IntVal(1))],
+        );
+        let other = ValidationContextFingerprint::validate_config(
+            &[0; 32],
+            &[("probe".to_string(), wit_types::Value::IntVal(2))],
+        );
+        let reason = PoisonReason::WallClockTimeout {
+            operation: "validate_config",
+        };
+        let mut state = RebuildableState {
+            instance: ValidationInstanceState::Poisoned {
+                reason: reason.clone(),
+            },
+            input_health: IndexMap::new(),
+        };
+
+        for attempt in 1..=2 {
+            state.record_wall_clock_timeout(context.clone(), reason.clone());
+            state.record_success(&other);
+            assert_eq!(state.suspended_reason(&context).is_some(), attempt == 2);
+        }
+        let error = suspended_validation_error(state.suspended_reason(&context).unwrap(), &context);
+        assert_eq!(
+            error.detail().host_cause(),
+            Some(carina_core::provider::HostErrorCause::ValidationSuspended(
+                context.suspended_validation_id()
+            ))
+        );
+        assert!(state.suspended_reason(&other).is_none());
+        assert_eq!(state.input_health.len(), 1);
+    }
+
     #[tokio::test]
     async fn rebuildable_state_retains_timeout_history_across_other_input_successes() {
         let Some(factory) = rebuildable_state_test_factory().await else {
@@ -12286,12 +12433,10 @@ mod tests {
             .expect("the second call for X should use the live instance")
             .wall_clock_timeout();
 
-        let started = std::time::Instant::now();
         let suspended = match instance.acquire(context_x.clone()).await {
             Ok(_) => panic!("X must be suspended after its second timeout"),
             Err(error) => error,
         };
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(
             suspended.detail().host_cause(),
             Some(carina_core::provider::HostErrorCause::ValidationSuspended(

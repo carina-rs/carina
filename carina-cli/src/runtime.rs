@@ -179,6 +179,7 @@ mod tests {
     async fn assert_reconfiguration_preserves_installed_hooks(
         reconfigure: impl FnOnce(&mut crate::test_support::TestCommandRuntime),
     ) {
+        tokio::time::pause();
         let mut fixture = crate::test_support::TestCommandRuntime::new();
         let (trigger, shutdown) = shutdown_channel();
         let refresh = install_refresh_drain_barrier(&fixture, shutdown.clone());
@@ -241,7 +242,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrent_invocation_hook_sets_do_not_overwrite_each_other() {
         let a = crate::test_support::TestCommandRuntime::new();
         let b = crate::test_support::TestCommandRuntime::new();

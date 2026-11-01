@@ -42,6 +42,7 @@ pub(crate) enum GraphNodeId {
 
 impl GraphNodeId {
     pub(crate) fn stable_key(&self) -> String {
+        super::layout::work::visit();
         match self {
             Self::Effect(index) => format!("effect:{index:020}"),
             Self::Unchanged(id) => format!("unchanged:{id}"),
@@ -182,6 +183,7 @@ pub(crate) struct GraphModel {
 
 impl GraphModel {
     pub(crate) fn node(&self, id: &GraphNodeId) -> Option<&GraphNode> {
+        super::layout::work::visit();
         self.node_indices.get(id).map(|index| &self.nodes[*index])
     }
 }

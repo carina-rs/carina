@@ -19,6 +19,13 @@ use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migrat
 #[cfg(test)]
 type WriteHook = Arc<dyn Fn(&StateFile) + Send + Sync>;
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum AcquireTestPhase {
+    Checking,
+    Retrying,
+}
+
 /// Local file backend for development and simple use cases
 pub struct LocalBackend {
     /// Path to the state file
@@ -40,6 +47,10 @@ pub struct LocalBackend {
     state_write: Arc<Mutex<LocalWriteState>>,
     #[cfg(test)]
     write_hook: Option<WriteHook>,
+    #[cfg(test)]
+    read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    acquire_hook: Option<Arc<dyn Fn(AcquireTestPhase) + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -82,6 +93,10 @@ impl LocalBackend {
             state_write: Arc::new(Mutex::new(LocalWriteState::default())),
             #[cfg(test)]
             write_hook: None,
+            #[cfg(test)]
+            read_hook: None,
+            #[cfg(test)]
+            acquire_hook: None,
         }
     }
 
@@ -262,7 +277,21 @@ impl LocalBackend {
     }
 
     async fn read_state_file(&self) -> BackendResult<Option<(Vec<u8>, PathBuf)>> {
-        let bytes = match tokio::fs::read(&self.state_path).await {
+        let state_path = self.state_path.clone();
+        #[cfg(test)]
+        let read_hook = self.read_hook.clone();
+        // Keep the blocking read on the blocking pool, just like tokio::fs::read.
+        let read = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = read_hook {
+                hook();
+            }
+            std::fs::read(state_path)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(std::convert::identity);
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -403,7 +432,15 @@ impl StateBackend for LocalBackend {
         let content = serde_json::to_string_pretty(&lock)
             .map_err(|e| BackendError::Serialization(format!("Failed to serialize lock: {}", e)))?;
         loop {
+            #[cfg(test)]
+            if let Some(hook) = &self.acquire_hook {
+                hook(AcquireTestPhase::Checking);
+            }
             if self.has_active_recovery_claim().await? {
+                #[cfg(test)]
+                if let Some(hook) = &self.acquire_hook {
+                    hook(AcquireTestPhase::Retrying);
+                }
                 async_sleep(Duration::from_millis(1)).await;
                 continue;
             }
@@ -1217,86 +1254,142 @@ mod tests {
         assert_eq!(backend.resource_definition("test"), None);
     }
 
-    /// Verify that async methods do not block the tokio runtime.
-    ///
-    /// Uses a single-threaded runtime so that any `std::thread::sleep` inside
-    /// the async lock-acquisition loop would starve concurrent tasks.  With
-    /// `tokio::time::sleep` the runtime can schedule other tasks while waiting.
-    #[tokio::test(flavor = "current_thread")]
+    /// A retry must yield before starting the next filesystem check.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_async_operations_do_not_block_runtime() {
+        use std::future::Future;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use tokio::time::{Duration, timeout};
 
         let dir = tempdir().unwrap();
-        let state_path = dir.path().join("test.state.json");
-        let backend = Arc::new(LocalBackend::with_path(state_path.clone()));
-
-        // Hold a lock so that a second acquire_lock will enter the retry loop
+        let retrying = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut backend = LocalBackend::with_path(dir.path().join("test.state.json"));
+        let waiting = retrying.clone();
+        let notify = entered.clone();
+        backend.acquire_hook = Some(Arc::new(move |phase| match phase {
+            AcquireTestPhase::Checking => assert!(
+                !waiting.load(Ordering::SeqCst),
+                "lock retry reached the next iteration without yielding"
+            ),
+            AcquireTestPhase::Retrying => {
+                waiting.store(true, Ordering::SeqCst);
+                notify.notify_one();
+            }
+        }));
         let lock = backend.acquire_lock("apply").await.unwrap();
-
-        let concurrent_ran = Arc::new(AtomicBool::new(false));
-        let concurrent_ran_clone = Arc::clone(&concurrent_ran);
-
-        // Spawn a task that tries to acquire the lock (will loop because lock is held)
-        let backend_clone = Arc::clone(&backend);
-        let acquire_handle = tokio::spawn(async move {
-            // This will fail with Locked error, but the important thing is
-            // it must yield to the runtime while retrying
-            let _ = backend_clone.acquire_lock("plan").await;
+        // An active recovery claim keeps acquire pending; an ordinary held lock
+        // alone returns Locked rather than entering the retry sleep.
+        std::fs::write(
+            backend.recovery_path(),
+            serde_json::to_vec(&LockInfo::for_test("recover")).unwrap(),
+        )
+        .unwrap();
+        let acquire = backend.acquire_lock("plan");
+        tokio::pin!(acquire);
+        let concurrent = tokio::spawn(async move {
+            entered.notified().await;
         });
-
-        // Spawn a concurrent task that should be able to run
-        let concurrent_handle = tokio::spawn(async move {
-            concurrent_ran_clone.store(true, Ordering::SeqCst);
-        });
-
-        // Wait for the concurrent task to complete - if the runtime is blocked
-        // by std::thread::sleep, this will time out
-        let result = timeout(Duration::from_secs(2), concurrent_handle).await;
+        tokio::pin!(concurrent);
+        tokio::select! {
+            biased;
+            outcome = &mut concurrent => outcome.unwrap(),
+            result = &mut acquire => panic!("acquire completed while its recovery claim was held: {result:?}"),
+        }
+        assert!(retrying.load(Ordering::SeqCst));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(
-            result.is_ok(),
-            "concurrent task should complete without being blocked"
+            acquire.as_mut().poll(&mut context).is_pending(),
+            "the concurrent task must finish while acquire is still pending"
         );
-        assert!(
-            concurrent_ran.load(Ordering::SeqCst),
-            "concurrent task should have executed"
-        );
-
-        // Clean up: abort the acquire task and release the lock
-        acquire_handle.abort();
+        retrying.store(false, Ordering::SeqCst);
+        std::fs::remove_file(backend.recovery_path()).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(acquire.await, Err(BackendError::Locked { .. })));
         backend.release_lock(&lock).await.unwrap();
     }
 
-    /// Verify that read_state and write_state use async I/O.
+    struct BlockingIoGate {
+        runtime_thread: std::thread::ThreadId,
+        entered: tokio::sync::Notify,
+        released: Mutex<bool>,
+        wake: Condvar,
+    }
+
+    impl Default for BlockingIoGate {
+        fn default() -> Self {
+            Self {
+                runtime_thread: std::thread::current().id(),
+                entered: tokio::sync::Notify::new(),
+                released: Mutex::new(false),
+                wake: Condvar::new(),
+            }
+        }
+    }
+
+    impl BlockingIoGate {
+        fn block(&self) {
+            assert_ne!(
+                std::thread::current().id(),
+                self.runtime_thread,
+                "filesystem I/O blocked the current-thread runtime"
+            );
+            self.entered.notify_one();
+            let _guard = self
+                .wake
+                .wait_while(self.released.lock().unwrap(), |released| !*released)
+                .unwrap();
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_one();
+        }
+    }
+
+    async fn concurrent_task_finishes_while_io_is_pending<T>(
+        io: impl std::future::Future<Output = T>,
+        gate: Arc<BlockingIoGate>,
+    ) -> T {
+        tokio::pin!(io);
+        let probe_gate = gate.clone();
+        let concurrent = tokio::spawn(async move {
+            probe_gate.entered.notified().await;
+        });
+        tokio::pin!(concurrent);
+        tokio::select! {
+            biased;
+            outcome = &mut concurrent => outcome.unwrap(),
+            _ = &mut io => panic!("I/O completed before the blocked-work probe ran"),
+        }
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            io.as_mut().poll(&mut context).is_pending(),
+            "the concurrent task must finish while the I/O future is still pending"
+        );
+        gate.release();
+        io.await
+    }
+
+    /// Both read and write must leave the current-thread runtime runnable.
     #[tokio::test(flavor = "current_thread")]
     async fn test_async_read_write_does_not_block_runtime() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use tokio::time::{Duration, timeout};
-
         let dir = tempdir().unwrap();
-        let state_path = dir.path().join("test.state.json");
-        let backend = Arc::new(LocalBackend::with_path(state_path));
-
-        let concurrent_ran = Arc::new(AtomicBool::new(false));
-        let concurrent_ran_clone = Arc::clone(&concurrent_ran);
-
-        let backend_clone = Arc::clone(&backend);
-        let io_handle = tokio::spawn(async move {
-            let mut state = StateFile::new();
-            state.increment_serial();
-            backend_clone.write_state(&state).await.unwrap();
-            let read = backend_clone.read_state().await.unwrap();
-            assert!(read.is_some());
-        });
-
-        let concurrent_handle = tokio::spawn(async move {
-            concurrent_ran_clone.store(true, Ordering::SeqCst);
-        });
-
-        let result = timeout(Duration::from_secs(2), concurrent_handle).await;
-        assert!(result.is_ok());
-        assert!(concurrent_ran.load(Ordering::SeqCst));
-
-        let _ = timeout(Duration::from_secs(2), io_handle).await;
+        let write_gate = Arc::new(BlockingIoGate::default());
+        let read_gate = Arc::new(BlockingIoGate::default());
+        let write_hook = write_gate.clone();
+        let mut backend = LocalBackend::with_path(dir.path().join("test.state.json"))
+            .with_write_hook(move |_| write_hook.block());
+        let read_hook = read_gate.clone();
+        backend.read_hook = Some(Arc::new(move || read_hook.block()));
+        let mut state = StateFile::new();
+        state.increment_serial();
+        concurrent_task_finishes_while_io_is_pending(backend.write_state(&state), write_gate)
+            .await
+            .unwrap();
+        let read = concurrent_task_finishes_while_io_is_pending(backend.read_state(), read_gate)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.into_state().serial, state.serial);
     }
 }

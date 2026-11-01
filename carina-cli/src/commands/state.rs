@@ -4771,6 +4771,7 @@ mod tests {
         );
         tokio::pin!(refresh);
         tokio::select! {
+            // wall-clock-ok: hang guard waiting for the mock provider read-readiness file on disk.
             ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while !read_ready_path.exists() {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -4783,6 +4784,7 @@ mod tests {
         assert!(fixture.lock_path().exists(), "fixture must hold the lock");
         fixture.shutdown_trigger().request_graceful_shutdown();
         tokio::select! {
+            // wall-clock-ok: hang guard for the real provider refresh-drain handshake.
             reached = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 drain_barrier.reached(),
@@ -4793,9 +4795,10 @@ mod tests {
         }
         fixture.shutdown_trigger().prioritize_cleanup();
         drain_barrier.release();
+        // wall-clock-ok: bounds cleanup-priority abandonment of a mock read held for 60s.
         let err = tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
             .await
-            .expect("state refresh did not abandon the in-flight read after cleanup priority")
+            .expect("cleanup priority must abandon the in-flight read")
             .unwrap_err();
 
         assert!(matches!(err, AppError::Interrupted));

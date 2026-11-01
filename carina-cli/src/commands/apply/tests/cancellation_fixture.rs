@@ -44,6 +44,7 @@ pub(super) struct ApplyCancellationFixture {
     cancel_after_successes: Option<usize>,
     success_count: Arc<AtomicUsize>,
     provider_ready_path: Option<std::path::PathBuf>,
+    provider_release_path: Option<std::path::PathBuf>,
 }
 
 impl ApplyCancellationFixture {
@@ -54,6 +55,7 @@ impl ApplyCancellationFixture {
             cancel_after_successes: None,
             success_count: Arc::new(AtomicUsize::new(0)),
             provider_ready_path: None,
+            provider_release_path: None,
         }
     }
 
@@ -121,25 +123,28 @@ impl ApplyCancellationFixture {
 
     pub(super) fn with_blocked_create(mut self, name: &str) -> Self {
         let ready_path = self.base.readiness_path("mock-create-ready");
+        let release_path = self.base.readiness_path("mock-create-release");
         self.base.update_mock(|behavior, _| {
             behavior.create_delay = Some(SelectedDelay {
                 address: format!("test.resource.{name}"),
                 duration: Duration::from_secs(60),
             });
             behavior.observations.create_ready = Some(ready_path.clone());
+            behavior.create_release = Some(release_path.clone());
         });
         self.provider_ready_path = Some(ready_path);
+        self.provider_release_path = Some(release_path);
         self
     }
 
-    pub(super) fn with_delayed_create(mut self, name: &str, delay: Duration) -> Self {
-        self.base.update_mock(|behavior, _| {
-            behavior.create_delay = Some(SelectedDelay {
-                address: format!("test.resource.{name}"),
-                duration: delay,
-            });
-        });
-        self
+    pub(super) fn release_blocked_create(&self) {
+        std::fs::write(
+            self.provider_release_path
+                .as_ref()
+                .expect("blocked create must be configured"),
+            b"",
+        )
+        .expect("write the mock create release handshake");
     }
 
     pub(super) async fn wait_for_blocked_create(&self) {
@@ -147,6 +152,7 @@ impl ApplyCancellationFixture {
             .provider_ready_path
             .as_ref()
             .expect("blocked create must be configured");
+        // wall-clock-ok: hang guard for actual provider readiness and refresh-drain handshakes.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !ready_path.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;

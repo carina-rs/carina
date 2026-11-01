@@ -35,6 +35,119 @@ const RELAXATION_ITERATIONS: usize = 5;
 const MAX_RELAXATION_SHIFT: f32 = 24.0;
 const PORT_MARGIN_FRACTION: f32 = 0.2;
 
+#[cfg(test)]
+pub(super) mod work {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Phase {
+        Layering,
+        Expansion,
+        Crossing,
+        Placement,
+        Relaxation,
+        Routing,
+        Ports,
+    }
+
+    pub(super) const PHASES: [Phase; 7] = [
+        Phase::Layering,
+        Phase::Expansion,
+        Phase::Crossing,
+        Phase::Placement,
+        Phase::Relaxation,
+        Phase::Routing,
+        Phase::Ports,
+    ];
+
+    thread_local! {
+        static UNITS: Cell<usize> = const { Cell::new(0) };
+        static SWAPS: Cell<usize> = const { Cell::new(0) };
+        static ACCEPTED: Cell<usize> = const { Cell::new(0) };
+        static PHASE: Cell<Phase> = const { Cell::new(Phase::Placement) };
+        static COUNTS: Cell<[usize; 7]> = const { Cell::new([0; 7]) };
+    }
+
+    pub(in crate::plan_image) fn visit() {
+        UNITS.with(|units| units.set(units.get() + 1));
+        COUNTS.with(|counts| {
+            let mut next = counts.get();
+            next[PHASE.with(Cell::get) as usize] += 1;
+            counts.set(next);
+        });
+    }
+
+    pub(super) fn text(text: &str) {
+        for _ in text.chars() {
+            visit();
+        }
+    }
+
+    pub(super) struct PhaseGuard(Phase);
+
+    impl Drop for PhaseGuard {
+        fn drop(&mut self) {
+            PHASE.with(|phase| phase.set(self.0));
+        }
+    }
+
+    pub(super) fn phase(next: Phase) -> PhaseGuard {
+        PhaseGuard(PHASE.with(|phase| phase.replace(next)))
+    }
+
+    pub(super) fn counts() -> [usize; 7] {
+        COUNTS.with(Cell::get)
+    }
+
+    pub(super) fn swap_attempt() {
+        visit();
+        SWAPS.with(|count| count.set(count.get() + 1));
+    }
+    pub(super) fn accepted_swap() {
+        ACCEPTED.with(|count| count.set(count.get() + 1));
+    }
+    pub(super) fn swaps() -> (usize, usize) {
+        (SWAPS.with(Cell::get), ACCEPTED.with(Cell::get))
+    }
+
+    pub(super) fn measure<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        UNITS.with(|units| units.set(0));
+        SWAPS.with(|count| count.set(0));
+        ACCEPTED.with(|count| count.set(0));
+        COUNTS.with(|counts| counts.set([0; 7]));
+        let result = f();
+        (result, UNITS.with(Cell::get))
+    }
+}
+
+#[cfg(not(test))]
+pub(super) mod work {
+    pub(super) enum Phase {
+        Layering,
+        Expansion,
+        Crossing,
+        Placement,
+        Relaxation,
+        Routing,
+        Ports,
+    }
+
+    pub(super) struct PhaseGuard;
+
+    #[inline(always)]
+    pub(in crate::plan_image) fn visit() {}
+    #[inline(always)]
+    pub(super) fn text(_: &str) {}
+    #[inline(always)]
+    pub(super) fn phase(_: Phase) -> PhaseGuard {
+        PhaseGuard
+    }
+    #[inline(always)]
+    pub(super) fn swap_attempt() {}
+    #[inline(always)]
+    pub(super) fn accepted_swap() {}
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NodeRect {
     pub id: GraphNodeId,
@@ -125,6 +238,7 @@ enum LayoutVertexId {
 
 impl LayoutVertexId {
     fn stable_key(&self) -> String {
+        work::visit();
         match self {
             Self::Real(id) => format!("real:{}", id.stable_key()),
             Self::Dummy { from, to, column } => format!(
@@ -185,13 +299,18 @@ struct Layering {
 }
 
 pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
+    let _phase = work::phase(work::Phase::Placement);
+
     let layering = graph_layering(model);
     let bands = ordered_bands(model);
     let band_rank: HashMap<_, _> = bands
         .iter()
         .cloned()
         .enumerate()
-        .map(|(rank, band)| (band, rank))
+        .map(|(rank, band)| {
+            work::visit();
+            (band, rank)
+        })
         .collect();
     let mut expanded = expand_long_edges(model, &layering);
     sort_initial_columns(model, &band_rank, &mut expanded);
@@ -202,7 +321,10 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
     let column_widths: Vec<_> = expanded
         .columns
         .iter()
-        .map(|column| column_width(model, column))
+        .map(|column| {
+            work::visit();
+            column_width(model, column)
+        })
         .collect();
     let graph_width =
         column_widths.iter().sum::<f32>() + COLUMN_GAP * column_count.saturating_sub(1) as f32;
@@ -211,16 +333,21 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
     let mut column_x = Vec::with_capacity(column_count);
     let mut x = graph_left;
     for column_width in &column_widths {
+        work::visit();
         column_x.push(x);
         x += *column_width + COLUMN_GAP;
     }
 
     let mut band_heights = Vec::with_capacity(bands.len());
     for band in &bands {
+        work::visit();
         let max_stack = expanded
             .columns
             .iter()
-            .map(|column| stack_height(model, &expanded, column, band))
+            .map(|column| {
+                work::visit();
+                stack_height(model, &expanded, column, band)
+            })
             .fold(0.0_f32, f32::max);
         let label_height = band_label_height(band);
         band_heights.push((label_height + max_stack + BAND_PADDING * 2.0).max(58.0));
@@ -229,6 +356,7 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
     let mut band_tops = Vec::with_capacity(bands.len());
     let mut cursor_y = HEADER_HEIGHT;
     for height in &band_heights {
+        work::visit();
         band_tops.push(cursor_y);
         cursor_y += *height + BAND_GAP;
     }
@@ -236,19 +364,27 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
     let band_bounds: Vec<_> = bands
         .iter()
         .enumerate()
-        .map(|(index, band)| BandBounds {
-            id: band.clone(),
-            content_top: band_tops[index] + BAND_PADDING + band_label_height(band),
-            content_bottom: band_tops[index] + band_heights[index] - BAND_PADDING,
+        .map(|(index, band)| {
+            work::visit();
+            BandBounds {
+                id: band.clone(),
+                content_top: band_tops[index] + BAND_PADDING + band_label_height(band),
+                content_bottom: band_tops[index] + band_heights[index] - BAND_PADDING,
+            }
         })
         .collect();
 
     let mut vertices = Vec::new();
     for (column_idx, column) in expanded.columns.iter().enumerate() {
+        work::visit();
         for (band_idx, band) in bands.iter().enumerate() {
+            work::visit();
             let band_vertices: Vec<_> = column
                 .iter()
-                .filter(|id| expanded.bands.get(*id) == Some(band))
+                .filter(|id| {
+                    work::visit();
+                    expanded.bands.get(*id) == Some(band)
+                })
                 .collect();
             if band_vertices.is_empty() {
                 continue;
@@ -258,6 +394,7 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
             let mut y = bounds.content_top
                 + ((bounds.content_bottom - bounds.content_top) - stack).max(0.0) / 2.0;
             for (index, id) in band_vertices.iter().enumerate() {
+                work::visit();
                 let height = vertex_height(model, id);
                 vertices.push(PositionedVertex {
                     id: (*id).clone(),
@@ -276,10 +413,14 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
 
     let vertex_positions: HashMap<_, _> = vertices
         .iter()
-        .map(|vertex| (vertex.id.clone(), vertex.center_y))
+        .map(|vertex| {
+            work::visit();
+            (vertex.id.clone(), vertex.center_y)
+        })
         .collect();
     let mut positioned_nodes = Vec::with_capacity(model.nodes.len());
     for vertex in &vertices {
+        work::visit();
         let LayoutVertexId::Real(id) = &vertex.id else {
             continue;
         };
@@ -294,6 +435,7 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
         });
     }
     positioned_nodes.sort_by(|left, right| {
+        work::visit();
         left.column
             .cmp(&right.column)
             .then_with(|| left.y.total_cmp(&right.y))
@@ -310,21 +452,34 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
 
     let mut module_rects = Vec::new();
     for (band_idx, band) in bands.iter().enumerate() {
+        work::visit();
         if let BandId::Module(id) = band {
             let members: Vec<_> = positioned_nodes
                 .iter()
                 .filter(|rect| {
-                    model
-                        .node(&rect.id)
-                        .is_some_and(|node| node.module.as_ref() == Some(id))
+                    work::visit();
+                    model.node(&rect.id).is_some_and(|node| {
+                        work::visit();
+                        node.module.as_ref() == Some(id)
+                    })
                 })
                 .collect();
-            let Some(member_left) = members.iter().map(|rect| rect.x).reduce(f32::min) else {
+            let Some(member_left) = members
+                .iter()
+                .map(|rect| {
+                    work::visit();
+                    rect.x
+                })
+                .reduce(f32::min)
+            else {
                 continue;
             };
             let member_right = members
                 .iter()
-                .map(|rect| rect.x + rect.width)
+                .map(|rect| {
+                    work::visit();
+                    rect.x + rect.width
+                })
                 .reduce(f32::max)
                 .expect("module band has at least one member");
             module_rects.push(ModuleRect {
@@ -345,12 +500,18 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
     let node_indices = positioned_nodes
         .iter()
         .enumerate()
-        .map(|(index, node)| (node.id.clone(), index))
+        .map(|(index, node)| {
+            work::visit();
+            (node.id.clone(), index)
+        })
         .collect();
     let edge_indices = edge_routes
         .iter()
         .enumerate()
-        .map(|(index, edge)| ((edge.from.clone(), edge.to.clone()), index))
+        .map(|(index, edge)| {
+            work::visit();
+            ((edge.from.clone(), edge.to.clone()), index)
+        })
         .collect();
     Layout {
         width: width.ceil() as u32,
@@ -377,7 +538,10 @@ impl BandId {
 
 fn ordered_bands(model: &GraphModel) -> Vec<BandId> {
     let mut bands = Vec::new();
-    if model.nodes.iter().any(|node| node.module.is_none()) {
+    if model.nodes.iter().any(|node| {
+        work::visit();
+        node.module.is_none()
+    }) {
         bands.push(BandId::Root);
     }
     bands.extend(
@@ -385,17 +549,22 @@ fn ordered_bands(model: &GraphModel) -> Vec<BandId> {
             .modules
             .iter()
             .filter(|module| {
-                model
-                    .nodes
-                    .iter()
-                    .any(|node| node.module.as_ref() == Some(&module.id))
+                work::visit();
+                model.nodes.iter().any(|node| {
+                    work::visit();
+                    node.module.as_ref() == Some(&module.id)
+                })
             })
-            .map(|module| BandId::Module(module.id.clone())),
+            .map(|module| {
+                work::visit();
+                BandId::Module(module.id.clone())
+            }),
     );
     bands
 }
 
 fn graph_node_width(node: &GraphNode) -> f32 {
+    work::visit();
     let mut widest = measured_width(&truncate_middle(&node.label, MAX_LABEL_CHARS), 15.0) + 70.0;
     widest = widest.max(
         measured_width(
@@ -410,6 +579,7 @@ fn graph_node_width(node: &GraphNode) -> f32 {
         widest = widest.max(measured_width(note, 11.0) + 34.0);
     }
     for attribute in node.attribute_names.iter().take(MAX_ATTRIBUTE_NAMES) {
+        work::visit();
         widest = widest.max(measured_width(attribute, 11.0) + 52.0);
     }
     if !node.affected_by.is_empty() {
@@ -424,6 +594,7 @@ fn graph_node_width(node: &GraphNode) -> f32 {
 }
 
 pub(crate) fn graph_node_height(node: &GraphNode) -> f32 {
+    work::visit();
     let mut height: f32 = if node.kind == EffectKind::Unchanged {
         66.0
     } else {
@@ -449,10 +620,14 @@ pub(crate) fn graph_node_height(node: &GraphNode) -> f32 {
 }
 
 fn measured_width(text: &str, font_size: f32) -> f32 {
+    work::text(text);
+
     text.chars().count() as f32 * font_size * MONOSPACE_ADVANCE_EM
 }
 
 fn truncate_for_measurement(text: &str, max_chars: usize) -> String {
+    work::text(text);
+
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
@@ -463,6 +638,8 @@ fn truncate_for_measurement(text: &str, max_chars: usize) -> String {
 }
 
 pub(crate) fn truncate_middle(text: &str, max_chars: usize) -> String {
+    work::text(text);
+
     let characters = text.chars().collect::<Vec<_>>();
     if characters.len() <= max_chars {
         return text.to_string();
@@ -490,6 +667,7 @@ fn band_label_height(band: &BandId) -> f32 {
 }
 
 fn vertex_height(model: &GraphModel, id: &LayoutVertexId) -> f32 {
+    work::visit();
     match id {
         LayoutVertexId::Real(id) => model.node(id).map_or(DUMMY_HEIGHT, graph_node_height),
         LayoutVertexId::Dummy { .. } => DUMMY_HEIGHT,
@@ -499,9 +677,12 @@ fn vertex_height(model: &GraphModel, id: &LayoutVertexId) -> f32 {
 fn column_width(model: &GraphModel, column: &[LayoutVertexId]) -> f32 {
     column
         .iter()
-        .filter_map(|id| match id {
-            LayoutVertexId::Real(id) => model.node(id),
-            LayoutVertexId::Dummy { .. } => None,
+        .filter_map(|id| {
+            work::visit();
+            match id {
+                LayoutVertexId::Real(id) => model.node(id),
+                LayoutVertexId::Dummy { .. } => None,
+            }
         })
         .map(graph_node_width)
         .fold(DUMMY_COLUMN_WIDTH, f32::max)
@@ -515,20 +696,30 @@ fn stack_height(
 ) -> f32 {
     let vertices: Vec<_> = column
         .iter()
-        .filter(|id| expanded.bands.get(*id) == Some(band))
+        .filter(|id| {
+            work::visit();
+            expanded.bands.get(*id) == Some(band)
+        })
         .collect();
     let heights = vertices
         .iter()
-        .map(|id| vertex_height(model, id))
+        .map(|id| {
+            work::visit();
+            vertex_height(model, id)
+        })
         .sum::<f32>();
     let gaps = vertices
         .windows(2)
-        .map(|pair| vertex_gap(expanded, pair[0], pair[1]))
+        .map(|pair| {
+            work::visit();
+            vertex_gap(expanded, pair[0], pair[1])
+        })
         .sum::<f32>();
     heights + gaps
 }
 
 fn vertex_gap(expanded: &ExpandedGraph, upper: &LayoutVertexId, lower: &LayoutVertexId) -> f32 {
+    work::visit();
     if expanded
         .same_column_reference_pairs
         .contains(&(upper.clone(), lower.clone()))
@@ -540,11 +731,14 @@ fn vertex_gap(expanded: &ExpandedGraph, upper: &LayoutVertexId, lower: &LayoutVe
 }
 
 fn expand_long_edges(model: &GraphModel, layering: &Layering) -> ExpandedGraph {
+    let _phase = work::phase(work::Phase::Expansion);
+
     let layers = &layering.layers;
     let column_count = layers.values().copied().max().map_or(0, |max| max + 1);
     let mut columns = vec![Vec::new(); column_count];
     let mut bands = HashMap::new();
     for node in &model.nodes {
+        work::visit();
         let Some(column) = layers.get(&node.id).copied() else {
             continue;
         };
@@ -557,6 +751,7 @@ fn expand_long_edges(model: &GraphModel, layering: &Layering) -> ExpandedGraph {
     let mut routes = Vec::new();
     let mut same_column_reference_pairs = HashSet::new();
     for edge in &layering.edges {
+        work::visit();
         let (Some(from_column), Some(to_column)) = (
             layers.get(&edge.from).copied(),
             layers.get(&edge.to).copied(),
@@ -582,6 +777,7 @@ fn expand_long_edges(model: &GraphModel, layering: &Layering) -> ExpandedGraph {
                 .take(to_column)
                 .skip(from_column + 1)
             {
+                work::visit();
                 let dummy = LayoutVertexId::Dummy {
                     from: edge.actual_from.clone(),
                     to: edge.actual_to.clone(),
@@ -599,6 +795,7 @@ fn expand_long_edges(model: &GraphModel, layering: &Layering) -> ExpandedGraph {
         }
         route.push(to.clone());
         for pair in route.windows(2) {
+            work::visit();
             edges.push((pair[0].clone(), pair[1].clone()));
         }
         if edge.reversed {
@@ -628,6 +825,7 @@ fn sort_initial_columns(
     expanded: &mut ExpandedGraph,
 ) {
     for column in &mut expanded.columns {
+        work::visit();
         column.sort_by_key(|id| {
             (
                 band_rank.get(&expanded.bands[id]).copied().unwrap_or(0),
@@ -643,11 +841,18 @@ fn cycle_removed_ordering_edges(
     let node_ids: HashSet<_> = model
         .nodes
         .iter()
-        .filter(|node| node.kind != EffectKind::Unchanged)
-        .map(|node| node.id.clone())
+        .filter(|node| {
+            work::visit();
+            node.kind != EffectKind::Unchanged
+        })
+        .map(|node| {
+            work::visit();
+            node.id.clone()
+        })
         .collect();
     let mut outgoing: HashMap<GraphNodeId, Vec<GraphNodeId>> = HashMap::new();
     for edge in &model.ordering_edges {
+        work::visit();
         if node_ids.contains(&edge.from) && node_ids.contains(&edge.to) {
             outgoing
                 .entry(edge.from.clone())
@@ -656,6 +861,7 @@ fn cycle_removed_ordering_edges(
         }
     }
     for targets in outgoing.values_mut() {
+        work::visit();
         targets.sort_by_key(|id| layout_node_sort_key(model, id));
         targets.dedup();
     }
@@ -675,6 +881,7 @@ fn cycle_removed_ordering_edges(
         states.insert(id.clone(), VisitState::Visiting);
         if let Some(targets) = outgoing.get(id) {
             for target in targets {
+                work::visit();
                 match states.get(target) {
                     Some(VisitState::Visiting) => {
                         reversed.insert((id.clone(), target.clone()));
@@ -692,6 +899,7 @@ fn cycle_removed_ordering_edges(
     let mut states = HashMap::new();
     let mut reversed_edges = HashSet::new();
     for id in ordered_nodes {
+        work::visit();
         if !states.contains_key(&id) {
             visit(&id, &outgoing, &mut states, &mut reversed_edges);
         }
@@ -700,8 +908,12 @@ fn cycle_removed_ordering_edges(
     let edges: Vec<_> = model
         .ordering_edges
         .iter()
-        .filter(|edge| node_ids.contains(&edge.from) && node_ids.contains(&edge.to))
+        .filter(|edge| {
+            work::visit();
+            node_ids.contains(&edge.from) && node_ids.contains(&edge.to)
+        })
         .map(|edge| {
+            work::visit();
             let reversed = reversed_edges.contains(&(edge.from.clone(), edge.to.clone()));
             let (from, to) = if reversed {
                 (edge.to.clone(), edge.from.clone())
@@ -727,37 +939,95 @@ fn cycle_removed_layering(model: &GraphModel) -> Layering {
     Layering { layers, edges }
 }
 
-fn graph_layering(model: &GraphModel) -> Layering {
-    let mut layering = cycle_removed_layering(model);
-    let mut constraint_edges = layering.edges.clone();
-    let mut accepted: HashMap<GraphNodeId, Vec<GraphNodeId>> = HashMap::new();
-    for edge in &constraint_edges {
-        accepted
-            .entry(edge.from.clone())
-            .or_default()
-            .push(edge.to.clone());
-    }
-    for targets in accepted.values_mut() {
-        targets.sort_by_key(GraphNodeId::stable_key);
-        targets.dedup();
+// An accepted constraint graph is acyclic. Keep its weak components alongside
+// its adjacency so an insertion joining separate components needs no DFS.
+// Adjacency iteration order cannot affect a reachability boolean; a set also
+// avoids sorting every growing fan-out after each accepted reference.
+#[derive(Default)]
+struct AcyclicConstraints {
+    outgoing: HashMap<GraphNodeId, HashSet<GraphNodeId>>,
+    parents: HashMap<GraphNodeId, GraphNodeId>,
+    ranks: HashMap<GraphNodeId, usize>,
+}
+
+impl AcyclicConstraints {
+    fn new(acyclic_edges: &[OrientedEdge]) -> Self {
+        let mut constraints = Self::default();
+        for edge in acyclic_edges {
+            work::visit();
+            constraints.insert(&edge.from, &edge.to);
+        }
+        constraints
     }
 
-    let visible: HashSet<_> = model.nodes.iter().map(|node| node.id.clone()).collect();
+    fn component(&mut self, id: &GraphNodeId) -> GraphNodeId {
+        work::visit();
+        let Some(parent) = self.parents.get(id).cloned() else {
+            return id.clone();
+        };
+        let root = self.component(&parent);
+        self.parents.insert(id.clone(), root.clone());
+        root
+    }
+
+    fn insert(&mut self, from: &GraphNodeId, to: &GraphNodeId) {
+        self.outgoing
+            .entry(from.clone())
+            .or_default()
+            .insert(to.clone());
+        let mut from = self.component(from);
+        let mut to = self.component(to);
+        if from == to {
+            return;
+        }
+        let mut from_rank = self.ranks.get(&from).copied().unwrap_or(0);
+        let mut to_rank = self.ranks.get(&to).copied().unwrap_or(0);
+        if from_rank < to_rank {
+            std::mem::swap(&mut from, &mut to);
+            std::mem::swap(&mut from_rank, &mut to_rank);
+        }
+        self.parents.insert(to, from.clone());
+        if from_rank == to_rank {
+            self.ranks.insert(from, from_rank + 1);
+        }
+    }
+
+    fn add_reference(&mut self, from: &GraphNodeId, to: &GraphNodeId) -> bool {
+        if self.component(from) == self.component(to) && path_exists(&self.outgoing, to, from) {
+            return false;
+        }
+        self.insert(from, to);
+        true
+    }
+}
+
+fn graph_layering(model: &GraphModel) -> Layering {
+    let _phase = work::phase(work::Phase::Layering);
+
+    let mut layering = cycle_removed_layering(model);
+    let mut constraint_edges = layering.edges.clone();
+    let mut accepted = AcyclicConstraints::new(&constraint_edges);
+
+    let visible: HashSet<_> = model
+        .nodes
+        .iter()
+        .map(|node| {
+            work::visit();
+            node.id.clone()
+        })
+        .collect();
     let mut references = model.reference_edges.clone();
     references.sort_by_key(|edge| (edge.from.stable_key(), edge.to.stable_key()));
     // Ordering constraints are already present in `accepted`. Add references
     // deterministically only while the constraint graph remains acyclic.
     for edge in &references {
+        work::visit();
         if !visible.contains(&edge.from)
             || !visible.contains(&edge.to)
-            || path_exists(&accepted, &edge.to, &edge.from)
+            || !accepted.add_reference(&edge.from, &edge.to)
         {
             continue;
         }
-        let targets = accepted.entry(edge.from.clone()).or_default();
-        targets.push(edge.to.clone());
-        targets.sort_by_key(GraphNodeId::stable_key);
-        targets.dedup();
         constraint_edges.push(OrientedEdge {
             actual_from: edge.from.clone(),
             actual_to: edge.to.clone(),
@@ -770,6 +1040,7 @@ fn graph_layering(model: &GraphModel) -> Layering {
     layering.layers = longest_path_layers(model, &constraint_edges);
 
     for edge in references {
+        work::visit();
         let (Some(from_column), Some(to_column)) = (
             layering.layers.get(&edge.from).copied(),
             layering.layers.get(&edge.to).copied(),
@@ -798,13 +1069,14 @@ fn graph_layering(model: &GraphModel) -> Layering {
 }
 
 fn path_exists(
-    adjacency: &HashMap<GraphNodeId, Vec<GraphNodeId>>,
+    adjacency: &HashMap<GraphNodeId, HashSet<GraphNodeId>>,
     from: &GraphNodeId,
     to: &GraphNodeId,
 ) -> bool {
     let mut stack = vec![from.clone()];
     let mut visited = HashSet::new();
     while let Some(id) = stack.pop() {
+        work::visit();
         if !visited.insert(id.clone()) {
             continue;
         }
@@ -819,11 +1091,26 @@ fn path_exists(
 }
 
 fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<GraphNodeId, usize> {
-    let node_ids: HashSet<_> = model.nodes.iter().map(|node| node.id.clone()).collect();
-    let mut indegree: HashMap<_, usize> = node_ids.iter().cloned().map(|id| (id, 0)).collect();
+    let node_ids: HashSet<_> = model
+        .nodes
+        .iter()
+        .map(|node| {
+            work::visit();
+            node.id.clone()
+        })
+        .collect();
+    let mut indegree: HashMap<_, usize> = node_ids
+        .iter()
+        .cloned()
+        .map(|id| {
+            work::visit();
+            (id, 0)
+        })
+        .collect();
     let mut outgoing: HashMap<GraphNodeId, Vec<(GraphNodeId, usize)>> = HashMap::new();
     let mut unique_edges = HashSet::new();
     for edge in edges {
+        work::visit();
         if unique_edges.insert((edge.from.clone(), edge.to.clone())) {
             // References prevent right-to-left placement but may share a
             // column. Ordering edges must advance by at least one column.
@@ -836,26 +1123,47 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
         }
     }
     for targets in outgoing.values_mut() {
+        work::visit();
         targets.sort_by_key(|(id, _)| id.stable_key());
         targets.dedup();
     }
 
     let ready_nodes: Vec<_> = indegree
         .iter()
-        .filter(|(_, degree)| **degree == 0)
-        .map(|(id, _)| id.clone())
+        .filter(|(_, degree)| {
+            work::visit();
+            **degree == 0
+        })
+        .map(|(id, _)| {
+            work::visit();
+            id.clone()
+        })
         .collect();
     let node_by_key: HashMap<_, _> = node_ids
         .iter()
-        .map(|id| (layout_node_sort_key(model, id), id.clone()))
+        .map(|id| {
+            work::visit();
+            (layout_node_sort_key(model, id), id.clone())
+        })
         .collect();
     let mut ready: BTreeSet<_> = ready_nodes
         .iter()
-        .map(|id| layout_node_sort_key(model, id))
+        .map(|id| {
+            work::visit();
+            layout_node_sort_key(model, id)
+        })
         .collect();
-    let mut layers: HashMap<_, usize> = node_ids.iter().cloned().map(|id| (id, 0)).collect();
+    let mut layers: HashMap<_, usize> = node_ids
+        .iter()
+        .cloned()
+        .map(|id| {
+            work::visit();
+            (id, 0)
+        })
+        .collect();
     let mut processed = HashSet::new();
     while let Some(key) = ready.pop_first() {
+        work::visit();
         let id = node_by_key[&key].clone();
         if !processed.insert(id.clone()) {
             continue;
@@ -863,9 +1171,11 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
         let parent_layer = layers[&id];
         if let Some(targets) = outgoing.get(&id) {
             for (target, minimum_advance) in targets {
-                layers
-                    .entry(target.clone())
-                    .and_modify(|layer| *layer = (*layer).max(parent_layer + minimum_advance));
+                work::visit();
+                layers.entry(target.clone()).and_modify(|layer| {
+                    work::visit();
+                    *layer = (*layer).max(parent_layer + minimum_advance)
+                });
                 let degree = indegree
                     .get_mut(target)
                     .expect("edge target initialized in indegree map");
@@ -882,6 +1192,7 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
 }
 
 fn layout_node_sort_key(model: &GraphModel, id: &GraphNodeId) -> (String, String, String) {
+    work::visit();
     model.node(id).map_or_else(
         || (String::new(), String::new(), id.stable_key()),
         |node| {
@@ -895,6 +1206,7 @@ fn layout_node_sort_key(model: &GraphModel, id: &GraphNodeId) -> (String, String
 }
 
 fn layout_vertex_sort_key(model: &GraphModel, id: &LayoutVertexId) -> (String, String, String) {
+    work::visit();
     match id {
         LayoutVertexId::Real(id) => layout_node_sort_key(model, id),
         LayoutVertexId::Dummy { .. } => (String::new(), String::new(), id.stable_key()),
@@ -902,9 +1214,12 @@ fn layout_vertex_sort_key(model: &GraphModel, id: &LayoutVertexId) -> (String, S
 }
 
 fn reduce_crossings(model: &GraphModel, bands: &[BandId], expanded: &mut ExpandedGraph) {
+    let _phase = work::phase(work::Phase::Crossing);
+
     let mut predecessors: HashMap<LayoutVertexId, Vec<LayoutVertexId>> = HashMap::new();
     let mut successors: HashMap<LayoutVertexId, Vec<LayoutVertexId>> = HashMap::new();
     for (from, to) in &expanded.edges {
+        work::visit();
         predecessors
             .entry(to.clone())
             .or_default()
@@ -912,6 +1227,7 @@ fn reduce_crossings(model: &GraphModel, bands: &[BandId], expanded: &mut Expande
         successors.entry(from.clone()).or_default().push(to.clone());
     }
     for neighbors in predecessors.values_mut().chain(successors.values_mut()) {
+        work::visit();
         neighbors.sort_by_key(LayoutVertexId::stable_key);
         neighbors.dedup();
     }
@@ -919,7 +1235,9 @@ fn reduce_crossings(model: &GraphModel, bands: &[BandId], expanded: &mut Expande
     let vertex_bands = &expanded.bands;
     let columns = &mut expanded.columns;
     for _ in 0..BARYCENTER_SWEEPS {
+        work::visit();
         for column_idx in 1..columns.len() {
+            work::visit();
             reorder_column(
                 model,
                 bands,
@@ -930,6 +1248,7 @@ fn reduce_crossings(model: &GraphModel, bands: &[BandId], expanded: &mut Expande
             );
         }
         for column_idx in (0..columns.len().saturating_sub(1)).rev() {
+            work::visit();
             reorder_column(model, bands, vertex_bands, columns, column_idx, &successors);
         }
     }
@@ -945,23 +1264,37 @@ fn reorder_column(
 ) {
     let positions: HashMap<_, _> = columns
         .iter()
-        .flat_map(|column| column.iter().enumerate())
-        .map(|(position, id)| (id.clone(), position))
+        .flat_map(|column| {
+            work::visit();
+            column.iter().enumerate()
+        })
+        .map(|(position, id)| {
+            work::visit();
+            (id.clone(), position)
+        })
         .collect();
     let previous = columns[column_idx].clone();
     let previous_rank: HashMap<_, _> = previous
         .iter()
         .enumerate()
-        .map(|(rank, id)| (id.clone(), rank))
+        .map(|(rank, id)| {
+            work::visit();
+            (id.clone(), rank)
+        })
         .collect();
     let mut reordered = Vec::with_capacity(previous.len());
     for band in bands {
+        work::visit();
         let mut group: Vec<_> = previous
             .iter()
-            .filter(|id| vertex_bands.get(*id) == Some(band))
+            .filter(|id| {
+                work::visit();
+                vertex_bands.get(*id) == Some(band)
+            })
             .cloned()
             .collect();
         group.sort_by(|left, right| {
+            work::visit();
             let left_barycenter = barycenter(left, neighbors, &positions);
             let right_barycenter = barycenter(right, neighbors, &positions);
             left_barycenter
@@ -987,7 +1320,10 @@ fn barycenter(
     };
     let positions: Vec<_> = neighbors
         .iter()
-        .filter_map(|neighbor| positions.get(neighbor).copied())
+        .filter_map(|neighbor| {
+            work::visit();
+            positions.get(neighbor).copied()
+        })
         .collect();
     if positions.is_empty() {
         f32::INFINITY
@@ -1051,10 +1387,17 @@ fn edges_by_column_pair(expanded: &ExpandedGraph) -> Vec<Vec<(LayoutVertexId, La
         .columns
         .iter()
         .enumerate()
-        .flat_map(|(column, vertices)| vertices.iter().map(move |id| (id.clone(), column)))
+        .flat_map(|(column, vertices)| {
+            work::visit();
+            vertices.iter().map(move |id| {
+                work::visit();
+                (id.clone(), column)
+            })
+        })
         .collect();
     let mut pairs = vec![Vec::new(); expanded.columns.len().saturating_sub(1)];
     for (from, to) in &expanded.edges {
+        work::visit();
         let (Some(&from_column), Some(&to_column)) =
             (columns_by_vertex.get(from), columns_by_vertex.get(to))
         else {
@@ -1065,6 +1408,7 @@ fn edges_by_column_pair(expanded: &ExpandedGraph) -> Vec<Vec<(LayoutVertexId, La
         }
     }
     for edges in &mut pairs {
+        work::visit();
         edges.sort_by_key(|(left, right)| (left.stable_key(), right.stable_key()));
         edges.dedup();
     }
@@ -1077,12 +1421,18 @@ fn pair_crossing_count(
 ) -> usize {
     let mut coordinates: Vec<_> = edges
         .iter()
-        .filter_map(|(left, right)| Some((*positions.get(left)?, *positions.get(right)?)))
+        .filter_map(|(left, right)| {
+            work::visit();
+            Some((*positions.get(left)?, *positions.get(right)?))
+        })
         .collect();
     coordinates.sort_unstable();
     let right_size = coordinates
         .iter()
-        .map(|(_, right)| *right)
+        .map(|(_, right)| {
+            work::visit();
+            *right
+        })
         .max()
         .map_or(0, |position| position + 2);
     let mut fenwick = vec![0_usize; right_size + 1];
@@ -1090,6 +1440,7 @@ fn pair_crossing_count(
     fn add(fenwick: &mut [usize], position: usize) {
         let mut index = position + 1;
         while index < fenwick.len() {
+            work::visit();
             fenwick[index] += 1;
             index += 1_usize << index.trailing_zeros();
         }
@@ -1099,6 +1450,7 @@ fn pair_crossing_count(
         let mut index = position + 1;
         let mut sum = 0;
         while index > 0 {
+            work::visit();
             sum += fenwick[index];
             index &= index - 1;
         }
@@ -1109,15 +1461,19 @@ fn pair_crossing_count(
     let mut seen = 0;
     let mut group_start = 0;
     while group_start < coordinates.len() {
+        work::visit();
         let left_position = coordinates[group_start].0;
         let mut group_end = group_start + 1;
         while group_end < coordinates.len() && coordinates[group_end].0 == left_position {
+            work::visit();
             group_end += 1;
         }
         for &(_, right_position) in &coordinates[group_start..group_end] {
+            work::visit();
             crossings += seen - prefix_sum(&fenwick, right_position);
         }
         for &(_, right_position) in &coordinates[group_start..group_end] {
+            work::visit();
             add(&mut fenwick, right_position);
             seen += 1;
         }
@@ -1126,77 +1482,167 @@ fn pair_crossing_count(
     crossings
 }
 
+// Swapping neighboring vertices changes only crossings between edges incident
+// to those vertices. Equal opposite endpoints never cross. For non-adjacent
+// vertices the caller additionally considers each intervening vertex.
+fn exchanged_edge_crossings(
+    upper: &LayoutVertexId,
+    lower: &LayoutVertexId,
+    neighbors: &HashMap<LayoutVertexId, Vec<LayoutVertexId>>,
+    positions: &HashMap<LayoutVertexId, usize>,
+) -> (usize, usize) {
+    let neighbor_positions = |vertex| {
+        let mut ordered: Vec<_> = neighbors
+            .get(vertex)
+            .into_iter()
+            .flatten()
+            .map(|neighbor| {
+                work::visit();
+                positions[neighbor]
+            })
+            .collect();
+        ordered.sort_unstable();
+        ordered
+    };
+    let upper_positions = neighbor_positions(upper);
+    let lower_positions = neighbor_positions(lower);
+    let mut before = 0;
+    let mut after = 0;
+    let mut less = 0;
+    let mut through = 0;
+    // Merge the ordered endpoints rather than comparing every pair of edges:
+    // two high-degree vertices must not make one swap quadratic.
+    for upper_position in upper_positions {
+        work::visit();
+        while less < lower_positions.len() {
+            work::visit();
+            if lower_positions[less] >= upper_position {
+                break;
+            }
+            less += 1;
+        }
+        through = through.max(less);
+        while through < lower_positions.len() {
+            work::visit();
+            if lower_positions[through] > upper_position {
+                break;
+            }
+            through += 1;
+        }
+        before += less;
+        after += lower_positions.len() - through;
+    }
+    (before, after)
+}
+
 fn refine_crossings(bands: &[BandId], expanded: &mut ExpandedGraph) {
+    let _phase = work::phase(work::Phase::Crossing);
+
     let pair_edges = edges_by_column_pair(expanded);
     let mut positions: HashMap<_, _> = expanded
         .columns
         .iter()
         .flat_map(|column| {
-            column
-                .iter()
-                .enumerate()
-                .map(|(position, id)| (id.clone(), position))
+            work::visit();
+            column.iter().enumerate().map(|(position, id)| {
+                work::visit();
+                (id.clone(), position)
+            })
         })
         .collect();
-    let mut pair_crossings: Vec<_> = pair_edges
+    let pair_crossings: Vec<_> = pair_edges
         .iter()
-        .map(|edges| pair_crossing_count(edges, &positions))
+        .map(|edges| {
+            work::visit();
+            pair_crossing_count(edges, &positions)
+        })
         .collect();
 
+    // Zero is a global minimum: no adjacent swap can improve this layout.
+    // Avoid rescanning all edges for each pair of already optimal vertices.
+    if pair_crossings.iter().all(|crossings| {
+        work::visit();
+        *crossings == 0
+    }) {
+        return;
+    }
+
+    let mut incoming: HashMap<LayoutVertexId, Vec<LayoutVertexId>> = HashMap::new();
+    let mut outgoing: HashMap<LayoutVertexId, Vec<LayoutVertexId>> = HashMap::new();
+    for edges in &pair_edges {
+        work::visit();
+        for (from, to) in edges {
+            work::visit();
+            incoming.entry(to.clone()).or_default().push(from.clone());
+            outgoing.entry(from.clone()).or_default().push(to.clone());
+        }
+    }
+
     for sweep in 0..SWAP_REFINEMENT_SWEEPS {
+        work::visit();
         let mut improved = false;
         let mut columns: Vec<_> = (0..expanded.columns.len()).collect();
         if sweep % 2 == 1 {
             columns.reverse();
         }
         for column_idx in columns {
+            work::visit();
             let mut sweep_bands: Vec<_> = bands.iter().collect();
             if sweep % 2 == 1 {
                 sweep_bands.reverse();
             }
             for band in sweep_bands {
+                work::visit();
                 let indices: Vec<_> = expanded.columns[column_idx]
                     .iter()
                     .enumerate()
                     .filter_map(|(index, id)| {
+                        work::visit();
                         (expanded.bands.get(id) == Some(band)).then_some(index)
                     })
                     .collect();
-                let mut pairs: Vec<_> = indices.windows(2).map(|pair| (pair[0], pair[1])).collect();
+                let mut pairs: Vec<_> = indices
+                    .windows(2)
+                    .map(|pair| {
+                        work::visit();
+                        (pair[0], pair[1])
+                    })
+                    .collect();
                 if sweep % 2 == 1 {
                     pairs.reverse();
                 }
                 for (left, right) in pairs {
-                    let mut affected_pairs = Vec::with_capacity(2);
-                    if column_idx > 0 {
-                        affected_pairs.push(column_idx - 1);
-                    }
-                    if column_idx < pair_edges.len() {
-                        affected_pairs.push(column_idx);
-                    }
-                    let before: usize = affected_pairs
-                        .iter()
-                        .map(|pair| pair_crossings[*pair])
-                        .sum();
-                    let left_id = expanded.columns[column_idx][left].clone();
-                    let right_id = expanded.columns[column_idx][right].clone();
-                    expanded.columns[column_idx].swap(left, right);
-                    positions.insert(left_id.clone(), right);
-                    positions.insert(right_id.clone(), left);
-                    let updated: Vec<_> = affected_pairs
-                        .iter()
-                        .map(|pair| pair_crossing_count(&pair_edges[*pair], &positions))
-                        .collect();
-                    let after: usize = updated.iter().sum();
-                    if after < before {
-                        improved = true;
-                        for (pair, crossings) in affected_pairs.iter().zip(updated) {
-                            pair_crossings[*pair] = crossings;
+                    work::swap_attempt();
+                    let column = &expanded.columns[column_idx];
+                    let left_id = &column[left];
+                    let right_id = &column[right];
+                    let mut before = 0;
+                    let mut after = 0;
+                    for neighbors in [&incoming, &outgoing] {
+                        work::visit();
+                        let (old, new) =
+                            exchanged_edge_crossings(left_id, right_id, neighbors, &positions);
+                        before += old;
+                        after += new;
+                        // Bands are normally contiguous. Also handle a swap
+                        // across intervening bands exactly, as the old recount did.
+                        for middle in &column[left + 1..right] {
+                            work::visit();
+                            for (upper, lower) in [(left_id, middle), (middle, right_id)] {
+                                work::visit();
+                                let (old, new) =
+                                    exchanged_edge_crossings(upper, lower, neighbors, &positions);
+                                before += old;
+                                after += new;
+                            }
                         }
-                    } else {
+                    }
+                    if after < before {
+                        work::accepted_swap();
+                        improved = true;
+                        positions.insert(left_id.clone(), right);
+                        positions.insert(right_id.clone(), left);
                         expanded.columns[column_idx].swap(left, right);
-                        positions.insert(left_id, left);
-                        positions.insert(right_id, right);
                     }
                 }
             }
@@ -1212,38 +1658,54 @@ fn relax_coordinates(
     band_bounds: &[BandBounds],
     vertices: &mut [PositionedVertex],
 ) {
+    let _phase = work::phase(work::Phase::Relaxation);
+
     let mut neighbors: HashMap<LayoutVertexId, Vec<LayoutVertexId>> = HashMap::new();
     for (from, to) in &expanded.edges {
+        work::visit();
         neighbors.entry(from.clone()).or_default().push(to.clone());
         neighbors.entry(to.clone()).or_default().push(from.clone());
     }
     for adjacent in neighbors.values_mut() {
+        work::visit();
         adjacent.sort_by_key(LayoutVertexId::stable_key);
         adjacent.dedup();
     }
     let vertex_index: HashMap<_, _> = vertices
         .iter()
         .enumerate()
-        .map(|(index, vertex)| (vertex.id.clone(), index))
+        .map(|(index, vertex)| {
+            work::visit();
+            (vertex.id.clone(), index)
+        })
         .collect();
     let bounds_by_band: HashMap<_, _> = band_bounds
         .iter()
-        .map(|bounds| (bounds.id.clone(), bounds))
+        .map(|bounds| {
+            work::visit();
+            (bounds.id.clone(), bounds)
+        })
         .collect();
 
     for _ in 0..RELAXATION_ITERATIONS {
+        work::visit();
         let prior: HashMap<_, _> = vertices
             .iter()
-            .map(|vertex| (vertex.id.clone(), vertex.center_y))
+            .map(|vertex| {
+                work::visit();
+                (vertex.id.clone(), vertex.center_y)
+            })
             .collect();
         let mut desired = HashMap::new();
         for vertex in vertices.iter() {
+            work::visit();
             let Some(adjacent) = neighbors.get(&vertex.id) else {
                 desired.insert(vertex.id.clone(), vertex.center_y);
                 continue;
             };
             let mut positions = Vec::new();
             for neighbor in adjacent {
+                work::visit();
                 if let Some(&center) = prior.get(neighbor) {
                     let weight = match neighbor {
                         LayoutVertexId::Real(_) => 2,
@@ -1265,10 +1727,15 @@ fn relax_coordinates(
         }
 
         for (column_idx, column) in expanded.columns.iter().enumerate() {
+            work::visit();
             for bounds in band_bounds {
+                work::visit();
                 let ids: Vec<_> = column
                     .iter()
-                    .filter(|id| expanded.bands.get(*id) == Some(&bounds.id))
+                    .filter(|id| {
+                        work::visit();
+                        expanded.bands.get(*id) == Some(&bounds.id)
+                    })
                     .collect();
                 if ids.is_empty() {
                     continue;
@@ -1281,10 +1748,10 @@ fn relax_coordinates(
                     expanded,
                     vertices,
                 );
-                debug_assert!(
-                    ids.iter()
-                        .all(|id| { vertices[vertex_index[*id]].column == column_idx })
-                );
+                debug_assert!(ids.iter().all(|id| {
+                    work::visit();
+                    vertices[vertex_index[*id]].column == column_idx
+                }));
             }
         }
     }
@@ -1301,6 +1768,7 @@ fn project_centers(
     let mut centers: Vec<_> = ids
         .iter()
         .map(|id| {
+            work::visit();
             let vertex = &vertices[vertex_index[*id]];
             desired[id].clamp(
                 bounds.content_top + vertex.height / 2.0,
@@ -1310,6 +1778,7 @@ fn project_centers(
         .collect();
 
     for index in 1..centers.len() {
+        work::visit();
         let previous = &vertices[vertex_index[ids[index - 1]]];
         let current = &vertices[vertex_index[ids[index]]];
         let gap = vertex_gap(expanded, ids[index - 1], ids[index]);
@@ -1320,6 +1789,7 @@ fn project_centers(
         let last_vertex = &vertices[vertex_index[ids[last]]];
         centers[last] = centers[last].min(bounds.content_bottom - last_vertex.height / 2.0);
         for index in (0..last).rev() {
+            work::visit();
             let current = &vertices[vertex_index[ids[index]]];
             let next = &vertices[vertex_index[ids[index + 1]]];
             let gap = vertex_gap(expanded, ids[index], ids[index + 1]);
@@ -1329,6 +1799,7 @@ fn project_centers(
         let first_vertex = &vertices[vertex_index[ids[0]]];
         centers[0] = centers[0].max(bounds.content_top + first_vertex.height / 2.0);
         for index in 1..centers.len() {
+            work::visit();
             let previous = &vertices[vertex_index[ids[index - 1]]];
             let current = &vertices[vertex_index[ids[index]]];
             let gap = vertex_gap(expanded, ids[index - 1], ids[index]);
@@ -1338,6 +1809,7 @@ fn project_centers(
     }
 
     for (id, center) in ids.iter().zip(centers) {
+        work::visit();
         vertices[vertex_index[*id]].center_y = center;
     }
 }
@@ -1349,12 +1821,21 @@ fn build_edge_routes(
     column_x: &[f32],
     column_widths: &[f32],
 ) -> Vec<EdgeRoute> {
-    let node_rects: HashMap<_, _> = nodes.iter().map(|node| (node.id.clone(), node)).collect();
+    let _phase = work::phase(work::Phase::Routing);
+
+    let node_rects: HashMap<_, _> = nodes
+        .iter()
+        .map(|node| {
+            work::visit();
+            (node.id.clone(), node)
+        })
+        .collect();
     let gate_offset = COLUMN_GAP * 0.18;
     let mut routes: Vec<_> = expanded
         .routes
         .iter()
         .filter_map(|route| {
+            work::visit();
             let (from_rect, to_rect) = (node_rects.get(&route.from)?, node_rects.get(&route.to)?);
             if route.is_reference
                 && (from_rect.column == to_rect.column || from_rect.column == to_rect.column + 1)
@@ -1388,6 +1869,7 @@ fn build_edge_routes(
                 .skip(1)
                 .take(route.vertices.len().saturating_sub(2))
             {
+                work::visit();
                 let LayoutVertexId::Dummy { column, .. } = vertex else {
                     continue;
                 };
@@ -1438,9 +1920,12 @@ fn build_edge_routes(
 }
 
 fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId, &NodeRect>) {
+    let _phase = work::phase(work::Phase::Ports);
+
     let mut groups: HashMap<(GraphNodeId, CardSide), Vec<PortEndpoint>> = HashMap::new();
 
     for (route_index, route) in routes.iter().enumerate() {
+        work::visit();
         let (Some(from_rect), Some(to_rect), Some(start), Some(end)) = (
             node_rects.get(&route.from),
             node_rects.get(&route.to),
@@ -1466,6 +1951,7 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
             ),
         ];
         for (card, side, endpoint, other, other_key) in endpoints {
+            work::visit();
             let Some(side) = side else {
                 continue;
             };
@@ -1488,10 +1974,12 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
     }
 
     for ((card, side), endpoints) in &mut groups {
+        work::visit();
         let Some(rect) = node_rects.get(card) else {
             continue;
         };
         endpoints.sort_by(|left, right| {
+            work::visit();
             left.other_primary
                 .total_cmp(&right.other_primary)
                 .then_with(|| left.other_secondary.total_cmp(&right.other_secondary))
@@ -1511,6 +1999,7 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
         };
         let count = endpoints.len();
         for (index, endpoint) in endpoints.iter().enumerate() {
+            work::visit();
             let coordinate = if count == 1 {
                 (minimum + maximum) / 2.0
             } else {
@@ -1526,12 +2015,14 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
     }
 
     for route in routes {
+        work::visit();
         expand_shifted_direct_route(route, node_rects);
         route.points.dedup();
     }
 }
 
 fn card_side(rect: &NodeRect, point: Point) -> Option<CardSide> {
+    work::visit();
     if point.x == rect.x {
         Some(CardSide::Left)
     } else if point.x == rect.x + rect.width {
@@ -1546,6 +2037,7 @@ fn card_side(rect: &NodeRect, point: Point) -> Option<CardSide> {
 }
 
 fn set_route_port(route: &mut EdgeRoute, endpoint: RouteEndpoint, side: CardSide, coordinate: f32) {
+    work::visit();
     let endpoint_index = match endpoint {
         RouteEndpoint::Start => 0,
         RouteEndpoint::End => route.points.len() - 1,
@@ -1572,6 +2064,7 @@ fn expand_shifted_direct_route(
     route: &mut EdgeRoute,
     node_rects: &HashMap<GraphNodeId, &NodeRect>,
 ) {
+    work::visit();
     if route.points.len() != 2 {
         return;
     }
@@ -1606,6 +2099,7 @@ fn expand_shifted_direct_route(
 }
 
 fn short_reference_route(from: &NodeRect, to: &NodeRect) -> Vec<Point> {
+    work::visit();
     let from_top = from.y;
     let from_bottom = from.y + from.height;
     let to_top = to.y;
@@ -1742,7 +2236,6 @@ fn edge_route_intersects_rect(route: &EdgeRoute, rect: &NodeRect) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::time::{Duration, Instant};
 
     use carina_core::effect::{Effect, EffectGeneration};
     use carina_core::executor::{PlanSchedulerPhase, UnresolvedResource};
@@ -2837,7 +3330,13 @@ mod tests {
         }
         let model = model_for(&plan, &resources, None);
 
-        let (before, after) = crossing_counts_before_and_after_refinement(&model);
+        let ((before, after), _) =
+            work::measure(|| crossing_counts_before_and_after_refinement(&model));
+        assert!(work::swaps().0 > 0, "nonzero crossings must attempt swaps");
+        assert!(
+            work::swaps().1 > 0,
+            "the fixture must accept an improving swap"
+        );
 
         assert_eq!(before, 2, "fixture must retain crossings after barycenter");
         assert_eq!(after, 0, "adjacent swaps must remove those crossings");
@@ -2958,32 +3457,459 @@ mod tests {
         }
     }
 
-    #[test]
-    fn layout_of_fifteen_hundred_nodes_completes_quickly_in_debug() {
-        const HALF: usize = 750;
-        let mut desired = Vec::with_capacity(HALF * 2);
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GrowthFixture {
+        ReversedMatching,
+        Swappable,
+        SharedHubs,
+        ReferenceHub,
+        ReferenceChain,
+    }
+
+    fn growth_model(nodes: usize, fixture: GrowthFixture) -> GraphModel {
+        let mut desired = Vec::new();
+        if fixture == GrowthFixture::SharedHubs {
+            let sources: Vec<_> = (0..nodes - 2)
+                .map(|index| format!("source_{index:04}"))
+                .collect();
+            for name in &sources {
+                desired.push(resource(name, &[]));
+            }
+            let refs: Vec<_> = sources.iter().map(String::as_str).collect();
+            for hub in 0..2 {
+                desired.push(resource(&format!("hub_{hub}"), &refs));
+            }
+        } else if fixture == GrowthFixture::Swappable {
+            // Replicate the nonzero-after-barycenter regression fixture. Its
+            // degree stays bounded as the graph grows; swap work must scale too.
+            const DEPS: [&[usize]; 9] = [&[], &[], &[0], &[], &[2], &[], &[2], &[0], &[3, 4, 5]];
+            for block in 0..nodes / 9 {
+                for (index, dependencies) in DEPS.iter().enumerate() {
+                    let names: Vec<_> = dependencies
+                        .iter()
+                        .map(|dep| format!("r{block:04}_n{dep}"))
+                        .collect();
+                    let refs: Vec<_> = names.iter().map(String::as_str).collect();
+                    desired.push(resource(&format!("r{block:04}_n{index}"), &refs));
+                }
+            }
+            while desired.len() < nodes {
+                desired.push(resource(&format!("isolated_{:04}", desired.len()), &[]));
+            }
+        } else {
+            for index in 0..nodes / 2 {
+                desired.push(resource(&format!("source_{index:04}"), &[]));
+            }
+            for index in 0..nodes / 2 {
+                desired.push(resource(
+                    &format!("target_{index:04}"),
+                    &[&format!("source_{:04}", nodes / 2 - index - 1)],
+                ));
+            }
+        }
         let mut plan = Plan::new();
-        for index in 0..HALF {
-            let source = resource(&format!("source_{index:04}"), &[]);
-            plan.add(Effect::Create(source.clone()));
-            desired.push(source);
+        for resource in &desired {
+            plan.add(Effect::Create(resource.clone()));
         }
-        for index in 0..HALF {
-            let dependency = format!("source_{:04}", HALF - index - 1);
-            let target = resource(&format!("target_{index:04}"), &[&dependency]);
-            plan.add(Effect::Create(target.clone()));
-            desired.push(target);
+        let mut model = model_for(&plan, &desired, None);
+        if matches!(
+            fixture,
+            GrowthFixture::ReferenceHub | GrowthFixture::ReferenceChain
+        ) {
+            // Reference-only constraints exercise incremental cycle detection:
+            // a hub has growing fan-out, and reverse chain insertion repeatedly
+            // searches a growing accepted path in the original implementation.
+            let mut ids: Vec<_> = model.nodes.iter().map(|node| node.id.clone()).collect();
+            ids.sort_by_key(GraphNodeId::stable_key);
+            model.ordering_edges.clear();
+            model.reference_edges = if fixture == GrowthFixture::ReferenceHub {
+                ids[1..]
+                    .iter()
+                    .map(|to| super::super::model::GraphEdge {
+                        from: ids[0].clone(),
+                        to: to.clone(),
+                        highlight: None,
+                    })
+                    .collect()
+            } else {
+                ids.windows(2)
+                    .map(|pair| super::super::model::GraphEdge {
+                        from: pair[1].clone(),
+                        to: pair[0].clone(),
+                        highlight: None,
+                    })
+                    .collect()
+            };
         }
-        let model = model_for(&plan, &desired, None);
+        model
+    }
 
-        let started = Instant::now();
-        let layout = layout_graph(&model);
-        let elapsed = started.elapsed();
-
-        assert_eq!(layout.nodes.len(), HALF * 2);
+    #[test]
+    fn layout_work_grows_at_most_n_log_n() {
+        let mut failures = Vec::new();
+        let mut measurements = Vec::new();
+        for fixture in [
+            GrowthFixture::ReversedMatching,
+            GrowthFixture::Swappable,
+            GrowthFixture::SharedHubs,
+            GrowthFixture::ReferenceHub,
+            GrowthFixture::ReferenceChain,
+        ] {
+            let measure = |nodes| {
+                let model = growth_model(nodes, fixture);
+                let (layout, units) = work::measure(|| layout_graph(&model));
+                assert_eq!(layout.nodes.len(), nodes);
+                assert!(units > 0);
+                if matches!(
+                    fixture,
+                    GrowthFixture::Swappable | GrowthFixture::SharedHubs
+                ) {
+                    assert!(
+                        work::swaps().0 > 0,
+                        "growth fixture must enter the swap loop"
+                    );
+                    if fixture == GrowthFixture::Swappable {
+                        assert!(work::swaps().1 > 0, "growth fixture must improve crossings");
+                    }
+                }
+                (units, work::counts())
+            };
+            let (small, small_phases) = measure(500);
+            let (large, large_phases) = measure(1500);
+            // Count actual loop/callback visits, sorting comparisons, character
+            // scans, DFS/Fenwick steps and swap attempts throughout layout_graph:
+            // layering, edge expansion, crossing reduction, placement, coordinate
+            // relaxation, route construction and port spreading. Guard each phase
+            // as well as the total so linear work cannot mask a quadratic phase.
+            // 4.5x permits n*log(n) growth (<3.6x) at these fixture sizes.
+            for (index, phase) in work::PHASES.iter().enumerate() {
+                measurements.push(format!(
+                    "fixture={fixture:?}, phase={phase:?}: work 500={}, 1500={}",
+                    small_phases[index], large_phases[index]
+                ));
+            }
+            measurements.push(format!(
+                "fixture={fixture:?}: work 500={small}, 1500={large}"
+            ));
+            if large * 2 > small * 9 {
+                failures.push(format!(
+                    "fixture={fixture:?}: layout work 500={small}, 1500={large}"
+                ));
+            }
+            for (index, phase) in work::PHASES.iter().enumerate() {
+                if large_phases[index] * 2 > small_phases[index] * 9 {
+                    failures.push(format!(
+                        "fixture={fixture:?}, phase={phase:?}: work 500={}, 1500={}",
+                        small_phases[index], large_phases[index]
+                    ));
+                }
+            }
+        }
         assert!(
-            elapsed < Duration::from_secs(5),
-            "1500-node layout took {elapsed:?}"
+            failures.is_empty(),
+            "{}\nMeasured work:\n{}",
+            failures.join("\n"),
+            measurements.join("\n")
         );
+    }
+
+    // Keep the pre-change implementation as an independent ordering reference,
+    // including its full edge recount after every proposed swap and no shortcut.
+    fn refine_crossings_full_recount(bands: &[BandId], expanded: &mut ExpandedGraph) {
+        let pair_edges = edges_by_column_pair(expanded);
+        let mut positions: HashMap<_, _> = expanded
+            .columns
+            .iter()
+            .flat_map(|column| {
+                column
+                    .iter()
+                    .enumerate()
+                    .map(|(position, id)| (id.clone(), position))
+            })
+            .collect();
+        let mut pair_crossings: Vec<_> = pair_edges
+            .iter()
+            .map(|edges| pair_crossing_count(edges, &positions))
+            .collect();
+
+        // Intentionally continue at zero to verify the production shortcut.
+        for sweep in 0..SWAP_REFINEMENT_SWEEPS {
+            let mut improved = false;
+            let mut columns: Vec<_> = (0..expanded.columns.len()).collect();
+            if sweep % 2 == 1 {
+                columns.reverse();
+            }
+            for column_idx in columns {
+                let mut sweep_bands: Vec<_> = bands.iter().collect();
+                if sweep % 2 == 1 {
+                    sweep_bands.reverse();
+                }
+                for band in sweep_bands {
+                    let indices: Vec<_> = expanded.columns[column_idx]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, id)| {
+                            (expanded.bands.get(id) == Some(band)).then_some(index)
+                        })
+                        .collect();
+                    let mut pairs: Vec<_> =
+                        indices.windows(2).map(|pair| (pair[0], pair[1])).collect();
+                    if sweep % 2 == 1 {
+                        pairs.reverse();
+                    }
+                    for (left, right) in pairs {
+                        let mut affected_pairs = Vec::with_capacity(2);
+                        if column_idx > 0 {
+                            affected_pairs.push(column_idx - 1);
+                        }
+                        if column_idx < pair_edges.len() {
+                            affected_pairs.push(column_idx);
+                        }
+                        let before: usize = affected_pairs
+                            .iter()
+                            .map(|pair| pair_crossings[*pair])
+                            .sum();
+                        let left_id = expanded.columns[column_idx][left].clone();
+                        let right_id = expanded.columns[column_idx][right].clone();
+                        expanded.columns[column_idx].swap(left, right);
+                        positions.insert(left_id.clone(), right);
+                        positions.insert(right_id.clone(), left);
+                        let updated: Vec<_> = affected_pairs
+                            .iter()
+                            .map(|pair| pair_crossing_count(&pair_edges[*pair], &positions))
+                            .collect();
+                        let after: usize = updated.iter().sum();
+                        if after < before {
+                            improved = true;
+                            for (pair, crossings) in affected_pairs.iter().zip(updated) {
+                                pair_crossings[*pair] = crossings;
+                            }
+                        } else {
+                            expanded.columns[column_idx].swap(left, right);
+                            positions.insert(left_id, left);
+                            positions.insert(right_id, right);
+                        }
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_refinement_matches_full_recounts_on_random_graphs() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *seed
+        }
+        let mut seed = 0x4027_1234_5678_abcd;
+        let mut zero_crossing_cases = 0;
+        let mut nonzero_crossing_cases = 0;
+        for case in 0..160 {
+            let column_count = (next(&mut seed) % 4 + 2) as usize;
+            let mut next_id = 0;
+            let mut columns = Vec::new();
+            for _ in 0..column_count {
+                let count = (next(&mut seed) % 7 + 1) as usize;
+                let mut column = Vec::new();
+                for _ in 0..count {
+                    column.push(LayoutVertexId::Real(GraphNodeId::Effect(next_id)));
+                    next_id += 1;
+                }
+                columns.push(column);
+            }
+            let mut edges = Vec::new();
+            for pair in columns.windows(2) {
+                for from in &pair[0] {
+                    for to in &pair[1] {
+                        if next(&mut seed).is_multiple_of(3) && case != 0 {
+                            edges.push((from.clone(), to.clone()));
+                        }
+                    }
+                }
+            }
+            let other_band = BandId::Module(EphemeralId::new(
+                carina_core::resource::ResolvedResourceId::new(
+                    carina_core::resource::ResourceId::with_identity("test.Module", "secondary"),
+                ),
+            ));
+            let bands = columns
+                .iter()
+                .flatten()
+                .cloned()
+                .enumerate()
+                .map(|(index, id)| {
+                    let band = if case % 3 == 0 && index % 2 == 1 {
+                        other_band.clone()
+                    } else {
+                        BandId::Root
+                    };
+                    (id, band)
+                })
+                .collect();
+            let band_order = [BandId::Root, other_band];
+            let original = ExpandedGraph {
+                columns,
+                edges,
+                routes: Vec::new(),
+                bands,
+                same_column_reference_pairs: HashSet::new(),
+            };
+            let mut actual = original.clone();
+            let mut expected = original.clone();
+            work::measure(|| refine_crossings(&band_order, &mut actual));
+            if crossing_count(&original.columns, &original.edges) == 0 {
+                zero_crossing_cases += 1;
+                assert_eq!(work::swaps().0, 0, "zero crossings must take the shortcut");
+            } else {
+                nonzero_crossing_cases += 1;
+            }
+            refine_crossings_full_recount(&band_order, &mut expected);
+            assert_eq!(actual.columns, expected.columns, "case {case}");
+        }
+        assert!(zero_crossing_cases > 0);
+        assert!(nonzero_crossing_cases > 0);
+    }
+    fn graph_layering_full_walk(model: &GraphModel) -> Layering {
+        let mut layering = cycle_removed_layering(model);
+        let mut constraint_edges = layering.edges.clone();
+        let mut accepted: HashMap<GraphNodeId, Vec<GraphNodeId>> = HashMap::new();
+        for edge in &constraint_edges {
+            accepted
+                .entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
+        }
+        for targets in accepted.values_mut() {
+            targets.sort_by_key(GraphNodeId::stable_key);
+            targets.dedup();
+        }
+
+        let visible: HashSet<_> = model.nodes.iter().map(|node| node.id.clone()).collect();
+        let mut references = model.reference_edges.clone();
+        references.sort_by_key(|edge| (edge.from.stable_key(), edge.to.stable_key()));
+        // Ordering constraints are already present in `accepted`. Add references
+        // deterministically only while the constraint graph remains acyclic.
+        for edge in &references {
+            if !visible.contains(&edge.from)
+                || !visible.contains(&edge.to)
+                || path_exists_full_walk(&accepted, &edge.to, &edge.from)
+            {
+                continue;
+            }
+            let targets = accepted.entry(edge.from.clone()).or_default();
+            targets.push(edge.to.clone());
+            targets.sort_by_key(GraphNodeId::stable_key);
+            targets.dedup();
+            constraint_edges.push(OrientedEdge {
+                actual_from: edge.from.clone(),
+                actual_to: edge.to.clone(),
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                reversed: false,
+                is_reference: true,
+            });
+        }
+        layering.layers = longest_path_layers(model, &constraint_edges);
+
+        for edge in references {
+            let (Some(from_column), Some(to_column)) = (
+                layering.layers.get(&edge.from).copied(),
+                layering.layers.get(&edge.to).copied(),
+            ) else {
+                continue;
+            };
+            let reversed = from_column > to_column;
+            let (from, to) = if reversed {
+                (edge.to.clone(), edge.from.clone())
+            } else {
+                (edge.from.clone(), edge.to.clone())
+            };
+            layering.edges.push(OrientedEdge {
+                actual_from: edge.from.clone(),
+                actual_to: edge.to.clone(),
+                from,
+                to,
+                reversed,
+                is_reference: true,
+            });
+        }
+        layering
+            .edges
+            .sort_by_key(|edge| (edge.actual_from.stable_key(), edge.actual_to.stable_key()));
+        layering
+    }
+
+    fn path_exists_full_walk(
+        adjacency: &HashMap<GraphNodeId, Vec<GraphNodeId>>,
+        from: &GraphNodeId,
+        to: &GraphNodeId,
+    ) -> bool {
+        let mut stack = vec![from.clone()];
+        let mut visited = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if id == *to {
+                return true;
+            }
+            if let Some(adjacent) = adjacency.get(&id) {
+                stack.extend(adjacent.iter().cloned());
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn incremental_layering_matches_full_walks_on_reference_graphs() {
+        fn assert_same(model: &GraphModel) {
+            let actual = graph_layering(model);
+            let expected = graph_layering_full_walk(model);
+            assert_eq!(actual.layers, expected.layers);
+            let describe = |edges: Vec<OrientedEdge>| {
+                edges
+                    .into_iter()
+                    .map(|edge| {
+                        (
+                            edge.actual_from,
+                            edge.actual_to,
+                            edge.from,
+                            edge.to,
+                            edge.reversed,
+                            edge.is_reference,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(describe(actual.edges), describe(expected.edges));
+        }
+        for fixture in [GrowthFixture::ReferenceHub, GrowthFixture::ReferenceChain] {
+            assert_same(&growth_model(80, fixture));
+        }
+        let mut seed = 0x4027_ffff_1234_abcd_u64;
+        for case in 0..160 {
+            let mut model = growth_model(8 + case % 17, GrowthFixture::ReversedMatching);
+            model.ordering_edges.clear();
+            model.reference_edges.clear();
+            for (from_index, from) in model.nodes.iter().enumerate() {
+                for (to_index, to) in model.nodes.iter().enumerate() {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let edge = super::super::model::GraphEdge {
+                        from: from.id.clone(),
+                        to: to.id.clone(),
+                        highlight: None,
+                    };
+                    if from_index < to_index && seed.is_multiple_of(11) {
+                        model.ordering_edges.push(edge);
+                    } else if seed.is_multiple_of(7) {
+                        model.reference_edges.push(edge);
+                    }
+                }
+            }
+            assert_same(&model);
+        }
     }
 }
