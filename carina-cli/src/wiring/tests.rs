@@ -1706,7 +1706,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn failing_aws_preflight_is_typed_and_stops_before_guest_loading() {
+async fn failing_aws_provision_is_typed_and_stops_before_guest_loading() {
     let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let source_path = tmp.path().join("aws-provider.wasm");
@@ -1728,10 +1728,11 @@ async fn failing_aws_preflight_is_typed_and_stops_before_guest_loading() {
     };
     let grants = TrustedLocalGrantInputs::new(vec![format!("{}=aws", source_path.display())], None);
     let calls = Arc::new(AtomicUsize::new(0));
-    let credential_source: Arc<dyn carina_plugin_host::AwsCredentialSource> =
+    let credential_provisioner = Arc::new(CliAwsCredentialProvisioner::with_source_for_test(
         Arc::new(FailingAwsCredentialSource {
             calls: Arc::clone(&calls),
-        });
+        }),
+    ));
     let guest_started = Arc::new(AtomicBool::new(false));
     let observed_guest = Arc::clone(&guest_started);
 
@@ -1746,17 +1747,17 @@ async fn failing_aws_preflight_is_typed_and_stops_before_guest_loading() {
                 verified.identity().trust().class(),
                 carina_provider_resolver::ProviderTrustClass::Aws
             );
-            let credential_source = Arc::clone(&credential_source);
+            let credential_provisioner = Arc::clone(&credential_provisioner);
             let observed_guest = Arc::clone(&observed_guest);
             async move {
-                let _capabilities = preflight_aws_runtime_capabilities(credential_source)
-                    .await
-                    .map_err(RuntimeProviderLoadError::AwsCredentials)?;
+                carina_plugin_host::AwsCredentialProvisioner::provision(
+                    credential_provisioner.as_ref(),
+                )
+                .await
+                .map_err(carina_plugin_host::WasmProviderLoadError::AwsCredentials)?;
                 observed_guest.store(true, Ordering::SeqCst);
-                Err(RuntimeProviderLoadError::Wasm(
-                    carina_plugin_host::WasmProviderLoadError::Other(
-                        "guest loader should not be reached".to_string(),
-                    ),
+                Err(carina_plugin_host::WasmProviderLoadError::Other(
+                    "guest loader should not be reached".to_string(),
                 ))
             }
         },

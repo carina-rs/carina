@@ -115,10 +115,9 @@ fn credentials_are_fresh(credentials: &AwsCredentials, now: SystemTime) -> bool 
 fn map_credentials_error(error: CredentialsError) -> AwsCredentialError {
     let not_found = matches!(error, CredentialsError::CredentialsNotLoaded(_));
     let mut message = render_error_chain(&error);
-    if message
-        .to_ascii_lowercase()
-        .contains("sso token has expired")
-        && !message.contains("aws sso login")
+    let lowercase_message = message.to_ascii_lowercase();
+    if lowercase_message.contains("sso token has expired")
+        && !lowercase_message.contains("aws sso login")
     {
         message.push_str("; run `aws sso login` to refresh the session");
     }
@@ -276,15 +275,15 @@ mod tests {
     }
 
     #[test]
-    fn sdk_expired_sso_message_gets_a_noninteractive_login_hint() {
-        let error =
-            CredentialsError::provider_error("the SSO token has expired and cannot be refreshed");
+    fn sdk_expired_sso_message_does_not_duplicate_an_existing_login_hint() {
+        let error = CredentialsError::provider_error(
+            "the SSO token has expired and cannot be refreshed; run `AWS SSO login`",
+        );
         let mapped = map_credentials_error(error);
         assert!(matches!(mapped, AwsCredentialError::ProviderFailed(_)));
-        assert!(mapped.to_string().contains("aws sso login"));
+        let rendered = mapped.to_string().to_ascii_lowercase();
+        assert_eq!(rendered.matches("aws sso login").count(), 1, "{rendered}");
     }
-
-    static ENVIRONMENT_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct EnvironmentGuard {
         previous: Vec<(&'static str, Option<OsString>)>,
@@ -329,8 +328,8 @@ mod tests {
                 .collect();
 
             for name in NAMES {
-                // SAFETY: every environment-mutating test in this test binary
-                // holds ENVIRONMENT_LOCK for the guard's full lifetime.
+                // SAFETY: nextest runs each test in a separate process, and
+                // these environment tests use a single-threaded runtime.
                 unsafe { std::env::remove_var(name) };
             }
             let config = home.join(".aws/config");
@@ -348,11 +347,11 @@ mod tests {
                 ),
                 ("SSL_CERT_FILE", OsStr::new("/etc/ssl/cert.pem")),
             ] {
-                // SAFETY: see the serialized mutation above.
+                // SAFETY: see the process isolation above.
                 unsafe { std::env::set_var(name, value) };
             }
             if let Some(profile) = profile {
-                // SAFETY: see the serialized mutation above.
+                // SAFETY: see the process isolation above.
                 unsafe { std::env::set_var("AWS_PROFILE", profile) };
             }
 
@@ -365,13 +364,13 @@ mod tests {
             while let Some((name, previous)) = self.previous.pop() {
                 match previous {
                     Some(value) => {
-                        // SAFETY: ENVIRONMENT_LOCK remains held until after
-                        // this guard is dropped.
+                        // SAFETY: this test is the only code mutating its
+                        // process environment; see `isolated` above.
                         unsafe { std::env::set_var(name, value) };
                     }
                     None => {
-                        // SAFETY: ENVIRONMENT_LOCK remains held until after
-                        // this guard is dropped.
+                        // SAFETY: this test is the only code mutating its
+                        // process environment; see `isolated` above.
                         unsafe { std::env::remove_var(name) };
                     }
                 }
@@ -388,7 +387,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn empty_environment_returns_not_found_within_ten_seconds() {
-        let _lock = ENVIRONMENT_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         write_aws_files(home.path(), "");
         let _environment = EnvironmentGuard::isolated(home.path(), None);
@@ -416,7 +414,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn expired_nonrefreshable_sso_session_fails_promptly_without_login() {
-        let _lock = ENVIRONMENT_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let start_url = "https://d-example.awsapps.com/start";
         let session_name = "expired-session";
@@ -457,10 +454,11 @@ mod tests {
 
         assert!(matches!(error, AwsCredentialError::ProviderFailed(_)));
         let rendered = error.to_string();
-        assert!(
-            rendered.contains("aws sso login"),
-            "unexpected error: {rendered}"
+        assert_eq!(
+            rendered,
+            "an error occurred while loading credentials: an error occurred while loading credentials: an error occurred while loading an access token: the SSO token has expired and cannot be refreshed; run `aws sso login` to refresh the session"
         );
+        assert_eq!(rendered.matches("aws sso login").count(), 1);
         assert!(!rendered.contains("expired-access-token-secret"));
     }
 }

@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,8 +26,8 @@ use carina_core::resource::{
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{
-    AwsCredentialError, AwsCredentialSource, AwsCredentials, GuestCallBudget, RuntimeCapabilities,
-    WasmProviderFactory, WasmProviderLoadError,
+    AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
+    GuestCallBudget, WasmProviderFactory, WasmProviderLoadError,
 };
 use carina_provider_resolver::{
     LockFile, ProviderLoadIdentity, ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
@@ -317,6 +318,30 @@ impl AwsCredentialSource for SequenceAwsCredentialSource {
     }
 }
 
+struct FixedAwsCredentialProvisioner(Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>);
+
+impl AwsCredentialProvisioner for FixedAwsCredentialProvisioner {
+    fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+        let result = self.0.clone();
+        Box::pin(async move { result })
+    }
+}
+
+struct CountingAwsCredentialProvisioner {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AwsCredentialProvisioner for CountingAwsCredentialProvisioner {
+    fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(AwsCredentialError::ProviderFailed(
+                "non-AWS loads must not provision credentials".to_string(),
+            ))
+        })
+    }
+}
+
 fn test_aws_credentials(access_key_id: &str) -> AwsCredentials {
     AwsCredentials::new(
         access_key_id,
@@ -326,16 +351,10 @@ fn test_aws_credentials(access_key_id: &str) -> AwsCredentials {
     )
 }
 
-fn default_runtime_capabilities(class: ProviderTrustClass) -> RuntimeCapabilities {
-    match class {
-        ProviderTrustClass::Aws => RuntimeCapabilities::Aws {
-            credentials: Arc::new(FixedAwsCredentialSource(Ok(test_aws_credentials(
-                "AKIADEFAULT",
-            )))),
-        },
-        ProviderTrustClass::GitHub => RuntimeCapabilities::GitHub,
-        ProviderTrustClass::Untrusted => RuntimeCapabilities::Untrusted,
-    }
+fn default_aws_provisioner() -> FixedAwsCredentialProvisioner {
+    FixedAwsCredentialProvisioner(Ok(Arc::new(FixedAwsCredentialSource(Ok(
+        test_aws_credentials("AKIADEFAULT"),
+    )))))
 }
 
 /// Build a `WasmProviderFactory` using a per-test temporary cache directory.
@@ -350,11 +369,12 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read WASM provider");
     let load = mock_load(&wasm_bytes);
     let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = default_aws_provisioner();
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
         cache.path(),
         locked_egress.as_ref(),
-        RuntimeCapabilities::Untrusted,
+        &aws,
     )
     .await
     .expect("Failed to load WASM provider");
@@ -369,11 +389,12 @@ async fn load_aws_http_factory(
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read AWS HTTP probe WASM provider");
     let load = mock_http_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
     let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = FixedAwsCredentialProvisioner(Ok(credentials));
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
         cache.path(),
         locked_egress.as_ref(),
-        RuntimeCapabilities::Aws { credentials },
+        &aws,
     )
     .await
     .expect("Failed to load AWS HTTP probe WASM provider");
@@ -392,11 +413,12 @@ async fn load_http_factory_with_class(
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read HTTP probe WASM provider");
     let load = mock_http_load_with_class(&wasm_bytes, class);
     let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = default_aws_provisioner();
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
         cache.path(),
         locked_egress.as_ref(),
-        default_runtime_capabilities(class),
+        &aws,
     )
     .await
     .expect("Failed to load HTTP probe WASM provider");
@@ -892,9 +914,13 @@ async fn schema_only_loads_an_aws_world_without_a_credential_source() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn non_aws_kinds_cannot_instantiate_an_aws_world() {
+async fn non_aws_kinds_never_provision_and_cannot_instantiate_an_aws_world() {
     let path = skip_if_no_aws_http_wasm!();
     let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let aws = CountingAwsCredentialProvisioner {
+        calls: Arc::clone(&calls),
+    };
 
     for class in [ProviderTrustClass::GitHub, ProviderTrustClass::Untrusted] {
         let cache = tempfile::tempdir().expect("create non-AWS cache tempdir");
@@ -904,7 +930,7 @@ async fn non_aws_kinds_cannot_instantiate_an_aws_world() {
             load,
             cache.path(),
             locked_egress.as_ref(),
-            default_runtime_capabilities(class),
+            &aws,
         )
         .await;
         let error = match result {
@@ -921,6 +947,7 @@ async fn non_aws_kinds_cannot_instantiate_an_aws_world() {
             "this provider requires AWS credentials, which only an AWS-kind provider can receive"
         );
     }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

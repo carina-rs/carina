@@ -167,6 +167,15 @@ pub trait AwsCredentialSource: Send + Sync + 'static {
     fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>>;
 }
 
+/// Supplies the run-scoped credential source for an AWS-kind runtime load.
+///
+/// The host calls this only after resolver-owned trust has classified the
+/// verified artifact as AWS. Implementations may lazily construct the source
+/// and preflight it before returning.
+pub trait AwsCredentialProvisioner: Send + Sync {
+    fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>>;
+}
+
 /// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
 /// the async `BoxFuture` shape used by `Provider`, preserving its typed cause.
 fn early_provider_err<T: 'static>(
@@ -731,11 +740,8 @@ pub enum WasmProviderLoadError {
         configured: String,
         reported: String,
     },
-    /// Runtime capabilities did not match the resolver-owned trust class.
-    RuntimeCapabilityMismatch {
-        trusted_kind: &'static str,
-        capability_kind: &'static str,
-    },
+    /// Host-side AWS credential provisioning failed before guest instantiation.
+    AwsCredentials(AwsCredentialError),
     /// A non-AWS runtime component imported the AWS credential interface.
     AwsCredentialsRequired,
     /// A provider metadata export trapped or returned malformed data.
@@ -762,13 +768,7 @@ impl fmt::Display for WasmProviderLoadError {
                 f,
                 "configured provider name '{configured}' does not match artifact-reported name '{reported}'"
             ),
-            WasmProviderLoadError::RuntimeCapabilityMismatch {
-                trusted_kind,
-                capability_kind,
-            } => write!(
-                f,
-                "provider trust kind '{trusted_kind}' cannot use runtime capabilities for '{capability_kind}'"
-            ),
+            WasmProviderLoadError::AwsCredentials(error) => error.fmt(f),
             WasmProviderLoadError::AwsCredentialsRequired => f.write_str(
                 "this provider requires AWS credentials, which only an AWS-kind provider can receive",
             ),
@@ -789,7 +789,7 @@ impl std::error::Error for WasmProviderLoadError {
             Self::PrecompiledDeserialization(_)
             | Self::Instantiation(_)
             | Self::ProviderNameMismatch { .. }
-            | Self::RuntimeCapabilityMismatch { .. }
+            | Self::AwsCredentials(_)
             | Self::AwsCredentialsRequired
             | Self::Metadata { .. }
             | Self::Other(_) => None,
@@ -842,6 +842,12 @@ impl From<carina_provider_resolver::LockedEgressLoadError> for WasmProviderLoadE
 impl From<carina_provider_resolver::EgressConsentError> for WasmProviderLoadError {
     fn from(error: carina_provider_resolver::EgressConsentError) -> Self {
         Self::EgressConsent(error)
+    }
+}
+
+impl From<AwsCredentialError> for WasmProviderLoadError {
+    fn from(error: AwsCredentialError) -> Self {
+        Self::AwsCredentials(error)
     }
 }
 
@@ -1279,7 +1285,6 @@ struct AllowedHost {
 #[derive(Debug)]
 enum AllowedHostTarget {
     Name(String),
-    Literal(IpAddr),
 }
 
 /// The only destination type accepted by the TCP connection handler.
@@ -1299,10 +1304,7 @@ impl VettedDestination {
     /// no bypass constructor.
     #[cfg(any(test, feature = "test-utils"))]
     fn from_http_test_route(allowed_host: AllowedHost, destination: HttpTestDestination) -> Self {
-        let host = match allowed_host.target {
-            AllowedHostTarget::Name(host) => host,
-            AllowedHostTarget::Literal(address) => address.to_string(),
-        };
+        let AllowedHostTarget::Name(host) = allowed_host.target;
         Self {
             host,
             first: destination.address(),
@@ -1472,11 +1474,7 @@ fn check_host(network: &GuestNetwork, host: &str) -> Result<AllowedHost, Destina
             let canonical_address = canonical_policy_address(address);
             match ResolvedAddressClass::classify(canonical_address) {
                 ResolvedAddressClass::Metadata => {
-                    if capabilities.is_some_and(RuntimeCapabilities::permits_metadata) {
-                        AllowedHostTarget::Literal(canonical_address)
-                    } else {
-                        return Err(DestinationDenied::MetadataWithheld(canonical_address));
-                    }
+                    return Err(DestinationDenied::MetadataWithheld(canonical_address));
                 }
                 ResolvedAddressClass::Loopback
                 | ResolvedAddressClass::Unspecified
@@ -1517,10 +1515,7 @@ fn vet_resolved_destination(
         capabilities,
         target,
     } = allowed_host;
-    let host = match target {
-        AllowedHostTarget::Name(host) => host,
-        AllowedHostTarget::Literal(address) => address.to_string(),
-    };
+    let AllowedHostTarget::Name(host) = target;
     let private_address_policy = match &capabilities {
         Some(capabilities) => capabilities.private_address_policy(),
         None => PrivateAddressPolicy::Deny,
@@ -1529,12 +1524,7 @@ fn vet_resolved_destination(
         let canonical_ip = canonical_policy_address(address.ip());
         match ResolvedAddressClass::classify(canonical_ip) {
             ResolvedAddressClass::Metadata => {
-                if !capabilities
-                    .as_ref()
-                    .is_some_and(RuntimeCapabilities::permits_metadata)
-                {
-                    return Err((DestinationDenied::MetadataWithheld(canonical_ip), host));
-                }
+                return Err((DestinationDenied::MetadataWithheld(canonical_ip), host));
             }
             ResolvedAddressClass::Loopback => {
                 return Err((DestinationDenied::LoopbackAddressDenied(canonical_ip), host));
@@ -1703,31 +1693,27 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                     return Ok::<_, ErrorCode>(resolution);
                 }
 
-                let addresses = match &allowed_host.target {
-                    AllowedHostTarget::Name(host) => tokio::time::timeout(
-                        config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
-                        resolver.resolve(host.clone(), port),
-                    )
-                    .await
-                    .map_err(|_| {
-                        log::warn!(
-                            "WASM plugin HTTP request timed out resolving host {:?}",
-                            host,
-                        );
-                        ErrorCode::ConnectionTimeout
-                    })?
-                    .map_err(|error| {
-                        log::warn!(
-                            "WASM plugin HTTP request failed to resolve host {:?}: {}",
-                            host,
-                            error,
-                        );
-                        dns_error_code()
-                    })?,
-                    AllowedHostTarget::Literal(address) => {
-                        vec![SocketAddr::new(*address, port)]
-                    }
-                };
+                let AllowedHostTarget::Name(host) = &allowed_host.target;
+                let addresses = tokio::time::timeout(
+                    config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
+                    resolver.resolve(host.clone(), port),
+                )
+                .await
+                .map_err(|_| {
+                    log::warn!(
+                        "WASM plugin HTTP request timed out resolving host {:?}",
+                        host,
+                    );
+                    ErrorCode::ConnectionTimeout
+                })?
+                .map_err(|error| {
+                    log::warn!(
+                        "WASM plugin HTTP request failed to resolve host {:?}: {}",
+                        host,
+                        error,
+                    );
+                    dns_error_code()
+                })?;
                 Ok::<_, ErrorCode>(ResolvedAddresses::Standard(addresses))
             }
             .await;
@@ -2904,18 +2890,18 @@ impl ConfiguredProvider {
     }
 }
 
-fn checked_runtime_network(
+async fn runtime_network(
     configured: &ConfiguredProvider,
-    capabilities: RuntimeCapabilities,
     egress: ConsentedEgress,
+    aws: &dyn AwsCredentialProvisioner,
 ) -> Result<GuestNetwork, WasmProviderLoadError> {
-    let capability_kind = capabilities.kind();
-    if configured.kind != capability_kind {
-        return Err(WasmProviderLoadError::RuntimeCapabilityMismatch {
-            trusted_kind: configured.kind.name(),
-            capability_kind: capability_kind.name(),
-        });
-    }
+    let capabilities = match configured.kind {
+        ProviderKind::Aws => RuntimeCapabilities::Aws {
+            credentials: aws.provision().await?,
+        },
+        ProviderKind::GitHub => RuntimeCapabilities::GitHub,
+        ProviderKind::Untrusted => RuntimeCapabilities::Untrusted,
+    };
     Ok(GuestNetwork::Runtime {
         capabilities,
         egress,
@@ -2936,16 +2922,6 @@ enum ProviderKind {
     /// Any provider the host has no credential partition for (e.g. the mock
     /// provider). Receives the shared group only.
     Untrusted,
-}
-
-impl ProviderKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Aws => "aws",
-            Self::GitHub => "github",
-            Self::Untrusted => "untrusted",
-        }
-    }
 }
 
 /// Runtime-only capabilities granted according to resolver-owned provider
@@ -2999,18 +2975,8 @@ impl RuntimeCapabilities {
         }
     }
 
-    /// Whether metadata endpoints are reachable by this kind. This match is
-    /// deliberately adjacent to the other partitions so a new kind cannot
-    /// compile without deciding the metadata policy.
-    fn permits_metadata(&self) -> bool {
-        match self {
-            Self::Aws { credentials: _ } | Self::GitHub | Self::Untrusted => false,
-        }
-    }
-
-    /// Private-address policy for this kind. This match stays next to the
-    /// credential and metadata partitions so a new kind must decide every
-    /// network-bearing capability in one place.
+    /// Private-address policy for this kind. Metadata is withheld
+    /// unconditionally before this kind-specific policy is considered.
     fn private_address_policy(&self) -> PrivateAddressPolicy {
         match self {
             Self::Aws { credentials: _ } => PrivateAddressPolicy::Allow,
@@ -4542,13 +4508,13 @@ impl WasmProviderFactory {
         load: VerifiedLoad,
         user_dirs: &UserDirs,
         locked_egress: Option<&LockedEgress>,
-        capabilities: RuntimeCapabilities,
+        aws: &dyn AwsCredentialProvisioner,
     ) -> Result<Self, WasmProviderLoadError> {
         let declaration = VerifiedEgressDeclaration::read(&load)?;
         let egress =
             ConsentedEgress::from_lock(locked_egress, declaration, load.carina_rs_signed())?;
         let configured = ConfiguredProvider::new(load.identity());
-        let runtime_network = checked_runtime_network(&configured, capabilities, egress)?;
+        let runtime_network = runtime_network(&configured, egress, aws).await?;
         let wasm_bytes = load.bytes().clone();
         let cache_dir = user_dirs.compiled_wasm_cache_dir().to_path_buf();
         Self::from_bytes_with_cache_dir_configured(
@@ -4566,13 +4532,13 @@ impl WasmProviderFactory {
         load: VerifiedLoad,
         cache_dir: &Path,
         locked_egress: Option<&LockedEgress>,
-        capabilities: RuntimeCapabilities,
+        aws: &dyn AwsCredentialProvisioner,
     ) -> Result<Self, WasmProviderLoadError> {
         let declaration = VerifiedEgressDeclaration::read(&load)?;
         let egress =
             ConsentedEgress::from_lock(locked_egress, declaration, load.carina_rs_signed())?;
         let configured = ConfiguredProvider::new(load.identity());
-        let runtime_network = checked_runtime_network(&configured, capabilities, egress)?;
+        let runtime_network = runtime_network(&configured, egress, aws).await?;
         Self::from_bytes_with_cache_dir_configured(
             load.bytes().as_bytes(),
             cache_dir,
@@ -4634,24 +4600,15 @@ impl WasmProviderFactory {
     async fn new_uncached(
         wasm_bytes: &[u8],
         identity: ProviderLoadIdentity,
+        aws: &dyn AwsCredentialProvisioner,
     ) -> Result<Self, WasmProviderLoadError> {
         let load = VerifiedLoad::for_test(wasm_bytes, identity);
         let declaration = VerifiedEgressDeclaration::read(&load)?;
         let locked_egress = test_explicit_egress(&declaration);
         let configured = ConfiguredProvider::new(load.identity());
-        let capabilities = match configured.kind {
-            ProviderKind::GitHub => RuntimeCapabilities::GitHub,
-            ProviderKind::Untrusted => RuntimeCapabilities::Untrusted,
-            ProviderKind::Aws => {
-                return Err(WasmProviderLoadError::RuntimeCapabilityMismatch {
-                    trusted_kind: ProviderKind::Aws.name(),
-                    capability_kind: "missing",
-                });
-            }
-        };
         let egress =
             ConsentedEgress::from_lock(Some(&locked_egress), declaration, load.carina_rs_signed())?;
-        let runtime_network = checked_runtime_network(&configured, capabilities, egress)?;
+        let runtime_network = runtime_network(&configured, egress, aws).await?;
         Self::new_uncached_configured(load.bytes().as_bytes(), configured, runtime_network).await
     }
 
@@ -7398,6 +7355,31 @@ mod tests {
         }
     }
 
+    struct UnusedAwsCredentialProvisioner;
+
+    impl AwsCredentialProvisioner for UnusedAwsCredentialProvisioner {
+        fn provision(
+            &self,
+        ) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+            let source: Arc<dyn AwsCredentialSource> = Arc::new(UnusedAwsCredentialSource);
+            Box::pin(async move { Ok(source) })
+        }
+    }
+
+    struct FailingAwsCredentialProvisioner;
+
+    impl AwsCredentialProvisioner for FailingAwsCredentialProvisioner {
+        fn provision(
+            &self,
+        ) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+            Box::pin(async {
+                Err(AwsCredentialError::NotFound(
+                    "host provisioning failed before instantiation".to_string(),
+                ))
+            })
+        }
+    }
+
     fn aws_capabilities() -> RuntimeCapabilities {
         RuntimeCapabilities::Aws {
             credentials: Arc::new(UnusedAwsCredentialSource),
@@ -7503,7 +7485,7 @@ mod tests {
             second,
             cache.path(),
             Some(&first_lock),
-            RuntimeCapabilities::Untrusted,
+            &UnusedAwsCredentialProvisioner,
         )
         .await;
 
@@ -7513,6 +7495,52 @@ mod tests {
                 carina_provider_resolver::EgressConsentError::DeclarationMismatch
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn failing_aws_provision_stops_before_guest_instantiation_with_typed_error() {
+        let declaration_json = serde_json::json!({
+            "version": 1,
+            "hosts": [],
+        })
+        .to_string();
+        let mut component = EncoderComponent::new();
+        component.section(&CustomSection {
+            name: Cow::Borrowed("carina:egress"),
+            data: Cow::Owned(declaration_json.into_bytes()),
+        });
+        let load = VerifiedLoad::for_test(
+            component.finish(),
+            ProviderLoadIdentity::for_test("aws", ProviderTrustClass::Aws),
+        );
+        let declaration = VerifiedEgressDeclaration::read(&load).unwrap();
+        let locked = test_explicit_egress(&declaration);
+        let cache = tempfile::tempdir().unwrap();
+
+        let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            load,
+            cache.path(),
+            Some(&locked),
+            &FailingAwsCredentialProvisioner,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WasmProviderLoadError::AwsCredentials(
+                AwsCredentialError::NotFound(ref message)
+            )) if message == "host provisioning failed before instantiation"
+        ));
+    }
+
+    #[test]
+    fn aws_credential_load_error_is_a_terminal_diagnostic() {
+        let error = WasmProviderLoadError::AwsCredentials(AwsCredentialError::NotFound(
+            "credential diagnostic".to_string(),
+        ));
+
+        assert_eq!(error.to_string(), "credential diagnostic");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     async fn rebuildable_state_test_factory() -> Option<WasmProviderFactory> {
@@ -7530,9 +7558,13 @@ mod tests {
         };
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
         Some(
-            WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
-                .await
-                .expect("mock WASM provider should load"),
+            WasmProviderFactory::new_uncached(
+                &wasm_bytes,
+                test_load_identity("mock"),
+                &UnusedAwsCredentialProvisioner,
+            )
+            .await
+            .expect("mock WASM provider should load"),
         )
     }
 
@@ -8996,6 +9028,7 @@ mod tests {
         let error = match WasmProviderFactory::new_uncached(
             &wasm_bytes,
             ProviderLoadIdentity::for_test("aws", ProviderTrustClass::Untrusted),
+            &UnusedAwsCredentialProvisioner,
         )
         .await
         {
@@ -9030,9 +9063,13 @@ mod tests {
         };
 
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
-        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
-            .await
-            .expect("mock WASM provider should load");
+        let factory = WasmProviderFactory::new_uncached(
+            &wasm_bytes,
+            test_load_identity("mock"),
+            &UnusedAwsCredentialProvisioner,
+        )
+        .await
+        .expect("mock WASM provider should load");
         let instance = factory
             .get_or_create_shared_instance(None, &IndexMap::new())
             .await
@@ -9315,17 +9352,6 @@ mod tests {
     }
 
     #[test]
-    fn every_runtime_kind_has_no_metadata_endpoints() {
-        for capabilities in [
-            aws_capabilities(),
-            RuntimeCapabilities::GitHub,
-            RuntimeCapabilities::Untrusted,
-        ] {
-            assert!(!capabilities.permits_metadata());
-        }
-    }
-
-    #[test]
     fn aws_credentials_debug_redacts_secret_material() {
         let credentials = AwsCredentials::new(
             "AKIAEXAMPLE",
@@ -9449,7 +9475,6 @@ mod tests {
         assert!(keys.contains(&"HOME"));
         assert!(!keys.contains(&"AWS_ACCESS_KEY_ID"));
         assert!(!keys.contains(&"GITHUB_TOKEN"));
-        assert!(!capabilities.permits_metadata());
     }
 
     #[test]
@@ -9545,7 +9570,6 @@ mod tests {
                 .credential_partition()
                 .is_empty()
         );
-        assert!(!RuntimeCapabilities::Untrusted.permits_metadata());
         assert_eq!(
             RuntimeCapabilities::Untrusted.private_address_policy(),
             PrivateAddressPolicy::Deny
@@ -10291,13 +10315,6 @@ mod tests {
             ResolvedAddressClass::classify(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 1))),
             ResolvedAddressClass::LinkLocal
         );
-        for capabilities in [
-            aws_capabilities(),
-            RuntimeCapabilities::GitHub,
-            RuntimeCapabilities::Untrusted,
-        ] {
-            assert!(!capabilities.permits_metadata());
-        }
     }
 
     struct StubResolver {
@@ -11843,9 +11860,13 @@ mod tests {
         };
 
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
-        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
-            .await
-            .expect("mock WASM provider should load");
+        let factory = WasmProviderFactory::new_uncached(
+            &wasm_bytes,
+            test_load_identity("mock"),
+            &UnusedAwsCredentialProvisioner,
+        )
+        .await
+        .expect("mock WASM provider should load");
         let instance = factory
             .get_or_create_shared_instance(None, &IndexMap::new())
             .await
