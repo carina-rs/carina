@@ -2548,9 +2548,6 @@ impl ProviderFactory for ReferenceValidationFactory {
     fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
         Ok(())
     }
-    fn extract_region(&self, _: &indexmap::IndexMap<String, Value>) -> String {
-        "test".into()
-    }
     fn create_provider(
         &self,
         _: Option<&str>,
