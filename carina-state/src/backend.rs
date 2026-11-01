@@ -122,6 +122,10 @@ pub enum BackendError {
     #[error("Invalid state file: {0}")]
     InvalidState(String),
 
+    /// Canonicalizing persisted edges must retain managed-row address shape.
+    #[error(transparent)]
+    InvalidDestroyDependency(#[from] carina_core::resource::NotAManagedRow),
+
     /// A pre-v21 binding-text dependency cannot be mapped to exactly one
     /// complete resource address.
     #[error("Invalid state file: {0}")]

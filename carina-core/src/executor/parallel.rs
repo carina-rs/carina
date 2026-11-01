@@ -2031,7 +2031,7 @@ mod tests {
         let resources = vec![role.clone(), role_policy.clone()];
         let mut parsed: crate::parser::ParsedFile = Default::default();
         parsed.compositions.push(virt.clone());
-        let index = crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
+        let index = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &[])
             .expect("composition references flatten at the expanded graph seam");
         let effects = resources
             .iter()

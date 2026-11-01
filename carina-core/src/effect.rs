@@ -17,7 +17,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::non_empty::NonEmptyVec;
-use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
+use crate::parser::{DeferredForExpression, MovedAddresses, StateBlock, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
 #[cfg(test)]
 use crate::resource::{DataSource, DeferredValue, Resource};
@@ -660,6 +660,65 @@ impl ResolvedMove {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMovePairs(Vec<(ResolvedResourceId, ResolvedResourceId)>);
 
+/// Address resolver output; a caller cannot substitute a literal collection.
+pub struct AddressedMoves(Vec<ResolvedExplicitMove>);
+
+pub struct ResolvedExplicitMove {
+    pub resolved_move: ResolvedMove,
+    pub target_is_desired: bool,
+}
+
+impl AddressedMoves {
+    /// Resolve every declared move, retaining destination membership beside
+    /// the addresses checked against the declaration.
+    pub fn resolve<E: From<ResolvedMoveMismatch>>(
+        blocks: &[StateBlock],
+        mut addresses: impl FnMut(
+            &MovedAddresses,
+        )
+            -> Result<Option<(ResolvedResourceId, ResolvedResourceId, bool)>, E>,
+    ) -> Result<Self, E> {
+        let mut moves = Vec::new();
+        for block in blocks {
+            let StateBlock::Moved {
+                addresses: declared,
+            } = block
+            else {
+                continue;
+            };
+            if let Some((from, to, target_is_desired)) = addresses(declared)? {
+                moves.push(ResolvedExplicitMove {
+                    resolved_move: ResolvedMove::from_moved_block(declared, from, to)?,
+                    target_is_desired,
+                });
+            }
+        }
+        Ok(Self(moves))
+    }
+
+    /// State refresh resolves the declarations under an address-preserving
+    /// policy: no declared move is applied to the persisted state.
+    pub fn preserve_addresses(blocks: &[StateBlock]) -> Self {
+        Self::resolve(blocks, |_| Ok::<_, ResolvedMoveMismatch>(None))
+            .expect("address preservation cannot produce a mismatched move")
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ResolvedExplicitMove> {
+        self.0.iter()
+    }
+}
+
+/// The complete move-effect scope of a plan. Only the plan can mint it.
+pub struct SavedMoveEffects<'a, S> {
+    effects: &'a [Effect<S>],
+}
+
+impl<'a, S> SavedMoveEffects<'a, S> {
+    pub(crate) fn from_effects(effects: &'a [Effect<S>]) -> Self {
+        Self { effects }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "resolved move {from} -> {to} conflicts with existing move {existing_from} -> {existing_to}"
@@ -686,14 +745,55 @@ impl ResolvedMovePairConflict {
 
 impl ResolvedMovePairs {
     /// Consume the resolved moves emitted by address reconciliation.
-    pub fn from_addressed_moves(moves: Vec<ResolvedMove>) -> Self {
-        Self(moves.into_iter().map(ResolvedMove::into_parts).collect())
+    ///
+    /// An empty literal does not prove that address resolution ran:
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::effect::ResolvedMovePairs;
+    /// let _ = ResolvedMovePairs::from_addressed_moves(Vec::new());
+    /// ```
+    ///
+    /// Address-preserving refresh obtains its empty scope from the resolver:
+    ///
+    /// ```
+    /// use carina_core::{effect::{AddressedMoves, ResolvedMovePairs}, parser::ParsedFile};
+    /// let configuration = ParsedFile::default();
+    /// let addressed = AddressedMoves::preserve_addresses(&configuration.state_blocks);
+    /// let pairs = ResolvedMovePairs::from_addressed_moves(addressed);
+    /// assert!(pairs.is_empty());
+    /// ```
+    pub fn from_addressed_moves(moves: AddressedMoves) -> Self {
+        Self(
+            moves
+                .0
+                .into_iter()
+                .map(|resolved| resolved.resolved_move.into_parts())
+                .collect(),
+        )
     }
 
     /// Recover the move scope recorded by a complete saved plan.
-    pub fn from_saved_plan<S>(plan: &crate::plan::Plan<S>) -> Self {
+    ///
+    /// An unwitnessed plan is not a move-effect scope:
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::{effect::ResolvedMovePairs, plan::Plan};
+    /// let plan: Plan = Plan::new();
+    /// let _ = ResolvedMovePairs::from_saved_plan(&plan);
+    /// ```
+    ///
+    /// The plan supplies the witness for its complete move-effect set:
+    ///
+    /// ```
+    /// use carina_core::{effect::ResolvedMovePairs, plan::Plan};
+    /// let plan: Plan = Plan::new();
+    /// let pairs = ResolvedMovePairs::from_saved_plan(plan.move_effects());
+    /// assert!(pairs.is_empty());
+    /// ```
+    pub fn from_saved_plan<S>(moves: SavedMoveEffects<'_, S>) -> Self {
         Self(
-            plan.effects()
+            moves
+                .effects
                 .iter()
                 .filter_map(|effect| match effect {
                     EffectWithSource::Move { from, to, .. } => Some((from.clone(), to.clone())),

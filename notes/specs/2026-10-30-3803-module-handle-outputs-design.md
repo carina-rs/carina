@@ -340,22 +340,32 @@ the pending typestate, display
 `dependencies not yet migrated (legacy: ...)`, and never write it.
 
 Configuration-aware commands classify each legacy name against state rows first and then the current expanded
-graph. For a row inside a module instance, resolution tries that instance's scope before root because old releases
+graph. Graph construction consumes the expanded file once; classification and live plan/apply, destroy,
+refresh, and offline checks retain that same graph. Configuration-only membership and module scopes are captured
+in `ConfiguredResources`, constructed from the configuration file; orphan/state candidates cannot enter that set.
+For a row inside a module instance, resolution tries that instance's scope before root because old releases
 stored module-local dependency and argument spellings inconsistently. A configured row fails with a typed
 `LegacyDependencyMigrationError` when a name is missing or ambiguous. A saved plan persists the complete
 classification, including its source fingerprints and warnings, so `apply --plan` validates it against the loaded
 state and cannot fall back to the old kind-blind strings. Move scope is an opaque `ResolvedMovePairs` value with no
-`Default` or empty constructor, built only from addressed moves or saved `Effect::Move` entries; migration APIs
+`Default` or empty constructor, built only from an `AddressedMoves` resolver witness or the plan's complete
+`SavedMoveEffects` witness. Address-preserving refresh also obtains its empty scope from the resolver; migration APIs
 cannot be called with an untyped empty slice.
 
 An orphan or deposed row is different: deletion must remain possible after its former module or dependency has
 left the configuration. Classification retains every known managed edge and returns a typed
-`LegacyDestroyOrderingWarning` for each unresolved name. Applying a classification yields
-`UnreportedMigratedState`, not a writable `StateFile`; the only transition back reports every current and deposed
-warning through one CLI formatter on stderr before returning the v21 state. This also precedes terminal wait
-validation and any state write. Scheduling uses the known edges. The warning is operation-scoped rather than state
+`LegacyDestroyOrderingWarning` for each unresolved name. Classification before terminal wait validation yields
+`UnvalidatedLegacyMigration`, which owns the graph, classification, and `UnreportedMigratedState`. Its only
+transition reports every current and deposed warning through one CLI formatter on stderr, then strictly validates
+that same graph before releasing the writable v21 state or saved classification. A failed wait therefore prints
+the warnings and leaves v20 state unchanged, byte for byte. Saved plans contain only classifications that crossed
+strict validation; replay reports their warnings before any migration write. Scheduling uses the known edges.
+The warning is operation-scoped rather than state
 data: v21 persists the known managed IDs only, never the unresolved name. Thus an unresolved name can leave memory
 only after it has been surfaced, while the v21 format remains free of dependency strings.
+
+Persisted destroy-dependency address mapping runs the same managed-row validation as decoding; neither mapping
+nor decoding can introduce provider-less or synthetic wait addresses.
 
 `carina state migrate --check DIR --state-url COPY` exercises the same transition without credentials, provider
 initialization, CRUD/data-source calls, upstream-state reads, backend access, locks, network access, cache writes,

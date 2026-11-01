@@ -530,7 +530,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();
-    let mut parsed = wiring.evaluated_resources_for_test().clone();
+    let parsed = wiring.evaluated_resources_for_test().clone();
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
     let mut current_states: HashMap<ResourceId, Current> = HashMap::new();
@@ -618,11 +618,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("plan preprocessing");
     let resources_for_plan = override_aware_resources.resources().to_vec();
     let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
-        &mut parsed,
+        parsed,
         &resources_for_plan,
         &data_sources,
     )
     .expect("expanded graph resolution");
+    let parsed = expanded_graph.configuration();
     let resolved_resources_for_plan = resources_for_plan
         .iter()
         .cloned()

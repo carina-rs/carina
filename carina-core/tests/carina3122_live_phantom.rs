@@ -53,9 +53,9 @@ use carina_core::schema::{
 };
 
 fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedResource {
-    let mut parsed = carina_core::parser::ParsedFile::default();
+    let parsed = carina_core::parser::ParsedFile::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph(
-        &mut parsed,
+        parsed,
         std::slice::from_ref(&resource),
         &[],
     )

@@ -79,12 +79,15 @@ fn migrate_legacy_with_config(
     state: StateFile,
     resources: &[Resource],
 ) -> Result<(StateFile, ReportedLegacyMigration), LegacyDependencyMigrationError> {
-    let mut parsed: carina_core::parser::ParsedFile = Default::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, resources, &[])
+    let parsed: carina_core::parser::ParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed, resources, &[])
         .expect("legacy migration fixture graph must resolve");
     let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
-    let moved_pairs = carina_core::effect::ResolvedMovePairs::from_saved_plan(&no_move_plan);
-    let input = LegacyMigrationInput::planned(&graph, resources, &moved_pairs);
+    let moved_pairs =
+        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
+    let configured =
+        carina_core::resolved_graph::ConfiguredResources::from_test_resources(resources);
+    let input = LegacyMigrationInput::planned(&graph, &configured, &moved_pairs);
     let classification = state.classify_legacy_dependencies(&input)?;
     let migration = state.with_legacy_classification(classification)?;
     let migrated_rows = migration.migrated_rows();
@@ -6164,10 +6167,9 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
         Resource::with_provider("mock", "test.Consumer", "module_instance.consumer", None)
             .with_binding("module_instance.consumer"),
     ];
-    let mut parsed: carina_core::parser::ParsedFile = Default::default();
-    let graph =
-        carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &graph_resources, &[])
-            .expect("moved-row graph resolves");
+    let parsed: carina_core::parser::ParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed, &graph_resources, &[])
+        .expect("moved-row graph resolves");
     let from = resolved_dependency("mock", "test.Consumer", "old_consumer", None);
     let to = resolved_dependency("mock", "test.Consumer", "module_instance.consumer", None);
 
@@ -6178,8 +6180,11 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
         to,
         origin: None,
     });
-    let moved_pairs = carina_core::effect::ResolvedMovePairs::from_saved_plan(&move_plan);
-    let input = LegacyMigrationInput::planned(&graph, &resources, &moved_pairs);
+    let moved_pairs =
+        carina_core::effect::ResolvedMovePairs::from_saved_plan(move_plan.move_effects());
+    let configured =
+        carina_core::resolved_graph::ConfiguredResources::from_test_resources(&resources);
+    let input = LegacyMigrationInput::planned(&graph, &configured, &moved_pairs);
     let classification = state
         .classify_legacy_dependencies(&input)
         .expect("the moved row must classify with its configured destination scope");
@@ -6221,11 +6226,14 @@ fn with_legacy_classification_rejects_stale_sources() {
         Resource::with_provider("mock", "test.Target", "target", None).with_binding("target"),
         Resource::with_provider("mock", "test.Consumer", "consumer", None).with_binding("consumer"),
     ];
-    let mut parsed: carina_core::parser::ParsedFile = Default::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &configured, &[])
+    let parsed: carina_core::parser::ParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed, &configured, &[])
         .expect("stale-classification graph resolves");
     let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
-    let moved_pairs = carina_core::effect::ResolvedMovePairs::from_saved_plan(&no_move_plan);
+    let moved_pairs =
+        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
+    let configured =
+        carina_core::resolved_graph::ConfiguredResources::from_test_resources(&configured);
     let input = LegacyMigrationInput::planned(&graph, &configured, &moved_pairs);
     let classification = original
         .classify_legacy_dependencies(&input)
@@ -6343,12 +6351,15 @@ fn report_invokes_sink_for_every_current_and_deposed_warning_before_returning_st
     let state = check_and_migrate(&state_json_with_resources(20, vec![orphan]))
         .expect("warning fixture loads into the migration typestate")
         .into_state();
-    let mut parsed: carina_core::parser::ParsedFile = Default::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &[], &[])
+    let parsed: carina_core::parser::ParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed, &[], &[])
         .expect("empty warning graph resolves");
     let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
-    let moved_pairs = carina_core::effect::ResolvedMovePairs::from_saved_plan(&no_move_plan);
+    let moved_pairs =
+        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
     let configured: Vec<Resource> = Vec::new();
+    let configured =
+        carina_core::resolved_graph::ConfiguredResources::from_test_resources(&configured);
     let input = LegacyMigrationInput::planned(&graph, &configured, &moved_pairs);
     let classification = state
         .classify_legacy_dependencies(&input)

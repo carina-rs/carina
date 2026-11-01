@@ -1400,10 +1400,9 @@ mod tests {
             Value::resource_ref("connector".to_string(), "id".to_string(), vec![]),
         );
         let resources = vec![a, connector, b];
-        let mut parsed = carina_core::parser::ParsedFile::default();
-        let graph =
-            carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
-                .expect("test graph targets resolve");
+        let parsed = carina_core::parser::ParsedFile::default();
+        let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed, &resources, &[])
+            .expect("test graph targets resolve");
         let desired = resources
             .into_iter()
             .map(|resource| {

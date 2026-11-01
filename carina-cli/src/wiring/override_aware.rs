@@ -131,10 +131,6 @@ impl<E> CanonicalResourcePair<E> {
         &self.parsed
     }
 
-    pub(super) fn parsed_mut(&mut self) -> &mut ModuleResolvedFile<E> {
-        &mut self.parsed
-    }
-
     pub fn unresolved(&self) -> &[Resource] {
         &self.unresolved
     }

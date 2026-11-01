@@ -1833,7 +1833,7 @@ enum SourceApplyAfterHeartbeat {
 
 struct SourceApplyPersistExports {
     validated_config: ValidatedConfig<
-        crate::wiring::ExpandedCanonicalResources<carina_core::parser::InferredExportParam>,
+        crate::wiring::PostExpansionConfiguration<carina_core::parser::InferredExportParam>,
     >,
     state_file: Option<StateFile>,
     resources: Vec<Resource>,

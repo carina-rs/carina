@@ -83,7 +83,7 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
 }
 
 fn resolve_plan_graph(
-    parsed: &mut carina_core::parser::ModuleResolvedParsedFile,
+    parsed: carina_core::parser::ModuleResolvedParsedFile,
     resources: &[Resource],
     registry: &SchemaRegistry,
 ) -> (
@@ -98,7 +98,8 @@ fn resolve_plan_graph(
         .map(|resource| index.resolve_resource(resource, registry))
         .collect::<Result<Vec<_>, _>>()
         .expect("managed test dependencies must resolve");
-    let waits = parsed
+    let waits = index
+        .configuration()
         .wait_bindings
         .iter()
         .map(|wait| index.resolve_wait_binding(wait))
@@ -308,7 +309,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
 
     let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed for the caller fixture");
-    let mut parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
+    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
     // expansion, instance-prefixed with the module-call binding (`r`).
@@ -404,7 +405,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
     let (resolved_resources_for_plan, resolved_waits) =
-        resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
+        resolve_plan_graph(parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -502,8 +503,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
 
     let parsed = parse_directory(&root, &ProviderContext::default())
         .expect("parse_directory should succeed for the nested root fixture");
-    let mut parsed =
-        resolve_modules(parsed, &root).expect("nested module resolution should succeed");
+    let parsed = resolve_modules(parsed, &root).expect("nested module resolution should succeed");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
     // (outer call binding `o`, inner call binding `c`).
@@ -579,7 +579,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
     let (resolved_resources_for_plan, resolved_waits) =
-        resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
+        resolve_plan_graph(parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -679,7 +679,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed");
-    let mut parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
+    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
 
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).expect("topological sort");
@@ -762,7 +762,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
     let (resolved_resources_for_plan, resolved_waits) =
-        resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
+        resolve_plan_graph(parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],

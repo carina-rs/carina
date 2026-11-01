@@ -17,15 +17,18 @@ use carina_core::provider::{
     StateRowInFlightCreate, StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
     merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
-use carina_core::resolved_graph::ExpandedBindingIndex;
+use carina_core::resolved_graph::{
+    ConfiguredResources, ExpandedBindingIndex, ExpandedGraphResolutionError,
+    LegacyClassificationGraph, ResolvedExpandedGraph,
+};
 pub use carina_core::resource::DeposedKey;
-#[cfg(test)]
-use carina_core::resource::Directives;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, PartialReadMarker, PendingReRead,
     PersistedDestroyDependencies, PersistedDestroyDependencyProjection, PersistedDirectives,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
+    ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, State, Value,
 };
+#[cfg(test)]
+use carina_core::resource::{Directives, Resource};
 use carina_core::schema::{
     FieldName, ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys,
 };
@@ -1199,13 +1202,10 @@ impl StateFile {
     /// rows, the row's own instance scope is tried before root. Configured
     /// rows fail closed on missing/ambiguous names; orphan and deposed deletes
     /// retain known edges and return explicit display warnings for the rest.
-    pub fn classify_legacy_dependencies<S>(
+    pub fn classify_legacy_dependencies(
         &self,
-        input: &LegacyMigrationInput<'_, S>,
-    ) -> Result<LegacyDependencyClassification, LegacyDependencyMigrationError>
-    where
-        S: carina_core::resource::LegacyDependencyModuleSource,
-    {
+        input: &LegacyMigrationInput<'_>,
+    ) -> Result<LegacyDependencyClassification, LegacyDependencyMigrationError> {
         use carina_core::utils::canonicalize_map_key_address;
 
         if !self.requires_legacy_dependency_migration() {
@@ -1246,13 +1246,6 @@ impl StateFile {
             candidates.dedup_by(|left, right| left.id == right.id);
         }
 
-        let configured = input
-            .configured
-            .iter()
-            .filter_map(|resource| {
-                ResolvedResourceId::try_new(resource.id.clone()).map(|id| (id, resource))
-            })
-            .collect::<HashMap<_, _>>();
         let mut migrated = BTreeMap::new();
         let mut warnings = Vec::new();
 
@@ -1266,8 +1259,8 @@ impl StateFile {
                 .iter()
                 .find_map(|(from, to)| (from == &row_id).then_some(to))
                 .unwrap_or(&row_id);
-            let configured_resource = configured.get(classified_id).copied();
-            if configured_resource.is_none()
+            let configured_scope = input.configured.scope(classified_id);
+            if configured_scope.is_none()
                 && input.offline_unmaterialized.iter().any(|prefix| {
                     [Some(row.identity.as_str()), row.binding.as_deref()]
                         .into_iter()
@@ -1285,18 +1278,14 @@ impl StateFile {
                     row: row_id.to_string(),
                 });
             }
-            let scope = configured_resource
-                .and_then(|resource| resource.module_source.as_ref())
-                .and_then(
-                    carina_core::resource::LegacyDependencyModuleSource::legacy_dependency_scope_prefix,
-                );
+            let scope = configured_scope.flatten();
             let row_description = format!(
                 "resources[{row_index}] ({}.{} {:?})",
                 row.provider,
                 row.resource_type,
                 row.identity.as_str()
             );
-            let strict = configured_resource.is_some();
+            let strict = configured_scope.is_some();
             let (value_dependencies, value_unknown) = classify_legacy_names(
                 input.graph,
                 &legacy.value_dependencies,
@@ -2658,17 +2647,17 @@ impl LegacyDependencyClassification {
 }
 
 /// Configuration and move evidence bound to one legacy-classification run.
-pub struct LegacyMigrationInput<'a, S> {
+pub struct LegacyMigrationInput<'a> {
     graph: &'a ExpandedBindingIndex,
-    configured: &'a [Resource<S>],
+    configured: &'a ConfiguredResources,
     moved_pairs: &'a ResolvedMovePairs,
     offline_unmaterialized: BTreeSet<String>,
 }
 
-impl<'a, S> LegacyMigrationInput<'a, S> {
-    pub fn planned(
-        graph: &'a ExpandedBindingIndex,
-        configured: &'a [Resource<S>],
+impl<'a> LegacyMigrationInput<'a> {
+    pub fn planned<E, D>(
+        graph: &'a ResolvedExpandedGraph<E, D>,
+        configured: &'a ConfiguredResources,
         moved_pairs: &'a ResolvedMovePairs,
     ) -> Self {
         Self {
@@ -2679,9 +2668,9 @@ impl<'a, S> LegacyMigrationInput<'a, S> {
         }
     }
 
-    pub fn offline(
-        graph: &'a ExpandedBindingIndex,
-        configured: &'a [Resource<S>],
+    pub fn offline<E, D>(
+        graph: &'a ResolvedExpandedGraph<E, D>,
+        configured: &'a ConfiguredResources,
         moved_pairs: &'a ResolvedMovePairs,
         offline_unmaterialized: BTreeSet<String>,
     ) -> Self {
@@ -5179,3 +5168,72 @@ fn migrate_v10_reserved_attributes(state: &mut StateFile) {
 
 #[cfg(test)]
 mod tests;
+
+impl StateFile {
+    /// Bind classification to the consumed graph until reporting and strict
+    /// validation release both the saved classification and writable state.
+    pub fn classify_legacy_graph<E, D>(
+        self,
+        graph: LegacyClassificationGraph<E, D>,
+        moves: &ResolvedMovePairs,
+        offline_unmaterialized: BTreeSet<String>,
+    ) -> Result<UnvalidatedLegacyMigration<E, D>, LegacyDependencyMigrationError> {
+        let input = LegacyMigrationInput {
+            graph: graph.classification_index(),
+            configured: graph.configured(),
+            moved_pairs: moves,
+            offline_unmaterialized,
+        };
+        let classification = self.classify_legacy_dependencies(&input)?;
+        let migration = self.with_legacy_classification(classification.clone())?;
+        Ok(UnvalidatedLegacyMigration {
+            graph,
+            classification,
+            migration,
+        })
+    }
+}
+
+/// Neither its classification nor its state may escape before strict graph
+/// validation. Warnings remain inspectable so read-only checks can count them.
+///
+/// ```compile_fail
+/// use carina_core::parser::{ParsedExportParam, ResolvedDeferredForPhase};
+/// use carina_state::{StateFile, UnvalidatedLegacyMigration};
+/// fn skip_validation(migration: UnvalidatedLegacyMigration<ParsedExportParam, ResolvedDeferredForPhase>) -> StateFile {
+///     migration.report(|_| {})
+/// }
+/// ```
+pub struct UnvalidatedLegacyMigration<E, D> {
+    graph: LegacyClassificationGraph<E, D>,
+    classification: LegacyDependencyClassification,
+    migration: UnreportedMigratedState,
+}
+
+pub struct ValidatedLegacyMigration<E, D> {
+    pub graph: ResolvedExpandedGraph<E, D>,
+    pub classification: LegacyDependencyClassification,
+    pub state: StateFile,
+}
+
+impl<E, D> UnvalidatedLegacyMigration<E, D> {
+    pub fn migrated_rows(&self) -> usize {
+        self.migration.migrated_rows()
+    }
+    pub fn warnings(&self) -> &[LegacyDestroyOrderingWarning] {
+        self.migration.warnings()
+    }
+
+    pub fn report_and_validate(
+        self,
+        sink: impl FnMut(&LegacyDestroyOrderingWarning),
+    ) -> Result<ValidatedLegacyMigration<E, D>, ExpandedGraphResolutionError> {
+        let state = self.migration.report(sink);
+        let graph = self.graph.validate()?;
+        Ok(ValidatedLegacyMigration {
+            graph,
+            classification: self.classification,
+            state,
+        })
+    }
+}

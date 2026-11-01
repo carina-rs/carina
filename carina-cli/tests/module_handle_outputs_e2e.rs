@@ -190,6 +190,141 @@ fn assert_resolved_id(value: &Value, expected_identity: &str) {
     );
 }
 
+fn seed_v20_handle_dependencies(scenario: &Scenario) {
+    // Use an output alias distinct from its internal binding: otherwise a
+    // second graph build can accidentally resolve the spelling as a resource.
+    let root = scenario.project.join("main.crn");
+    let source = fs::read_to_string(&root).unwrap();
+    fs::write(
+        root,
+        source
+            .replace("producer.validation_record", "producer.r")
+            .replace(
+                "comment = consumer.observed_comment",
+                "comment = consumer.observed_comment\n  directives { depends_on = [producer.r] }",
+            ),
+    )
+    .unwrap();
+    fs::write(
+        scenario.project.join("producer/attributes.crn"),
+        "attributes {\n  r = validation_record\n}\n",
+    )
+    .unwrap();
+    let consumer = scenario.project.join("consumer/resource.crn");
+    fs::write(
+        &consumer,
+        fs::read_to_string(&consumer).unwrap().replace(
+            "comment = validation_record.comment",
+            "comment = \"consumer\"",
+        ),
+    )
+    .unwrap();
+    assert_success("init handle migration", &scenario.command(&["init", "."]));
+    assert_success(
+        "seed handle migration",
+        &scenario.command(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    let mut state = scenario.json(&scenario.state);
+    state["version"] = Value::from(20);
+    for row in state["resources"].as_array_mut().unwrap() {
+        let names = row["dependency_bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dependency| dependency["identity"].clone())
+            .collect::<Vec<_>>();
+        row["dependency_bindings"] = Value::from(names);
+        if let Some(dependencies) = row
+            .get_mut("directives")
+            .and_then(|directives| directives.get_mut("depends_on"))
+            .and_then(Value::as_array_mut)
+        {
+            for dependency in dependencies {
+                *dependency = dependency["identity"].clone();
+            }
+        }
+    }
+    fs::write(&scenario.state, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+}
+
+#[test]
+fn v20_plan_resolves_module_handle_outputs_and_p3_arguments_once() {
+    let scenario = Scenario::new();
+    seed_v20_handle_dependencies(&scenario);
+    let before = fs::read(&scenario.state).unwrap();
+    assert_success("plan v20 handles", &scenario.command(&["plan", "."]));
+    assert_eq!(fs::read(&scenario.state).unwrap(), before);
+}
+
+#[test]
+fn v20_apply_resolves_module_handle_outputs_and_p3_arguments_once() {
+    let scenario = Scenario::new();
+    seed_v20_handle_dependencies(&scenario);
+    assert_success(
+        "apply v20 handles",
+        &scenario.command(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    let state = scenario.json(&scenario.state);
+    assert_eq!(state["version"], 21);
+    let reader = state["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["binding"] == "reader")
+        .unwrap();
+    assert!(
+        reader["dependency_bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|dependency| dependency["identity"] == "producer.validation_record")
+    );
+}
+
+#[test]
+fn v20_destroy_resolves_module_handle_outputs_and_p3_arguments_once() {
+    let scenario = Scenario::new();
+    seed_v20_handle_dependencies(&scenario);
+    assert_success(
+        "destroy v20 handles",
+        &scenario.command(&["destroy", "--auto-approve", "--lock=false", "."]),
+    );
+}
+
+#[test]
+fn v20_state_refresh_resolves_module_handle_outputs_and_p3_arguments_once() {
+    let scenario = Scenario::new();
+    seed_v20_handle_dependencies(&scenario);
+    assert_success(
+        "refresh v20 handles",
+        &scenario.command(&["state", "refresh", "--lock=false", "."]),
+    );
+}
+
+#[test]
+fn v20_migration_check_resolves_module_handle_outputs_and_p3_arguments_once() {
+    let scenario = Scenario::new();
+    seed_v20_handle_dependencies(&scenario);
+    let before = fs::read(&scenario.state).unwrap();
+    scenario.clear_operations();
+    assert_success(
+        "check v20 handles",
+        &scenario.command(&[
+            "state",
+            "migrate",
+            "--check",
+            ".",
+            "--state-url",
+            "carina.state.json",
+        ]),
+    );
+    assert!(fs::read(&scenario.state).unwrap() == before);
+    assert!(
+        !scenario.operation_log.exists(),
+        "offline check must not contact the provider"
+    );
+}
+
 #[test]
 fn saved_p3_handles_round_trip_without_tainting_unchanged_dependents() {
     let scenario = Scenario::new();

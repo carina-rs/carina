@@ -774,7 +774,7 @@ impl PersistedDestroyDependencies {
     ///
     /// This supports state-format canonicalization without opening a route to
     /// insert data-source or wait IDs into persisted dependencies.
-    pub fn try_map_addresses<E>(
+    pub fn try_map_addresses<E: From<NotAManagedRow>>(
         self,
         mut map: impl FnMut(ResolvedResourceId) -> Result<ResolvedResourceId, E>,
     ) -> Result<Self, E> {
@@ -782,7 +782,7 @@ impl PersistedDestroyDependencies {
             .into_iter()
             .map(&mut map)
             .collect::<Result<BTreeSet<_>, _>>()
-            .map(Self)
+            .and_then(|dependencies| Self::decode_persisted(dependencies).map_err(E::from))
     }
 
     #[cfg(any(test, feature = "test-utils"))]

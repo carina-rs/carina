@@ -9145,7 +9145,7 @@ let consumer = mock.test.Consumer {
 
     let context = handle_output_provider_context();
     let parsed = crate::parser::parse(root_source, &context).expect("root parses");
-    let mut parsed = resolve_modules_with_config(
+    let parsed = resolve_modules_with_config(
         parsed,
         &root,
         &context,
@@ -9172,12 +9172,12 @@ let consumer = mock.test.Consumer {
         .expect("producer record has a resolved instance-qualified identity");
     let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
     let data_sources = parsed.data_sources.clone();
-    let index =
-        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
-            .expect("transitive handle outputs resolve at the expanded graph seam");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &data_sources)
+        .expect("transitive handle outputs resolve at the expanded graph seam");
     let expected_type = TypeExpr::Ref(ResourceTypePath::new("mock", "test.Record"));
     for instance in ["produced", "relayed"] {
-        let output = parsed
+        let output = index
+            .configuration()
             .compositions
             .iter()
             .find(|composition| composition.instance == instance)
@@ -9235,7 +9235,7 @@ let consumer = mock.test.Consumer {
 
     let context = handle_output_provider_context();
     let parsed = crate::parser::parse(root_source, &context).expect("root parses");
-    let mut parsed = resolve_modules_with_config(
+    let parsed = resolve_modules_with_config(
         parsed,
         &root,
         &context,
@@ -9265,9 +9265,8 @@ let consumer = mock.test.Consumer {
 
     let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
     let data_sources = parsed.data_sources.clone();
-    let index =
-        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
-            .expect("expanded dependency graph resolves both operands");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &data_sources)
+        .expect("expanded dependency graph resolves both operands");
     let consumer = index
         .resolve_resource(consumer, &crate::schema::SchemaRegistry::new())
         .expect("consumer dependencies resolve");
@@ -9312,7 +9311,7 @@ let child = consumer_module { peer = source }
 
     let context = handle_output_provider_context();
     let parsed = crate::parser::parse(root_source, &context).expect("root parses");
-    let mut parsed = resolve_modules_with_config(
+    let parsed = resolve_modules_with_config(
         parsed,
         &root,
         &context,
@@ -9343,9 +9342,8 @@ let child = consumer_module { peer = source }
         .expect("caller source has a resolved identity");
     let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
     let data_sources = parsed.data_sources.clone();
-    let index =
-        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
-            .expect("expanded graph resolves the caller-supplied wait dependency");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &data_sources)
+        .expect("expanded graph resolves the caller-supplied wait dependency");
     let resolved_wait = index
         .resolve_wait_binding(&wait)
         .expect("module-internal wait resolves structurally");
@@ -9390,7 +9388,7 @@ let child = consumer_module { peer = source }
 
     let context = handle_output_provider_context();
     let parsed = crate::parser::parse(root_source, &context).expect("root parses");
-    let mut parsed = resolve_modules_with_config(
+    let parsed = resolve_modules_with_config(
         parsed,
         &root,
         &context,
@@ -9411,9 +9409,8 @@ let child = consumer_module { peer = source }
         .expect("expanded wait");
     let resources = parsed.resources.clone();
     let data_sources = parsed.data_sources.clone();
-    let index =
-        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
-            .expect("expanded graph resolves the caller-supplied wait target");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &data_sources)
+        .expect("expanded graph resolves the caller-supplied wait target");
     let resolved = index
         .resolve_wait_binding(&wait)
         .expect("wait target and predicate root resolve through the module argument");
@@ -9555,7 +9552,7 @@ let child = consumer_module {}
     let context = handle_output_provider_context();
     let parsed = crate::parser::parse_file(root_source, &root.join("main.crn"), &context)
         .expect("root parses with its source path");
-    let mut parsed = resolve_modules_with_config(
+    let parsed = resolve_modules_with_config(
         parsed,
         &root,
         &context,
@@ -9586,9 +9583,8 @@ let child = consumer_module {}
 
     let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
     let data_sources = parsed.data_sources.clone();
-    let index =
-        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
-            .expect("expanded graph registers the prefixed loop group");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &data_sources)
+        .expect("expanded graph registers the prefixed loop group");
     let resolved_wait = index
         .resolve_wait_binding(&wait)
         .expect("wait dependency resolves to the complete managed group");
@@ -9659,7 +9655,7 @@ let reader = mock.test.Consumer { name = consumer.observed_name }
 
     let context = handle_output_provider_context();
     let parsed = crate::parser::parse(root_source, &context).expect("root parses");
-    let mut parsed = resolve_modules_with_config(
+    let parsed = resolve_modules_with_config(
         parsed,
         &root,
         &context,
@@ -9700,9 +9696,8 @@ let reader = mock.test.Consumer { name = consumer.observed_name }
 
     let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
     let data_sources = parsed.data_sources.clone();
-    let index =
-        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
-            .expect("P3 graph addresses resolve");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &data_sources)
+        .expect("P3 graph addresses resolve");
     let resolved_wait = index
         .resolve_wait_binding(&wait)
         .expect("consumer wait dependency resolves");

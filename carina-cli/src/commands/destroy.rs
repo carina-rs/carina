@@ -333,7 +333,6 @@ async fn run_destroy_locked_owned(
         &parsed.data_sources,
         &state_file,
     )?;
-    let mut classification_resources = detected_resources.sorted_resources().to_vec();
     let mut all_resources = detected_resources.into_destroy_resources(&moved_pairs);
 
     if !refresh {
@@ -552,7 +551,6 @@ async fn run_destroy_locked_owned(
                     && let Some(resolved_id) = ResolvedResourceId::try_new(id.clone())
                 {
                     let orphan_resource = build_orphan_resource(sf, &resolved_id);
-                    classification_resources.push(orphan_resource.clone());
                     all_resources.push(orphan_resource);
                 }
                 managed_current.insert(id, current);
@@ -575,63 +573,31 @@ async fn run_destroy_locked_owned(
             let current = loaded.into_current();
             if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
                 let orphan_resource = build_orphan_resource(sf, &resolved_id);
-                classification_resources.push(orphan_resource.clone());
                 all_resources.push(orphan_resource);
             }
             managed_current.insert(id, current);
         }
     }
 
-    if state_file
-        .as_ref()
-        .is_some_and(StateFile::requires_legacy_dependency_migration)
-    {
-        let mut classification_file = parsed.clone();
-        let classification = crate::wiring::classify_legacy_state(
-            &mut classification_file,
-            crate::wiring::MaterializedConfiguration::Planned {
-                resources: &classification_resources,
-                data_sources: &parsed.data_sources,
-            },
-            &moved_pairs,
-            state_file
-                .as_ref()
-                .expect("checked legacy state presence"),
-        )?;
-        let migration = state_file
-            .take()
-            .expect("checked legacy state presence")
-            .with_legacy_classification(classification)
-            .map_err(|error| AppError::Backend(error.into()))?;
-        state_file = Some(crate::wiring::report_legacy_migration(migration));
+    let validated = validated_config.resolve_legacy_graph(
+        &all_resources, &moved_pairs, state_file.as_ref(),
+    )?;
+    let (ctx, destroy_graph) = validated.config.context_and_resources();
+    let parsed = destroy_graph.configuration();
+    let resolved_wait_bindings = destroy_graph.configuration().wait_bindings.iter()
+        .map(|wait| destroy_graph.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(migrated) = validated.migrated_state {
+        state_file = Some(migrated);
         if let Some(state) = state_file.as_ref() {
             for (id, current) in &mut managed_current {
                 if let Some(row) = state.find_resource_for_id(id) {
-                    current.set_dependency_bindings(
-                        row.dependency_bindings.to_resolved_dependencies(),
-                    );
+                    current.set_dependency_bindings(row.dependency_bindings.to_resolved_dependencies());
                 }
             }
         }
-        mid_run_writer
-            .write_schema_migration(
-                state_file
-                    .as_mut()
-                    .expect("legacy migration retains the state file"),
-            )
-            .await?;
+        mid_run_writer.write_schema_migration(state_file.as_mut().expect("validated migration retains state")).await?;
     }
-    let mut destroy_graph_file = parsed.clone();
-    let destroy_graph = carina_core::resolved_graph::resolve_expanded_graph(
-        &mut destroy_graph_file,
-        &all_resources,
-        &parsed.data_sources,
-    )?;
-    let resolved_wait_bindings = destroy_graph_file
-        .wait_bindings
-        .iter()
-        .map(|wait| destroy_graph.resolve_wait_binding(wait))
-        .collect::<Result<Vec<_>, _>>()?;
 
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket

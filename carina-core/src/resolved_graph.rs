@@ -2,6 +2,7 @@
 //! complete scheduler addresses.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 
 use crate::eval_value::UnexpandedResourceHandle;
 use crate::parser::{
@@ -945,50 +946,151 @@ fn require_resolved_id(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WaitResolutionPolicy {
-    Strict,
-    DeferInvalidForLegacyClassification,
+/// Configuration-only membership and module scopes for legacy migration.
+/// State-row candidates can participate in address lookup, but cannot mint
+/// configured membership through this type.
+#[derive(Debug)]
+pub struct ConfiguredResources(HashMap<ResolvedResourceId, Option<String>>);
+
+impl ConfiguredResources {
+    pub fn from_configuration<E, D>(parsed: &File<E, D>) -> Self {
+        Self::collect(&parsed.resources)
+    }
+
+    fn collect<S: crate::resource::LegacyDependencyModuleSource>(
+        resources: &[Resource<S>],
+    ) -> Self {
+        use crate::resource::LegacyDependencyModuleSource;
+        Self(
+            resources
+                .iter()
+                .filter_map(|resource| {
+                    ResolvedResourceId::try_new(resource.id.clone()).map(|id| {
+                        let scope = resource
+                            .module_source
+                            .as_ref()
+                            .and_then(LegacyDependencyModuleSource::legacy_dependency_scope_prefix)
+                            .map(str::to_owned);
+                        (id, scope)
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_test_resources<S: crate::resource::LegacyDependencyModuleSource>(
+        resources: &[Resource<S>],
+    ) -> Self {
+        Self::collect(resources)
+    }
+
+    pub fn scope(&self, id: &ResolvedResourceId) -> Option<Option<&str>> {
+        self.0.get(id).map(|scope| scope.as_deref())
+    }
+}
+
+/// Read-only configuration metadata retained after its graph input is consumed.
+/// There is deliberately no transition back to a graph-resolution input.
+#[derive(Debug)]
+pub struct GraphConfiguration<E, D>(File<E, D>);
+
+impl<E, D> GraphConfiguration<E, D> {
+    /// Seal metadata for a diagnostic outcome which has no executable graph.
+    pub fn for_diagnostics(parsed: File<E, D>) -> Self {
+        Self(parsed)
+    }
+
+    pub fn parsed(&self) -> &File<E, D> {
+        &self.0
+    }
+}
+
+/// The one constructed graph, before its deferred wait errors are checked.
+pub struct LegacyClassificationGraph<E, D> {
+    configuration: GraphConfiguration<E, D>,
+    configured: ConfiguredResources,
+    index: ExpandedBindingIndex,
+    wait_error: Option<ExpandedGraphResolutionError>,
+}
+
+impl<E, D> LegacyClassificationGraph<E, D> {
+    pub fn classification_index(&self) -> &ExpandedBindingIndex {
+        &self.index
+    }
+
+    pub fn configured(&self) -> &ConfiguredResources {
+        &self.configured
+    }
+
+    pub fn validate(self) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError> {
+        if let Some(error) = self.wait_error {
+            return Err(error);
+        }
+        Ok(ResolvedExpandedGraph {
+            configuration: self.configuration,
+            configured: self.configured,
+            index: self.index,
+        })
+    }
+}
+
+/// A strictly validated graph and the metadata produced by that same resolution.
+#[derive(Debug)]
+pub struct ResolvedExpandedGraph<E, D> {
+    configuration: GraphConfiguration<E, D>,
+    configured: ConfiguredResources,
+    index: ExpandedBindingIndex,
+}
+
+impl<E, D> ResolvedExpandedGraph<E, D> {
+    pub fn configuration(&self) -> &File<E, D> {
+        self.configuration.parsed()
+    }
+
+    pub fn configured(&self) -> &ConfiguredResources {
+        &self.configured
+    }
+
+    pub fn into_parts(self) -> (GraphConfiguration<E, D>, ExpandedBindingIndex) {
+        (self.configuration, self.index)
+    }
+}
+
+impl<E, D> Deref for ResolvedExpandedGraph<E, D> {
+    type Target = ExpandedBindingIndex;
+    fn deref(&self) -> &Self::Target {
+        &self.index
+    }
 }
 
 /// Resolve all module handle outputs and build the address index used by every
 /// subsequent resource, data-source, and wait transition.
+///
+/// ```compile_fail,E0382
+/// use carina_core::{parser::ParsedFile, resolved_graph::resolve_expanded_graph};
+/// let parsed = ParsedFile::default();
+/// let first = resolve_expanded_graph(parsed, &[], &[]);
+/// let second = resolve_expanded_graph(parsed, &[], &[]);
+/// ```
 pub fn resolve_expanded_graph<E, D>(
-    parsed: &mut File<E, D>,
+    parsed: File<E, D>,
     managed: &[Resource],
     data_sources: &[DataSource],
-) -> Result<ExpandedBindingIndex, ExpandedGraphResolutionError> {
-    resolve_expanded_graph_with_wait_policy(
-        parsed,
-        managed,
-        data_sources,
-        WaitResolutionPolicy::Strict,
-    )
+) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError> {
+    resolve_expanded_graph_for_legacy_classification(parsed, managed, data_sources)?.validate()
 }
 
 /// Build the graph used only to classify legacy state before terminal wait
 /// validation. Invalid waits remain addressable but have no destroy closure,
 /// so legacy references to them fail closed as unresolved names. The strict
-/// graph transition must still run before any provider operation.
+/// validation consumes this graph before any migrated state is released.
 pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
-    parsed: &mut File<E, D>,
+    mut parsed: File<E, D>,
     managed: &[Resource],
     data_sources: &[DataSource],
-) -> Result<ExpandedBindingIndex, ExpandedGraphResolutionError> {
-    resolve_expanded_graph_with_wait_policy(
-        parsed,
-        managed,
-        data_sources,
-        WaitResolutionPolicy::DeferInvalidForLegacyClassification,
-    )
-}
-
-fn resolve_expanded_graph_with_wait_policy<E, D>(
-    parsed: &mut File<E, D>,
-    managed: &[Resource],
-    data_sources: &[DataSource],
-    wait_policy: WaitResolutionPolicy,
-) -> Result<ExpandedBindingIndex, ExpandedGraphResolutionError> {
+) -> Result<LegacyClassificationGraph<E, D>, ExpandedGraphResolutionError> {
+    let configured = ConfiguredResources::from_configuration(&parsed);
     let upstream_bindings = parsed
         .upstream_binding_names()
         .into_iter()
@@ -1154,6 +1256,7 @@ fn resolve_expanded_graph_with_wait_policy<E, D>(
         ephemeral_dependencies.insert(id, dependencies);
     }
     let mut invalid_ephemeral_ids = HashSet::new();
+    let mut wait_error = None;
     for wait in &parsed.wait_bindings {
         let owner = format!("wait '{}'", wait.binding);
         let id = wait_scheduler_id(wait.binding.as_str());
@@ -1167,15 +1270,13 @@ fn resolve_expanded_graph_with_wait_policy<E, D>(
             Ok(dependencies) => {
                 ephemeral_dependencies.insert(id, dependencies);
             }
-            Err(_error)
-                if wait_policy == WaitResolutionPolicy::DeferInvalidForLegacyClassification =>
-            {
+            Err(error) => {
+                wait_error.get_or_insert(error);
                 invalid_ephemeral_ids.insert(id);
             }
-            Err(error) => return Err(error),
         }
     }
-    if wait_policy == WaitResolutionPolicy::DeferInvalidForLegacyClassification {
+    if wait_error.is_some() {
         loop {
             let newly_invalid = ephemeral_dependencies
                 .iter()
@@ -1245,7 +1346,12 @@ fn resolve_expanded_graph_with_wait_policy<E, D>(
         }
     }
 
-    Ok(index)
+    Ok(LegacyClassificationGraph {
+        configuration: GraphConfiguration(parsed),
+        configured,
+        index,
+        wait_error,
+    })
 }
 
 #[cfg(test)]
@@ -1262,8 +1368,8 @@ mod tests {
             binding: "orgs".to_string(),
             source: "../organizations".into(),
         });
-        let graph = resolve_expanded_graph(&mut parsed, &[], &[])
-            .expect("upstream-only graph must resolve");
+        let graph =
+            resolve_expanded_graph(parsed, &[], &[]).expect("upstream-only graph must resolve");
         let template = DeferredForExpression {
             file: Some("main.crn".to_string()),
             line: 4,

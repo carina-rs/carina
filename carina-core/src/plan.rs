@@ -896,6 +896,10 @@ impl<S> Plan<S> {
         &self.effects
     }
 
+    pub fn move_effects(&self) -> crate::effect::SavedMoveEffects<'_, S> {
+        crate::effect::SavedMoveEffects::from_effects(&self.effects)
+    }
+
     pub fn ignored_change_summaries(&self) -> &[IgnoredChangeSummary] {
         &self.ignored_change_summaries
     }

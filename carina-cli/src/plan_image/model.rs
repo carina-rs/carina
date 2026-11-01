@@ -1172,10 +1172,9 @@ mod tests {
 
     fn resolved_with_graph(resources: impl IntoIterator<Item = Resource>) -> Vec<ResolvedResource> {
         let resources = resources.into_iter().collect::<Vec<_>>();
-        let mut parsed = carina_core::parser::ParsedFile::default();
-        let graph =
-            carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
-                .expect("test graph targets resolve");
+        let parsed = carina_core::parser::ParsedFile::default();
+        let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed, &resources, &[])
+            .expect("test graph targets resolve");
         resources
             .into_iter()
             .map(|resource| {

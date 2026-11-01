@@ -872,18 +872,15 @@ fn create_plan_for_tests(
     orphans: &Orphans,
     wait_bindings: &[crate::parser::WaitBinding],
 ) -> crate::plan::Plan {
-    let mut parsed = crate::parser::ParsedFile {
+    let parsed = crate::parser::ParsedFile {
         wait_bindings: wait_bindings.to_vec(),
         ..Default::default()
     };
     let mut binding_resources = managed.to_vec();
     binding_resources.extend(orphans.iter().map(|(_, orphan)| orphan.binding_resource()));
-    let binding_index = crate::resolved_graph::resolve_expanded_graph(
-        &mut parsed,
-        &binding_resources,
-        data_sources,
-    )
-    .expect("differ test graph must resolve");
+    let binding_index =
+        crate::resolved_graph::resolve_expanded_graph(parsed, &binding_resources, data_sources)
+            .expect("differ test graph must resolve");
     let managed = managed
         .iter()
         .cloned()

@@ -71,11 +71,11 @@ fn resolved_fixture_graph(
 }
 
 fn resolved_fixture_graph_with_parsed(
-    mut parsed: crate::parser::ParsedFile,
+    parsed: crate::parser::ParsedFile,
     managed: &[Resource],
     data_sources: &[DataSource],
 ) -> (Vec<ResolvedResource>, Vec<ResolvedDataSource>) {
-    let index = crate::resolved_graph::resolve_expanded_graph(&mut parsed, managed, data_sources)
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed, managed, data_sources)
         .expect("executor fixture graph must resolve");
     let managed = managed
         .iter()
@@ -7508,8 +7508,8 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
     rt.dependencies.value_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
     let resources = vec![vpc, tgw, subnet, tgw_attach, rt, route];
-    let mut parsed: crate::parser::ParsedFile = Default::default();
-    let index = crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
+    let parsed: crate::parser::ParsedFile = Default::default();
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &[])
         .expect("fixture graph must resolve");
     let mut plan = Plan::new();
     for resource in resources {

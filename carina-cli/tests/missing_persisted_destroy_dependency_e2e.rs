@@ -72,6 +72,19 @@ let orphan = mock.test.resource {
     }
 
     fn prepare_v20_orphan_that_refreshes_absent_with_current_and_deposed_warnings(&self) {
+        self.prepare_v20_orphan_with_current_and_deposed_warnings();
+        let mut provider: Value =
+            serde_json::from_slice(&fs::read(&self.mock_state).expect("read mock provider state"))
+                .expect("parse mock provider state");
+        provider["states"] = serde_json::json!({});
+        fs::write(
+            &self.mock_state,
+            serde_json::to_vec_pretty(&provider).expect("encode empty mock provider state"),
+        )
+        .expect("make orphan absent from provider");
+    }
+
+    fn prepare_v20_orphan_with_current_and_deposed_warnings(&self) {
         fs::write(self.project.join("resources.crn"), "")
             .expect("remove resources from configuration");
 
@@ -95,16 +108,6 @@ let orphan = mock.test.resource {
             serde_json::to_vec_pretty(&state).expect("encode v20 orphan state"),
         )
         .expect("write v20 orphan state");
-
-        let mut provider: Value =
-            serde_json::from_slice(&fs::read(&self.mock_state).expect("read mock provider state"))
-                .expect("parse mock provider state");
-        provider["states"] = serde_json::json!({});
-        fs::write(
-            &self.mock_state,
-            serde_json::to_vec_pretty(&provider).expect("encode empty mock provider state"),
-        )
-        .expect("make orphan absent from provider");
     }
 }
 
@@ -225,6 +228,9 @@ fn destroy_reports_legacy_warning_when_wait_resolution_fails_after_migration() {
     )
     .expect("write invalid wait fixture");
 
+    let state_path = scenario.project.join("carina.state.json");
+    let before = fs::read(&state_path).expect("read v20 state before invalid destroy");
+
     let destroy = scenario.run(&["destroy", "--auto-approve", "--lock=false", "."]);
     let text = output_text(&destroy);
     assert!(
@@ -237,13 +243,54 @@ fn destroy_reports_legacy_warning_when_wait_resolution_fails_after_migration() {
     );
     assert_legacy_current_and_deposed_warnings(&destroy);
 
-    let state: Value = serde_json::from_slice(
-        &fs::read(scenario.project.join("carina.state.json")).expect("read migrated state"),
-    )
-    .expect("parse migrated state");
-    assert_eq!(
-        state["version"],
-        Value::from(21),
-        "the writable v21 state must become available only after warnings are reported",
+    assert!(
+        fs::read(state_path).expect("read state after failed destroy") == before,
+        "strict wait validation must succeed before a reported migration can be persisted",
     );
+}
+
+fn present_legacy_orphan_scenario() -> Scenario {
+    let scenario = Scenario::new();
+    assert_success("init", &scenario.run(&["init", "."]));
+    assert_success(
+        "seed apply",
+        &scenario.run(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.prepare_v20_orphan_with_current_and_deposed_warnings();
+    scenario
+}
+
+#[test]
+fn destroy_warns_for_present_legacy_orphan_with_missing_binding() {
+    let scenario = present_legacy_orphan_scenario();
+    let output = scenario.run(&["destroy", "--auto-approve", "--lock=false", "."]);
+    assert_success("destroy present legacy orphan", &output);
+    assert_legacy_current_and_deposed_warnings(&output);
+}
+
+#[test]
+fn destroy_without_refresh_warns_for_present_legacy_orphan_with_missing_binding() {
+    let scenario = present_legacy_orphan_scenario();
+    let output = scenario.run(&[
+        "destroy",
+        "--refresh=false",
+        "--auto-approve",
+        "--lock=false",
+        ".",
+    ]);
+    assert_success("destroy cached legacy orphan", &output);
+    assert_legacy_current_and_deposed_warnings(&output);
+}
+
+#[test]
+fn state_refresh_warns_for_present_legacy_orphan_with_missing_binding() {
+    let scenario = present_legacy_orphan_scenario();
+    let output = scenario.run(&["state", "refresh", "--lock=false", "."]);
+    assert_success("refresh present legacy orphan", &output);
+    assert_legacy_current_and_deposed_warnings(&output);
+    let state: Value =
+        serde_json::from_slice(&fs::read(scenario.project.join("carina.state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["version"], 21);
+    assert_eq!(state["resources"].as_array().unwrap().len(), 1);
 }

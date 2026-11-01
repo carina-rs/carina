@@ -99,5 +99,6 @@ pub use state::{
     LoadedState, MigratedStateFile, MigrationInfo, NameOverride, NotOutcomeUnknown,
     NotOutcomeUnknownKind, OutcomeUnknownRow, PreviousSecretHashAuthority, PublishedExports,
     ResourceState, ResourceStateEncodingError, RowBasis, StateFile, UnreportedMigratedState,
-    check_and_migrate, check_and_migrate_bytes, log_state_migration_once, should_apply_override,
+    UnvalidatedLegacyMigration, ValidatedLegacyMigration, check_and_migrate,
+    check_and_migrate_bytes, log_state_migration_once, should_apply_override,
 };

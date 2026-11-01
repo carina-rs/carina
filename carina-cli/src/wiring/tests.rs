@@ -30,7 +30,7 @@ fn resolved_move_pairs_for_test(
             origin: None,
         });
     }
-    ResolvedMovePairs::from_saved_plan(&plan)
+    ResolvedMovePairs::from_saved_plan(plan.move_effects())
 }
 
 fn comparison_provider_for_resources(
@@ -2419,7 +2419,7 @@ fn create_plan(
     let mut parsed = carina_core::parser::ParsedFile::default();
     parsed.wait_bindings = wait_bindings.to_vec();
     let expanded_graph =
-        carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, managed, data_sources)
+        carina_core::resolved_graph::resolve_expanded_graph(parsed, managed, data_sources)
             .expect("test graph dependencies must resolve");
     let managed = managed
         .iter()

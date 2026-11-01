@@ -97,8 +97,9 @@ use carina_core::differ::{
 };
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::effect::{
-    DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, MoveAuthority,
-    NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedMove, ResolvedMovePairs,
+    AddressedMoves, DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration,
+    MoveAuthority, NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedExplicitMove,
+    ResolvedMove, ResolvedMovePairs,
 };
 use carina_core::executor::normalized::{
     apply_desired_normalization_slice, is_value_fully_concrete_for_expansion,
@@ -327,11 +328,11 @@ pub struct PlanContext {
 /// private; production values are returned only by the planning transition.
 pub struct ExpandedPlanContext<E> {
     context: PlanContext,
-    canonical_resources: ExpandedCanonicalResources<E>,
+    canonical_resources: PostExpansionConfiguration<E>,
 }
 
 impl<E> ExpandedPlanContext<E> {
-    fn new(context: PlanContext, canonical_resources: ExpandedCanonicalResources<E>) -> Self {
+    fn new(context: PlanContext, canonical_resources: PostExpansionConfiguration<E>) -> Self {
         Self {
             context,
             canonical_resources,
@@ -1808,7 +1809,10 @@ impl MigrationCheckConfig {
     pub(crate) fn migrate_legacy_dependencies_from_copied_state(
         mut self,
         mut state: StateFile,
-    ) -> Result<carina_state::UnreportedMigratedState, AppError> {
+    ) -> Result<
+        legacy_migration::ClassifiedLegacyGraph<carina_core::parser::InferredExportParam>,
+        AppError,
+    > {
         let state_view = Some(state.clone());
         self.prepare_from_copied_state(&state_view)?;
         state.remove_legacy_data_source_rows(&self.resources.data_sources);
@@ -1823,19 +1827,16 @@ impl MigrationCheckConfig {
         let configured = self.resources.resources.clone();
         let data_sources = self.resources.data_sources.clone();
         let residual_loops = self.resources.deferred_for_expressions().clone();
-        let classification = classify_legacy_state(
-            &mut self.resources,
+        classify_legacy_state(
+            self.resources,
             MaterializedConfiguration::Offline {
                 resources: &configured,
                 data_sources: &data_sources,
                 residual_loops: residual_loops.as_slice(),
             },
             &moved_pairs,
-            &state,
-        )?;
-        state
-            .with_legacy_classification(classification)
-            .map_err(|error| AppError::Backend(error.into()))
+            Some(&state),
+        )
     }
 
     fn canonicalize_and_compute_identifiers(&mut self) -> Result<(), AppError> {
@@ -1845,6 +1846,59 @@ impl MigrationCheckConfig {
             &mut self.resources.resources,
             &providers,
         )
+    }
+}
+
+pub(crate) struct ValidatedLegacyConfiguration<E> {
+    pub config: ValidatedConfig<
+        carina_core::resolved_graph::ResolvedExpandedGraph<
+            E,
+            carina_core::parser::ResolvedDeferredForPhase,
+        >,
+    >,
+    pub migrated_state: Option<StateFile>,
+}
+
+impl<E> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
+    /// Consume the configuration exactly once, preserving its wiring owner
+    /// through classification, warning reporting, and strict graph validation.
+    pub(crate) fn resolve_legacy_graph(
+        self,
+        resources: &[Resource],
+        moves: &ResolvedMovePairs,
+        state: Option<&StateFile>,
+    ) -> Result<ValidatedLegacyConfiguration<E>, AppError> {
+        let Self {
+            wiring,
+            resources: validated_resources,
+            config_state: _,
+        } = self;
+        let ValidationReady {
+            inner: parsed,
+            origin,
+        } = validated_resources;
+        let data_sources = parsed.data_sources.clone();
+        let validated = classify_legacy_state(
+            parsed,
+            MaterializedConfiguration::Planned {
+                resources,
+                data_sources: &data_sources,
+            },
+            moves,
+            state,
+        )?
+        .report_and_validate()?;
+        Ok(ValidatedLegacyConfiguration {
+            config: ValidatedConfig {
+                wiring,
+                resources: ValidationReady {
+                    inner: validated.graph,
+                    origin,
+                },
+                config_state: std::marker::PhantomData,
+            },
+            migrated_state: validated.migrated_state,
+        })
     }
 }
 
@@ -4966,6 +5020,7 @@ impl DetectedAutomaticMoves {
 /// state refresh can expand only its raw parsed file. A future caller cannot
 /// silently choose the wrong behavior with a flag or an empty metadata map.
 pub struct DeferredForExpansionPrelude<'state> {
+    preserved_move_scope: AddressedMoves,
     state_file: &'state Option<StateFile>,
     sorted_resources: Vec<Resource>,
     saved_attrs: LiftedSavedAttrs,
@@ -5081,6 +5136,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
         schemas: &SchemaRegistry,
     ) -> Result<Self, AppError> {
         Ok(Self {
+            preserved_move_scope: AddressedMoves::preserve_addresses(&parsed.state_blocks),
             state_file,
             sorted_resources,
             saved_attrs: state_file
@@ -5187,7 +5243,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
                 orphans: inputs.orphans,
                 saved_attrs: self.saved_attrs,
                 prev_explicit: self.prev_explicit,
-                moved_pairs: ResolvedMovePairs::from_addressed_moves(Vec::new()),
+                moved_pairs: ResolvedMovePairs::from_addressed_moves(self.preserved_move_scope),
             },
         })
     }
@@ -5669,6 +5725,11 @@ pub(crate) struct ExpandedCanonicalResources<E> {
     resources: CanonicalResourcePair<E>,
 }
 
+pub(crate) type PostExpansionConfiguration<E> = carina_core::resolved_graph::GraphConfiguration<
+    E,
+    carina_core::parser::ResolvedDeferredForPhase,
+>;
+
 impl<E> ExpandedCanonicalResources<E> {
     pub(crate) fn parsed(&self) -> &carina_core::parser::ModuleResolvedFile<E> {
         self.resources.parsed()
@@ -5678,8 +5739,19 @@ impl<E> ExpandedCanonicalResources<E> {
         &self.resources
     }
 
-    fn parsed_mut(&mut self) -> &mut carina_core::parser::ModuleResolvedFile<E> {
-        self.resources.parsed_mut()
+    fn into_configuration(self) -> carina_core::parser::ModuleResolvedFile<E> {
+        self.resources.into_parts().0
+    }
+
+    fn into_plan_configuration(
+        self,
+        configured: &OverrideAwareResources,
+    ) -> carina_core::parser::ModuleResolvedFile<E> {
+        let mut parsed = self.into_configuration();
+        // The override-aware owner contains configuration resources only and
+        // has just reconciled their final anonymous addresses.
+        parsed.resources = configured.resources().to_vec();
+        parsed
     }
 
     async fn prepare_desired_side_for_plan(
@@ -6190,7 +6262,7 @@ impl<M: PostExpansionMode, R> PostExpansionOutcome<M, R> {
 /// expansion.
 pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     input: PostExpansionPlanInput<'_, E, impl ChildrenSettledFor<M>>,
-) -> Result<PostExpansionOutcome<M, ExpandedCanonicalResources<E>>, AppError> {
+) -> Result<PostExpansionOutcome<M, PostExpansionConfiguration<E>>, AppError> {
     let PostExpansionPlanInput {
         context,
         expansion,
@@ -6210,7 +6282,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     let PostExpansionPlanView { data, children } = expansion;
     children.consume();
     let PostExpansionPlanData {
-        mut expanded_resources,
+        expanded_resources,
         sorted_resources,
         mut addressed,
         mut data_source_values,
@@ -6306,7 +6378,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
             .collect();
         let artifacts = PostExpansionArtifacts {
-            expanded_resources,
+            expanded_resources: PostExpansionConfiguration::for_diagnostics(
+                expanded_resources.into_configuration(),
+            ),
             residual_deferred_for,
             plan,
             compositions,
@@ -6346,33 +6420,18 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         state_file,
     )?;
 
-    let legacy_dependency_classification = if let Some(state) = state_file
-        .as_ref()
-        .filter(|state| state.requires_legacy_dependency_migration())
-    {
-        Some(classify_legacy_state(
-            expanded_resources.parsed_mut(),
-            MaterializedConfiguration::Planned {
-                resources: override_aware_resources.resources(),
-                data_sources: &data_sources_for_plan,
-            },
-            &addressed.moved_pairs,
-            state,
-        )?)
-    } else {
-        None
-    };
-    let migrated_legacy_state = if let Some(classification) = &legacy_dependency_classification {
-        let migrated = state_file
-            .as_ref()
-            .expect("checked legacy state presence")
-            .clone()
-            .with_legacy_classification(classification.clone())
-            .map_err(|error| AppError::Backend(error.into()))?;
-        Some(report_legacy_migration(migrated))
-    } else {
-        None
-    };
+    let validated = classify_legacy_state(
+        expanded_resources.into_plan_configuration(&override_aware_resources),
+        MaterializedConfiguration::Planned {
+            resources: override_aware_resources.resources(),
+            data_sources: &data_sources_for_plan,
+        },
+        &addressed.moved_pairs,
+        state_file.as_ref(),
+    )?
+    .report_and_validate()?;
+    let legacy_dependency_classification = validated.classification;
+    let migrated_legacy_state = validated.migrated_state;
     if let Some(migrated) = migrated_legacy_state.as_ref() {
         addressed.refresh_destroy_metadata_from_state(migrated);
     }
@@ -6381,11 +6440,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     } else {
         state_file
     };
-    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
-        expanded_resources.parsed_mut(),
-        override_aware_resources.resources(),
-        &data_sources_for_plan,
-    )?;
+    let (expanded_resources, expanded_graph) = validated.graph.into_parts();
     compositions = expanded_resources.parsed().compositions.clone();
     for target in &mut deferred_create_targets {
         target.dependencies = expanded_graph.resolve_deferred_for_dependencies(&target.template)?;
@@ -6629,7 +6684,7 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
     pub(crate) async fn finish_post_expansion_plan<M: PostExpansionMode>(
         self,
         environment: PostExpansionPlanEnvironment<'_>,
-    ) -> Result<PostExpansionOutcome<M, ValidatedConfig<ExpandedCanonicalResources<E>>>, AppError>
+    ) -> Result<PostExpansionOutcome<M, ValidatedConfig<PostExpansionConfiguration<E>>>, AppError>
     where
         S: ChildrenSettledFor<M>,
     {
@@ -7128,7 +7183,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
             origin: None,
         });
     }
-    let moved_pairs = ResolvedMovePairs::from_saved_plan(&move_plan);
+    let moved_pairs = ResolvedMovePairs::from_saved_plan(move_plan.move_effects());
     let prepared = PreparedAddressPreservingDeferredForExpansion(DeferredForExpansionInputs {
         addressed: AddressedDeferredForExpansionInputs {
             sorted_resources: sorted_resources.to_vec(),
@@ -7907,23 +7962,13 @@ fn resolved_state_row_id(
 /// Keeping destination membership with the validated move lets the mutating
 /// plan path transfer state while read-only migration consumers reuse the
 /// exact same address resolution without fabricating a move pair themselves.
-struct ResolvedExplicitMove {
-    resolved_move: ResolvedMove,
-    target_is_desired: bool,
-}
-
 fn resolve_explicit_moved_blocks(
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     mut desired_id: impl FnMut(&StateBlockAddress) -> Option<ResolvedResourceId>,
     warn_missing: &mut dyn FnMut(String),
-) -> Result<Vec<ResolvedExplicitMove>, AppError> {
-    let mut resolved = Vec::new();
-
-    for block in state_blocks {
-        let StateBlock::Moved { addresses } = block else {
-            continue;
-        };
+) -> Result<AddressedMoves, AppError> {
+    AddressedMoves::resolve(state_blocks, |addresses| {
         let from = addresses.from();
         let to = addresses.to();
         // `from`/`to` syntax has no provider-instance slot. Recover source
@@ -7948,19 +7993,13 @@ fn resolve_explicit_moved_blocks(
                     from.name_str()
                 ));
             }
-            continue;
+            return Ok(None);
         };
         let desired_to = desired_id(&to);
         let target_is_desired = desired_to.is_some();
         let resolved_to = desired_to.unwrap_or_else(|| to.to_unrouted_resource_id());
-        let resolved_move = ResolvedMove::from_moved_block(addresses, resolved_from, resolved_to)?;
-        resolved.push(ResolvedExplicitMove {
-            resolved_move,
-            target_is_desired,
-        });
-    }
-
-    Ok(resolved)
+        Ok(Some((resolved_from, resolved_to, target_is_desired)))
+    })
 }
 
 /// Resolve every explicit and late anonymous move against one materialized
@@ -7980,12 +8019,7 @@ pub(crate) fn resolve_moved_pairs<E>(
         |to| find_desired_id(to, resources.iter().map(|resource| &resource.id)),
         &mut suppress_warning,
     )?;
-    let mut moved_pairs = ResolvedMovePairs::from_addressed_moves(
-        explicit
-            .into_iter()
-            .map(|resolved| resolved.resolved_move)
-            .collect(),
-    );
+    let mut moved_pairs = ResolvedMovePairs::from_addressed_moves(explicit);
     let state_block_claims =
         resolve_state_block_claims(&parsed.state_blocks, state_file, resources, ctx.schemas());
     let comparison = MetadataComparisonResolver::new(resources.iter().map(|resource| &resource.id));
@@ -8052,7 +8086,6 @@ fn materialize_moved_states_with_warning_sink(
     state_file: &Option<StateFile>,
     warn_missing: &mut dyn FnMut(String),
 ) -> Result<ResolvedMovePairs, AppError> {
-    let mut addressed_moves = Vec::new();
     let resolved_moves = resolve_explicit_moved_blocks(
         state_blocks,
         state_file,
@@ -8063,13 +8096,13 @@ fn materialize_moved_states_with_warning_sink(
     for ResolvedExplicitMove {
         resolved_move,
         target_is_desired,
-    } in resolved_moves
+    } in resolved_moves.iter()
     {
         let authority = resolved_move.authority();
 
         // Transfer state from the old name to the new name so the
         // differ compares desired(to) against actual(from).
-        let transfer = if target_is_desired {
+        let transfer = if *target_is_desired {
             promote_orphan_or_move_current_state(
                 managed_current,
                 orphans,
@@ -8101,11 +8134,9 @@ fn materialize_moved_states_with_warning_sink(
         // Transfer saved_attrs so create_plan can look up saved
         // attributes under the new resource name.
         saved_attrs.remap_resource_id(authority.from(), authority.to().clone());
-
-        addressed_moves.push(resolved_move);
     }
 
-    Ok(ResolvedMovePairs::from_addressed_moves(addressed_moves))
+    Ok(ResolvedMovePairs::from_addressed_moves(resolved_moves))
 }
 
 fn promote_orphan_or_move_current_state(

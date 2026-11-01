@@ -485,8 +485,8 @@ async fn run_state_migration_check(
     // Historical identifier-less read rows are removed only from this copy.
     let migration = validated.migrate_legacy_dependencies_from_copied_state(state)?;
     let migrated_rows = migration.migrated_rows();
-    let warning_count = migration.warnings().len();
-    let _migrated_state = crate::wiring::report_legacy_migration(migration);
+    let warning_count = migration.warning_count();
+    let _validated = migration.report_and_validate()?;
     println!(
         "State dependency migration check passed: {} row(s) classified, {} orphan/deposed warning(s); no state was written.",
         migrated_rows, warning_count
@@ -1964,26 +1964,12 @@ pub(crate) async fn run_state_refresh_locked(
         &parsed.data_sources,
         &state_file,
     )?;
-    if state_file
-        .as_ref()
-        .is_some_and(StateFile::requires_legacy_dependency_migration)
-    {
-        let mut classification_file = parsed.clone();
-        let classification = crate::wiring::classify_legacy_state(
-            &mut classification_file,
-            crate::wiring::MaterializedConfiguration::Planned {
-                resources: &graph_managed,
-                data_sources: &parsed.data_sources,
-            },
-            &moved_pairs,
-            state_file.as_ref().expect("checked legacy state presence"),
-        )?;
-        let migration = state_file
-            .take()
-            .expect("checked legacy state presence")
-            .with_legacy_classification(classification)
-            .map_err(|error| AppError::Backend(error.into()))?;
-        state_file = Some(crate::wiring::report_legacy_migration(migration));
+    let validated =
+        validated_config.resolve_legacy_graph(&graph_managed, &moved_pairs, state_file.as_ref())?;
+    let (ctx, expanded_graph) = validated.config.context_and_resources();
+    let parsed = expanded_graph.configuration();
+    if let Some(migrated) = validated.migrated_state {
+        state_file = Some(migrated);
         if let Some(state) = state_file.as_ref() {
             for (id, current) in &mut managed_current {
                 if let Some(row) = state.find_resource_for_id(id) {
@@ -1994,12 +1980,6 @@ pub(crate) async fn run_state_refresh_locked(
             }
         }
     }
-    let mut dependency_graph = parsed.clone();
-    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
-        &mut dependency_graph,
-        &graph_managed,
-        &parsed.data_sources,
-    )?;
     let resolved_resources = sorted_resources
         .iter()
         .cloned()
