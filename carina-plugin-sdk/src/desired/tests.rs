@@ -585,12 +585,7 @@ fn deferred_reordering_is_allowed_but_dropping_or_foreign_movement_is_atomic() {
     for foreign in [false, true] {
         let snapshot = original.clone();
         let mut owner = NativeDesiredNormalization::from_core(&mut original).unwrap();
-        let node = owner
-            .inner
-            .attributes
-            .entries
-            .shift_remove("items")
-            .unwrap();
+        let node = owner.inner.attributes.entries.remove("items").unwrap();
         if foreign {
             owner.inner.attributes.entries.insert("other".into(), node);
         }
@@ -1065,16 +1060,61 @@ async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
 }
 
 #[tokio::test]
-async fn provider_ready_inputs_preserve_authored_map_order_like_native_inputs() {
+async fn native_and_wasm_normalization_views_iterate_maps_in_the_same_order() {
+    let mut resource = Resource::with_provider("test", "test.Resource", "ordered", None)
+        .with_attribute("z", map([("z", string("last")), ("a", string("first"))]))
+        .with_attribute("a", string("first"));
+    let batch = NormalizationBatch::new(std::slice::from_ref(&resource)).unwrap();
+    let mut guest = DesiredResource::from_wire(batch.resources()[0].clone())
+        .into_normalization()
+        .unwrap();
+    let native = NativeDesiredNormalization::from_core(&mut resource).unwrap();
+    let native_inputs = native.inputs();
+    let guest_view = guest.view();
+    let guest_inputs = guest_view.inputs();
+    let map_names = |inputs: &DesiredInputs<'_>| {
+        let tree = match &inputs.tree {
+            InputsTree::Borrowed(tree) => tree,
+            InputsTree::Owned(tree) => tree,
+        };
+        let Some(DesiredValue::Map(nested)) = tree.get("z") else {
+            panic!()
+        };
+        (
+            tree.entries.keys().cloned().collect::<Vec<_>>(),
+            nested.entries.keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(map_names(&native_inputs), map_names(&guest_inputs));
+    assert_eq!(
+        map_names(&native_inputs),
+        (vec!["a".into(), "z".into()], vec!["a".into(), "z".into()])
+    );
+}
+
+#[tokio::test]
+async fn provider_ready_and_update_inputs_use_protocol_map_order() {
     use carina_core::executor::{
         ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+        prepare_update_request,
     };
     let mut resource = Resource::with_provider("test", "test.Resource", "ordered", None)
         .with_attribute("z", map([("z", string("last")), ("a", string("first"))]))
         .with_attribute("a", string("first"));
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    let witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
+        vec![
+            carina_core::schema::PatternResourceSchema::new("test.Resource")
+                .validate()
+                .unwrap(),
+        ],
+        carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    schemas.insert_provider_witness("test", &witness).unwrap();
     let context = ProviderPreparationContext::new(
         &bindings,
         &gate,
@@ -1087,28 +1127,36 @@ async fn provider_ready_inputs_preserve_authored_map_order_like_native_inputs() 
         .await
         .unwrap();
     let ready = DesiredInputs::from_provider_ready(request.resource());
+    let from = carina_core::resource::State::existing(
+        resource.id.clone(),
+        resource.attributes.clone().into_iter().collect(),
+    );
+    let update = prepare_update_request(resource.clone(), from, &["a".into()], &context)
+        .await
+        .unwrap();
+    let update = DesiredInputs::from_update(&update);
     let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
-    for inputs in [ready, owner.inputs()] {
+    for inputs in [ready, update, owner.inputs()] {
         let tree = match &inputs.tree {
             InputsTree::Owned(tree) => tree,
             InputsTree::Borrowed(tree) => tree,
         };
         assert_eq!(
             tree.entries.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["z", "a"]
+            ["a", "z"]
         );
         let Some(DesiredValue::Map(map)) = tree.get("z") else {
             panic!()
         };
         assert_eq!(
             map.entries.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["z", "a"]
+            ["a", "z"]
         );
     }
 }
 
 #[tokio::test]
-async fn update_validators_read_the_complete_checked_desired_resource() {
+async fn update_validators_read_complete_checked_validation_inputs() {
     use carina_core::executor::{
         ModuleConstraintGate, ProviderPreparationContext, prepare_update_request,
     };
@@ -1166,8 +1214,21 @@ async fn update_validators_read_the_complete_checked_desired_resource() {
             .await
             .unwrap();
         assert!(request.patch().ops.iter().all(|op| op.key() != unchanged));
-        assert_eq!(request.resource().as_resource().attributes, desired);
-        let inputs = DesiredInputs::from_provider_ready(request.resource());
+        let inputs = DesiredInputs::from_update(&request);
+        assert_eq!(inputs.id(), &request.from().id);
+        for (name, expected) in &desired {
+            match (expected, inputs.attribute(name)) {
+                (
+                    Value::Concrete(ConcreteValue::String(expected)),
+                    Some(DesiredValue::Known(DesiredScalar::String(actual))),
+                ) => assert_eq!(actual, expected),
+                (
+                    Value::Concrete(ConcreteValue::Bool(expected)),
+                    Some(DesiredValue::Known(DesiredScalar::Bool(actual))),
+                ) => assert_eq!(actual, expected),
+                _ => panic!("the validation view must retain each desired input"),
+            }
+        }
         assert!(inputs.attribute(unchanged).is_some());
         assert!(
             !validate(inputs),

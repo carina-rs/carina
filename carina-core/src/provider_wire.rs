@@ -187,13 +187,14 @@ mod sealed {
 /// Projection is internal to the wire gate; callers cannot mint a projection
 /// directly from raw configuration attributes:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0603
 /// use carina_core::provider::{ProviderWirePayload, ProviderWireTarget};
 /// use carina_core::resource::Value;
 /// use indexmap::IndexMap;
 /// let attributes = IndexMap::<String, Value>::new();
 /// let target = ProviderWireTarget::Configuration { provider: "test".into() };
-/// let _ = attributes.project(&target);
+/// let token = carina_core::provider_wire::sealed::ProjectionToken::new();
+/// let _ = attributes.project(&target, token);
 /// ```
 pub trait ProviderWirePayload: sealed::Sealed {
     type Projection: Clone;

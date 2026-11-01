@@ -66,13 +66,14 @@ Wire failures are terminal diagnostics containing the resource or configuration,
 attribute, nested path and conversion reason exactly once, without the value.
 `ProviderWireError::conversion_error()` retains the typed conversion reason.
 
-Native create/update validators use the infallible
-`DesiredInputs::from_provider_ready(request.resource())`.
-Native update requests additionally expose the checked desired resource for
-cross-field validation. The WIT update request carries current state and the
-checked patch; provider writes come exclusively from that patch. Normalization
-callers query `DesiredView::inputs()` or `NativeDesiredNormalization::inputs()`; there is
-no public raw-resource `DesiredInputs` constructor.
+Native create validators use the infallible
+`DesiredInputs::from_provider_ready(request.resource())`; native update validators
+use `DesiredInputs::from_update(&request)`. Update requests retain the checked
+desired resource privately and expose only a read-only validation view, without
+its core attributes or resource. The WIT update request carries current state
+and the checked patch. Normalization callers query `DesiredView::inputs()` or
+`NativeDesiredNormalization::inputs()`. All views use protocol map key order;
+there is no public raw-resource `DesiredInputs` constructor.
 
 The host validates and decodes the entire result before writing any changes.
 It restores original deferred values at their returned positions and preserves

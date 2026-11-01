@@ -54,6 +54,10 @@ pub use crate::executor::provider_ready::{
     CanonicalProviderConfigAttributes, ProviderReady, ProviderReadyConfig, ProviderReadyDataSource,
     ProviderReadyResource,
 };
+pub use crate::provider_validation::{
+    ProviderValidationInputs, ProviderValidationList, ProviderValidationMap,
+    ProviderValidationValue,
+};
 pub use crate::provider_wire::{
     ProviderWireError, ProviderWirePayload, ProviderWireTarget, ResourceWirePayload,
     WireAttributes, WirePatchOp, WireReady, WireValue,
@@ -799,8 +803,8 @@ pub struct ReadRequest;
 /// provider-side state; `patch` carries the user's intended changes plus any
 /// desired, updatable write-only values that must be reasserted alongside an
 /// update. The patch is the sole source of truth for what the provider should
-/// write. The checked desired resource is available for cross-field validation;
-/// providers MUST derive writes exclusively from the patch (see #2559).
+/// write. Cross-field validation receives a separate read-only view; the full
+/// desired resource remains private (see #2559).
 ///
 /// External callers cannot assemble an update request from raw state and
 /// patch data; the private witness is supplied only by the checked provider
@@ -823,6 +827,13 @@ pub struct ReadRequest;
 /// fn replace_patch(request: &mut UpdateRequest, replacement: UpdatePatch) {
 ///     request.patch = replacement;
 /// }
+/// ```
+///
+/// Update validation cannot expose the full desired resource:
+///
+/// ```compile_fail,E0599
+/// use carina_core::provider::UpdateRequest;
+/// fn bypass(request: &UpdateRequest) { let _ = request.resource(); }
 /// ```
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
@@ -868,10 +879,10 @@ impl UpdateRequest {
         self.patch.wire()
     }
 
-    /// Complete checked desired inputs for cross-field validation.
-    /// Derive provider writes exclusively from [`Self::patch`].
-    pub fn resource(&self) -> &ProviderReadyResource {
-        &self.resource
+    /// Read-only SDK bridge for cross-field validation, without the backing
+    /// desired resource or core attributes. SDK callers use `DesiredInputs::from_update`.
+    pub fn validation_inputs(&self) -> ProviderValidationInputs<'_> {
+        ProviderValidationInputs::from_provider_ready(&self.resource)
     }
 
     /// Effective directives resolved while the desired resource crossed the

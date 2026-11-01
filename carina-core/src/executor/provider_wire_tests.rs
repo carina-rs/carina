@@ -139,6 +139,48 @@ fn schemas() -> SchemaRegistry {
 }
 
 #[tokio::test]
+async fn default_tag_duration_boundary_is_signed_i64_seconds() {
+    use carina_provider_protocol::types::Value as Wire;
+    let max = u64::try_from(i64::MAX).unwrap();
+    for seconds in [max, max + 1] {
+        let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
+        let bindings = ResolvedBindings::default();
+        let gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = schemas();
+        let configs = [config(duration(seconds))];
+        let context = ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &configs,
+            &NoopNormalizer,
+            &[],
+            &schemas,
+        );
+        let result = prepare_create_request(resource, &context).await;
+        if seconds == max {
+            let request = result.unwrap();
+            assert_eq!(
+                request
+                    .resource()
+                    .wire_attributes()
+                    .get("tags")
+                    .unwrap()
+                    .value(),
+                &Wire::Map(BTreeMap::from([("unrelated".into(), Wire::Int(i64::MAX))]))
+            );
+        } else {
+            assert_duration_error(
+                &result.unwrap_err(),
+                "tags",
+                &[crate::protocol_convert::WirePathSegment::Key(
+                    "unrelated".into(),
+                )],
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_create_rejects_a_non_wire_default_tag_before_dispatch() {
     let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
     let id = resource.id.clone();

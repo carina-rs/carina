@@ -8,11 +8,9 @@ use carina_core::desired::NormalizationBatch;
 use carina_core::protocol_convert::{ProtocolConvertError, protocol_to_resource_id};
 use carina_core::provider::{
     ProviderError as NativeProviderError, ProviderReady, ProviderResult as NativeProviderResult,
-    ResourceWirePayload,
+    ProviderValidationInputs, ProviderValidationValue, ResourceWirePayload, UpdateRequest,
 };
-use carina_core::resource::{
-    ConcreteValue, DeferredValue, Resource, ResourceId, Value, ValueString,
-};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value, ValueString};
 use carina_provider_protocol::normalization::{
     NormalizationErrorKind as Kind, NormalizationPathSegment as Segment, NormalizationResource,
     NormalizationValue as Wire,
@@ -117,7 +115,7 @@ impl std::error::Error for DesiredEditError {}
 /// the map; any deferred leaves dropped that way cause `MissingHandle` at finish.
 #[derive(Debug, Default)]
 pub struct DesiredMap {
-    entries: IndexMap<String, DesiredValue>,
+    entries: BTreeMap<String, DesiredValue>,
 }
 impl DesiredMap {
     /// Construct a map of known defaults using [`Self::insert_absent`].
@@ -133,7 +131,7 @@ impl DesiredMap {
     /// Return the removed value so deferred leaves can be moved within the attribute.
     /// Dropping a removed deferred leaf causes `MissingHandle` at finish.
     pub fn remove(&mut self, key: &str) -> Option<DesiredValue> {
-        self.entries.shift_remove(key)
+        self.entries.remove(key)
     }
     pub fn insert_absent(
         &mut self,
@@ -141,13 +139,15 @@ impl DesiredMap {
         value: DesiredValue,
     ) -> Result<(), DesiredEditError> {
         match self.entries.entry(name.into()) {
-            indexmap::map::Entry::Vacant(entry) => {
+            std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(value);
                 Ok(())
             }
-            indexmap::map::Entry::Occupied(entry) => Err(DesiredEditError::Occupied {
-                name: entry.key().clone(),
-            }),
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                Err(DesiredEditError::Occupied {
+                    name: entry.key().clone(),
+                })
+            }
         }
     }
 }
@@ -222,21 +222,22 @@ impl DesiredInputs<'_> {
     /// fn bypass(raw: &Resource) { let _ = DesiredInputs::from_core(raw); }
     /// ```
     pub fn from_provider_ready<T: ResourceWirePayload>(resource: &ProviderReady<T>) -> Self {
+        Self::from_validation_inputs(ProviderValidationInputs::from_provider_ready(resource))
+    }
+
+    /// Query checked update inputs without exposing the desired resource.
+    pub fn from_update(request: &UpdateRequest) -> Self {
+        Self::from_validation_inputs(request.validation_inputs())
+    }
+
+    fn from_validation_inputs(inputs: ProviderValidationInputs<'_>) -> Self {
         let owner = Arc::new(());
-        let entries = resource
-            .as_inner()
-            .attributes()
-            .iter()
-            .map(|(name, value)| {
-                let wire = resource
-                    .wire_attributes()
-                    .get(name)
-                    .expect("checked attribute");
-                (name.clone(), checked_value(value, wire.value(), &owner))
-            })
-            .collect();
+        let mut entries = BTreeMap::new();
+        inputs.visit(|name, value| {
+            entries.insert(name.to_owned(), checked_value(value, &owner));
+        });
         Self {
-            id: std::borrow::Cow::Owned(resource.as_inner().resource_id().clone()),
+            id: std::borrow::Cow::Owned(inputs.id().clone()),
             tree: InputsTree::Owned(DesiredMap { entries }),
         }
     }
@@ -254,111 +255,28 @@ impl DesiredInputs<'_> {
     }
 }
 
-// The original tree supplies provenance and order, never a second scalar
-// representation policy. Keep this exhaustive so new core variants require an
-// explicit decision before they can enter the SDK view.
-enum DesiredProvenance<'a> {
-    Scalar,
-    String(&'a ValueString),
-    StringList(&'a [ValueString]),
-    List(&'a [Value]),
-    Map(&'a IndexMap<String, Value>),
-    Secret,
-}
-
-fn desired_provenance(value: &Value) -> DesiredProvenance<'_> {
+fn checked_value(value: ProviderValidationValue<'_>, owner: &Arc<()>) -> DesiredValue {
     match value {
-        Value::Concrete(ConcreteValue::String(value)) => DesiredProvenance::String(value),
-        Value::Concrete(ConcreteValue::StringList(values)) => DesiredProvenance::StringList(values),
-        Value::Concrete(ConcreteValue::List(values)) => DesiredProvenance::List(values),
-        Value::Concrete(ConcreteValue::Map(values)) => DesiredProvenance::Map(values),
-        Value::Concrete(
-            ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_),
-        ) => DesiredProvenance::Scalar,
-        Value::Deferred(DeferredValue::Secret(_)) => DesiredProvenance::Secret,
-        Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        | Value::Deferred(
-            DeferredValue::ModuleIf(_)
-            | DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Coalesce { .. }
-            | DeferredValue::IntegerArithmetic(_)
-            | DeferredValue::Interpolation(_)
-            | DeferredValue::FunctionCall { .. }
-            | DeferredValue::Unavailable { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Access(_)
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
-        ) => unreachable!("the wire witness excludes unresolved desired values"),
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-    }
-}
-
-fn checked_value(original: &Value, wire: &crate::types::Value, owner: &Arc<()>) -> DesiredValue {
-    use crate::types::Value as Wire;
-    let provenance = desired_provenance(original);
-    if matches!(provenance, DesiredProvenance::Secret) {
-        return DesiredValue::Deferred(DeferredLeaf {
+        ProviderValidationValue::Bool(value) => DesiredValue::Known(DesiredScalar::Bool(value)),
+        ProviderValidationValue::Int(value) => DesiredValue::Known(DesiredScalar::Int(value)),
+        ProviderValidationValue::Float(value) => DesiredValue::Known(DesiredScalar::Float(value)),
+        ProviderValidationValue::String(value) => DesiredValue::Known(DesiredScalar::String(value)),
+        ProviderValidationValue::Deferred => DesiredValue::Deferred(DeferredLeaf {
             slot: 0,
             owner: Arc::clone(owner),
-        });
-    }
-    match wire {
-        Wire::Bool(value) => DesiredValue::Known(DesiredScalar::Bool(*value)),
-        Wire::Int(value) => DesiredValue::Known(DesiredScalar::Int(*value)),
-        Wire::Float(value) => DesiredValue::Known(DesiredScalar::Float(*value)),
-        Wire::String(value) => {
-            let value = match provenance {
-                DesiredProvenance::String(original) => original.clone(),
-                DesiredProvenance::Scalar => value.clone().into(),
-                DesiredProvenance::StringList(_)
-                | DesiredProvenance::List(_)
-                | DesiredProvenance::Map(_)
-                | DesiredProvenance::Secret => unreachable!("checked string provenance"),
-            };
-            DesiredValue::Known(DesiredScalar::String(value))
-        }
-        Wire::StringList(_) => {
-            let DesiredProvenance::StringList(originals) = provenance else {
-                unreachable!("checked string-list provenance")
-            };
-            DesiredValue::List(DesiredList {
-                values: originals
-                    .iter()
-                    .map(|value| DesiredValue::Known(DesiredScalar::String(value.clone())))
-                    .collect(),
-            })
-        }
-        Wire::List(values) => {
-            let DesiredProvenance::List(originals) = provenance else {
-                unreachable!("checked list provenance")
-            };
-            DesiredValue::List(DesiredList {
-                values: originals
-                    .iter()
-                    .zip(values)
-                    .map(|(original, wire)| checked_value(original, wire, owner))
-                    .collect(),
-            })
-        }
-        Wire::Map(values) => {
-            let DesiredProvenance::Map(originals) = provenance else {
-                unreachable!("checked map provenance")
-            };
-            DesiredValue::Map(DesiredMap {
-                entries: originals
-                    .iter()
-                    .map(|(name, original)| {
-                        (name.clone(), checked_value(original, &values[name], owner))
-                    })
-                    .collect(),
-            })
-        }
+        }),
+        ProviderValidationValue::List(values) => DesiredValue::List(DesiredList {
+            values: values
+                .iter()
+                .map(|value| checked_value(value, owner))
+                .collect(),
+        }),
+        ProviderValidationValue::Map(values) => DesiredValue::Map(DesiredMap {
+            entries: values
+                .iter()
+                .map(|(name, value)| (name.to_owned(), checked_value(value, owner)))
+                .collect(),
+        }),
     }
 }
 
@@ -520,7 +438,7 @@ impl Decoder<'_> {
                     .collect(),
             }),
             Wire::Map(values) => {
-                let mut entries = IndexMap::new();
+                let mut entries = BTreeMap::new();
                 for (key, value) in values {
                     path.push(Segment::Key(key.clone()));
                     entries.insert(key.clone(), self.value(value, attribute, path)?);
@@ -551,7 +469,7 @@ impl DesiredNormalization {
             owner: owner.clone(),
             expected: BTreeMap::new(),
         };
-        let mut entries = IndexMap::new();
+        let mut entries = BTreeMap::new();
         for (name, value) in resource.attributes {
             entries.insert(name.clone(), decoder.value(value, &name, &mut Vec::new())?);
         }
@@ -717,17 +635,15 @@ fn decode_native<S>(
     Ok((batch, inner))
 }
 
-// The normalization wire deliberately carries only plaintext and sorted maps.
-// On the native route, keep the original diagnostic provenance and map order
-// while retaining the decoder's move-only deferred handles.
+// The normalization wire carries plaintext and sorted maps. Restore native
+// diagnostic provenance while keeping protocol order and move-only handles.
 fn retain_native_map_metadata(tree: &mut DesiredMap, originals: &IndexMap<String, Value>) {
-    let mut entries = std::mem::take(&mut tree.entries);
     for (name, original) in originals {
-        let mut value = entries
-            .shift_remove(name)
+        let value = tree
+            .entries
+            .get_mut(name)
             .expect("decoded original attribute");
-        retain_native_value_metadata(&mut value, original);
-        tree.entries.insert(name.clone(), value);
+        retain_native_value_metadata(value, original);
     }
 }
 

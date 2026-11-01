@@ -1404,7 +1404,8 @@ pub trait CarinaProvider {
     /// opaque secret/reference/unknown leaves. Every deferred leaf must survive
     /// exactly once within its original resource and top-level attribute.
     /// Validate cross-field inputs with [`DesiredView::inputs`] here, or
-    /// [`DesiredInputs::from_provider_ready`] during native create/update validation.
+    /// [`DesiredInputs::from_provider_ready`] during native create validation and
+    /// [`DesiredInputs::from_update`] during native update validation.
     /// Normalization views keep secrets/references deferred; the provider-ready
     /// projection is infallible and retains remaining secret annotations as
     /// opaque leaves. CRUD bodies still get real secret values. Move nodes with [`DesiredMap::remove`] followed by
