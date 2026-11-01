@@ -38,5 +38,7 @@ dirs = "6"
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
+# Integration fixtures use the same gated helpers as the crate's unit tests.
+carina-core = { path = ".", features = ["test-utils"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
 tempfile = "3"

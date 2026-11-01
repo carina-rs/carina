@@ -224,6 +224,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         .empty_like();
     let expansion = PostExpansionPlanView {
         data: PostExpansionPlanData {
+            reference_preparation: Default::default(),
             expanded_resources,
             sorted_resources: Vec::new(),
             addressed: AddressedState {
@@ -10906,16 +10907,15 @@ mod expand_same_config_deferred_for_tests {
             })
             .seal(DataSourceValues::empty());
 
-        let out = prepared
-            .expand_parsed(
-                &mut parsed,
-                &schemas,
-                &HashMap::new(),
-                DeferredForWarningPolicy::Suppress,
-                &ProviderRouter::new(),
-                &identity_context,
-            )
-            .expect("deferred-for expansion should succeed");
+        let out = futures::executor::block_on(prepared.expand_parsed(
+            &mut parsed,
+            &schemas,
+            &HashMap::new(),
+            DeferredForWarningPolicy::Suppress,
+            &ProviderRouter::new(),
+            &identity_context,
+        ))
+        .expect("deferred-for expansion should succeed");
         assert!(
             !out.printed_warnings,
             "verification must not print warnings"

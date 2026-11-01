@@ -327,6 +327,7 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> ProviderResult<()> {
     print!(
         "{}",
@@ -340,6 +341,7 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
             prev_explicit,
             expansion_trace,
             provider,
+            comparisons,
         )?
     );
     Ok(())
@@ -365,6 +367,7 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> ProviderResult<String> {
     let mut out = String::new();
 
@@ -393,6 +396,7 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
             prev_explicit,
             expansion_trace,
             provider,
+            comparisons,
         )?);
 
         // Show deferred for-expressions
@@ -573,6 +577,7 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
         None,
         None, // ExpansionTrace doesn't apply to destroy plans (no compositions in state)
         provider,
+        carina_core::detail_rows::DetailComparisons::RecordedEffects,
     )?);
 
     Ok(out)
@@ -601,6 +606,7 @@ struct TreeRenderContext<'a, S> {
     /// Used to skip Move line display when the move is already shown via annotation.
     update_or_replace_targets: HashSet<ResourceId>,
     provider: &'a ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'a>,
 }
 
 impl<'a, S> TreeRenderContext<'a, S> {
@@ -1027,6 +1033,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.detail.to_core(),
                         explicit,
                         self.provider,
+                        self.comparisons,
                     )?
                 } else {
                     build_detail_rows_by_instance(
@@ -1036,6 +1043,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.historical_display,
                         self.prev_explicit,
                         self.provider,
+                        self.comparisons,
                     )?
                 };
 
@@ -1244,6 +1252,7 @@ fn format_plan_tree<'a, S>(
     prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &'a ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'a>,
 ) -> ProviderResult<String> {
     // Build dependency graph from effects
     let graph = build_dependency_graph(plan);
@@ -1295,6 +1304,7 @@ fn format_plan_tree<'a, S>(
         prev_explicit,
         update_or_replace_targets,
         provider,
+        comparisons,
     };
 
     // #3307: when an ExpansionTrace is supplied AND it actually

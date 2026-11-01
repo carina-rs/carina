@@ -45,3 +45,15 @@ Schema-only operations such as `validate`, `fmt`, and LSP diagnostics do not res
 When no source is found, the error suggests `AWS_PROFILE`, `aws sso login`, or the static environment keys. In CI, provide the same environment or workload credential source that an AWS SDK application would use. Do not copy profile files or credentials into a provider component.
 
 Local provider builds also need an explicit AWS trust grant; see [`--trust-local-provider`](/reference/cli/global-options/#trust-local-provider-pathkind). The grant authorizes the typed credential import but does not expose metadata endpoints.
+
+## KMS reference planning permissions
+
+When a KMS reference differs from the value returned by the service, planning resolves both values to key identities before deciding whether an update or replacement is needed. Key ARNs need no lookup. Key IDs, alias names, and alias ARNs require `kms:DescribeKey`. Identical concrete values and values deferred until apply need no lookup. Validation and LSP diagnostics remain offline.
+
+Grant `kms:DescribeKey` to the effective identity of each routed provider instance, including its assumed role. The KMS key policy must also authorize the lookup. Cross-account references require authorization in the target account's key policy and the caller's IAM policy. Bare key IDs and aliases use the instance's region and credentials; qualified ARNs retain their own region and account.
+
+This permission is required whenever a lookup is needed, independently of the advisory `--check-iam` option. Access denials, credential failures, transient failures, and invalid references abort planning with exit code 1 and produce no executable saved plan. A missing desired reference is also an error. A current reference that no longer resolves is shown as a difference so that an update can repair it.
+
+Resolving an AWS-managed alias such as `alias/aws/ecr` uses `DescribeKey` directly. On first use, this call can initialize the service's AWS-managed key during planning. There is no alias precheck or special success for an alias that cannot be found.
+
+Resolved key ARNs are comparison-only. Resource payloads and state retain their raw values. A normal `apply` resolves references again when it re-plans; applying a saved plan uses its raw effects under the existing saved-plan contract.

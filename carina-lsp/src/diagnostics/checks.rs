@@ -656,7 +656,8 @@ fn collect_enum_provider_namespaces(
                 collect_enum_provider_namespaces(member, namespaces);
             }
         }
-        RawShape::String { .. }
+        RawShape::Reference { .. }
+        | RawShape::String { .. }
         | RawShape::Int { .. }
         | RawShape::Float { .. }
         | RawShape::Bool

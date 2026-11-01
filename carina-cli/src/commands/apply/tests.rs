@@ -573,6 +573,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         &crate::empty_lifted_saved_attrs(),
         &HashMap::new(),
         &[],
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("create-only behavior change must plan a replacement");
     assert!(
@@ -7722,7 +7723,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     //
     // This tests the scenario from issue #1499 where plan-verify fails
     // because the block_name attribute shows as an addition.
-    use carina_core::differ::diff;
+    use carina_core::differ::diff_for_test as diff;
     use carina_core::schema::StructField;
 
     let schema = ResourceSchema::new("awscc.iam.role")
@@ -7826,8 +7827,10 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
         &saved,
         Some(&prev_explicit),
         Some(&schema),
-        &carina_core::differ::exact_comparison_context_for_tests(),
-    );
+        &carina_core::differ::exact_comparison_schema_for_tests(),
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
 
     assert!(
         matches!(d, carina_core::differ::Diff::NoChange(_)),

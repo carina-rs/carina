@@ -1844,6 +1844,86 @@ pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProvide
     CoreProviderError::from_wire(wit_to_wire_provider_error(err))
 }
 
+pub(crate) fn decode_reference_results(
+    expected: usize,
+    results: Vec<Result<wit::ReferenceOutcome, wit::ReferenceError>>,
+) -> Result<
+    Vec<Result<carina_core::references::ReferenceOutcome, carina_core::references::ReferenceError>>,
+    carina_core::references::ReferenceError,
+> {
+    use carina_core::references::{ReferenceError, ReferenceOutcome};
+    if results.len() != expected {
+        return Err(ReferenceError::InvalidReference(
+            CoreProviderError::invalid_input(format!(
+                "reference result length mismatch: expected {expected}, got {}",
+                results.len()
+            )),
+        ));
+    }
+    Ok(results
+        .into_iter()
+        .map(|result| match result {
+            Ok(wit::ReferenceOutcome::Resolved(value)) => {
+                ReferenceOutcome::from_guest(proto::ReferenceOutcome::Resolved(value))
+            }
+            Ok(wit::ReferenceOutcome::NotFound(error)) => Ok(ReferenceOutcome::NotFound(
+                wit_to_core_provider_error(error),
+            )),
+            Err(wit::ReferenceError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
+                wit_to_core_provider_error(error),
+            )),
+            Err(wit::ReferenceError::Transient(error)) => {
+                Err(ReferenceError::Transient(wit_to_core_provider_error(error)))
+            }
+            Err(wit::ReferenceError::InvalidReference(error)) => Err(
+                ReferenceError::InvalidReference(wit_to_core_provider_error(error)),
+            ),
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    use carina_core::references::{ReferenceError, ReferenceOutcome};
+
+    #[test]
+    fn reference_result_length_mismatch_is_invalid_reference() {
+        for (expected, actual) in [(2, 0), (2, 3), (0, 1)] {
+            let mut results = Vec::with_capacity(actual);
+            for _ in 0..actual {
+                results.push(Ok(wit::ReferenceOutcome::Resolved("key/one".into())));
+            }
+            assert!(matches!(
+                decode_reference_results(expected, results),
+                Err(ReferenceError::InvalidReference(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn reference_success_is_nonempty_and_format_is_guest_owned() {
+        let results = decode_reference_results(
+            2,
+            vec![
+                Ok(wit::ReferenceOutcome::Resolved(String::new())),
+                Ok(wit::ReferenceOutcome::Resolved(
+                    "generic-provider-key".into(),
+                )),
+            ],
+        );
+        let mut results = results.unwrap().into_iter();
+        assert!(matches!(
+            results.next().unwrap(),
+            Err(ReferenceError::InvalidReference(_))
+        ));
+        assert!(matches!(
+            results.next().unwrap(),
+            Ok(ReferenceOutcome::Resolved(_))
+        ));
+    }
+}
+
 /// Decode a guest initialization error and attach its boundary phase when the
 /// guest did not provide a more specific operation.
 ///
@@ -4675,9 +4755,11 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v15_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 15);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 15);
+    fn test_protocol_version_range_accepts_only_the_current_version() {
+        assert_eq!(
+            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION,
+            carina_provider_protocol::PROTOCOL_VERSION
+        );
     }
 
     #[test]
@@ -4689,7 +4771,10 @@ mod tests {
 
         assert!(error.contains("provider 'old'"));
         assert!(error.contains("protocol version 14"));
-        assert!(error.contains("requires at least version 15"));
+        assert!(error.contains(&format!(
+            "requires at least version {}",
+            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+        )));
     }
 
     #[test]

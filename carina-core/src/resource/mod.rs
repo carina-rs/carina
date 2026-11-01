@@ -30,7 +30,7 @@ use subtle::ConstantTimeEq;
 
 use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
-use crate::differ::ComparisonContext;
+use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::effect::MoveAuthority;
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
@@ -6605,15 +6605,58 @@ impl<'a> SavedValueViews<'a> {
     pub(crate) fn same(value: &'a Value) -> Self {
         Self::new(value, value)
     }
+
+    pub(crate) fn projected(self) -> &'a Value {
+        self.projected
+    }
 }
 
-pub(crate) fn merge_with_saved(
+/// Borrow either concrete list representation at the comparison seam.
+/// Conversion is local to comparison and never rewrites a payload or state.
+/// Pair identical concrete items before probing other unordered candidates.
+/// Preparation and comparison share this pairing so a reordered echoed
+/// reference never requires resolution merely because another item came first.
+pub(crate) fn match_equal_concrete_items(a: &[Value], b: &[Value]) -> (Vec<bool>, Vec<bool>) {
+    let mut matched_a = vec![false; a.len()];
+    let mut matched_b = vec![false; b.len()];
+    for (i, item) in a.iter().enumerate() {
+        if !matches!(item, Value::Concrete(_)) || !item.is_fully_resolved() {
+            continue;
+        }
+        if let Some(j) = b
+            .iter()
+            .enumerate()
+            .position(|(j, candidate)| !matched_b[j] && item == candidate)
+        {
+            matched_a[i] = true;
+            matched_b[j] = true;
+        }
+    }
+    (matched_a, matched_b)
+}
+
+pub(crate) fn comparison_list_items(value: &Value) -> Option<std::borrow::Cow<'_, [Value]>> {
+    match value {
+        Value::Concrete(ConcreteValue::List(items)) => Some(std::borrow::Cow::Borrowed(items)),
+        Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(
+            items
+                .iter()
+                .cloned()
+                .map(ConcreteValue::String)
+                .map(Value::Concrete)
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn merge_with_saved<R: ReferenceEquality>(
     desired: &Value,
     saved: SavedValueViews<'_>,
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Value {
     match (desired, saved.projected) {
         (
@@ -6656,14 +6699,14 @@ pub(crate) fn merge_with_saved(
     }
 }
 
-fn merge_maps(
+fn merge_maps<R: ReferenceEquality>(
     desired: &IndexMap<String, Value>,
     projected_saved: &IndexMap<String, Value>,
     raw_saved: &IndexMap<String, Value>,
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Value {
     let prior_children = match prior_explicit {
         ExplicitFields::Struct { children } => Some(children),
@@ -6724,12 +6767,12 @@ fn merge_maps(
 /// (or equal scalar), then run the exact same global best-first commit phase.
 /// Hash collisions only add a candidate: [`similarity_score`] remains the
 /// authority before a candidate can be committed.
-pub(crate) fn pair_list_elements<D, S>(
+pub(crate) fn pair_list_elements<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<Option<usize>>
 where
     D: Borrow<Value>,
@@ -6759,12 +6802,12 @@ pub(crate) enum ListElementPairing {
 /// A match is unique only when the selected saved element is the sole
 /// positive, highest-scoring candidate for that desired element. Global
 /// contention that forces a lower-scoring choice is therefore ambiguous too.
-pub(crate) fn pair_list_elements_with_uniqueness<D, S>(
+pub(crate) fn pair_list_elements_with_uniqueness<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<ListElementPairing>
 where
     D: Borrow<Value>,
@@ -6775,12 +6818,12 @@ where
     classify_list_element_pairs(&pairs, saved.len(), &candidates)
 }
 
-fn list_pair_candidates<D, S>(
+fn list_pair_candidates<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -6967,12 +7010,12 @@ struct PairCandidates {
     implicit_scores: Vec<usize>,
 }
 
-fn pair_candidates_quadratic<D, S>(
+fn pair_candidates_quadratic<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -7019,12 +7062,12 @@ where
 /// but non-universal bucket can still make the worst case quadratic; the
 /// universal-field compression covers the common policy-statement shape while
 /// preserving exactly the same pairing decisions.
-fn pair_candidates_hashed<D, S>(
+fn pair_candidates_hashed<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -7203,11 +7246,11 @@ where
     }
 }
 
-fn pairing_hashes(
+fn pairing_hashes<R: ReferenceEquality>(
     value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<u64> {
     let mut hashes = vec![value.canonical_hash()];
     match value {
@@ -7243,11 +7286,11 @@ fn secret_state_pairing_hash() -> u64 {
     pairing_component_hash(0x08, &RedactedSecretHash::V2_MARKER_PREFIX)
 }
 
-fn append_schema_pairing_hashes(
+fn append_schema_pairing_hashes<R: ReferenceEquality>(
     value: &Value,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
     hashes: &mut Vec<u64>,
     depth: usize,
 ) {
@@ -7256,6 +7299,10 @@ fn append_schema_pairing_hashes(
         return;
     }
     match attr_type.shape_with_defs(defs) {
+        Shape::Reference { .. } => {
+            // Resolved equality must also be considered by multiset pairing.
+            hashes.push(pairing_component_hash(0x09, &0_u8));
+        }
         Shape::String {
             identity, to_dsl, ..
         } => {
@@ -7360,14 +7407,14 @@ fn pairing_component_hash<T: Hash>(tag: u8, value: &T) -> u64 {
 
 /// Merge two lists using projected saved values for value pairing and raw saved values to
 /// corroborate stored-index authoring attribution.
-fn merge_lists(
+fn merge_lists<R: ReferenceEquality>(
     desired: &[Value],
     projected_saved: &[Value],
     raw_saved: &[Value],
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<Value> {
     // `WholeValue` is the explicit whole-value fallback used when a carried row
     // cannot transfer a pending nested removal to a uniquely identified list
@@ -7450,12 +7497,12 @@ fn merge_lists(
 /// For Maps: count matching key-value pairs.
 /// For equal scalars: return 1.
 /// Otherwise: return 0.
-fn similarity_score(
+fn similarity_score<R: ReferenceEquality>(
     a: &Value,
     b: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> usize {
     match (a, b) {
         (Value::Concrete(ConcreteValue::Map(am)), Value::Concrete(ConcreteValue::Map(bm))) => am

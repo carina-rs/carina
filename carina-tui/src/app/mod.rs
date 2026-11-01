@@ -107,8 +107,17 @@ impl App {
             schemas,
             plan.effects().iter().map(Effect::resource_id),
         );
-        Self::new(plan, &schemas, &historical_display, None, &provider)
-            .expect("test plan display must resolve every comparison")
+        Self::new(
+            plan,
+            &schemas,
+            &historical_display,
+            None,
+            &provider,
+            carina_core::detail_rows::DetailComparisons::Planning(
+                &carina_core::references::prepare_empty_for_tests(),
+            ),
+        )
+        .expect("test plan display must resolve every comparison")
     }
 
     pub fn new(
@@ -117,6 +126,7 @@ impl App {
         historical_display: &HistoricalDisplayAttributes,
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
         provider: &ProviderRouter,
+        comparisons: carina_core::detail_rows::DetailComparisons<'_>,
     ) -> ProviderResult<Self> {
         let replacement_display: Vec<_> = plan.replace_display_info().collect();
         let replacement_create_info: HashMap<_, _> = replacement_display
@@ -136,6 +146,7 @@ impl App {
                     replacement_create_info.get(&idx).copied(),
                     prev_explicit,
                     provider,
+                    comparisons,
                 )
             })
             .collect::<ProviderResult<Vec<_>>>()?;
@@ -770,6 +781,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn effect_to_node(
     plan: &Plan,
     effect: &Effect,
@@ -778,6 +790,7 @@ fn effect_to_node(
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> ProviderResult<TreeNode> {
     let detail_rows =
         if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
@@ -790,6 +803,7 @@ fn effect_to_node(
                 DetailLevel::Full,
                 prev_explicit.and_then(|map| map.get(&resource.id)),
                 provider,
+                comparisons,
             )
         } else {
             build_detail_rows_by_instance(
@@ -799,6 +813,7 @@ fn effect_to_node(
                 historical_display,
                 prev_explicit,
                 provider,
+                comparisons,
             )
         }?;
     Ok(effect_to_node_with_rows(

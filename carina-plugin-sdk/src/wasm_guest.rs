@@ -2606,6 +2606,26 @@ macro_rules! export_provider {
                     .map_err(validate_string_to_provider_error)
                 }
 
+                fn resolve_references(
+                    requests: Vec<wit_types::ReferenceRequest>,
+                ) -> Result<Vec<Result<wit_types::ReferenceOutcome, wit_types::ReferenceError>>, wit_types::ProviderError> {
+                    let requests = requests.into_iter().map(|request| {
+                        let wit_types::ReferenceRequest { ty, value } = request;
+                        proto::ReferenceRequest { ty: wit_to_proto_type_identity(&ty), value }
+                    }).collect();
+                    let results = {
+                        let provider = get_provider().lock().unwrap();
+                        $crate::CarinaProvider::resolve_references(&*provider, requests)
+                    }.map_err(proto_to_wit_provider_error)?;
+                    Ok(results.into_iter().map(|result| match result {
+                        Ok(proto::ReferenceOutcome::Resolved(value)) => Ok(wit_types::ReferenceOutcome::Resolved(value)),
+                        Ok(proto::ReferenceOutcome::NotFound(error)) => Ok(wit_types::ReferenceOutcome::NotFound(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::AccessDenied(error)) => Err(wit_types::ReferenceError::AccessDenied(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::Transient(error)) => Err(wit_types::ReferenceError::Transient(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::InvalidReference(error)) => Err(wit_types::ReferenceError::InvalidReference(proto_to_wit_provider_error(*error))),
+                    }).collect())
+                }
+
                 fn normalize_desired(
                     resources: Vec<exports::carina::provider::provider::DesiredResource>,
                 ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {

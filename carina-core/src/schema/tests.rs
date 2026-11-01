@@ -5882,7 +5882,7 @@ fn resolved_attr_type_never_returns_ref_after_peel() {
     );
     assert!(matches!(
         resolved.as_attr().kind(),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. }
     ));
 
     // Non-Ref input is returned as-is (identity behavior).
@@ -5964,7 +5964,7 @@ fn union_members_ref_free_skips_ref_member_and_keeps_sibling() {
             .expect("String sibling must remain visible")
             .as_attr()
             .kind(),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. }
     ));
 }
 
@@ -5981,7 +5981,7 @@ fn ref_hop_limit_counts_only_the_current_resolution_chain() {
         .expect("an accumulated path must not consume the current chain's hop budget");
     assert!(matches!(
         resolution.attr.kind(),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. }
     ));
     assert_eq!(visited_refs.len(), MAX_REF_PATH_HOPS + 1);
 }
@@ -6978,7 +6978,8 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
             .as_raw_slice()
             .iter()
             .any(contains_unrefined_primitive),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -12783,7 +12784,7 @@ fn select_union_member_retains_only_the_chosen_member_ref_chain() {
         .expect("String value must select Chosen");
     assert!(matches!(
         selected.as_attr().kind(),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. }
     ));
     assert_eq!(visited_refs, vec!["Caller", "Chosen"]);
 }

@@ -265,9 +265,29 @@ pub fn set_trusted_local_grant_inputs(
         .map_err(|_| TrustedLocalGrantInputsAlreadySetError)
 }
 
+/// Comparison evidence belongs to the result of this preparation, rather than
+/// to the router shared by successive plans. Diagnostic plans have no effects.
+#[derive(Debug)]
+pub enum PlanReferenceEvidence {
+    Prepared(carina_core::references::ResolvedReferences),
+    Diagnostics,
+}
+
+impl PlanReferenceEvidence {
+    pub fn for_display(&self) -> carina_core::detail_rows::DetailComparisons<'_> {
+        match self {
+            Self::Prepared(references) => {
+                carina_core::detail_rows::DetailComparisons::Planning(references)
+            }
+            Self::Diagnostics => carina_core::detail_rows::DetailComparisons::RecordedEffects,
+        }
+    }
+}
+
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
     pub plan: Plan,
+    pub references: PlanReferenceEvidence,
     pub provider: ProviderRouter,
     /// Evaluated desired resources after the identity-resolution boundary.
     pub sorted_resources: Vec<ResolvedResource>,
@@ -561,6 +581,7 @@ impl<R> ValidationReady<R> {
         self.inner
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn try_map_with_output_preserving_binding_use_resolution<T, O, E>(
         self,
         transform: impl FnOnce(R) -> Result<(T, O), E>,
@@ -573,6 +594,19 @@ impl<R> ValidationReady<R> {
             },
             output,
         ))
+    }
+
+    async fn try_map_async_with_output_preserving_binding_use_resolution<T, O, E, F, Fut>(
+        self,
+        transform: F,
+    ) -> Result<(ValidationReady<T>, O), E>
+    where
+        F: FnOnce(R) -> Fut,
+        Fut: std::future::Future<Output = Result<(T, O), E>>,
+    {
+        let Self { inner, origin } = self;
+        let (inner, output) = transform(inner).await?;
+        Ok((ValidationReady { inner, origin }, output))
     }
 
     async fn try_map_async_preserving_binding_use_resolution<T, E, F, Fut>(
@@ -1715,7 +1749,7 @@ impl<E> ValidatedConfig<ExpandedPlanContext<E>> {
 impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
     /// Consume this validated pair through the shared deferred-`for`
     /// expansion transition while retaining its validating provider load.
-    pub(crate) fn expand_deferred_for(
+    pub(crate) async fn expand_deferred_for(
         self,
         prepared: &PreparedDeferredForExpansion,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -1732,15 +1766,18 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
             wiring, resources, ..
         } = self;
         let (resources, expansion) = resources
-            .try_map_with_output_preserving_binding_use_resolution(|resources| {
-                prepared.expand(
-                    resources,
-                    wiring.context(),
-                    remote_bindings,
-                    warning_policy,
-                    provider,
-                )
-            })?;
+            .try_map_async_with_output_preserving_binding_use_resolution(|resources| async {
+                prepared
+                    .expand(
+                        resources,
+                        wiring.context(),
+                        remote_bindings,
+                        warning_policy,
+                        provider,
+                    )
+                    .await
+            })
+            .await?;
         Ok((
             ValidatedConfig {
                 wiring,
@@ -1766,15 +1803,14 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         } = self;
         let (resources, ()) =
             resources.try_map_with_output_preserving_binding_use_resolution(|resources| {
-                prepared
-                    .expand_for_plan(
-                        resources,
-                        wiring.context(),
-                        remote_bindings,
-                        warning_policy,
-                        provider,
-                    )
-                    .map(|expanded| (expanded, ()))
+                futures::executor::block_on(prepared.expand_for_plan(
+                    resources,
+                    wiring.context(),
+                    remote_bindings,
+                    warning_policy,
+                    provider,
+                ))
+                .map(|expanded| (expanded, ()))
             })?;
         Ok(ValidatedConfig {
             wiring,
@@ -5250,6 +5286,7 @@ struct DeferredForExpansionWitness;
 
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
 pub struct DeferredForExpansion {
+    reference_preparation: carina_core::references::ReferencePreparation,
     /// The augmented, re-sorted resource set: every original resource
     /// plus the materialized loop children, topologically ordered.
     /// Equal in length to the input when no loop resolved.
@@ -5331,7 +5368,7 @@ impl<E> ExpandedCanonicalResources<E> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn derive_managed_binding_stability<E>(
+pub async fn derive_managed_binding_stability<E>(
     parsed: &ExpandedFile<E>,
     resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
@@ -5342,12 +5379,43 @@ pub fn derive_managed_binding_stability<E>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
     provider: &ProviderRouter,
+    reference_preparation: &mut carina_core::references::ReferencePreparation,
 ) -> Result<HashMap<ResourceId, carina_core::binding_index::ManagedBindingStability>, AppError> {
-    let plan_input_current = carina_core::resource::into_plan_input_current_map(
-        managed_current.clone(),
-        schemas,
-        resources,
-    );
+    // Binding stability is a planning comparison too. Normalize cloned
+    // observations and resolved desired values before preparing its witness.
+    let mut normalized_current = managed_current.clone();
+    // Optimistic binding snapshots may carry unknown output attributes. The
+    // persisted-state normalizer cannot encode these; withhold them just as
+    // desired normalization withholds deferred attributes, then restore them.
+    let mut deferred_attributes = HashMap::new();
+    for (id, current) in &mut normalized_current {
+        if let Some(attributes) = current.attributes_mut() {
+            let deferred = attributes
+                .extract_if(|_, value| carina_core::resource::value_contains_unknown(value))
+                .collect::<HashMap<_, _>>();
+            if !deferred.is_empty() {
+                deferred_attributes.insert(id.clone(), deferred);
+            }
+        }
+    }
+
+    normalize_prior_states(
+        &mut normalized_current,
+        &mut HashMap::new(),
+        &mut Orphans::new(),
+        provider,
+    )
+    .await?;
+    for (id, deferred) in deferred_attributes {
+        normalized_current
+            .get_mut(&id)
+            .and_then(Current::attributes_mut)
+            .expect("normalization preserves state-bearing resource routes")
+            .extend(deferred);
+    }
+
+    let plan_input_current =
+        carina_core::resource::into_plan_input_current_map(normalized_current, schemas, resources);
     let optimistic_bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: resources,
         compositions: &parsed.compositions,
@@ -5363,6 +5431,7 @@ pub fn derive_managed_binding_stability<E>(
         &parsed.upstream_binding_names(),
     )
     .map_err(AppError::Validation)?;
+    apply_desired_normalization_slice(&mut resolved, &parsed.providers, provider, schemas).await?;
     // Identity derivation runs later in the plan pipeline. Pending resources
     // cannot have a refreshed row addressed to them yet, so they are
     // conservatively unavailable; resolved resources can be diffed normally.
@@ -5380,6 +5449,15 @@ pub fn derive_managed_binding_stability<E>(
         }
     }
     let resolved = schema_resolved;
+    let references = reference_preparation
+        .prepare(
+            &resolved,
+            &plan_input_current,
+            schemas,
+            saved_attrs,
+            provider,
+        )
+        .await?;
     let mut stability = carina_core::differ::managed_binding_stability(
         &resolved,
         &plan_input_current,
@@ -5387,6 +5465,7 @@ pub fn derive_managed_binding_stability<E>(
         saved_attrs,
         prev_explicit,
         provider,
+        &references,
     )?;
     stability.extend(pending_stability);
     Ok(stability)
@@ -5436,6 +5515,7 @@ impl children_settlement::Sealed for ApplyChildrenSettled {}
 /// `C` marker additionally prevents that seam from accepting expanded loop
 /// children before their prior-state transition has completed.
 struct PostExpansionPlanData<E> {
+    reference_preparation: carina_core::references::ReferencePreparation,
     expanded_resources: ExpandedCanonicalResources<E>,
     sorted_resources: Vec<Resource>,
     addressed: AddressedState,
@@ -5738,6 +5818,7 @@ pub(crate) struct PostExpansionArtifacts<R> {
     pub expanded_resources: R,
     pub residual_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
     pub plan: Plan,
+    pub references: PlanReferenceEvidence,
     pub compositions: Vec<LiveComposition>,
     pub data_sources: Vec<DataSource>,
     pub managed_current: HashMap<ResourceId, Current>,
@@ -5753,6 +5834,7 @@ impl<R> PostExpansionArtifacts<R> {
             expanded_resources,
             residual_deferred_for,
             plan,
+            references,
             compositions,
             data_sources,
             managed_current,
@@ -5765,6 +5847,7 @@ impl<R> PostExpansionArtifacts<R> {
             expanded_resources: map(expanded_resources),
             residual_deferred_for,
             plan,
+            references,
             compositions,
             data_sources,
             managed_current,
@@ -5855,6 +5938,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     let PostExpansionPlanView { data, children } = expansion;
     children.consume();
     let PostExpansionPlanData {
+        mut reference_preparation,
         expanded_resources,
         sorted_resources,
         mut addressed,
@@ -5883,7 +5967,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         remote_bindings,
         &wait_aliases,
         provider,
-    )?;
+        &mut reference_preparation,
+    )
+    .await?;
     let pre_apply_current = carina_core::resource::into_plan_input_current_map(
         addressed.managed_current.clone(),
         context.schemas(),
@@ -5958,6 +6044,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             expanded_resources,
             residual_deferred_for,
             plan,
+            references: PlanReferenceEvidence::Diagnostics,
             compositions,
             data_sources: data_sources_for_plan,
             managed_current: into_all_prior_states(addressed.orphans, addressed.managed_current),
@@ -6007,6 +6094,15 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         override_aware_resources.resources().iter().cloned(),
         context.schemas(),
     )?;
+    let references = reference_preparation
+        .prepare(
+            &stability_resources,
+            &reconciled_input_current,
+            context.schemas(),
+            &addressed.saved_attrs,
+            provider,
+        )
+        .await?;
     let managed_stability = carina_core::differ::managed_binding_stability(
         &stability_resources,
         &reconciled_input_current,
@@ -6014,6 +6110,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         &addressed.saved_attrs,
         &addressed.prev_explicit,
         provider,
+        &references,
     )?;
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
@@ -6065,6 +6162,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         &addressed.prev_explicit,
         &wait_bindings,
         &outcome_unknown_import_replacements,
+        &references,
     )?;
     let plan = plan.finish(|plan| {
         add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
@@ -6104,6 +6202,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             expanded_resources,
             residual_deferred_for,
             plan,
+            references: PlanReferenceEvidence::Prepared(references),
             compositions,
             data_sources: data_sources_for_plan,
             managed_current,
@@ -6241,7 +6340,7 @@ impl PreparedDeferredForExpansion {
     /// Expand against the exact addressed state/metadata view sealed by
     /// one of the prelude's typed address transitions, consuming the canonical
     /// pair into an [`ExpandedCanonicalResources`] witness.
-    pub(crate) fn expand<E: Clone>(
+    pub(crate) async fn expand<E: Clone>(
         &self,
         mut resources: CanonicalResourcePair<E>,
         ctx: &WiringContext,
@@ -6270,14 +6369,15 @@ impl PreparedDeferredForExpansion {
             warning_policy,
             provider,
             ctx,
-        )?;
+        )
+        .await?;
         Ok((ExpandedCanonicalResources { resources }, expansion))
     }
 
     /// Consume the prepared state and canonical pair as one plan-expansion
     /// transition. The returned bundle is the only input accepted by the
     /// shared post-expansion plan builder.
-    pub(crate) fn expand_for_plan<E: Clone>(
+    pub(crate) async fn expand_for_plan<E: Clone>(
         self,
         resources: CanonicalResourcePair<E>,
         ctx: &WiringContext,
@@ -6285,14 +6385,16 @@ impl PreparedDeferredForExpansion {
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
     ) -> Result<PostExpansionPlanView<E, ChildrenPending>, AppError> {
-        let (expanded_resources, expansion) =
-            self.expand(resources, ctx, remote_bindings, warning_policy, provider)?;
+        let (expanded_resources, expansion) = self
+            .expand(resources, ctx, remote_bindings, warning_policy, provider)
+            .await?;
         let PreparedDeferredForExpansionParts {
             addressed,
             data_source_values,
             wait_aliases,
         } = self.into_parts();
         let DeferredForExpansion {
+            reference_preparation,
             sorted_resources,
             residual_deferred_for,
             #[cfg(test)]
@@ -6307,6 +6409,7 @@ impl PreparedDeferredForExpansion {
         } = expansion;
         Ok(PostExpansionPlanView {
             data: PostExpansionPlanData {
+                reference_preparation,
                 expanded_resources,
                 sorted_resources,
                 addressed,
@@ -6327,7 +6430,7 @@ impl PreparedDeferredForExpansion {
 impl PreparedAddressPreservingDeferredForExpansion {
     /// Raw-file expansion is reserved for address-preserving state refresh and
     /// focused tests; this type cannot invoke canonical prefix reconciliation.
-    pub(crate) fn expand_parsed<E: Clone>(
+    pub(crate) async fn expand_parsed<E: Clone>(
         &self,
         parsed: &mut ExpandedFile<E>,
         schemas: &SchemaRegistry,
@@ -6352,6 +6455,7 @@ impl PreparedAddressPreservingDeferredForExpansion {
             provider,
             identity_context,
         )
+        .await
     }
 }
 
@@ -6506,7 +6610,7 @@ impl<E> DeferredExpansionTarget<E> for ExpandedFile<E> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E>>(
+async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E>>(
     target: &mut T,
     sorted_resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
@@ -6522,6 +6626,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     provider: &ProviderRouter,
     identity_context: &WiringContext,
 ) -> Result<DeferredForExpansion, AppError> {
+    let mut reference_preparation = carina_core::references::ReferencePreparation::default();
     let parsed = target.parsed();
     // Common case: no deferred-for at all. Skip the binding projection
     // and the whole-`File` clone entirely (this runs on every plan /
@@ -6532,6 +6637,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         let printed_warnings =
             warning_policy == DeferredForWarningPolicy::Print && parsed.print_warnings();
         return Ok(DeferredForExpansion {
+            reference_preparation,
             sorted_resources: sorted_resources.to_vec(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             #[cfg(test)]
@@ -6561,7 +6667,9 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         remote_bindings,
         wait_aliases,
         provider,
-    )?;
+        &mut reference_preparation,
+    )
+    .await?;
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         schemas,
@@ -6656,6 +6764,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     );
 
     Ok(DeferredForExpansion {
+        reference_preparation,
         sorted_resources: resorted,
         residual_deferred_for,
         #[cfg(test)]
@@ -6728,14 +6837,14 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
         data_source_values: data_source_values.clone(),
     });
     let mut expanded = parsed.clone();
-    prepared.expand_parsed(
+    futures::executor::block_on(prepared.expand_parsed(
         &mut expanded,
         &comparison_schemas,
         remote_bindings,
         DeferredForWarningPolicy::Print,
         &comparison_provider,
         &identity_context,
-    )
+    ))
 }
 
 /// Result of the deferred-for expansion, materialised-child read,
@@ -6834,14 +6943,17 @@ async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormaliz
     parsed: &mut ExpandedFile<E>,
     inputs: ExpandRefreshAndLiftInputs<'_, '_, P, PreparedAddressPreservingDeferredForExpansion>,
 ) -> Result<ExpandedRefreshState, AppError> {
-    let expansion = inputs.expansion.expand_parsed(
-        parsed,
-        inputs.schemas,
-        inputs.remote_bindings,
-        inputs.warning_policy,
-        inputs.comparison_provider,
-        inputs.identity_context,
-    )?;
+    let expansion = inputs
+        .expansion
+        .expand_parsed(
+            parsed,
+            inputs.schemas,
+            inputs.remote_bindings,
+            inputs.warning_policy,
+            inputs.comparison_provider,
+            inputs.identity_context,
+        )
+        .await?;
     finish_expanded_refresh_state(expansion, inputs).await
 }
 
@@ -6878,13 +6990,15 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
         let schemas = identity_context.schemas();
         canonical_resources
             .try_map_async_preserving_binding_use_resolution(|canonical_resources| async move {
-                let pending = expansion.expand_for_plan(
-                    canonical_resources,
-                    identity_context,
-                    remote_bindings,
-                    warning_policy,
-                    comparison_provider,
-                )?;
+                let pending = expansion
+                    .expand_for_plan(
+                        canonical_resources,
+                        identity_context,
+                        remote_bindings,
+                        warning_policy,
+                        comparison_provider,
+                    )
+                    .await?;
                 let settled = if let Some(state_file) = state_file.as_ref() {
                     pending
                         .settle_children_live(LiveExpandedChildrenInputs {
@@ -7083,6 +7197,7 @@ async fn finish_expanded_refresh_state<
     inputs: ExpandRefreshAndLiftInputs<'_, '_, P, E>,
 ) -> Result<ExpandedRefreshState, AppError> {
     let DeferredForExpansion {
+        reference_preparation: _,
         sorted_resources,
         residual_deferred_for: _,
         #[cfg(test)]
@@ -7369,13 +7484,15 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // Expansion yields a pending child-state witness. The plan seam accepts
     // only the settled witness produced by one of the three exhaustive prior-
     // state transitions below.
-    let pending_expansion = prepared_expansion.expand_for_plan(
-        canonical_resources,
-        ctx,
-        remote_bindings,
-        DeferredForWarningPolicy::Print,
-        &provider,
-    )?;
+    let pending_expansion = prepared_expansion
+        .expand_for_plan(
+            canonical_resources,
+            ctx,
+            remote_bindings,
+            DeferredForWarningPolicy::Print,
+            &provider,
+        )
+        .await?;
     let child_saved_dep_bindings = HashMap::new();
     let plan_expansion = match (refresh_phase.as_ref(), state_file.as_ref()) {
         (Some(refresh_phase), Some(state_file)) => pending_expansion
@@ -7432,6 +7549,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         expanded_resources,
         residual_deferred_for,
         plan,
+        references,
         compositions,
         data_sources,
         managed_current,
@@ -7444,6 +7562,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     Ok(ExpandedPlanContext::new(
         PlanContext {
             plan,
+            references,
             provider,
             // Keep the evaluated desired view distinct from the authored
             // pre-resolution snapshot. Before carina#3861 this field was filled

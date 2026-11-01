@@ -236,7 +236,7 @@ async fn create_checked_bootstrap_resource(
     let resolved = request.resource().as_inner().clone();
     let resolved_comparison = comparison_provider.comparison_for(schemas, &resolved.id)?;
     let owner_schema = resolved_comparison.owner_schema();
-    let comparison = resolved_comparison.context();
+    let comparison = &resolved_comparison.context().observation();
     let schema = Some(owner_schema.schema().as_schema());
     let accepted_request = AcceptedRequest::from_create_request(&request);
     let (create, create_cancellation) =
@@ -1368,7 +1368,7 @@ pub(crate) async fn detect_drift<S: Clone>(
                                 planned_val,
                                 Some(validated_schema),
                                 key,
-                                typed_comparison.context(),
+                                &typed_comparison.context().observation(),
                             ) =>
                         {
                             let masked = carina_core::value::mask_plaintext_using_secret_shape(
@@ -2145,6 +2145,7 @@ async fn run_apply_locked_owned(
                 expanded_resources: validated_expansion,
                 residual_deferred_for,
                 plan,
+                references,
                 compositions: pre_resolve_compositions,
                 data_sources: _,
                 mut managed_current,
@@ -2231,6 +2232,7 @@ async fn run_apply_locked_owned(
                     None,
                     None,
                     &provider,
+                    references.for_display(),
                 )?;
                 // This fast path has no managed-resource mutations, so it
                 // cannot contain the Delete + Create pair required for a
@@ -2341,6 +2343,7 @@ async fn run_apply_locked_owned(
                 Some(&prev_explicit),
                 None,
                 &provider,
+                references.for_display(),
             )?;
             let moved_hints = crate::moved_hint::detect_moved_block_hints(
                 &plan,
@@ -2841,12 +2844,14 @@ async fn prepare_saved_plan_secret_candidates(
         )
         .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Suppress)?
         .seal(data_source_values);
-    let (mut validated_expansion, _expansion) = validated_config.expand_deferred_for(
-        &prepared_expansion,
-        provider_inputs.remote_bindings(),
-        crate::wiring::DeferredForWarningPolicy::Suppress,
-        &provider,
-    )?;
+    let (mut validated_expansion, _expansion) = validated_config
+        .expand_deferred_for(
+            &prepared_expansion,
+            provider_inputs.remote_bindings(),
+            crate::wiring::DeferredForWarningPolicy::Suppress,
+            &provider,
+        )
+        .await?;
 
     let normalizers = create_normalizers_from_configs_with_ctx(
         validated_expansion.context(),
@@ -3646,6 +3651,7 @@ async fn run_apply_from_plan_locked_owned(
                     None,
                     None,
                     &provider,
+                    carina_core::detail_rows::DetailComparisons::RecordedEffects,
                 )?;
                 let stdin = tokio::io::BufReader::new(tokio::io::stdin());
                 if confirm_apply(stdin, cancel.clone(), auto_approve).await?
@@ -3691,6 +3697,7 @@ async fn run_apply_from_plan_locked_owned(
                 None,
                 None,
                 &provider,
+                carina_core::detail_rows::DetailComparisons::RecordedEffects,
             )?;
             let moved_hints = crate::moved_hint::detect_moved_block_hints(
                 plan,

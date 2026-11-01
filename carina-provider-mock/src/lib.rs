@@ -1,3 +1,4 @@
+pub mod references;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -109,6 +110,7 @@ pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a>(
 /// Schemas exposed by Carina's built-in `provider mock {}` implementation.
 pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
     let schemas = vec![
+        references::resource_schema().as_schema().clone(),
         ResourceSchema::new("test.resource")
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
@@ -393,6 +395,7 @@ pub fn builtin_schema_witness() -> ValidatedProviderSchemaWitness {
 
 pub struct MockProvider {
     state_file: PathBuf,
+    reference_table: Option<references::ReferenceTable>,
     partial_create: Option<PartialConfig>,
     partial_update: Option<PartialConfig>,
 }
@@ -475,9 +478,73 @@ impl MockProvider {
         }
         Self {
             state_file,
+            reference_table: None,
             partial_create: partial_create_config_from_env(),
             partial_update: partial_update_config_from_env(),
         }
+    }
+
+    pub fn with_reference_table(mut self, table: references::ReferenceTable) -> Self {
+        self.reference_table = Some(table);
+        self
+    }
+
+    fn resolve_reference_requests(
+        &self,
+        requests: Vec<carina_plugin_sdk::types::ReferenceRequest>,
+    ) -> ProviderResult<
+        Vec<
+            Result<
+                carina_plugin_sdk::types::ReferenceOutcome,
+                carina_plugin_sdk::types::ReferenceError,
+            >,
+        >,
+    > {
+        let table = match &self.reference_table {
+            Some(table) => table.clone(),
+            None => match env::var("CARINA_MOCK_REFERENCE_TABLE") {
+                Ok(table) => serde_json::from_str(&table).map_err(|error| {
+                    ProviderError::invalid_input_caused_by("Invalid mock reference table", error)
+                })?,
+                Err(_) => references::ReferenceTable::new(),
+            },
+        };
+        Ok(references::resolve(&table, requests))
+    }
+
+    fn canonicalize_mock_reference_write(
+        &self,
+        id: &ResourceId,
+        attributes: &mut HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        if id.resource_type != "test.reference"
+            || env::var("CARINA_MOCK_REFERENCE_ECHO_ALIAS").as_deref() == Ok("true")
+        {
+            return Ok(());
+        }
+        for name in ["key", "fixed_key"] {
+            let Some(Value::Concrete(ConcreteValue::String(raw))) = attributes.get(name) else {
+                continue;
+            };
+            let request = carina_plugin_sdk::types::ReferenceRequest {
+                ty: carina_plugin_sdk::types::TypeIdentity {
+                    provider: "mock".into(),
+                    segments: vec!["keys".into(), "Key".into()],
+                    kind: "Reference".into(),
+                },
+                value: raw.expose_plaintext().into(),
+            };
+            let mut results = self.resolve_reference_requests(vec![request])?;
+            if let Some(Ok(carina_plugin_sdk::types::ReferenceOutcome::Resolved(value))) =
+                results.pop()
+            {
+                attributes.insert(
+                    name.into(),
+                    Value::Concrete(ConcreteValue::String(value.into())),
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn with_partial_create_for(
@@ -1092,6 +1159,9 @@ impl MockProvider {
         };
 
         let mut persisted_values = resource.resolved_attributes();
+        if let Err(error) = self.canonicalize_mock_reference_write(&id, &mut persisted_values) {
+            return Err(attempt.untracked(error));
+        }
         Self::add_server_list_defaults(&id, &mut persisted_values);
         let attrs = persisted_values
             .iter()
@@ -1416,6 +1486,55 @@ impl Provider for MockProvider {
         "mock"
     }
 
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [carina_core::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<
+                Result<
+                    carina_core::references::ReferenceOutcome,
+                    carina_core::references::ReferenceError,
+                >,
+            >,
+        >,
+    > {
+        Box::pin(async move {
+            use carina_core::references::{ReferenceError, ReferenceOutcome};
+            use carina_plugin_sdk::types::{
+                ReferenceError as WireError, TypeIdentity as WireIdentity,
+            };
+            let requests = requests
+                .iter()
+                .map(|request| carina_plugin_sdk::types::ReferenceRequest {
+                    ty: WireIdentity {
+                        provider: request.ty.provider.clone().unwrap_or_default(),
+                        segments: request.ty.segments.clone(),
+                        kind: request.ty.kind.clone(),
+                    },
+                    value: request.value.clone(),
+                })
+                .collect();
+            Ok(self
+                .resolve_reference_requests(requests)?
+                .into_iter()
+                .map(|result| match result {
+                    Ok(outcome) => ReferenceOutcome::from_guest(outcome),
+                    Err(WireError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
+                        ProviderError::from_wire(*error),
+                    )),
+                    Err(WireError::Transient(error)) => {
+                        Err(ReferenceError::Transient(ProviderError::from_wire(*error)))
+                    }
+                    Err(WireError::InvalidReference(error)) => Err(
+                        ReferenceError::InvalidReference(ProviderError::from_wire(*error)),
+                    ),
+                })
+                .collect())
+        })
+    }
+
     fn read(
         &self,
         id: &ResourceId,
@@ -1618,6 +1737,7 @@ impl Provider for MockProvider {
             // This test hook models a service-side addition after saved-plan
             // drift verification but before the update response is read back.
             Self::add_server_list_update_out_of_band_element(&id, &mut attributes);
+            self.canonicalize_mock_reference_write(&id, &mut attributes)?;
             Self::add_server_list_defaults(&id, &mut attributes);
 
             let partial_update = self.partial_update_config_for(&id);
@@ -1866,6 +1986,7 @@ mod tests {
         let _operation_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
         let tmp = tempfile::tempdir().unwrap();
         let provider = MockProvider {
+            reference_table: None,
             state_file: tmp.path().join("mock-state.json"),
             partial_create: None,
             partial_update: None,
@@ -2113,6 +2234,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let provider = MockProvider {
+            reference_table: None,
             state_file: state_file.clone(),
             partial_create: None,
             partial_update: None,
@@ -2159,6 +2281,7 @@ mod tests {
         )
         .unwrap();
         let provider = MockProvider {
+            reference_table: None,
             state_file,
             partial_create: None,
             partial_update: None,
@@ -2240,6 +2363,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let provider = MockProvider {
+            reference_table: None,
             state_file: state_file.clone(),
             partial_create: None,
             partial_update: None,
@@ -2295,6 +2419,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let provider = MockProvider {
+            reference_table: None,
             state_file,
             partial_create: None,
             partial_update: None,
@@ -2330,6 +2455,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let provider = MockProvider {
+            reference_table: None,
             state_file: state_file.clone(),
             partial_create: None,
             partial_update: None,
@@ -2380,6 +2506,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let provider = MockProvider {
+            reference_table: None,
             state_file: state_file.clone(),
             partial_create: None,
             partial_update: None,
@@ -2422,6 +2549,7 @@ mod tests {
         let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
         let tmp = tempfile::tempdir().unwrap();
         let provider = MockProvider {
+            reference_table: None,
             state_file: tmp.path().join("mock-state.json"),
             partial_create: None,
             partial_update: None,
@@ -2512,6 +2640,7 @@ mod tests {
         let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
         let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
         let provider = MockProvider {
+            reference_table: None,
             state_file,
             partial_create: None,
             partial_update: None,
@@ -2593,6 +2722,7 @@ mod tests {
         let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
         let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
         let provider = MockProvider {
+            reference_table: None,
             state_file,
             partial_create: None,
             partial_update: None,
@@ -2631,6 +2761,7 @@ mod tests {
         let log_path = tmp.path().join("op.log");
         let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
         let provider = MockProvider {
+            reference_table: None,
             state_file: tmp.path().join("mock-state.json"),
             partial_create: None,
             partial_update: None,
@@ -2659,6 +2790,7 @@ mod tests {
         let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
         let _create_fail = EnvGuard::set("CARINA_MOCK_CREATE_FAIL_FOR", "test.resource.blocked");
         let provider = MockProvider {
+            reference_table: None,
             state_file,
             partial_create: None,
             partial_update: None,
@@ -2698,6 +2830,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let provider = MockProvider {
+            reference_table: None,
             state_file,
             partial_create: None,
             partial_update: None,

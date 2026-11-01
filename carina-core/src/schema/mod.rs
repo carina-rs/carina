@@ -533,6 +533,13 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind>(
         return;
     }
     match &attr_type.kind {
+        // Reference leaves have portable offline constraints and no custom
+        // validator callback. Their identity selects only the plan resolver.
+        AttrTypeKind::Reference {
+            identity: _,
+            pattern: _,
+            length: _,
+        } => {}
         AttrTypeKind::String { binding, .. }
         | AttrTypeKind::Int { binding, .. }
         | AttrTypeKind::Float { binding, .. } => {
@@ -1198,6 +1205,12 @@ pub struct TypeInSchema<'a> {
 /// `Ref`-peeled view) or the constructor methods on [`AttributeType`].
 #[derive(Clone)]
 pub(crate) enum AttrTypeKind {
+    /// A string-valued reference resolved only for comparison by its schema owner.
+    Reference {
+        identity: TypeIdentity,
+        pattern: Option<String>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    },
     /// String
     String {
         binding: RefinementBinding,
@@ -1313,6 +1326,12 @@ pub(crate) enum AttrTypeKind {
 /// enum and the compiler will surface the omission.
 #[derive(Clone, Copy)]
 pub enum Shape<'a> {
+    /// String-valued reference with mandatory resolver identity.
+    Reference {
+        identity: &'a TypeIdentity,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
@@ -1396,6 +1415,16 @@ impl ShapeWalkBudget {
 impl fmt::Debug for Shape<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Shape::Reference {
+                identity,
+                pattern,
+                length,
+            } => f
+                .debug_struct("Shape::Reference")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish(),
             Shape::String {
                 identity,
                 pattern,
@@ -1485,6 +1514,12 @@ impl fmt::Debug for Shape<'_> {
 /// against the source enum and the compiler will surface the omission.
 #[derive(Clone, Copy)]
 pub enum RawShape<'a> {
+    /// String-valued reference with mandatory resolver identity.
+    Reference {
+        identity: &'a TypeIdentity,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
@@ -1546,6 +1581,16 @@ pub enum RawShape<'a> {
 impl fmt::Debug for RawShape<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RawShape::Reference {
+                identity,
+                pattern,
+                length,
+            } => f
+                .debug_struct("RawShape::Reference")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish(),
             RawShape::String {
                 identity,
                 pattern,
@@ -2513,6 +2558,16 @@ impl fmt::Debug for AttributeType {
     // variant matches what `#[derive(Debug)]` would produce.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            } => f
+                .debug_struct("Reference")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish(),
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -2901,6 +2956,15 @@ impl AttributeType {
 
     fn shape_from_resolved(resolved: &AttributeType) -> Shape<'_> {
         match &resolved.kind {
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            } => Shape::Reference {
+                identity,
+                pattern: pattern.as_deref(),
+                length: *length,
+            },
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -2991,6 +3055,15 @@ impl AttributeType {
     /// carina#3349 bug class at the walk-site.
     pub fn raw_shape<'a>(&'a self) -> RawShape<'a> {
         match &self.kind {
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            } => RawShape::Reference {
+                identity,
+                pattern: pattern.as_deref(),
+                length: *length,
+            },
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -3107,6 +3180,22 @@ impl AttributeType {
     pub(crate) fn string_literal_set(values: Vec<String>) -> Self {
         AttributeType {
             kind: AttrTypeKind::StringLiteralSet { values },
+        }
+    }
+
+    /// Create a reference leaf. Resolution changes comparison keys only; its
+    /// authored and persisted values remain strings. Validation is offline.
+    pub fn reference(
+        identity: TypeIdentity,
+        pattern: Option<String>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    ) -> Self {
+        Self {
+            kind: AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            },
         }
     }
 
@@ -3513,7 +3602,8 @@ impl AttributeType {
                 to_dsl.as_ref(),
                 concrete,
             ),
-            AttrTypeKind::String { .. }
+            AttrTypeKind::Reference { .. }
+            | AttrTypeKind::String { .. }
             | AttrTypeKind::ResourceHandle { .. }
             | AttrTypeKind::StringLiteralSet { .. }
             | AttrTypeKind::Int { .. }
@@ -3535,7 +3625,8 @@ impl AttributeType {
     pub(crate) fn validate_identified_scalar_value(&self, value: &Value) -> Result<(), TypeError> {
         debug_assert!(matches!(
             self.kind,
-            AttrTypeKind::String { .. }
+            AttrTypeKind::Reference { .. }
+                | AttrTypeKind::String { .. }
                 | AttrTypeKind::Int { .. }
                 | AttrTypeKind::Float { .. }
                 | AttrTypeKind::Enum { .. }
@@ -3571,6 +3662,14 @@ impl AttributeType {
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
+            (
+                AttrTypeKind::Reference {
+                    identity,
+                    pattern,
+                    length,
+                },
+                ConcreteValueRef::String(s),
+            ) => validate_string_refinement(Some(identity), pattern.as_deref(), *length, s),
             (AttrTypeKind::ResourceHandle { .. }, ConcreteValueRef::String(_)) => Ok(()),
             (AttrTypeKind::StringLiteralSet { values }, ConcreteValueRef::String(value))
                 if values.iter().any(|candidate| candidate == value) =>
@@ -3781,6 +3880,11 @@ impl AttributeType {
 
     pub fn type_name(&self) -> String {
         match &self.kind {
+            AttrTypeKind::Reference {
+                identity,
+                pattern: _,
+                length: _,
+            } => identity.to_string(),
             AttrTypeKind::Bool => "Bool".to_string(),
             AttrTypeKind::Duration => "Duration".to_string(),
             AttrTypeKind::Enum { identity, .. } => identity.to_string(),
@@ -3828,6 +3932,7 @@ impl AttributeType {
     /// are considered compatible with each other.
     pub fn is_string_based_custom(&self) -> bool {
         match &self.kind {
+            AttrTypeKind::Reference { .. } => true,
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -4030,6 +4135,12 @@ impl<'source> TypeInSchema<'source> {
             });
         }
         match (&self.attr.kind, &sink.attr.kind) {
+            // A resolver identity selects comparison behavior, not a different
+            // wire scalar. Reference inputs accept string outputs; constraints
+            // are checked on the materialized value before planning.
+            (String { .. } | Reference { .. }, Reference { .. }) => true,
+            (Reference { .. }, String { .. }) => true,
+
             (
                 ResourceHandle {
                     provider: source_provider,
@@ -4698,7 +4809,8 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind>(
                 ))
             }
             AT::Ref(_) => unreachable!("fit dispatch received an unresolved Ref"),
-            AT::String { .. }
+            AT::Reference { .. }
+            | AT::String { .. }
             | AT::ResourceHandle { .. }
             | AT::StringLiteralSet { .. }
             | AT::Bool
@@ -4924,7 +5036,8 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind>(
         }
         (AT::Ref(_), _) => unreachable!("fit dispatch received an unresolved Ref"),
         (
-            AT::String { .. }
+            AT::Reference { .. }
+            | AT::String { .. }
             | AT::ResourceHandle { .. }
             | AT::StringLiteralSet { .. }
             | AT::Int { .. }
@@ -8226,6 +8339,24 @@ impl<'a> EffectiveType<'a> {
         })
     }
 
+    pub(crate) fn union_members(&self) -> Vec<Self> {
+        union_members_with_defs(self.attr_type, self.defs)
+            .into_iter()
+            .flat_map(|members| {
+                members
+                    .iter()
+                    .flatten()
+                    .map(|member| Self {
+                        attr_type: member.as_attr(),
+                        defs: self.defs,
+                        path: self.path.clone(),
+                        field_ancestry: self.field_ancestry,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn map_value(&self) -> Option<Self> {
         let Shape::Map { value, .. } = self.shape() else {
             return None;
@@ -8310,7 +8441,8 @@ fn type_contains_struct(
             .as_raw_slice()
             .iter()
             .any(|member| type_contains_struct(member, defs, budget)),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::Int { .. }
         | AttrTypeKind::Float { .. }
         | AttrTypeKind::Bool
@@ -8372,7 +8504,8 @@ fn collect_effective_field_candidates<'a>(
                 );
             }
         }
-        Shape::String { .. }
+        Shape::Reference { .. }
+        | Shape::String { .. }
         | Shape::Int { .. }
         | Shape::Float { .. }
         | Shape::Bool
@@ -8951,6 +9084,11 @@ fn identified_declaration_kind(
     attribute_type: &AttributeType,
 ) -> Option<IdentifiedDeclarationKind> {
     match attribute_type.raw_shape() {
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(IdentifiedDeclarationKind::String),
         RawShape::String {
             identity: Some(_identity),
             pattern: _pattern,
@@ -9015,6 +9153,11 @@ fn identified_declaration_kind(
 
 fn identified_declaration_scalar_kind(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(RefinedScalarKind::String),
         RawShape::String {
             identity: Some(_identity),
             pattern: _pattern,
@@ -9082,6 +9225,11 @@ fn visit_identified_declarations(
     visitor: &mut dyn FnMut(&TypeIdentity, &AttributeType),
 ) {
     match attribute_type.raw_shape() {
+        RawShape::Reference {
+            identity,
+            pattern: _pattern,
+            length: _length,
+        } => visitor(identity, attribute_type),
         RawShape::String {
             identity: Some(identity),
             pattern: _,
@@ -9207,6 +9355,11 @@ fn validate_identified_scalar_kind_consistency(
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
     let identified = match attribute_type.raw_shape() {
+        RawShape::Reference {
+            identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some((identity, RefinedScalarKind::String)),
         RawShape::String {
             identity: Some(identity),
             ..
@@ -9356,7 +9509,8 @@ fn validate_identified_scalar_kind_consistency(
                 );
             }
         }
-        RawShape::String { .. }
+        RawShape::Reference { .. }
+        | RawShape::String { .. }
         | RawShape::Int { .. }
         | RawShape::Float { .. }
         | RawShape::Bool
@@ -9368,7 +9522,7 @@ fn validate_identified_scalar_kind_consistency(
 
 fn scalar_kind_for_schema_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
-        RawShape::String { .. } => Some(RefinedScalarKind::String),
+        RawShape::Reference { .. } | RawShape::String { .. } => Some(RefinedScalarKind::String),
         RawShape::Int { .. } => Some(RefinedScalarKind::Int),
         RawShape::Float { .. } => Some(RefinedScalarKind::Float),
         RawShape::Enum { base, .. } => scalar_kind_for_schema_base(base),
@@ -9706,7 +9860,8 @@ fn validate_type_definition(
                 );
             }
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -9876,7 +10031,8 @@ fn type_write_only_analysis<'schema>(
                 ..nested
             }
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -10106,6 +10262,7 @@ fn project_write_only_leaves<'schema>(
             }
         }
         AttrTypeKind::Union(_)
+        | AttrTypeKind::Reference { .. }
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -10210,6 +10367,7 @@ fn strip_write_only_leaves_from_value<'schema>(
             ))
         }
         AttrTypeKind::Union(_)
+        | AttrTypeKind::Reference { .. }
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -10654,7 +10812,8 @@ impl ResourceSchema {
                     }
                 }
             }
-            Shape::String { .. }
+            Shape::Reference { .. }
+            | Shape::String { .. }
             | Shape::Int { .. }
             | Shape::Float { .. }
             | Shape::Bool
@@ -11146,7 +11305,8 @@ fn collect_block_names_from_type(
                 collect_block_names_from_type(t, defs, ancestry, visited_definitions, result);
             }
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }

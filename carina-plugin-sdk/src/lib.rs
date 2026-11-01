@@ -1254,6 +1254,42 @@ pub trait CarinaProvider {
     /// any schema metadata is emitted.
     fn reference_forms(&self) -> ReferenceForms;
 
+    /// Resolve comparison-only leaves in this initialized provider instance.
+    /// Results are positional. Unsupported identities fail individually.
+    fn resolve_references(
+        &self,
+        requests: Vec<types::ReferenceRequest>,
+    ) -> Result<Vec<Result<types::ReferenceOutcome, types::ReferenceError>>, ProviderError> {
+        Ok(requests
+            .into_iter()
+            .map(|request| {
+                let types::TypeIdentity {
+                    provider,
+                    segments,
+                    kind,
+                } = request.ty;
+                let identity = std::iter::once(provider)
+                    .chain(segments)
+                    .chain(std::iter::once(kind))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Err(types::ReferenceError::InvalidReference(Box::new(
+                    ProviderError {
+                        kind: types::ProviderErrorKind::InvalidInput,
+                        message: format!("unsupported reference identity {identity}"),
+                        resource_id: None,
+                        cause: None,
+                        provider_name: None,
+                        operation: Some("resolve_references".into()),
+                        status: None,
+                        code: None,
+                        request_id: None,
+                    },
+                )))
+            })
+            .collect())
+    }
+
     /// Return the types of the provider block's configuration attributes
     /// (e.g., `region`). The host uses these to validate attributes
     /// against their declared types *before* calling [`validate_config`].
@@ -1518,6 +1554,33 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn default_reference_resolver_rejects_every_unsupported_identity() {
+        let provider = SchemaOnlyProvider {
+            resources: Vec::new(),
+            forms: BTreeMap::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let requests = ["First", "Second"]
+            .into_iter()
+            .map(|kind| types::ReferenceRequest {
+                ty: TypeIdentity {
+                    provider: "test".into(),
+                    segments: vec!["keys".into()],
+                    kind: kind.into(),
+                },
+                value: "alias/example".into(),
+            })
+            .collect();
+        let results = provider.resolve_references(requests).unwrap();
+        assert_eq!(results.len(), 2);
+        for (result, name) in results.into_iter().zip(["First", "Second"]) {
+            assert!(
+                matches!(result, Err(types::ReferenceError::InvalidReference(error)) if error.message.contains(&format!("test.keys.{name}")))
+            );
+        }
+    }
 
     struct SchemaOnlyProvider {
         resources: Vec<ValidatedResourceSchema>,

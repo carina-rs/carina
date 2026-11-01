@@ -12,8 +12,7 @@ use std::ops::Index;
 use crate::binding_index::ManagedBindingStability;
 use crate::effect::{MoveAuthority, ReleasedListKey, ReleasedListKeys};
 use crate::provider::{
-    LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, ProviderResult, ProviderRouter,
-    StateTransformMap,
+    LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, ProviderRouter, StateTransformMap,
 };
 use crate::resource::{
     CanonicalComparisonAttributes, Current, Directives, PlanInputCurrent, PlanInputDesired,
@@ -29,6 +28,23 @@ pub use plan::{
     CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice, PendingCascadePlan,
     block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades,
 };
+
+/// Typed failures before a plan can become executable.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanComparisonError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error(transparent)]
+    Reference(#[from] Box<crate::references::ReferencePlanError>),
+}
+
+impl From<crate::provider::ComparisonResolutionError> for PlanComparisonError {
+    fn from(error: crate::provider::ComparisonResolutionError) -> Self {
+        Self::Provider(error.into())
+    }
+}
+
+pub type PlanComparisonResult<T> = Result<T, PlanComparisonError>;
 
 struct PlanInputSavedAttributes {
     attributes: HashMap<ResourceId, CanonicalComparisonAttributes>,
@@ -79,7 +95,9 @@ pub fn managed_binding_stability(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     provider: &ProviderRouter,
-) -> ProviderResult<HashMap<ResourceId, ManagedBindingStability>> {
+    references: &crate::references::ResolvedReferences,
+) -> PlanComparisonResult<HashMap<ResourceId, ManagedBindingStability>> {
+    references.validate_for(managed, current_states, registry, saved_attrs)?;
     let mut result = HashMap::new();
     let comparison_saved = PlanInputSavedAttributes::new(saved_attrs, registry);
     for resource in managed {
@@ -97,21 +115,24 @@ pub fn managed_binding_stability(
         let context = resolved_comparison.context();
         let schema = owner_schema.schema();
         let desired = PlanInputDesired::with_resource_schema(resource, Some(schema.as_schema()));
-        let changed_attributes = match diff_present_with_releases(
-            &desired,
-            present,
-            ExistingComparisonInputs {
-                current_attributes,
-                saved: comparison_saved.get(&resource.id),
-                nested_write_only: saved_attrs.nested_write_only(&resource.id),
-                prev_explicit: prev_explicit.get(&resource.id),
-                schema: Some(schema.as_schema()),
-                context,
-            },
-            schema,
-        )
-        .diff
-        {
+        let diff = context.with_references(references, &resource.id, |context| {
+            diff_present_with_releases(
+                &desired,
+                present,
+                ExistingComparisonInputs {
+                    current_attributes,
+                    saved: comparison_saved.get(&resource.id),
+                    nested_write_only: saved_attrs.nested_write_only(&resource.id),
+                    prev_explicit: prev_explicit.get(&resource.id),
+                    schema: Some(schema.as_schema()),
+                    context,
+                    observations: &resolved_comparison.context().observation(),
+                },
+                schema,
+            )
+            .diff
+        })?;
+        let changed_attributes = match diff {
             PresentDiff::NoChange { .. } => {
                 result.insert(
                     resource.id.clone(),
@@ -863,16 +884,24 @@ use crate::effect::Effect;
 use crate::plan::Plan;
 #[cfg(test)]
 use crate::schema::AttributeType;
-pub use comparison::ComparisonContext;
+pub(crate) use comparison::SavedPlanComparison;
+pub use comparison::{
+    ComparisonContext, ComparisonSchema, ObservationComparison, ObservationEquality,
+    PlanningComparison, PlanningEquality, ReferenceEquality, SavedPlanReferenceComparisonError,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
-pub fn exact_comparison_context_for_tests() -> ComparisonContext<'static> {
-    use std::sync::LazyLock;
+pub fn exact_comparison_context_for_tests() -> ObservationComparison<'static> {
+    exact_comparison_schema_for_tests().observation()
+}
 
+#[cfg(any(test, feature = "test-utils"))]
+pub fn exact_comparison_schema_for_tests() -> ComparisonSchema<'static> {
+    use std::sync::LazyLock;
     static SCOPE: crate::provider::ReferenceScope = crate::provider::ReferenceScope::Unavailable;
     static FORMS: LazyLock<crate::schema::ReferenceForms> =
         LazyLock::new(crate::schema::ReferenceForms::new);
-    ComparisonContext::for_test(&SCOPE, &FORMS)
+    ComparisonSchema::for_test(&SCOPE, &FORMS)
 }
 
 #[cfg(test)]
@@ -1164,7 +1193,8 @@ struct ExistingComparisonInputs<'a, 'context> {
     nested_write_only: &'a NestedWriteOnlyRecord,
     prev_explicit: Option<&'a crate::explicit::ExplicitFields>,
     schema: Option<&'a ResourceSchema>,
-    context: &'a ComparisonContext<'context>,
+    context: &'a PlanningComparison<'context>,
+    observations: &'a ObservationComparison<'a>,
 }
 
 fn diff_present_with_releases(
@@ -1265,6 +1295,7 @@ fn diff_existing_state(
         inputs.schema,
         authored.ignore_changes(),
         inputs.context,
+        inputs.observations,
     );
 
     if changes.changed.is_empty() {
@@ -1295,41 +1326,108 @@ fn diff_existing_state(
 /// records when present; otherwise projection uses their legacy union. The
 /// authoring tree also drives explicit-removal detection for attributes the
 /// user previously wrote but no longer mentions.
-/// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
-/// case-insensitive enum matching).
+/// The owner-bound schema and reference witness are required, so every leaf
+/// uses its declared comparison semantics.
 ///
 /// Pending resources cannot enter the differ:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::differ::diff;
-/// use carina_core::provider::RawSavedAttrs;
+/// use carina_core::provider::{LiftedSavedAttrs, ResolvedComparison};
+/// use carina_core::differ::PlanningComparison;
 /// use carina_core::resource::{Resource, State};
-/// use carina_core::schema::SchemaRegistry;
 ///
-/// let resource = Resource::pending("test.Resource");
-/// let state = State::not_found(resource.id.clone());
-/// let saved = RawSavedAttrs::default().lift(&SchemaRegistry::new());
-/// let _ = diff(&resource, &state, &saved, None, None);
+/// fn pending(comparison: ResolvedComparison<'_>, context: &PlanningComparison<'_>,
+///     saved: &LiftedSavedAttrs) {
+///     let resource = Resource::pending("test.Resource");
+///     let state = State::not_found(resource.id.clone());
+///     let _ = diff(&resource, &state, saved, None, comparison, context);
+/// }
 /// ```
 ///
 /// Nested write-only provenance is a required planning input:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::differ::diff;
+/// use carina_core::provider::ResolvedComparison;
+/// use carina_core::differ::PlanningComparison;
 /// use carina_core::resource::{ResolvedResource, Resource, ResourceId, State};
 ///
-/// let resource = ResolvedResource::new(Resource::new("test.Resource", "example"));
-/// let state = State::not_found(ResourceId::with_identity("test.Resource", "example"));
-/// let _ = diff(&resource, &state, None, None, None);
+/// fn missing_provenance(comparison: ResolvedComparison<'_>, context: &PlanningComparison<'_>) {
+///     let resource = ResolvedResource::new(Resource::new("test.Resource", "example"));
+///     let state = State::not_found(ResourceId::with_identity("test.Resource", "example"));
+///     let _ = diff(&resource, &state, None, None, comparison, context);
+/// }
+/// ```
+/// An observation context cannot enter the planning differ:
+///
+/// ```compile_fail,E0308
+/// use carina_core::differ::{diff, ObservationComparison};
+/// use carina_core::provider::{LiftedSavedAttrs, ResolvedComparison};
+/// use carina_core::resource::{ResolvedResource, State};
+/// fn observation_cannot_plan(
+///     desired: &ResolvedResource, current: &State, saved: &LiftedSavedAttrs,
+///     schema: ResolvedComparison<'_>, observation: &ObservationComparison<'_>,
+/// ) {
+///     let _ = diff(desired, current, saved, None, schema, observation);
+/// }
 /// ```
 pub fn diff(
     desired: &ResolvedResource,
     current: &State,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    comparison: crate::provider::ResolvedComparison<'_>,
+    context: &PlanningComparison<'_>,
+) -> PlanComparisonResult<Diff> {
+    let schema = comparison.owner_schema().schema();
+    diff_with_schema(
+        desired,
+        current,
+        saved_attrs,
+        prev_explicit,
+        Some(schema.as_schema()),
+        context,
+        &comparison.context().observation(),
+    )
+}
+
+/// Explicit unschematized comparison support for focused fixtures only.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn diff_for_test(
+    desired: &ResolvedResource,
+    current: &State,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
-) -> Diff {
+    context_schema: &ComparisonSchema<'_>,
+    references: &crate::references::ResolvedReferences,
+) -> PlanComparisonResult<Diff> {
+    context_schema.with_references(references, &desired.id, |context| {
+        diff_with_schema(
+            desired,
+            current,
+            saved_attrs,
+            prev_explicit,
+            schema,
+            context,
+            &context_schema.observation(),
+        )
+    })?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_with_schema(
+    desired: &ResolvedResource,
+    current: &State,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+    context: &PlanningComparison<'_>,
+    observations: &ObservationComparison<'_>,
+) -> PlanComparisonResult<Diff> {
     let current_attributes = match schema {
         Some(schema) => {
             CanonicalComparisonAttributes::canonicalize(current.attributes.clone(), schema)
@@ -1338,6 +1436,19 @@ pub fn diff(
             crate::resource::UnschematizedComparisonAttributes::new(current.attributes.clone()),
         ),
     };
+    if current.exists
+        && let Some(schema) = schema
+    {
+        let validated = schema.clone().validate().map_err(|error| {
+            ProviderError::invalid_input_caused_by("Invalid direct-diff schema", error)
+        })?;
+        context.resolved_references().validate_resource(
+            desired,
+            &current_attributes,
+            saved_attrs,
+            &validated,
+        )?;
+    }
     let saved = saved_attrs
         .get(&desired.id)
         .cloned()
@@ -1347,7 +1458,7 @@ pub fn diff(
                 crate::resource::UnschematizedComparisonAttributes::new(saved),
             ),
         });
-    diff_with_saved_parts(
+    Ok(diff_with_saved_parts(
         desired,
         current,
         ExistingComparisonInputs {
@@ -1357,8 +1468,9 @@ pub fn diff(
             prev_explicit,
             schema,
             context,
+            observations,
         },
-    )
+    ))
 }
 
 fn diff_with_saved_parts(
@@ -1394,7 +1506,7 @@ pub(crate) fn diff_test(
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
+    context_schema: &ComparisonSchema<'_>,
 ) -> Diff {
     let current_attributes = match schema {
         Some(schema) => {
@@ -1410,18 +1522,27 @@ pub(crate) fn diff_test(
             crate::resource::UnschematizedComparisonAttributes::new(saved),
         ),
     });
-    diff_with_saved_parts(
-        &ResolvedResource::new(desired.clone()),
-        current,
-        ExistingComparisonInputs {
-            current_attributes: &current_attributes,
-            saved: saved.as_ref(),
-            nested_write_only: &NestedWriteOnlyRecord::new(),
-            prev_explicit,
-            schema,
-            context,
-        },
-    )
+    context_schema
+        .with_references(
+            &crate::references::prepare_empty_for_tests(),
+            &desired.id,
+            |context| {
+                diff_with_saved_parts(
+                    &ResolvedResource::new(desired.clone()),
+                    current,
+                    ExistingComparisonInputs {
+                        current_attributes: &current_attributes,
+                        saved: saved.as_ref(),
+                        nested_write_only: &NestedWriteOnlyRecord::new(),
+                        prev_explicit,
+                        schema,
+                        context,
+                        observations: &context_schema.observation(),
+                    },
+                )
+            },
+        )
+        .expect("test differ requires prepared reference pairs")
 }
 
 #[cfg(test)]

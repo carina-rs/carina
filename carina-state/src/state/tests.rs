@@ -15,7 +15,7 @@ fn persisted_prevent_destroy_json(directives: &PersistedDirectives) -> serde_jso
         .clone()
 }
 
-fn exact_comparison_context() -> carina_core::differ::ComparisonContext<'static> {
+fn exact_comparison_context() -> carina_core::differ::ObservationComparison<'static> {
     carina_core::differ::exact_comparison_context_for_tests()
 }
 
@@ -62,14 +62,16 @@ fn diff(
     prev_explicit: Option<&carina_core::explicit::ExplicitFields>,
     schema: Option<&carina_core::schema::ResourceSchema>,
 ) -> carina_core::differ::Diff {
-    carina_core::differ::diff(
+    carina_core::differ::diff_for_test(
         desired,
         current,
         saved_attrs,
         prev_explicit,
         schema,
-        &exact_comparison_context(),
+        &carina_core::differ::exact_comparison_schema_for_tests(),
+        &carina_core::references::prepare_empty_for_tests(),
     )
+    .unwrap()
 }
 
 #[test]
@@ -5128,6 +5130,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         &historical,
         None,
         &provider,
+        carina_core::detail_rows::DetailComparisons::RecordedEffects,
     )
     .expect("delete display must use the production detail-row builder");
     assert_eq!(

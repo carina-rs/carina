@@ -3015,8 +3015,17 @@ mod historical_display_tests {
         );
         let (schemas, provider) =
             carina_core::provider::comparison_fixture_for_test(&schemas, std::iter::once(&id));
-        let app = carina_tui::App::new(&plan, &schemas, &historical, None, &provider)
-            .expect("detail-row fixture must have an initialized provider route");
+        let app = carina_tui::App::new(
+            &plan,
+            &schemas,
+            &historical,
+            None,
+            &provider,
+            carina_core::detail_rows::DetailComparisons::Planning(
+                &carina_core::references::prepare_empty_for_tests(),
+            ),
+        )
+        .expect("detail-row fixture must have an initialized provider route");
         let rendered = format!("{:?}", app.nodes[0].detail_rows);
 
         assert!(
@@ -4928,6 +4937,7 @@ pub async fn run_plan(
             &historical_display,
             Some(&ctx.prev_explicit),
             &ctx.provider,
+            ctx.references.for_display(),
         )?;
         if !directive_changes.is_empty() {
             eprint!("{}", format_persisted_directive_changes(&directive_changes));
@@ -4947,6 +4957,7 @@ pub async fn run_plan(
             Some(&ctx.prev_explicit),
             Some(&ctx.expansion_trace),
             &ctx.provider,
+            ctx.references.for_display(),
         )?;
         if let Some(note) = drift_note.as_ref() {
             println!();
@@ -6739,6 +6750,9 @@ mod run_plan_out_tests {
         });
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
+            references: crate::wiring::PlanReferenceEvidence::Prepared(
+                carina_core::references::prepare_empty_for_tests(),
+            ),
             plan,
             provider: ProviderRouter::new(),
             sorted_resources: ResolvedResource::collect_resolved([
@@ -7118,6 +7132,9 @@ mod run_plan_out_tests {
         parsed.data_sources = vec![parsed_data_source];
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
+            references: crate::wiring::PlanReferenceEvidence::Prepared(
+                carina_core::references::prepare_empty_for_tests(),
+            ),
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
@@ -7203,6 +7220,9 @@ mod run_plan_out_tests {
         };
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
+            references: crate::wiring::PlanReferenceEvidence::Prepared(
+                carina_core::references::prepare_empty_for_tests(),
+            ),
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
@@ -7256,6 +7276,9 @@ mod run_plan_out_tests {
             carina_core::resource::ConcreteValue::String("upstream-secret".into()),
         ))));
         let ctx = crate::wiring::PlanContext {
+            references: crate::wiring::PlanReferenceEvidence::Prepared(
+                carina_core::references::prepare_empty_for_tests(),
+            ),
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
@@ -7322,6 +7345,9 @@ mod run_plan_out_tests {
         )
         .unwrap();
         let ctx = crate::wiring::PlanContext {
+            references: crate::wiring::PlanReferenceEvidence::Prepared(
+                carina_core::references::prepare_empty_for_tests(),
+            ),
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),

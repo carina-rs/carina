@@ -1178,7 +1178,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 .comparison_provider
                 .comparison_context_for(id, owner_schema)
             {
-                Ok(comparison) => comparison,
+                Ok(comparison) => comparison.observation(),
                 Err(error) => {
                     return StartedBasicEffectResult::new(
                         started_effect,

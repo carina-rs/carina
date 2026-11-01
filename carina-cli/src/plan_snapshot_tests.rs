@@ -56,6 +56,9 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
         prev_explicit,
         expansion_trace,
         &provider,
+        carina_core::detail_rows::DetailComparisons::Planning(
+            &carina_core::references::prepare_empty_for_tests(),
+        ),
     )
     .expect("snapshot plan must have an initialized provider route")
 }
@@ -664,6 +667,7 @@ fn snapshot_state_only_directive_change() {
             Some(&fp.prev_explicit),
             Some(&fp.expansion_trace),
             &provider,
+            fp.references.for_display(),
         )
         .expect("state-only fixture plan must render"),
     );

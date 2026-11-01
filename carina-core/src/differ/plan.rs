@@ -15,7 +15,7 @@ use crate::plan::{
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
+use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
 use crate::resource::{
     ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, PlanInputDesiredResources,
     ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
@@ -372,6 +372,10 @@ pub fn generate_temporary_name(
 /// let states = HashMap::<ResourceId, Current>::new();
 /// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let orphans = Orphans::new();
+/// let references = futures::executor::block_on(carina_core::references::prepare_references(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &compositions,
 ///     &[],
@@ -382,6 +386,7 @@ pub fn generate_temporary_name(
 ///     &saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 ///
@@ -400,6 +405,10 @@ pub fn generate_temporary_name(
 /// let states: HashMap<ResourceId, State> = HashMap::new();
 /// let registry = SchemaRegistry::default();
 /// let saved_attrs = RawSavedAttrs::default().lift(&registry);
+/// let references = futures::executor::block_on(carina_core::references::prepare_references(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
@@ -410,6 +419,7 @@ pub fn generate_temporary_name(
 ///     &saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 ///
@@ -429,6 +439,10 @@ pub fn generate_temporary_name(
 /// let registry = SchemaRegistry::default();
 /// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let raw_saved_attrs = RawSavedAttrs::default();
+/// let references = futures::executor::block_on(carina_core::references::prepare_references(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
@@ -439,9 +453,23 @@ pub fn generate_temporary_name(
 ///     &raw_saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 #[allow(clippy::too_many_arguments)]
+/// Reference preparation is a required input, even for a caller with all
+/// other planning inputs available:
+///
+/// ```compile_fail,E0061
+/// use std::collections::HashMap;
+/// use carina_core::{differ::{create_plan, PlanPriorStates}, provider::{ProviderRouter, LiftedSavedAttrs},
+///     resource::{ResolvedResource, ResourceId, Directives}, schema::SchemaRegistry};
+/// fn without_preparation(resources: &[ResolvedResource], provider: &ProviderRouter,
+///     prior: PlanPriorStates<'_>, registry: &SchemaRegistry, saved: &LiftedSavedAttrs) {
+///     let _ = create_plan(resources, &[], provider, prior, &HashMap::new(), registry,
+///         saved, &HashMap::new(), &[]);
+/// }
+/// ```
 pub fn create_plan(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
@@ -452,7 +480,8 @@ pub fn create_plan(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[WaitBinding],
-) -> ProviderResult<Plan> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<Plan> {
     create_plan_with_provider(
         managed,
         data_sources,
@@ -464,6 +493,7 @@ pub fn create_plan(
         saved_attrs,
         prev_explicit,
         wait_bindings,
+        references,
     )
 }
 
@@ -482,11 +512,19 @@ pub fn create_plan_for_test(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[WaitBinding],
-) -> ProviderResult<Plan> {
+) -> super::PlanComparisonResult<Plan> {
     let (registry, comparison_provider) = crate::provider::comparison_fixture_for_test(
         registry,
         managed.iter().map(|resource| &resource.id),
     );
+    let current = prior_states.materialize_current_states(managed, &registry);
+    let references = futures::executor::block_on(crate::references::prepare_references(
+        managed,
+        &current,
+        &registry,
+        saved_attrs,
+        &comparison_provider,
+    ))?;
     create_plan_with_provider(
         managed,
         data_sources,
@@ -498,6 +536,7 @@ pub fn create_plan_for_test(
         saved_attrs,
         prev_explicit,
         wait_bindings,
+        &references,
     )
 }
 
@@ -513,7 +552,8 @@ pub(crate) fn create_plan_with_provider(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[WaitBinding],
-) -> ProviderResult<Plan> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<Plan> {
     let desired = plan_input_desired_resources(managed, registry);
     let managed_current = prior_states.materialize_current_states(desired.authored(), registry);
     let mut build = create_plan_parts(
@@ -528,6 +568,7 @@ pub(crate) fn create_plan_with_provider(
         prior_states.orphans(),
         wait_bindings,
         &HashSet::new(),
+        references,
     )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
@@ -554,7 +595,8 @@ pub fn create_plan_with_cascades(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[WaitBinding],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<PendingCascadePlan> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<PendingCascadePlan> {
     let managed_current = prior_states.materialize_current_states(managed.authored(), registry);
     let mut build = create_plan_parts(
         managed,
@@ -568,6 +610,7 @@ pub fn create_plan_with_cascades(
         prior_states.orphans(),
         wait_bindings,
         outcome_unknown_import_replacements,
+        references,
     )?;
     cascade_dependent_updates(
         &mut build.plan,
@@ -696,7 +739,9 @@ fn create_plan_parts(
     orphans: &super::Orphans,
     wait_bindings: &[WaitBinding],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<PlanBuild> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<PlanBuild> {
+    references.validate_for(managed.authored(), current_states, registry, saved_attrs)?;
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
     let authored_managed = managed.authored();
@@ -756,19 +801,22 @@ fn create_plan_parts(
                 let context = resolved_comparison.context();
                 let validated_schema = owner_schema.schema();
                 let schema = validated_schema.as_schema();
-                let result = diff_present_with_releases(
-                    comparison_desired,
-                    present,
-                    ExistingComparisonInputs {
-                        current_attributes,
-                        saved,
-                        nested_write_only: saved_attrs.nested_write_only(&resource.id),
-                        prev_explicit: prev_explicit_for_resource,
-                        schema: Some(schema),
-                        context,
-                    },
-                    validated_schema,
-                );
+                let result = context.with_references(references, &resource.id, |context| {
+                    diff_present_with_releases(
+                        comparison_desired,
+                        present,
+                        ExistingComparisonInputs {
+                            current_attributes,
+                            saved,
+                            nested_write_only: saved_attrs.nested_write_only(&resource.id),
+                            prev_explicit: prev_explicit_for_resource,
+                            schema: Some(schema),
+                            context,
+                            observations: &resolved_comparison.context().observation(),
+                        },
+                        validated_schema,
+                    )
+                })?;
                 match result.diff {
                     PresentDiff::Update {
                         id,

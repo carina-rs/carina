@@ -5227,14 +5227,16 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
             ConcreteValue::String(plaintext.into()),
         )))),
     );
-    let diff = carina_core::differ::diff(
+    let diff = carina_core::differ::diff_for_test(
         &ResolvedResource::new(desired),
         &states[&id],
         &saved_attrs,
         None,
         None,
-        &carina_core::differ::exact_comparison_context_for_tests(),
-    );
+        &carina_core::differ::exact_comparison_schema_for_tests(),
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
     assert!(
         !diff.is_change(),
         "refresh hydration of an unchanged write-only legacy secret must not plan an update: {diff:?}",
@@ -5886,4 +5888,66 @@ async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
         error.to_string().contains("satisfier_hint"),
         "the error must name the malformed export: {error}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_reference_batches_preserve_order_and_all_typed_outcomes() {
+    use carina_core::references::{ReferenceError, ReferenceOutcome, ReferenceRequest};
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let error = serde_json::json!({"kind":"api_error","message":"mock lookup diagnostic","code":"MockDenied","request_id":"request-123"});
+    let table = serde_json::json!({
+        "alias/live":{"Ok":{"Resolved":"key/a"}},
+        "gone":{"Ok":{"NotFound":error.clone()}},
+        "denied":{"Err":{"AccessDenied":error.clone()}},
+        "retry":{"Err":{"Transient":error.clone()}},
+        "invalid":{"Err":{"InvalidReference":error}},
+        "empty":{"Ok":{"Resolved":""}}
+    });
+    let attributes = indexmap::IndexMap::from([(
+        "reference_table".into(),
+        Value::Concrete(ConcreteValue::String(table.to_string().into())),
+    )]);
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &attributes))
+        .await
+        .unwrap();
+    let requests = ["alias/live", "gone", "denied", "retry", "invalid", "empty"]
+        .into_iter()
+        .map(|value| ReferenceRequest {
+            ty: TypeIdentity::new(Some("mock"), ["keys", "Key"], "Reference"),
+            value: value.into(),
+        })
+        .collect::<Vec<_>>();
+    let results = provider
+        .provider()
+        .resolve_references(&requests)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), requests.len());
+    let mut results = results.into_iter();
+    assert!(matches!(
+        results.next().unwrap(),
+        Ok(ReferenceOutcome::Resolved(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Ok(ReferenceOutcome::NotFound(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Err(ReferenceError::AccessDenied(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Err(ReferenceError::Transient(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Err(ReferenceError::InvalidReference(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Err(ReferenceError::InvalidReference(_))
+    ));
 }

@@ -1610,7 +1610,7 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
             .comparison_for(&resource.id)
             .map_err(AppError::from)?;
         let owner_schema = resolved_comparison.owner_schema();
-        let comparison = resolved_comparison.context();
+        let comparison = &resolved_comparison.context().observation();
         let schema = Some(owner_schema.schema().as_schema());
         let mut resource_state = match &planned.source {
             UpsertSource::Complete { state, request } => {

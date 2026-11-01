@@ -18,6 +18,216 @@ use crate::schema::{
 };
 use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
 
+/// Scope and schema forms resolved from one initialized provider. This is not
+/// a comparison context: callers must explicitly choose planning or observation.
+#[derive(Debug, Clone, Copy)]
+pub struct ComparisonSchema<'a> {
+    scope: &'a ReferenceScope,
+    reference_forms: &'a ReferenceForms,
+}
+
+/// Shared comparison core parameterized by an explicit reference equality policy.
+/// Planning entry points accept only [`PlanningComparison`].
+#[derive(Debug, Clone, Copy)]
+pub struct ComparisonContext<'a, R: ReferenceEquality> {
+    schema: ComparisonSchema<'a>,
+    references: R,
+}
+
+pub type PlanningComparison<'a> = ComparisonContext<'a, PlanningEquality<'a>>;
+pub type ObservationComparison<'a> = ComparisonContext<'a, ObservationEquality>;
+pub(crate) type SavedPlanComparison<'a> = ComparisonContext<'a, SavedPlanEquality<'a>>;
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A closed set of policies for shared structural comparison helpers.
+pub trait ReferenceEquality: sealed::Sealed + std::fmt::Debug + Copy {
+    #[doc(hidden)]
+    fn equal(&self, identity: &TypeIdentity, a: &str, b: &str) -> bool;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlanningEquality<'a>(&'a ReferenceComparisonSession<'a>);
+
+/// Observation changes are byte changes, including reference-typed leaves.
+#[derive(Debug, Clone, Copy)]
+pub struct ObservationEquality;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SavedPlanEquality<'a>(
+    &'a std::cell::RefCell<Option<SavedPlanReferenceComparisonError>>,
+);
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "saved-plan rendering attempted reference equality for `{identity}`; use the effect's recorded changed attributes"
+)]
+pub struct SavedPlanReferenceComparisonError {
+    pub identity: TypeIdentity,
+}
+
+impl sealed::Sealed for PlanningEquality<'_> {}
+impl sealed::Sealed for ObservationEquality {}
+impl sealed::Sealed for SavedPlanEquality<'_> {}
+
+impl ReferenceEquality for PlanningEquality<'_> {
+    fn equal(&self, identity: &TypeIdentity, a: &str, b: &str) -> bool {
+        match self.0.references.equal(self.0.resource, identity, a, b) {
+            Ok(equal) => equal,
+            Err(error) => {
+                self.0.error.borrow_mut().get_or_insert(error);
+                false
+            }
+        }
+    }
+}
+
+impl ReferenceEquality for ObservationEquality {
+    fn equal(&self, _: &TypeIdentity, a: &str, b: &str) -> bool {
+        a == b
+    }
+}
+
+impl ReferenceEquality for SavedPlanEquality<'_> {
+    fn equal(&self, identity: &TypeIdentity, _: &str, _: &str) -> bool {
+        self.0
+            .borrow_mut()
+            .get_or_insert_with(|| SavedPlanReferenceComparisonError {
+                identity: identity.clone(),
+            });
+        false
+    }
+}
+
+#[derive(Debug)]
+struct ReferenceComparisonSession<'a> {
+    references: &'a crate::references::ResolvedReferences,
+    resource: &'a crate::resource::ResourceId,
+    error: std::cell::RefCell<Option<Box<crate::references::ReferencePlanError>>>,
+}
+
+impl<'a> ComparisonSchema<'a> {
+    pub(crate) fn from_initialized_provider(
+        provider: &'a InitializedProvider,
+        schema: OwnerBoundResourceSchema<'a>,
+    ) -> Self {
+        Self::from_scope_and_forms(provider.reference_scope(), schema.reference_forms())
+    }
+
+    pub(crate) fn from_scope_and_forms(
+        scope: &'a ReferenceScope,
+        reference_forms: &'a ReferenceForms,
+    ) -> Self {
+        Self {
+            scope,
+            reference_forms,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(scope: &'a ReferenceScope, reference_forms: &'a ReferenceForms) -> Self {
+        Self::from_scope_and_forms(scope, reference_forms)
+    }
+
+    /// Explicitly compare refreshed observations or state writeback bytes.
+    pub fn observation(self) -> ObservationComparison<'a> {
+        ComparisonContext {
+            schema: self,
+            references: ObservationEquality,
+        }
+    }
+
+    /// Only this scope constructs a planning context. Its higher-ranked
+    /// callback cannot release output until missing witness entries have been
+    /// checked, and cannot return the context itself.
+    pub fn with_references<T>(
+        &self,
+        references: &crate::references::ResolvedReferences,
+        resource: &crate::resource::ResourceId,
+        compare: impl for<'session> FnOnce(&PlanningComparison<'session>) -> T,
+    ) -> Result<T, Box<crate::references::ReferencePlanError>> {
+        let session = ReferenceComparisonSession {
+            references,
+            resource,
+            error: std::cell::RefCell::new(None),
+        };
+        let context = ComparisonContext {
+            schema: *self,
+            references: PlanningEquality(&session),
+        };
+        let result = compare(&context);
+        match session.error.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+
+    pub(crate) fn with_recorded_effects<T>(
+        &self,
+        compare: impl for<'session> FnOnce(SavedPlanComparison<'session>) -> T,
+    ) -> Result<T, SavedPlanReferenceComparisonError> {
+        let error = std::cell::RefCell::new(None);
+        let result = compare(ComparisonContext {
+            schema: *self,
+            references: SavedPlanEquality(&error),
+        });
+        match error.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+}
+
+impl<'a> ObservationComparison<'a> {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(scope: &'a ReferenceScope, reference_forms: &'a ReferenceForms) -> Self {
+        ComparisonSchema::for_test(scope, reference_forms).observation()
+    }
+}
+
+impl PlanningComparison<'_> {
+    pub(crate) fn resolved_references(&self) -> &crate::references::ResolvedReferences {
+        self.references.0.references
+    }
+}
+
+impl<R: ReferenceEquality> ComparisonContext<'_, R> {
+    fn reference_form(&self, identity: &TypeIdentity) -> Option<&ReferenceForm> {
+        self.schema.reference_forms.get(identity)
+    }
+
+    /// Canonicalize the protocol's unqualified reference form.
+    ///
+    /// `{name}` denotes exactly one bare segment: it contains neither `:` nor
+    /// `/`. Values containing either delimiter are already qualified or path
+    /// forms and compare exactly; they are never expanded and can never equal
+    /// a bare name through reference-form canonicalization.
+    pub(crate) fn canonical_string<'b>(
+        &self,
+        value: &'b str,
+        identity: Option<&TypeIdentity>,
+        to_dsl: Option<&DslTransform>,
+    ) -> Cow<'b, str> {
+        let transformed = to_dsl
+            .map(|transform| transform.apply(value))
+            .unwrap_or(Cow::Borrowed(value));
+        let Some(form) = identity.and_then(|identity| self.reference_form(identity)) else {
+            return transformed;
+        };
+        if transformed.is_empty() || transformed.contains(':') || transformed.contains('/') {
+            return transformed;
+        }
+        match form {
+            ReferenceForm::Template { long } => long
+                .render(self.schema.scope, transformed.as_ref())
+                .map(Cow::Owned)
+                .unwrap_or(transformed),
+        }
+    }
+}
+
 /// Type-aware semantic comparison of two Values.
 ///
 /// When an `AttributeType` is provided, the comparison uses type information
@@ -63,86 +273,23 @@ use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secr
 // rows agree with `find_changed_attributes`' own verdict. Reusing it
 // — never reimplementing — is the carina#3073 fix; a second equality
 // notion is precisely the drift this avoids.
-#[derive(Debug, Clone, Copy)]
-pub struct ComparisonContext<'a> {
-    scope: &'a ReferenceScope,
-    reference_forms: &'a ReferenceForms,
-}
-
-impl<'a> ComparisonContext<'a> {
-    pub(crate) fn from_initialized_provider(
-        provider: &'a InitializedProvider,
-        schema: OwnerBoundResourceSchema<'a>,
-    ) -> Self {
-        Self::from_scope_and_forms(provider.reference_scope(), schema.reference_forms())
-    }
-
-    pub(crate) fn from_scope_and_forms(
-        scope: &'a ReferenceScope,
-        reference_forms: &'a ReferenceForms,
-    ) -> Self {
-        Self {
-            scope,
-            reference_forms,
-        }
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn for_test(scope: &'a ReferenceScope, reference_forms: &'a ReferenceForms) -> Self {
-        Self::from_scope_and_forms(scope, reference_forms)
-    }
-
-    fn reference_form(&self, identity: &TypeIdentity) -> Option<&ReferenceForm> {
-        self.reference_forms.get(identity)
-    }
-
-    /// Canonicalize the protocol's unqualified reference form.
-    ///
-    /// `{name}` denotes exactly one bare segment: it contains neither `:` nor
-    /// `/`. Values containing either delimiter are already qualified or path
-    /// forms and compare exactly; they are never expanded and can never equal
-    /// a bare name through reference-form canonicalization.
-    pub(crate) fn canonical_string<'b>(
-        &self,
-        value: &'b str,
-        identity: Option<&TypeIdentity>,
-        to_dsl: Option<&DslTransform>,
-    ) -> Cow<'b, str> {
-        let transformed = to_dsl
-            .map(|transform| transform.apply(value))
-            .unwrap_or(Cow::Borrowed(value));
-        let Some(form) = identity.and_then(|identity| self.reference_form(identity)) else {
-            return transformed;
-        };
-        if transformed.is_empty() || transformed.contains(':') || transformed.contains('/') {
-            return transformed;
-        }
-        match form {
-            ReferenceForm::Template { long } => long
-                .render(self.scope, transformed.as_ref())
-                .map(Cow::Owned)
-                .unwrap_or(transformed),
-        }
-    }
-}
-
-pub(crate) fn type_aware_equal(
+pub(crate) fn type_aware_equal<R: ReferenceEquality>(
     a: &Value,
     b: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     type_aware_equal_on_path(a, b, attr_type, defs, &[], context)
 }
 
-fn type_aware_equal_on_path<'a>(
+fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
     a: &Value,
     b: &Value,
     attr_type: Option<&'a AttributeType>,
     defs: &'a BTreeMap<String, AttributeType>,
     visited_refs: &[&'a str],
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     // Secret comparison: compare the desired secret with the typed hash
     // decoded from state. Desired carries `DeferredValue::Secret(inner)`.
@@ -215,6 +362,20 @@ fn type_aware_equal_on_path<'a>(
                 let b = sb.expose_plaintext();
                 context.canonical_string(a, identity, to_dsl)
                     == context.canonical_string(b, identity, to_dsl)
+            }
+
+            (
+                Value::Concrete(ConcreteValue::String(a)),
+                Value::Concrete(ConcreteValue::String(b)),
+                crate::schema::Shape::Reference {
+                    identity,
+                    pattern: _,
+                    length: _,
+                },
+            ) => {
+                let a = a.expose_plaintext();
+                let b = b.expose_plaintext();
+                context.references.equal(identity, a, b)
             }
 
             // Lists: ordered or multiset comparison with inner type awareness
@@ -401,13 +562,13 @@ fn type_aware_equal_on_path<'a>(
 /// List comparison with type-aware element comparison.
 /// When `ordered` is true, elements are compared positionally (sequential).
 /// When `ordered` is false, elements are compared as multisets (order-insensitive).
-fn type_aware_lists_equal(
+fn type_aware_lists_equal<R: ReferenceEquality>(
     a: &[Value],
     b: &[Value],
     inner: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     ordered: bool,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     if a.len() != b.len() {
         return false;
@@ -419,8 +580,11 @@ fn type_aware_lists_equal(
             .all(|(va, vb)| type_aware_equal(va, vb, inner, defs, context))
     } else {
         // Multiset comparison: order-insensitive
-        let mut matched = vec![false; b.len()];
-        for item_a in a {
+        let (matched_a, mut matched) = crate::resource::match_equal_concrete_items(a, b);
+        for (i, item_a) in a.iter().enumerate() {
+            if matched_a[i] {
+                continue;
+            }
             let mut found = false;
             for (j, item_b) in b.iter().enumerate() {
                 if !matched[j] && type_aware_equal(item_a, item_b, inner, defs, context) {
@@ -438,12 +602,12 @@ fn type_aware_lists_equal(
 }
 
 /// Map comparison with per-key type lookup.
-fn type_aware_maps_equal<'a, F>(
+fn type_aware_maps_equal<'a, F, R: ReferenceEquality>(
     a: &IndexMap<String, Value>,
     b: &IndexMap<String, Value>,
     get_type: F,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool
 where
     F: Fn(&str) -> Option<&'a AttributeType>,
@@ -464,12 +628,12 @@ where
 /// If the extra key's value is the "zero/default" for its type (e.g., `false`
 /// for Bool, `0` for Int), the extra field is ignored. This prevents false diffs
 /// when AWS returns default values for fields the user didn't specify.
-fn type_aware_struct_equal(
+fn type_aware_struct_equal<R: ReferenceEquality>(
     a: &IndexMap<String, Value>,
     b: &IndexMap<String, Value>,
     fields: &[crate::schema::StructField],
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     let field_types: HashMap<&str, &AttributeType> = fields
         .iter()
@@ -681,7 +845,10 @@ fn contains_pending_reread(value: &Value) -> bool {
 }
 
 /// Return whether a single attribute's values differ semantically.
-pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>, context: &ComparisonContext<'_>) -> bool {
+pub(crate) fn should_patch_attr<R: ReferenceEquality>(
+    cmp: AttrComparison<'_>,
+    context: &ComparisonContext<'_, R>,
+) -> bool {
     // A post-apply read failure can leave a generated desired value unknown.
     // There is no concrete target value to send, so it cannot form a patch
     // (and, in particular, cannot force replacement for a create-only name).
@@ -716,12 +883,12 @@ pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>, context: &ComparisonCon
 }
 
 /// Return whether a key is eligible for a provider patch and semantically changed.
-pub(crate) fn key_should_enter_patch(
+pub(crate) fn key_should_enter_patch<R: ReferenceEquality>(
     key: &str,
     schema: Option<&ResourceSchema>,
     leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     key_should_enter_patch_with_ignores(
         key,
@@ -733,13 +900,13 @@ pub(crate) fn key_should_enter_patch(
     )
 }
 
-pub(crate) fn key_should_enter_patch_with_ignores(
+pub(crate) fn key_should_enter_patch_with_ignores<R: ReferenceEquality>(
     key: &str,
     schema: Option<&ResourceSchema>,
     leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
     ignore_changes: &ResolvedIgnoreChanges,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     if ignore_changes.ignores_whole_attribute(key) {
         return false;
@@ -753,6 +920,18 @@ pub(crate) fn key_should_enter_patch_with_ignores(
     {
         return false;
     }
+    let cmp = if cmp.from.is_none()
+        && schema
+            .and_then(|schema| schema.attributes.get(key))
+            .is_some_and(|attribute| attribute.write_only)
+    {
+        AttrComparison {
+            from: cmp.saved.map(|saved| saved.views.projected()),
+            ..cmp
+        }
+    } else {
+        cmp
+    };
     if let Some(schema) = schema
         && schema.write_only_bearing(key)
     {
@@ -768,13 +947,13 @@ pub(crate) fn key_should_enter_patch_with_ignores(
     should_patch_attr(cmp, context)
 }
 
-fn nested_write_only_should_enter_patch(
+fn nested_write_only_should_enter_patch<R: ReferenceEquality>(
     key: &str,
     schema: &ResourceSchema,
     leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
     ignore_changes: &ResolvedIgnoreChanges,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     if contains_pending_reread(cmp.to) {
         return false;
@@ -882,13 +1061,13 @@ fn has_observable_content(value: &Value) -> bool {
 ///
 /// A provider may omit the whole attribute when stripping its write-only
 /// leaves produces no observable content.
-fn write_only_observable_equal(
+fn write_only_observable_equal<R: ReferenceEquality>(
     schema: &ResourceSchema,
     key: &str,
     from: Option<&Value>,
     to: &Value,
     attr_type: &AttributeType,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     let observable_to = schema.strip_write_only_leaves(key, to);
     let Some(from) = from else {
@@ -1016,7 +1195,8 @@ pub(super) fn find_changed_attributes_with_ignores(
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
     ignore_changes: &ResolvedIgnoreChanges,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
+    observations: &ObservationComparison<'_>,
 ) -> AttributeChanges {
     let AttributeValueViews {
         desired,
@@ -1106,7 +1286,9 @@ pub(super) fn find_changed_attributes_with_ignores(
                             .map(|attr| &attr.attr_type)
                     })
                     .flatten();
-                type_aware_equal(current, desired, attr_type, defs, context)
+                // Ignored-change counts describe raw observations; they do
+                // not decide a provider effect and must not trigger resolution.
+                type_aware_equal(current, desired, attr_type, defs, observations)
             }
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
@@ -1217,6 +1399,7 @@ pub(super) fn find_changed_attributes_with_ignores(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn find_changed_attributes(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
@@ -1224,7 +1407,8 @@ pub(super) fn find_changed_attributes(
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
+    observations: &ObservationComparison<'_>,
 ) -> Vec<String> {
     let canonicalize = |attributes| match schema {
         Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
@@ -1241,6 +1425,7 @@ pub(super) fn find_changed_attributes(
         schema,
         &ResolvedIgnoreChanges::default(),
         context,
+        observations,
     )
     .changed
 }
@@ -1263,6 +1448,51 @@ mod tests {
             defs,
             &crate::differ::exact_comparison_context_for_tests(),
         )
+    }
+
+    #[test]
+    fn saved_plan_context_rejects_reference_equality_even_for_identical_bytes() {
+        let identity = TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference");
+        let attr_type = AttributeType::reference(identity.clone(), None, None);
+        let value = Value::Concrete(ConcreteValue::String("alias/live".into()));
+        let error = crate::differ::exact_comparison_schema_for_tests()
+            .with_recorded_effects(|comparison| {
+                super::type_aware_equal(
+                    &value,
+                    &value,
+                    Some(&attr_type),
+                    empty_defs_for_schema_walks(),
+                    &comparison,
+                )
+            })
+            .unwrap_err();
+        assert_eq!(error.identity, identity);
+    }
+
+    #[test]
+    fn observation_reference_equality_detects_byte_changes_without_a_witness() {
+        let attr_type = AttributeType::reference(
+            TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
+            None,
+            None,
+        );
+        let alias = Value::Concrete(ConcreteValue::String("alias/live".into()));
+        let canonical = Value::Concrete(ConcreteValue::String("key/a".into()));
+        let comparison = crate::differ::exact_comparison_context_for_tests();
+        assert!(super::type_aware_equal(
+            &alias,
+            &alias,
+            Some(&attr_type),
+            empty_defs_for_schema_walks(),
+            &comparison
+        ));
+        assert!(!super::type_aware_equal(
+            &alias,
+            &canonical,
+            Some(&attr_type),
+            empty_defs_for_schema_walks(),
+            &comparison
+        ));
     }
 
     #[test]

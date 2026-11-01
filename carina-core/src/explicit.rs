@@ -8,7 +8,7 @@
 //! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
 use crate::diff_helpers::{list_element_type, map_entry_subtype};
-use crate::differ::ComparisonContext;
+use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::provider::SentDesiredAttributes;
 use crate::resource::{
     CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, Resource, Value,
@@ -142,11 +142,11 @@ pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
 /// not evidence that the provider added them. Use
 /// [`build_from_resource_for_stored_values_after_send`] only when typed send
 /// evidence is available.
-pub fn build_from_read_resource_for_stored_values<S>(
+pub fn build_from_read_resource_for_stored_values<S, R: ReferenceEquality>(
     resource: &Resource<S>,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     build_for_stored_values(
         resource,
@@ -174,13 +174,13 @@ pub fn build_from_read_resource_for_stored_values<S>(
 /// lists without a concrete stored-list counterpart use the legacy union
 /// [`ExplicitFields::List`] representation rather than recording unjustified
 /// indices.
-pub fn build_from_resource_for_stored_values_after_send<S>(
+pub fn build_from_resource_for_stored_values_after_send<S, R: ReferenceEquality>(
     resource: &Resource<S>,
     prior_stored_authoring: Option<(&HashMap<String, Value>, &ExplicitFields)>,
     stored_attributes: &HashMap<String, Value>,
     sent_desired: &SentDesiredAttributes<'_>,
     schema: Option<&ResourceSchema>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     let mut rebuilt = match prior_stored_authoring {
         Some((prior_stored_attributes, prior_explicit)) => {
@@ -249,12 +249,12 @@ impl StoredValueAuthoringBasis {
     }
 }
 
-fn build_for_stored_values<S>(
+fn build_for_stored_values<S, R: ReferenceEquality>(
     resource: &Resource<S>,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
     basis: StoredValueAuthoringBasis,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     let defs = schema
         .map(|schema| &schema.defs)
@@ -291,13 +291,13 @@ fn build_for_stored_values<S>(
 /// removal crosses an ambiguous list identity, the list becomes
 /// [`ExplicitFields::WholeValue`]. That keeps the removal visible without assigning
 /// it to a guessed element.
-pub fn build_carried_from_resource_for_stored_values<S>(
+pub fn build_carried_from_resource_for_stored_values<S, R: ReferenceEquality>(
     resource: &Resource<S>,
     prior_stored_attributes: &HashMap<String, Value>,
     prior_explicit: &ExplicitFields,
     fresh_stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     let defs = schema
         .map(|schema| &schema.defs)
@@ -354,17 +354,17 @@ enum CarryLocation<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct CarryContext<'a> {
+struct CarryContext<'a, R: ReferenceEquality> {
     location: CarryLocation<'a>,
     defs: &'a BTreeMap<String, AttributeType>,
-    comparison: ComparisonContext<'a>,
+    comparison: ComparisonContext<'a, R>,
 }
 
-impl<'a> CarryContext<'a> {
+impl<'a, R: ReferenceEquality> CarryContext<'a, R> {
     fn resource(
         schema: Option<&'a ResourceSchema>,
         defs: &'a BTreeMap<String, AttributeType>,
-        comparison: ComparisonContext<'a>,
+        comparison: ComparisonContext<'a, R>,
     ) -> Self {
         Self {
             location: CarryLocation::Resource(schema),
@@ -376,7 +376,7 @@ impl<'a> CarryContext<'a> {
     fn value(
         attr_type: Option<&'a AttributeType>,
         defs: &'a BTreeMap<String, AttributeType>,
-        comparison: ComparisonContext<'a>,
+        comparison: ComparisonContext<'a, R>,
     ) -> Self {
         Self {
             location: CarryLocation::Value(attr_type),
@@ -411,13 +411,13 @@ impl<'a> CarryContext<'a> {
     }
 }
 
-fn carry_node(
+fn carry_node<R: ReferenceEquality>(
     prior_explicit: &ExplicitFields,
     rebuilt: ExplicitFields,
     prior_stored: Option<&Value>,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     match prior_explicit {
         ExplicitFields::Leaf | ExplicitFields::Unrecorded => CarriedNode {
@@ -439,12 +439,12 @@ fn carry_node(
     }
 }
 
-fn carry_legacy_list(
+fn carry_legacy_list<R: ReferenceEquality>(
     element: &ExplicitFields,
     rebuilt: ExplicitFields,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
     else {
@@ -473,12 +473,12 @@ fn carry_legacy_list(
     }
 }
 
-fn carry_whole_value(
+fn carry_whole_value<R: ReferenceEquality>(
     rebuilt: ExplicitFields,
     pending: &PendingPaths,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
     else {
@@ -524,13 +524,13 @@ fn carry_whole_value(
     }
 }
 
-fn carry_struct(
+fn carry_struct<R: ReferenceEquality>(
     prior_children: &HashMap<String, ExplicitFields>,
     rebuilt: ExplicitFields,
     prior_stored: Option<&Value>,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_fields), Some(fresh_fields)) = (concrete_map(desired), concrete_map(fresh))
     else {
@@ -549,13 +549,13 @@ fn carry_struct(
     )
 }
 
-fn carry_struct_fields(
+fn carry_struct_fields<R: ReferenceEquality>(
     prior_children: &HashMap<String, ExplicitFields>,
     rebuilt: ExplicitFields,
     prior_fields: Option<CarryMap<'_>>,
     desired_fields: CarryMap<'_>,
     fresh_fields: CarryMap<'_>,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let mut rebuilt_children = match rebuilt {
         ExplicitFields::Struct { children } => children,
@@ -605,13 +605,13 @@ fn carry_struct_fields(
     }
 }
 
-fn carry_list(
+fn carry_list<R: ReferenceEquality>(
     prior_elements: &[ExplicitFields],
     rebuilt: ExplicitFields,
     prior_stored: Option<&Value>,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
     else {
@@ -792,12 +792,12 @@ fn carried_list_without_alignment(
     }
 }
 
-fn mutually_unique_pairs(
+fn mutually_unique_pairs<R: ReferenceEquality>(
     left: &[Value],
     right: &[Value],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> Vec<Option<usize>> {
     let forward = pair_list_elements_with_uniqueness(left, right, attr_type, defs, comparison);
     let reverse = pair_list_elements_with_uniqueness(right, left, attr_type, defs, comparison);
@@ -819,11 +819,11 @@ fn mutually_unique_pairs(
         .collect()
 }
 
-fn pending_paths_by_element(
+fn pending_paths_by_element<R: ReferenceEquality>(
     elements: &[ExplicitFields],
     desired_items: &[Value],
     fresh_items: &[Value],
-    item_context: CarryContext<'_>,
+    item_context: CarryContext<'_, R>,
 ) -> (Vec<BTreeSet<Vec<String>>>, Vec<Option<usize>>) {
     let authored_by_element: Vec<_> = elements
         .iter()
@@ -849,11 +849,11 @@ fn pending_paths_by_element(
     )
 }
 
-fn pending_candidate_paths(
+fn pending_candidate_paths<R: ReferenceEquality>(
     prior_authored_counts: BTreeMap<Vec<String>, usize>,
     desired_items: &[Value],
     fresh_items: &[Value],
-    item_context: CarryContext<'_>,
+    item_context: CarryContext<'_, R>,
 ) -> (BTreeSet<Vec<String>>, Vec<Option<usize>>) {
     let broad_candidates: BTreeSet<_> = prior_authored_counts
         .into_iter()
@@ -1021,13 +1021,13 @@ pub fn build_from_value(value: &Value) -> ExplicitFields {
     }
 }
 
-fn build_from_value_for_stored_value(
+fn build_from_value_for_stored_value<R: ReferenceEquality>(
     desired: &Value,
     stored: Option<&Value>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     basis: StoredValueAuthoringBasis,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     match desired {
         Value::Concrete(ConcreteValue::Map(desired_fields)) => {
@@ -1221,12 +1221,12 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// authored element as [`ExplicitFields::Unrecorded`]. Missing or mismatched
 /// stored lists use the legacy union projection. Schema-aware list pairing
 /// uses the same equality as state writeback.
-pub struct ExplicitProjection<'a> {
+pub struct ExplicitProjection<'a, R: ReferenceEquality> {
     stored_attributes: &'a CanonicalComparisonAttributes,
     desired: ProjectionDesired<'a>,
     explicit: &'a ExplicitFields,
     schema: Option<&'a ResourceSchema>,
-    comparison: ComparisonContext<'a>,
+    comparison: ComparisonContext<'a, R>,
 }
 
 enum ProjectionDesired<'a> {
@@ -1254,7 +1254,7 @@ impl ProjectionDesiredValue<'_> {
     }
 }
 
-impl<'a> ExplicitProjection<'a> {
+impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
     /// Build a projection whose server-added classification is checked against
     /// the resource's desired attributes.
     pub fn for_desired(
@@ -1262,7 +1262,7 @@ impl<'a> ExplicitProjection<'a> {
         desired_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
-        comparison: &ComparisonContext<'a>,
+        comparison: &ComparisonContext<'a, R>,
     ) -> Self {
         Self {
             stored_attributes,
@@ -1286,7 +1286,7 @@ impl<'a> ExplicitProjection<'a> {
         stored_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
-        comparison: &ComparisonContext<'a>,
+        comparison: &ComparisonContext<'a, R>,
     ) -> Self {
         Self {
             stored_attributes,
@@ -1444,14 +1444,14 @@ struct ProjectedValue {
     authoring: ProjectedAuthoring,
 }
 
-fn project_value(
+fn project_value<R: ReferenceEquality>(
     value: Value,
     stored: Option<&Value>,
     desired: ProjectionDesiredValue<'_>,
     explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ProjectedValue {
     match explicit {
         ExplicitFields::Leaf | ExplicitFields::Unrecorded => ProjectedValue {

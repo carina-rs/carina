@@ -272,6 +272,9 @@ fn whole_value_list_uses_whole_value_detail_row() {
         &historical_display,
         Some(&prev_explicit),
         &provider,
+        carina_core::detail_rows::DetailComparisons::Planning(
+            &carina_core::references::prepare_empty_for_tests(),
+        ),
     )
     .expect("whole-value display must use the production app constructor");
     assert!(matches!(

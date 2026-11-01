@@ -16,7 +16,7 @@ fn diff_test(
         saved,
         prev_explicit,
         schema,
-        &super::exact_comparison_context_for_tests(),
+        &super::exact_comparison_schema_for_tests(),
     )
 }
 

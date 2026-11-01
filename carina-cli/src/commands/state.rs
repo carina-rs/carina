@@ -1211,6 +1211,7 @@ async fn run_state_show(
             &historical_display,
             Some(&prev_explicit),
             &carina_core::provider::ProviderRouter::new(),
+            carina_core::detail_rows::DetailComparisons::RecordedEffects,
         )?;
     } else {
         let output = format_state_show(&state);
@@ -2513,7 +2514,7 @@ fn diff_display_update_resource_with_provider(
 
     let resolved_comparison = provider.comparison_for(schemas, id.as_inner())?;
     let owner_schema = resolved_comparison.owner_schema();
-    let comparison = resolved_comparison.context();
+    let comparison = &resolved_comparison.context().observation();
     let resource_schema = Some(owner_schema.schema().as_schema());
 
     let refreshed_resource_state = if exists {
@@ -5970,7 +5971,7 @@ mod tests {
 
     #[test]
     fn current_refresh_seeds_unrecorded_from_empty_desired_without_promoting_tags() {
-        use carina_core::differ::{Diff, diff};
+        use carina_core::differ::{Diff, diff_for_test as diff};
         use carina_core::explicit::ExplicitFields;
 
         let id = ResourceId::with_provider_identity("mock", "ec2.InternetGateway", "igw", None);
@@ -6039,15 +6040,17 @@ mod tests {
                 schemas
                     .get_for(&desired)
                     .map(|schema| schema.schema().as_schema()),
-                &carina_core::differ::exact_comparison_context_for_tests(),
-            ),
+                &carina_core::differ::exact_comparison_schema_for_tests(),
+                &carina_core::references::prepare_empty_for_tests(),
+            )
+            .unwrap(),
             Diff::NoChange(_)
         ));
     }
 
     #[test]
     fn current_refresh_keeps_prior_authored_tags_when_desired_has_removed_them() {
-        use carina_core::differ::{Diff, diff};
+        use carina_core::differ::{Diff, diff_for_test as diff};
         use carina_core::explicit::ExplicitFields;
 
         let id = ResourceId::with_provider_identity("mock", "ec2.InternetGateway", "igw", None);
@@ -6136,8 +6139,10 @@ mod tests {
             schemas
                 .get_for(&desired)
                 .map(|schema| schema.schema().as_schema()),
-            &carina_core::differ::exact_comparison_context_for_tests(),
+            &carina_core::differ::exact_comparison_schema_for_tests(),
+            &carina_core::references::prepare_empty_for_tests(),
         )
+        .unwrap()
         else {
             panic!("refresh must preserve the pending tags removal");
         };
@@ -6153,7 +6158,7 @@ mod tests {
         carina_core::differ::Diff,
         carina_core::explicit::ExplicitFields,
     ) {
-        use carina_core::differ::{Diff, diff};
+        use carina_core::differ::{Diff, diff_for_test as diff};
         use carina_core::executor::AcceptedRequest;
 
         let id = desired.id.clone();
@@ -6185,8 +6190,10 @@ mod tests {
             &prior_saved,
             Some(&prior.explicit),
             None,
-            &carina_core::differ::exact_comparison_context_for_tests(),
+            &carina_core::differ::exact_comparison_schema_for_tests(),
+            &carina_core::references::prepare_empty_for_tests(),
         )
+        .unwrap()
         else {
             panic!("the Applied row must initially plan the nested removal");
         };
@@ -6237,8 +6244,10 @@ mod tests {
                 &saved,
                 Some(&explicit),
                 None,
-                &carina_core::differ::exact_comparison_context_for_tests(),
-            ),
+                &carina_core::differ::exact_comparison_schema_for_tests(),
+                &carina_core::references::prepare_empty_for_tests(),
+            )
+            .unwrap(),
             explicit,
         )
     }

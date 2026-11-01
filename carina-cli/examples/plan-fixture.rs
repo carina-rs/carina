@@ -204,6 +204,7 @@ fn main() -> ExitCode {
             &historical_display,
             Some(&fp.prev_explicit),
             &provider,
+            fp.references.for_display(),
         ) {
             eprintln!("{}", carina_cli::error::format_error_with_source_chain(&e));
             return ExitCode::from(1);
@@ -218,6 +219,7 @@ fn main() -> ExitCode {
             detail,
             &historical_display,
             &provider,
+            fp.references.for_display(),
         ) {
             Ok(output) => output,
             Err(error) => {
@@ -237,6 +239,7 @@ fn main() -> ExitCode {
             Some(&fp.prev_explicit),
             None,
             &provider,
+            fp.references.for_display(),
         ) {
             eprintln!("error: {error}");
             return ExitCode::from(1);

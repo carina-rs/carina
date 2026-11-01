@@ -84,6 +84,7 @@ struct DeleteToken {
 }
 
 struct MockProcessProvider {
+    reference_table: carina_provider_mock::references::ReferenceTable,
     states: Mutex<HashMap<String, MockState>>,
     read_back_polls: Mutex<HashMap<String, u32>>,
 }
@@ -105,6 +106,7 @@ struct MockIdentifierPayload {
 impl Default for MockProcessProvider {
     fn default() -> Self {
         Self {
+            reference_table: Default::default(),
             states: Mutex::new(HashMap::new()),
             read_back_polls: Mutex::new(HashMap::new()),
         }
@@ -630,6 +632,7 @@ impl CarinaProvider for MockProcessProvider {
 
     fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
         vec![
+            carina_provider_mock::references::resource_schema(),
             CoreResourceSchema::new("test.read_back")
                 .attribute(
                     CoreAttributeSchema::optional(
@@ -773,7 +776,11 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
-        CoreValidatedConfigSchema::default()
+        CoreValidatedConfigSchema::validate(BTreeMap::from([(
+            "reference_table".into(),
+            CoreAttributeType::string(),
+        )]))
+        .expect("mock config schema")
     }
 
     fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
@@ -789,6 +796,10 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String> {
+        if let Some(Value::String(table)) = attrs.get("reference_table") {
+            self.reference_table =
+                serde_json::from_str(table).map_err(|error| error.to_string())?;
+        }
         if attrs.contains_key("__mock_initialize_error__") {
             return Err("intentional mock initialization failure".to_string());
         }
@@ -799,6 +810,16 @@ impl CarinaProvider for MockProcessProvider {
             }
             Some(_) | None => Ok(ReferenceScope::Unavailable),
         }
+    }
+
+    fn resolve_references(
+        &self,
+        requests: Vec<ReferenceRequest>,
+    ) -> Result<Vec<Result<ReferenceOutcome, ReferenceError>>, ProviderError> {
+        Ok(carina_provider_mock::references::resolve(
+            &self.reference_table,
+            requests,
+        ))
     }
 
     fn read(

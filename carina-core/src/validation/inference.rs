@@ -917,6 +917,7 @@ pub(super) fn attribute_type_to_type_expr(
     schema_owner: &str,
 ) -> TypeExpr {
     let scalar_identity = match attr_type.kind() {
+        AttrTypeKind::Reference { identity, .. } => Some(identity),
         AttrTypeKind::String { binding, .. }
         | AttrTypeKind::Int { binding, .. }
         | AttrTypeKind::Float { binding, .. } => binding.identity(),
@@ -938,7 +939,7 @@ pub(super) fn attribute_type_to_type_expr(
     }
 
     match attr_type.kind() {
-        AttrTypeKind::String { .. } => TypeExpr::String,
+        AttrTypeKind::Reference { .. } | AttrTypeKind::String { .. } => TypeExpr::String,
         AttrTypeKind::ResourceHandle {
             provider,
             resource_type,

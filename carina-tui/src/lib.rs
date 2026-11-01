@@ -235,8 +235,16 @@ pub fn run(
     historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> Result<(), TuiError> {
-    let mut app = app_for_run(plan, schemas, historical_display, prev_explicit, provider)?;
+    let mut app = app_for_run(
+        plan,
+        schemas,
+        historical_display,
+        prev_explicit,
+        provider,
+        comparisons,
+    )?;
     run_tui(ui::draw, handle_key, &mut app).map_err(TuiError::Io)
 }
 
@@ -246,9 +254,17 @@ fn app_for_run(
     historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> Result<App, TuiError> {
-    App::new(plan, schemas, historical_display, prev_explicit, provider)
-        .map_err(TuiError::PlanDisplay)
+    App::new(
+        plan,
+        schemas,
+        historical_display,
+        prev_explicit,
+        provider,
+        comparisons,
+    )
+    .map_err(TuiError::PlanDisplay)
 }
 
 fn run_tui<A>(
@@ -368,6 +384,9 @@ mod tests {
             &historical_display,
             None,
             &ProviderRouter::new(),
+            carina_core::detail_rows::DetailComparisons::Planning(
+                &carina_core::references::prepare_empty_for_tests(),
+            ),
         ) {
             Ok(_) => panic!("the missing comparison schema must reach the TUI boundary"),
             Err(error) => error,

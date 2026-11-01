@@ -380,6 +380,9 @@ mod tests {
             &historical,
             None,
             &provider,
+            carina_core::detail_rows::DetailComparisons::Planning(
+                &carina_core::references::prepare_empty_for_tests(),
+            ),
         )
         .expect("diff display test must use the production comparison path")
     }

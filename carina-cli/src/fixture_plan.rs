@@ -221,6 +221,7 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
 /// Complete output of fixture-based plan construction.
 pub struct FixturePlan {
     pub plan: Plan,
+    pub references: crate::wiring::PlanReferenceEvidence,
     pub moved_hints: MovedBlockHints,
     /// Resolved desired resources, including unchanged resources omitted from
     /// `plan.effects()`. Plan-image tests use these to retain only unchanged
@@ -626,6 +627,7 @@ where
                 expanded_resources: validated_expansion,
                 residual_deferred_for,
                 plan,
+                references,
                 compositions,
                 data_sources: _,
                 managed_current,
@@ -639,6 +641,7 @@ where
                     .expect("fixture moved-hint comparisons must resolve");
             FixturePlan {
                 plan,
+                references,
                 moved_hints,
                 // Error plans abort before resolved-resource and export consumers.
                 desired_resources: Vec::new(),
@@ -673,6 +676,7 @@ where
                 expanded_resources: validated_expansion,
                 residual_deferred_for,
                 plan,
+                references,
                 compositions,
                 data_sources: _,
                 managed_current,
@@ -706,6 +710,7 @@ where
 
             FixturePlan {
                 plan,
+                references,
                 moved_hints,
                 desired_resources: resolved_resources,
                 unresolved_resources,

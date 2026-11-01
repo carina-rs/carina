@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
-use crate::differ::ComparisonContext;
+use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::resource::{CanonicalComparisonAttributes, Value};
 use crate::schema::{
     AttributeType, ResourceSchema, ValidatedResourceSchema, empty_defs_for_schema_walks,
@@ -29,12 +29,12 @@ use crate::value::CanonicalState;
 /// `type_aware_equal`'s secret arm and compare unequal, which only ever
 /// *over*-reports a diff (safe-by-default) — it never hides a real
 /// change.
-pub(crate) fn schema_aware_equal(
+pub(crate) fn schema_aware_equal<R: ReferenceEquality>(
     old: &Value,
     new: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     match attr_type {
         Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs, context),
@@ -56,7 +56,7 @@ pub fn resource_attribute_values_equal(
     new: &Value,
     schema: Option<&ValidatedResourceSchema>,
     attribute_name: &str,
-    context: &ComparisonContext<'_>,
+    context: &crate::differ::ObservationComparison<'_>,
 ) -> bool {
     let Some(attribute) = schema.and_then(|schema| schema.effective_attribute(attribute_name))
     else {
@@ -241,12 +241,12 @@ pub(crate) fn list_element_type<'a>(
 /// `# (n unchanged attributes hidden)` tally would not add up. With
 /// `schema = None`, behavior is the schema-blind `semantically_equal`
 /// path (unchanged for embedded / test callers).
-pub fn compute_unchanged_count(
+pub fn compute_unchanged_count<R: ReferenceEquality>(
     from_attrs: &CanonicalComparisonAttributes,
     to_attrs: &CanonicalComparisonAttributes,
     exclude: Option<&std::collections::HashSet<&str>>,
     schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> usize {
     let defs: &BTreeMap<String, AttributeType> = schema
         .map(|s| &s.defs)

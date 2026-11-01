@@ -2,7 +2,7 @@
 
 use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::deps::get_resource_dependencies;
-use carina_core::differ::{ComparisonContext, Orphan};
+use carina_core::differ::{ObservationComparison, Orphan};
 use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect};
 use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
@@ -3254,7 +3254,7 @@ impl ResourceState {
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
         authoring_basis: DesiredAuthoringBasis<'_>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ObservationComparison<'_>,
     ) {
         if let Some(existing) = existing {
             self.protected = existing.protected;
@@ -3310,7 +3310,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ObservationComparison<'_>,
     ) -> ExplicitFields {
         let Some(existing) = existing else {
             return explicit::build_from_read_resource_for_stored_values(
@@ -3346,7 +3346,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ObservationComparison<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let applied_desired = created
             .resolved_desired_attributes()
@@ -3476,7 +3476,7 @@ impl ResourceState {
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ObservationComparison<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let (persisted, sent_desired) = match pending.persistence() {
             InFlightPersistence::Persisted => {
@@ -3567,7 +3567,7 @@ impl ResourceState {
         unknown: &UnknownCreateOutcome,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ObservationComparison<'_>,
     ) -> Self {
         let mut row = existing.cloned().unwrap_or_else(|| {
             Self::new(
@@ -3613,7 +3613,7 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         row_basis: RowBasis<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ObservationComparison<'_>,
     ) -> Result<Self, ResourceStateEncodingError> {
         // The resource carried by a saved plan still contains deferred expressions.
         // Once an operation has run, secret protection must follow the provider-ready

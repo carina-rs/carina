@@ -665,6 +665,19 @@ pub fn attribute_type_to_protocol(
     attribute_type: &AttributeType,
 ) -> Result<protocol::AttributeType, ProtocolConvertError> {
     match attribute_type.raw_shape() {
+        RawShape::Reference {
+            identity,
+            pattern,
+            length,
+        } => Ok(protocol::AttributeType::Reference {
+            identity: protocol::TypeIdentity {
+                provider: identity.provider.clone().unwrap_or_default(),
+                segments: identity.segments.clone(),
+                kind: identity.kind.clone(),
+            },
+            pattern: pattern.map(str::to_owned),
+            length,
+        }),
         RawShape::String {
             identity,
             pattern,
@@ -1106,6 +1119,26 @@ pub fn protocol_to_attribute_type(
     attribute_type: &protocol::AttributeType,
 ) -> Result<AttributeType, SchemaDecodeError> {
     match attribute_type {
+        protocol::AttributeType::Reference {
+            identity,
+            pattern,
+            length,
+        } => {
+            let protocol::TypeIdentity {
+                provider,
+                segments,
+                kind,
+            } = identity;
+            Ok(AttributeType::reference(
+                TypeIdentity::new(
+                    (!provider.is_empty()).then(|| provider.clone()),
+                    segments.clone(),
+                    kind.clone(),
+                ),
+                pattern.clone(),
+                *length,
+            ))
+        }
         protocol::AttributeType::String {
             pattern,
             length,
@@ -1331,6 +1364,14 @@ fn protocol_legacy_custom_to_core(
     }
 
     match base {
+        protocol::AttributeType::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Err(SchemaDecodeError::unsupported_custom_base(
+            enclosing_name,
+            "Reference",
+        )),
         protocol::AttributeType::String {
             pattern: base_pattern,
             length: base_length,
@@ -2486,6 +2527,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reference_type_round_trip_and_offline_constraints() {
+        let identity = TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference");
+        let ty = AttributeType::reference(
+            identity.clone(),
+            Some("^alias/[a-z]+$".into()),
+            Some((Some(8), Some(12))),
+        );
+        let wire = attribute_type_to_protocol(&ty).unwrap();
+        let decoded = protocol_to_attribute_type(&wire).unwrap();
+        assert!(
+            matches!(decoded.raw_shape(), RawShape::Reference { identity: actual, pattern: Some("^alias/[a-z]+$"), length: Some((Some(8), Some(12))) } if actual == &identity)
+        );
+        let schema = ResourceSchema::new("keys.Resource")
+            .attribute(crate::schema::AttributeSchema::optional("key", decoded).build())
+            .validate()
+            .unwrap();
+        let attribute = schema.effective_attribute("key").unwrap();
+        assert!(
+            attribute
+                .value_type()
+                .validate(&Value::<crate::resource::NoPlaceholder>::Concrete(
+                    ConcreteValue::String("alias/abc".into())
+                ))
+                .is_ok()
+        );
+        for invalid in ["alias/a", "alias/abcdefghijk", "key/abc"] {
+            assert!(
+                attribute
+                    .value_type()
+                    .validate(&Value::<crate::resource::NoPlaceholder>::Concrete(
+                        ConcreteValue::String(invalid.into())
+                    ))
+                    .is_err()
+            );
+        }
+    }
+
     fn schema_with_identified_type(
         identity: &TypeIdentity,
         attribute_type: AttributeType,
@@ -3321,6 +3400,11 @@ mod tests {
             let decoded_wire: protocol::AttributeType = serde_json::from_str(&json).unwrap();
             let decoded = protocol_to_attribute_type(&decoded_wire).unwrap();
             let (decoded_identity, has_callback) = match decoded.raw_shape() {
+                RawShape::Reference {
+                    identity,
+                    pattern: _pattern,
+                    length: _length,
+                } => (Some(identity), false),
                 RawShape::String {
                     identity,
                     pattern: _pattern,
