@@ -488,6 +488,35 @@ fn round5_let_bound_struct_list_error_stays_in_second_resource() {
 }
 
 #[test]
+fn round8_struct_item_errors_include_full_leaf_path() {
+    for (body, paths) in [
+        ("rules {\n    label = 5\n  }", vec!["rules[0].label"]),
+        (
+            "rules {\n    label = \"ok\"\n  }\n  rules {\n    label = 5\n  }",
+            vec!["rules[1].label"],
+        ),
+        (
+            "rules {\n    label = \"ok\"\n    tags = [5, 6]\n  }",
+            vec!["rules[0].tags[0]", "rules[0].tags[1]"],
+        ),
+    ] {
+        let (_, diagnostics) = unique_list_declaration_scope_fixture(body, true);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected String"))
+            .collect();
+        assert_eq!(errors.len(), paths.len(), "{diagnostics:#?}");
+        for path in paths {
+            assert!(
+                errors.iter().any(|diagnostic| diagnostic.message
+                    == format!("Type mismatch: expected String, got Int for '{path}'")),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn round5_let_bound_unknown_attribute_is_reported_once() {
     let (_, diagnostics) = unique_list_declaration_scope_fixture("typo = true", true);
     let diagnostic = only_message_diagnostic(&diagnostics, "Unknown attribute 'typo'");
@@ -614,8 +643,10 @@ fn unique_list_count_error_stays_in_the_second_resource() {
         .nth(1)
         .unwrap();
     let attributes = resource.attributes();
+    let text = document.text();
+    let source = DiagnosticSource::new(&document, &text);
     let (diagnostics, reported_duplicate) = test_engine().validate_container_value(
-        &document,
+        &source,
         "values",
         attributes.get("values").unwrap(),
         &effective_type,
@@ -630,8 +661,8 @@ fn unique_list_count_error_stays_in_the_second_resource() {
 #[test]
 fn unique_list_item_errors_retain_the_attribute_suffix() {
     for (body, attribute, message) in [
-        ("tags_list = [\"ok\", 5]", "tags_list", "expected String"),
-        ("modes = [allow, invalid]", "modes", "invalid"),
+        ("tags_list = [\"ok\", 5]", "tags_list[1]", "expected String"),
+        ("modes = [allow, invalid]", "modes[1]", "invalid"),
     ] {
         let (_, diagnostics) = unique_list_scope_fixture(body);
         let diagnostic = only_message_diagnostic(&diagnostics, message);
@@ -700,8 +731,10 @@ fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
     let effective_attribute = schema.effective_attribute("matrix").unwrap();
     let effective_type = effective_attribute.value_type();
     let engine = test_engine();
+    let text = document.text();
+    let source = DiagnosticSource::new(&document, &text);
     let (diagnostics, reported_duplicate) = engine.validate_container_value(
-        &document,
+        &source,
         "matrix",
         value,
         &effective_type,
@@ -721,9 +754,15 @@ fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
     .unwrap();
     let errors = effective_type.validate_collect(&evaluated);
     assert!(
-        errors
-            .iter()
-            .any(|(_, error)| matches!(error, TypeError::DuplicateListElement { .. })),
+        errors.iter().any(|(_, error)| matches!(
+            error,
+            TypeError::DuplicateListElement {
+                value: _,
+                index: _,
+                first_index: _,
+                attribute: _
+            }
+        )),
         "{errors:?}"
     );
 }

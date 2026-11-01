@@ -2664,7 +2664,19 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
                 let (i, fit) = result.map_err(|failure| {
                     let error = *failure.error;
                     match failure.index {
-                        Some(_) if matches!(error, TypeError::DuplicateListElement { .. }) => error,
+                        Some(_)
+                            if matches!(
+                                error,
+                                TypeError::DuplicateListElement {
+                                    value: _,
+                                    index: _,
+                                    first_index: _,
+                                    attribute: _
+                                }
+                            ) =>
+                        {
+                            error
+                        }
                         Some(index) => error.at_list_index(index),
                         None => error,
                     }
@@ -4903,7 +4915,7 @@ impl ListConstraints {
         let mut seen: HashMap<KnownListElement, usize> = HashMap::new();
         let authored = match purpose {
             CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl)
-            | CanonicalizationPurpose::ProviderConfig { .. } => true,
+            | CanonicalizationPurpose::ProviderConfig { provider_name: _ } => true,
             // A wait RHS compares against observed state; it is not provider input.
             CanonicalizationPurpose::WaitRhs
             | CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput)
@@ -6859,7 +6871,12 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         | TypeError::InvalidEnumVariant { .. }
         | TypeError::PatternMismatch { .. }
         | TypeError::LengthOutOfRange { .. }
-        | TypeError::DuplicateListElement { .. }
+        | TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _,
+        }
         | TypeError::StringLiteralExpectedEnum { .. }
         | TypeError::ValidationFailed { .. }
         | TypeError::CustomTypeValidation { .. }
@@ -7147,7 +7164,12 @@ impl TypeError {
             TypeError::InvalidEnumVariant { attribute, .. }
             | TypeError::PatternMismatch { attribute, .. }
             | TypeError::LengthOutOfRange { attribute, .. }
-            | TypeError::DuplicateListElement { attribute, .. }
+            | TypeError::DuplicateListElement {
+                attribute,
+                value: _,
+                index: _,
+                first_index: _,
+            }
             | TypeError::StringLiteralExpectedEnum { attribute, .. }
             | TypeError::ResourceValidationFailed { attribute, .. } => attribute.as_deref(),
             TypeError::ReadOnlyAttribute { name }
@@ -7230,7 +7252,7 @@ impl TypeError {
                 index,
                 first_index,
                 attribute,
-                ..
+                value: _,
             } => TypeError::DuplicateListElement {
                 value: DiagnosticValue::Masked,
                 index,
@@ -7402,7 +7424,9 @@ impl TypeError {
                     }
                     | TypeError::DuplicateListElement {
                         attribute: attr_slot,
-                        ..
+                        value: _,
+                        index: _,
+                        first_index: _,
                     }
                     | TypeError::StringLiteralExpectedEnum {
                         attribute: attr_slot,
@@ -11874,7 +11898,12 @@ impl ResourceSchema {
                     &mut errors,
                 );
             } else if mode == ValueEntryValidation::FullInput {
-                let suggestion = suggest_similar_name(name, &known);
+                let id_attribute = format!("{name}_id");
+                let suggestion = if known.contains(&id_attribute.as_str()) {
+                    Some(id_attribute)
+                } else {
+                    suggest_similar_name(name, &known)
+                };
                 errors.push(TypeError::UnknownAttribute {
                     name: name.clone(),
                     suggestion,
@@ -13405,7 +13434,7 @@ pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
     known
         .iter()
         .map(|name| (*name, levenshtein_distance(unknown, name)))
-        .filter(|(name, dist)| *dist <= max_distance || name.strip_suffix("_id") == Some(unknown))
+        .filter(|(_, dist)| *dist <= max_distance)
         .min_by_key(|(_, dist)| *dist)
         .map(|(name, _)| name.to_string())
 }

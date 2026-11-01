@@ -23,8 +23,8 @@ use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::typecheck::{self, TypecheckInference};
 
 use super::{
-    DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic, carina_diagnostic_range,
-    parse_error_to_diagnostic, parser_span_range,
+    DiagnosticEngine, DiagnosticSource, ProviderValidationDeduplicator, carina_diagnostic,
+    carina_diagnostic_range, parse_error_to_diagnostic, parser_span_range,
 };
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
@@ -1759,12 +1759,11 @@ impl DiagnosticEngine {
     /// for the other declaration kinds.
     pub(super) fn duplicate_declaration_diagnostics(
         &self,
-        doc: &Document,
+        source: &DiagnosticSource<'_>,
         current_file_name: Option<&str>,
         duplicates: &[DuplicateDeclaration],
     ) -> Vec<Diagnostic> {
-        let binding_spans =
-            carina_core::parser::top_level_let_binding_spans(&doc.text()).unwrap_or_default();
+        let doc = source.doc;
         duplicates
             .iter()
             .filter(|duplicate| {
@@ -1785,7 +1784,9 @@ impl DiagnosticEngine {
                     DeclarationKind::Export => {
                         self.find_exports_param_position(doc, duplicate.name())
                     }
-                    DeclarationKind::Binding => binding_spans
+                    DeclarationKind::Binding => source
+                        .spans()
+                        .let_binding_spans()
                         .get(duplicate.name())
                         .and_then(|spans| parser_span_range(doc, spans.name))
                         .map(|range| (range.start.line, range.start.character)),
@@ -2336,17 +2337,18 @@ impl DiagnosticEngine {
     /// handles the final position lookup and diagnostic construction.
     pub(super) fn unused_binding_diagnostics<I>(
         &self,
-        doc: &Document,
+        source: &DiagnosticSource<'_>,
         unused_bindings: I,
     ) -> Vec<Diagnostic>
     where
         I: IntoIterator<Item = String>,
     {
-        let binding_spans =
-            carina_core::parser::top_level_let_binding_spans(&doc.text()).unwrap_or_default();
+        let doc = source.doc;
         let mut diagnostics = Vec::new();
         for binding_name in unused_bindings {
-            if let Some(range) = binding_spans
+            if let Some(range) = source
+                .spans()
+                .let_binding_spans()
                 .get(&binding_name)
                 .and_then(|spans| parser_span_range(doc, spans.name))
             {

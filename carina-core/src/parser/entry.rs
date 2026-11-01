@@ -96,6 +96,78 @@ pub struct LetBindingSourceSpans {
     pub name: super::SourceSpan,
 }
 
+/// Reusable syntax spans for editor lookups, collected in one grammar parse.
+#[derive(Debug, Default)]
+pub struct SourceSpanIndex {
+    let_bindings: HashMap<String, LetBindingSourceSpans>,
+    resource_members: Vec<SourceSpanNode>,
+}
+
+/// An owned syntax node retains source mappings without borrowing pest pairs.
+#[derive(Debug)]
+struct SourceSpanNode {
+    rule: Rule,
+    span: super::SourceSpan,
+    name: Option<String>,
+    children: Vec<Self>,
+}
+
+impl SourceSpanNode {
+    fn from_pair(pair: pest::iterators::Pair<'_, Rule>, file: &super::PreprocessedFile) -> Self {
+        let rule = pair.as_rule();
+        let name = if matches!(rule, Rule::attribute | Rule::map_entry | Rule::nested_block) {
+            pair.clone()
+                .into_inner()
+                .next()
+                .map(|key| key.as_str().trim_matches(['\'', '"']).to_string())
+        } else {
+            None
+        };
+        Self {
+            rule,
+            span: super::SourceSpan::from_pest(&pair, file),
+            name,
+            children: pair
+                .into_inner()
+                .map(|child| Self::from_pair(child, file))
+                .collect(),
+        }
+    }
+}
+
+impl SourceSpanIndex {
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
+        let file = super::preprocess_file(input)?;
+        let pairs = file.parse()?;
+        let let_bindings = collect_top_level_let_binding_spans(pairs.clone(), &file);
+        let resource_members = pairs
+            .flatten()
+            .filter(|pair| {
+                matches!(
+                    pair.as_rule(),
+                    Rule::anonymous_resource | Rule::resource_expr | Rule::read_resource_expr
+                )
+            })
+            .flat_map(|resource| resource.into_inner())
+            .filter(|pair| {
+                matches!(
+                    pair.as_rule(),
+                    Rule::block_content | Rule::attribute | Rule::nested_block
+                )
+            })
+            .map(|pair| SourceSpanNode::from_pair(pair, &file))
+            .collect();
+        Ok(Self {
+            let_bindings,
+            resource_members,
+        })
+    }
+
+    pub fn let_binding_spans(&self) -> &HashMap<String, LetBindingSourceSpans> {
+        &self.let_bindings
+    }
+}
+
 impl<'a> BindingSeed<'a> {
     pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
         Self {
@@ -253,112 +325,106 @@ pub fn attribute_value_source_spans(
     path: &crate::schema::FieldPath,
     scope: Option<(u32, u32)>,
 ) -> Result<Option<AttributeValueSourceSpans>, ParseError> {
-    use crate::schema::FieldPathStep;
-    use pest::iterators::Pair;
+    Ok(SourceSpanIndex::parse(input)?.attribute_value_source_spans(attribute, path, scope))
+}
 
-    fn peel(mut pair: Pair<'_, Rule>) -> Option<Pair<'_, Rule>> {
-        while !matches!(pair.as_rule(), Rule::list | Rule::map | Rule::nested_block) {
-            let mut children = pair.into_inner();
-            pair = children.next()?;
-            if children.next().is_some() {
+impl SourceSpanIndex {
+    /// Locate an attribute or literal descendant without reparsing the source.
+    pub fn attribute_value_source_spans(
+        &self,
+        attribute: &str,
+        path: &crate::schema::FieldPath,
+        scope: Option<(u32, u32)>,
+    ) -> Option<AttributeValueSourceSpans> {
+        use crate::schema::FieldPathStep;
+
+        fn peel(mut node: &SourceSpanNode) -> Option<&SourceSpanNode> {
+            while !matches!(node.rule, Rule::list | Rule::map | Rule::nested_block) {
+                let [child] = node.children.as_slice() else {
+                    return None;
+                };
+                node = child;
+            }
+            Some(node)
+        }
+
+        fn named_value<'a>(node: &'a SourceSpanNode, name: &str) -> Option<&'a SourceSpanNode> {
+            let node = if node.rule == Rule::block_content {
+                node.children.first()?
+            } else {
+                node
+            };
+            if !matches!(
+                node.rule,
+                Rule::attribute | Rule::map_entry | Rule::nested_block
+            ) || node.name.as_deref() != Some(name)
+            {
                 return None;
             }
-        }
-        Some(pair)
-    }
-
-    fn named_value<'a>(pair: Pair<'a, Rule>, name: &str) -> Option<Pair<'a, Rule>> {
-        let pair = if pair.as_rule() == Rule::block_content {
-            pair.into_inner().next()?
-        } else {
-            pair
-        };
-        if !matches!(
-            pair.as_rule(),
-            Rule::attribute | Rule::map_entry | Rule::nested_block
-        ) {
-            return None;
-        }
-        let mut children = pair.clone().into_inner();
-        let key = children.next()?;
-        if key.as_str().trim_matches(['\'', '"']) != name {
-            return None;
-        }
-        if pair.as_rule() == Rule::nested_block {
-            Some(pair)
-        } else {
-            children.next()
-        }
-    }
-
-    fn descend<'a>(pair: Pair<'a, Rule>, steps: &[FieldPathStep]) -> Option<Pair<'a, Rule>> {
-        let Some((step, rest)) = steps.split_first() else {
-            return Some(pair);
-        };
-        let pair = peel(pair)?;
-        match step {
-            FieldPathStep::Index(index) if pair.as_rule() == Rule::list => {
-                descend(pair.into_inner().nth(*index)?, rest)
+            if node.rule == Rule::nested_block {
+                Some(node)
+            } else {
+                node.children.get(1)
             }
-            FieldPathStep::Field(name) => {
-                let mut matches = pair
-                    .into_inner()
-                    .filter_map(|child| named_value(child, name));
-                let first = matches.next()?;
-                if first.as_rule() == Rule::nested_block
-                    && let Some((FieldPathStep::Index(index), rest)) = rest.split_first()
-                {
-                    descend(std::iter::once(first).chain(matches).nth(*index)?, rest)
-                } else {
-                    descend(first, rest)
+        }
+
+        fn descend<'a>(
+            node: &'a SourceSpanNode,
+            steps: &[FieldPathStep],
+        ) -> Option<&'a SourceSpanNode> {
+            let Some((step, rest)) = steps.split_first() else {
+                return Some(node);
+            };
+            let node = peel(node)?;
+            match step {
+                FieldPathStep::Index(index) if node.rule == Rule::list => {
+                    descend(node.children.get(*index)?, rest)
                 }
+                FieldPathStep::Field(name) => {
+                    let mut matches = node
+                        .children
+                        .iter()
+                        .filter_map(|child| named_value(child, name));
+                    let first = matches.next()?;
+                    if first.rule == Rule::nested_block
+                        && let Some((FieldPathStep::Index(index), rest)) = rest.split_first()
+                    {
+                        descend(std::iter::once(first).chain(matches).nth(*index)?, rest)
+                    } else {
+                        descend(first, rest)
+                    }
+                }
+                FieldPathStep::Index(_) => None,
             }
-            FieldPathStep::Index(_) => None,
         }
-    }
 
-    let file = super::preprocess_file(input)?;
-    let mut values = file
-        .parse()?
-        .flatten()
-        .filter(|pair| {
-            matches!(
-                pair.as_rule(),
-                Rule::anonymous_resource | Rule::resource_expr | Rule::read_resource_expr
-            )
-        })
-        .flat_map(|resource| resource.into_inner())
-        .filter_map(|pair| {
-            let span = super::SourceSpan::from_pest(&pair, &file);
-            let line = (span.start_line() - 1) as u32;
+        let mut values = self.resource_members.iter().filter_map(|node| {
+            let line = (node.span.start_line() - 1) as u32;
             if scope.is_some_and(|(start, end)| line < start || line >= end) {
                 return None;
             }
-            named_value(pair, attribute)
+            named_value(node, attribute)
         });
-    let Some(first) = values.next() else {
-        return Ok(None);
-    };
-    let selected = if first.as_rule() == Rule::nested_block
-        && let Some((FieldPathStep::Index(index), rest)) = path.steps().split_first()
-    {
-        std::iter::once(first)
-            .chain(values)
-            .nth(*index)
-            .and_then(|pair| descend(pair, rest))
-    } else {
-        descend(first, path.steps())
-    };
-    Ok(selected.map(|pair| AttributeValueSourceSpans {
-        value: super::SourceSpan::from_pest(&pair, &file),
-        block_header: if pair.as_rule() == Rule::nested_block {
-            pair.into_inner()
-                .next()
-                .map(|name| super::SourceSpan::from_pest(&name, &file))
+        let first = values.next()?;
+        let selected = if first.rule == Rule::nested_block
+            && let Some((FieldPathStep::Index(index), rest)) = path.steps().split_first()
+        {
+            std::iter::once(first)
+                .chain(values)
+                .nth(*index)
+                .and_then(|pair| descend(pair, rest))
         } else {
-            None
-        },
-    }))
+            descend(first, path.steps())
+        };
+        selected.map(|node| AttributeValueSourceSpans {
+            value: node.span,
+            block_header: if node.rule == Rule::nested_block {
+                node.children.first().map(|name| name.span)
+            } else {
+                None
+            },
+        })
+    }
 }
 
 /// Return keyword spans for state blocks parsed as top-level statements.
@@ -431,8 +497,15 @@ pub fn top_level_let_binding_spans(
     input: &str,
 ) -> Result<HashMap<String, LetBindingSourceSpans>, ParseError> {
     let file = super::preprocess_file(input)?;
+    Ok(collect_top_level_let_binding_spans(file.parse()?, &file))
+}
+
+fn collect_top_level_let_binding_spans(
+    pairs: pest::iterators::Pairs<'_, Rule>,
+    file: &super::PreprocessedFile,
+) -> HashMap<String, LetBindingSourceSpans> {
     let mut spans = HashMap::new();
-    for pair in file.parse()? {
+    for pair in pairs {
         if pair.as_rule() != Rule::file {
             continue;
         }
@@ -453,14 +526,14 @@ pub fn top_level_let_binding_spans(
                 spans.insert(
                     name.as_str().to_string(),
                     LetBindingSourceSpans {
-                        statement: super::SourceSpan::from_pest(&binding, &file),
-                        name: super::SourceSpan::from_pest(&name, &file),
+                        statement: super::SourceSpan::from_pest(&binding, file),
+                        name: super::SourceSpan::from_pest(&name, file),
                     },
                 );
             }
         }
     }
-    Ok(spans)
+    spans
 }
 
 /// Return type-name spans for authored top-level anonymous resources.

@@ -975,7 +975,8 @@ async fn wasm_schema_preserves_unique_list_refinement() {
             carina_core::schema::TypeError::DuplicateListElement {
                 index: 1,
                 first_index: 0,
-                ..
+                value: _,
+                attribute: _
             }
         ),
         "{error:?}"

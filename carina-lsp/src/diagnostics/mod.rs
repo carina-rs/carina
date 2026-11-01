@@ -4,6 +4,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,30 @@ use carina_core::resource::{
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
+
+/// One syntax-span parse shared by all checks in an analysis. Delay it until
+/// a check needs a binding or attribute span, including duplicate bindings.
+struct DiagnosticSource<'a> {
+    doc: &'a Document,
+    text: &'a str,
+    spans: OnceCell<carina_core::parser::SourceSpanIndex>,
+}
+
+impl<'a> DiagnosticSource<'a> {
+    fn new(doc: &'a Document, text: &'a str) -> Self {
+        Self {
+            doc,
+            text,
+            spans: OnceCell::new(),
+        }
+    }
+
+    fn spans(&self) -> &carina_core::parser::SourceSpanIndex {
+        self.spans.get_or_init(|| {
+            carina_core::parser::SourceSpanIndex::parse(self.text).unwrap_or_default()
+        })
+    }
+}
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let text = doc.text();
@@ -449,6 +474,7 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
+        let source = DiagnosticSource::new(doc, &text);
         let base_path = current_file_path.map(|path| {
             path.parent()
                 .expect("a current file path must have a parent directory")
@@ -551,7 +577,7 @@ impl DiagnosticEngine {
         }
         if let Some(result) = merged_result.as_ref() {
             diagnostics.extend(self.duplicate_declaration_diagnostics(
-                doc,
+                &source,
                 current_file_name,
                 &result.directory.duplicate_declarations,
             ));
@@ -566,7 +592,7 @@ impl DiagnosticEngine {
                 parsed,
             );
             diagnostics.extend(self.duplicate_declaration_diagnostics(
-                doc,
+                &source,
                 current_file_name,
                 &duplicates,
             ));
@@ -1128,8 +1154,6 @@ impl DiagnosticEngine {
                 .as_ref()
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
             let mut anonymous_resource_lines = HashMap::<(String, String), VecDeque<u32>>::new();
-            let let_binding_spans =
-                carina_core::parser::top_level_let_binding_spans(&doc.text()).unwrap_or_default();
             if let Ok(spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
             {
                 for authored in spans {
@@ -1179,12 +1203,15 @@ impl DiagnosticEngine {
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
                 let authored_binding_scope = match rref {
-                    ResourceRef::Deferred { .. } => None,
+                    ResourceRef::Deferred {
+                        resource: _resource,
+                        deferred: _deferred,
+                    } => None,
                     ResourceRef::Resource(_)
                     | ResourceRef::LiveComposition(_)
                     | ResourceRef::DataSource(_) => rref
                         .binding()
-                        .and_then(|binding| let_binding_spans.get(binding))
+                        .and_then(|binding| source.spans().let_binding_spans().get(binding))
                         .map(|spans| {
                             let span = spans.statement;
                             (
@@ -1199,7 +1226,13 @@ impl DiagnosticEngine {
                             .get_mut(&(provider.to_string(), resource_id.resource_type.clone()))
                             .and_then(VecDeque::pop_front)
                     }
-                    _ => None,
+                    ResourceRef::Resource(_)
+                    | ResourceRef::LiveComposition(_)
+                    | ResourceRef::DataSource(_) => None,
+                    ResourceRef::Deferred {
+                        resource: _resource,
+                        deferred: _deferred,
+                    } => None,
                 };
                 // Source-range hint for attribute position lookups. Without
                 // this, a `for`-body diagnostic like `mode = "aaa"` would
@@ -1782,7 +1815,11 @@ impl DiagnosticEngine {
                             if contains_struct
                                 || (matches!(
                                     effective_type.shape(),
-                                    carina_core::schema::Shape::List { .. }
+                                    carina_core::schema::Shape::List {
+                                        element_type: _,
+                                        ordered: _,
+                                        constraints: _
+                                    }
                                 ) && matches!(
                                     attr_value,
                                     Value::Concrete(
@@ -1792,7 +1829,7 @@ impl DiagnosticEngine {
                             {
                                 let (nested_diagnostics, reported_duplicate) = self
                                     .validate_container_value(
-                                        doc,
+                                        &source,
                                         attr_name,
                                         attr_value,
                                         &effective_type,
@@ -1848,17 +1885,21 @@ impl DiagnosticEngine {
                             let deferred_attribute = error.attribute_name();
                             // Unknown names are invalid even while their values
                             // are deferred; core is their only diagnostic owner.
-                            if !matches!(&error, TypeError::UnknownAttribute { .. })
-                                && deferred_attribute.is_some_and(|attribute| {
-                                    matches!(
-                                        resource_attributes.get(attribute),
-                                        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-                                            | Some(Value::Deferred(
-                                                DeferredValue::BindingRef { .. }
-                                            ))
-                                    )
-                                })
-                            {
+                            if !matches!(
+                                &error,
+                                TypeError::UnknownAttribute {
+                                    name: _,
+                                    suggestion: _
+                                }
+                            ) && deferred_attribute.is_some_and(|attribute| {
+                                matches!(
+                                    resource_attributes.get(attribute),
+                                    Some(Value::Deferred(DeferredValue::ResourceRef { path: _ }))
+                                        | Some(Value::Deferred(DeferredValue::BindingRef {
+                                            binding: _
+                                        }))
+                                )
+                            }) {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
@@ -1912,14 +1953,11 @@ impl DiagnosticEngine {
                             let block_header_range = error
                                 .attribute_name()
                                 .and_then(|attr| {
-                                    carina_core::parser::attribute_value_source_spans(
-                                        &doc.text(),
+                                    source.spans().attribute_value_source_spans(
                                         attr,
                                         &carina_core::schema::FieldPath::new(),
                                         scope,
                                     )
-                                    .ok()
-                                    .flatten()
                                 })
                                 .and_then(|spans| spans.block_header)
                                 .and_then(|span| parser_span_range(doc, span));
@@ -2017,7 +2055,7 @@ impl DiagnosticEngine {
                 .unwrap_or_default(),
                 (None, Some(_)) => Vec::new(),
             };
-            diagnostics.extend(self.unused_binding_diagnostics(doc, unused_binding_names));
+            diagnostics.extend(self.unused_binding_diagnostics(&source, unused_binding_names));
 
             // Surface unused-for-binding warnings (recorded in parsed.warnings by
             // the parser) as LSP diagnostics. Other ParseWarnings (e.g. the
@@ -2562,12 +2600,77 @@ fn build_enum_diagnostic(
 
 fn is_duplicate_list_error(error: &TypeError) -> bool {
     match error {
-        TypeError::DuplicateListElement { .. } => true,
-        TypeError::ListItemError { inner, .. }
-        | TypeError::MapKeyError { inner, .. }
-        | TypeError::MapValueError { inner, .. }
-        | TypeError::StructFieldError { inner, .. } => is_duplicate_list_error(inner),
-        _ => false,
+        TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _,
+        } => true,
+        TypeError::ListItemError { inner, index: _ }
+        | TypeError::MapKeyError { inner, key: _ }
+        | TypeError::MapValueError { inner, key: _ }
+        | TypeError::StructFieldError { inner, field: _ } => is_duplicate_list_error(inner),
+        TypeError::TypeMismatch {
+            expected: _,
+            got: _,
+        }
+        | TypeError::BindingShadowsEnumMember(_)
+        | TypeError::InvalidEnumVariant {
+            value: _,
+            value_kind: _,
+            attribute: _,
+            type_name: _,
+            expected: _,
+        }
+        | TypeError::PatternMismatch {
+            value: _,
+            pattern: _,
+            attribute: _,
+            type_name: _,
+        }
+        | TypeError::LengthOutOfRange {
+            value: _,
+            length: _,
+            min: _,
+            max: _,
+            attribute: _,
+            type_name: _,
+        }
+        | TypeError::StringLiteralExpectedEnum {
+            user_typed: _,
+            attribute: _,
+            type_name: _,
+            expected: _,
+            extra_message: _,
+        }
+        | TypeError::ValidationFailed { message: _ }
+        | TypeError::CustomTypeValidation {
+            error: _,
+            attribute: _,
+        }
+        | TypeError::ResourceValidationFailed {
+            message: _,
+            attribute: _,
+        }
+        | TypeError::MissingRequired { name: _ }
+        | TypeError::FieldGroupViolation { path: _, group: _ }
+        | TypeError::ReadOnlyAttribute { name: _ }
+        | TypeError::UnknownAttribute {
+            name: _,
+            suggestion: _,
+        }
+        | TypeError::UnknownStructField {
+            struct_name: _,
+            field: _,
+            suggestion: _,
+        }
+        | TypeError::UnionStructMismatch {
+            reason: _,
+            supplied_fields: _,
+            alternatives: _,
+        }
+        | TypeError::UnionAlternativesMismatch { failures: _ }
+        | TypeError::BlockSyntaxNotAllowed { attribute: _ } => false,
     }
 }
 

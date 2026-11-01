@@ -32,7 +32,15 @@ type ParserDataSource = crate::resource::DataSource<
 /// Duplicates carry their own index and need no extra list-item wrapper.
 fn assert_duplicate(error: TypeError) -> TypeError {
     assert!(
-        matches!(error, TypeError::DuplicateListElement { .. }),
+        matches!(
+            error,
+            TypeError::DuplicateListElement {
+                value: _,
+                index: _,
+                first_index: _,
+                attribute: _
+            }
+        ),
         "{error:?}"
     );
     error
@@ -78,7 +86,8 @@ fn unique_enum_list_rejects_duplicate_canonical_values() {
                 TypeError::DuplicateListElement {
                     index: 2,
                     first_index: 0,
-                    ..
+                    value: _,
+                    attribute: _
                 }
             ));
             assert!(error.to_string().contains("repo"), "{error}");
@@ -124,7 +133,12 @@ fn unique_list_accepts_distinct_enum_values_and_resolves_aliases() {
         assert!(
             matches!(
                 unique.validate(&duplicate).map_err(assert_duplicate),
-                Err(TypeError::DuplicateListElement { .. })
+                Err(TypeError::DuplicateListElement {
+                    value: _,
+                    index: _,
+                    first_index: _,
+                    attribute: _
+                })
             ),
             "alias {alias}: {:?}",
             unique.validate(&duplicate)
@@ -170,7 +184,8 @@ fn unique_lists_validate_strings_ints_and_legacy_string_lists() {
                 Err(TypeError::DuplicateListElement {
                     index: 2,
                     first_index: 0,
-                    ..
+                    value: _,
+                    attribute: _
                 })
             ));
             assert_eq!(Schema::flat(list).validate_collect(&duplicate).len(), 1);
@@ -182,7 +197,12 @@ fn unique_lists_validate_strings_ints_and_legacy_string_lists() {
         ]));
         assert!(matches!(
             list.validate(&duplicate).map_err(assert_duplicate),
-            Err(TypeError::DuplicateListElement { .. })
+            Err(TypeError::DuplicateListElement {
+                value: _,
+                index: _,
+                first_index: _,
+                attribute: _
+            })
         ));
         assert_eq!(Schema::flat(list).validate_collect(&duplicate).len(), 1);
     }
@@ -224,7 +244,8 @@ fn unique_lists_skip_unresolved_elements_but_check_known_elements() {
             Err(TypeError::DuplicateListElement {
                 index: 3,
                 first_index: 1,
-                ..
+                value: _,
+                attribute: _
             })
         ));
     }
@@ -246,7 +267,12 @@ fn unique_list_collector_reports_all_duplicates_and_item_errors() {
             .iter()
             .filter(|(_, error)| matches!(
                 error,
-                TypeError::DuplicateListElement { first_index: 0, .. }
+                TypeError::DuplicateListElement {
+                    first_index: 0,
+                    value: _,
+                    index: _,
+                    attribute: _
+                }
             ))
             .count(),
         2
@@ -272,7 +298,12 @@ fn unique_enum_list_read_side_fits_and_canonicalizes_duplicate_api_spellings() {
     ]));
     assert!(matches!(
         list.validate(&authored).map_err(assert_duplicate),
-        Err(TypeError::DuplicateListElement { .. })
+        Err(TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _
+        })
     ));
     for state in [
         Value::Concrete(ConcreteValue::List(vec![
@@ -358,7 +389,12 @@ fn unique_lists_compare_nested_canonical_values_and_skip_partial_objects() {
     ]));
     assert!(matches!(
         schema.validate(&duplicate).map_err(assert_duplicate),
-        Err(TypeError::DuplicateListElement { .. })
+        Err(TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _
+        })
     ));
     assert_eq!(schema.validate_collect(&duplicate).len(), 1);
     let mut partial = object("allow");
@@ -488,7 +524,14 @@ fn unique_list_constraints_collect_length_and_element_errors_together() {
     ] {
         assert!(matches!(
             list.validate(&value),
-            Err(TypeError::LengthOutOfRange { .. })
+            Err(TypeError::LengthOutOfRange {
+                value: _,
+                length: _,
+                min: _,
+                max: _,
+                attribute: _,
+                type_name: _
+            })
         ));
         assert!(
             fit_value_to_type_on_path(
@@ -505,7 +548,17 @@ fn unique_list_constraints_collect_length_and_element_errors_together() {
         assert_eq!(
             errors
                 .iter()
-                .filter(|(_, error)| matches!(error, TypeError::LengthOutOfRange { .. }))
+                .filter(|(_, error)| matches!(
+                    error,
+                    TypeError::LengthOutOfRange {
+                        value: _,
+                        length: _,
+                        min: _,
+                        max: _,
+                        attribute: _,
+                        type_name: _
+                    }
+                ))
                 .count(),
             1,
             "{errors:?}"
@@ -513,7 +566,15 @@ fn unique_list_constraints_collect_length_and_element_errors_together() {
         assert_eq!(
             errors
                 .iter()
-                .filter(|(_, error)| matches!(error, TypeError::DuplicateListElement { .. }))
+                .filter(|(_, error)| matches!(
+                    error,
+                    TypeError::DuplicateListElement {
+                        value: _,
+                        index: _,
+                        first_index: _,
+                        attribute: _
+                    }
+                ))
                 .count(),
             2,
             "{errors:?}"
@@ -611,7 +672,7 @@ fn unique_list_three_plain_occurrences_keep_the_first_index() {
     for ((path, error), index) in errors.iter().zip([1, 2]) {
         assert_eq!(path.steps(), &[FieldPathStep::Index(index)]);
         assert!(
-            matches!(error, TypeError::DuplicateListElement { first_index: 0, index: found, .. } if *found == index)
+            matches!(error, TypeError::DuplicateListElement { first_index: 0, index: found, value: _, attribute: _ } if *found == index)
         );
     }
 }
@@ -622,7 +683,13 @@ fn unique_list_first_error_keeps_the_collected_item_path() {
     let value = Value::Concrete(ConcreteValue::List(vec![string_value("x"); 2]));
     let collected = schema.validate_collect(&value);
     let error = schema.validate(&value).unwrap_err();
-    let TypeError::DuplicateListElement { index, .. } = &error else {
+    let TypeError::DuplicateListElement {
+        index,
+        value: _,
+        first_index: _,
+        attribute: _,
+    } = &error
+    else {
         panic!("expected an unwrapped duplicate: {error:?}");
     };
     assert_eq!(collected[0].0.steps(), &[FieldPathStep::Index(*index)]);
@@ -651,7 +718,12 @@ fn unique_list_nested_duplicate_only_wraps_the_outer_index() {
     };
     assert!(matches!(
         *inner,
-        TypeError::DuplicateListElement { index: 1, .. }
+        TypeError::DuplicateListElement {
+            index: 1,
+            value: _,
+            first_index: _,
+            attribute: _
+        }
     ));
     assert_eq!(
         collected[0].0.steps(),
@@ -4526,11 +4598,73 @@ fn round7_unknown_attribute_suggests_existing_id_attribute() {
             if name == "vpc" && suggestion.as_deref() == Some("vpc_id")),
         "{errors:#?}"
     );
-    assert_eq!(
-        suggest_similar_name("vpc", &["vpc_id"]),
-        Some("vpc_id".into())
-    );
+    assert_eq!(suggest_similar_name("vpc", &["vpc_id"]), None);
     assert_eq!(suggest_similar_name("vpc", &["subnet_id"]), None);
+}
+
+#[test]
+fn round8_unknown_attribute_prefers_existing_id_over_closer_name() {
+    for (unknown, known, expected) in [
+        ("vpc", vec!["vpc_id", "vpn"], "vpc_id"),
+        ("ip", vec!["ip_id"], "ip_id"),
+        ("vpc", vec!["vpn"], "vpn"),
+    ] {
+        let schema = known
+            .into_iter()
+            .fold(ResourceSchema::new("test.Subnet"), |schema, name| {
+                schema.attribute(AttributeSchema::optional(name, AttributeType::string()).build())
+            })
+            .validate()
+            .unwrap();
+        let attrs = HashMap::from([(
+            unknown.to_string(),
+            Value::Concrete(ConcreteValue::String("id-123".into())),
+        )]);
+        let errors = schema.validate(&attrs).unwrap_err();
+        assert!(
+            matches!(&errors[..], [TypeError::UnknownAttribute { name, suggestion }]
+                if name == unknown && suggestion.as_deref() == Some(expected)),
+            "{errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn round8_struct_field_and_binding_suggestions_do_not_invent_id_suffix() {
+    let ty = AttributeType::struct_(
+        "Rule",
+        vec![StructField::optional("ip_id", AttributeType::string()).build()],
+    );
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "ip".to_string(),
+        Value::Concrete(ConcreteValue::String("id-123".into())),
+    )])));
+    let error = ty.validate(&value).unwrap_err();
+    assert!(
+        matches!(&error, TypeError::UnknownStructField { struct_name, field, suggestion }
+            if struct_name == "Rule" && field == "ip" && suggestion.is_none()),
+        "{error:#?}"
+    );
+    assert_eq!(suggest_similar_name("ip", &["ip_id"]), None);
+    let binding_error = crate::parser::ParseError::undefined_identifier(
+        "ip".to_string(),
+        1,
+        vec!["ip_id".to_string()],
+    );
+    match binding_error {
+        crate::parser::ParseError::UndefinedIdentifier {
+            name,
+            line: _,
+            span: _,
+            suggestion,
+            in_scope,
+        } => {
+            assert_eq!(name, "ip");
+            assert_eq!(suggestion, None);
+            assert_eq!(in_scope, ["ip_id"]);
+        }
+        error => panic!("expected an undefined binding: {error:?}"),
+    }
 }
 
 #[test]

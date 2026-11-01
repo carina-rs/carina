@@ -16,7 +16,9 @@ use carina_core::schema::{
     EffectiveType, FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema,
 };
 
-use super::{DiagnosticEngine, build_schema_diagnostic_from_error, carina_diagnostic};
+use super::{
+    DiagnosticEngine, DiagnosticSource, build_schema_diagnostic_from_error, carina_diagnostic,
+};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -33,13 +35,14 @@ impl DiagnosticEngine {
     /// a duplicate diagnostic was emitted, for whole-resource deduplication.
     pub(super) fn validate_container_value(
         &self,
-        doc: &Document,
+        source: &DiagnosticSource<'_>,
         attr_name: &str,
         value: &Value,
         effective_type: &EffectiveType<'_>,
         value_range: Option<Range>,
         scope: Option<(u32, u32)>,
     ) -> (Vec<Diagnostic>, bool) {
+        let doc = source.doc;
         let errors = effective_type.validate_collect(value);
         let mut diagnostics = Vec::new();
         let mut reported_duplicate = false;
@@ -47,7 +50,7 @@ impl DiagnosticEngine {
             let is_duplicate = super::is_duplicate_list_error(&err);
             let ends_in_index = matches!(path.steps().last(), Some(FieldPathStep::Index(_)));
             let element_range = if is_duplicate || ends_in_index {
-                self.value_range_for_path(doc, attr_name, &path, scope, is_duplicate)
+                self.value_range_for_path(source, attr_name, &path, scope, is_duplicate)
             } else {
                 None
             };
@@ -75,19 +78,19 @@ impl DiagnosticEngine {
                     .steps()
                     .iter()
                     .any(|step| matches!(step, FieldPathStep::Index(_)));
-                // Computed lists have no authored element span. Preserve the
-                // collected path so separate item errors remain distinguishable.
+                // Preserve the full leaf path for struct item errors and for
+                // computed lists, which have no authored element span.
                 // Duplicate and field-group messages already carry their paths.
-                let attribute = if ends_in_index
-                    && element_range.is_none()
+                let attribute = if is_item_error
                     && !is_duplicate
-                    && !matches!(&err, TypeError::FieldGroupViolation { .. })
+                    && !matches!(&err, TypeError::FieldGroupViolation { path: _, group: _ })
                 {
                     format!("{attr_name}{path}")
                 } else {
                     attr_name.to_string()
                 };
-                let err = if is_item_error || matches!(&err, TypeError::FieldGroupViolation { .. })
+                let err = if is_item_error
+                    || matches!(&err, TypeError::FieldGroupViolation { path: _, group: _ })
                 {
                     err.with_attribute(&attribute)
                 } else {
@@ -110,15 +113,15 @@ impl DiagnosticEngine {
 
     fn value_range_for_path(
         &self,
-        doc: &Document,
+        source: &DiagnosticSource<'_>,
         attr_name: &str,
         path: &FieldPath,
         scope: Option<(u32, u32)>,
         is_duplicate: bool,
     ) -> Option<Range> {
-        let spans =
-            carina_core::parser::attribute_value_source_spans(&doc.text(), attr_name, path, scope)
-                .ok()??;
+        let spans = source
+            .spans()
+            .attribute_value_source_spans(attr_name, path, scope)?;
         let span = if is_duplicate {
             spans.value
         } else {
@@ -410,9 +413,14 @@ impl DiagnosticEngine {
 
 fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
     match error {
-        TypeError::ReadOnlyAttribute { .. }
-        | TypeError::FieldGroupViolation { .. }
-        | TypeError::DuplicateListElement { .. } => DiagnosticSeverity::ERROR,
+        TypeError::ReadOnlyAttribute { name: _ }
+        | TypeError::FieldGroupViolation { path: _, group: _ }
+        | TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _,
+        } => DiagnosticSeverity::ERROR,
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }
         | TypeError::MapValueError { inner, .. }
