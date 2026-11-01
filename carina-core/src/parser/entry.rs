@@ -34,7 +34,7 @@ use crate::eval_value::{
 use crate::parser::{
     ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
 };
-use crate::resource::{LegacyLoopAddress, LoopKind};
+use crate::resource::{LegacyLoopAddress, LoopKind, RelativeBindingName};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -821,7 +821,11 @@ fn parse_with_seeded_bindings_inner(
                                 };
                                 let fn_name = user_fn.name.clone();
                                 // Check for shadowing builtins
-                                if crate::builtins::evaluate_builtin(&fn_name, &[]).is_ok()
+                                if crate::builtins::evaluate_builtin::<RelativeBindingName>(
+                                    &fn_name,
+                                    &[],
+                                )
+                                .is_ok()
                                     || crate::builtins::builtin_functions()
                                         .iter()
                                         .any(|f| f.name == fn_name)
@@ -940,7 +944,10 @@ fn parse_with_seeded_bindings_inner(
                                 if !expanded_module_calls.is_empty() {
                                     for mut call in expanded_module_calls {
                                         if call.binding_name.is_none() {
-                                            call.binding_name = Some(name.clone());
+                                            call.binding_name =
+                                                Some(crate::resource::RelativeBindingName::new(
+                                                    name.clone(),
+                                                ));
                                         }
                                         module_calls.push(call);
                                     }
@@ -1128,7 +1135,11 @@ fn parse_with_seeded_bindings_inner(
     parsed.upstream_states = upstream_states;
     parsed.wait_bindings = wait_bindings;
     parsed.requires = requires;
-    parsed.structural_bindings = ctx.structural_bindings;
+    parsed.structural_bindings = ctx
+        .structural_bindings
+        .into_iter()
+        .map(crate::resource::RelativeBindingName::new)
+        .collect();
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = warnings;
     *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;

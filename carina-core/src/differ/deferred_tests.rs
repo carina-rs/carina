@@ -1,5 +1,6 @@
 use super::*;
 use crate::parser::parse;
+use crate::resource::absolute_binding_address_for_test as absolute_binding;
 
 fn test_identity(value: &str) -> ResourceIdentity {
     ResourceIdentity::new(value)
@@ -11,15 +12,15 @@ fn fixture_applied_identifier(value: impl Into<String>) -> crate::provider::Appl
 fn deferred_replace_test_template() -> crate::parser::DeferredForExpression {
     let template_resource =
         Resource::with_provider("aws", "route53.Record", "validation_records", None)
-            .with_binding("validation_records");
+            .with_absolute_binding(absolute_binding("validation_records"));
 
     crate::parser::DeferredForExpression::new(
         Some("main.crn".to_string()),
         12,
         "for opt in cert.domain_validation_options".to_string(),
-        crate::parser::DeferredForTarget::bound("validation_records")
+        crate::parser::DeferredForTarget::bound(absolute_binding("validation_records"))
             .expect("fixture binding is valid"),
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
         crate::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
     )
@@ -40,8 +41,8 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
         identifier: fixture_applied_identifier(format!("{binding}-old-id")),
         generation: crate::effect::EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some(binding.to_string()),
-        dependencies: std::collections::HashSet::from(["cert".to_string()]),
+        binding: Some(absolute_binding(binding)),
+        dependencies: std::collections::HashSet::from([absolute_binding("cert")]),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: std::collections::HashSet::new(),
     }
@@ -80,7 +81,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
     assert_eq!(id, target.deferred_effect_id());
     assert_eq!(
         template.root_bindings(),
-        std::collections::BTreeSet::from(["cert".to_string()])
+        std::collections::BTreeSet::from([absolute_binding("cert")])
     );
     assert_eq!(
         template.target().bound_binding(),
@@ -91,7 +92,10 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
         deletes[0].id,
         ResourceId::with_provider_identity("aws", "route53.Record", "validation_records[0]", None)
     );
-    assert_eq!(deletes[0].binding.as_deref(), Some("validation_records[0]"));
+    assert_eq!(
+        deletes[0].binding.as_ref().map(|binding| binding.as_str()),
+        Some("validation_records[0]")
+    );
 
     assert!(
         !plan.effects().iter().any(|effect| {
@@ -100,7 +104,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
                 Effect::Delete {
                     binding: Some(binding),
                     ..
-                } if binding == "validation_records[0]"
+                } if binding.as_str() == "validation_records[0]"
             )
         }),
         "absorbed delete must not remain as a standalone Delete"
@@ -144,7 +148,7 @@ fn delete_effect_for_unbound_child(
         identifier: fixture_applied_identifier("old-child"),
         generation: crate::effect::EffectGeneration::Current,
         directives: Directives::default(),
-        binding: binding.map(str::to_string),
+        binding: binding.map(absolute_binding),
         dependencies: std::collections::HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: std::collections::HashSet::new(),
@@ -180,7 +184,10 @@ fn unbound_deferred_create_absorbs_exact_legacy_current_delete() {
     assert_eq!(payload.deletes.len(), 1);
     assert_eq!(payload.deletes[0].id, legacy_id);
     assert_eq!(
-        payload.deletes[0].binding.as_deref(),
+        payload.deletes[0]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
         Some("_accounts.alpha")
     );
     assert!(
@@ -324,7 +331,7 @@ fn deferred_create_targets_do_not_absorb_deposed_deletes() {
                     binding: Some(binding),
                     generation: crate::effect::EffectGeneration::Deposed(key),
                     ..
-                } if binding == "validation_records[0]" && key == &deposed_key
+                } if binding.as_str() == "validation_records[0]" && key == &deposed_key
             )
         }),
         "deposed delete must remain top-level so remove-deposed writeback can observe it"
@@ -361,7 +368,7 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
                 Effect::Delete {
                     binding: Some(binding),
                     ..
-                } if binding == "some_other_resource[0]"
+                } if binding.as_str() == "some_other_resource[0]"
             )
         }),
         "unrelated orphan delete must stay a plain Delete"

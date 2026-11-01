@@ -1,0 +1,12 @@
+arguments {
+  label:    String
+  upstream: mock.test.resource
+}
+
+let leaf = mock.test.resource {
+  name = "${label}-nested"
+
+  directives {
+    depends_on = [upstream]
+  }
+}

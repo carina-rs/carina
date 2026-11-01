@@ -9,6 +9,10 @@ use tempfile::TempDir;
 
 const UPDATE_DELAY_MS: &str = "200";
 
+fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
 struct Scenario {
     _tmp: TempDir,
     project: PathBuf,
@@ -70,7 +74,7 @@ let distribution = mock.test.resource {{
                 .with_attribute("name", serde_json::json!("web-acl-old"))
                 .with_attribute("identifier", serde_json::json!("web-acl-old-id"))
                 .with_attribute("comment", serde_json::json!("v1"));
-        web_acl.binding = Some("web_acl".to_string());
+        web_acl.binding = Some(absolute_binding("web_acl"));
         state
             .upsert_resource(web_acl)
             .expect("test state setup must be valid");
@@ -82,10 +86,10 @@ let distribution = mock.test.resource {{
                 .with_attribute("identifier", serde_json::json!("dist-id"))
                 .with_attribute("comment", serde_json::json!("dist-v1"))
                 .with_attribute("web_acl_arn", serde_json::json!("web-acl-old-id"));
-        distribution.binding = Some("distribution".to_string());
+        distribution.binding = Some(absolute_binding("distribution"));
         distribution
             .dependency_bindings
-            .insert("web_acl".to_string());
+            .insert(absolute_binding("web_acl"));
         state
             .upsert_resource(distribution)
             .expect("test state setup must be valid");

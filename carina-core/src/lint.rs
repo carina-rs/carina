@@ -11,7 +11,7 @@ use pest::Span;
 use pest::iterators::Pair;
 
 use crate::parser::{PreprocessedFile, Rule, extract_key_string, preprocess_file};
-use crate::schema::ResourceSchema;
+use crate::schema::CompiledResourceSchema as ResourceSchema;
 
 /// Find list literal syntax (`attr = [...]`) for the given attribute names.
 /// Returns attribute name and 1-indexed line number for each occurrence.
@@ -405,13 +405,14 @@ pub fn collect_tag_keys_for_file(source: &str, file: &Path) -> Vec<TagKeyEntry> 
 /// symlink aliases, repeated imports, and multiple aliases to one module. When
 /// canonicalization fails, the original path is the identity, matching the
 /// module walk's cycle-guard convention.
-pub fn collect_all_tag_keys<E, D, S: AsRef<str>>(
+pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddress>(
     root_inputs: &[(PathBuf, S)],
     parsed: &crate::parser::File<
         E,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
+        B,
     >,
     base_dir: &Path,
 ) -> Vec<TagKeyEntry> {
@@ -681,7 +682,9 @@ fn fixed_keyword<'i>(pair: Pair<'i, Rule>) -> Option<(String, Span<'i>)> {
 mod tests {
     use super::*;
     use crate::parser::{ModuleCall, ParsedFile, UseStatement};
-    use crate::schema::{AttributeType, StructField};
+    use crate::schema::{
+        CompiledAttributeType as AttributeType, CompiledStructField as StructField,
+    };
 
     const NOT_COMPARED: &[(Rule, &str)] = &[
         (
@@ -1429,7 +1432,7 @@ let ready = wait source {
     fn test_list_struct_attr_names() {
         let schema = ResourceSchema::new("ec2.SecurityGroup")
             .attribute(
-                crate::schema::AttributeSchema::optional(
+                crate::schema::CompiledAttributeSchema::optional(
                     "security_group_ingress",
                     AttributeType::list(AttributeType::struct_(
                         "Ingress".to_string(),
@@ -1439,14 +1442,14 @@ let ready = wait source {
                 .build(),
             )
             .attribute(
-                crate::schema::AttributeSchema::optional(
+                crate::schema::CompiledAttributeSchema::optional(
                     "tags",
                     AttributeType::list(AttributeType::string()),
                 )
                 .build(),
             )
             .attribute(
-                crate::schema::AttributeSchema::optional(
+                crate::schema::CompiledAttributeSchema::optional(
                     "group_description",
                     AttributeType::string(),
                 )
@@ -1943,7 +1946,7 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("net", "./modules/network")], vec!["net"]);
 
-        let results = collect_all_tag_keys::<_, _, String>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, String, _>(&[], &parsed, temp.path());
         assert!(
             results.iter().any(|entry| entry.key == "Name"),
             "tag key 'Name' must be collected from the module's main.crn; got {:?}",
@@ -1964,7 +1967,7 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("unused", "./unused")], vec![]);
 
-        let results = collect_all_tag_keys::<_, _, String>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, String, _>(&[], &parsed, temp.path());
         assert!(
             results.is_empty(),
             "tag keys from uncalled imports must not be collected; got {:?}",
@@ -1977,7 +1980,7 @@ tags = {
         let temp = tempfile::tempdir().unwrap();
         let parsed = parsed_with_uses(vec![("missing", "./does-not-exist")], vec!["missing"]);
 
-        let results = collect_all_tag_keys::<_, _, String>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, String, _>(&[], &parsed, temp.path());
 
         assert!(results.is_empty());
     }
@@ -2003,7 +2006,7 @@ tags = {
             vec!["real", "alias"],
         );
 
-        let results = collect_all_tag_keys::<_, _, String>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, String, _>(&[], &parsed, temp.path());
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "Name");

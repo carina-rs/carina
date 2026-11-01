@@ -8,9 +8,9 @@ use crate::parser::{
     ArgumentParameter, CompareOp, ModuleCallId, RequireBlock, ValidateExpr, display_string_literal,
 };
 use crate::resource::{
-    AccessMissPolicy, ConcreteValue, DeferredValue, LiveComposition, ModuleConstraintId,
-    NoPlaceholder, PendingModuleConstraint, PlaceholderKind, ResourceId, Value,
-    apply_value_path_segment,
+    AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue, DeferredValue,
+    LiveComposition, ModuleConstraintId, NoPlaceholder, PendingModuleConstraint, PlaceholderKind,
+    ResourceId, Value, apply_value_path_segment,
 };
 
 use super::ModuleError;
@@ -169,18 +169,22 @@ pub enum ModuleConstraintKind {
 /// and apply re-evaluate the subset that was pending during expansion and was
 /// retained on the composition. Both paths enter the same evaluator.
 #[derive(Clone, Copy)]
-pub enum ModuleConstraints<'a, P: PlaceholderKind = NoPlaceholder> {
+pub enum ModuleConstraints<
+    'a,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     Declarations {
-        arguments: &'a [ArgumentParameter<crate::parser::TypeExpr, P>],
-        requires: &'a [RequireBlock<P>],
+        arguments: &'a [ArgumentParameter<crate::parser::TypeExpr, P, B>],
+        requires: &'a [RequireBlock<P, B>],
     },
-    Pending(&'a [PendingModuleConstraint<P>]),
+    Pending(&'a [PendingModuleConstraint<P, B>]),
 }
 
-impl<'a, P: PlaceholderKind> ModuleConstraints<'a, P> {
+impl<'a, P: PlaceholderKind, B: BindingAddress> ModuleConstraints<'a, P, B> {
     pub fn declarations(
-        arguments: &'a [ArgumentParameter<crate::parser::TypeExpr, P>],
-        requires: &'a [RequireBlock<P>],
+        arguments: &'a [ArgumentParameter<crate::parser::TypeExpr, P, B>],
+        requires: &'a [RequireBlock<P, B>],
     ) -> Self {
         Self::Declarations {
             arguments,
@@ -188,7 +192,7 @@ impl<'a, P: PlaceholderKind> ModuleConstraints<'a, P> {
         }
     }
 
-    pub fn pending(constraints: &'a [PendingModuleConstraint<P>]) -> Self {
+    pub fn pending(constraints: &'a [PendingModuleConstraint<P, B>]) -> Self {
         Self::Pending(constraints)
     }
 }
@@ -196,16 +200,19 @@ impl<'a, P: PlaceholderKind> ModuleConstraints<'a, P> {
 /// One authored module constraint together with its evaluation at the current
 /// resolution boundary.
 #[derive(Debug, Clone, PartialEq)]
-pub struct EvaluatedModuleConstraint<P: PlaceholderKind = NoPlaceholder> {
-    constraint: PendingModuleConstraint<P>,
+pub struct EvaluatedModuleConstraint<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    constraint: PendingModuleConstraint<P, B>,
     kind: ModuleConstraintKind,
     arguments: Vec<String>,
     actuals: Vec<(String, String)>,
     evaluation: ConstraintEvaluation,
 }
 
-impl<P: PlaceholderKind> EvaluatedModuleConstraint<P> {
-    pub fn constraint(&self) -> &PendingModuleConstraint<P> {
+impl<P: PlaceholderKind, B: BindingAddress> EvaluatedModuleConstraint<P, B> {
+    pub fn constraint(&self) -> &PendingModuleConstraint<P, B> {
         &self.constraint
     }
 
@@ -225,7 +232,7 @@ impl<P: PlaceholderKind> EvaluatedModuleConstraint<P> {
         &self.evaluation
     }
 
-    pub fn into_constraint(self) -> PendingModuleConstraint<P> {
+    pub fn into_constraint(self) -> PendingModuleConstraint<P, B> {
         self.constraint
     }
 
@@ -283,10 +290,10 @@ impl<P: PlaceholderKind> EvaluatedModuleConstraint<P> {
 /// Collect and evaluate every module constraint using the language's single
 /// scoping rule: an argument-local `validation` sees only its own argument;
 /// a module-level `require` sees every argument.
-pub fn evaluate_module_constraints<P: PlaceholderKind>(
-    constraints: ModuleConstraints<'_, P>,
-    argument_values: &HashMap<String, Value<P>>,
-) -> Vec<EvaluatedModuleConstraint<P>> {
+pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
+    constraints: ModuleConstraints<'_, P, B>,
+    argument_values: &HashMap<String, Value<P, B>>,
+) -> Vec<EvaluatedModuleConstraint<P, B>> {
     let definitions = match constraints {
         ModuleConstraints::Declarations {
             arguments,
@@ -419,9 +426,9 @@ pub fn evaluate_module_constraints<P: PlaceholderKind>(
 /// expression branch may accidentally turn an unresolved value into an
 /// evaluation error. Concrete collections are ordinary expression values, so
 /// functions such as `length()` do not need a variable-only escape hatch.
-pub fn evaluate_constraint<P: PlaceholderKind>(
-    expr: &ValidateExpr<P>,
-    arguments: &HashMap<String, Value<P>>,
+pub fn evaluate_constraint<P: PlaceholderKind, B: BindingAddress>(
+    expr: &ValidateExpr<P, B>,
+    arguments: &HashMap<String, Value<P, B>>,
     message: impl Into<String>,
 ) -> ConstraintEvaluation {
     match evaluate_constraint_inner(expr, arguments, message.into()) {
@@ -430,9 +437,9 @@ pub fn evaluate_constraint<P: PlaceholderKind>(
     }
 }
 
-fn evaluate_constraint_inner<P: PlaceholderKind>(
-    expr: &ValidateExpr<P>,
-    arguments: &HashMap<String, Value<P>>,
+fn evaluate_constraint_inner<P: PlaceholderKind, B: BindingAddress>(
+    expr: &ValidateExpr<P, B>,
+    arguments: &HashMap<String, Value<P, B>>,
     message: String,
 ) -> Result<ConstraintEvaluation, String> {
     let referenced = referenced_constraint_arguments(expr);
@@ -460,8 +467,13 @@ fn evaluate_constraint_inner<P: PlaceholderKind>(
 }
 
 /// Return the variables referenced by an expression in stable name order.
-pub fn referenced_constraint_arguments<P: PlaceholderKind>(expr: &ValidateExpr<P>) -> Vec<String> {
-    fn collect<P: PlaceholderKind>(expr: &ValidateExpr<P>, names: &mut BTreeSet<String>) {
+pub fn referenced_constraint_arguments<P: PlaceholderKind, B: BindingAddress>(
+    expr: &ValidateExpr<P, B>,
+) -> Vec<String> {
+    fn collect<P: PlaceholderKind, B: BindingAddress>(
+        expr: &ValidateExpr<P, B>,
+        names: &mut BTreeSet<String>,
+    ) {
         match expr {
             ValidateExpr::Var(name) => {
                 names.insert(name.clone());
@@ -750,9 +762,9 @@ fn raw_constraint_arguments(expression: &ValidateExpr) -> BTreeSet<String> {
     out
 }
 
-fn constraint_actuals<P: PlaceholderKind>(
+fn constraint_actuals<P: PlaceholderKind, B: BindingAddress>(
     arguments: &[String],
-    values: &HashMap<String, Value<P>>,
+    values: &HashMap<String, Value<P, B>>,
 ) -> Vec<(String, String)> {
     arguments
         .iter()
@@ -766,13 +778,13 @@ fn constraint_actuals<P: PlaceholderKind>(
         .collect()
 }
 
-fn constraint_actuals_for_expression<P: PlaceholderKind>(
-    expression: &ValidateExpr<P>,
+fn constraint_actuals_for_expression<P: PlaceholderKind, B: BindingAddress>(
+    expression: &ValidateExpr<P, B>,
     arguments: &[String],
-    values: &HashMap<String, Value<P>>,
+    values: &HashMap<String, Value<P, B>>,
 ) -> Vec<(String, String)> {
-    fn collect<P: PlaceholderKind>(
-        expression: &ValidateExpr<P>,
+    fn collect<P: PlaceholderKind, B: BindingAddress>(
+        expression: &ValidateExpr<P, B>,
         actuals: &mut std::collections::BTreeMap<String, String>,
     ) {
         match expression {
@@ -821,7 +833,7 @@ fn constraint_actuals_for_expression<P: PlaceholderKind>(
     }
 }
 
-fn format_constraint_actual<P: PlaceholderKind>(value: &Value<P>) -> String {
+fn format_constraint_actual<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => value
             .diagnostic_literal()
@@ -863,7 +875,7 @@ fn format_constraint_actual<P: PlaceholderKind>(value: &Value<P>) -> String {
     }
 }
 
-fn is_recursively_concrete<P: PlaceholderKind>(value: &Value<P>) -> bool {
+fn is_recursively_concrete<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
     match value {
         Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_recursively_concrete),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_recursively_concrete),
@@ -874,12 +886,12 @@ fn is_recursively_concrete<P: PlaceholderKind>(value: &Value<P>) -> bool {
 }
 
 #[derive(Clone)]
-enum EvalValue<P: PlaceholderKind = NoPlaceholder> {
-    Value(Value<P>),
+enum EvalValue<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
+    Value(Value<P, B>),
     Null,
 }
 
-impl<P: PlaceholderKind> EvalValue<P> {
+impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
     fn kind_name(&self) -> &'static str {
         match self {
             Self::Null => "null",
@@ -928,10 +940,10 @@ impl<P: PlaceholderKind> EvalValue<P> {
     }
 }
 
-fn eval_expr<P: PlaceholderKind>(
-    expr: &ValidateExpr<P>,
-    arguments: &HashMap<String, Value<P>>,
-) -> Result<EvalValue<P>, String> {
+fn eval_expr<P: PlaceholderKind, B: BindingAddress>(
+    expr: &ValidateExpr<P, B>,
+    arguments: &HashMap<String, Value<P, B>>,
+) -> Result<EvalValue<P, B>, String> {
     match expr {
         ValidateExpr::Bool(value) => Ok(value_from(ConcreteValue::Bool(*value))),
         ValidateExpr::Int(value) => Ok(value_from(ConcreteValue::Int(*value))),
@@ -1006,10 +1018,10 @@ fn eval_expr<P: PlaceholderKind>(
     }
 }
 
-fn apply_constraint_path<P: PlaceholderKind>(
-    mut value: Value<P>,
+fn apply_constraint_path<P: PlaceholderKind, B: BindingAddress>(
+    mut value: Value<P, B>,
     path: &[crate::resource::PathSegment],
-) -> Result<Value<P>, String> {
+) -> Result<Value<P, B>, String> {
     for step in path {
         value = apply_value_path_segment(value, step.clone(), 0, AccessMissPolicy::Error)
             .and_then(crate::resource::ValuePathSegmentResult::into_value)
@@ -1018,9 +1030,9 @@ fn apply_constraint_path<P: PlaceholderKind>(
     Ok(value)
 }
 
-fn constraint_inputs_are_concrete<P: PlaceholderKind>(
-    expr: &ValidateExpr<P>,
-    arguments: &HashMap<String, Value<P>>,
+fn constraint_inputs_are_concrete<P: PlaceholderKind, B: BindingAddress>(
+    expr: &ValidateExpr<P, B>,
+    arguments: &HashMap<String, Value<P, B>>,
 ) -> Result<bool, String> {
     match expr {
         ValidateExpr::Var(name) => arguments
@@ -1058,21 +1070,25 @@ fn constraint_inputs_are_concrete<P: PlaceholderKind>(
     }
 }
 
-fn value_from<P: PlaceholderKind>(value: ConcreteValue<P>) -> EvalValue<P> {
+fn value_from<P: PlaceholderKind, B: BindingAddress>(
+    value: ConcreteValue<P, B>,
+) -> EvalValue<P, B> {
     EvalValue::Value(Value::Concrete(value))
 }
 
-fn value_for_evaluation<P: PlaceholderKind>(value: &Value<P>) -> EvalValue<P> {
+fn value_for_evaluation<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> EvalValue<P, B> {
     match value {
         Value::Deferred(DeferredValue::Secret(inner)) => value_for_evaluation(inner),
         other => EvalValue::Value(other.clone()),
     }
 }
 
-fn compare_values<P: PlaceholderKind>(
-    left: &EvalValue<P>,
+fn compare_values<P: PlaceholderKind, B: BindingAddress>(
+    left: &EvalValue<P, B>,
     op: &CompareOp,
-    right: &EvalValue<P>,
+    right: &EvalValue<P, B>,
 ) -> Result<bool, String> {
     match (left, right) {
         (EvalValue::Null, EvalValue::Null) => return Ok(matches!(op, CompareOp::Eq)),
@@ -1157,11 +1173,11 @@ fn compare_equality<T: PartialEq>(
     }
 }
 
-fn eval_function<P: PlaceholderKind>(
+fn eval_function<P: PlaceholderKind, B: BindingAddress>(
     name: &str,
-    args: &[ValidateExpr<P>],
-    arguments: &HashMap<String, Value<P>>,
-) -> Result<EvalValue<P>, String> {
+    args: &[ValidateExpr<P, B>],
+    arguments: &HashMap<String, Value<P, B>>,
+) -> Result<EvalValue<P, B>, String> {
     match name {
         "len" | "length" => {
             if args.len() != 1 {
@@ -1273,7 +1289,7 @@ mod tests {
                 &divide,
                 &HashMap::from([(
                     "divisor".to_string(),
-                    Value::resource_ref("producer", "divisor", Vec::new()),
+                    Value::root_resource_ref("producer", "divisor", Vec::new()),
                 )]),
                 "positive",
             ),
@@ -1301,7 +1317,7 @@ mod tests {
         };
         let arguments = HashMap::from([(
             "port".to_string(),
-            Value::resource_ref("producer", "port", Vec::new()),
+            Value::root_resource_ref("producer", "port", Vec::new()),
         )]);
 
         assert_eq!(

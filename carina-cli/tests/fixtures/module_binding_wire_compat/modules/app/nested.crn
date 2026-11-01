@@ -1,0 +1,2 @@
+# The nested module call existed in the state used to produce the saved
+# update/delete plan, so removing it yields module-prefixed Delete effects.

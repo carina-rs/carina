@@ -15,6 +15,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
+use carina_core::resource::{
+    AbsoluteBindingAddress, BindingAddress, NoPlaceholder, PlaceholderKind,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendError, BackendResult, LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
@@ -111,8 +114,20 @@ impl BackendLock {
     /// configuration name"; lock creation, drift inspection, `init`'s
     /// warning path, and the migration path all go through it so they
     /// cannot disagree.
-    pub fn for_config(
-        backend_config: Option<&carina_core::parser::BackendConfig>,
+    pub fn for_config<P: PlaceholderKind, B: BindingAddress>(
+        backend_config: Option<&carina_core::parser::BackendConfig<P, B>>,
+    ) -> BackendResult<Self> {
+        match backend_config {
+            Some(cfg) => BackendConfig::try_from(cfg)
+                .map(|config| Self::from_config(&config))
+                .map_err(BackendError::from),
+            None => Ok(Self::local_default()),
+        }
+    }
+
+    /// Expanded-config counterpart of [`BackendLock::for_config`].
+    pub fn for_expanded_config(
+        backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
     ) -> BackendResult<Self> {
         match backend_config {
             Some(cfg) => BackendConfig::try_from(cfg)
@@ -205,11 +220,12 @@ impl BackendLock {
                 Ok((key.clone(), value))
             })
             .collect::<BackendResult<_>>()?;
-        let raw = carina_core::parser::BackendConfig {
-            backend_type: self.backend_type.clone(),
-            attributes,
-            attribute_spans: Default::default(),
-        };
+        let raw: carina_core::parser::BackendConfig<NoPlaceholder, AbsoluteBindingAddress> =
+            carina_core::parser::BackendConfig {
+                backend_type: self.backend_type.clone(),
+                attributes,
+                attribute_spans: Default::default(),
+            };
         BackendConfig::try_from(&raw).map_err(BackendError::from)
     }
 

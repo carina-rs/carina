@@ -1,11 +1,19 @@
 use super::comparison::SavedAttr;
 use super::{create_plan_for_tests as create_plan, *};
+use crate::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 
 use crate::explicit::ExplicitFields;
 use crate::provider::ReferenceScope;
-use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, ValueString};
+use crate::resource::{
+    CanonicalEnumValue, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource, ExpandedValue as Value,
+    ValueString,
+};
 use crate::schema::{
-    ReferenceForm, ReferenceForms, ReferenceTemplate, ResourceSchema, TypeIdentity,
+    CompiledResourceSchema as ResourceSchema, ReferenceForm, ReferenceForms, ReferenceTemplate,
+    TypeIdentity,
 };
 use crate::value::value_to_json;
 use indexmap::IndexMap;
@@ -80,7 +88,7 @@ fn diff_test(
 
 fn resolved_ignored_resource(
     mut resource: Resource,
-    schema: ResourceSchema,
+    schema: crate::schema::ResourceSchema,
     path: &[&str],
 ) -> (ResolvedResource, SchemaRegistry) {
     resource.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(
@@ -100,15 +108,15 @@ fn resolved_ignored_resource(
 
 #[test]
 fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
-    use crate::schema::AttributeSchema;
-
-    let schema = ResourceSchema::new("Widget")
+    let schema = PatternResourceSchema::new("Widget")
         .attribute(
-            AttributeSchema::optional("function_version", AttributeType::string())
+            PatternAttributeSchema::optional("function_version", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
-        .attribute(AttributeSchema::optional("comment", AttributeType::string()).build());
+        .attribute(
+            PatternAttributeSchema::optional("comment", PatternAttributeType::string()).build(),
+        );
     let desired = Resource::with_provider("test", "Widget", "alias", None)
         .with_attribute(
             "function_version",
@@ -154,10 +162,10 @@ fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
 
 #[test]
 fn resolved_ignore_changes_without_comparison_schema_does_not_panic() {
-    use crate::schema::AttributeSchema;
-
-    let schema = ResourceSchema::new("Widget")
-        .attribute(AttributeSchema::optional("function_version", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("Widget").attribute(
+        PatternAttributeSchema::optional("function_version", PatternAttributeType::string())
+            .build(),
+    );
     let desired = Resource::with_provider("test", "Widget", "alias", None).with_attribute(
         "function_version",
         Value::Concrete(ConcreteValue::String("recorded".into())),
@@ -187,16 +195,18 @@ fn resolved_ignore_changes_without_comparison_schema_does_not_panic() {
 
 #[test]
 fn ignored_readable_struct_leaf_does_not_hide_changed_sibling() {
-    use crate::schema::{AttributeSchema, StructField};
-
-    let schema = ResourceSchema::new("Widget").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("Widget").attribute(
+        PatternAttributeSchema::optional(
             "config",
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Config",
                 vec![
-                    StructField::optional("function_version", AttributeType::string()).build(),
-                    StructField::optional("memory", AttributeType::int()).build(),
+                    PatternStructField::optional(
+                        "function_version",
+                        PatternAttributeType::string(),
+                    )
+                    .build(),
+                    PatternStructField::optional("memory", PatternAttributeType::int()).build(),
                 ],
             ),
         )
@@ -406,7 +416,7 @@ fn create_only_reference_form_equivalence_suppresses_replace() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
     let context = ComparisonContext::for_test(&scope, &forms);
     let schema = ResourceSchema::new("lambda.Permission").attribute(
-        crate::schema::AttributeSchema::optional("function_name", attr_type)
+        crate::schema::CompiledAttributeSchema::optional("function_name", attr_type)
             .create_only()
             .build(),
     );
@@ -542,7 +552,7 @@ fn type_aware_list_with_inner_type() {
 
 #[test]
 fn type_aware_struct_per_field() {
-    use crate::schema::StructField;
+    use crate::schema::CompiledStructField as StructField;
 
     let struct_type = AttributeType::struct_(
         "Config".to_string(),
@@ -604,7 +614,9 @@ fn type_aware_custom_delegates_to_base() {
 
 #[test]
 fn type_aware_diff_no_change_with_schema() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let schema = ResourceSchema::new("test.resource")
         .attribute(AttributeSchema::optional("port", AttributeType::float()).build());
@@ -641,7 +653,7 @@ fn type_aware_diff_no_change_with_schema() {
 
 #[test]
 fn type_aware_struct_ignores_default_bool_false() {
-    use crate::schema::StructField;
+    use crate::schema::CompiledStructField as StructField;
 
     // Struct with an optional bool field (bucket_key_enabled)
     let struct_type = AttributeType::struct_(
@@ -683,7 +695,7 @@ fn type_aware_struct_ignores_default_bool_false() {
 
 #[test]
 fn type_aware_struct_does_not_ignore_non_default_bool() {
-    use crate::schema::StructField;
+    use crate::schema::CompiledStructField as StructField;
 
     let struct_type = AttributeType::struct_(
         "ServerSideEncryptionRule".to_string(),
@@ -929,7 +941,7 @@ fn type_aware_enum_canonical_enum_value_compares_against_api_string() {
 
 #[test]
 fn type_aware_struct_ignores_default_enum_empty() {
-    use crate::schema::StructField;
+    use crate::schema::CompiledStructField as StructField;
 
     let struct_type = AttributeType::struct_(
         "Config".to_string(),
@@ -980,7 +992,7 @@ fn type_aware_struct_ignores_default_enum_empty() {
 
 #[test]
 fn type_aware_struct_ignores_default_custom_type() {
-    use crate::schema::StructField;
+    use crate::schema::CompiledStructField as StructField;
 
     let struct_type = AttributeType::struct_(
         "Config".to_string(),
@@ -1026,17 +1038,18 @@ fn type_aware_struct_ignores_default_custom_type() {
 
 #[test]
 fn plan_canonicalization_ignores_default_nested_struct_empty() {
-    use crate::schema::{AttributeSchema, StructField};
-
-    let struct_type = AttributeType::struct_(
+    let struct_type = PatternAttributeType::struct_(
         "Outer".to_string(),
         vec![
-            StructField::optional("name", AttributeType::string()).build(),
-            StructField::optional(
+            PatternStructField::optional("name", PatternAttributeType::string()).build(),
+            PatternStructField::optional(
                 "inner",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Inner".to_string(),
-                    vec![StructField::optional("value", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("value", PatternAttributeType::string())
+                            .build(),
+                    ],
                 ),
             )
             .build(),
@@ -1060,8 +1073,8 @@ fn plan_canonicalization_ignores_default_nested_struct_empty() {
         ),
     ])));
 
-    let schema = ResourceSchema::new("Widget")
-        .attribute(AttributeSchema::optional("rule", struct_type).build());
+    let schema = PatternResourceSchema::new("Widget")
+        .attribute(PatternAttributeSchema::optional("rule", struct_type).build());
     let mut registry = SchemaRegistry::new();
     registry.insert("", schema.validate().expect("schema fixture must be valid"));
     let desired = Resource::new("Widget", "example").with_attribute("rule", desired_value);
@@ -1096,7 +1109,7 @@ fn plan_canonicalization_ignores_default_nested_struct_empty() {
 
 #[test]
 fn type_aware_zero_field_struct_marker_is_not_default_when_nested() {
-    use crate::schema::StructField;
+    use crate::schema::CompiledStructField as StructField;
 
     let struct_type = AttributeType::struct_(
         "Rule",
@@ -1130,21 +1143,26 @@ fn type_aware_zero_field_struct_marker_is_not_default_when_nested() {
 
 #[test]
 fn plan_treats_empty_non_empty_struct_as_absent_but_marker_as_present() {
-    use crate::schema::{AttributeSchema, StructField};
-
-    let schema = ResourceSchema::new("Widget")
+    let schema = PatternResourceSchema::new("Widget")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "config",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Config",
-                    vec![StructField::optional("label", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("label", PatternAttributeType::string())
+                            .build(),
+                    ],
                 ),
             )
             .build(),
         )
         .attribute(
-            AttributeSchema::optional("count", AttributeType::struct_("Count", Vec::new())).build(),
+            PatternAttributeSchema::optional(
+                "count",
+                PatternAttributeType::struct_("Count", Vec::new()),
+            )
+            .build(),
         );
     let mut registry = SchemaRegistry::new();
     registry.insert("", schema.validate().expect("schema fixture must be valid"));
@@ -1187,14 +1205,12 @@ fn plan_treats_empty_non_empty_struct_as_absent_but_marker_as_present() {
 
 #[test]
 fn top_level_non_empty_struct_transitions_to_and_from_empty_are_diffs() {
-    use crate::schema::{AttributeSchema, StructField};
-
-    let schema = ResourceSchema::new("Widget").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("Widget").attribute(
+        PatternAttributeSchema::optional(
             "config",
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Config",
-                vec![StructField::optional("label", AttributeType::string()).build()],
+                vec![PatternStructField::optional("label", PatternAttributeType::string()).build()],
             ),
         )
         .build(),
@@ -1315,7 +1331,10 @@ fn type_aware_unordered_list_ignores_reorder() {
 #[test]
 fn oidc_listener_with_matching_nested_write_only_provenance_converges() {
     use crate::provider::NestedWriteOnlyRecord;
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+        CompiledStructField as StructField,
+    };
 
     let oidc_config = AttributeType::struct_(
         "AuthenticateOidcConfig",
@@ -1412,7 +1431,10 @@ fn oidc_listener_diff_fixture(
     HashMap<String, Value>,
     HashMap<String, Value>,
 ) {
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+        CompiledStructField as StructField,
+    };
 
     let schema = ResourceSchema::new("elasticloadbalancingv2.Listener")
         .attribute(
@@ -1590,7 +1612,9 @@ fn secret_wrapped_oidc_listener_fixture(
     HashMap<String, Value>,
     HashMap<String, Value>,
 ) {
-    use crate::schema::{AttributeSchema, StructField};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
+    };
 
     let schema = ResourceSchema::new("elasticloadbalancingv2.Listener").attribute(
         AttributeSchema::optional(
@@ -1712,7 +1736,10 @@ fn oidc_listener_with_secret_wrapped_action_list_converges() {
 #[test]
 fn entirely_write_only_struct_absent_from_read_converges_with_matching_record() {
     use crate::provider::NestedWriteOnlyRecord;
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+        CompiledStructField as StructField,
+    };
 
     let schema = ResourceSchema::new("test.Credential").attribute(
         AttributeSchema::optional(
@@ -1762,7 +1789,9 @@ fn entirely_write_only_struct_absent_from_read_converges_with_matching_record() 
 #[test]
 fn omitted_read_with_empty_observable_string_list_converges() {
     use crate::provider::NestedWriteOnlyRecord;
-    use crate::schema::{AttributeSchema, StructField};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
+    };
 
     let schema = ResourceSchema::new("test.Credential").attribute(
         AttributeSchema::optional(
@@ -1820,7 +1849,9 @@ fn omitted_read_with_empty_observable_string_list_converges() {
 #[test]
 fn entirely_write_only_secret_wrapped_struct_absent_from_read_converges() {
     use crate::provider::NestedWriteOnlyRecord;
-    use crate::schema::{AttributeSchema, StructField};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
+    };
 
     let schema = ResourceSchema::new("test.Credential").attribute(
         AttributeSchema::optional(
@@ -1871,7 +1902,9 @@ fn entirely_write_only_secret_wrapped_struct_absent_from_read_converges() {
 
 #[test]
 fn non_create_only_write_only_attr_in_desired_not_in_current_detects_diff() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
@@ -1913,7 +1946,9 @@ fn non_create_only_write_only_attr_in_desired_not_in_current_detects_diff() {
 
 #[test]
 fn create_only_write_only_attr_in_desired_not_in_current_has_no_diff() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
@@ -1955,7 +1990,9 @@ fn create_only_write_only_attr_in_desired_not_in_current_has_no_diff() {
 
 #[test]
 fn write_only_attr_in_both_same_value_no_diff() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
@@ -2003,7 +2040,9 @@ fn write_only_attr_in_both_same_value_no_diff() {
 
 #[test]
 fn write_only_attr_in_both_different_value_detects_diff() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
@@ -2050,7 +2089,9 @@ fn write_only_attr_in_both_different_value_detects_diff() {
 
 #[test]
 fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let schema = ResourceSchema::new("ec2.Vpc")
         .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
@@ -2296,7 +2337,9 @@ fn nested_post_create_read_unknown_cannot_enter_a_patch() {
 
 #[test]
 fn dependent_nested_post_create_read_unknown_cannot_force_replacement() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "Name".to_string(),
@@ -2535,7 +2578,9 @@ fn secret_does_not_match_different_plain_text() {
 /// the state value is the raw provider response (not a hash).
 #[test]
 fn secret_in_map_with_refresh_no_false_diff() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     // Desired: tags map with a secret value (as written in .crn)
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -2590,10 +2635,11 @@ fn secret_in_map_with_refresh_no_false_diff() {
 
 /// Helper: build the `Union[String, list(String)]` shape used by
 /// IAM-style `string_or_list_of_strings` schema fields.
-fn string_or_list_of_strings_type() -> AttributeType {
-    AttributeType::union(vec![
-        AttributeType::string(),
-        AttributeType::list(AttributeType::string()),
+fn string_or_list_of_strings_type<R: crate::schema::PatternForm>()
+-> crate::schema::PatternAttributeType<R> {
+    PatternAttributeType::union(vec![
+        PatternAttributeType::string(),
+        PatternAttributeType::list(PatternAttributeType::string()),
     ])
 }
 
@@ -2767,10 +2813,9 @@ fn union_string_or_list_compares_string_list() {
 
 #[test]
 fn into_plan_input_current_map_from_states_canonicalizes_string_or_list_state() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
-
-    let schema = ResourceSchema::new("iam.policy")
-        .attribute(AttributeSchema::optional("action", string_or_list_of_strings_type()).build());
+    let schema = PatternResourceSchema::new("iam.policy").attribute(
+        PatternAttributeSchema::optional("action", string_or_list_of_strings_type()).build(),
+    );
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "aws",
@@ -2822,12 +2867,12 @@ fn into_plan_input_current_map_from_states_canonicalizes_string_or_list_state() 
 #[test]
 fn into_plan_input_current_map_from_states_canonicalizes_separator_folded_enum_state_before_diffing()
  {
-    use crate::schema::{AttributeSchema, ResourceSchema, enum_identity};
+    use crate::schema::enum_identity;
 
-    let schema = ResourceSchema::new("acm.Certificate").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("acm.Certificate").attribute(
+        PatternAttributeSchema::optional(
             "key_algorithm",
-            AttributeType::enum_(
+            PatternAttributeType::enum_(
                 enum_identity("KeyAlgorithm", Some("aws.acm.Certificate")),
                 Some(vec!["RSA_2048".to_string()]),
                 vec![],
@@ -2893,27 +2938,26 @@ fn into_plan_input_current_map_from_states_canonicalizes_separator_folded_enum_s
 /// `canonicalize_*_with_schemas` (the apply/plan path) → `diff`.
 #[test]
 fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
-    let principal = AttributeType::union(vec![
-        AttributeType::struct_(
+    let principal = PatternAttributeType::union(vec![
+        PatternAttributeType::struct_(
             "PrincipalStruct".to_string(),
             vec![
-                StructField::optional(
+                PatternStructField::optional(
                     "service",
-                    AttributeType::union(vec![
-                        AttributeType::string(),
-                        AttributeType::list(AttributeType::string()),
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::string(),
+                        PatternAttributeType::list(PatternAttributeType::string()),
                     ]),
                 )
                 .build(),
             ],
         ),
-        AttributeType::string(),
+        PatternAttributeType::string(),
     ]);
-    let schema = ResourceSchema::new("iam.policy")
-        .attribute(AttributeSchema::optional("principal", principal).build());
+    let schema = PatternResourceSchema::new("iam.policy")
+        .attribute(PatternAttributeSchema::optional("principal", principal).build());
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "aws",
@@ -2966,7 +3010,22 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
         }
         Current::MissingIdentifier(state) => state.state(),
     };
-    let result = diff_test(&resources[0], current, None, None, Some(&schema));
+    let result = diff_test(
+        &resources[0],
+        current,
+        None,
+        None,
+        Some(
+            registry
+                .get(
+                    "aws",
+                    schema.resource_type(),
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap()
+                .as_schema(),
+        ),
+    );
     assert!(
         matches!(result, Diff::NoChange(_)),
         "carina#3080: scalar (desired) vs singleton-list (state) under \
@@ -2980,25 +3039,25 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
 #[test]
 fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     use crate::provider::RawSavedAttrs;
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
-    let statement = AttributeType::struct_(
+    let statement = PatternAttributeType::struct_(
         "Statement".to_string(),
         vec![
-            StructField::optional("effect", AttributeType::string()).build(),
-            StructField::optional(
+            PatternStructField::optional("effect", PatternAttributeType::string()).build(),
+            PatternStructField::optional(
                 "action",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
+                PatternAttributeType::union(vec![
+                    PatternAttributeType::string(),
+                    PatternAttributeType::list(PatternAttributeType::string()),
                 ]),
             )
             .build(),
         ],
     );
-    let schema = ResourceSchema::new("iam.policy")
-        .attribute(AttributeSchema::optional("statement", statement).build());
+    let schema = PatternResourceSchema::new("iam.policy")
+        .attribute(PatternAttributeSchema::optional("statement", statement).build());
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "aws",
@@ -3067,7 +3126,16 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
         current,
         saved_attrs.get(&id),
         None,
-        Some(&schema),
+        Some(
+            registry
+                .get(
+                    "aws",
+                    schema.resource_type(),
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap()
+                .as_schema(),
+        ),
     );
     assert!(
         matches!(result, Diff::NoChange(_)),
@@ -3082,26 +3150,25 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
 #[test]
 fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
     use crate::provider::RawSavedAttrs;
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
 
-    let config = AttributeType::struct_(
+    let config = PatternAttributeType::struct_(
         "Config".to_string(),
         vec![
-            StructField::optional("enabled", AttributeType::bool()).build(),
-            StructField::optional(
+            PatternStructField::optional("enabled", PatternAttributeType::bool()).build(),
+            PatternStructField::optional(
                 "password",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
+                PatternAttributeType::union(vec![
+                    PatternAttributeType::string(),
+                    PatternAttributeType::list(PatternAttributeType::string()),
                 ]),
             )
             .build(),
         ],
     );
-    let mut schema = ResourceSchema::new("service.Widget");
+    let mut schema = PatternResourceSchema::new("service.Widget");
     schema.attributes.insert(
         "config".to_string(),
-        AttributeSchema::optional("config", config).build(),
+        PatternAttributeSchema::optional("config", config).build(),
     );
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -3154,7 +3221,16 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
         &current,
         saved_attrs.get(&desired.id),
         None,
-        Some(&schema),
+        Some(
+            registry
+                .get(
+                    "test",
+                    schema.resource_type(),
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap()
+                .as_schema(),
+        ),
     );
     assert!(
         matches!(result, Diff::NoChange(_)),
@@ -3197,11 +3273,10 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
 /// `diff` pipeline (see `feedback_unit_test_path_is_not_apply_path`).
 #[test]
 fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
     let method_enum = |name: &str, values: &[&str]| {
-        AttributeType::enum_(
+        PatternAttributeType::enum_(
             crate::schema::enum_identity(name, Some("awscc.cloudfront.Distribution")),
             Some(values.iter().map(|s| s.to_string()).collect()),
             values
@@ -3212,21 +3287,21 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
             None,
         )
     };
-    let default_cache_behavior = AttributeType::struct_(
+    let default_cache_behavior = PatternAttributeType::struct_(
         "DefaultCacheBehavior".to_string(),
         vec![
-            StructField::optional(
+            PatternStructField::optional(
                 "allowed_methods",
-                AttributeType::unordered_list(method_enum(
+                PatternAttributeType::unordered_list(method_enum(
                     "AllowedMethods",
                     &["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"],
                 )),
             )
             .with_provider_name("AllowedMethods")
             .build(),
-            StructField::optional(
+            PatternStructField::optional(
                 "cached_methods",
-                AttributeType::unordered_list(method_enum(
+                PatternAttributeType::unordered_list(method_enum(
                     "CachedMethods",
                     &["GET", "HEAD", "OPTIONS"],
                 )),
@@ -3236,13 +3311,13 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
             // User-authored scalar fields, so the test also covers the
             // "authored field survives projection and compares equal"
             // path alongside the read-back-default stripping.
-            StructField::optional("compress", AttributeType::bool())
+            PatternStructField::optional("compress", PatternAttributeType::bool())
                 .with_provider_name("Compress")
                 .build(),
-            StructField::optional("target_origin_id", AttributeType::string())
+            PatternStructField::optional("target_origin_id", PatternAttributeType::string())
                 .with_provider_name("TargetOriginId")
                 .build(),
-            StructField::optional(
+            PatternStructField::optional(
                 "viewer_protocol_policy",
                 method_enum(
                     "ViewerProtocolPolicy",
@@ -3253,16 +3328,17 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
             .build(),
         ],
     );
-    let distribution_config = AttributeType::struct_(
+    let distribution_config = PatternAttributeType::struct_(
         "DistributionConfig".to_string(),
         vec![
-            StructField::optional("default_cache_behavior", default_cache_behavior)
+            PatternStructField::optional("default_cache_behavior", default_cache_behavior)
                 .with_provider_name("DefaultCacheBehavior")
                 .build(),
         ],
     );
-    let schema = ResourceSchema::new("cloudfront.Distribution")
-        .attribute(AttributeSchema::optional("distribution_config", distribution_config).build());
+    let schema = PatternResourceSchema::new("cloudfront.Distribution").attribute(
+        PatternAttributeSchema::optional("distribution_config", distribution_config).build(),
+    );
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "awscc",
@@ -3430,7 +3506,16 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         current,
         Some(&saved_attrs),
         Some(&prev_explicit),
-        Some(&schema),
+        Some(
+            registry
+                .get(
+                    "awscc",
+                    schema.resource_type(),
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap()
+                .as_schema(),
+        ),
     );
     assert!(
         matches!(result, Diff::NoChange(_)),
@@ -3460,11 +3545,10 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
 /// input.
 #[test]
 fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline() {
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
     let method_enum = |name: &str, values: &[&str]| {
-        AttributeType::enum_(
+        PatternAttributeType::enum_(
             crate::schema::enum_identity(name, Some("awscc.cloudfront.Distribution")),
             Some(values.iter().map(|s| s.to_string()).collect()),
             values
@@ -3480,12 +3564,12 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     // `unordered_list`. (This test uses a trimmed shape — no
     // `cached_methods`, no read-back-default state block — since only
     // the `allowed_methods` ordering is under test here.)
-    let default_cache_behavior = AttributeType::struct_(
+    let default_cache_behavior = PatternAttributeType::struct_(
         "DefaultCacheBehavior".to_string(),
         vec![
-            StructField::optional(
+            PatternStructField::optional(
                 "allowed_methods",
-                AttributeType::list(method_enum(
+                PatternAttributeType::list(method_enum(
                     "AllowedMethods",
                     &["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"],
                 )),
@@ -3494,16 +3578,17 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
             .build(),
         ],
     );
-    let distribution_config = AttributeType::struct_(
+    let distribution_config = PatternAttributeType::struct_(
         "DistributionConfig".to_string(),
         vec![
-            StructField::optional("default_cache_behavior", default_cache_behavior)
+            PatternStructField::optional("default_cache_behavior", default_cache_behavior)
                 .with_provider_name("DefaultCacheBehavior")
                 .build(),
         ],
     );
-    let schema = ResourceSchema::new("cloudfront.Distribution")
-        .attribute(AttributeSchema::optional("distribution_config", distribution_config).build());
+    let schema = PatternResourceSchema::new("cloudfront.Distribution").attribute(
+        PatternAttributeSchema::optional("distribution_config", distribution_config).build(),
+    );
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "awscc",
@@ -3571,7 +3656,16 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
         current,
         None,
         Some(&prev_explicit),
-        Some(&schema),
+        Some(
+            registry
+                .get(
+                    "awscc",
+                    schema.resource_type(),
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap()
+                .as_schema(),
+        ),
     );
     assert!(
         matches!(result, Diff::Update { .. }),

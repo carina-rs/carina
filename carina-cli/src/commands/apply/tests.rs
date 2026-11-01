@@ -12,8 +12,9 @@ use carina_core::resource::{
     ModuleConstraintId, PendingModuleConstraint, PlaceholderKind, ResolvedDataSource,
     ResolvedResource, Resource, ResourceId, ResourceIdentity,
 };
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
 use indexmap::IndexMap;
@@ -38,6 +39,15 @@ use crate::wiring::{
     OverrideAwareBuildMode, OverrideAwareResources, ParserCanonicalResourcePair,
     resolve_config_block_names_for_test,
 };
+
+fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
+fn root_resource_ref(binding: &str, attribute: &str) -> carina_core::resource::Value {
+    carina_core::resource::Value::resource_ref(binding, attribute, Vec::new())
+        .resolve_root_for_test()
+}
 
 struct UnusedAwsCredentialProvisioner;
 
@@ -68,8 +78,10 @@ fn validate_with_test_factories(
         &parsed.providers,
         load_errors,
     );
+    let parsed =
+        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed.clone());
     crate::commands::validate_and_resolve_errors(
-        parsed,
+        &parsed,
         base_dir,
         &providers,
         skip_resource_validation,
@@ -84,14 +96,12 @@ fn complete_create(state: carina_core::resource::State) -> carina_core::executor
     }
 }
 
-fn resolve_module_file_for_test<E: carina_core::parser::ExportParamLike>(
-    parsed: carina_core::parser::File<
-        E,
-        carina_core::resource::ParserPlaceholder,
-        carina_core::resource::ParserPlaceholder,
-        carina_core::parser::ParsedDeferredForPhase<carina_core::resource::ParserPlaceholder>,
-    >,
-) -> carina_core::parser::ModuleResolvedFile<E> {
+fn resolve_module_file_for_test<E>(
+    parsed: carina_core::parser::File<E>,
+) -> carina_core::parser::ModuleResolvedFile<E::Absolute>
+where
+    E: carina_core::parser::ResolveExportBindingPhase<carina_core::resource::ParserPlaceholder>,
+{
     let base_dir = parsed
         .module_calls
         .first()
@@ -99,7 +109,7 @@ fn resolve_module_file_for_test<E: carina_core::parser::ExportParamLike>(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
+        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
         &base_dir,
         &carina_core::parser::ProviderContext::default(),
         &carina_core::schema::SchemaRegistry::new(),
@@ -108,15 +118,16 @@ fn resolve_module_file_for_test<E: carina_core::parser::ExportParamLike>(
 }
 
 fn resolve_file_for_test<E>(
-    parsed: carina_core::parser::File<
-        E,
-        carina_core::resource::ParserPlaceholder,
-        carina_core::resource::ParserPlaceholder,
-        carina_core::parser::ParsedDeferredForPhase<carina_core::resource::ParserPlaceholder>,
-    >,
-) -> carina_core::parser::ExpandedFile<E::Expanded>
+    parsed: carina_core::parser::File<E>,
+) -> carina_core::parser::ExpandedFile<
+    <E::Absolute as carina_core::parser::IntoExpandedExportParam<
+        carina_core::resource::AbsoluteBindingAddress,
+    >>::Expanded,
+>
 where
-    E: carina_core::parser::ExportParamLike + carina_core::parser::IntoExpandedExportParam,
+    E: carina_core::parser::ResolveExportBindingPhase<carina_core::resource::ParserPlaceholder>,
+    E::Absolute:
+        carina_core::parser::IntoExpandedExportParam<carina_core::resource::AbsoluteBindingAddress>,
 {
     resolve_module_file_for_test(parsed)
         .into_expanded()
@@ -138,7 +149,7 @@ fn canonical_unresolved_for_test(
     ctx: &WiringContext,
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> ParserCanonicalResourcePair<carina_core::parser::InferredExportParam> {
+) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
     resolve_config_block_names_for_test(
         resolve_module_file_for_test(parsed.clone()),
         unresolved.clone(),
@@ -160,7 +171,7 @@ fn canonical_resolved_unresolved_for_test(
     ctx: &WiringContext,
     parsed: &carina_core::parser::ModuleResolvedInferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> ParserCanonicalResourcePair<carina_core::parser::InferredExportParam> {
+) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
     resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
         .unwrap_or_else(|errors| {
             panic!(
@@ -177,9 +188,7 @@ fn canonical_resolved_unresolved_for_test(
 fn canonical_resources_for_test(
     resources: Vec<Resource>,
     _schemas: &SchemaRegistry,
-) -> crate::wiring::CanonicalResourcePair<
-    carina_core::parser::ParsedExportParam<carina_core::resource::NoPlaceholder>,
-> {
+) -> crate::wiring::CanonicalResourcePair<carina_core::parser::ExpandedParsedExportParam> {
     let mut parsed = carina_core::parser::ExpandedParsedFile::default();
     parsed.resources = resources.clone();
     crate::wiring::CanonicalResourcePair::for_test(parsed, resources)
@@ -368,15 +377,21 @@ fn mock_http_ready_config(
 }
 
 fn mock_http_replacement_schema() -> carina_core::schema::ValidatedResourceSchema {
-    ResourceSchema::new("test.send_phase")
-        .attribute(AttributeSchema::required("url", AttributeType::string()).build())
-        .attribute(AttributeSchema::required("method", AttributeType::string()).build())
-        .attribute(AttributeSchema::required("body", AttributeType::string()).build())
+    PatternResourceSchema::new("test.send_phase")
+        .attribute(PatternAttributeSchema::required("url", PatternAttributeType::string()).build())
         .attribute(
-            AttributeSchema::provider_populated("send_phase", AttributeType::string()).build(),
+            PatternAttributeSchema::required("method", PatternAttributeType::string()).build(),
+        )
+        .attribute(PatternAttributeSchema::required("body", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::provider_populated(
+                "send_phase",
+                PatternAttributeType::string(),
+            )
+            .build(),
         )
         .attribute(
-            AttributeSchema::optional("create_behavior", AttributeType::string())
+            PatternAttributeSchema::optional("create_behavior", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
@@ -880,7 +895,9 @@ fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderCon
     .expect("empty provider configs must resolve")
 }
 
-fn expanded_provider_configs(parsed: &carina_core::parser::InferredFile) -> Vec<ProviderConfig> {
+fn expanded_provider_configs(
+    parsed: &carina_core::parser::InferredFile,
+) -> Vec<carina_core::parser::ExpandedProviderConfig> {
     parsed
         .clone()
         .into_expanded()
@@ -896,7 +913,7 @@ trait IntoValidatedTestSchema {
     fn into_validated_test_schema(self) -> carina_core::schema::ValidatedResourceSchema;
 }
 
-impl IntoValidatedTestSchema for ResourceSchema {
+impl IntoValidatedTestSchema for carina_core::schema::ResourceSchema {
     fn into_validated_test_schema(self) -> carina_core::schema::ValidatedResourceSchema {
         self.validate().expect("schema fixture must be valid")
     }
@@ -920,7 +937,7 @@ where
 }
 
 fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
-    let ctx = ValidatedConfig::from_factories_for_test(
+    let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
         (),
         Vec::new(),
         contents.provider_configs.as_provider_configs(),
@@ -975,10 +992,13 @@ for account_id in orgs.accounts {
         &ProviderContext::default(),
     )
     .expect("parse saved-plan loop provenance fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(parsed, Path::new("."))
-        .expect("cross the deferred-body resolution seam")
-        .into_expanded()
-        .expect("saved-plan loop fixture must contain only loop slots");
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        Path::new("."),
+    )
+    .expect("cross the deferred-body resolution seam")
+    .into_expanded()
+    .expect("saved-plan loop fixture must contain only loop slots");
 
     let mut deferred = parsed.deferred_for_expressions().to_vec().into_iter();
 
@@ -1266,24 +1286,13 @@ async fn saved_plan_apply_rejects_changed_attribute_flag_before_provider_call() 
         .into_iter()
         .find(|schema| schema.parts().resource_type == "test.resource")
         .expect("built-in test.resource schema");
-    let mut planned_schema =
-        ResourceSchema::new("test.resource").with_unique_name_attribute("name");
-    for attribute in builtin_schema
-        .as_schema()
-        .attributes()
-        .values()
-        .filter(|attribute| attribute.name() != "comment")
-    {
-        planned_schema = planned_schema.attribute(attribute.clone());
-    }
-    let comment_type = builtin_schema.as_schema().attributes()["comment"]
-        .attr_type()
-        .clone();
-    planned_schema = planned_schema.attribute(
-        carina_core::schema::AttributeSchema::optional("comment", comment_type)
-            .write_only()
-            .build(),
-    );
+    let mut wire =
+        carina_core::protocol_convert::resource_schema_to_protocol(&builtin_schema).unwrap();
+    wire.attributes
+        .get_mut("comment")
+        .expect("built-in comment attribute")
+        .write_only = true;
+    let planned_schema = carina_core::protocol_convert::protocol_to_resource_schema(&wire).unwrap();
     let planning_schemas = mock_schema_registry([planned_schema]);
 
     let (result, operations) = run_saved_plan_schema_fingerprint_case(
@@ -1369,9 +1378,12 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
 
     let bound = ProviderBoundPlanFile::for_test(
         inspected_saved_plan(plan_file),
-        ProviderLoad::for_test::<carina_core::resource::NoPlaceholder>(Vec::new(), &[])
-            .into_complete()
-            .expect("test provider load is complete"),
+        ProviderLoad::for_test_with_provider_phase::<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >(Vec::new(), &[])
+        .into_complete()
+        .expect("test provider load is complete"),
         Path::new("."),
     )
     .expect("placeholder-free plan must bind its provider load");
@@ -1427,7 +1439,7 @@ fn resolve_and_materialize_exports_for_test(
 }
 
 fn saved_provider_configs(
-    configs: Vec<ProviderConfig>,
+    configs: Vec<carina_core::parser::ExpandedProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
@@ -1441,14 +1453,17 @@ fn saved_provider_configs(
 }
 
 fn deserialize_saved_provider_configs(
-    configs: Vec<ProviderConfig>,
+    configs: Vec<carina_core::parser::ExpandedProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
     serde_json::from_value(serde_json::to_value(configs).unwrap()).unwrap()
 }
 
-fn saved_composition_argument<P: PlaceholderKind + PartialEq>(
-    value: Value<P>,
-) -> LiveCompositionArgument<P> {
+fn saved_composition_argument<
+    P: PlaceholderKind + PartialEq,
+    B: carina_core::resource::BindingAddress,
+>(
+    value: Value<P, B>,
+) -> LiveCompositionArgument<P, B> {
     LiveCompositionArgument::from_value(
         value,
         carina_core::validation::resolve_consumer_static_type_for_signature(
@@ -1459,10 +1474,11 @@ fn saved_composition_argument<P: PlaceholderKind + PartialEq>(
     )
 }
 
-fn saved_module_composition<P: PlaceholderKind + PartialEq>(
-    argument: Value<P>,
+fn module_composition<P: PlaceholderKind + PartialEq, B: carina_core::resource::BindingAddress>(
+    argument: Value<P, B>,
     rejected: &str,
-) -> LiveComposition<P> {
+    binding: B,
+) -> LiveComposition<P, B> {
     let argument_name = "value";
     LiveComposition {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1489,13 +1505,44 @@ fn saved_module_composition<P: PlaceholderKind + PartialEq>(
                 message: format!("value must not be {rejected}"),
             }],
         },
-        binding: Some("checked".to_string()),
+        binding: Some(binding.clone()),
         dependency_bindings: BTreeSet::new(),
         module_name: "checked_module".to_string(),
         instance: "root.checked".to_string(),
-        call_path: crate::test_composition_call_path(),
+        call_path: {
+            let prototype = crate::test_composition_call_path();
+            carina_core::resource::CompositionCallPath::direct(
+                carina_core::resource::CompositionCall {
+                    id: prototype.root().id.clone(),
+                    module_name: prototype.root().module_name.clone(),
+                    binding: Some(binding.clone()),
+                    instance: prototype.root().instance.clone(),
+                    module_source: prototype.root().module_source.clone(),
+                    module_directory: prototype.root().module_directory.clone(),
+                    loop_origin: None,
+                },
+            )
+        },
         quoted_string_attrs: HashSet::new(),
     }
+}
+
+fn saved_module_composition<P: PlaceholderKind + PartialEq>(
+    argument: Value<P>,
+    rejected: &str,
+) -> LiveComposition<P> {
+    module_composition(argument, rejected, absolute_binding("checked"))
+}
+
+fn authored_module_composition<P: PlaceholderKind + PartialEq>(
+    argument: Value<P, carina_core::resource::RelativeBindingName>,
+    rejected: &str,
+) -> LiveComposition<P, carina_core::resource::RelativeBindingName> {
+    module_composition(
+        argument,
+        rejected,
+        carina_core::resource::RelativeBindingName::new("checked"),
+    )
 }
 
 #[test]
@@ -1722,9 +1769,26 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         )
         .await
         .expect_err("an invalid saved composition path must reject the plan");
-        let AppError::CorruptPlanFile { error, .. } = error else {
+        let rendered = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            rendered.contains(expected_detail)
+                && rendered.contains(&plan_path.display().to_string())
+                && rendered
+                    .contains("JSON location compositions[0].origin_id.root.source_file.path")
+                && rendered.contains("corrupted or hand-edited")
+                && rendered.contains("regenerate the plan")
+                && rendered.contains("plan --out"),
+            "{case}: corrupt-plan diagnostic must be located and actionable: {rendered}",
+        );
+        let AppError::CorruptPlanFile(error) = error else {
             panic!("{case}: expected typed corrupt-plan error, got {error:?}");
         };
+        let error = error.json_error();
+        assert_eq!(
+            error.json_path(),
+            "compositions[0].origin_id.root.source_file.path",
+            "{case}: path validation must retain its JSON location",
+        );
         assert_eq!(
             error.classify(),
             serde_json::error::Category::Data,
@@ -1913,9 +1977,15 @@ impl ProviderFactory for FailBCreateFactory {
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             vec![
-                ResourceSchema::new("test.resource")
-                    .attribute(AttributeSchema::optional("id", AttributeType::string()).build())
-                    .attribute(AttributeSchema::optional("name", AttributeType::string()).build()),
+                PatternResourceSchema::new("test.resource")
+                    .attribute(
+                        PatternAttributeSchema::optional("id", PatternAttributeType::string())
+                            .build(),
+                    )
+                    .attribute(
+                        PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                            .build(),
+                    ),
             ]
         };
         schema_drafts
@@ -1940,7 +2010,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
     std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
     std::fs::write(&source_path, b"not a wasm component").unwrap();
     std::fs::write(&installed_path, b"not a wasm component").unwrap();
-    let provider_config = ProviderConfig {
+    let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -1950,7 +2020,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         unresolved_attributes: IndexMap::new(),
         binding: None,
     };
-    let planning_context = ValidatedConfig::from_factories_for_test(
+    let planning_context = ValidatedConfig::from_factories_for_test_with_provider_phase(
         (),
         vec![Box::new(FailBCreateFactory)],
         std::slice::from_ref(&provider_config),
@@ -2034,7 +2104,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
     )
     .parse()
     .unwrap();
-    let provider_config = ProviderConfig {
+    let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -2045,7 +2115,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         binding: None,
     };
     let provider_configs = vec![provider_config.clone(), provider_config];
-    let planning_context = ValidatedConfig::from_factories_for_test(
+    let planning_context = ValidatedConfig::from_factories_for_test_with_provider_phase(
         (),
         vec![Box::new(FailBCreateFactory)],
         &provider_configs,
@@ -2170,14 +2240,12 @@ let secret_resource = mock.test.resource {{
 async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     let (_temp, downstream, parsed) =
         crate::provider_upstream_test_support::provider_upstream_fixture();
-    let expanded = parsed
-        .into_expanded()
-        .expect("provider upstream fixture has no parser placeholders");
+    let expanded = resolve_file_for_test(parsed);
     let inputs = load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
         .await
         .expect("bootstrap provider inputs must resolve");
     let received_role_arn = Arc::new(Mutex::new(None));
-    let ctx = ValidatedConfig::from_factories_for_test(
+    let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
         (),
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
@@ -2308,8 +2376,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let unresolved_parsed = loaded.unresolved_parsed;
     let wiring = ValidatedWiring::from_load_for_test(providers);
     let validated_config = validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
-    let expanded = parsed
-        .clone()
+    let expanded = resolve_module_file_for_test(parsed.clone().into_parsed())
         .into_expanded()
         .expect("provider upstream fixture has no parser placeholders");
     let stale_inputs =
@@ -2335,7 +2402,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     )
     .expect("bootstrap reload must succeed");
     let received_role_arn = Arc::new(Mutex::new(None));
-    let ctx = ValidatedWiring::from_factories_for_test(
+    let ctx = ValidatedWiring::from_factories_for_test_with_provider_phase(
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2671,77 +2738,111 @@ impl ProviderFactory for ApplyTimeReadFactory {
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             vec![
-                ResourceSchema::new("iam.Role")
+                PatternResourceSchema::new("iam.Role")
                     .attribute(
-                        AttributeSchema::optional("role_name", AttributeType::string())
+                        PatternAttributeSchema::optional(
+                            "role_name",
+                            PatternAttributeType::string(),
+                        )
+                        .create_only()
+                        .build(),
+                    )
+                    .attribute(
+                        PatternAttributeSchema::optional("path", PatternAttributeType::string())
                             .create_only()
                             .build(),
                     )
                     .attribute(
-                        AttributeSchema::optional("path", AttributeType::string())
-                            .create_only()
-                            .build(),
+                        PatternAttributeSchema::optional(
+                            "max_session_duration",
+                            PatternAttributeType::int(),
+                        )
+                        .create_only()
+                        .build(),
                     )
                     .attribute(
-                        AttributeSchema::optional("max_session_duration", AttributeType::int())
-                            .create_only()
-                            .build(),
-                    )
-                    .attribute(
-                        AttributeSchema::optional("description", AttributeType::string()).build(),
+                        PatternAttributeSchema::optional(
+                            "description",
+                            PatternAttributeType::string(),
+                        )
+                        .build(),
                     ),
-                ResourceSchema::new("iam.Roles")
+                PatternResourceSchema::new("iam.Roles")
                     .attribute(
-                        AttributeSchema::optional("name_regex", AttributeType::string()).build(),
+                        PatternAttributeSchema::optional(
+                            "name_regex",
+                            PatternAttributeType::string(),
+                        )
+                        .build(),
                     )
                     .attribute(
-                        AttributeSchema::optional(
+                        PatternAttributeSchema::optional(
                             "names",
-                            AttributeType::list(AttributeType::string()),
+                            PatternAttributeType::list(PatternAttributeType::string()),
                         )
                         .build(),
                     )
                     .as_data_source(),
-                ResourceSchema::new("ec2.InternetGateway")
-                    .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                PatternResourceSchema::new("ec2.InternetGateway")
                     .attribute(
-                        AttributeSchema::optional(
+                        PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                            .build(),
+                    )
+                    .attribute(
+                        PatternAttributeSchema::optional(
                             "tags",
-                            AttributeType::map(AttributeType::string()),
+                            PatternAttributeType::map(PatternAttributeType::string()),
                         )
                         .build(),
                     )
                     .attribute(
-                        AttributeSchema::optional(
+                        PatternAttributeSchema::optional(
                             "settings",
-                            AttributeType::struct_(
+                            PatternAttributeType::struct_(
                                 "InternetGatewaySettings",
                                 vec![
-                                    StructField::optional("enabled", AttributeType::bool()).build(),
-                                    StructField::optional("description", AttributeType::string())
-                                        .build(),
+                                    PatternStructField::optional(
+                                        "enabled",
+                                        PatternAttributeType::bool(),
+                                    )
+                                    .build(),
+                                    PatternStructField::optional(
+                                        "description",
+                                        PatternAttributeType::string(),
+                                    )
+                                    .build(),
                                 ],
                             ),
                         )
                         .build(),
                     )
                     .attribute(
-                        AttributeSchema::optional(
+                        PatternAttributeSchema::optional(
                             "rules",
-                            AttributeType::list(AttributeType::struct_(
+                            PatternAttributeType::list(PatternAttributeType::struct_(
                                 "InternetGatewayRule",
                                 vec![
-                                    StructField::optional("port", AttributeType::int()).build(),
-                                    StructField::optional("description", AttributeType::string())
-                                        .build(),
+                                    PatternStructField::optional(
+                                        "port",
+                                        PatternAttributeType::int(),
+                                    )
+                                    .build(),
+                                    PatternStructField::optional(
+                                        "description",
+                                        PatternAttributeType::string(),
+                                    )
+                                    .build(),
                                 ],
                             )),
                         )
                         .build(),
                     ),
-                ResourceSchema::new("ec2.NatGateway").attribute(
-                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
-                        .build(),
+                PatternResourceSchema::new("ec2.NatGateway").attribute(
+                    PatternAttributeSchema::optional(
+                        "tags",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
                 ),
             ]
         };
@@ -2848,36 +2949,51 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             vec![
-                ResourceSchema::new("ec2.Vpc")
+                PatternResourceSchema::new("ec2.Vpc")
                     .attribute(
-                        AttributeSchema::optional("cidr_block", AttributeType::string())
-                            .create_only()
-                            .build(),
+                        PatternAttributeSchema::optional(
+                            "cidr_block",
+                            PatternAttributeType::string(),
+                        )
+                        .create_only()
+                        .build(),
                     )
                     .attribute(
-                        AttributeSchema::provider_populated("vpc_id", AttributeType::string())
-                            .build(),
+                        PatternAttributeSchema::provider_populated(
+                            "vpc_id",
+                            PatternAttributeType::string(),
+                        )
+                        .build(),
                     )
                     .with_coexisting_replacement(),
-                ResourceSchema::new("ec2.Subnet")
+                PatternResourceSchema::new("ec2.Subnet")
                     .attribute(
-                        AttributeSchema::optional("vpc_id", AttributeType::string())
+                        PatternAttributeSchema::optional("vpc_id", PatternAttributeType::string())
                             .create_only()
                             .build(),
                     )
                     .attribute(
-                        AttributeSchema::optional("cidr_block", AttributeType::string())
-                            .create_only()
-                            .build(),
+                        PatternAttributeSchema::optional(
+                            "cidr_block",
+                            PatternAttributeType::string(),
+                        )
+                        .create_only()
+                        .build(),
                     )
                     .attribute(
-                        AttributeSchema::optional("availability_zone", AttributeType::string())
-                            .create_only()
-                            .build(),
+                        PatternAttributeSchema::optional(
+                            "availability_zone",
+                            PatternAttributeType::string(),
+                        )
+                        .create_only()
+                        .build(),
                     )
                     .attribute(
-                        AttributeSchema::provider_populated("subnet_id", AttributeType::string())
-                            .build(),
+                        PatternAttributeSchema::provider_populated(
+                            "subnet_id",
+                            PatternAttributeType::string(),
+                        )
+                        .build(),
                     )
                     .with_coexisting_replacement(),
             ]
@@ -3088,7 +3204,7 @@ let vpc = awscc.ec2.Vpc {{
 
 fn concrete_subnet_identity(
     ctx: &WiringContext,
-    providers: &[ProviderConfig],
+    providers: &[carina_core::parser::ExpandedProviderConfig],
     vpc_id: &str,
     cidr_block: &str,
 ) -> ResourceIdentity {
@@ -3113,14 +3229,14 @@ fn concrete_subnet_identity(
 fn seed_apply_cascade_state(
     fixture: &ApplyCancellationFixture,
     ctx: &WiringContext,
-    providers: &[ProviderConfig],
+    providers: &[carina_core::parser::ExpandedProviderConfig],
     include_subnet: bool,
 ) {
     let mut vpc_state = ResourceState::try_applied("ec2.Vpc", "vpc", "awscc", "vpc-old")
         .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
         .with_attribute("vpc_id", serde_json::json!("vpc-old"));
-    vpc_state.binding = Some("vpc".to_string());
+    vpc_state.binding = Some(absolute_binding("vpc"));
 
     let mut state_file = carina_state::StateFile::new();
     state_file
@@ -3138,7 +3254,9 @@ fn seed_apply_cascade_state(
         .with_attribute("vpc_id", serde_json::json!("vpc-old"))
         .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
         .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-        subnet_state.dependency_bindings.insert("vpc".to_string());
+        subnet_state
+            .dependency_bindings
+            .insert(absolute_binding("vpc"));
         state_file
             .upsert_resource(subnet_state)
             .expect("test state setup must be valid");
@@ -3155,7 +3273,7 @@ fn seed_apply_cascade_state_with_deposed(
         .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.221.0.0/16"))
         .with_attribute("vpc_id", serde_json::json!("vpc-new"));
-    vpc_state.binding = Some("vpc".to_string());
+    vpc_state.binding = Some(absolute_binding("vpc"));
     for identifier in deposed_identifiers {
         vpc_state.deposed.push(DeposedInstance::from_persisted_json(
             DeposedKey::new_unique(),
@@ -3586,7 +3704,10 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         load_and_resolve_module_data_source_fixture(&fixture, &shared);
 
     assert_eq!(
-        parsed.data_sources[0].binding.as_deref(),
+        parsed.data_sources[0]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
         Some("registry_publish.caller"),
         "module resolution must prefix the data-source binding"
     );
@@ -3726,7 +3847,7 @@ let lookup = read mock.iam.Roles {{
         &SchemaRegistry::new(),
     )
     .expect("phase-2 module constraint fixture must load");
-    let mut parsed = loaded.parsed;
+    let mut parsed = loaded.parsed.into_parsed();
     let unresolved_parsed = loaded.unresolved_parsed;
     let validation_errors = validate_with_test_factories(
         &parsed,
@@ -3739,36 +3860,37 @@ let lookup = read mock.iam.Roles {{
         &loaded.duplicate_declarations,
     );
     assert!(validation_errors.is_empty(), "{validation_errors:?}");
-    let mut composition = saved_module_composition(
-        Value::<carina_core::resource::ParserPlaceholder>::Concrete(ConcreteValue::String(
-            "bad".into(),
-        )),
-        "bad",
-    );
+    let mut composition =
+        authored_module_composition(
+            Value::<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::RelativeBindingName,
+            >::Concrete(ConcreteValue::String("bad".into())),
+            "bad",
+        );
     composition.signature.attributes.insert(
         "value".to_string(),
         carina_core::resource::LiveCompositionAttribute::from_value(
-            Value::<carina_core::resource::ParserPlaceholder>::Concrete(ConcreteValue::String(
-                "^existing$".to_string().into(),
-            )),
+            Value::<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::RelativeBindingName,
+            >::Concrete(ConcreteValue::String("^existing$".to_string().into())),
             None,
         ),
     );
     parsed.compositions.push(composition);
     parsed.data_sources[0].set_attr(
         "name_regex",
-        Value::resource_ref("checked", "value", Vec::new()),
+        Value::<
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::RelativeBindingName,
+        >::resource_ref("checked", "value", Vec::new()),
     );
-    let expanded_provider_configs = parsed
-        .clone()
-        .into_expanded()
-        .expect("phase-2 constraint fixture has no leftover parser placeholders")
-        .providers;
-    let wiring = ValidatedWiring::from_factories_for_test(
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
-        &expanded_provider_configs,
+        &parsed.providers,
     );
     let observer_factory = fixture.observer_factory();
 
@@ -3841,20 +3963,21 @@ fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &s
 
 #[test]
 fn export_only_fast_path_is_disabled_when_deferred_reads_exist() {
-    let mut data_source = DataSource::with_provider("mock", "iam.Roles", "roles", None);
-    data_source.binding = Some("roles".to_string());
+    let mut data_source: DataSource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
+    data_source.binding = Some(absolute_binding("roles"));
     data_source.attributes.insert(
         "name_regex".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: carina_core::resource::AccessPath::new("target_role", "role_name"),
+            path: carina_core::resource::AccessPath::new("target_role", "role_name")
+                .resolve_root_for_test(),
         }),
     );
     let mut plan = Plan::new();
     plan.add(carina_core::effect::Effect::Read {
         resource: carina_core::resource::ResolvedDataSource::new(data_source.clone()),
     });
-    let mut target = Resource::with_provider("mock", "iam.Role", "target_role", None);
-    target.binding = Some("target_role".to_string());
+    let mut target: Resource = Resource::with_provider("mock", "iam.Role", "target_role", None);
+    target.binding = Some(absolute_binding("target_role"));
     let data_sources = [data_source];
     let mut classified = crate::wiring::classify_apply_time_data_source_read_inputs(
         &data_sources,
@@ -3880,19 +4003,19 @@ fn export_only_fast_path_is_disabled_when_deferred_reads_exist() {
 
 #[test]
 fn apply_time_classification_uses_folded_data_source_preserved_dependency() {
-    let mut data_source =
+    let mut data_source: DataSource =
         DataSource::with_provider("mock", "iam.Roles", "registry_publish.roles", None);
-    data_source.binding = Some("registry_publish.roles".to_string());
+    data_source.binding = Some(absolute_binding("registry_publish.roles"));
     data_source
         .attributes
         .insert("name_regex".to_string(), string_value("^target-role$"));
     data_source
         .dependency_bindings
-        .insert("registry_publish.target_role".to_string());
+        .insert(absolute_binding("registry_publish.target_role"));
     let id = data_source.id.clone();
-    let mut target =
+    let mut target: Resource =
         Resource::with_provider("mock", "iam.Role", "registry_publish.target_role", None);
-    target.binding = Some("registry_publish.target_role".to_string());
+    target.binding = Some(absolute_binding("registry_publish.target_role"));
 
     let data_sources = [data_source];
     let mut classified = crate::wiring::classify_apply_time_data_source_read_inputs(
@@ -3919,7 +4042,7 @@ fn apply_time_classification_uses_folded_data_source_preserved_dependency() {
 
 #[test]
 fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
-    let configured = DataSource::with_provider("mock", "iam.Roles", "configured", None);
+    let configured: DataSource = DataSource::with_provider("mock", "iam.Roles", "configured", None);
     let unexpected: DataSource = DataSource::with_provider("mock", "iam.Roles", "unexpected", None);
 
     let missing = data_source_values_from_saved_plan(std::slice::from_ref(&configured), &[])
@@ -3972,29 +4095,29 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     }
 
     let target_id = ResourceId::with_provider_identity("mock", "test.resource", "target", None);
-    let mut target = Resource::with_provider("mock", "test.resource", "target", None);
+    let mut target: Resource = Resource::with_provider("mock", "test.resource", "target", None);
     target.id = target_id.clone();
-    target.binding = Some("target".to_string());
+    target.binding = Some(absolute_binding("target"));
     target.set_attr(
         "name",
         Value::Concrete(ConcreteValue::String("target".into())),
     );
 
     let lookup_id = ResourceId::with_provider_identity("mock", "iam.Roles", "lookup", None);
-    let mut lookup = DataSource::with_provider("mock", "iam.Roles", "lookup", None);
+    let mut lookup: DataSource = DataSource::with_provider("mock", "iam.Roles", "lookup", None);
     lookup.id = lookup_id.clone();
-    lookup.binding = Some("lookup".to_string());
+    lookup.binding = Some(absolute_binding("lookup"));
     lookup.set_attr(
         "name_regex",
         Value::Deferred(DeferredValue::ResourceRef {
-            path: carina_core::resource::AccessPath::new("target", "name"),
+            path: carina_core::resource::AccessPath::new("target", "name").resolve_root_for_test(),
         }),
     );
 
     let consumer_id = ResourceId::with_provider_identity("mock", "test.resource", "consumer", None);
-    let mut consumer = Resource::with_provider("mock", "test.resource", "consumer", None);
+    let mut consumer: Resource = Resource::with_provider("mock", "test.resource", "consumer", None);
     consumer.id = consumer_id.clone();
-    consumer.binding = Some("consumer".to_string());
+    consumer.binding = Some(absolute_binding("consumer"));
     consumer.set_attr(
         "name",
         Value::Concrete(ConcreteValue::String("consumer".into())),
@@ -4007,7 +4130,8 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
                 "names",
                 Vec::new(),
                 vec![carina_core::resource::Subscript::Int { index: 0 }],
-            ),
+            )
+            .resolve_root_for_test(),
         }),
     );
 
@@ -4139,25 +4263,22 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         std::env::set_var("CARINA_MOCK_OP_LOG", &op_log_path);
     }
 
-    let mut producer = Resource::with_provider("mock", "test.resource", "producer", None);
-    producer.binding = Some("producer".to_string());
+    let mut producer: Resource = Resource::with_provider("mock", "test.resource", "producer", None);
+    producer.binding = Some(absolute_binding("producer"));
     producer.set_attr("name", string_value("bad"));
     let producer_id = producer.id.clone();
 
-    let mut consumer = Resource::with_provider("mock", "test.resource", "consumer", None);
-    consumer.binding = Some("consumer".to_string());
+    let mut consumer: Resource = Resource::with_provider("mock", "test.resource", "consumer", None);
+    consumer.binding = Some(absolute_binding("consumer"));
     consumer.set_attr("name", string_value("consumer"));
-    consumer.set_attr(
-        "comment",
-        Value::resource_ref("producer", "identifier", vec![]),
-    );
-    consumer.dependency_bindings.insert("producer".to_string());
+    consumer.set_attr("comment", root_resource_ref("producer", "identifier"));
+    consumer
+        .dependency_bindings
+        .insert(absolute_binding("producer"));
     let consumer_id = consumer.id.clone();
 
-    let composition = saved_module_composition(
-        Value::resource_ref("producer", "identifier", vec![]),
-        "bad-id",
-    );
+    let composition =
+        saved_module_composition(root_resource_ref("producer", "identifier"), "bad-id");
     let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
         .expect("create composition source identity resolver");
     let saved_composition = composition
@@ -4336,7 +4457,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
             name: "mock".to_string(),
             attributes: IndexMap::from([(
                 "region".to_string(),
-                Value::resource_ref("mgmt", "region", vec![]),
+                root_resource_ref("mgmt", "region"),
             )]),
             default_tags: IndexMap::new(),
             source: None,
@@ -4424,9 +4545,15 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     )
     .expect("load plan fixture")
     .parsed;
-    let parsed = parsed
-        .into_expanded()
-        .expect("saved-plan provider fixture has no parser placeholders");
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
+        &downstream,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution")
+    .into_expanded()
+    .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
         &parsed,
         &downstream,
@@ -4500,10 +4627,14 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
 async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     let fixture = ApplyCancellationFixture::new();
     let mut parsed = carina_core::parser::InferredFile::default();
-    parsed.compositions = vec![saved_module_composition(
-        Value::<carina_core::resource::ParserPlaceholder>::resource_ref("missing", "value", vec![]),
-        "bad",
-    )];
+    parsed.compositions =
+        vec![authored_module_composition(
+            Value::<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::RelativeBindingName,
+            >::resource_ref("missing", "value", vec![]),
+            "bad",
+        )];
     let unresolved_parsed = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
@@ -4838,8 +4969,8 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         "CARINA_MOCK_STATE_FILE",
         fixture.config_path().join("saved-plan-mock-state.json"),
     );
-    let mut resource = Resource::with_provider("mock", "test.resource", "slow", None);
-    resource.binding = Some("slow".to_string());
+    let mut resource: Resource = Resource::with_provider("mock", "test.resource", "slow", None);
+    resource.binding = Some(absolute_binding("slow"));
     resource.set_attr("name", string_value("slow"));
     let resource_id = resource.id.clone();
     let mut plan = Plan::new();
@@ -5508,7 +5639,7 @@ awscc.ec2.Subnet {{
         .expect("fixture identifier is non-empty")
         .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
         .with_attribute("vpc_id", serde_json::json!("vpc-old"));
-    vpc_state.binding = Some("vpc".to_string());
+    vpc_state.binding = Some(absolute_binding("vpc"));
 
     let mut subnet_state = ResourceState::try_applied(
         "ec2.Subnet",
@@ -5525,7 +5656,9 @@ awscc.ec2.Subnet {{
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-    subnet_state.dependency_bindings.insert("vpc".to_string());
+    subnet_state
+        .dependency_bindings
+        .insert(absolute_binding("vpc"));
 
     let mut state_file = carina_state::StateFile::new();
     state_file
@@ -6413,7 +6546,7 @@ let consumer = mock.iam.Role {{
     );
 }
 
-fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::BackendConfig {
+fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::ExpandedBackendConfig {
     let mut attributes = HashMap::new();
     attributes.insert(
         "bucket".to_string(),
@@ -6689,9 +6822,14 @@ async fn bootstrap_declared_state_bucket(
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("versioning", AttributeType::string()).build()))
+        (PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("versioning", PatternAttributeType::string())
+                    .build(),
+            ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -6952,10 +7090,10 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional(
                 "bucket",
-                AttributeType::refined_string(None, Some("^state-".to_string()), None, None),
+                PatternAttributeType::refined_string(None, Some("^state-".to_string()), None, None),
             )
             .build(),
         ))
@@ -7028,8 +7166,9 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -7081,8 +7220,9 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -7128,9 +7268,14 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("observed", AttributeType::string()).build()))
+        (PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("observed", PatternAttributeType::string())
+                    .build(),
+            ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -7213,8 +7358,9 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -7302,8 +7448,9 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -7367,8 +7514,9 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build()))
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -7483,10 +7631,12 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     // This test verifies that write-only attributes are found when the schema key
     // includes the provider prefix.
     let mut schemas = SchemaRegistry::new();
-    let schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("ec2.Vpc")
         .attribute(
-            AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("ipv4_netmask_length", PatternAttributeType::int())
                 .write_only()
                 .build(),
         );
@@ -7562,23 +7712,27 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     // is carried over by the provider because CloudControl doesn't return it,
     // the state after apply should include the attribute under the canonical name.
     // This is the scenario in issue #1499 (iam_role/with_policy).
-    use carina_core::schema::StructField;
 
     let mut schemas = SchemaRegistry::new();
-    let schema = ResourceSchema::new("iam.role")
+    let schema = PatternResourceSchema::new("iam.role")
         .attribute(
-            AttributeSchema::optional("role_name", AttributeType::string())
+            PatternAttributeSchema::optional("role_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "policies",
-                AttributeType::unordered_list(AttributeType::struct_(
+                PatternAttributeType::unordered_list(PatternAttributeType::struct_(
                     "Policy".to_string(),
                     vec![
-                        StructField::required("policy_name", AttributeType::string()).build(),
-                        StructField::required("policy_document", AttributeType::string()).build(),
+                        PatternStructField::required("policy_name", PatternAttributeType::string())
+                            .build(),
+                        PatternStructField::required(
+                            "policy_document",
+                            PatternAttributeType::string(),
+                        )
+                        .build(),
                     ],
                 )),
             )
@@ -7820,12 +7974,13 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
         ]),
     };
 
+    let schema = schema.validate().expect("IAM schema must validate");
     let d = diff(
         &ResolvedResource::new(resource),
         &current,
         &saved,
         Some(&prev_explicit),
-        Some(&schema),
+        Some(schema.as_schema()),
         &carina_core::differ::exact_comparison_context_for_tests(),
     );
 
@@ -7844,22 +7999,26 @@ fn block_unique_name_attribute_state_roundtrip() {
     //
     // This covers the ec2_ipam case (operating_region -> operating_regions)
     // from issue #1499.
-    use carina_core::schema::StructField;
 
     let mut schemas = SchemaRegistry::new();
-    let schema = ResourceSchema::new("ec2.ipam")
+    let schema = PatternResourceSchema::new("ec2.ipam")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "operating_regions",
-                AttributeType::unordered_list(AttributeType::struct_(
+                PatternAttributeType::unordered_list(PatternAttributeType::struct_(
                     "IpamOperatingRegion".to_string(),
-                    vec![StructField::required("region_name", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::required("region_name", PatternAttributeType::string())
+                            .build(),
+                    ],
                 )),
             )
             .with_block_name("operating_region")
             .build(),
         )
-        .attribute(AttributeSchema::optional("description", AttributeType::string()).build());
+        .attribute(
+            PatternAttributeSchema::optional("description", PatternAttributeType::string()).build(),
+        );
     schemas.insert(
         "awscc",
         schema.validate().expect("schema fixture must be valid"),
@@ -7995,13 +8154,15 @@ fn move_plus_update_keeps_post_update_attributes() {
     use carina_state::{ResourceState, StateFile};
 
     let mut schemas = SchemaRegistry::new();
-    let schema = ResourceSchema::new("ec2.Tag")
+    let schema = PatternResourceSchema::new("ec2.Tag")
         .attribute(
-            AttributeSchema::optional("key", AttributeType::string())
+            PatternAttributeSchema::optional("key", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
-        .attribute(AttributeSchema::optional("value", AttributeType::string()).build());
+        .attribute(
+            PatternAttributeSchema::optional("value", PatternAttributeType::string()).build(),
+        );
     schemas.insert(
         "awscc",
         schema.validate().expect("schema fixture must be valid"),
@@ -8102,8 +8263,8 @@ fn move_alone_carries_attributes_via_managed_current() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional("bucket_name", AttributeType::string())
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -8238,8 +8399,8 @@ fn failed_refresh_preserves_existing_row() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional("bucket_name", AttributeType::string())
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -8303,8 +8464,8 @@ fn move_from_overlapping_desired_resource_errors() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional("bucket_name", AttributeType::string())
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -8369,8 +8530,8 @@ fn remove_overlapping_desired_resource_errors() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional("bucket_name", AttributeType::string())
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -8430,8 +8591,8 @@ fn self_move_overlapping_desired_resource_errors() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional("bucket_name", AttributeType::string())
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -8509,7 +8670,6 @@ fn format_duration_zero() {
 #[test]
 fn resolve_exports_resolves_cross_file_resource_refs() {
     use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
-    use carina_core::resource::Value;
 
     // Build a state file with a resource that has a binding and attributes
     let state = {
@@ -8540,19 +8700,15 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     let export_params = vec![ExportParameter {
         name: "account_id".to_string(),
         static_type: fixture_unchecked_export_static_type(),
-        value: Some(Value::resource_ref(
-            "registry_prod".to_string(),
-            "account_id".to_string(),
-            vec![],
-        )),
+        value: Some(root_resource_ref("registry_prod", "account_id")),
     }];
 
     // Mirror production callers: the resource is in sorted_resources
     // with a binding; provider-returned attributes flow in via
     // `managed_current` derived from `state.resources`.
-    let mut registry_prod =
+    let mut registry_prod: Resource =
         Resource::with_provider("awscc", "organizations.account", "registry-prod", None);
-    registry_prod.binding = Some("registry_prod".to_string());
+    registry_prod.binding = Some(absolute_binding("registry_prod"));
     let sorted_resources = vec![registry_prod];
 
     let post_apply_states =
@@ -8593,7 +8749,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // referencing `<module_call>.<attr>` failed with
     // `unresolved reference <call>.<attr>`.
     use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
-    use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
+    use carina_core::resource::LiveComposition;
 
     let state = {
         let json = serde_json::json!({
@@ -8617,9 +8773,9 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         state_file_from_json(json)
     };
 
-    let mut role_resource =
+    let mut role_resource: Resource =
         Resource::with_provider("awscc", "iam.Role", "github_actions_carina.role", None);
-    role_resource.binding = Some("github_actions_carina.role".to_string());
+    role_resource.binding = Some(absolute_binding("github_actions_carina.role"));
 
     // Virtual resource as `expand_module_call` produces it: binding is
     // the module-call alias, and each attribute is a ResourceRef into
@@ -8631,9 +8787,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     virt_attrs.insert(
         "role_arn".to_string(),
         carina_core::resource::LiveCompositionAttribute::from_value(
-            Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("github_actions_carina.role", "arn"),
-            }),
+            root_resource_ref("github_actions_carina.role", "arn"),
             None,
         ),
     );
@@ -8646,7 +8800,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
             attributes: virt_attrs,
             pending_constraints: Vec::new(),
         },
-        binding: Some("github_actions_carina".to_string()),
+        binding: Some(absolute_binding("github_actions_carina")),
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "github_module".to_string(),
         instance: "github_actions_carina".to_string(),
@@ -8659,9 +8813,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
         static_type: fixture_unchecked_export_static_type(),
-        value: Some(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("github_actions_carina", "role_arn"),
-        })),
+        value: Some(root_resource_ref("github_actions_carina", "role_arn")),
     }];
 
     let post_apply_states =
@@ -8706,7 +8858,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     // role's `arn` from state. Pins the resolver's transitive walk so a
     // regression that broke after a single hop would surface.
     use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
-    use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
+    use carina_core::resource::LiveComposition;
 
     let state = {
         let json = serde_json::json!({
@@ -8730,8 +8882,9 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         state_file_from_json(json)
     };
 
-    let mut role_resource = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
-    role_resource.binding = Some("outer.inner.role".to_string());
+    let mut role_resource: Resource =
+        Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
+    role_resource.binding = Some(absolute_binding("outer.inner.role"));
 
     // carina#3181: compositions are a distinct typestate.
     let make_virtual =
@@ -8743,9 +8896,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
             attributes.insert(
                 attr.to_string(),
                 carina_core::resource::LiveCompositionAttribute::from_value(
-                    Value::Deferred(DeferredValue::ResourceRef {
-                        path: AccessPath::new(ref_b, ref_a),
-                    }),
+                    root_resource_ref(ref_b, ref_a),
                     None,
                 ),
             );
@@ -8758,7 +8909,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
                     attributes,
                     pending_constraints: Vec::new(),
                 },
-                binding: Some(binding.to_string()),
+                binding: Some(absolute_binding(binding)),
                 dependency_bindings: std::collections::BTreeSet::new(),
                 module_name: "mod".to_string(),
                 instance: binding.to_string(),
@@ -8786,9 +8937,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
         static_type: fixture_unchecked_export_static_type(),
-        value: Some(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("outer", "public_role_arn"),
-        })),
+        value: Some(root_resource_ref("outer", "public_role_arn")),
     }];
 
     let pre_resolve_compositions = vec![inner_virtual, outer_virtual];
@@ -8869,8 +9018,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
     use carina_core::resolver::resolve_managed_refs_with_state_and_remote;
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, LiveComposition, ResourceId,
-        State as ResourceState, Value,
+        ConcreteValue, LiveComposition, ResourceId, State as ResourceState, Value,
     };
     use std::collections::HashMap;
 
@@ -8922,8 +9070,9 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // head-of-pipeline resolver — they keep their authored
     // `ResourceRef`s, which is exactly the pre-resolve snapshot the
     // #3177 fix needs.
-    let mut role_managed = Resource::with_provider("awscc", "iam.Role", "carina_role", None);
-    role_managed.binding = Some("role".to_string());
+    let mut role_managed: Resource =
+        Resource::with_provider("awscc", "iam.Role", "carina_role", None);
+    role_managed.binding = Some(absolute_binding("role"));
 
     let mut virt_attrs: indexmap::IndexMap<
         String,
@@ -8932,9 +9081,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     virt_attrs.insert(
         "role_arn".to_string(),
         carina_core::resource::LiveCompositionAttribute::from_value(
-            Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("role", "arn"),
-            }),
+            root_resource_ref("role", "arn"),
             None,
         ),
     );
@@ -8948,7 +9095,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             attributes: virt_attrs,
             pending_constraints: Vec::new(),
         },
-        binding: Some("carina_module".to_string()),
+        binding: Some(absolute_binding("carina_module")),
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "carina_module".to_string(),
         instance: "carina_module".to_string(),
@@ -8984,9 +9131,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     let export_params = vec![ExportParameter {
         name: "role_arn".to_string(),
         static_type: fixture_unchecked_export_static_type(),
-        value: Some(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("carina_module", "role_arn"),
-        })),
+        value: Some(root_resource_ref("carina_module", "role_arn")),
     }];
 
     let post_apply_states =
@@ -9046,8 +9191,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // at the pre-apply literal in production.
     use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DataSource, DeferredValue, ResourceId, State as ResourceState,
-        Value,
+        ConcreteValue, DataSource, ResourceId, State as ResourceState, Value,
     };
     use std::collections::HashMap;
 
@@ -9069,8 +9213,9 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
 
     // The authored data source: `let admin_access_roles = read aws.iam.Roles { ... }`.
     let ds_id = ResourceId::with_provider_identity("aws", "iam.Roles", "admin_access_roles", None);
-    let mut ds = DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
-    ds.binding = Some("admin_access_roles".to_string());
+    let mut ds: DataSource =
+        DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    ds.binding = Some(absolute_binding("admin_access_roles"));
     ds.attributes.insert(
         "path_prefix".to_string(),
         Value::Concrete(ConcreteValue::String(
@@ -9098,9 +9243,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     let export_params = vec![ExportParameter {
         name: "admin_access_role_arns".to_string(),
         static_type: fixture_unchecked_export_static_type(),
-        value: Some(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("admin_access_roles", "arns"),
-        })),
+        value: Some(root_resource_ref("admin_access_roles", "arns")),
     }];
 
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
@@ -9234,41 +9377,57 @@ async fn confirm_apply_returns_interrupted_when_cancel_token_fires() {
 // registry shape (chained `opt.resource_record.name`, resolvable since
 // carina#3136) materializes + resolves identically on the apply side.
 mod apply_deferred_for_parity {
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use carina_core::binding_index::WaitAliasSpec;
     use carina_core::data_source_value::DataSourceValues;
     use carina_core::parser::{ProviderContext, parse_file};
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
-    use carina_core::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-    };
+    use carina_core::schema::SchemaRegistry;
     use std::collections::HashMap;
 
+    fn parse_resolved(source: &str) -> carina_core::parser::ModuleResolvedParsedFile {
+        let parsed = parse_file(
+            source,
+            std::path::Path::new("apply_deferred_for.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("parse");
+        carina_core::module_resolver::resolve_modules_providerless(
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("cross the deferred-body resolution seam")
+    }
+
     fn comparison_schemas() -> SchemaRegistry {
-        let certificate = ResourceSchema::new("acm.Certificate")
+        let certificate = PatternResourceSchema::new("acm.Certificate")
             .attribute(
-                AttributeSchema::optional("domain_name", AttributeType::string())
+                PatternAttributeSchema::optional("domain_name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated(
+                PatternAttributeSchema::provider_populated(
                     "domain_validation_options",
-                    AttributeType::list(AttributeType::struct_(
+                    PatternAttributeType::list(PatternAttributeType::struct_(
                         "DomainValidation",
                         vec![
-                            StructField::provider_populated(
+                            PatternStructField::provider_populated(
                                 "resource_record",
-                                AttributeType::struct_(
+                                PatternAttributeType::struct_(
                                     "ResourceRecord",
                                     vec![
-                                        StructField::provider_populated(
+                                        PatternStructField::provider_populated(
                                             "name",
-                                            AttributeType::string(),
+                                            PatternAttributeType::string(),
                                         )
                                         .build(),
-                                        StructField::provider_populated(
+                                        PatternStructField::provider_populated(
                                             "value",
-                                            AttributeType::string(),
+                                            PatternAttributeType::string(),
                                         )
                                         .build(),
                                     ],
@@ -9293,7 +9452,7 @@ mod apply_deferred_for_parity {
         let cert = parsed
             .resources
             .iter()
-            .find(|r| r.binding.as_deref() == Some("cert"))
+            .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("cert"))
             .expect("parsed cert resource");
         let mut rr = indexmap::IndexMap::new();
         rr.insert(
@@ -9349,17 +9508,7 @@ mod apply_deferred_for_parity {
                 }
             }
         "#;
-        let parsed = parse_file(
-            src,
-            std::path::Path::new("apply_deferred_for.crn"),
-            &ProviderContext::default(),
-        )
-        .expect("parse");
-        let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
-            std::path::Path::new("."),
-        )
-        .expect("cross the deferred-body resolution seam");
+        let parsed = parse_resolved(src);
         let states = dvo_state(&parsed);
         let parsed = parsed
             .into_expanded()
@@ -9430,12 +9579,7 @@ mod apply_deferred_for_parity {
                 aws.route53.RecordSet { name = opt.resource_record.name }
             }
         "#;
-        let parsed = parse_file(
-            src,
-            std::path::Path::new("apply_deferred_for.crn"),
-            &ProviderContext::default(),
-        )
-        .expect("parse");
+        let parsed = parse_resolved(src);
         let parsed = parsed
             .into_expanded()
             .expect("deferred-for fixture must contain only loop slots");
@@ -9494,17 +9638,7 @@ mod apply_deferred_for_parity {
             }
         "#
         .replacen("LOOP_TARGET", loop_target, 1);
-        let parsed = parse_file(
-            &src,
-            std::path::Path::new("apply_deferred_for.crn"),
-            &ProviderContext::default(),
-        )
-        .expect("parse");
-        let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
-            std::path::Path::new("."),
-        )
-        .expect("cross the deferred-body resolution seam");
+        let parsed = parse_resolved(&src);
         let states = dvo_state(&parsed);
         let parsed = parsed
             .into_expanded()
@@ -9513,14 +9647,11 @@ mod apply_deferred_for_parity {
         let mut schemas = carina_core::schema::SchemaRegistry::new();
         schemas.insert(
             "aws",
-            carina_core::schema::ResourceSchema::new("route53.RecordSet")
+            PatternResourceSchema::new("route53.RecordSet")
                 .attribute(
-                    carina_core::schema::AttributeSchema::optional(
-                        "name",
-                        carina_core::schema::AttributeType::string(),
-                    )
-                    .create_only()
-                    .build(),
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .create_only()
+                        .build(),
                 )
                 .validate()
                 .expect("record-set schema fixture must be valid"),
@@ -9561,7 +9692,10 @@ mod apply_deferred_for_parity {
             assert!(child.binding.is_none());
             assert!(child.loop_provenance.display_origin().is_some());
         } else {
-            assert_eq!(child.binding.as_deref(), Some("records[0]"));
+            assert_eq!(
+                child.binding.as_ref().map(|binding| binding.as_str()),
+                Some("records[0]")
+            );
         }
 
         // Declare it a `moved` `to`: it must drop out of the refreshable
@@ -9607,6 +9741,7 @@ mod apply_deferred_for_parity {
 
 #[cfg(test)]
 mod saved_plan_version_tests {
+
     //! Saved plan formats have no backward-compatibility path: re-running
     //! `carina plan` is the supported migration. Version 37 requires deferred
     //! diagnostic locations. Version 36 adds typed
@@ -9622,6 +9757,9 @@ mod saved_plan_version_tests {
     //! version 25 persists total data-source outcomes (carina#3993); version 24
     //! removed the wait target schema kind (carina#3916), and version 23 added
     //! the mandatory provider schema fingerprint snapshot (carina#3983).
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
+    };
 
     use std::path::Path;
 
@@ -10474,7 +10612,7 @@ mod saved_plan_version_tests {
         .await;
 
         let error = result.expect_err("malformed current-version plan must be rejected");
-        let message = error.to_string();
+        let message = crate::error::format_error_with_source_chain(&error);
         assert!(
             message.contains("The plan file may be corrupted. Re-run"),
             "current-version structural errors must be reported as corruption: {message}",
@@ -10498,7 +10636,7 @@ mod saved_plan_version_tests {
 
     fn replacement_plan_json() -> (TempDir, std::path::PathBuf, serde_json::Value) {
         use carina_core::provider::ProviderRouter;
-        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+        use carina_core::schema::SchemaRegistry;
 
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
@@ -10523,8 +10661,8 @@ mod saved_plan_version_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "",
-            (ResourceSchema::new("ec2.Vpc").attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+            (PatternResourceSchema::new("ec2.Vpc").attribute(
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             ))
@@ -10578,7 +10716,10 @@ mod saved_plan_version_tests {
             wait_bindings: Vec::new(),
         }
         .record_for_test(
-            &crate::wiring::ValidatedConfig::from_factories_with_additional_schemas_for_test(
+            &crate::wiring::ValidatedConfig::from_factories_with_additional_schemas_for_test::<
+                carina_core::resource::NoPlaceholder,
+                carina_core::resource::AbsoluteBindingAddress,
+            >(
                 (),
                 Vec::new(),
                 &[],
@@ -10636,7 +10777,8 @@ mod saved_plan_version_tests {
         )
         .await;
 
-        result.expect_err(expectation).to_string()
+        let error = result.expect_err(expectation);
+        crate::error::format_error_with_source_chain(&error)
     }
 
     fn replace_first_resource_identity(value: &mut serde_json::Value, identity: &str) -> bool {

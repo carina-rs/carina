@@ -212,6 +212,51 @@ fn anonymous_loop_identical_identity_error() {
 }
 
 #[test]
+fn equal_nested_identity_has_identical_typed_validate_and_plan_errors_across_files() {
+    let scenario = Scenario::from_fixture("anonymous_equal_nested_identity");
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+
+    let mut typed_messages = Vec::new();
+    for args in [
+        ["validate", "."].as_slice(),
+        ["plan", "--refresh=false", "."].as_slice(),
+    ] {
+        let output = scenario.carina(args);
+        assert!(
+            !output.status.success(),
+            "carina {} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+            args[0],
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let typed = stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("Error: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            typed.starts_with(
+                "Anonymous resources of type 'mock.budgets.Budget' on the same provider route \
+                 have equal declared identity values and produce address ",
+            ),
+            "missing typed equal-identity diagnostic from carina {}: {stderr}",
+            args[0],
+        );
+        assert!(
+            typed.ends_with("Give one of them a name with `let`."),
+            "diagnostic must explain the repair: {typed}",
+        );
+        typed_messages.push(typed);
+    }
+
+    assert_eq!(
+        typed_messages[0], typed_messages[1],
+        "validate and plan must report the same typed identity error",
+    );
+}
+
+#[test]
 fn anonymous_loop_moved_to_legacy() {
     assert_validate_and_plan_error(
         "anonymous_loop_moved_to_legacy",

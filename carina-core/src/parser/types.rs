@@ -180,9 +180,9 @@ pub(super) fn parse_type_expr(
 /// Derived from [`crate::schema::builtin_type_registry`], the same source used
 /// for provider admission and validator reconstruction.
 pub fn builtin_bare_custom_types()
--> &'static std::collections::BTreeMap<String, crate::schema::AttributeType> {
+-> &'static std::collections::BTreeMap<String, crate::schema::CompiledAttributeType> {
     static TYPES: std::sync::OnceLock<
-        std::collections::BTreeMap<String, crate::schema::AttributeType>,
+        std::collections::BTreeMap<String, crate::schema::CompiledAttributeType>,
     > = std::sync::OnceLock::new();
     TYPES.get_or_init(|| {
         crate::schema::builtin_type_registry()

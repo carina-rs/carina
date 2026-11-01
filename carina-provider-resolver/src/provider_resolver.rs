@@ -22,6 +22,7 @@ use carina_core::parser::ProviderConfig;
 use carina_core::provider_source::{
     FileSource, GithubSource, ProviderSource, RegistrySource, RemoteSource, RemoteSourceKey,
 };
+use carina_core::resource::{BindingAddress, PlaceholderKind};
 use carina_core::version_constraint::VersionConstraint;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -4128,9 +4129,9 @@ impl LockFile {
             .find(|e| Self::sources_match(&e.source, source))
     }
 
-    fn find_by_remote_config(
+    fn find_by_remote_config<P: PlaceholderKind, B: BindingAddress>(
         &self,
-        config: &ProviderConfig,
+        config: &ProviderConfig<P, B>,
         source: &RemoteSource,
     ) -> Option<&LockEntry<RegistryLock>> {
         let source_key = source.source_key();
@@ -9015,9 +9016,9 @@ pub fn find_file_provider_source(
     InstalledProvider::file_source(path, config.name.clone(), file_source, base_dir)
 }
 
-fn lock_entry_matches_remote_config(
+fn lock_entry_matches_remote_config<P: PlaceholderKind, B: BindingAddress>(
     entry: &LockEntry<RegistryLock>,
-    config: &ProviderConfig,
+    config: &ProviderConfig<P, B>,
     source: &RemoteSource,
 ) -> bool {
     match (source, config.revision.as_deref(), &entry.kind) {
@@ -9142,9 +9143,9 @@ fn lock_entry_matches_remote_config(
     }
 }
 
-fn select_locked_artifact<'lock>(
+fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
     base_dir: &Path,
-    config: &ProviderConfig,
+    config: &ProviderConfig<P, B>,
     remote_source: &RemoteSource,
     lock_file: &'lock LockFile,
 ) -> Result<Option<LockArtifactSelection<'lock>>, FindInstalledProviderError> {
@@ -9262,9 +9263,9 @@ pub fn provider_artifact_fingerprint(
 /// provenance that selected it. This is used by the LSP to avoid
 /// editor-triggered downloads as well as by CLI load paths after `carina init`
 /// has installed the artifact.
-pub fn find_installed_provider(
+pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &Path,
-    config: &ProviderConfig,
+    config: &ProviderConfig<P, B>,
 ) -> Result<InstalledProvider, FindInstalledProviderError> {
     let source = config
         .source
@@ -10509,9 +10510,9 @@ fn print_any_depth_warning(patterns: &BTreeSet<crate::HostPattern>) {
 ///
 /// Called before plan/apply to catch cases where the lock file and constraints have
 /// drifted out of sync (e.g., the user tightened a constraint after last `carina init`).
-pub fn validate_lock_constraints(
+pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &Path,
-    providers: &[ProviderConfig],
+    providers: &[ProviderConfig<P, B>],
 ) -> Result<(), LockConstraintError> {
     let lock_file = match load_lock_file(base_dir)? {
         Some(lf) => lf,

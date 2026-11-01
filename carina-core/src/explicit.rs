@@ -14,7 +14,10 @@ use crate::resource::{
     CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, Resource, Value,
     pair_list_elements, pair_list_elements_with_uniqueness,
 };
-use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
+use crate::schema::{
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    empty_defs_for_schema_walks,
+};
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1702,8 +1705,12 @@ fn project_legacy_value(value: Value, explicit: &ExplicitFields) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ApplyTimeUnknown, DeferredValue};
+    use crate::resource::{ApplyTimeUnknown, DeferredValue, RelativeBindingName, RootScope};
     use indexmap::IndexMap;
+
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
+    }
 
     fn build_carried_from_resource_for_stored_values<S>(
         resource: &Resource<S>,
@@ -1848,7 +1855,7 @@ mod tests {
     }
 
     fn build_attribute_explicit(desired: Value, stored: Option<Value>) -> ExplicitFields {
-        let resource =
+        let resource: Resource =
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
         let stored_attributes = stored
             .map(|stored| HashMap::from([("items".to_string(), stored)]))
@@ -1883,7 +1890,7 @@ mod tests {
     #[test]
     fn stored_builder_uses_sent_basis_per_top_level_attribute() {
         let desired_items = Value::Concrete(ConcreteValue::List(vec![rule(80, Some("authored"))]));
-        let resource = Resource::new("example.Listener", "listener")
+        let resource: Resource = Resource::new("example.Listener", "listener")
             .with_attribute(
                 "description",
                 Value::Concrete(ConcreteValue::String("after".into())),
@@ -1980,7 +1987,7 @@ mod tests {
         fresh_items: Vec<Value>,
         schema: Option<&ResourceSchema>,
     ) -> ExplicitFields {
-        let resource = Resource::new("example.Listener", "listener")
+        let resource: Resource = Resource::new("example.Listener", "listener")
             .with_attribute("items", Value::Concrete(ConcreteValue::List(desired_items)));
         let prior_stored = HashMap::from([(
             "items".to_string(),
@@ -2256,7 +2263,7 @@ mod tests {
         };
         let one = Value::Concrete(ConcreteValue::Int(1));
         let two = Value::Concrete(ConcreteValue::Int(2));
-        let resource = Resource::new("example.Listener", "listener").with_attribute(
+        let resource: Resource = Resource::new("example.Listener", "listener").with_attribute(
             "items",
             Value::Concrete(ConcreteValue::List(vec![two.clone()])),
         );
@@ -2281,7 +2288,7 @@ mod tests {
     #[test]
     fn carried_list_without_prior_stored_mixed_list_without_removal_uses_rebuilt_record() {
         let desired_items = vec![rule(80, Some("web")), rule(443, None)];
-        let resource = Resource::new("example.Listener", "listener").with_attribute(
+        let resource: Resource = Resource::new("example.Listener", "listener").with_attribute(
             "items",
             Value::Concrete(ConcreteValue::List(desired_items.clone())),
         );
@@ -2470,7 +2477,9 @@ mod tests {
 
     #[test]
     fn carried_whole_value_fallback_survives_refresh_until_values_converge() {
-        use crate::schema::{AttributeSchema, StructField};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
+        };
 
         let prior_explicit = ExplicitFields::Struct {
             children: HashMap::from([("items".to_string(), whole_value(&[&["description"]]))]),
@@ -2648,7 +2657,7 @@ mod tests {
         assert_eq!(
             build_from_value(&Value::Deferred(DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "upstream".to_string(),
+                    binding: absolute_binding("upstream"),
                 },
             ))),
             ExplicitFields::Leaf
@@ -2708,7 +2717,10 @@ mod tests {
 
     #[test]
     fn aligned_builder_pairing_matches_schema_aware_differ_pairing() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+            CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+        };
 
         let effect_type = AttributeType::enum_(
             crate::schema::TypeIdentity::bare("Effect"),
@@ -2749,7 +2761,7 @@ mod tests {
         ])));
         let desired = Value::Concrete(ConcreteValue::List(vec![desired_item]));
         let stored = Value::Concrete(ConcreteValue::List(vec![stored_item]));
-        let resource =
+        let resource: Resource =
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
         let stored_attributes = HashMap::from([("items".to_string(), stored)]);
         let sent = crate::executor::AcceptedRequest::create_for_test();
@@ -2899,7 +2911,7 @@ mod tests {
         let aligned = build_attribute_explicit(
             Value::Deferred(DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "upstream".to_string(),
+                    binding: absolute_binding("upstream"),
                 },
             )),
             Some(Value::Concrete(ConcreteValue::List(vec![rule(
@@ -3530,7 +3542,7 @@ mod tests {
         let current = Value::Concrete(ConcreteValue::List(vec![current_item.clone()]));
         let desired = Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
             DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".to_string(),
+                binding: absolute_binding("upstream"),
             }),
         )]));
         let explicit = ExplicitFields::ListElements {

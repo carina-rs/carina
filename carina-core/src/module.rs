@@ -184,7 +184,7 @@ fn format_value(value: &Value) -> String {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             format!("{}.{}", path.binding(), path.attribute())
         }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => binding.clone(),
+        Value::Deferred(DeferredValue::BindingRef { binding }) => binding.to_string(),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             format!("{} ?? {}", format_value(value), format_value(default))
         }
@@ -398,7 +398,8 @@ pub struct ModuleCallInfo {
 fn resource_graph_binding(resource: &Resource, declaration_index: usize) -> String {
     resource
         .binding
-        .clone()
+        .as_ref()
+        .map(ToString::to_string)
         .unwrap_or_else(|| format!("<anonymous:{declaration_index}>"))
 }
 
@@ -443,7 +444,7 @@ impl RootConfigSignature {
             .iter()
             .map(|call| ModuleCallInfo {
                 module_name: call.module_name.clone(),
-                binding_name: call.binding_name.clone(),
+                binding_name: call.binding_name.as_ref().map(ToString::to_string),
                 arguments: call.arguments().map(|(name, _)| name.to_string()).collect(),
             })
             .collect();
@@ -512,11 +513,11 @@ impl RootConfigSignature {
             // displayed `attribute` slot stays empty so
             // `format_dep_detail` renders `target (via used_in)`.
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                let target_type = binding_types.get(binding).cloned();
+                let target_type = binding_types.get(binding.as_str()).cloned();
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
-                        target: binding.clone(),
+                        target: binding.to_string(),
                         target_type,
                         attribute: String::new(),
                         used_in: attr_key.to_string(),
@@ -1084,15 +1085,15 @@ impl ModuleSignature {
             // `vpc`, since #2847) — same dependency edge, empty
             // attribute slot.
             Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                let target_type = if let Some(arg_type) = argument_types.get(binding) {
+                let target_type = if let Some(arg_type) = argument_types.get(binding.as_str()) {
                     Self::dependency_target_type(arg_type)
                 } else {
-                    binding_types.get(binding).cloned()
+                    binding_types.get(binding.as_str()).cloned()
                 };
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
-                        target: binding.clone(),
+                        target: binding.to_string(),
                         target_type,
                         attribute: String::new(),
                         used_in: attr_key.to_string(),
@@ -1536,6 +1537,10 @@ mod tests {
     use super::*;
     use crate::parser::TypeExpr;
 
+    type Value = crate::resource::AuthoredValue;
+    type ConcreteValue = crate::resource::AuthoredConcreteValue;
+    type DeferredValue = crate::resource::AuthoredDeferredValue;
+
     #[test]
     fn format_value_uses_canonical_string_literals() {
         assert_eq!(
@@ -1551,10 +1556,10 @@ mod tests {
         );
         assert_eq!(
             format_value(&Value::Deferred(DeferredValue::Interpolation(vec![
-                crate::resource::InterpolationPart::Literal("prefix-".into()),
-                crate::resource::InterpolationPart::Expr(Value::Deferred(
+                crate::resource::AuthoredInterpolationPart::Literal("prefix-".into()),
+                crate::resource::AuthoredInterpolationPart::Expr(Value::Deferred(
                     DeferredValue::BindingRef {
-                        binding: "name".to_string(),
+                        binding: "name".into(),
                     },
                 )),
             ]))),
@@ -1562,10 +1567,10 @@ mod tests {
         );
         assert_eq!(
             format_value(&Value::Deferred(DeferredValue::Interpolation(vec![
-                crate::resource::InterpolationPart::Literal(r#"prefix-${literal}""#.into(),),
-                crate::resource::InterpolationPart::Expr(Value::Deferred(
+                crate::resource::AuthoredInterpolationPart::Literal(r#"prefix-${literal}""#.into(),),
+                crate::resource::AuthoredInterpolationPart::Expr(Value::Deferred(
                     DeferredValue::BindingRef {
-                        binding: "name".to_string(),
+                        binding: "name".into(),
                     },
                 )),
             ]))),
@@ -1855,11 +1860,14 @@ mod tests {
         )]);
         let binding_types = HashMap::new();
         let values = [
-            ("resource ref", Value::resource_ref("vpc", "id", vec![])),
+            (
+                "resource ref",
+                crate::resource::AuthoredValue::resource_ref("vpc", "id", vec![]),
+            ),
             (
                 "bare binding ref",
                 Value::Deferred(DeferredValue::BindingRef {
-                    binding: "vpc".to_string(),
+                    binding: "vpc".into(),
                 }),
             ),
             (

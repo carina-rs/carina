@@ -24,7 +24,10 @@ serde_json = "1"
 wasi = { version = "0.14", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wit-bindgen = { workspace = true }
+carina-plugin-bindings-aws = { path = "../carina-plugin-bindings-aws" }
+carina-plugin-bindings-aws-credentials = { path = "../carina-plugin-bindings-aws-credentials" }
+carina-plugin-bindings-http = { path = "../carina-plugin-bindings-http" }
+carina-plugin-bindings-provider = { path = "../carina-plugin-bindings-provider" }
 wasi = "0.14"
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
 aws-smithy-types = "1"

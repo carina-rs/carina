@@ -3,10 +3,12 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
-use super::{CanonicalComparisonAttributes, ConcreteValue, PlaceholderKind, Resource, Value};
+use super::{
+    BindingAddress, CanonicalComparisonAttributes, ConcreteValue, PlaceholderKind, Resource, Value,
+};
 use crate::schema::{
-    EffectiveType, LeafPath, LeafPathSegment, ResourceSchema, Shape, ShapeWalkBudget,
-    ValidatedResourceSchema,
+    CompiledResourceSchema as ResourceSchema, EffectiveType, LeafPath, LeafPathSegment, Shape,
+    ShapeWalkBudget, ValidatedResourceSchema,
 };
 
 /// A syntactic attribute path read from `directives.ignore_changes`.
@@ -333,15 +335,15 @@ impl Display for IgnoreChangeError {
 
 impl std::error::Error for IgnoreChangeError {}
 
-struct ValueCursor<'a, P: PlaceholderKind> {
+struct ValueCursor<'a, P: PlaceholderKind, B: BindingAddress> {
     leaf: Vec<LeafPathSegment>,
-    value: &'a Value<P>,
+    value: &'a Value<P, B>,
 }
 
 /// Resolve authored ignore paths against the effective schema and the values
 /// written in the same resource block.
-pub fn resolve_ignore_changes<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+pub fn resolve_ignore_changes<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     schema: &ValidatedResourceSchema,
 ) -> Result<ResolvedIgnoreChanges, Vec<IgnoreChangeError>> {
     let mut errors = Vec::new();
@@ -369,8 +371,8 @@ pub fn resolve_ignore_changes<S, P: PlaceholderKind>(
     }
 }
 
-fn resolve_one_ignore_change<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+fn resolve_one_ignore_change<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     schema: &ValidatedResourceSchema,
     path: &ParsedIgnorePath,
 ) -> Result<Vec<ResolvedIgnorePath>, IgnoreChangeError> {
@@ -488,9 +490,9 @@ fn resolve_one_ignore_change<S, P: PlaceholderKind>(
         .collect())
 }
 
-fn normalize_authored_struct_block<'a, P: PlaceholderKind>(
+fn normalize_authored_struct_block<'a, P: PlaceholderKind, B: BindingAddress>(
     value_type: &EffectiveType<'_>,
-    cursors: &mut Vec<ValueCursor<'a, P>>,
+    cursors: &mut Vec<ValueCursor<'a, P, B>>,
 ) {
     if !matches!(value_type.shape(), Shape::Struct { .. }) {
         return;
@@ -520,11 +522,14 @@ fn ignore_error(path: &ParsedIgnorePath, kind: IgnoreChangeErrorKind) -> IgnoreC
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use indexmap::IndexMap;
 
     use super::*;
     use crate::resource::{ConcreteValue, Directives, Resource, Value};
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
     fn path(segments: impl IntoIterator<Item = ParsedIgnorePathSegment>) -> ParsedIgnorePath {
         ParsedIgnorePath::new(segments.into_iter().collect())
@@ -574,19 +579,23 @@ mod tests {
     }
 
     fn schema() -> crate::schema::ValidatedResourceSchema {
-        ResourceSchema::new("Widget")
+        PatternResourceSchema::new("Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "configuration",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Configuration",
                         vec![
-                            StructField::optional("desired", AttributeType::string()).build(),
-                            StructField::optional("secret", AttributeType::string())
+                            PatternStructField::optional("desired", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::optional("secret", PatternAttributeType::string())
                                 .write_only()
                                 .build(),
-                            StructField::provider_populated("observed", AttributeType::string())
-                                .build(),
+                            PatternStructField::provider_populated(
+                                "observed",
+                                PatternAttributeType::string(),
+                            )
+                            .build(),
                         ],
                     ),
                 )
@@ -594,38 +603,60 @@ mod tests {
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional("labels", AttributeType::map(AttributeType::string()))
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "labels",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional("create_key", AttributeType::string())
+                PatternAttributeSchema::optional("create_key", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "rule",
-                    AttributeType::list(AttributeType::struct_(
+                    PatternAttributeType::list(PatternAttributeType::struct_(
                         "Rule",
-                        vec![StructField::optional("action", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("action", PatternAttributeType::string())
+                                .build(),
+                        ],
                     )),
                 )
                 .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated("generated", AttributeType::string()).build(),
+                PatternAttributeSchema::provider_populated(
+                    "generated",
+                    PatternAttributeType::string(),
+                )
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "choice",
-                    AttributeType::union(vec![
-                        AttributeType::struct_(
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::struct_(
                             "A",
-                            vec![StructField::optional("value", AttributeType::string()).build()],
+                            vec![
+                                PatternStructField::optional(
+                                    "value",
+                                    PatternAttributeType::string(),
+                                )
+                                .build(),
+                            ],
                         ),
-                        AttributeType::struct_(
+                        PatternAttributeType::struct_(
                             "B",
-                            vec![StructField::optional("value", AttributeType::string()).build()],
+                            vec![
+                                PatternStructField::optional(
+                                    "value",
+                                    PatternAttributeType::string(),
+                                )
+                                .build(),
+                            ],
                         ),
                     ]),
                 )

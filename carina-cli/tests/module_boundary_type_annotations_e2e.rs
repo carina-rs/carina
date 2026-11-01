@@ -225,6 +225,13 @@ fn security_group_schema() -> ResourceSchema {
             AttributeSchema::provider_populated("group_id", identity("ec2.SecurityGroup", "Id"))
                 .build(),
         )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "group_ids",
+                AttributeType::list(identity("ec2.SecurityGroup", "Id")),
+            )
+            .build(),
+        )
         .with_unique_name_attribute("name")
 }
 
@@ -1319,6 +1326,101 @@ fn unannotated_composition_argument_is_inferred_at_root_call_boundary_once() {
         mismatches.len(),
         1,
         "the post-expansion root call check must infer the output and report it once: {diagnostics:#?}",
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the call-boundary diagnostic must not be duplicated inside the module body: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn unannotated_composition_subscript_argument_is_reported_only_at_call_boundary() {
+    let root = root_with_two_calls().replace("web.security_group_id", "web.security_group_ids[0]");
+    let fixture = Fixture::module(
+        &[
+            ("arguments.crn", "arguments { vpc_id: aws.ec2.Vpc.Id }\n"),
+            (
+                "attributes.crn",
+                "attributes { security_group_ids = web_sg.group_ids }\n",
+            ),
+            ("resources.crn", MODULE_SECURITY_GROUP),
+        ],
+        &[("main.crn", &root)],
+    );
+
+    let diagnostics = fixture.validate();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let diagnostic = &diagnostics[0];
+    assert!(
+        diagnostic.contains("module call 'web2': argument 'vpc_id'"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("expected aws.ec2.Vpc.Id"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("got aws.ec2.SecurityGroup.Id"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("from web.security_group_ids[0]"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn expanded_call_boundary_finding_keeps_unrelated_root_resource_ref_error() {
+    let module = issue_module("aws.ec2.Vpc.Id", "");
+    let module = borrowed(&module);
+    let fixture = Fixture::module(
+        &module,
+        &[
+            ("main.crn", root_with_two_calls()),
+            (
+                "unrelated.crn",
+                r#"let root_source = aws.ec2.SecurityGroup {
+  name = "root-source"
+  vpc_id = main_vpc.vpc_id
+}
+
+let unrelated = aws.ec2.SecurityGroup {
+  name = "unrelated"
+  vpc_id = root_source.group_id
+}
+"#,
+            ),
+        ],
+    );
+
+    let diagnostics = fixture.validate();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.contains("module call 'web2': argument 'vpc_id'")
+                    && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                    && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+                    && diagnostic.contains("from web.security_group_id")
+            })
+            .count(),
+        1,
+        "the expanded call boundary must report its finding: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("aws.ec2.SecurityGroup.unrelated")
+                && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.contains("from root_source.group_id")
+        }),
+        "a call-boundary finding must not suppress an unrelated root reference error: {diagnostics:#?}",
+    );
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "each independent error must be reported once, without a module-body duplicate: {diagnostics:#?}",
     );
 }
 

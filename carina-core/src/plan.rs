@@ -18,8 +18,8 @@ use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
 pub use crate::resource::PreventDestroySource;
 use crate::resource::{
-    DeposedKey, Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity,
-    Value,
+    AbsoluteBindingAddress, DeposedKey, Directives, ResolvedResource, ResolvedResourceId,
+    ResourceId, ResourceIdentity, Value,
 };
 pub use crate::resource::{ModuleSource, SavedModuleSource};
 
@@ -595,9 +595,9 @@ pub(crate) struct ReplacementDelete {
     pub id: ResolvedResourceId,
     pub identifier: AppliedIdentifier,
     pub directives: Directives,
-    pub binding: Option<String>,
-    pub dependencies: HashSet<String>,
-    pub explicit_dependencies: HashSet<String>,
+    pub binding: Option<AbsoluteBindingAddress>,
+    pub dependencies: HashSet<AbsoluteBindingAddress>,
+    pub explicit_dependencies: HashSet<AbsoluteBindingAddress>,
 }
 
 /// A malformed historical generation explicitly abandoned by a `removed`
@@ -1309,7 +1309,8 @@ mod tests {
     use super::*;
     use crate::effect::{DeferredCreatePayload, DeferredReplacePayload};
     use crate::resource::{
-        DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity,
+        DataSource, RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource,
+        ResourceIdentity, RootScope,
     };
 
     fn render_plan_error_kind(kind: PlanErrorKind) -> String {
@@ -1332,6 +1333,10 @@ mod tests {
 
     fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
         ResolvedDataSource::new(resource)
+    }
+
+    fn absolute(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
     }
 
     fn deserialize_plan(json: &str) -> SavedPlan {
@@ -1377,16 +1382,16 @@ mod tests {
 
     fn replacement_group(consumer_updates: HashSet<ResourceIdentity>) -> ReplacementGroup {
         ReplacementGroup {
-            create: resolved(Resource::new("ec2.Vpc", "vpc").with_binding("vpc")),
+            create: resolved(Resource::new("ec2.Vpc", "vpc").with_root_binding("vpc")),
             delete: ReplacementDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "ec2.Vpc", "vpc-old",
                 )),
                 identifier: crate::effect::fixture_applied_identifier("vpc-123"),
                 directives: Directives::default(),
-                binding: Some("vpc".to_string()),
-                dependencies: HashSet::from(["internet_gateway".to_string()]),
-                explicit_dependencies: HashSet::from(["internet_gateway".to_string()]),
+                binding: Some(absolute("vpc")),
+                dependencies: HashSet::from([absolute("internet_gateway")]),
+                explicit_dependencies: HashSet::from([absolute("internet_gateway")]),
             },
             create_before_destroy: true,
             changed_create_only: changed_create_only(),
@@ -1454,7 +1459,7 @@ mod tests {
             "cert",
         ))));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
             target_id: crate::wait::ManagedWaitTarget::new(&resolved(Resource::new(
                 "acm.Certificate",
                 "cert",
@@ -1520,15 +1525,17 @@ mod tests {
             None,
             1,
             "for opt in cert.domain_validation_options".to_string(),
-            crate::parser::DeferredForTarget::bound("validation_records")
-                .expect("fixture binding is valid"),
-            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            crate::parser::DeferredForTarget::bound(
+                crate::resource::absolute_binding_address_for_test("validation_records"),
+            )
+            .expect("fixture binding is valid"),
+            Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(
-            Resource::new("acm.Certificate", "cert").with_binding("cert"),
+            Resource::new("acm.Certificate", "cert").with_root_binding("cert"),
         )));
         plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
             Box::new(deferred),
@@ -1549,7 +1556,7 @@ mod tests {
     #[test]
     fn plan_summary_excludes_deferred_replace_from_totals() {
         use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
-        use crate::parser::{DeferredForExpression, ForBinding};
+        use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
         use crate::resource::{Directives, ResourceId};
         use std::collections::HashSet;
 
@@ -1558,9 +1565,11 @@ mod tests {
             None,
             1,
             "for opt in cert.domain_validation_options".to_string(),
-            crate::parser::DeferredForTarget::bound("validation_records")
-                .expect("fixture binding is valid"),
-            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            crate::parser::DeferredForTarget::bound(
+                crate::resource::absolute_binding_address_for_test("validation_records"),
+            )
+            .expect("fixture binding is valid"),
+            Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
@@ -1575,7 +1584,7 @@ mod tests {
                 )),
                 identifier: crate::effect::fixture_applied_identifier(format!("record-{idx}")),
                 directives: Directives::default(),
-                binding: Some(format!("validation_records[{idx}]")),
+                binding: Some(absolute(&format!("validation_records[{idx}]"))),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),

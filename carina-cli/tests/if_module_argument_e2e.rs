@@ -288,6 +288,10 @@ let consumer = mock.test.resource {
 
 fn plan_json(project: &Path) -> serde_json::Value {
     assert_success("conditional dependency init", &run(project, &["init", "."]));
+    plan_json_after_init(project)
+}
+
+fn plan_json_after_init(project: &Path) -> serde_json::Value {
     let plan = run(project, &["plan", "--json", "--refresh=false", "."]);
     assert_success("conditional dependency JSON plan", &plan);
     serde_json::from_slice(&plan.stdout).unwrap_or_else(|error| {
@@ -624,6 +628,42 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
     assert_eq!(
         wait["explicit_dependencies"],
         serde_json::json!(["stack.data_consumer"]),
+    );
+}
+
+#[test]
+fn nested_module_plan_json_is_stable_and_keeps_child_before_parent_order() {
+    let fixture = OrdinaryModuleDependencyFixture::new();
+    assert_success(
+        "ordinary nested-module init",
+        &run(&fixture.caller, &["init", "."]),
+    );
+
+    let mut first = plan_json_after_init(&fixture.caller);
+    let mut second = plan_json_after_init(&fixture.caller);
+    first
+        .as_object_mut()
+        .expect("plan JSON object")
+        .remove("timestamp");
+    second
+        .as_object_mut()
+        .expect("plan JSON object")
+        .remove("timestamp");
+
+    assert_eq!(first, second, "independent plans must emit stable JSON");
+    assert_eq!(
+        first["compositions"]
+            .as_array()
+            .expect("saved compositions")
+            .iter()
+            .map(|composition| {
+                composition["id"]["identity"]
+                    .as_str()
+                    .expect("composition identity")
+            })
+            .collect::<Vec<_>>(),
+        ["stack.nested_call", "stack"],
+        "nested compositions must retain origin/main's child-before-parent order",
     );
 }
 

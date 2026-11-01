@@ -1,25 +1,28 @@
 use std::collections::HashSet;
 
 use crate::provider::{Provider, ProviderResult};
-use crate::resource::ResourceId;
+use crate::resource::{BindingAddress, ResourceId};
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
 /// Resolve satisfier hints from the provider against the plan's known bindings,
 /// and return additional explicit dependencies for a wait on `target_id.attr_path`.
-pub fn satisfier_augmentation(
+pub fn satisfier_augmentation<B: BindingAddress>(
     provider: &dyn Provider,
     target_id: &ResourceId,
     attr_path: &AttrPath,
-    known_bindings: &HashSet<String>,
-) -> ProviderResult<HashSet<String>> {
+    known_bindings: &HashSet<B>,
+) -> ProviderResult<HashSet<B>> {
     let mut additional = HashSet::new();
 
     for hint in provider.satisfier_hint(target_id, attr_path)? {
         match hint {
             BindingPattern::Exact(name) => {
-                if known_bindings.contains(&name) {
-                    additional.insert(name);
+                if let Some(binding) = known_bindings
+                    .iter()
+                    .find(|binding| binding.as_str() == name)
+                {
+                    additional.insert(binding.clone());
                 }
             }
             BindingPattern::ForLoopChildren { base } => {
@@ -27,7 +30,7 @@ pub fn satisfier_augmentation(
                 additional.extend(
                     known_bindings
                         .iter()
-                        .filter(|name| name.starts_with(&prefix))
+                        .filter(|binding| binding.as_str().starts_with(&prefix))
                         .cloned(),
                 );
             }
@@ -152,7 +155,10 @@ mod tests {
             hints,
             failure: None,
         };
-        let known_bindings = known.iter().map(|name| (*name).to_string()).collect();
+        let known_bindings = known
+            .iter()
+            .map(|name| crate::resource::RelativeBindingName::new(*name))
+            .collect();
         satisfier_augmentation(
             &provider,
             &ResourceId::with_identity("acm.Certificate", "cert"),
@@ -160,6 +166,9 @@ mod tests {
             &known_bindings,
         )
         .expect("test provider hints should succeed")
+        .into_iter()
+        .map(crate::resource::RelativeBindingName::into_string)
+        .collect()
     }
 
     #[test]
@@ -221,7 +230,7 @@ mod tests {
             &provider,
             &ResourceId::with_identity("acm.Certificate", "cert"),
             &AttrPath::single("status"),
-            &HashSet::new(),
+            &HashSet::<crate::resource::RelativeBindingName>::new(),
         )
         .expect_err("provider hint failures must abort augmentation");
 

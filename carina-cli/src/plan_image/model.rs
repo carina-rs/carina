@@ -290,12 +290,14 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
                 .or_insert_with(|| info.clone());
         }
         let label = resource_label(
-            resource.binding.as_deref(),
+            resource.binding.as_ref().map(|binding| binding.as_str()),
             &resource.id,
             module.as_ref().map(|info| info.label.as_str()),
         );
-        let anonymous_discriminator =
-            resource_anonymous_discriminator(resource.binding.as_deref(), &resource.id);
+        let anonymous_discriminator = resource_anonymous_discriminator(
+            resource.binding.as_ref().map(|binding| binding.as_str()),
+            &resource.id,
+        );
         nodes.push(GraphNode {
             id: id.clone(),
             label,
@@ -312,24 +314,15 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
     let dependency_graph =
         build_dependency_graph_from_effects(&analysis_effects, input.plan.replace_display_info());
     let mut logical_edge_set = HashSet::new();
-    let mut effect_dependencies: Vec<_> = dependency_graph.effect_deps.iter().collect();
-    effect_dependencies.sort_by_key(|(idx, _)| **idx);
-    for (dependent_idx, bindings) in effect_dependencies {
-        let mut bindings: Vec<_> = bindings.iter().collect();
-        bindings.sort();
-        for binding in bindings {
-            let Some(dependency_idx) = dependency_graph.binding_to_effect.get(binding) else {
-                continue;
-            };
-            let (Some(dependency), Some(dependent)) = (
-                effect_nodes.get(*dependency_idx).and_then(Clone::clone),
-                effect_nodes.get(*dependent_idx).and_then(Clone::clone),
-            ) else {
-                continue;
-            };
-            if dependency != dependent {
-                logical_edge_set.insert((dependency, dependent));
-            }
+    for (dependency_idx, dependent_idx) in dependency_graph.dependency_edges() {
+        let (Some(dependency), Some(dependent)) = (
+            effect_nodes.get(dependency_idx).and_then(Clone::clone),
+            effect_nodes.get(dependent_idx).and_then(Clone::clone),
+        ) else {
+            continue;
+        };
+        if dependency != dependent {
+            logical_edge_set.insert((dependency, dependent));
         }
     }
     let mut logical_edges: Vec<_> = logical_edge_set
@@ -621,7 +614,11 @@ fn node_from_effect(
     let anonymous_discriminator = effect_anonymous_discriminator(effect);
     let (mut label, resource_type, kind, mut attribute_names, note) = match effect {
         Effect::Read { resource } => (
-            resource_label(resource.binding.as_deref(), &resource.id, module_label),
+            resource_label(
+                resource.binding.as_ref().map(|binding| binding.as_str()),
+                &resource.id,
+                module_label,
+            ),
             resource.id.display_type(),
             EffectKind::Read,
             Vec::new(),
@@ -630,7 +627,11 @@ fn node_from_effect(
         Effect::Create(resource) => {
             if let Some(replacement) = replacement {
                 (
-                    resource_label(resource.binding.as_deref(), &resource.id, module_label),
+                    resource_label(
+                        resource.binding.as_ref().map(|binding| binding.as_str()),
+                        &resource.id,
+                        module_label,
+                    ),
                     resource.id.display_type(),
                     EffectKind::Replace,
                     replacement.changed_create_only.to_vec(),
@@ -640,7 +641,11 @@ fn node_from_effect(
                 )
             } else {
                 (
-                    resource_label(resource.binding.as_deref(), &resource.id, module_label),
+                    resource_label(
+                        resource.binding.as_ref().map(|binding| binding.as_str()),
+                        &resource.id,
+                        module_label,
+                    ),
                     resource.id.display_type(),
                     EffectKind::Create,
                     Vec::new(),
@@ -652,7 +657,11 @@ fn node_from_effect(
             resource,
             started_at: _,
         } => (
-            resource_label(resource.binding.as_deref(), &resource.id, module_label),
+            resource_label(
+                resource.binding.as_ref().map(|binding| binding.as_str()),
+                &resource.id,
+                module_label,
+            ),
             resource.id.display_type(),
             EffectKind::ResumeCreate,
             Vec::new(),
@@ -664,7 +673,11 @@ fn node_from_effect(
             to,
             changed_attributes,
         } => (
-            resource_label(to.binding.as_deref(), &to.id, module_label),
+            resource_label(
+                to.binding.as_ref().map(|binding| binding.as_str()),
+                &to.id,
+                module_label,
+            ),
             to.id.display_type(),
             EffectKind::Update,
             changed_attributes.clone(),
@@ -680,7 +693,11 @@ fn node_from_effect(
             explicit_dependencies: _,
             blocked_by_updates: _,
         } => (
-            resource_label(binding.as_deref(), id.as_inner(), module_label),
+            resource_label(
+                binding.as_ref().map(|binding| binding.as_str()),
+                id.as_inner(),
+                module_label,
+            ),
             id.display_type(),
             EffectKind::Delete,
             Vec::new(),
@@ -774,24 +791,37 @@ fn node_from_effect(
     }
 }
 
-fn deferred_after_note(template: &carina_core::parser::DeferredForExpression) -> Option<String> {
+fn deferred_after_note(
+    template: &carina_core::parser::ExpandedDeferredForExpression,
+) -> Option<String> {
     let root_bindings = template.root_bindings();
     (!root_bindings.is_empty()).then(|| {
         format!(
             "after {}",
-            root_bindings.into_iter().collect::<Vec<_>>().join(", ")
+            root_bindings
+                .into_iter()
+                .map(|binding| binding.into_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     })
 }
 
 fn effect_anonymous_discriminator(effect: &Effect) -> Option<String> {
     let (binding, id) = match effect {
-        Effect::Read { resource } => (resource.binding.as_deref(), &resource.id),
-        Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
-            (resource.binding.as_deref(), &resource.id)
-        }
-        Effect::Update { to, .. } => (to.binding.as_deref(), &to.id),
-        Effect::Delete { binding, id, .. } => (binding.as_deref(), id.as_inner()),
+        Effect::Read { resource } => (
+            resource.binding.as_ref().map(|binding| binding.as_str()),
+            &resource.id,
+        ),
+        Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => (
+            resource.binding.as_ref().map(|binding| binding.as_str()),
+            &resource.id,
+        ),
+        Effect::Update { to, .. } => (to.binding.as_ref().map(|binding| binding.as_str()), &to.id),
+        Effect::Delete { binding, id, .. } => (
+            binding.as_ref().map(|binding| binding.as_str()),
+            id.as_inner(),
+        ),
         Effect::ReleaseListKeys { id, .. } => (None, id.as_inner()),
         Effect::Import { .. }
         | Effect::Remove { .. }
@@ -1132,6 +1162,18 @@ mod tests {
 
     use super::*;
 
+    fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
+    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+        carina_core::resource::Value::<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::RelativeBindingName,
+        >::resource_ref(binding, attribute, Vec::new())
+        .resolve_root_for_test()
+    }
+
     fn input<'a>(
         plan: &'a Plan,
         desired_resources: &'a [ResolvedResource],
@@ -1198,11 +1240,11 @@ mod tests {
         let identity = carina_core::resource::ResourceIdentity::try_from(binding.to_string())
             .expect("test binding is a valid identity");
         let mut resource = Resource::new("test.Widget", identity);
-        resource.binding = Some(binding.to_string());
+        resource.binding = Some(absolute_binding(binding));
         for dependency in dependencies {
             resource.set_attr(
                 format!("ref_{dependency}"),
-                Value::resource_ref((*dependency).to_string(), "id".to_string(), vec![]),
+                root_resource_ref(dependency, "id"),
             );
         }
         resource
@@ -1216,10 +1258,10 @@ mod tests {
             identifier: AppliedIdentifier::new(format!("{binding}-provider-id")).unwrap(),
             generation: EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some(binding.to_string()),
+            binding: Some(absolute_binding(binding)),
             dependencies: dependencies
                 .iter()
-                .map(|value| (*value).to_string())
+                .map(|value| absolute_binding(*value))
                 .collect(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -1229,15 +1271,9 @@ mod tests {
     #[test]
     fn anonymous_same_type_resources_with_unresolved_names_remain_distinct() {
         let mut first = Resource::new("test.Widget", "anonymous-system-id-1");
-        first.set_attr(
-            "name",
-            Value::resource_ref("future".to_string(), "name".to_string(), vec![]),
-        );
+        first.set_attr("name", root_resource_ref("future", "name"));
         let mut second = Resource::new("test.Widget", "anonymous-system-id-2");
-        second.set_attr(
-            "name",
-            Value::resource_ref("future".to_string(), "name".to_string(), vec![]),
-        );
+        second.set_attr("name", root_resource_ref("future", "name"));
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(ResolvedResource::new(first.clone())));
@@ -1301,7 +1337,7 @@ mod tests {
             "named_but_hash_suffixed_166e04b3",
             None,
         );
-        resource.binding = Some("production_security_group".to_string());
+        resource.binding = Some(absolute_binding("production_security_group"));
         let mut plan = Plan::new();
         plan.add(Effect::Create(ResolvedResource::new(resource.clone())));
 
@@ -1331,8 +1367,10 @@ mod tests {
             None,
             1,
             "for item in literal".to_string(),
-            carina_core::parser::DeferredForTarget::bound("widgets")
-                .expect("fixture binding is valid"),
+            carina_core::parser::DeferredForTarget::bound(
+                carina_core::resource::absolute_binding_address_for_test("widgets"),
+            )
+            .expect("fixture binding is valid"),
             Value::Concrete(ConcreteValue::String(ITERABLE_VALUE.into())),
             ForBinding::Simple("item".to_string()),
             Resource::new("test.Widget", "widgets"),
@@ -1363,9 +1401,11 @@ mod tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("parse deferred loop fixture");
-        let mut parsed = parsed
-            .into_expanded()
-            .expect("deferred loop fixture must contain no parser placeholders");
+        let mut parsed =
+            carina_core::module_resolver::resolve_modules_providerless(parsed, fixture.path())
+                .expect("cross the deferred-body resolution seam")
+                .into_expanded()
+                .expect("deferred loop fixture must contain no parser placeholders");
         let template = parsed
             .deferred_for_expressions_mut()
             .pop()

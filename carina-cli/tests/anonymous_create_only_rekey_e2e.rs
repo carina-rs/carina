@@ -10,6 +10,10 @@ use std::process::{Command, Output};
 use carina_state::{ResourceState, StateFile, check_and_migrate};
 use tempfile::TempDir;
 
+fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
 struct Scenario {
     _temp: TempDir,
     project: PathBuf,
@@ -309,7 +313,7 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let initial_identity = initial_row.identity.as_str().to_string();
     assert_eq!(
         initial_row.dependency_bindings,
-        ["cluster".to_string()].into_iter().collect(),
+        [absolute_binding("cluster")].into_iter().collect(),
         "the anonymous row must retain its dependency metadata before the move"
     );
 
@@ -324,7 +328,7 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     );
     assert_eq!(
         refreshed_row.dependency_bindings,
-        ["cluster".to_string()].into_iter().collect(),
+        [absolute_binding("cluster")].into_iter().collect(),
     );
 
     let replacement_plan = changed.carina(&["plan"]);
@@ -356,7 +360,7 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let replaced_identity = replaced_row.identity.as_str().to_string();
     assert_eq!(
         replaced_row.dependency_bindings,
-        ["cluster".to_string()].into_iter().collect(),
+        [absolute_binding("cluster")].into_iter().collect(),
         "Move+Replace writeback must preserve dependency metadata on the re-keyed row"
     );
 
@@ -377,7 +381,7 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let fresh_identity = fresh_row.identity.as_str().to_string();
     assert_eq!(
         fresh_row.dependency_bindings,
-        ["cluster".to_string()].into_iter().collect(),
+        [absolute_binding("cluster")].into_iter().collect(),
     );
 
     assert_eq!(

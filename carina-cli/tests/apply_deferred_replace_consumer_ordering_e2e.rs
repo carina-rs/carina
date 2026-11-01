@@ -15,8 +15,8 @@ use carina_core::parser::{
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, ResourceIdentity, State,
-    Value,
+    AbsoluteBindingAddress, ConcreteValue, Directives, LoopSlot, NoPlaceholder,
+    RelativeBindingName, ResolvedResource, Resource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_state::{ResourceState, StateFile};
 use indexmap::IndexMap;
@@ -26,6 +26,10 @@ const UPDATE_DELAY_MS: &str = "200";
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
 }
 
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
@@ -50,7 +54,7 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
 }
 
 fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
-    let configs = [ProviderConfig {
+    let configs: [ProviderConfig; 1] = [ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -118,8 +122,10 @@ provider mock {}
         .expect("fixture identifier is non-empty")
         .with_attribute("name", serde_json::json!("old-validation-token"))
         .with_attribute("identifier", serde_json::json!("old-validation-id"));
-        validation.binding = Some("validation_records[0]".to_string());
-        validation.dependency_bindings.insert("cert".to_string());
+        validation.binding = Some(absolute_binding("validation_records[0]"));
+        validation
+            .dependency_bindings
+            .insert(absolute_binding("cert"));
         state
             .upsert_resource(validation)
             .expect("test state setup must be valid");
@@ -130,10 +136,10 @@ provider mock {}
                 .with_attribute("name", serde_json::json!("consumer"))
                 .with_attribute("identifier", serde_json::json!("consumer-id"))
                 .with_attribute("web_acl_arn", serde_json::json!("old-validation-id"));
-        consumer.binding = Some("consumer".to_string());
+        consumer.binding = Some(absolute_binding("consumer"));
         consumer
             .dependency_bindings
-            .insert("validation_records[0]".to_string());
+            .insert(absolute_binding("validation_records[0]"));
         state
             .upsert_resource(consumer)
             .expect("test state setup must be valid");
@@ -199,13 +205,14 @@ provider mock {}
 }
 
 fn mock_resource(name: &str, binding: &str) -> Resource {
-    Resource::with_provider(
+    let mut resource = Resource::with_provider(
         "mock",
         "test.resource",
         ResourceIdentity::try_from(name.to_string()).unwrap(),
         None,
-    )
-    .with_binding(binding)
+    );
+    resource.binding = Some(absolute_binding(binding));
+    resource
 }
 
 fn string(value: &str) -> Value {
@@ -245,16 +252,22 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         .with_attribute("identifier", string("consumer-id"))
         .with_attribute(
             "web_acl_arn",
-            Value::resource_ref("validation_records[0]", "identifier", vec![]),
+            Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+                "validation_records[0]",
+                "identifier",
+                vec![],
+            )
+            .resolve_root_for_test(),
         );
     consumer
         .dependency_bindings
-        .insert("validation_records[0]".to_string());
+        .insert(absolute_binding("validation_records[0]"));
     let consumer_from = consumer_current_state(&consumer.id);
 
     let template_resource: carina_core::resource::Resource<
         carina_core::resource::ModuleSource,
-        carina_core::resource::LoopSlot,
+        LoopSlot,
+        AbsoluteBindingAddress,
     > = carina_core::resource::Resource::with_provider(
         "mock",
         "test.resource",
@@ -262,14 +275,23 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             .unwrap(),
         None,
     )
-    .with_binding("validation_records");
+    .with_absolute_binding(carina_core::resource::absolute_binding_address_for_test(
+        "validation_records",
+    ));
     let template = DeferredForExpression::new(
         Some("main.crn".to_string()),
         1,
         "for opt in cert.domain_validation_options".to_string(),
-        carina_core::parser::DeferredForTarget::bound("validation_records")
-            .expect("fixture binding is valid"),
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        carina_core::parser::DeferredForTarget::bound(
+            carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+            "cert",
+            "domain_validation_options",
+            Vec::new(),
+        )
+        .resolve_root_for_test(),
         ForBinding::Simple("opt".to_string()),
         template_resource,
     );
@@ -285,8 +307,8 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             identifier: AppliedIdentifier::new("old-validation-id")
                 .expect("fixture identifier is non-empty"),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: HashSet::from([absolute_binding("cert")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::from([identity("consumer")]),
         }])

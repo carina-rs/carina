@@ -1002,6 +1002,25 @@ mod tests {
         )
     }
 
+    fn builtin_mock_provider_state(directory: &std::path::Path) -> ProviderState {
+        let discovered = workspace::discover_providers_by_dir(directory);
+        let configs = discovered[directory]
+            .iter()
+            .cloned()
+            .map(|config| (directory.to_path_buf(), config))
+            .collect();
+        ProviderState::new(
+            vec![],
+            HashMap::new(),
+            configs,
+            None,
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
+        )
+    }
+
     #[test]
     fn formatting_without_eligible_block_names_matches_plain_format() {
         let input = r#"awscc.ec2.ipam {
@@ -1083,6 +1102,218 @@ mock.test.Thing {
                     && message.contains("Use `let` bindings")
             }),
             "LSP must run attribute-derived identity conflict checks with mock schemas: {messages:#?}",
+        );
+    }
+
+    #[test]
+    fn equal_nested_identity_diagnostic_matches_validate_across_sibling_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let providers = "provider mock {}\n";
+        let budget = r#"mock.budgets.Budget {
+  budget = {
+    budget_name = "shared-budget"
+    budget_type = "COST"
+    time_unit = "MONTHLY"
+  }
+}
+"#;
+        std::fs::write(temp.path().join("providers.crn"), providers).unwrap();
+        std::fs::write(temp.path().join("a.crn"), budget).unwrap();
+        std::fs::write(temp.path().join("b.crn"), budget).unwrap();
+
+        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let configs = discovered[temp.path()]
+            .iter()
+            .cloned()
+            .map(|config| (temp.path().to_path_buf(), config))
+            .collect();
+        let state = ProviderState::new(
+            vec![],
+            HashMap::new(),
+            configs,
+            None,
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
+        );
+        let path = temp.path().join("a.crn");
+        let document = Document::new_with_path(
+            budget.to_string(),
+            path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+
+        let diagnostics = state.diagnostic_engine.analyze(&document, Some(&path));
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("equal declared identity values")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(
+            matching[0].message,
+            "Anonymous resources of type 'mock.budgets.Budget' on the same provider route have \
+             equal declared identity values and produce address \
+             'mock_budgets_budget_d96fb606'. Give one of them a name with `let`."
+        );
+    }
+
+    const INCOMPLETE_BUDGET_IDENTITY_ERROR: &str = "Anonymous resource of type \
+        'mock.budgets.Budget' cannot derive an address because identity value \
+        'budget.budget_name' is not available as a written value or authored expression at plan \
+        time. Write the identity value or give the resource a name with `let`.";
+
+    fn incomplete_budget_diagnostics(
+        sibling_files: &[(&str, &str)],
+        budget: &str,
+    ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        let temp = tempfile::tempdir().expect("multi-file identity fixture");
+        std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("backend.crn"),
+            "backend local { path = \"carina.state.json\" }\n",
+        )
+        .unwrap();
+        for (name, source) in sibling_files {
+            std::fs::write(temp.path().join(name), source).unwrap();
+        }
+        let path = temp.path().join("budget.crn");
+        std::fs::write(&path, budget).unwrap();
+        let state = builtin_mock_provider_state(temp.path());
+        let document = Document::new_with_path(
+            budget.to_string(),
+            path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+        state.diagnostic_engine.analyze(&document, Some(&path))
+    }
+
+    #[test]
+    fn omitted_identity_value_lsp_error_matches_validate_and_plan_in_multi_file_directory() {
+        let budget = r#"mock.budgets.Budget {
+  budget = {
+    budget_type = "COST"
+    time_unit = "MONTHLY"
+  }
+}
+"#;
+
+        let diagnostics = incomplete_budget_diagnostics(&[], budget);
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == INCOMPLETE_BUDGET_IDENTITY_ERROR)
+            .collect::<Vec<_>>();
+
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(
+            matching[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(matching[0].range.start.line, 0);
+        assert_eq!(matching[0].range.start.character, 0);
+    }
+
+    #[test]
+    fn apply_time_reference_has_no_incomplete_identity_lsp_error() {
+        let source = r#"let source = mock.test.resource {
+  name = "identity-source"
+}
+"#;
+        let budget = r#"mock.budgets.Budget {
+  budget = {
+    budget_name = source.identifier
+    budget_type = "COST"
+    time_unit = "MONTHLY"
+  }
+}
+"#;
+
+        let diagnostics = incomplete_budget_diagnostics(&[("source.crn", source)], budget);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.message != INCOMPLETE_BUDGET_IDENTITY_ERROR),
+            "an authored resource reference is a complete identity value: {diagnostics:#?}",
+        );
+    }
+
+    #[test]
+    fn route53_reference_identity_directory_has_no_lsp_errors() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../carina-cli/tests/fixtures/anonymous_reference_identity");
+        let path = fixture.join("records.crn");
+        let records = std::fs::read_to_string(&path).expect("read shared RecordSet fixture");
+        let state = builtin_mock_provider_state(&fixture);
+        let document = Document::new_with_path(
+            records,
+            path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+
+        let diagnostics = state.diagnostic_engine.analyze(&document, Some(&path));
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.severity != Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            }),
+            "the shared multi-file reference-identity fixture must be LSP-valid: {diagnostics:#?}",
+        );
+    }
+
+    #[test]
+    fn plan_time_module_argument_has_no_incomplete_identity_lsp_error() {
+        let temp = tempfile::tempdir().expect("multi-file module identity fixture");
+        let module = temp.path().join("budget_module");
+        std::fs::create_dir(&module).unwrap();
+        std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("backend.crn"),
+            "backend local { path = \"carina.state.json\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("arguments.crn"),
+            "arguments {\n  budget_name: String\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("budget.crn"),
+            r#"mock.budgets.Budget {
+  budget = {
+    budget_name = budget_name
+    budget_type = "COST"
+    time_unit = "MONTHLY"
+  }
+}
+"#,
+        )
+        .unwrap();
+        let modules = r#"let budget_module = use { source = "./budget_module" }
+
+budget_module {
+  budget_name = "module-budget"
+}
+"#;
+        let path = temp.path().join("modules.crn");
+        std::fs::write(&path, modules).unwrap();
+        let state = builtin_mock_provider_state(temp.path());
+        let document = Document::new_with_path(
+            modules.to_string(),
+            path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+
+        let diagnostics = state.diagnostic_engine.analyze(&document, Some(&path));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.message != INCOMPLETE_BUDGET_IDENTITY_ERROR),
+            "a concrete module argument is known at plan time: {diagnostics:#?}",
         );
     }
 

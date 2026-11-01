@@ -128,6 +128,7 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     let expanded = config
         .parsed
         .clone()
+        .into_parsed()
         .into_expanded()
         .expect("provider fixture has no parser placeholders");
     let resolved =

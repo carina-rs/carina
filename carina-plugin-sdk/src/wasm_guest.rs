@@ -1,8 +1,8 @@
 //! WASM guest-side helpers for the carina-provider WIT interface.
 //!
 //! Provides type conversion functions between WIT guest types and protocol types.
-//! The `export_provider!` macro generates the wit-bindgen bindings and Guest trait
-//! implementation in the consumer crate.
+//! The `export_provider!` macro implements SDK-owned Guest traits in the
+//! consumer crate and exports the adapter with SDK-owned bindings.
 
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
@@ -163,7 +163,7 @@ pub const fn egress_json_bytes<const N: usize>(json: &str) -> [u8; N] {
     output
 }
 
-/// Decode the version-13 `desired-resource` record into the SDK's typed view.
+/// Decode the version-16 `desired-resource` record into the SDK's typed view.
 ///
 /// This is public only because [`crate::export_provider!`] expands in the
 /// provider crate. Provider implementations receive [`crate::DesiredResource`]
@@ -192,7 +192,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource.id, resource.resource.attributes.iter())
 }
 
-/// Render one error chain for protocol-v13 metadata's string-only failure
+/// Render one error chain for protocol-v16 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -220,14 +220,14 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-13 WIT resource records.
+/// Return the honest directive default for protocol-16 WIT resource records.
 ///
-/// Protocol 13 does not transport directives on create, poll-create,
+/// Protocol 16 does not transport directives on create, poll-create,
 /// resume-create, read-data-source, or normalize-desired requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
 /// Delete-request directives are transported separately after host resolution.
 #[doc(hidden)]
-pub fn protocol_13_default_resource_directives() -> proto::Directives {
+pub fn protocol_16_default_resource_directives() -> proto::Directives {
     proto::Directives::default()
 }
 
@@ -698,22 +698,11 @@ macro_rules! __carina_egress_json {
     };
 }
 
-/// Generate provider bindings from Carina's single canonical WIT path.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __carina_wit_bindgen {
-    ({ $($bindgen:tt)* }) => {
-        wit_bindgen::generate!({
-            path: "../carina-plugin-wit/wit",
-            $($bindgen)*
-        });
-    };
-}
-
 /// Macro to export a `CarinaProvider` implementation as a WASM component.
 ///
-/// This macro generates wit-bindgen bindings in the consumer crate and implements
-/// the Guest trait by bridging to the CarinaProvider trait.
+/// This macro implements the SDK-owned Guest trait for a consumer-local adapter
+/// that bridges to CarinaProvider. The SDK owns the WIT and binding generator;
+/// consumers need neither WIT files nor a wit-bindgen dependency.
 ///
 /// Usage:
 /// ```ignore
@@ -740,9 +729,7 @@ macro_rules! __carina_wit_bindgen {
 #[macro_export]
 macro_rules! export_provider {
     ($provider_type:ty) => {
-        $crate::export_provider!(@internal $provider_type, {
-            world: "carina-provider",
-        }, {});
+        $crate::export_provider!(@internal $provider_type, provider, {});
     };
     ($provider_type:ty, http, egress: [$($host:literal),* $(,)?] $(,)?) => {
         const _: () = {
@@ -756,17 +743,7 @@ macro_rules! export_provider {
         static __CARINA_EGRESS_DECLARATION: [u8; $crate::__carina_egress_json!($($host),*).len()] =
             $crate::wasm_guest::egress_json_bytes($crate::__carina_egress_json!($($host),*));
 
-        $crate::export_provider!(@internal $provider_type, {
-            world: "carina-provider-with-http",
-            with: {
-                "wasi:io/poll@0.2.6": ::wasi::io::poll,
-                "wasi:io/error@0.2.6": ::wasi::io::error,
-                "wasi:io/streams@0.2.6": ::wasi::io::streams,
-                "wasi:clocks/monotonic-clock@0.2.6": ::wasi::clocks::monotonic_clock,
-                "wasi:http/types@0.2.6": ::wasi::http::types,
-                "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
-            },
-        }, {});
+        $crate::export_provider!(@internal $provider_type, http, {});
     };
     ($provider_type:ty, aws, egress: [$($host:literal),* $(,)?] $(,)?) => {
         const _: () = {
@@ -780,17 +757,7 @@ macro_rules! export_provider {
         static __CARINA_EGRESS_DECLARATION: [u8; $crate::__carina_egress_json!($($host),*).len()] =
             $crate::wasm_guest::egress_json_bytes($crate::__carina_egress_json!($($host),*));
 
-        $crate::export_provider!(@internal $provider_type, {
-            world: "carina-provider-aws",
-            with: {
-                "wasi:io/poll@0.2.6": ::wasi::io::poll,
-                "wasi:io/error@0.2.6": ::wasi::io::error,
-                "wasi:io/streams@0.2.6": ::wasi::io::streams,
-                "wasi:clocks/monotonic-clock@0.2.6": ::wasi::clocks::monotonic_clock,
-                "wasi:http/types@0.2.6": ::wasi::http::types,
-                "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
-            },
-        }, {
+        $crate::export_provider!(@internal $provider_type, aws, {
             // Keep the AWS-world import in the component even when the
             // provider never calls it. The host uses the import itself as the
             // type-safe proof that an AWS-kind provider selected this world.
@@ -799,14 +766,12 @@ macro_rules! export_provider {
                 __carina_keep_aws_credentials_import;
 
             fn __carina_keep_aws_credentials_import() {
-                let _ = carina::provider::aws_credentials::current_credentials();
+                let _ = $crate::aws_credentials::current();
             }
         });
     };
-    (@internal $provider_type:ty, { $($bindgen:tt)* }, { $($world_items:item)* }) => {
+    (@internal $provider_type:ty, $world:ident, { $($world_items:item)* }) => {
         mod __carina_wasm_guest {
-            $crate::__carina_wit_bindgen!({ $($bindgen)* });
-
             $($world_items)*
 
             use super::*;
@@ -814,8 +779,7 @@ macro_rules! export_provider {
             use $crate::wasm_guest as helpers;
             use std::collections::{BTreeMap, HashMap};
 
-            // Type aliases for the generated types
-            use carina::provider::types as wit_types;
+            use $crate::__private::$world as wit_types;
 
             fn get_provider() -> &'static ::std::sync::Mutex<$provider_type> {
                 static PROVIDER: ::std::sync::OnceLock<::std::sync::Mutex<$provider_type>> =
@@ -842,7 +806,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v13 metadata exports return a bare string rather
+                // Protocol v16 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure
@@ -855,8 +819,7 @@ macro_rules! export_provider {
             }
 
             // -- WIT <-> proto conversion functions --
-            // These are local to this module because they reference the locally-generated
-            // wit-bindgen types.
+            // These bridge the selected SDK-owned world to protocol types.
 
             fn wit_to_proto_resource_id(id: &wit_types::ResourceId) -> proto::ResourceId {
                 proto::ResourceId {
@@ -2160,13 +2123,13 @@ macro_rules! export_provider {
             }
 
             fn wit_to_sdk_plan_op(
-                op: exports::carina::provider::provider::PlanOp,
+                op: wit_types::PlanOp,
             ) -> $crate::PlanOp {
                 match op {
-                    exports::carina::provider::provider::PlanOp::Create => $crate::PlanOp::Create,
-                    exports::carina::provider::provider::PlanOp::Read => $crate::PlanOp::Read,
-                    exports::carina::provider::provider::PlanOp::Update => $crate::PlanOp::Update,
-                    exports::carina::provider::provider::PlanOp::Delete => $crate::PlanOp::Delete,
+                    wit_types::PlanOp::Create => $crate::PlanOp::Create,
+                    wit_types::PlanOp::Read => $crate::PlanOp::Read,
+                    wit_types::PlanOp::Update => $crate::PlanOp::Update,
+                    wit_types::PlanOp::Delete => $crate::PlanOp::Delete,
                 }
             }
 
@@ -2196,7 +2159,7 @@ macro_rules! export_provider {
 
             struct WasmGuest;
 
-            impl exports::carina::provider::provider::Guest for WasmGuest {
+            impl wit_types::Guest for WasmGuest {
                 fn info() -> String {
                     let provider = get_provider().lock().unwrap();
                     let info = $crate::CarinaProvider::info(&*provider);
@@ -2297,7 +2260,7 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let directives = helpers::protocol_13_default_resource_directives();
+                    let directives = helpers::protocol_16_default_resource_directives();
                     let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
                     })?;
@@ -2315,7 +2278,7 @@ macro_rules! export_provider {
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let directives = helpers::protocol_13_default_resource_directives();
+                    let directives = helpers::protocol_16_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2347,7 +2310,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_13_default_resource_directives();
+                    let directives = helpers::protocol_16_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2395,7 +2358,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_13_default_resource_directives();
+                    let directives = helpers::protocol_16_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2549,7 +2512,7 @@ macro_rules! export_provider {
 
                 fn required_permissions(
                     id: wit_types::ResourceId,
-                    operation: exports::carina::provider::provider::PlanOp,
+                    operation: wit_types::PlanOp,
                 ) -> Vec<String> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let result = {
@@ -2607,16 +2570,16 @@ macro_rules! export_provider {
                 }
 
                 fn normalize_desired(
-                    resources: Vec<exports::carina::provider::provider::DesiredResource>,
+                    resources: Vec<wit_types::DesiredResource>,
                 ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
                     let proto_resources = resources
                         .into_iter()
                         .map(|desired| {
-                            let exports::carina::provider::provider::DesiredResource {
+                            let wit_types::DesiredResource {
                                 resource,
                                 deferred,
                             } = desired;
-                            let directives = helpers::protocol_13_default_resource_directives();
+                            let directives = helpers::protocol_16_default_resource_directives();
                             let resource = wit_to_proto_resource(&resource, directives).map_err(|error| {
                                 boundary_decode_to_provider_error(
                                     "normalize_desired",
@@ -2734,7 +2697,7 @@ macro_rules! export_provider {
 
             }
 
-            export!(WasmGuest);
+            $crate::__private::$world::export!(WasmGuest);
         }
     };
 }
@@ -2838,7 +2801,7 @@ mod tests {
 
     #[test]
     fn wit_resource_protocol_directives_are_all_false_without_transport() {
-        let directives = protocol_13_default_resource_directives();
+        let directives = protocol_16_default_resource_directives();
 
         assert!(!directives.force_delete);
         assert!(!directives.create_before_destroy);

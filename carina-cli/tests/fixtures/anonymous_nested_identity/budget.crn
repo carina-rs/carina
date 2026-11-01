@@ -1,0 +1,13 @@
+mock.budgets.Budget {
+  budget = {
+    budget_name = "migration-budget"
+    budget_type = "COST"
+    time_unit = "MONTHLY"
+  }
+  notifications_with_subscribers = [
+    {
+      notification_type = "ACTUAL"
+      threshold = 80.0
+    },
+  ]
+}

@@ -1,6 +1,6 @@
 //! Boundary assignability when provider declarations may not be loaded.
 
-use super::{AttrTypeKind, TypeIdentity, TypeInSchema, resolve_refs_on_path};
+use super::{AttrTypeKind, PatternForm, TypeIdentity, TypeInSchema, resolve_refs_on_path};
 use crate::parser::CustomTypeValidationError;
 
 /// Missing provider evidence is distinct from a proven type mismatch.
@@ -41,7 +41,7 @@ impl TypeAssignability {
     }
 }
 
-fn identity(kind: &AttrTypeKind) -> Option<&TypeIdentity> {
+fn identity<R: PatternForm>(kind: &AttrTypeKind<R>) -> Option<&TypeIdentity> {
     match kind {
         AttrTypeKind::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
         AttrTypeKind::String { binding, .. }
@@ -60,19 +60,19 @@ fn identity(kind: &AttrTypeKind) -> Option<&TypeIdentity> {
     }
 }
 
-impl<'source> TypeInSchema<'source> {
+impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// Prove assignment, prove a mismatch, or defer for the existing
     /// `ProvidersNotLoaded` reason. Identified types use the shared directional
     /// identity relation, including provider and segments, even when a schema
     /// is unloaded. A source without identity cannot satisfy a nominal sink.
     /// Only comparisons that require the unavailable scalar kind are unchecked.
-    pub fn assignment_to(self, sink: TypeInSchema<'_>) -> TypeAssignability {
+    pub fn assignment_to(self, sink: TypeInSchema<'_, R>) -> TypeAssignability {
         self.assignment_on_paths(sink, &mut Vec::new(), &mut Vec::new())
     }
 
     fn assignment_on_paths<'sink>(
         self,
-        sink: TypeInSchema<'sink>,
+        sink: TypeInSchema<'sink, R>,
         source_refs: &mut Vec<&'source str>,
         sink_refs: &mut Vec<&'sink str>,
     ) -> TypeAssignability {
