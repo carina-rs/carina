@@ -266,21 +266,24 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
     let preparation_errors =
         NonEmptyPlanErrors::try_from(vec![expected.clone()]).expect("one error is non-empty");
 
-    let outcome = build_post_expansion_plan::<PlanMode, _>(PostExpansionPlanInput {
-        context: &context,
-        expansion,
-        environment: PostExpansionPlanEnvironment {
-            data_sources: &[],
-            provider: &provider,
-            normalizer: &provider,
-            provider_configs: &[],
-            remote_bindings: &HashMap::new(),
-            state_file: &state_file,
-            state_block_claims: &state_block_claims,
-            resolved_state_block_targets: &resolved_state_block_targets,
-            preparation_errors: Some(preparation_errors),
+    let outcome = build_post_expansion_plan::<PlanMode, _>(
+        PostExpansionPlanInput {
+            context: &context,
+            expansion,
+            environment: PostExpansionPlanEnvironment {
+                data_sources: &[],
+                provider: &provider,
+                normalizer: &provider,
+                provider_configs: &[],
+                remote_bindings: &HashMap::new(),
+                state_file: &state_file,
+                state_block_claims: &state_block_claims,
+                resolved_state_block_targets: &resolved_state_block_targets,
+                preparation_errors: Some(preparation_errors),
+            },
         },
-    })
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
+    )
     .await
     .expect("typed preparation diagnostics should produce an outcome");
 
@@ -288,9 +291,9 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         panic!("non-empty preparation diagnostics must not produce a plan")
     };
     let errors = diagnostics.errors().clone();
-    let artifacts = diagnostics.into_artifacts();
+    let (_artifacts, plan) = diagnostics.into_parts();
     assert_eq!(errors.as_slice(), &[expected]);
-    assert_eq!(artifacts.plan.errors(), errors.as_slice());
+    assert_eq!(plan.errors(), errors.as_slice());
 }
 
 struct RawEnumStateFactory;
@@ -528,6 +531,7 @@ let item = test.thing {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .unwrap_or_else(|error| panic!("refresh={refresh} plan failed: {error}"));
@@ -634,6 +638,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build enum/int rename plan");
@@ -728,6 +733,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build unordered enum rename plan");
@@ -939,6 +945,7 @@ let first = test.thing {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("a contested orphan must fall back to delete and create");
@@ -1064,6 +1071,7 @@ let direct = awscc.ec2.Route {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("a cross-pass contest must fall back to delete and create");
@@ -2638,6 +2646,7 @@ where
         remote_bindings,
         state_block_claims,
         resolved_state_block_targets,
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .map(ValidatedConfig::into_context_for_test)
@@ -3572,6 +3581,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await;
     let error = match result {
@@ -4102,6 +4112,7 @@ let shared = read test.shared.Type {}
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("managed orphan and same-id data source must coexist through planning");
@@ -7097,6 +7108,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build mixed automatic-move plan");
@@ -7320,6 +7332,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &expanded_remote_bindings,
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build late mixed automatic-move plan");
@@ -8494,6 +8507,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &HashMap::new(),
         &StateBlockClaims::empty(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan should build");
@@ -10857,6 +10871,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         &HashMap::new(),
         &claims,
         &targets,
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("state blocks and the retained loop must plan together");
@@ -10921,7 +10936,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         "deferred effects must follow state-block effects: {:#?}",
         plan.effects()
     );
-    plan
+    (*plan).clone()
 }
 
 #[tokio::test]
@@ -13564,6 +13579,7 @@ exports { team_prefix: String = "x" }"#,
             &remote_bindings,
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("resolved-value violations must be represented by the plan");
@@ -13641,6 +13657,7 @@ exports { team_prefix: String = "x" }"#,
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("module violations must be represented by the plan");

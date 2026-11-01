@@ -1238,12 +1238,14 @@ async fn run_state_show(
             carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
         let prev_explicit = state.build_explicit();
         carina_tui::run(
-            &plan,
+            carina_core::detail_rows::PlanDisplay::unprepared(
+                &plan,
+                &historical_display,
+                carina_core::detail_rows::DetailComparisons::RecordedEffects,
+            ),
             &carina_core::schema::SchemaRegistry::new(),
-            &historical_display,
             Some(&prev_explicit),
             &carina_core::provider::ProviderRouter::new(),
-            carina_core::detail_rows::DetailComparisons::RecordedEffects,
         )?;
     } else {
         let output = format_state_show(&state);

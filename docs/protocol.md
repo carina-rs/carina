@@ -15,7 +15,8 @@ Protocol v17 adds string-valued reference schema leaves and the initialized
 provider's `resolve-references` export. Requests carry a structured type
 identity and raw string; positional outcomes are a resolved canonical string,
 NotFound, or a typed AccessDenied, Transient, or InvalidReference failure.
-The host rejects batch length mismatches and empty resolved values. Guests
+Core rejects batch length mismatches and empty resolved values for every
+provider, native or WASM. Guests
 validate their canonical value shapes. Reference validation remains offline;
 resolution runs only when preparing a planning comparison.
 

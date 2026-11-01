@@ -447,9 +447,10 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
     let plan = prepared.value.finish(|_| {});
     preparation
         .display(
-            &plan,
+            plan.clone(),
             &prepared.references,
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
+            crate::detail_rows::DetailLevel::Full,
             &fixture.registry,
             &HashMap::new(),
             &fixture.router,

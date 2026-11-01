@@ -527,30 +527,34 @@ impl ReferencePreparation {
         .await
     }
 
-    /// Render against one immutable historical view. Only the clean pass's
-    /// rows are released, so frontends never repeat reference comparisons.
+    /// Consume the finalized plan and render only the requested detail level.
+    /// Each recording pass constructs its rows together with that immutable
+    /// plan; only a clean pass can release the owning display value.
+    #[allow(clippy::too_many_arguments)]
     pub async fn display(
         &mut self,
-        plan: &crate::plan::Plan,
+        plan: crate::plan::Plan,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
+        detail: crate::detail_rows::DetailLevel,
         registry: &SchemaRegistry,
         explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
         provider: &ProviderRouter,
     ) -> crate::provider::ProviderResult<PreparedComparison<crate::detail_rows::PreparedPlanDisplay>>
     {
-        let prepared = self
-            .run(provider, |session| {
-                session.render(plan, planning, &historical, registry, explicit, provider)
-            })
-            .await?;
-        Ok(PreparedComparison {
-            value: crate::detail_rows::PreparedPlanDisplay {
-                historical,
-                rows: prepared.value,
-            },
-            references: prepared.references,
+        let plan = Arc::new(plan);
+        self.run(provider, |session| {
+            session.render(
+                Arc::clone(&plan),
+                planning,
+                historical.clone(),
+                detail,
+                registry,
+                explicit,
+                provider,
+            )
         })
+        .await
     }
 
     /// Test compatibility seam for callers without CLI-owned state history.
@@ -595,9 +599,10 @@ impl ReferencePreparation {
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, saved);
         let display = self
             .display(
-                &plan,
+                plan.clone(),
                 &prepared.references,
                 historical,
+                crate::detail_rows::DetailLevel::Full,
                 registry,
                 explicit,
                 provider,
@@ -657,17 +662,19 @@ impl<'run> RecordingSession<'run> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render(
         self,
-        plan: &crate::plan::Plan,
+        plan: Arc<crate::plan::Plan>,
         planning: &ResolvedReferences,
-        historical: &crate::detail_rows::HistoricalDisplayAttributes,
+        historical: crate::detail_rows::HistoricalDisplayAttributes,
+        detail: crate::detail_rows::DetailLevel,
         registry: &SchemaRegistry,
         explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
         provider: &ProviderRouter,
     ) -> ProvisionalComparison<
         'run,
-        crate::provider::ProviderResult<crate::detail_rows::PreparedDetailRows>,
+        crate::provider::ProviderResult<crate::detail_rows::PreparedPlanDisplay>,
     > {
         self.references
             .recording
@@ -676,9 +683,10 @@ impl<'run> RecordingSession<'run> {
             .lock()
             .expect("reference recording lock")
             .dangling = planning.dangling.clone();
-        self.result(crate::detail_rows::PreparedDetailRows::build(
+        self.result(crate::detail_rows::PreparedPlanDisplay::build(
             plan,
             historical,
+            detail,
             registry,
             explicit,
             provider,

@@ -34,6 +34,7 @@ use ratatui::prelude::*;
 
 use carina_core::explicit::ExplicitFields;
 use carina_core::module::FileSignature;
+#[cfg(test)]
 use carina_core::plan::Plan;
 use carina_core::provider::{ProviderError, ProviderRouter};
 use carina_core::resource::ResourceId;
@@ -230,24 +231,17 @@ impl std::error::Error for TuiError {
 /// When prior authoring records are provided, ambiguous pending list removals
 /// use the same whole-value display as the CLI.
 pub fn run(
-    plan: &Plan,
+    display: carina_core::detail_rows::PlanDisplay<'_>,
     schemas: &SchemaRegistry,
-    historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
-    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> Result<(), TuiError> {
-    let mut app = app_for_run(
-        plan,
-        schemas,
-        historical_display,
-        prev_explicit,
-        provider,
-        comparisons,
-    )?;
+    let mut app = App::from_display(display, schemas, prev_explicit, provider)
+        .map_err(TuiError::PlanDisplay)?;
     run_tui(ui::draw, handle_key, &mut app).map_err(TuiError::Io)
 }
 
+#[cfg(test)]
 fn app_for_run(
     plan: &Plan,
     schemas: &SchemaRegistry,

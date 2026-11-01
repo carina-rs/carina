@@ -3739,6 +3739,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("module data-source plan should build");
@@ -5815,6 +5816,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("post-apply plan should succeed");
@@ -5931,6 +5933,7 @@ let nat = mock.ec2.NatGateway {{
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after create should succeed");
@@ -5990,6 +5993,7 @@ let nat = mock.ec2.NatGateway {{
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after sibling update should succeed");
@@ -6117,6 +6121,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("retry plan should succeed");
@@ -6258,6 +6263,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("the removal plan should succeed");
@@ -6339,6 +6345,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("retry plan should succeed");
@@ -6414,6 +6421,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after the successful retry should succeed");

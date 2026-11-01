@@ -262,47 +262,122 @@ pub fn set_trusted_local_grant_inputs(
         .map_err(|_| TrustedLocalGrantInputsAlreadySetError)
 }
 
-/// Comparison evidence belongs to the result of this preparation, rather than
-/// to the router shared by successive plans. Diagnostic plans have no effects.
-#[derive(Debug)]
-pub enum PlanReferenceEvidence {
-    #[cfg(any(test, feature = "test-utils"))]
-    Prepared(carina_core::references::ResolvedReferences),
-    DisplayPrepared {
-        references: carina_core::references::ResolvedReferences,
-        display: Box<carina_core::detail_rows::PreparedPlanDisplay>,
-    },
-    Diagnostics,
+/// Whether this planning invocation needs human-readable attribute rows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RowRequest {
+    Render(carina_core::detail_rows::DetailLevel),
+    None,
 }
 
-impl PlanReferenceEvidence {
-    pub fn historical_display(&self) -> &carina_core::detail_rows::HistoricalDisplayAttributes {
-        match self {
-            Self::DisplayPrepared { display, .. } => &display.historical,
-            #[cfg(any(test, feature = "test-utils"))]
-            Self::Prepared(_) => panic!("test evidence has no prepared display view"),
-            Self::Diagnostics => panic!("diagnostic plans cannot be displayed"),
-        }
-    }
+/// A successful plan either owns its requested display or has no rows at all.
+/// Diagnostics never inhabit this type.
+#[derive(Debug)]
+pub enum PlannedPlan {
+    Rendered {
+        display: Box<carina_core::detail_rows::PreparedPlanDisplay>,
+        references: carina_core::references::ResolvedReferences,
+    },
+    Unrendered {
+        plan: Plan,
+        references: carina_core::references::ResolvedReferences,
+    },
+}
 
-    pub fn for_display(&self) -> carina_core::detail_rows::DetailComparisons<'_> {
+impl PlannedPlan {
+    pub(crate) fn references(&self) -> &carina_core::references::ResolvedReferences {
         match self {
-            #[cfg(any(test, feature = "test-utils"))]
-            Self::Prepared(references) => {
-                carina_core::detail_rows::DetailComparisons::Planning(references)
-            }
-            Self::DisplayPrepared { display, .. } => {
-                carina_core::detail_rows::DetailComparisons::Prepared(&display.rows)
-            }
-            Self::Diagnostics => carina_core::detail_rows::DetailComparisons::RecordedEffects,
+            Self::Rendered { references, .. } | Self::Unrendered { references, .. } => references,
         }
     }
+}
+
+impl std::ops::Deref for PlannedPlan {
+    type Target = Plan;
+
+    fn deref(&self) -> &Plan {
+        match self {
+            Self::Rendered { display, .. } => display.plan(),
+            Self::Unrendered { plan, .. } => plan,
+        }
+    }
+}
+
+/// Command planning keeps diagnostics separate from every display-capable plan.
+#[derive(Debug)]
+pub enum PlanOutcome {
+    Planned(PlannedPlan),
+    Diagnostics(DiagnosticPlan),
+}
+
+#[derive(Debug)]
+pub struct DiagnosticPlan {
+    plan: Plan,
+    pub(crate) errors: NonEmptyPlanErrors,
+}
+
+impl std::ops::Deref for DiagnosticPlan {
+    type Target = Plan;
+    fn deref(&self) -> &Plan {
+        &self.plan
+    }
+}
+
+impl std::ops::Deref for PlanOutcome {
+    type Target = Plan;
+
+    fn deref(&self) -> &Plan {
+        match self {
+            Self::Planned(plan) => plan,
+            Self::Diagnostics(plan) => plan,
+        }
+    }
+}
+
+/// Seal the finalized plan according to the command's display request. Error
+/// plans exit through a distinct type before a historical view is constructed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_plan_outcome(
+    plan: Plan,
+    planning: carina_core::references::ResolvedReferences,
+    preparation: &mut carina_core::references::ReferencePreparation,
+    row_request: RowRequest,
+    managed_current: &HashMap<ResourceId, Current>,
+    state_file: Option<&StateFile>,
+    schemas: &SchemaRegistry,
+    explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    provider: &ProviderRouter,
+) -> Result<PlanOutcome, AppError> {
+    if let Ok(errors) = NonEmptyPlanErrors::try_from(plan.errors().to_vec()) {
+        return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
+    }
+    let planned = match row_request {
+        RowRequest::Render(detail) => {
+            let historical = crate::commands::plan::collect_historical_display_attributes(
+                &plan,
+                managed_current,
+                state_file,
+            );
+            let display = preparation
+                .display(
+                    plan, &planning, historical, detail, schemas, explicit, provider,
+                )
+                .await?;
+            PlannedPlan::Rendered {
+                display: Box::new(display.value),
+                references: display.references,
+            }
+        }
+        RowRequest::None => PlannedPlan::Unrendered {
+            plan,
+            references: planning,
+        },
+    };
+    Ok(PlanOutcome::Planned(planned))
 }
 
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
-    pub plan: Plan,
-    pub references: PlanReferenceEvidence,
+    pub plan: PlanOutcome,
     pub provider: ProviderRouter,
     /// Evaluated desired resources after the identity-resolution boundary.
     pub sorted_resources: Vec<ResolvedResource>,
@@ -5928,8 +6003,6 @@ impl PostExpansionMode for ApplyMode {
 pub(crate) struct PostExpansionArtifacts<R> {
     pub expanded_resources: R,
     pub residual_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
-    pub plan: Plan,
-    pub references: PlanReferenceEvidence,
     pub compositions: Vec<LiveComposition>,
     pub data_sources: Vec<DataSource>,
     pub managed_current: HashMap<ResourceId, Current>,
@@ -5944,8 +6017,6 @@ impl<R> PostExpansionArtifacts<R> {
         let Self {
             expanded_resources,
             residual_deferred_for,
-            plan,
-            references,
             compositions,
             data_sources,
             managed_current,
@@ -5957,8 +6028,6 @@ impl<R> PostExpansionArtifacts<R> {
         PostExpansionArtifacts {
             expanded_resources: map(expanded_resources),
             residual_deferred_for,
-            plan,
-            references,
             compositions,
             data_sources,
             managed_current,
@@ -5972,6 +6041,7 @@ impl<R> PostExpansionArtifacts<R> {
 
 /// A successfully constructed plan with the resource view selected by `M`.
 pub(crate) struct PostExpansionPlan<M: PostExpansionMode, R> {
+    pub plan: PlannedPlan,
     pub artifacts: PostExpansionArtifacts<R>,
     pub resources: M::Resources,
 }
@@ -5980,20 +6050,25 @@ pub(crate) struct PostExpansionPlan<M: PostExpansionMode, R> {
 /// need to construct their command-specific error context.
 pub(crate) struct PostExpansionDiagnostics<R> {
     artifacts: PostExpansionArtifacts<R>,
+    plan: Plan,
     errors: NonEmptyPlanErrors,
 }
 
 impl<R> PostExpansionDiagnostics<R> {
-    fn new(artifacts: PostExpansionArtifacts<R>, errors: NonEmptyPlanErrors) -> Self {
-        Self { artifacts, errors }
+    fn new(artifacts: PostExpansionArtifacts<R>, plan: Plan, errors: NonEmptyPlanErrors) -> Self {
+        Self {
+            artifacts,
+            plan,
+            errors,
+        }
     }
 
     pub(crate) fn errors(&self) -> &NonEmptyPlanErrors {
         &self.errors
     }
 
-    pub(crate) fn into_artifacts(self) -> PostExpansionArtifacts<R> {
-        self.artifacts
+    pub(crate) fn into_parts(self) -> (PostExpansionArtifacts<R>, Plan) {
+        (self.artifacts, self.plan)
     }
 }
 
@@ -6008,16 +6083,23 @@ impl<M: PostExpansionMode, R> PostExpansionOutcome<M, R> {
     fn map_expanded_resources<T>(self, map: impl FnOnce(R) -> T) -> PostExpansionOutcome<M, T> {
         match self {
             Self::Planned(PostExpansionPlan {
+                plan,
                 artifacts,
                 resources,
             }) => PostExpansionOutcome::Planned(PostExpansionPlan {
+                plan,
                 artifacts: artifacts.map_expanded_resources(map),
                 resources,
             }),
             Self::Diagnostics(diagnostics) => {
-                let PostExpansionDiagnostics { artifacts, errors } = diagnostics;
+                let PostExpansionDiagnostics {
+                    artifacts,
+                    plan,
+                    errors,
+                } = diagnostics;
                 PostExpansionOutcome::Diagnostics(PostExpansionDiagnostics::new(
                     artifacts.map_expanded_resources(map),
+                    plan,
                     errors,
                 ))
             }
@@ -6029,6 +6111,7 @@ impl<M: PostExpansionMode, R> PostExpansionOutcome<M, R> {
 /// expansion.
 pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     input: PostExpansionPlanInput<'_, E, impl ChildrenSettledFor<M>>,
+    row_request: RowRequest,
 ) -> Result<PostExpansionOutcome<M, ExpandedCanonicalResources<E>>, AppError> {
     let PostExpansionPlanInput {
         context,
@@ -6154,8 +6237,6 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         let artifacts = PostExpansionArtifacts {
             expanded_resources,
             residual_deferred_for,
-            plan,
-            references: PlanReferenceEvidence::Diagnostics,
             compositions,
             data_sources: data_sources_for_plan,
             managed_current: into_all_prior_states(addressed.orphans, addressed.managed_current),
@@ -6165,7 +6246,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             wait_aliases,
         };
         return Ok(PostExpansionOutcome::Diagnostics(
-            PostExpansionDiagnostics::new(artifacts, errors),
+            PostExpansionDiagnostics::new(artifacts, plan, errors),
         ));
     }
 
@@ -6296,24 +6377,36 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         .collect();
     let prev_explicit = addressed.prev_explicit;
     let managed_current = into_all_prior_states(addressed.orphans, addressed.managed_current);
-    let historical = crate::commands::plan::collect_historical_display_attributes(
-        &plan,
-        &managed_current,
+    let artifacts = PostExpansionArtifacts {
+        expanded_resources,
+        residual_deferred_for,
+        compositions,
+        data_sources: data_sources_for_plan,
+        managed_current,
+        data_source_values,
+        moved_origins,
+        prev_explicit,
+        wait_aliases,
+    };
+    let outcome = prepare_plan_outcome(
+        plan,
+        prepared.references,
+        &mut reference_preparation,
+        row_request,
+        &artifacts.managed_current,
         state_file.as_ref(),
-    );
-    let display = reference_preparation
-        .display(
-            &plan,
-            &prepared.references,
-            historical,
-            context.schemas(),
-            &prev_explicit,
-            provider,
-        )
-        .await?;
-    let references = PlanReferenceEvidence::DisplayPrepared {
-        references: display.references,
-        display: Box::new(display.value),
+        context.schemas(),
+        &artifacts.prev_explicit,
+        provider,
+    )
+    .await?;
+    let plan = match outcome {
+        PlanOutcome::Planned(plan) => plan,
+        PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }) => {
+            return Ok(PostExpansionOutcome::Diagnostics(
+                PostExpansionDiagnostics::new(artifacts, plan, errors),
+            ));
+        }
     };
     let resources = M::build_resources(PostExpansionResourceInputs {
         override_aware: &override_aware_resources,
@@ -6324,19 +6417,8 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     });
 
     Ok(PostExpansionOutcome::Planned(PostExpansionPlan {
-        artifacts: PostExpansionArtifacts {
-            expanded_resources,
-            residual_deferred_for,
-            plan,
-            references,
-            compositions,
-            data_sources: data_sources_for_plan,
-            managed_current,
-            data_source_values,
-            moved_origins,
-            prev_explicit,
-            wait_aliases,
-        },
+        plan,
+        artifacts,
         resources,
     }))
 }
@@ -6431,6 +6513,7 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
     pub(crate) async fn finish_post_expansion_plan<M: PostExpansionMode>(
         self,
         environment: PostExpansionPlanEnvironment<'_>,
+        row_request: RowRequest,
     ) -> Result<PostExpansionOutcome<M, ValidatedConfig<ExpandedCanonicalResources<E>>>, AppError>
     where
         S: ChildrenSettledFor<M>,
@@ -6443,11 +6526,14 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
             origin,
         } = resources;
         let context = wiring.context();
-        let outcome = build_post_expansion_plan::<M, E>(PostExpansionPlanInput {
-            context,
-            expansion,
-            environment,
-        })
+        let outcome = build_post_expansion_plan::<M, E>(
+            PostExpansionPlanInput {
+                context,
+                expansion,
+                environment,
+            },
+            row_request,
+        )
         .await?;
         Ok(
             outcome.map_expanded_resources(|expanded_resources| ValidatedConfig {
@@ -7386,6 +7472,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
+    row_request: RowRequest,
 ) -> Result<ValidatedConfig<ExpandedPlanContext<E>>, AppError> {
     let ValidatedConfig {
         wiring,
@@ -7406,6 +7493,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                     remote_bindings,
                     state_block_claims,
                     resolved_state_block_targets,
+                    row_request,
                 )
                 .await
             })
@@ -7429,6 +7517,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
+    row_request: RowRequest,
 ) -> Result<ExpandedPlanContext<E>, AppError> {
     let parsed = canonical_resources.parsed();
     let raw_provider_configs = provider_configs.as_provider_configs();
@@ -7646,36 +7735,53 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     };
 
     drop(refresh_phase);
-    let outcome = build_post_expansion_plan::<PlanMode, E>(PostExpansionPlanInput {
-        context: ctx,
-        expansion: plan_expansion,
-        environment: PostExpansionPlanEnvironment {
-            data_sources: &data_sources,
-            provider: &provider,
-            normalizer: &provider,
-            provider_configs: raw_provider_configs,
-            remote_bindings,
-            state_file,
-            state_block_claims,
-            resolved_state_block_targets,
-            preparation_errors: refresh_module_constraint_errors,
+    let outcome = build_post_expansion_plan::<PlanMode, E>(
+        PostExpansionPlanInput {
+            context: ctx,
+            expansion: plan_expansion,
+            environment: PostExpansionPlanEnvironment {
+                data_sources: &data_sources,
+                provider: &provider,
+                normalizer: &provider,
+                provider_configs: raw_provider_configs,
+                remote_bindings,
+                state_file,
+                state_block_claims,
+                resolved_state_block_targets,
+                preparation_errors: refresh_module_constraint_errors,
+            },
         },
-    })
+        row_request,
+    )
     .await?;
-    let (artifacts, sorted_resources, unresolved_resources) = match outcome {
+    let (artifacts, plan, sorted_resources, unresolved_resources) = match outcome {
         PostExpansionOutcome::Planned(PostExpansionPlan {
+            plan,
             artifacts,
             resources,
-        }) => (artifacts, resources.resolved, resources.unresolved),
+        }) => (
+            artifacts,
+            PlanOutcome::Planned(plan),
+            resources.resolved,
+            resources.unresolved,
+        ),
         PostExpansionOutcome::Diagnostics(diagnostics) => {
-            (diagnostics.into_artifacts(), Vec::new(), Vec::new())
+            let PostExpansionDiagnostics {
+                artifacts,
+                plan,
+                errors,
+            } = diagnostics;
+            (
+                artifacts,
+                PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }),
+                Vec::new(),
+                Vec::new(),
+            )
         }
     };
     let PostExpansionArtifacts {
         expanded_resources,
         residual_deferred_for,
-        plan,
-        references,
         compositions,
         data_sources,
         managed_current,
@@ -7688,7 +7794,6 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     Ok(ExpandedPlanContext::new(
         PlanContext {
             plan,
-            references,
             provider,
             // Keep the evaluated desired view distinct from the authored
             // pre-resolution snapshot. Before carina#3861 this field was filled

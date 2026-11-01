@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use carina_core::detail_rows::{
-    DetailLevel, DetailRow, HistoricalDisplayAttributes, build_detail_rows_by_instance,
-    build_replace_detail_rows_from_display, delete_identifier_fallback_row,
+    DetailLevel, DetailRow, HistoricalDisplayAttributes, PlanDisplay,
+    delete_identifier_fallback_row,
 };
 use carina_core::effect::Effect;
 use carina_core::explicit::ExplicitFields;
@@ -128,6 +128,21 @@ impl App {
         provider: &ProviderRouter,
         comparisons: carina_core::detail_rows::DetailComparisons<'_>,
     ) -> ProviderResult<Self> {
+        Self::from_display(
+            PlanDisplay::unprepared(plan, historical_display, comparisons),
+            schemas,
+            prev_explicit,
+            provider,
+        )
+    }
+
+    pub fn from_display(
+        display: PlanDisplay<'_>,
+        schemas: &SchemaRegistry,
+        prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
+        provider: &ProviderRouter,
+    ) -> ProviderResult<Self> {
+        let plan = display.plan();
         let replacement_display: Vec<_> = plan.replace_display_info().collect();
         let replacement_create_info: HashMap<_, _> = replacement_display
             .iter()
@@ -137,17 +152,14 @@ impl App {
             .effects()
             .iter()
             .enumerate()
-            .map(|(idx, effect)| {
+            .map(|(idx, _effect)| {
                 effect_to_node(
-                    plan,
+                    &display,
                     idx,
-                    effect,
                     schemas,
-                    historical_display,
                     replacement_create_info.get(&idx).copied(),
                     prev_explicit,
                     provider,
-                    comparisons,
                 )
             })
             .collect::<ProviderResult<Vec<_>>>()?;
@@ -782,57 +794,25 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn effect_to_node(
-    plan: &Plan,
+    display: &PlanDisplay<'_>,
     index: usize,
-    effect: &Effect,
     schemas: &SchemaRegistry,
-    historical_display: &HistoricalDisplayAttributes,
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
-    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> ProviderResult<TreeNode> {
-    let detail_rows = if let Some(rows) = comparisons.prepared_rows(index, DetailLevel::Full)? {
-        rows.to_vec()
-    } else if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
-        build_replace_detail_rows_from_display(
-            plan,
-            resource,
-            replacement,
-            historical_display,
-            Some(schemas),
+    let mut detail_rows = display
+        .detail_rows(
+            index,
             DetailLevel::Full,
-            prev_explicit.and_then(|map| map.get(&resource.id)),
-            provider,
-            comparisons,
-        )?
-    } else {
-        build_detail_rows_by_instance(
-            effect,
             Some(schemas),
-            DetailLevel::Full,
-            historical_display,
             prev_explicit,
             provider,
-            comparisons,
         )?
-    };
-    Ok(effect_to_node_with_rows(
-        plan,
-        effect,
-        replacement_info,
-        detail_rows,
-    ))
-}
-
-fn effect_to_node_with_rows(
-    plan: &Plan,
-    effect: &Effect,
-    replacement_info: Option<ReplaceDisplayInfo<'_>>,
-    mut detail_rows: Vec<DetailRow>,
-) -> TreeNode {
+        .into_owned();
+    let plan = display.plan();
+    let effect = &plan.effects()[index];
     if let Effect::Remove { id } = effect {
         detail_rows.extend(
             plan.abandoned_deposed_generations()
@@ -843,7 +823,7 @@ fn effect_to_node_with_rows(
         );
     }
 
-    match effect {
+    Ok(match effect {
         Effect::Read { resource } => TreeNode {
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
@@ -1047,7 +1027,7 @@ fn effect_to_node_with_rows(
                 parent: None,
             }
         }
-    }
+    })
 }
 
 #[cfg(test)]

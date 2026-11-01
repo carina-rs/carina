@@ -2200,18 +2200,20 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
             ))
         ),
         printed: HashSet::new(),
-        plan: &plan,
+        display: PlanDisplay::unprepared(
+            &plan,
+            &historical_display,
+            carina_core::detail_rows::DetailComparisons::RecordedEffects,
+        ),
         dependents: HashMap::new(),
         replacement_create_info: HashMap::new(),
         replacement_delete_indices: HashSet::new(),
         detail: DetailLevel::None,
-        historical_display: &historical_display,
         schemas: None,
         moved_origins: &moved_origins,
         prev_explicit: None,
         update_or_replace_targets: [to_id].into_iter().collect(),
         provider: &provider,
-        comparisons: carina_core::detail_rows::DetailComparisons::RecordedEffects,
     };
 
     let rendered_attrs = ctx
@@ -2276,18 +2278,20 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
-        plan: &plan,
+        display: PlanDisplay::unprepared(
+            &plan,
+            &historical_display,
+            carina_core::detail_rows::DetailComparisons::RecordedEffects,
+        ),
         dependents: HashMap::from([(0, vec![1])]),
         replacement_create_info: HashMap::new(),
         replacement_delete_indices: HashSet::new(),
         detail: DetailLevel::Full,
-        historical_display: &historical_display,
         schemas: None,
         moved_origins: &moved_origins,
         prev_explicit: None,
         update_or_replace_targets: [to_id].into_iter().collect(),
         provider: &provider,
-        comparisons: carina_core::detail_rows::DetailComparisons::RecordedEffects,
     };
 
     let rendered_attrs = ctx

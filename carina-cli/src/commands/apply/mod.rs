@@ -2133,9 +2133,11 @@ async fn run_apply_locked_owned(
                         resolved_state_block_targets: &resolved_state_block_targets,
                         preparation_errors: refresh_module_constraint_errors,
                     },
+                    crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
                 )
                 .await?;
             let crate::wiring::PostExpansionPlan {
+                plan,
                 artifacts,
                 resources,
             } = match post_expansion {
@@ -2147,8 +2149,6 @@ async fn run_apply_locked_owned(
             let crate::wiring::PostExpansionArtifacts {
                 expanded_resources: validated_expansion,
                 residual_deferred_for,
-                plan,
-                references,
                 compositions: pre_resolve_compositions,
                 data_sources: _,
                 mut managed_current,
@@ -2157,7 +2157,6 @@ async fn run_apply_locked_owned(
                 prev_explicit,
                 wait_aliases,
             } = artifacts;
-            render_plan_errors_and_abort(&plan, project_dir)?;
             #[cfg(any(test, feature = "test-utils"))]
             capture_live_apply_plan_for_test(&plan)?;
             let crate::wiring::PostExpansionApplyResources {
@@ -2217,24 +2216,20 @@ async fn run_apply_locked_owned(
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
 
-                let historical_display = references.historical_display();
                 let summary = PlanChangeSummary::new(
                     &plan,
                     &export_changes,
                     &residual_deferred_for,
                     &directive_changes,
                 );
-                print_plan(
+                crate::display::print_planned_plan(
                     &plan,
                     &summary,
-                    DetailLevel::Full,
-                    historical_display,
                     Some(ctx.schemas()),
                     &HashMap::new(),
                     None,
                     None,
                     &provider,
-                    references.for_display(),
                 )?;
                 // This fast path has no managed-resource mutations, so it
                 // cannot contain the Delete + Create pair required for a
@@ -2301,8 +2296,6 @@ async fn run_apply_locked_owned(
                 )));
             }
 
-            let historical_display = references.historical_display();
-
             let checked_exports_pre_apply =
                 crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
                     export_params: &parsed.export_params,
@@ -2333,17 +2326,14 @@ async fn run_apply_locked_owned(
                 &residual_deferred_for,
                 &directive_changes,
             );
-            print_plan(
+            crate::display::print_planned_plan(
                 &plan,
                 &summary,
-                DetailLevel::Full,
-                historical_display,
                 Some(ctx.schemas()),
                 &moved_origins,
                 Some(&prev_explicit),
                 None,
                 &provider,
-                references.for_display(),
             )?;
             let moved_hints = crate::moved_hint::detect_moved_block_hints(
                 &plan,
@@ -2382,16 +2372,7 @@ async fn run_apply_locked_owned(
                     None,
                     provider.as_ref(),
                 )?
-                .with_reference_evidence(match &references {
-                    crate::wiring::PlanReferenceEvidence::DisplayPrepared {
-                        references, ..
-                    } => Some(references.clone()),
-                    #[cfg(any(test, feature = "test-utils"))]
-                    crate::wiring::PlanReferenceEvidence::Prepared(references) => {
-                        Some(references.clone())
-                    }
-                    crate::wiring::PlanReferenceEvidence::Diagnostics => None,
-                }),
+                .with_reference_evidence(Some(plan.references().clone())),
             );
             let saver =
                 start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
