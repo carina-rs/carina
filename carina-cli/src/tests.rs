@@ -1868,6 +1868,60 @@ async fn detect_drift_returns_none_when_no_drift() {
 }
 
 #[tokio::test]
+async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None);
+    let id = resource.id.clone();
+    let identifier = "provider-id";
+    let empty_config = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        (ResourceSchema::new("test.Resource").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![StructField::optional("label", AttributeType::string()).build()],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
+    );
+
+    for (planned_attributes, actual_attributes) in [
+        (
+            HashMap::from([("config".to_string(), empty_config.clone())]),
+            HashMap::new(),
+        ),
+        (
+            HashMap::new(),
+            HashMap::from([("config".to_string(), empty_config.clone())]),
+        ),
+    ] {
+        let planned = State::existing(id.clone(), planned_attributes).with_identifier(identifier);
+        let actual = State::existing(id.clone(), actual_attributes).with_identifier(identifier);
+        let provider = TestProvider::with_read_state(&id, identifier, actual);
+        let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
+
+        let result = detect_drift_for_test(
+            std::slice::from_ref(&resource),
+            &planned_states,
+            &MovedOrigins::from_plan(&Plan::new()),
+            &provider,
+            None,
+            &schemas,
+            ApplyTarget::Project(std::path::Path::new(".")),
+        )
+        .await
+        .expect("drift check succeeds");
+
+        assert_eq!(result.drift_messages(), None);
+    }
+}
+
+#[tokio::test]
 async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
     use carina_core::schema::{

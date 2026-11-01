@@ -9904,7 +9904,10 @@ impl Current {
         }
     }
 
-    fn into_plan_input(mut self) -> PlanInputCurrent {
+    fn into_plan_input(
+        mut self,
+        schema: Option<&crate::schema::ResourceSchema>,
+    ) -> PlanInputCurrent {
         match &mut self {
             Self::Absent(state) => state.0.materialize_partial_read_unknowns(),
             Self::Present(present) => present.state.materialize_partial_read_unknowns(),
@@ -9912,19 +9915,20 @@ impl Current {
             Self::CreateOutcomeUnknown(_unknown) => {}
             Self::MissingIdentifier(state) => state.0.materialize_partial_read_unknowns(),
         }
-        let comparison_attributes = match &self {
-            Self::Absent(state) => CanonicalComparisonAttributes {
-                attributes: state.state().attributes.clone(),
-            },
-            Self::Present(present) => CanonicalComparisonAttributes {
-                attributes: present.state().attributes.clone(),
-            },
-            Self::MissingIdentifier(state) => CanonicalComparisonAttributes {
-                attributes: state.state().attributes.clone(),
-            },
-            Self::CreateInFlight(_) | Self::CreateOutcomeUnknown(_) => {
-                CanonicalComparisonAttributes::default()
+        let attributes = match &self {
+            Self::Absent(state) => Some(state.state().attributes.clone()),
+            Self::Present(present) => Some(present.state().attributes.clone()),
+            Self::MissingIdentifier(state) => Some(state.state().attributes.clone()),
+            Self::CreateInFlight(_) | Self::CreateOutcomeUnknown(_) => None,
+        };
+        let comparison_attributes = match (attributes, schema) {
+            (Some(attributes), Some(schema)) => {
+                CanonicalComparisonAttributes::canonicalize(attributes, schema)
             }
+            (Some(attributes), None) => CanonicalComparisonAttributes::from_unschematized(
+                UnschematizedComparisonAttributes::new(attributes),
+            ),
+            (None, _) => CanonicalComparisonAttributes::default(),
         };
         PlanInputCurrent {
             current: self,
@@ -9955,7 +9959,7 @@ pub struct PlanInputCurrent {
 
 impl PlanInputCurrent {
     pub(crate) fn absent(id: ResourceId) -> Self {
-        Current::absent(id).into_plan_input()
+        Current::absent(id).into_plan_input(None)
     }
 
     pub fn current(&self) -> &Current {
@@ -10005,7 +10009,8 @@ impl UnschematizedComparisonAttributes {
 }
 
 impl CanonicalComparisonAttributes {
-    pub(crate) fn canonicalize(
+    /// Build the state-style canonical comparison view for one resource.
+    pub fn canonicalize(
         mut attributes: HashMap<String, Value>,
         schema: &crate::schema::ResourceSchema,
     ) -> Self {
@@ -10019,19 +10024,19 @@ impl CanonicalComparisonAttributes {
         }
     }
 
-    pub(crate) fn get(&self, key: &str) -> Option<&Value> {
+    pub fn get(&self, key: &str) -> Option<&Value> {
         self.attributes.get(key)
     }
 
-    pub(crate) fn contains_key(&self, key: &str) -> bool {
+    pub fn contains_key(&self, key: &str) -> bool {
         self.attributes.contains_key(key)
     }
 
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.attributes.keys()
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.attributes.iter()
     }
 
@@ -10144,7 +10149,16 @@ pub fn into_plan_input_current_map<S>(
     crate::utils::lift_current_state_enum_leaves(&mut current, resources, schemas);
     current
         .into_iter()
-        .map(|(id, current)| (id, current.into_plan_input()))
+        .map(|(id, current)| {
+            let schema = schemas
+                .get(
+                    &id.provider,
+                    &id.resource_type,
+                    crate::schema::SchemaKind::Resource,
+                )
+                .map(|schema| schema.schema().as_schema());
+            (id, current.into_plan_input(schema))
+        })
         .collect()
 }
 
@@ -10171,7 +10185,16 @@ pub fn plan_input_current_map_from_refs<'a, S: 'a>(
     }
     current
         .into_iter()
-        .map(|(id, current)| (id, current.into_plan_input()))
+        .map(|(id, current)| {
+            let schema = schemas
+                .get(
+                    &id.provider,
+                    &id.resource_type,
+                    crate::schema::SchemaKind::Resource,
+                )
+                .map(|schema| schema.schema().as_schema());
+            (id, current.into_plan_input(schema))
+        })
         .collect()
 }
 

@@ -153,6 +153,39 @@ fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
 }
 
 #[test]
+fn resolved_ignore_changes_without_comparison_schema_does_not_panic() {
+    use crate::schema::AttributeSchema;
+
+    let schema = ResourceSchema::new("Widget")
+        .attribute(AttributeSchema::optional("function_version", AttributeType::string()).build());
+    let desired = Resource::with_provider("test", "Widget", "alias", None).with_attribute(
+        "function_version",
+        Value::Concrete(ConcreteValue::String("recorded".into())),
+    );
+    let (desired, registry) = resolved_ignored_resource(desired, schema, &["function_version"]);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "function_version".to_string(),
+            Value::Concrete(ConcreteValue::String("external".into())),
+        )]),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+
+    assert!(matches!(
+        diff(
+            &desired,
+            &current,
+            &saved,
+            None,
+            None,
+            &exact_comparison_context(),
+        ),
+        Diff::NoChange(_)
+    ));
+}
+
+#[test]
 fn ignored_readable_struct_leaf_does_not_hide_changed_sibling() {
     use crate::schema::{AttributeSchema, StructField};
 

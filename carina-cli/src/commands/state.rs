@@ -2553,15 +2553,21 @@ fn diff_display_update_resource_with_provider(
     };
 
     // Build old attributes as DSL values for comparison
-    let old_attrs = existing_rs
-        .persisted_attributes()
-        .map(PersistedAttributes::to_values)
-        .unwrap_or_default();
-    let refreshed_attrs: HashMap<String, Value> = refreshed_resource_state
-        .as_ref()
-        .and_then(ResourceState::persisted_attributes)
-        .map(PersistedAttributes::to_values)
-        .unwrap_or_default();
+    let old_attrs = carina_core::resource::CanonicalComparisonAttributes::canonicalize(
+        existing_rs
+            .persisted_attributes()
+            .map(PersistedAttributes::to_values)
+            .unwrap_or_default(),
+        owner_schema.schema().as_schema(),
+    );
+    let refreshed_attrs = carina_core::resource::CanonicalComparisonAttributes::canonicalize(
+        refreshed_resource_state
+            .as_ref()
+            .and_then(ResourceState::persisted_attributes)
+            .map(PersistedAttributes::to_values)
+            .unwrap_or_default(),
+        owner_schema.schema().as_schema(),
+    );
 
     let mut has_changes = false;
     let mut changes: Vec<String> = Vec::new();
@@ -2579,8 +2585,8 @@ fn diff_display_update_resource_with_provider(
         sorted_keys.sort();
 
         for key in sorted_keys {
-            let old_val = old_attrs.get(*key);
-            let new_val = refreshed_attrs.get(*key);
+            let old_val = old_attrs.get(key);
+            let new_val = refreshed_attrs.get(key);
 
             match (old_val, new_val) {
                 (Some(old), Some(new))
@@ -2695,7 +2701,9 @@ mod tests {
         ConcreteValue, DeferredValue, LiveComposition, LiveCompositionArgument,
         LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint, Resource,
     };
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    };
     use carina_state::{DeposedInstance, DeposedKey};
     use indexmap::IndexMap;
     use serde_json::json;
@@ -5907,6 +5915,57 @@ mod tests {
         .expect("state refresh should compare the reordered list");
 
         counts
+    }
+
+    #[test]
+    fn current_refresh_treats_empty_non_marker_struct_and_absent_as_unchanged() {
+        let id = ResourceId::with_provider_identity("test", "example.Settings", "main", None);
+        let desired = resolved(Resource::with_provider(
+            "test",
+            "example.Settings",
+            "main",
+            None,
+        ));
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("example.Settings", "main", "test", "settings-current")
+                    .expect("fixture identifier is non-empty")
+                    .with_attribute("config", json!({})),
+            )
+            .expect("test state setup must be valid");
+        let fresh = State::existing(id.clone(), HashMap::new()).with_identifier("settings-current");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            (ResourceSchema::new("example.Settings").attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+            ))
+            .validate()
+            .expect("schema fixture must be valid"),
+        );
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &ResolvedResourceId::new(id),
+            &Current::from_state(fresh),
+            &mut state,
+            Some(&desired),
+            &schemas,
+            "",
+            &mut counts,
+        )
+        .expect("state refresh comparison succeeds");
+
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.unchanged, 1);
     }
 
     #[test]

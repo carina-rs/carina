@@ -149,7 +149,6 @@ impl ResolvedIgnoreChanges {
         if self.is_empty() {
             return desired.clone();
         }
-        let schema = schema.expect("resolved ignore_changes paths require a resource schema");
         let mut masked = desired.attributes.clone();
         let attributes = self
             .iter()
@@ -178,7 +177,12 @@ impl ResolvedIgnoreChanges {
                 self.with_observed_readable_leaves(&attribute, &value, observed.get(&attribute));
             masked.insert(attribute, value);
         }
-        CanonicalComparisonAttributes::canonicalize(masked, schema)
+        match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(masked, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                super::UnschematizedComparisonAttributes::new(masked),
+            ),
+        }
     }
 
     /// Make an historical comparison baseline agree with a fresh observation
