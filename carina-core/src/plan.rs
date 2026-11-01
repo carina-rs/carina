@@ -1065,6 +1065,11 @@ impl<S> Plan<S> {
     }
 
     pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect<S>> {
+        // The comparison view is derived from desired resources carried by
+        // effects. Mutable access may replace any of those resources, so the
+        // renderer must rebuild from the resulting effect instead of keeping
+        // a detached pre-mutation copy.
+        self.comparison_attributes.clear();
         &mut self.effects
     }
 

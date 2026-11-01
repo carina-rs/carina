@@ -2579,7 +2579,7 @@ mod tests {
     use crate::effect::{ChangedCreateOnly, EffectGeneration};
     use crate::explicit::{ExplicitFields, PendingPaths};
     use crate::parser::ProviderConfig;
-    use crate::plan::{ReplaceDisplayMetadata, SavedPlan};
+    use crate::plan::{ReplaceDisplayMetadata, SavedPlan, UnresolvedSavedPlan};
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
     use std::collections::HashSet;
 
@@ -2714,6 +2714,114 @@ mod tests {
             &provider,
         )
         .expect("test detail display must resolve its comparison")
+    }
+
+    #[test]
+    fn saved_plan_secret_rehydration_removes_redacted_renderer_comparison_view() {
+        let secret = |plaintext: &str| {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(plaintext.into()),
+            ))))
+        };
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "",
+            ResourceSchema::new("test.Widget")
+                .attribute(AttributeSchema::optional("password", AttributeType::string()).build())
+                .validate()
+                .expect("secret fixture schema must be valid"),
+        );
+        let desired = Resource::new("test.Widget", "example")
+            .with_attribute("password", secret("new-secret"));
+        let id = desired.id.clone();
+        let schema = registry
+            .get_for(&desired)
+            .expect("secret fixture schema")
+            .schema()
+            .as_schema();
+        let to = ResolvedResource::resolve_with_schemas(desired.clone(), &registry)
+            .expect("desired fixture resolves with its schema");
+        let from = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "password".to_string(),
+                Value::Concrete(ConcreteValue::String("old-secret".into())),
+            )]),
+        );
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from),
+            identifier: crate::effect::fixture_applied_identifier("widget-id"),
+            to,
+            changed_attributes: vec!["password".to_string()],
+        });
+        plan.record_comparison_attributes(
+            id.clone(),
+            CanonicalComparisonAttributes::canonicalize(desired.resolved_attributes(), schema),
+        );
+
+        let redacted =
+            crate::value::redact_secrets_in_plan(&plan).expect("saved-plan fixture secrets redact");
+        let wire =
+            serde_json::to_string(&SavedPlan::from(redacted)).expect("saved plan serializes");
+        assert!(
+            !wire.contains("comparison_attributes"),
+            "the derived comparison view must remain outside saved-plan JSON"
+        );
+        let unresolved: UnresolvedSavedPlan =
+            serde_json::from_str(&wire).expect("saved plan wire format deserializes");
+        let loaded = unresolved
+            .resolve_with_schemas(&registry)
+            .expect("saved plan resolves with current schemas");
+        assert!(matches!(
+            loaded
+                .comparison_attributes(&id)
+                .and_then(|attributes| attributes.get("password")),
+            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        ));
+
+        let deferred_templates: crate::parser::ResolvedDeferredForExpressions =
+            crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([]);
+        let rehydrated = crate::value::rehydrate_plan_desired_secrets(
+            &loaded,
+            &HashMap::from([(id.clone(), desired)]),
+            &HashMap::new(),
+            &HashMap::new(),
+            &deferred_templates,
+        )
+        .expect("fresh desired secret rehydrates the saved plan");
+        let Effect::Update { to, .. } = &rehydrated.effects()[0] else {
+            panic!("fixture must remain an Update effect");
+        };
+        assert!(matches!(
+            to.attributes.get("password"),
+            Some(Value::Deferred(DeferredValue::Secret(_)))
+        ));
+
+        let historical = HistoricalDisplayAttributes::for_plan(&rehydrated);
+        assert!(
+            historical
+                .update(&id)
+                .expect("renderer has update history")
+                .comparison_attributes
+                .is_none(),
+            "renderer must derive comparison attributes from the rehydrated effect"
+        );
+        let (registry, provider) =
+            crate::provider::comparison_fixture_for_test(&registry, std::iter::once(&id));
+        let rows = build_detail_rows_by_instance(
+            &rehydrated.effects()[0],
+            Some(&registry),
+            DetailLevel::Explicit,
+            &historical,
+            None,
+            &provider,
+        )
+        .expect("rehydrated update rows render");
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            DetailRow::Changed { key, .. } if key == "password"
+        )));
     }
 
     fn replace_rows_for_test(

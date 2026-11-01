@@ -1922,6 +1922,54 @@ async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
 }
 
 #[tokio::test]
+async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
+    let ignored_comment: ParsedIgnorePath = serde_json::from_value(serde_json::json!({
+        "segments": [{ "kind": "attribute", "value": "comment" }]
+    }))
+    .expect("valid ignored comment path");
+    let mut resource = Resource::with_provider("mock", "test.Resource", "main", None)
+        .with_attribute(
+            "comment",
+            Value::Concrete(ConcreteValue::String("configured".into())),
+        );
+    resource.directives.ignore_changes = vec![ignored_comment];
+    let id = resource.id.clone();
+    let identifier = "provider-id";
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Resource")
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .validate()
+            .expect("ignore_changes fixture schema must be valid"),
+    );
+    let planned = State::existing(id.clone(), HashMap::new()).with_identifier(identifier);
+    let actual = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("added-after-plan".into())),
+        )]),
+    )
+    .with_identifier(identifier);
+    let provider = TestProvider::with_read_state(&id, identifier, actual);
+
+    let result = detect_drift_for_test(
+        &[resource],
+        &[ReloadedCurrentStateEntry::managed(id, planned)],
+        &MovedOrigins::from_plan(&Plan::new()),
+        &provider,
+        None,
+        &schemas,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await
+    .expect("ignored added attribute drift check succeeds");
+
+    assert_eq!(result.drift_messages(), None);
+}
+
+#[tokio::test]
 async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
     use carina_core::schema::{
