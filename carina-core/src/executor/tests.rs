@@ -2413,9 +2413,7 @@ async fn dependency_cycle_records_members_and_emits_failure_events() {
     let second = make_resource("cycle_second", &["cycle_first"]);
     let first_id = first.id.clone();
     let second_id = second.id.clone();
-    let mut plan = Plan::new();
-    plan.add(create_effect(first));
-    plan.add(create_effect(second));
+    let plan = create_plan_from_fixture_resources(vec![first, second]);
     let observer = MockObserver::new();
 
     let result =
@@ -2719,9 +2717,12 @@ async fn resumed_partial_success_reports_once_and_preserves_partial_binding() {
     let source_id = source.id.clone();
     let dependent_id = dependent.id.clone();
     let pending = persisted_create_for_executor(&source_id);
+    let mut resources = resolved_fixture_resources(vec![source, dependent]);
+    let source = resources.remove(0);
+    let dependent = resources.remove(0);
     let mut plan = Plan::new();
-    plan.add_resume_create(resolved(source), pending.started_at().clone());
-    plan.add(create_effect(dependent));
+    plan.add_resume_create(source, pending.started_at().clone());
+    plan.add(Effect::Create(dependent));
     provider.push_resume(ResumeFixture::Partial);
     provider.push_create(Ok(ok_state(&dependent_id)));
     let observer = MockObserver::new();

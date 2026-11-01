@@ -1490,7 +1490,13 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
         schemas,
         sorted_resources.iter().map(|resource| &resource.id),
     );
-    let sorted_resources = ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?
+    let index =
+        carina_core::resolved_graph::ExpandedBindingIndex::for_test_resources(sorted_resources)?;
+    let sorted_resources = sorted_resources
+        .iter()
+        .cloned()
+        .map(|resource| index.resolve_resource(resource, &schemas))
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .map(ResolvedResource::into_inner)
         .collect::<Vec<_>>();

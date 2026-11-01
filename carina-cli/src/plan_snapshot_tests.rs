@@ -966,6 +966,8 @@ fn snapshot_delete_orphan() {
 
 #[test]
 fn snapshot_legacy_orphan_unknown_destroy_ordering() {
+    // Legacy dependency warnings are emitted to stderr during state migration,
+    // before the plan renderer consumes the migrated, typed dependencies.
     let (plan, current_states, schemas, _moved) =
         build_plan_and_states_from_fixture("legacy_orphan_unknown_destroy_ordering");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
@@ -2842,7 +2844,7 @@ fn snapshot_deferred_for_with_dependent_wait() {
                     .effects()
                     .iter()
                     .find_map(|effect| match effect {
-                        Effect::DeferredCreate(payload) => Some(payload.id()),
+                        Effect::DeferredReplace(payload) => Some(payload.id()),
                         _ => None,
                     })
                     .expect("fixture deferred producer");

@@ -2714,16 +2714,28 @@ mod tests {
         )
     }
 
+    fn deferred_for_producer() -> Resource {
+        Resource::with_provider("mock", "test", "cert", None)
+            .with_absolute_binding(absolute_binding("cert"))
+    }
+
+    fn compiled_deferred_for_template(
+        template: crate::parser::DeferredForExpression,
+    ) -> DeferredCreatePayload {
+        crate::test_support::compiled_loop_with_producers(
+            Box::new(template),
+            vec![deferred_for_producer()],
+        )
+    }
+
     fn deferred_create_effect() -> Effect {
-        Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(
-            deferred_for_template(),
-        )))
+        Effect::DeferredCreate(compiled_deferred_for_template(deferred_for_template()))
     }
 
     fn deferred_replace_effect() -> Effect {
-        let template = deferred_for_template_at(None, 0);
-        Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
-            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+        let payload = compiled_deferred_for_template(deferred_for_template_at(None, 0));
+        Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
                     "validation_records[0]",
@@ -2731,15 +2743,16 @@ mod tests {
                 identifier: fixture_applied_identifier("old-record-id"),
                 directives: Directives::default(),
                 binding: Some(absolute_binding("validation_records[0]")),
-                dependencies: crate::test_support::persisted([
-                    ResolvedResourceId::with_provider_identity("mock", "test", "cert", None),
-                ]),
+                dependencies: crate::test_support::persisted([ResolvedResourceId::new(
+                    deferred_for_producer().id,
+                )]),
                 explicit_dependencies: Default::default(),
                 blocked_by_updates: Default::default(),
             }])
             .expect("test fixture has one delete"),
-            Box::new(template),
-        )))
+            template: payload.template,
+            dependency_template: payload.dependency_template,
+        }))
     }
 
     #[test]
@@ -2762,7 +2775,7 @@ mod tests {
             dependency_template: crate::resource::DeferredDependencyTemplate,
         }
 
-        let create_payload = crate::test_support::compiled_loop(Box::new(deferred_for_template()));
+        let create_payload = compiled_deferred_for_template(deferred_for_template());
         let create_template = create_payload.template.clone();
         let create_id = ResolvedResourceId::with_provider_identity(
             "",
@@ -3012,7 +3025,10 @@ mod tests {
     #[test]
     fn deferred_create_blocking_dependencies_is_upstream_only() {
         let effect = deferred_create_effect();
-        assert_eq!(effect.blocking_keys(), test_dependencies(&["cert"]));
+        assert_eq!(
+            effect.blocking_keys(),
+            ResolvedDependencies::from_iter([ResolvedResourceId::new(deferred_for_producer().id)]),
+        );
     }
 
     #[test]

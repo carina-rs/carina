@@ -946,6 +946,10 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
     ");
 }
 
+fn certificate_resource() -> Resource {
+    Resource::new("acm.Certificate", "cert").with_absolute_binding(absolute_binding("cert"))
+}
+
 fn deferred_validation_records_effect() -> Effect {
     let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::with_provider("aws", "route53.Record", "validation_records", None);
@@ -965,7 +969,17 @@ fn deferred_validation_records_effect() -> Effect {
         template_resource,
     );
 
-    Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(deferred)))
+    let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+    configuration.resources = vec![certificate_resource()];
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
+        .expect("certificate fixture graph resolves");
+    let (template, dependency_template) = graph
+        .compile_deferred_for(deferred)
+        .expect("deferred fixture references the certificate producer");
+    Effect::DeferredCreate(carina_core::effect::DeferredCreatePayload::new(
+        Box::new(template),
+        dependency_template,
+    ))
 }
 
 #[test]
@@ -1022,11 +1036,8 @@ fn delete_record_effect(binding: &'static str) -> Effect {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(absolute_binding(binding)),
-        dependencies: crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
-            "mock",
-            "acm.Certificate",
-            "cert",
-            None,
+        dependencies: crate::test_support::persisted([ResolvedResourceId::new(
+            certificate_resource().id,
         )]),
         explicit_dependencies: Default::default(),
         blocked_by_updates: Default::default(),
@@ -1153,9 +1164,7 @@ fn test_deferred_replace_renders_dependent_children() {
 #[test]
 fn test_deferred_replace_keeps_unrelated_same_type_delete() {
     let mut plan = Plan::new();
-    let mut certificate = Resource::new("acm.Certificate", "cert");
-    certificate.binding = Some(absolute_binding("cert"));
-    plan.add(Effect::Create(resolved(certificate)));
+    plan.add(Effect::Create(resolved(certificate_resource())));
     plan.add(delete_record_effect("old_record"));
     plan.add(deferred_replace_validation_records_effect());
 

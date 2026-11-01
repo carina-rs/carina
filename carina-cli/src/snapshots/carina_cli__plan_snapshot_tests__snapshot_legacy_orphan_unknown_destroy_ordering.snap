@@ -11,6 +11,5 @@ Execution Plan:
       tags:
         Name: 'test-subnet'
       vpc_id: 'vpc-0123456789abcdef0'
-Warning: destroy ordering for awscc.ec2.Subnet.removed_module.subnet is partially unknown: legacy dependency "removed_module.gone" no longer resolves.
 
 Plan: 0 to add, 0 to change, 1 to destroy.
