@@ -51,9 +51,12 @@ EOF
 }
 
 failures=0
+valid_fixtures=0
+regressions=0
 
 assert_accepted() {
     local output
+    valid_fixtures=$((valid_fixtures + 1))
     if ! output=$(bash "$fixture_dir/scripts/check-provider-sdk-bindings.sh" 2>&1); then
         printf 'FAIL: guard rejected %s:\n%s\n' "$1" "$output" >&2
         failures=$((failures + 1))
@@ -62,6 +65,7 @@ assert_accepted() {
 
 assert_rejected() {
     local output
+    regressions=$((regressions + 1))
     if output=$(bash "$fixture_dir/scripts/check-provider-sdk-bindings.sh" 2>&1); then
         printf 'FAIL: guard accepted %s\n' "$1" >&2
         failures=$((failures + 1))
@@ -146,4 +150,4 @@ if [[ "$failures" -gt 0 ]]; then
     exit 1
 fi
 
-printf 'OK: Provider SDK bindings guard accepted all 5 valid fixtures and rejected all 10 regressions.\n'
+printf 'OK: Provider SDK bindings guard accepted all %s valid fixtures and rejected all %s regressions.\n' "$valid_fixtures" "$regressions"
