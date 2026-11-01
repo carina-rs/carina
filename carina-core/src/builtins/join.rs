@@ -1,6 +1,8 @@
 //! `join(separator, list)` built-in function
 
-use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Value, ValueString};
+use crate::resource::{
+    BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Value, ValueString,
+};
 
 use super::value_type_name;
 
@@ -15,7 +17,9 @@ use super::value_type_name;
 /// join("-", ["a", "b", "c"])  // => "a-b-c"
 /// ["a", "b"] |> join("-")     // => "a-b" (pipe form)
 /// ```
-pub(crate) fn builtin_join<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_join<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!(
             "join() expects 2 arguments (separator, list), got {}",
@@ -67,7 +71,9 @@ pub(crate) fn builtin_join<B: BindingAddress>(args: &[Value<B>]) -> Result<Value
     }
 }
 
-fn join_scalar<B: BindingAddress>(value: &Value<B>) -> Result<(ValueString, bool), String> {
+fn join_scalar<B: BindingAddress>(
+    value: &Value<NoPlaceholder, B>,
+) -> Result<(ValueString, bool), String> {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => Ok((value.clone(), false)),
         Value::Concrete(ConcreteValue::EnumIdentifier(value)) => Ok((value.as_str().into(), false)),

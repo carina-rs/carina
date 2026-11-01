@@ -15,7 +15,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
 use crate::parser::{File, ResourceRef};
-use crate::resource::BindingAddress;
+use crate::resource::{BindingAddress, ModuleSource, ParserPlaceholder};
+
+type ParsedResourceRef<'a, D, B> =
+    ResourceRef<'a, ModuleSource, ParserPlaceholder, ParserPlaceholder, D, B>;
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,10 +79,10 @@ impl DependsOnDiagnostic {
 ///
 /// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<'a, B, D>(rref: ResourceRef<'a, crate::resource::ModuleSource, B, D>) -> &'a [B]
+fn depends_on_of<B, D>(rref: ParsedResourceRef<'_, D, B>) -> &[B]
 where
     B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<B>,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     rref.directives()
         .map_or(&[][..], |d| d.depends_on.as_slice())
@@ -88,10 +91,12 @@ where
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
-pub fn validate_depends_on<E, B, D>(parsed: &File<E, B, D>) -> Vec<DependsOnDiagnostic>
+pub fn validate_depends_on<E, B, D>(
+    parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+) -> Vec<DependsOnDiagnostic>
 where
     B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<B>,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     // Common-case fast path: the vast majority of resources will have
     // no `depends_on` set, and the checks below allocate per-resource.
@@ -106,11 +111,10 @@ where
 
     let mut diags = Vec::new();
 
-    let bindings_by_name: HashMap<&str, ResourceRef<'_, crate::resource::ModuleSource, B, D>> =
-        parsed
-            .iter_all_resources()
-            .filter_map(|rref| rref.binding().map(|n| (n, rref)))
-            .collect();
+    let bindings_by_name: HashMap<&str, ParsedResourceRef<'_, D, B>> = parsed
+        .iter_all_resources()
+        .filter_map(|rref| rref.binding().map(|n| (n, rref)))
+        .collect();
     let upstream_names: HashSet<&str> = parsed
         .upstream_states
         .iter()
@@ -130,7 +134,7 @@ where
 
     let mut check_resource =
         |binding: Option<&str>,
-         attributes: &indexmap::IndexMap<String, crate::resource::Value<B>>,
+         attributes: &indexmap::IndexMap<String, crate::resource::Value<ParserPlaceholder, B>>,
          dependency_bindings: &std::collections::BTreeSet<B>,
          depends_on: &[B]| {
             if depends_on.is_empty() {
@@ -215,10 +219,7 @@ where
                     continue;
                 }
 
-                if value_ref_deps
-                    .iter()
-                    .any(|dependency| dependency.as_str() == dep_name.as_str())
-                {
+                if value_ref_deps.contains(dep_name) {
                     diags.push(
                         DependsOnDiagnostic::warning(format!(
                             "directives.depends_on on '{}': edge to '{}' is redundant; \

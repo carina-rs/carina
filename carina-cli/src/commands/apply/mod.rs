@@ -34,8 +34,10 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
+#[cfg(test)]
+use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
-    ExpandedInferredFile, ExpandedProviderConfig, LoadedProviderContext, ProviderContext,
+    ExpandedProviderConfig, ExpandedUpstreamState, LoadedProviderContext, ProviderContext,
     ResolvedProviderConfigs,
 };
 
@@ -198,7 +200,7 @@ fn format_total_apply_line(elapsed: Duration) -> String {
 
 struct BootstrapCreateContext<'a> {
     backend: &'a dyn StateBackend,
-    parsed: &'a ExpandedInferredFile,
+    parsed: &'a carina_core::parser::ExpandedInferredFile,
     provider_configs: &'a ResolvedProviderConfigs,
     normalizer: &'a dyn ProviderNormalizer,
     factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
@@ -384,7 +386,9 @@ fn format_partial_state_bucket_create_warning(
     )
 }
 
-fn bootstrap_resolved_bindings(parsed: &ExpandedInferredFile) -> ResolvedBindings {
+fn bootstrap_resolved_bindings(
+    parsed: &carina_core::parser::ExpandedInferredFile,
+) -> ResolvedBindings {
     let managed_current = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases: Vec<WaitAliasSpec> = parsed
@@ -730,16 +734,14 @@ async fn verify_upstream_snapshot(
     snapshot: &HashMap<String, HashMap<String, Value>>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    use carina_core::parser::UpstreamState;
     let project_dir = apply_target.source_dir();
-    let upstream_states: Vec<UpstreamState<carina_core::resource::AbsoluteBindingAddress>> =
-        sources
-            .iter()
-            .map(|s| UpstreamState {
-                binding: s.binding.clone(),
-                source: s.source.clone(),
-            })
-            .collect();
+    let upstream_states: Vec<ExpandedUpstreamState> = sources
+        .iter()
+        .map(|s| ExpandedUpstreamState {
+            binding: s.binding.clone(),
+            source: s.source.clone(),
+        })
+        .collect();
     let provider_context = ProviderContext::default();
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
     let current = super::plan::load_upstream_states(
@@ -1770,7 +1772,7 @@ fn reload_apply_configuration_after_bootstrap(
 }
 
 async fn load_apply_provider_inputs<E>(
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -2638,10 +2640,8 @@ fn ensure_saved_plan_backend_matches_current(
     current_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    let planned =
-        BackendLock::for_expanded_config(plan_backend_config).map_err(AppError::Backend)?;
-    let current =
-        BackendLock::for_expanded_config(current_backend_config).map_err(AppError::Backend)?;
+    let planned = BackendLock::for_config(plan_backend_config).map_err(AppError::Backend)?;
+    let current = BackendLock::for_config(current_backend_config).map_err(AppError::Backend)?;
 
     if planned == current {
         Ok(())
@@ -2738,7 +2738,7 @@ where
 
 fn import_identifiers_from_current_config<S>(
     plan: &carina_core::plan::Plan<S>,
-    parsed: &ExpandedInferredFile,
+    parsed: &carina_core::parser::ExpandedInferredFile,
 ) -> HashMap<ResourceId, Value> {
     let mut identifiers = HashMap::new();
     let bindings = bootstrap_resolved_bindings(parsed);
@@ -2877,7 +2877,7 @@ fn rehydrate_desired_plan_file(
 
 fn rehydrate_desired_plan_file_from_parts(
     plan_file: &mut ReloadedPlanFile,
-    parsed: &ExpandedInferredFile,
+    parsed: &carina_core::parser::ExpandedInferredFile,
     provider_inputs: &ResolvedProviderInputs,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
@@ -3064,11 +3064,12 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 35
-    // stores tri-state prevent_destroy directives, so format 34 plans must be
-    // regenerated. Format 34 adds typed deferred integer arithmetic
-    // expressions. Format 33 adds the typed keyed-list release effect. Format
-    // 32 records provider
+    // Validate version compatibility before decoding the payload. Format 36
+    // adds typed deferred-for templates and stage-specific placeholder types.
+    // Format 35 stores tri-state prevent_destroy directives, so format 34
+    // plans must be regenerated. Format 34 adds typed deferred integer
+    // arithmetic expressions. Format 33 adds the typed keyed-list release
+    // effect. Format 32 records provider
     // instance reference scopes and create-outcome-unknown markers for
     // protocol v13. Format 31 persists authored ignore paths; format 30 was
     // never emitted. Format 29 persists anonymous-loop provenance, typed
@@ -3216,7 +3217,14 @@ async fn run_apply_from_plan_with_observer_factory(
         InspectedPlanFile::Verified(plan) => {
             let parsed_backend = loaded_current_config
                 .ok()
-                .map(|config| config.into_root_expanded().backend);
+                .map(|config| {
+                    config
+                        .into_root_expanded()
+                        .backend
+                        .map(carina_core::parser::BackendConfig::into_expanded)
+                        .transpose()
+                })
+                .transpose()?;
             (
                 ProviderBoundPlanFile::verified(plan, providers),
                 parsed_backend,
@@ -3699,7 +3707,7 @@ async fn run_apply_from_plan_locked_owned(
             // `(binding, target)` pairs so `apply --plan`'s cascade
             // re-resolution resolves `<wait-binding>.<attr>` exactly as the
             // plan path did (carina#3085). `PlanWaitBinding` (String) →
-            // `WaitAliasSpec` (typed `AbsoluteBindingAddress`); the parser `WaitBinding`
+            // `WaitAliasSpec` (typed `BindingName`); the parser `WaitBinding`
             // is not serializable so it is reconstructed here, not deserialized.
             let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
                 .wait_bindings()

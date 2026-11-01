@@ -1,13 +1,15 @@
 //! Binary integer-arithmetic expression parsing and constant folding.
 
-use crate::eval_value::{
-    AuthoredEvalValue as EvalValue, AuthoredStructuralHandleMetadata as StructuralHandleMetadata,
-};
+use crate::eval_value::{EvalValue, StructuralHandleMetadata};
 use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
 use crate::parser::context::ExpressionMode;
 use crate::parser::expressions::primary::parse_postfix_eval_with_mode;
 use crate::parser::{ParseContext, ParseError, Rule, next_pair};
-use crate::resource::{AuthoredDeferredValue as DeferredValue, AuthoredValue as Value};
+use crate::resource::{
+    DeferredValue, ParserPlaceholder, RelativeBindingName, Value as GenericValue,
+};
+
+type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
 pub(crate) fn parse_additive_expr_with_mode(
     pair: pest::iterators::Pair<Rule>,

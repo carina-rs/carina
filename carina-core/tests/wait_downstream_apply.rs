@@ -282,7 +282,11 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
 
     let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed for the caller fixture");
+
     let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
+    let parsed = parsed
+        .into_expanded()
+        .expect("expanded module fixture contains no parser placeholders");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
     // expansion, instance-prefixed with the module-call binding (`r`).
@@ -331,16 +335,18 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         .find(|r| r.id.resource_type == "cloudfront.Distribution")
         .expect("expanded Distribution must be present");
     assert!(
-        carina_core::deps::get_resource_value_ref_dependencies(
-            carina_core::parser::ResourceRef::Resource(dist)
-        )
+        carina_core::deps::get_resource_value_ref_dependencies(carina_core::parser::ResourceRef::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::NoPlaceholder,
+        >::Resource(dist))
         .iter()
         .any(|dependency| dependency.as_str() == "r.cert_issued"),
         "Distribution must depend on the prefixed wait binding \
          `r.cert_issued`; deps were {:?}",
-        carina_core::deps::get_resource_value_ref_dependencies(
-            carina_core::parser::ResourceRef::Resource(dist)
-        )
+        carina_core::deps::get_resource_value_ref_dependencies(carina_core::parser::ResourceRef::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::NoPlaceholder,
+        >::Resource(dist))
     );
 
     // ---- Apply pipeline (mirrors `carina apply`): the Distribution
@@ -477,7 +483,11 @@ async fn nested_module_wait_binding_survives_two_expansions() {
 
     let parsed = parse_directory(&root, &ProviderContext::default())
         .expect("parse_directory should succeed for the nested root fixture");
+
     let parsed = resolve_modules(parsed, &root).expect("nested module resolution should succeed");
+    let parsed = parsed
+        .into_expanded()
+        .expect("expanded nested module fixture contains no parser placeholders");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
     // (outer call binding `o`, inner call binding `c`).
@@ -508,16 +518,18 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         .find(|r| r.id.resource_type == "cloudfront.Distribution")
         .expect("expanded Distribution must be present");
     assert!(
-        carina_core::deps::get_resource_value_ref_dependencies(
-            carina_core::parser::ResourceRef::Resource(dist)
-        )
+        carina_core::deps::get_resource_value_ref_dependencies(carina_core::parser::ResourceRef::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::NoPlaceholder,
+        >::Resource(dist))
         .iter()
         .any(|dependency| dependency.as_str() == "o.c.cert_issued"),
         "Distribution must depend on the doubly-prefixed wait binding \
          `o.c.cert_issued`; deps were {:?}",
-        carina_core::deps::get_resource_value_ref_dependencies(
-            carina_core::parser::ResourceRef::Resource(dist)
-        )
+        carina_core::deps::get_resource_value_ref_dependencies(carina_core::parser::ResourceRef::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::NoPlaceholder,
+        >::Resource(dist))
     );
 
     // End-to-end apply: the Distribution must wait, not fail/skip.
@@ -655,6 +667,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed");
     let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
+    let parsed = parsed
+        .into_expanded()
+        .expect("expanded module fixture contains no parser placeholders");
 
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).expect("topological sort");

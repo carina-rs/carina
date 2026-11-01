@@ -18,26 +18,63 @@ mod static_eval;
 mod types;
 mod util;
 
+pub(crate) type ParsedValue = crate::resource::Value<
+    crate::resource::ParserPlaceholder,
+    crate::resource::RelativeBindingName,
+>;
+pub(crate) type ParsedResource = crate::resource::Resource<
+    crate::resource::ModuleSource,
+    crate::resource::ParserPlaceholder,
+    crate::resource::RelativeBindingName,
+>;
+pub(crate) type ParsedDataSource = crate::resource::DataSource<
+    crate::resource::ModuleSource,
+    crate::resource::ParserPlaceholder,
+    crate::resource::RelativeBindingName,
+>;
+pub(crate) type ParsedFunctionArgument = crate::resource::FunctionArgument<
+    crate::resource::ParserPlaceholder,
+    crate::resource::RelativeBindingName,
+>;
+pub(crate) type ParserProviderConfig =
+    ast::ProviderConfig<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
+pub(crate) type ParserBackendConfig =
+    ast::BackendConfig<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
+pub(crate) type ParserStateBlock =
+    ast::StateBlock<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
+pub(crate) type ParserWaitBinding = ast::WaitBinding<crate::resource::RelativeBindingName>;
+pub(crate) type ParserUntilPredicate = ast::UntilPredicateAst<crate::resource::RelativeBindingName>;
+pub(crate) type ParserValidateExpr =
+    ast::ValidateExpr<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
+pub(crate) type ParserValidationBlock =
+    ast::ValidationBlock<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
+pub(crate) type ParserRequireBlock =
+    ast::RequireBlock<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
+
 pub use crate::eval_value::StructuralHandleKind;
 pub use crate::resource::RelativeBindingName;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
-    AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingScopeId,
-    BindingUseOwner, CallExpansion, ConsumerArgumentParameter, ConsumerAttributeParameter,
-    DeferredForBody, DeferredForExpansionError, DeferredForExpression, DeferredForPhaseTraversal,
-    DeferredForSite, DeferredForTarget, ExpandedBackendConfig, ExpandedDeferredForExpression,
-    ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedExportParam,
-    ExpandedParsedFile, ExpandedProviderConfig, ExpandedStateBlock, ExpandedUpstreamState,
-    ExpansionKey, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
-    InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallId,
-    ModuleResolvedFile, ModuleResolvedInferredFile, ModuleResolvedParsedFile, MovedAddresses,
-    ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedExportParam,
-    ParsedFile, ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock,
+    AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
+    BindingScopeId, BindingUseOwner, CallExpansion, ConsumerArgumentParameter,
+    ConsumerAttributeParameter, DeferredForBody, DeferredForExpansionError, DeferredForExpression,
+    DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, ExpandedBackendConfig,
+    ExpandedDeferredForExpression, ExpandedFile, ExpandedInferredExportParam, ExpandedInferredFile,
+    ExpandedParsedExportParam, ExpandedParsedFile, ExpandedProviderConfig, ExpandedStateBlock,
+    ExpandedUpstreamState, ExpansionKey, ExportParamLike, ExportParameter, File, FnParam,
+    InferredExportParam, InferredFile, IntoExpandedExportParam, ModuleArgument, ModuleCall,
+    ModuleCallDiagnosticSource, ModuleCallId, ModuleResolvedFile,
+    ModuleResolvedInferredExportParam, ModuleResolvedInferredFile, ModuleResolvedParsedFile,
+    MovedAddresses, ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForPhase,
+    ParsedExportParam, ParsedFile, ParserBindingMetadata, ParserDeferredForPhaseAudit,
+    ParserPlaceholderBoundary, PendingValueSlot, ProviderConfig, RequireBlock,
     ResolveExportBindingPhase, ResolvedDeferredForExpressions, ResolvedDeferredForPhase,
     ResourceAddress, ResourceContext, ResourceMut, ResourceRef, ResourceTypePath,
+    RootBindingResolvedFile, RootBindingResolvedInferredFile, RootBindingResolvedParsedFile,
     SavedDeferredForExpression, ShapeMismatch, SourceFileId, SourceSpan, StateBlock,
-    StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
-    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
+    StateBlockAddress, TopLevelResourceRef, TypeExpr, UntilPredicateAst, UpstreamState,
+    UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
+    expand_deferred_children,
 };
 pub(crate) use ast::{
     BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,

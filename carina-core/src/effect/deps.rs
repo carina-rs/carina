@@ -440,9 +440,9 @@ impl<'a> DependencyAnalyzer<'a> {
         }
     }
 
-    fn collect_from_resource_ref<S>(
+    fn collect_from_resource_ref<S, P: crate::resource::PlaceholderKind>(
         &self,
-        resource: ResourceRef<'_, S, AbsoluteBindingAddress>,
+        resource: ResourceRef<'_, S, P>,
         analysis: &mut DependencyAnalysis,
         child: usize,
     ) {
@@ -765,7 +765,10 @@ mod tests {
     }
 
     fn root_resource_ref(binding: &str, attribute: &str) -> Value {
-        AuthoredValue::resource_ref(binding, attribute, Vec::new()).resolve_root(&RootScope::new())
+        AuthoredValue::resource_ref(binding, attribute, Vec::new())
+            .resolve_root(&RootScope::new())
+            .into_expanded()
+            .expect("dependency fixture contains no parser placeholder")
     }
 
     fn state_for(id: &ResourceId) -> State {

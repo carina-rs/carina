@@ -3,20 +3,22 @@ use std::sync::{Arc, Mutex};
 use indexmap::IndexMap;
 
 use crate::executor::normalized::{apply_desired_normalization, apply_desired_normalization_slice};
-use crate::parser::ProviderConfig;
+use crate::parser::ExpandedProviderConfig as ProviderConfig;
 use crate::provider::{
     BoxFuture, NoopNormalizer, ProviderError, ProviderNormalizer, ProviderResult, ready_noop,
 };
 use crate::resource::{
-    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+    ApplyTimeUnknown, ExpandedConcreteValue as ConcreteValue,
     ExpandedDeferredValue as DeferredValue, ExpandedInterpolationPart as InterpolationPart,
-    ExpandedResource as Resource, ExpandedUnknownReason as UnknownReason, ExpandedValue as Value,
+    ExpandedResource as Resource, ExpandedValue as Value, RelativeBindingName, RootScope,
 };
 use crate::schema::SchemaRegistry;
 
-fn provider_config(
-    default_tags: IndexMap<String, Value>,
-) -> ProviderConfig<AbsoluteBindingAddress> {
+fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
+
+fn provider_config(default_tags: IndexMap<String, Value>) -> ProviderConfig {
     ProviderConfig {
         name: "test".to_string(),
         attributes: IndexMap::new(),
@@ -868,7 +870,11 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
     resource.set_attr("role_arn", deferred.clone());
     resource.set_attr(
         "pending",
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: absolute_binding("upstream"),
+            },
+        )),
     );
 
     let normalized =
@@ -884,7 +890,7 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
     assert!(matches!(
         normalized.as_resource().get_attr("pending"),
         Some(Value::Deferred(DeferredValue::Unknown(
-            UnknownReason::ForValue
+            ApplyTimeUnknown::UpstreamAllExports { .. }
         )))
     ));
     assert_eq!(

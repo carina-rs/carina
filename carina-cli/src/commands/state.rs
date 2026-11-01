@@ -23,8 +23,8 @@ use carina_core::provider::{
     ProviderError, ProviderNormalizer, ProviderRouter, RawSavedAttrs, UnknownCreateOutcome,
 };
 use carina_core::resource::{
-    Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
-    ResourceIdentity, State, Value,
+    AbsoluteBindingAddress, Current, DataSource, ResolvedDataSource, ResolvedResource,
+    ResolvedResourceId, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
@@ -495,14 +495,18 @@ pub async fn run_state_forget(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let address = state_forget_address(namespaced_type, identity)?;
-    let parsed = load_configuration_with_config(
+    let loaded = load_configuration_with_config(
         path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?
-    .parsed;
+    )?;
+    let backend_config = loaded
+        .into_root_expanded()
+        .backend
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
     let verified_backend =
-        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::ForgetState)?;
+        verify_for_mutation(path, backend_config.as_ref(), DriftCommand::ForgetState)?;
     let backend = verified_backend
         .resolve()
         .await
@@ -591,13 +595,18 @@ pub async fn run_force_unlock(
     )?
     .parsed;
     let base_dir = get_base_dir(path);
+    let backend_config = parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
 
     // Administrative lock recovery uses the shared old-backend-on-drift
     // selector without emitting the read-command warning.
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
 
-    match BackendSelection::force_unlock(base_dir, parsed.backend.as_ref(), lock_id).await {
+    match BackendSelection::force_unlock(base_dir, backend_config.as_ref(), lock_id).await {
         Ok(()) => {
             println!("{}", "State has been successfully unlocked.".green().bold());
             Ok(())
@@ -643,12 +652,17 @@ async fn load_state_file(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let parsed = loaded.parsed;
+    let backend_config = parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
 
     let base_dir = get_base_dir(path);
     let backend = resolve_backend_for_read(
         base_dir,
         path,
-        parsed.backend.as_ref(),
+        backend_config.as_ref(),
         BackendLockRequirement::AllowMissing,
         ReadBackendWarningPolicy::CommandBoundary { project_dir: path },
     )
@@ -873,42 +887,31 @@ fn resolve_resource_address<'a>(
     // name) matches the longest prefix of `query`. Equal-length
     // candidates: binding wins over name (matches the historical
     // `find_resource_by_query` precedence).
-    let mut best: Option<(&'a ResourceState, usize, bool)> = None;
+    let mut best: Option<(&'a ResourceState, &'a str, bool)> = None;
     for rs in state.resources() {
-        if let Some(binding) = &rs.binding {
-            let spelling = binding.as_str();
-            if query_starts_with_address(query, spelling) {
+        for (candidate, is_binding) in candidate_addresses(rs) {
+            if query_starts_with_address(query, candidate) {
                 let take = match &best {
                     None => true,
-                    Some(previous) => {
-                        spelling.len() > previous.1 || (spelling.len() == previous.1 && !previous.2)
+                    Some((_, prev, prev_is_binding)) => {
+                        candidate.len() > prev.len()
+                            || (candidate.len() == prev.len() && is_binding && !*prev_is_binding)
                     }
                 };
                 if take {
-                    best = Some((rs, spelling.len(), true));
+                    best = Some((rs, candidate, is_binding));
                 }
-            }
-        }
-
-        let identity = rs.identity.as_str();
-        if query_starts_with_address(query, identity) {
-            let take = match &best {
-                None => true,
-                Some(previous) => identity.len() > previous.1,
-            };
-            if take {
-                best = Some((rs, identity.len(), false));
             }
         }
     }
 
-    let (rs, matched_len, _) = best?;
-    let attribute = if query.len() == matched_len {
+    let (rs, matched, _) = best?;
+    let attribute = if query.len() == matched.len() {
         None
     } else {
         // matched is a strict prefix; the byte after it must be '.'
         // (guaranteed by query_starts_with_address).
-        Some(&query[matched_len + 1..])
+        Some(&query[matched.len() + 1..])
     };
     Some((rs, attribute))
 }
@@ -959,6 +962,16 @@ fn format_state_lookup_json(
 
     serde_json::to_string_pretty(&value)
         .map_err(|error| AppError::Config(format!("Failed to serialize state JSON: {error}")))
+}
+
+/// Candidate addresses for a resource, paired with `is_binding` so the
+/// longest-prefix tie-break can prefer bindings over identities.
+fn candidate_addresses(rs: &ResourceState) -> impl Iterator<Item = (&str, bool)> {
+    rs.binding
+        .as_ref()
+        .map(|binding| (binding.as_str(), true))
+        .into_iter()
+        .chain(std::iter::once((rs.identity.as_str(), false)))
 }
 
 /// `true` if `query` is exactly `address` or starts with `address` + '.'.
@@ -1386,7 +1399,7 @@ fn state_bucket_delete_request(
 }
 
 async fn load_state_bucket_delete_provider_inputs<E>(
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -1646,10 +1659,7 @@ pub(crate) async fn run_state_refresh_locked(
         state_file.as_ref(),
     )
     .await?;
-    let saved_dep_bindings: HashMap<
-        ResourceId,
-        BTreeSet<carina_core::resource::AbsoluteBindingAddress>,
-    > = state_file
+    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<AbsoluteBindingAddress>> = state_file
         .as_ref()
         .map(|sf| {
             sorted_resources
@@ -1883,9 +1893,24 @@ pub(crate) async fn run_state_refresh_locked(
                 &data_source_values,
                 &state,
             );
+        let plan_input_current = carina_core::resource::into_plan_input_current_map(
+            managed_current.clone(),
+            ctx.schemas(),
+            &sorted_resources,
+        );
+        let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
+                managed: &sorted_resources,
+                compositions: &parsed.compositions,
+                managed_current: &plan_input_current,
+                data_source_values: &data_source_values,
+                remote_bindings: &empty_remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
-            &carina_core::binding_index::ResolvedBindings::for_expanded_validation(parsed),
+            &export_bindings,
             ctx.provider_context(),
         )
         .map_err(AppError::Validation)?;
@@ -2711,22 +2736,35 @@ mod tests {
 
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
-    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
-        carina_core::resource::absolute_binding_address_for_test(name)
-    }
-
-    fn relative_binding(name: &str) -> carina_core::resource::RelativeBindingName {
-        carina_core::resource::RelativeBindingName::new(name)
-    }
-
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
     }
 
-    fn resolve_file_for_test<E: carina_core::parser::ResolveExportBindingPhase>(
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
+    fn resolve_file_for_test<E>(
+        parsed: carina_core::parser::ExpandedFile<E>,
+        _base_dir: &Path,
+    ) -> carina_core::parser::ExpandedFile<E> {
+        parsed
+    }
+
+    fn resolve_authored_file_for_test<E>(
         parsed: carina_core::parser::File<E>,
         base_dir: &Path,
-    ) -> carina_core::parser::ModuleResolvedFile<E::Absolute> {
+    ) -> carina_core::parser::ExpandedFile<
+        <E::Absolute as carina_core::parser::IntoExpandedExportParam<
+            carina_core::resource::AbsoluteBindingAddress,
+        >>::Expanded,
+    >
+    where
+        E: carina_core::parser::ResolveExportBindingPhase<carina_core::resource::ParserPlaceholder>,
+        E::Absolute: carina_core::parser::IntoExpandedExportParam<
+                carina_core::resource::AbsoluteBindingAddress,
+            >,
+    {
         carina_core::module_resolver::resolve_modules_with_providerless_config(
             carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
             base_dir,
@@ -2734,6 +2772,8 @@ mod tests {
             &SchemaRegistry::new(),
         )
         .expect("test fixture crosses module resolution")
+        .into_expanded()
+        .expect("test fixture contains no leftover parser placeholders")
     }
 
     fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
@@ -2937,10 +2977,10 @@ mod tests {
     #[tokio::test]
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let parsed = resolve_file_for_test(parsed, &downstream);
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2981,13 +3021,13 @@ mod tests {
         parsed
             .upstream_states
             .push(carina_core::parser::UpstreamState {
-                binding: relative_binding("unrelated"),
+                binding: carina_core::resource::RelativeBindingName::new("unrelated"),
                 source: PathBuf::from("../unrelated"),
             });
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let parsed = resolve_file_for_test(parsed, &downstream);
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -3016,10 +3056,10 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let parsed = resolve_file_for_test(parsed, &downstream);
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -3150,7 +3190,7 @@ mod tests {
     #[tokio::test]
     async fn state_bucket_delete_prepares_resolved_upstream_provider_config() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = resolve_file_for_test(parsed, &downstream);
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &downstream,
@@ -3207,7 +3247,7 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
-        let parsed = resolve_file_for_test(parsed, &downstream);
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
 
         let error = match load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3232,7 +3272,7 @@ mod tests {
     async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         parsed.providers[0].name = "test".to_string();
-        let parsed = resolve_file_for_test(parsed, &base_dir);
+        let parsed = resolve_authored_file_for_test(parsed, &base_dir);
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &base_dir,
@@ -3287,7 +3327,7 @@ mod tests {
                 .contains_key("default_tags"),
             "the fixture must exercise the parser shape used by bucket delete"
         );
-        let parsed = resolve_file_for_test(parsed, temp.path());
+        let parsed = resolve_authored_file_for_test(parsed, temp.path());
 
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3623,7 +3663,7 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed
             .data_sources
@@ -3631,13 +3671,13 @@ mod tests {
         parsed
             .data_sources
             .push(DataSource::with_provider("test", "lookup", "second", None));
-        let provider_configs = parsed.providers.clone();
         let parsed = resolve_file_for_test(parsed, Path::new("."));
         let backend = non_empty_refresh_backend("test");
         let root = ShutdownToken::running();
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(CancellingDataSourceRefreshFactory {
                 reads: reads.clone(),
@@ -3712,12 +3752,11 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut authored = carina_core::parser::InferredFile::default();
-        authored.providers.push(provider_config);
-        let provider_configs = authored.providers.clone();
-        let mut parsed = resolve_file_for_test(authored, Path::new("."));
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
 
         let mut state = StateFile::new();
         state
@@ -3728,7 +3767,8 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory {
                 reads: reads.clone(),
@@ -3782,22 +3822,19 @@ mod tests {
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
         };
-        let mut authored = carina_core::parser::InferredFile::default();
-        authored
-            .providers
-            .push(carina_core::parser::ProviderConfig {
-                name: "test".to_string(),
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
-                source: None,
-                version: None,
-                revision: None,
-                unresolved_attributes: IndexMap::new(),
-                binding: None,
-            });
-        let provider_configs = authored.providers.clone();
-        let mut parsed = resolve_file_for_test(authored, Path::new("."));
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        parsed.providers.push(carina_core::parser::ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        });
         parsed.compositions.push(composition);
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
 
         let mut state = StateFile::new();
         state
@@ -3808,7 +3845,8 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let provider_configs = parsed.providers.clone();
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory { reads })],
             &provider_configs,
@@ -4399,12 +4437,8 @@ mod tests {
             &ProviderContext::default(),
         )
         .expect("test config should parse");
-        let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
-        )
-        .expect("state-refresh fixture crosses module resolution");
-        assert_eq!(parsed.deferred_for_expressions().len(), 1);
+        assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+        let parsed = resolve_authored_file_for_test(parsed, Path::new("."));
 
         let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let source = parsed
@@ -4551,7 +4585,10 @@ mod tests {
             .seal(carina_core::data_source_value::DataSourceValues::empty());
         let progress = ProgressBackend::plain(std::io::sink());
         let refresh_phase = RefreshPhase::start(&progress);
-        let mut validated_config = ValidatedConfig::from_factories_with_additional_schemas_for_test(
+        let mut validated_config = ValidatedConfig::from_factories_with_additional_schemas_for_test::<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >(
             parsed,
             Vec::new(),
             &[],
@@ -4913,12 +4950,7 @@ mod tests {
         let shown_target = document
             .resources
             .iter()
-            .find(|resource| {
-                resource
-                    .binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.as_str() == "target")
-            })
+            .find(|resource| resource.binding.as_deref() == Some("target"))
             .expect("target row must be present in state show JSON");
         let shown_target =
             serde_json::to_value(shown_target).expect("state show resource must serialize");
@@ -4935,7 +4967,7 @@ mod tests {
     fn lookup_json_in_flight_resource_returns_public_row_and_rejects_attributes() {
         let id =
             ResourceId::with_provider_identity("mock", "test.resource", "pending-resource", None);
-        let resource: ResolvedResource = ResolvedResource::new(Resource::from_id(id.clone()));
+        let resource = ResolvedResource::new(Resource::from_id(id.clone()));
         let pending = crate::fixture_in_flight_create(
             &id,
             "resume-token",

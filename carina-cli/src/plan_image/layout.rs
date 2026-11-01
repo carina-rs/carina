@@ -1768,8 +1768,11 @@ mod tests {
         for dependency in dependencies {
             resource.set_attr(
                 format!("ref_{dependency}"),
-                carina_core::resource::AuthoredValue::resource_ref(*dependency, "id", vec![])
-                    .resolve_root_for_test(),
+                carina_core::resource::Value::<
+                    carina_core::resource::NoPlaceholder,
+                    carina_core::resource::RelativeBindingName,
+                >::resource_ref(*dependency, "id", vec![])
+                .resolve_root_for_test(),
             );
         }
         resource

@@ -1025,7 +1025,7 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
         cached_plan.sorted_resources[0].attributes.get("name"),
         Some(carina_core::resource::Value::Deferred(
             carina_core::resource::DeferredValue::Unknown(
-                carina_core::resource::UnknownReason::PendingReRead(_)
+                carina_core::resource::ApplyTimeUnknown::PendingReRead(_)
             )
         ))
     ));

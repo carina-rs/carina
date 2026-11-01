@@ -15,7 +15,7 @@ use carina_core::executor::{
     ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
 };
 use carina_core::parser::{
-    LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext, ResolveExportBindingPhase,
+    ExpandedProviderConfig, LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext,
 };
 use carina_core::plan::Plan;
 use carina_core::provider::{
@@ -25,6 +25,7 @@ use carina_core::provider::{
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Directives, ParsedIgnorePath,
     ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
+    absolute_binding_address_for_test,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -63,17 +64,17 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
-fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
-    carina_core::resource::absolute_binding_address_for_test(name)
-}
-
 fn loaded_provider_context() -> LoadedProviderContext {
     LoadedProviderContext::empty_for_test()
 }
 
+fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAddress {
+    absolute_binding_address_for_test(spelling)
+}
+
 #[test]
-fn saved_plan_version_is_35_for_tri_state_directives() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 35);
+fn saved_plan_version_is_36_for_deferred_value_stages() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 36);
 }
 
 #[test]
@@ -189,7 +190,7 @@ impl ProviderFactory for EvidenceTestFactory {
     }
 }
 
-fn provider_config_for_evidence_test(name: &str) -> ProviderConfig {
+fn provider_config_for_evidence_test(name: &str) -> ExpandedProviderConfig {
     ProviderConfig {
         name: name.to_string(),
         attributes: IndexMap::new(),
@@ -249,16 +250,11 @@ fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
 }
 
 fn checked_exports(
-    params: &[carina_core::parser::InferredExportParam],
+    params: &[carina_core::parser::ExpandedInferredExportParam],
 ) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::ExpandedInferredExportParam>
 {
-    let params = params
-        .iter()
-        .cloned()
-        .map(|param| param.resolve_root_for_test())
-        .collect::<Vec<_>>();
     carina_core::validation::check_export_values_pre_apply(
-        &params,
+        params,
         &carina_core::binding_index::ResolvedBindings::default(),
         &loaded_provider_context(),
     )
@@ -278,11 +274,10 @@ fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportSta
 }
 
 fn saved_provider_configs(
-    configs: Vec<ProviderConfig>,
+    configs: Vec<ExpandedProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
-    let parsed = parsed.resolve_root_for_test();
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),
@@ -1295,7 +1290,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: carina_core::resource::absolute_binding_address_for_test("cert_issued"),
+        identity: absolute_binding("cert_issued"),
         target_id: ManagedWaitTarget::for_test(&resolved(Resource::new("acm.Certificate", "cert"))),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -1312,7 +1307,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
     assert!(!has_changes);
 }
 
-fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
+fn make_awscc_provider(region_dsl: &str) -> ExpandedProviderConfig {
     let mut attrs = IndexMap::new();
     attrs.insert(
         "region".to_string(),
@@ -1814,7 +1809,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
 
 #[tokio::test]
 async fn detect_drift_errors_when_resource_missing_from_planned_states() {
-    let resource: Resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
 
     // Provider returns a non-existing state (identifier is None since no planned state)
@@ -1848,7 +1843,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
 
 #[tokio::test]
 async fn detect_drift_returns_none_when_no_drift() {
-    let resource: Resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
@@ -1915,7 +1910,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
         .insert_provider_witness("aws", &witness)
         .expect("fixture owner has one validated witness");
 
-    let resource: Resource = Resource::with_provider("aws", "lambda.Permission", "invoke", None);
+    let resource = Resource::with_provider("aws", "lambda.Permission", "invoke", None);
     let id = resource.id.clone();
     let identifier = "permission-id";
     let planned = State::existing(
@@ -1971,7 +1966,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
         .expect("secret is persistable")
         .as_json()
         .clone();
-    let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None)
+    let resource = Resource::with_provider("mock", "test.resource", "r1", None)
         .with_attribute("name", Value::Concrete(ConcreteValue::String("r1".into())))
         .with_attribute("password", secret);
     let id = resource.id.clone();
@@ -2035,7 +2030,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
 
 #[tokio::test]
 async fn detect_drift_uses_identifier_carried_by_present_current() {
-    let resource: Resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier =
         AppliedIdentifier::new("typed-provider-id").expect("fixture identifier is non-empty");
@@ -2064,7 +2059,7 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
 
 #[tokio::test]
 async fn detect_drift_returns_messages_when_drift_detected() {
-    let resource: Resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
@@ -2864,7 +2859,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
 
 #[tokio::test]
 async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -2874,8 +2869,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
     let lock = LockInfo::for_test("apply");
 
     let data_source_id = ResourceId::with_provider_identity("mock", "test.lookup", "lookup", None);
-    let mut data_source: DataSource =
-        DataSource::with_provider("mock", "test.lookup", "lookup", None);
+    let mut data_source = DataSource::with_provider("mock", "test.lookup", "lookup", None);
     data_source.binding = Some(absolute_binding("lookup"));
     let data_sources = vec![data_source];
     let data_source_state = State::existing(
@@ -2905,7 +2899,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
         name: "answer".to_string(),
         static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("lookup", "answer"),
+            path: AccessPath::new("lookup", "answer").resolve_root_for_test(),
         })),
     }];
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
@@ -2956,7 +2950,7 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         &carina_core::parser::ProviderContext::default(),
     )
     .unwrap();
-    let ctx = WiringContext::new_for_test(vec![], &parsed.providers);
+    let ctx = WiringContext::new_for_test_with_provider_phase(vec![], &parsed.providers);
 
     assert!(
         ctx.factories().is_empty(),
@@ -3868,11 +3862,9 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("bound deferred loop parses");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect("cross the deferred-body resolution seam");
+    let parsed = parsed
+        .into_expanded()
+        .expect("bound deferred loop must contain only loop slots");
     let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target,
@@ -3943,11 +3935,9 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect("cross the deferred-body resolution seam");
+    let parsed = parsed
+        .into_expanded()
+        .expect("unbound deferred loop must contain only loop slots");
     let mut template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target,
@@ -4022,7 +4012,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
     let target_id = managed_target.resolved_id().as_inner().clone();
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: carina_core::resource::absolute_binding_address_for_test("lookup_ready"),
+        identity: absolute_binding("lookup_ready"),
         target_id: ManagedWaitTarget::for_test(&managed_target),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -4261,6 +4251,23 @@ fn plan_file_decode_accepts_base_mock_provider_evidence() {
 }
 
 #[test]
+fn plan_file_decode_rejects_loop_placeholder_outside_template() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["sorted_resources"][0]["attributes"]["leaked"] =
+        serde_json::json!({ "Unknown": "ForValue" });
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("a loop placeholder outside a deferred template must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("for-loop placeholder is not allowed outside a deferred for-loop template"),
+        "unexpected plan decode error: {error}"
+    );
+}
+
+#[test]
 fn plan_file_decode_rejects_empty_schema_fingerprints_for_referenced_provider() {
     let mut encoded = encoded_plan_with_mock_provider_evidence();
     encoded["schema_fingerprints"]["providers"] = serde_json::json!({});
@@ -4362,7 +4369,7 @@ fn plan_file_decode_rejects_duplicate_schema_fingerprint() {
     );
 }
 
-fn builtin_mock_provider_config() -> ProviderConfig {
+fn builtin_mock_provider_config() -> ExpandedProviderConfig {
     ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
@@ -4376,7 +4383,11 @@ fn builtin_mock_provider_config() -> ProviderConfig {
 }
 
 fn builtin_mock_recording_context() -> ValidatedConfig<()> {
-    ValidatedConfig::from_factories_for_test((), Vec::new(), &[builtin_mock_provider_config()])
+    ValidatedConfig::from_factories_for_test_with_provider_phase(
+        (),
+        Vec::new(),
+        &[builtin_mock_provider_config()],
+    )
 }
 
 #[test]
@@ -4566,7 +4577,7 @@ fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
 
 #[test]
 fn recording_invalid_provider_artifact_inventory_does_not_panic() {
-    let configured = ProviderConfig {
+    let configured = ExpandedProviderConfig {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -4590,7 +4601,8 @@ fn recording_invalid_provider_artifact_inventory_does_not_panic() {
     contents.sorted_resources.clear();
     contents.current_states.clear();
 
-    let ctx = ValidatedConfig::from_factories_for_test((), Vec::new(), &[configured]);
+    let ctx =
+        ValidatedConfig::from_factories_for_test_with_provider_phase((), Vec::new(), &[configured]);
     let error = contents
         .record_for_test(&ctx, Vec::new())
         .expect_err("a configured provider without a loaded artifact must be rejected");
@@ -4697,7 +4709,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
 #[tokio::test]
 async fn persist_exports_only_writes_state_with_new_exports() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::{ConcreteValue, Value};
 
     let captured = Arc::new(Mutex::new(None));
@@ -4745,7 +4757,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
 #[tokio::test]
 async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -4759,7 +4771,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
         name: "role_arn".to_string(),
         static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("role", "web_acl_arn"),
+            path: AccessPath::new("role", "web_acl_arn").resolve_root_for_test(),
         })),
     }];
 
@@ -4941,7 +4953,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
 
 #[tokio::test]
 async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -4950,9 +4962,9 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     };
     let lock = LockInfo::for_test("apply");
 
-    let mut resource_a: Resource = Resource::with_provider("mock", "test.resource", "a", None);
+    let mut resource_a = Resource::with_provider("mock", "test.resource", "a", None);
     resource_a.binding = Some(absolute_binding("a"));
-    let mut resource_b: Resource = Resource::with_provider("mock", "test.resource", "b", None);
+    let mut resource_b = Resource::with_provider("mock", "test.resource", "b", None);
     resource_b.binding = Some(absolute_binding("b"));
     let sorted_resources = vec![resolved(resource_a.clone()), resolved(resource_b)];
     let export_resources = sorted_resources
@@ -4990,14 +5002,14 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
             name: "ax".to_string(),
             static_type: fixture_unchecked_export_static_type(),
             value: Some(Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("a", "id"),
+                path: AccessPath::new("a", "id").resolve_root_for_test(),
             })),
         },
         InferredExportParam {
             name: "bx".to_string(),
             static_type: fixture_unchecked_export_static_type(),
             value: Some(Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("b", "id"),
+                path: AccessPath::new("b", "id").resolve_root_for_test(),
             })),
         },
     ];
@@ -5065,7 +5077,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
 
 #[tokio::test]
 async fn finalize_apply_persists_resource_state_before_reporting_export_error() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::{ExpandedInferredExportParam as InferredExportParam, TypeExpr};
 
     let captured = Arc::new(Mutex::new(None));
     let backend = CapturingBackend {
@@ -5073,7 +5085,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     };
     let lock = LockInfo::for_test("apply");
 
-    let mut resource: Resource = Resource::with_provider("mock", "test.resource", "created", None);
+    let mut resource = Resource::with_provider("mock", "test.resource", "created", None);
     resource.binding = Some(absolute_binding("created"));
     let sorted_resources = vec![resolved(resource.clone())];
     let export_resources = vec![resource.clone()];

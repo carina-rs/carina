@@ -15,11 +15,11 @@ use crate::parser::{
     RelativeBindingName, WaitBinding,
 };
 use crate::resource::{
-    AbsoluteBindingAddress, AccessMissPolicy, AuthoredDataSource as DataSource,
+    AbsoluteBindingAddress, AccessMissPolicy, ApplyTimeUnknown, AuthoredDataSource as DataSource,
     AuthoredDeferredValue as DeferredValue, AuthoredResource as Resource, AuthoredValue as Value,
-    BindingAddress, ConcreteValue, ExpandedValue, LegacyLoopAddress, ModuleInstanceScope,
-    ModuleSource, PathSegment, ResourceId, ResourceIdentity, ResourceIdentityState,
-    StructuralOperandRef, ValuePathSegmentResult, apply_value_path_segment,
+    BindingAddress, ConcreteValue, LegacyLoopAddress, LoopSlot, ModuleInstanceScope, ModuleSource,
+    ParserPlaceholder, PathSegment, PlaceholderKind, ResourceId, ResourceIdentity,
+    ResourceIdentityState, StructuralOperandRef, ValuePathSegmentResult, apply_value_path_segment,
 };
 
 use super::error::ModuleError;
@@ -30,6 +30,14 @@ use super::resolver::{
 use super::validation::{
     ConstraintEvaluation, ModuleConstraintKind, ModuleConstraints, evaluate_module_constraints,
 };
+
+type ModuleResolvedValue = crate::resource::Value<ParserPlaceholder, AbsoluteBindingAddress>;
+type ModuleResolvedResource =
+    crate::resource::Resource<ModuleSource, ParserPlaceholder, AbsoluteBindingAddress>;
+type ModuleResolvedDataSource =
+    crate::resource::DataSource<ModuleSource, ParserPlaceholder, AbsoluteBindingAddress>;
+type ModuleResolvedLiveComposition =
+    crate::resource::LiveComposition<ParserPlaceholder, AbsoluteBindingAddress>;
 
 fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingName> {
     module
@@ -86,7 +94,6 @@ fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingNam
         )
         .collect()
 }
-
 struct ModuleExpansionSource<'a> {
     module: Option<&'a ParsedFile>,
     source: Option<&'a str>,
@@ -141,12 +148,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     pub(super) fn expand_module_call_checked(
         &self,
         authored_call: &ModuleCall,
-        call: &crate::parser::ModuleCall<AbsoluteBindingAddress>,
+        call: &crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
         instance_prefix: &str,
         ref_check: &super::resolver::RefCheckWitness,
         binding_index: Option<&BindingIndex<'_>>,
-        resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
-    ) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
+        resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
+    ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
         match ref_check {
             super::resolver::RefCheckWitness(()) => {}
         }
@@ -171,12 +178,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     pub(super) fn expand_module_call_checked_collecting(
         &self,
         authored_call: &ModuleCall,
-        call: &crate::parser::ModuleCall<AbsoluteBindingAddress>,
+        call: &crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
         instance_prefix: &str,
         ref_check: &super::resolver::RefCheckWitness,
         binding_index: Option<&BindingIndex<'_>>,
-        resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
-    ) -> Result<crate::parser::ExpandedParsedFile, Vec<ModuleError>> {
+        resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
+    ) -> Result<crate::parser::RootBindingResolvedParsedFile, Vec<ModuleError>> {
         match ref_check {
             super::resolver::RefCheckWitness(()) => {}
         }
@@ -204,12 +211,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     fn expand_module_call_inner(
         &self,
         authored_call: &ModuleCall,
-        call: &crate::parser::ModuleCall<AbsoluteBindingAddress>,
+        call: &crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
         instance_prefix: &str,
         binding_index: Option<&BindingIndex<'_>>,
-        resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+        resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
         expansion_source: ModuleExpansionSource<'_>,
-    ) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
+    ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
         let module = match expansion_source.module {
             Some(module) => module,
             None => self
@@ -451,7 +458,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             binding_index,
             config: self.config(),
         };
-        let argument_values: HashMap<String, ExpandedValue> = resolved_arguments
+        let argument_values: HashMap<String, ModuleResolvedValue> = resolved_arguments
             .iter()
             .map(|(name, argument)| {
                 let value = argument.walker_value();
@@ -656,11 +663,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .arguments
                 .keys()
                 .map(|name| {
-                    let placeholder = Value::Deferred(DeferredValue::Unknown(
-                        crate::resource::UnknownReason::ModuleArgument {
+                    let placeholder = Value::Deferred(DeferredValue::Placeholder(
+                        ParserPlaceholder::ModuleArgument {
                             name: name.clone(),
-                            source_line: argument_substitutions.default_line.into(),
-                            diagnostic_name: None,
+                            diagnostic: Box::default(),
                         },
                     ));
                     (
@@ -723,7 +729,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         }
 
         // Expand managed resources with substituted values.
-        let mut resources: Vec<crate::resource::ExpandedResource> = Vec::new();
+        let mut resources: Vec<ModuleResolvedResource> = Vec::new();
         let mut expanded_parser_metadata: crate::parser::ParserBindingMetadata<
             AbsoluteBindingAddress,
         > = crate::parser::ParserBindingMetadata::default();
@@ -754,7 +760,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         }
 
         // Expand data sources with substituted values.
-        let mut data_sources: Vec<crate::resource::ExpandedDataSource> = Vec::new();
+        let mut data_sources: Vec<ModuleResolvedDataSource> = Vec::new();
         for data_source in module.data_sources.iter().chain(&selected.data_sources) {
             let source_file = module
                 .parser_binding_metadata
@@ -777,7 +783,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             data_sources.push(expanded);
         }
 
-        let mut compositions: Vec<crate::resource::ExpandedLiveComposition> = module
+        let mut compositions: Vec<ModuleResolvedLiveComposition> = module
             .compositions
             .iter()
             .map(|composition| {
@@ -805,7 +811,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         {
             let mut composition_attrs: IndexMap<
                 String,
-                crate::resource::LiveCompositionAttribute<AbsoluteBindingAddress>,
+                crate::resource::LiveCompositionAttribute<
+                    ParserPlaceholder,
+                    AbsoluteBindingAddress,
+                >,
             > = IndexMap::new();
 
             // Copy attribute values from the module definition.
@@ -854,7 +863,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             // call-site argument was a value or a structural handle.
             let mut signature_arguments: IndexMap<
                 String,
-                crate::resource::LiveCompositionArgument<AbsoluteBindingAddress>,
+                crate::resource::LiveCompositionArgument<ParserPlaceholder, AbsoluteBindingAddress>,
             > = IndexMap::new();
             for arg in &module.arguments {
                 if let Some(argument) = resolved_arguments.get(&arg.name) {
@@ -929,7 +938,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // its generated resources are isolated per module instance
         // (carina#3126 PR-B).
         let expanded_parsed_deferred_for_expressions: Vec<
-            ParsedDeferredForExpression<AbsoluteBindingAddress>,
+            ParsedDeferredForExpression<ParserPlaceholder, AbsoluteBindingAddress>,
         > = module
             .parsed_deferred_for_expressions()
             .iter()
@@ -999,9 +1008,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // graph. Module-local declarations and boundary inputs remain empty
         // on `ParsedFile::default()` because they were consumed above or are
         // rejected while loading the module.
-        let mut contribution = crate::parser::ExpandedParsedFile::empty_with_parsed_binding_uses(
-            expanded_binding_uses,
-        );
+        let mut contribution =
+            crate::parser::RootBindingResolvedParsedFile::empty_with_parsed_binding_uses(
+                expanded_binding_uses,
+            );
         contribution.resources = resources;
         contribution.data_sources = data_sources;
         contribution.compositions = compositions;
@@ -1056,7 +1066,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         &self,
         call: &crate::parser::ModuleCall,
         instance_prefix: &str,
-    ) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
+    ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
         let root = crate::resource::RootScope::new();
         let expanded_call = call
             .clone()
@@ -1079,8 +1089,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
 /// the same metadata path. One helper owns the classification so declared
 /// output types and duplicate-diagnostic suppression cannot drift by shape.
 fn source_argument_name<B: BindingAddress, C: BindingAddress>(
-    value: &crate::resource::Value<B>,
-    argument_values: &HashMap<String, crate::resource::Value<C>>,
+    value: &crate::resource::Value<ParserPlaceholder, B>,
+    argument_values: &HashMap<String, crate::resource::Value<ParserPlaceholder, C>>,
 ) -> Option<String> {
     use crate::resource::{DeferredValue, Value};
 
@@ -1132,20 +1142,21 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
                 | DeferredValue::Secret(_)
                 | DeferredValue::RedactedSecret { hash: _ }
                 | DeferredValue::Unknown(
-                    crate::resource::UnknownReason::UpstreamExport { path: _ }
-                    | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-                    | crate::resource::UnknownReason::ForKey
-                    | crate::resource::UnknownReason::ForIndex
-                    | crate::resource::UnknownReason::ForValue
-                    | crate::resource::UnknownReason::FnParam { name: _ }
-                    | crate::resource::UnknownReason::ModuleArgument {
+                    ApplyTimeUnknown::UpstreamExport { path: _ }
+                    | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
+                    | ApplyTimeUnknown::PendingReRead(_),
+                )
+                | DeferredValue::Placeholder(
+                    ParserPlaceholder::FnParam { name: _ }
+                    | ParserPlaceholder::ModuleArgument {
                         name: _,
-                        source_line: _,
-                        diagnostic_name: _,
+                        diagnostic: _,
                     }
-                    | crate::resource::UnknownReason::FnLocal { name: _ }
-                    | crate::resource::UnknownReason::EmptyInterpolation
-                    | crate::resource::UnknownReason::PendingReRead(_),
+                    | ParserPlaceholder::FnLocal { name: _ }
+                    | ParserPlaceholder::Loop(LoopSlot::Key)
+                    | ParserPlaceholder::Loop(LoopSlot::Index)
+                    | ParserPlaceholder::Loop(LoopSlot::Value)
+                    | ParserPlaceholder::EmptyInterpolation { source: _ },
                 ),
             ) => None,
         })?;
@@ -1157,18 +1168,20 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
 fn resolve_nested_module_call(
     call: &ModuleCall,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<crate::parser::ModuleCall<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+) -> Result<
+    crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
+    ArgumentSubstitutionError,
+> {
     let mut resolve_binding =
         |binding: RelativeBindingName| resolver.resolve_declared_binding(&binding);
     let mut resolve_argument = |argument: ModuleArgument| match argument.value_ref() {
         StructuralOperandRef::Value(value) => {
             let forwarded_name = match value {
                 Value::Deferred(DeferredValue::BindingRef { binding }) => Some(binding.as_str()),
-                Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument {
+                Value::Deferred(DeferredValue::Placeholder(
+                    ParserPlaceholder::ModuleArgument {
                         name,
-                        source_line: _,
-                        diagnostic_name: _,
+                        diagnostic: _,
                     },
                 )) => Some(name.as_str()),
                 Value::Concrete(
@@ -1213,15 +1226,17 @@ fn resolve_nested_module_call(
                     | DeferredValue::Secret(_)
                     | DeferredValue::RedactedSecret { hash: _ }
                     | DeferredValue::Unknown(
-                        crate::resource::UnknownReason::UpstreamExport { path: _ }
-                        | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-                        | crate::resource::UnknownReason::ForKey
-                        | crate::resource::UnknownReason::ForIndex
-                        | crate::resource::UnknownReason::ForValue
-                        | crate::resource::UnknownReason::FnParam { name: _ }
-                        | crate::resource::UnknownReason::FnLocal { name: _ }
-                        | crate::resource::UnknownReason::EmptyInterpolation
-                        | crate::resource::UnknownReason::PendingReRead(_),
+                        ApplyTimeUnknown::UpstreamExport { path: _ }
+                        | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
+                        | ApplyTimeUnknown::PendingReRead(_),
+                    )
+                    | DeferredValue::Placeholder(
+                        ParserPlaceholder::FnParam { name: _ }
+                        | ParserPlaceholder::FnLocal { name: _ }
+                        | ParserPlaceholder::Loop(LoopSlot::Key)
+                        | ParserPlaceholder::Loop(LoopSlot::Index)
+                        | ParserPlaceholder::Loop(LoopSlot::Value)
+                        | ParserPlaceholder::EmptyInterpolation { source: _ },
                     ),
                 ) => None,
             };
@@ -1306,8 +1321,8 @@ pub(crate) fn build_expansion_trace(
     instance_prefix: &str,
     source_path: Option<&str>,
     inner_trace: &crate::resource::ExpansionTrace,
-    leaf_resources: &[crate::resource::ExpandedResource],
-    leaf_data_sources: &[crate::resource::ExpandedDataSource],
+    leaf_resources: &[ModuleResolvedResource],
+    leaf_data_sources: &[ModuleResolvedDataSource],
 ) -> crate::resource::ExpansionTrace {
     let id = crate::resource::EphemeralId::new(crate::resource::ResolvedResourceId::new(
         crate::resource::ResourceId::with_identity(
@@ -1324,10 +1339,16 @@ pub(crate) fn build_expansion_trace(
 
     // Direct leaves at this expansion level: chain is `[this_call_site]`.
     for r in leaf_resources {
-        out.record(r.persistent_id(), vec![this_call_site.clone()]);
+        out.record(
+            crate::resource::PersistentId::new(r.id.clone()),
+            vec![this_call_site.clone()],
+        );
     }
     for d in leaf_data_sources {
-        out.record(d.persistent_id(), vec![this_call_site.clone()]);
+        out.record(
+            crate::resource::PersistentId::new(d.id.clone()),
+            vec![this_call_site.clone()],
+        );
     }
 
     // Leaves from nested expansions inside `module` already have an
@@ -1454,8 +1475,7 @@ fn resolve_wait_binding(
         until_predicate: crate::parser::UntilPredicateAst {
             root: predicate_root,
             attribute_segments: until_predicate.attribute_segments.clone(),
-            rhs: resolver
-                .resolve_value(&until_predicate.rhs, ArgumentSubstitutionPosition::Value)?,
+            rhs: resolver.resolve_wait_rhs(&until_predicate.rhs)?,
         },
         timeout_secs: *timeout_secs,
         depends_on: depends_on
@@ -1523,20 +1543,21 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { hash: _ }
             | DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamExport { path: _ }
-                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-                | crate::resource::UnknownReason::ForKey
-                | crate::resource::UnknownReason::ForIndex
-                | crate::resource::UnknownReason::ForValue
-                | crate::resource::UnknownReason::FnParam { name: _ }
-                | crate::resource::UnknownReason::ModuleArgument {
+                ApplyTimeUnknown::UpstreamExport { path: _ }
+                | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
+                | ApplyTimeUnknown::PendingReRead(_),
+            )
+            | DeferredValue::Placeholder(
+                ParserPlaceholder::FnParam { name: _ }
+                | ParserPlaceholder::ModuleArgument {
                     name: _,
-                    source_line: _,
-                    diagnostic_name: _,
+                    diagnostic: _,
                 }
-                | crate::resource::UnknownReason::FnLocal { name: _ }
-                | crate::resource::UnknownReason::EmptyInterpolation
-                | crate::resource::UnknownReason::PendingReRead(_),
+                | ParserPlaceholder::FnLocal { name: _ }
+                | ParserPlaceholder::Loop(LoopSlot::Key)
+                | ParserPlaceholder::Loop(LoopSlot::Index)
+                | ParserPlaceholder::Loop(LoopSlot::Value)
+                | ParserPlaceholder::EmptyInterpolation { source: _ },
             ),
         ) => crate::resource::module_argument_reference_path(value),
     }
@@ -1588,23 +1609,20 @@ fn append_reference_path(
 }
 
 fn module_parameter_postfix<B: BindingAddress>(
-    value: &crate::resource::Value<B>,
+    value: &crate::resource::Value<ParserPlaceholder, B>,
     arguments: &HashMap<String, ResolvedArgument<B>>,
 ) -> Option<(String, Vec<PathSegment>)> {
     use crate::resource::{DeferredValue, Value};
 
     fn collect<B: BindingAddress>(
-        value: &crate::resource::Value<B>,
+        value: &crate::resource::Value<ParserPlaceholder, B>,
         arguments: &HashMap<String, ResolvedArgument<B>>,
     ) -> Option<(String, Vec<PathSegment>)> {
         match value {
-            Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ModuleArgument {
-                    name,
-                    source_line: _,
-                    diagnostic_name: _,
-                },
-            )) if arguments.contains_key(name) => Some((name.clone(), Vec::new())),
+            Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+                name,
+                diagnostic: _,
+            })) if arguments.contains_key(name) => Some((name.clone(), Vec::new())),
             Value::Deferred(DeferredValue::Access(access)) => {
                 let (argument, mut postfix) = collect(access.base(), arguments)?;
                 postfix.push(access.step().clone());
@@ -1667,20 +1685,21 @@ fn module_parameter_postfix<B: BindingAddress>(
                 | DeferredValue::Secret(_)
                 | DeferredValue::RedactedSecret { hash: _ }
                 | DeferredValue::Unknown(
-                    crate::resource::UnknownReason::UpstreamExport { path: _ }
-                    | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-                    | crate::resource::UnknownReason::ForKey
-                    | crate::resource::UnknownReason::ForIndex
-                    | crate::resource::UnknownReason::ForValue
-                    | crate::resource::UnknownReason::FnParam { name: _ }
-                    | crate::resource::UnknownReason::ModuleArgument {
+                    ApplyTimeUnknown::UpstreamExport { path: _ }
+                    | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
+                    | ApplyTimeUnknown::PendingReRead(_),
+                )
+                | DeferredValue::Placeholder(
+                    ParserPlaceholder::FnParam { name: _ }
+                    | ParserPlaceholder::ModuleArgument {
                         name: _,
-                        source_line: _,
-                        diagnostic_name: _,
+                        diagnostic: _,
                     }
-                    | crate::resource::UnknownReason::FnLocal { name: _ }
-                    | crate::resource::UnknownReason::EmptyInterpolation
-                    | crate::resource::UnknownReason::PendingReRead(_),
+                    | ParserPlaceholder::FnLocal { name: _ }
+                    | ParserPlaceholder::Loop(LoopSlot::Key)
+                    | ParserPlaceholder::Loop(LoopSlot::Index)
+                    | ParserPlaceholder::Loop(LoopSlot::Value)
+                    | ParserPlaceholder::EmptyInterpolation { source: _ },
                 ),
             ) => None,
         }
@@ -1691,14 +1710,14 @@ fn module_parameter_postfix<B: BindingAddress>(
 
 #[derive(Clone)]
 struct ResolvedArgument<B: BindingAddress = AbsoluteBindingAddress> {
-    argument: ModuleArgument<B>,
+    argument: ModuleArgument<ParserPlaceholder, B>,
     origin: ArgumentOrigin,
     caller_reference: Option<crate::resource::AuthoredReferencePath>,
     forwarded_from_enclosing_parameter: bool,
 }
 
 impl<B: BindingAddress> std::ops::Deref for ResolvedArgument<B> {
-    type Target = ModuleArgument<B>;
+    type Target = ModuleArgument<ParserPlaceholder, B>;
 
     fn deref(&self) -> &Self::Target {
         &self.argument
@@ -1720,7 +1739,7 @@ impl<B: BindingAddress> ResolvedArgument<B> {
         &self,
         name: &str,
         position: ArgumentSubstitutionPosition,
-    ) -> Result<StructuralOperandRef<'_, B>, String> {
+    ) -> Result<StructuralOperandRef<'_, ParserPlaceholder, B>, String> {
         match (position, self.value_ref()) {
             (ArgumentSubstitutionPosition::Value, StructuralOperandRef::Value(value)) => {
                 Ok(StructuralOperandRef::Value(value))
@@ -1859,7 +1878,7 @@ impl ModuleScopeResolver<'_> {
         &self,
         value: &Value,
         position: ArgumentSubstitutionPosition,
-    ) -> Result<ExpandedValue, ArgumentSubstitutionError> {
+    ) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
         let normalized = substitute_arguments_with_position(
             value,
             ArgumentSubstitutions {
@@ -1881,6 +1900,22 @@ impl ModuleScopeResolver<'_> {
         let substituted = substitute_arguments_with_position(&expanded, self.arguments, position)?;
         let evaluated = evaluate_expanded_module_functions(&substituted, self.arguments.config)?;
         select_expanded_module_ifs(&evaluated)
+    }
+
+    fn resolve_wait_rhs(
+        &self,
+        value: &crate::resource::Value<crate::resource::NoPlaceholder, RelativeBindingName>,
+    ) -> Result<
+        crate::resource::Value<crate::resource::NoPlaceholder, AbsoluteBindingAddress>,
+        ArgumentSubstitutionError,
+    > {
+        for binding in value.root_bindings() {
+            if !self.local_bindings.contains(&binding) {
+                let diagnostic_source = value.diagnostic_source_for_root_binding(&binding);
+                return Err(self.unknown_binding_at(binding.as_str(), diagnostic_source));
+            }
+        }
+        Ok(value.clone().resolve_module(self.scope))
     }
 
     fn resolve_structural_handle(
@@ -1954,7 +1989,7 @@ struct ConditionalBindingOrigin {
 #[derive(Debug)]
 struct SelectedDeferredIfs {
     contribution: ParsedFile,
-    forwarded: Vec<DeferredStructuralIf<AbsoluteBindingAddress>>,
+    forwarded: Vec<DeferredStructuralIf<ParserPlaceholder, AbsoluteBindingAddress>>,
     dropped: HashMap<AbsoluteBindingAddress, (RelativeBindingName, ConditionalBindingOrigin)>,
 }
 
@@ -1980,6 +2015,7 @@ fn select_deferred_module_ifs(
     let mut contribution = ParsedFile::default();
     let mut forwarded = Vec::new();
     let mut selected_bindings = HashSet::new();
+    let mut nested_dropped = HashMap::new();
     for deferred in &module.deferred_module_ifs {
         let condition = resolve_module_value(deferred.condition().value(), resolver)
             .map_err(|error| error.with_source_file(deferred.condition().source_file()))?;
@@ -2037,17 +2073,27 @@ fn select_deferred_module_ifs(
                 contribution.data_sources.push((**data_source).clone());
             }
             DeferredIfBody::ModuleCall(call) => contribution.module_calls.push(call.clone()),
+            DeferredIfBody::ExpandedModuleCall(prepared) => {
+                let mut prepared = prepared.as_ref().clone();
+                let nested = select_deferred_module_ifs(&prepared, module_call, resolver)?;
+                prepared.deferred_module_ifs.clear();
+                prepared.merge_from(nested.contribution);
+                contribution.merge_from(prepared);
+                forwarded.extend(nested.forwarded);
+                nested_dropped.extend(nested.dropped);
+            }
         }
     }
 
-    let dropped = origins
+    let mut dropped = origins
         .into_iter()
         .filter(|(binding, _origin)| !selected_bindings.contains(binding))
         .map(|(binding, origin)| {
             let absolute = resolver.scope.resolve(binding.clone());
             (absolute, (binding, origin))
         })
-        .collect();
+        .collect::<HashMap<_, _>>();
+    dropped.extend(nested_dropped);
     Ok(SelectedDeferredIfs {
         contribution,
         forwarded,
@@ -2059,7 +2105,7 @@ fn expand_forwarded_if_body(
     body: &DeferredIfBody,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<DeferredIfBody<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+) -> Result<DeferredIfBody<ParserPlaceholder, AbsoluteBindingAddress>, ArgumentSubstitutionError> {
     match body {
         DeferredIfBody::Resource(resource) => Ok(DeferredIfBody::Resource(Box::new(
             expand_module_resource(resource, None, module_call, resolver)?,
@@ -2070,18 +2116,27 @@ fn expand_forwarded_if_body(
         DeferredIfBody::ModuleCall(call) => Ok(DeferredIfBody::ModuleCall(
             resolve_nested_module_call(call, resolver)?,
         )),
+        DeferredIfBody::ExpandedModuleCall(contribution) => {
+            let contribution = contribution
+                .as_ref()
+                .clone()
+                .resolve_bindings(&mut |binding| resolver.scope.resolve(binding));
+            Ok(DeferredIfBody::ExpandedModuleCall(std::sync::Arc::new(
+                contribution,
+            )))
+        }
     }
 }
 
 fn reject_dropped_conditional_references(
     selected: &SelectedDeferredIfs,
-    expanded: &crate::parser::ExpandedParsedFile,
+    expanded: &crate::parser::RootBindingResolvedParsedFile,
 ) -> Result<(), ModuleError> {
     if selected.dropped.is_empty() {
         return Ok(());
     }
 
-    let dropped_value = |value: &ExpandedValue| {
+    let dropped_value = |value: &ModuleResolvedValue| {
         value
             .root_bindings()
             .into_iter()
@@ -2166,7 +2221,13 @@ fn reject_dropped_conditional_references(
             found = dropped_binding(&wait.target)
                 .or_else(|| dropped_binding(&wait.until_predicate.root))
                 .or_else(|| wait.depends_on.iter().find_map(&dropped_binding))
-                .or_else(|| dropped_value(&wait.until_predicate.rhs));
+                .or_else(|| {
+                    wait.until_predicate
+                        .rhs
+                        .root_bindings()
+                        .into_iter()
+                        .find_map(|binding| selected.dropped.get(&binding))
+                });
             if found.is_some() {
                 break;
             }
@@ -2247,8 +2308,11 @@ fn resolve_module_binding_uses(
                 value,
                 declared_type,
             } => {
-                let parameter = if let Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument { name, .. },
+                let parameter = if let Value::Deferred(DeferredValue::Placeholder(
+                    ParserPlaceholder::ModuleArgument {
+                        name,
+                        diagnostic: _,
+                    },
                 )) = value.as_ref()
                 {
                     resolver.arguments.arguments.get(name)
@@ -2318,9 +2382,9 @@ enum ArgumentSubstitutionPosition {
 fn bind_module_constraints(
     module: &ParsedFile,
     arguments: ArgumentSubstitutions<'_>,
-    resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
 ) -> Result<
-    Vec<crate::resource::PendingModuleConstraint<AbsoluteBindingAddress>>,
+    Vec<crate::resource::PendingModuleConstraint<ParserPlaceholder, AbsoluteBindingAddress>>,
     ArgumentSubstitutionError,
 > {
     let mut constraints = Vec::new();
@@ -2365,62 +2429,66 @@ fn bind_module_constraints(
 }
 
 fn bind_constraint_expression(
-    expression: &crate::parser::ValidateExpr,
+    expression: &crate::parser::ValidateExpr<ParserPlaceholder, RelativeBindingName>,
     arguments: ArgumentSubstitutions<'_>,
-    resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
     line: usize,
     source_file: &std::path::Path,
-) -> Result<crate::parser::ValidateExpr<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+) -> Result<
+    crate::parser::ValidateExpr<ParserPlaceholder, AbsoluteBindingAddress>,
+    ArgumentSubstitutionError,
+> {
     use crate::parser::ValidateExpr;
 
-    let bind_value =
-        |argument: &str,
-         position: ArgumentSubstitutionPosition,
-         path: &[PathSegment]|
-         -> Result<ValidateExpr<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
-            let Some(resolved_argument) = arguments.arguments.get(argument) else {
-                return Err(ArgumentSubstitutionError {
+    let bind_value = |argument: &str,
+                      position: ArgumentSubstitutionPosition,
+                      path: &[PathSegment]|
+     -> Result<
+        ValidateExpr<ParserPlaceholder, AbsoluteBindingAddress>,
+        ArgumentSubstitutionError,
+    > {
+        let Some(resolved_argument) = arguments.arguments.get(argument) else {
+            return Err(ArgumentSubstitutionError {
+                source_file: Some(source_file.to_path_buf()),
+                line,
+                message: format!("unknown module argument '{argument}'"),
+                parse_error: None,
+            });
+        };
+        let substitution =
+            resolved_argument
+                .substitution(argument, position)
+                .map_err(|message| ArgumentSubstitutionError {
                     source_file: Some(source_file.to_path_buf()),
                     line,
-                    message: format!("unknown module argument '{argument}'"),
+                    message,
                     parse_error: None,
-                });
-            };
-            let substitution =
-                resolved_argument
-                    .substitution(argument, position)
-                    .map_err(|message| ArgumentSubstitutionError {
-                        source_file: Some(source_file.to_path_buf()),
-                        line,
-                        message,
-                        parse_error: None,
-                    })?;
-            let mut value = substitution.value().clone();
-            for step in path {
-                value =
-                    apply_value_path_segment(value, step.clone(), line, AccessMissPolicy::Error)
-                        .and_then(ValuePathSegmentResult::into_value)
-                        .map_err(|error| ArgumentSubstitutionError {
-                            source_file: Some(source_file.to_path_buf()),
-                            line,
-                            message: error.to_string(),
-                            parse_error: None,
-                        })?;
-            }
-            if let Some(bindings) = resolved_bindings
-                && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
-            {
-                value = resolved;
-            }
-            Ok(ValidateExpr::BoundArgument {
-                argument: argument.to_string(),
-                operand: path.iter().fold(argument.to_string(), |mut operand, step| {
-                    operand.push_str(&step.to_dot_string());
-                    operand
-                }),
-                value,
-            })
-        };
+                })?;
+        let mut value = substitution.value().clone();
+        for step in path {
+            value = apply_value_path_segment(value, step.clone(), line, AccessMissPolicy::Error)
+                .and_then(ValuePathSegmentResult::into_value)
+                .map_err(|error| ArgumentSubstitutionError {
+                    source_file: Some(source_file.to_path_buf()),
+                    line,
+                    message: error.to_string(),
+                    parse_error: None,
+                })?;
+        }
+        if let Some(bindings) = resolved_bindings
+            && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
+        {
+            value = resolved;
+        }
+        Ok(ValidateExpr::BoundArgument {
+            argument: argument.to_string(),
+            operand: path.iter().fold(argument.to_string(), |mut operand, step| {
+                operand.push_str(&step.to_dot_string());
+                operand
+            }),
+            value,
+        })
+    };
 
     Ok(match expression {
         ValidateExpr::Var(argument) => match arguments.arguments.contains_key(argument) {
@@ -2554,7 +2622,7 @@ fn bind_constraint_expression(
 fn resolve_module_value(
     value: &Value,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<ExpandedValue, ArgumentSubstitutionError> {
+) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
     let mut resolved = resolver.resolve_value(value, ArgumentSubstitutionPosition::Value)?;
     resolved.canonicalize_in_place();
     Ok(resolved)
@@ -2577,7 +2645,7 @@ impl ExpandedIfDependency {
     }
 }
 
-fn expanded_if_dependency(value: &ExpandedValue) -> ExpandedIfDependency {
+fn expanded_if_dependency(value: &ModuleResolvedValue) -> ExpandedIfDependency {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
     match value {
@@ -2641,6 +2709,9 @@ fn expanded_if_dependency(value: &ExpandedValue) -> ExpandedIfDependency {
                 .combine(expanded_if_dependency(expression.rhs()))
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => expanded_unknown_dependency(reason),
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            expanded_placeholder_dependency(placeholder)
+        }
         Value::Deferred(
             DeferredValue::ResourceRef { path: _ }
             | DeferredValue::BindingRef { binding: _ }
@@ -2656,27 +2727,31 @@ fn expanded_if_dependency(value: &ExpandedValue) -> ExpandedIfDependency {
 }
 
 fn expanded_unknown_dependency<B: BindingAddress>(
-    reason: &crate::resource::UnknownReason<B>,
+    reason: &ApplyTimeUnknown<B>,
 ) -> ExpandedIfDependency {
     match reason {
-        crate::resource::UnknownReason::ModuleArgument {
-            name: _,
-            source_line: _,
-            diagnostic_name: _,
-        } => ExpandedIfDependency::ModuleArgument,
-        crate::resource::UnknownReason::UpstreamExport { path: _ }
-        | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-        | crate::resource::UnknownReason::ForKey
-        | crate::resource::UnknownReason::ForIndex
-        | crate::resource::UnknownReason::ForValue
-        | crate::resource::UnknownReason::FnParam { name: _ }
-        | crate::resource::UnknownReason::FnLocal { name: _ }
-        | crate::resource::UnknownReason::EmptyInterpolation
-        | crate::resource::UnknownReason::PendingReRead(_) => ExpandedIfDependency::Runtime,
+        ApplyTimeUnknown::UpstreamExport { path: _ }
+        | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
+        | ApplyTimeUnknown::PendingReRead(_) => ExpandedIfDependency::Runtime,
     }
 }
 
-fn decide_expanded_if_condition(value: &ExpandedValue) -> Result<Option<bool>, String> {
+fn expanded_placeholder_dependency(placeholder: &ParserPlaceholder) -> ExpandedIfDependency {
+    match placeholder {
+        ParserPlaceholder::ModuleArgument {
+            name: _,
+            diagnostic: _,
+        } => ExpandedIfDependency::ModuleArgument,
+        ParserPlaceholder::FnParam { name: _ }
+        | ParserPlaceholder::FnLocal { name: _ }
+        | ParserPlaceholder::Loop(LoopSlot::Key)
+        | ParserPlaceholder::Loop(LoopSlot::Index)
+        | ParserPlaceholder::Loop(LoopSlot::Value)
+        | ParserPlaceholder::EmptyInterpolation { source: _ } => ExpandedIfDependency::Runtime,
+    }
+}
+
+fn decide_expanded_if_condition(value: &ModuleResolvedValue) -> Result<Option<bool>, String> {
     let mut value = value.clone();
     value.canonicalize_in_place();
     if let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Bool(condition)) =
@@ -2697,8 +2772,8 @@ fn decide_expanded_if_condition(value: &ExpandedValue) -> Result<Option<bool>, S
 }
 
 fn select_expanded_module_ifs(
-    value: &ExpandedValue,
-) -> Result<ExpandedValue, ArgumentSubstitutionError> {
+    value: &ModuleResolvedValue,
+) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
     Ok(match value {
@@ -2846,13 +2921,17 @@ fn select_expanded_module_ifs(
             let _dependency = expanded_unknown_dependency(reason);
             value.clone()
         }
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            let _dependency = expanded_placeholder_dependency(placeholder);
+            value.clone()
+        }
     })
 }
 
 fn evaluate_expanded_module_functions(
-    value: &ExpandedValue,
+    value: &ModuleResolvedValue,
     config: &crate::parser::ProviderContext,
-) -> Result<ExpandedValue, ArgumentSubstitutionError> {
+) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
     Ok(match value {
@@ -3026,6 +3105,10 @@ fn evaluate_expanded_module_functions(
             let _dependency = expanded_unknown_dependency(reason);
             value.clone()
         }
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            let _dependency = expanded_placeholder_dependency(placeholder);
+            value.clone()
+        }
     })
 }
 
@@ -3046,7 +3129,7 @@ fn expand_module_resource(
     dependency_values: Option<&IndexMap<String, Value>>,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<crate::resource::ExpandedResource, ArgumentSubstitutionError> {
+) -> Result<ModuleResolvedResource, ArgumentSubstitutionError> {
     let instance_identity = ResourceIdentity::try_from(resolver.scope.key().to_string())
         .expect("module instance prefix is non-empty");
     expand_module_resource_with_identity(
@@ -3064,7 +3147,7 @@ fn expand_module_resource_with_identity(
     instance_identity: &ResourceIdentity,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<crate::resource::ExpandedResource, ArgumentSubstitutionError> {
+) -> Result<ModuleResolvedResource, ArgumentSubstitutionError> {
     let instance_prefix = resolver.scope.key();
     let mut new_resource = match resource.id.identity_state() {
         ResourceIdentityState::Pending(_) => resource.instantiate(),
@@ -3139,7 +3222,7 @@ fn expand_module_data_source(
     data_source: &DataSource,
     dependency_values: Option<&IndexMap<String, Value>>,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<crate::resource::ExpandedDataSource, ArgumentSubstitutionError> {
+) -> Result<ModuleResolvedDataSource, ArgumentSubstitutionError> {
     let instance_prefix = resolver.scope.key();
     let new_data_source = match data_source.id.identity_state() {
         ResourceIdentityState::Pending(_) => data_source.instantiate(),
@@ -3192,7 +3275,7 @@ fn expand_module_composition(
     root_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
     provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
-) -> Result<crate::resource::ExpandedLiveComposition, ArgumentSubstitutionError> {
+) -> Result<ModuleResolvedLiveComposition, ArgumentSubstitutionError> {
     let crate::resource::LiveComposition {
         id,
         signature,
@@ -3216,11 +3299,10 @@ fn expand_module_composition(
             let resolved = match argument.operand_ref() {
                 StructuralOperandRef::Value(value) => {
                     let parameter = match value {
-                        Value::Deferred(DeferredValue::Unknown(
-                            crate::resource::UnknownReason::ModuleArgument {
+                        Value::Deferred(DeferredValue::Placeholder(
+                            ParserPlaceholder::ModuleArgument {
                                 name,
-                                source_line: _,
-                                diagnostic_name: _,
+                                diagnostic: _,
                             },
                         )) => Some(name.as_str()),
                         Value::Deferred(DeferredValue::BindingRef { binding }) => {
@@ -3268,15 +3350,17 @@ fn expand_module_composition(
                             | DeferredValue::Secret(_)
                             | DeferredValue::RedactedSecret { hash: _ }
                             | DeferredValue::Unknown(
-                                crate::resource::UnknownReason::UpstreamExport { path: _ }
-                                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-                                | crate::resource::UnknownReason::ForKey
-                                | crate::resource::UnknownReason::ForIndex
-                                | crate::resource::UnknownReason::ForValue
-                                | crate::resource::UnknownReason::FnParam { name: _ }
-                                | crate::resource::UnknownReason::FnLocal { name: _ }
-                                | crate::resource::UnknownReason::EmptyInterpolation
-                                | crate::resource::UnknownReason::PendingReRead(_),
+                                ApplyTimeUnknown::UpstreamExport { path: _ }
+                                | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
+                                | ApplyTimeUnknown::PendingReRead(_),
+                            )
+                            | DeferredValue::Placeholder(
+                                ParserPlaceholder::FnParam { name: _ }
+                                | ParserPlaceholder::FnLocal { name: _ }
+                                | ParserPlaceholder::Loop(LoopSlot::Key)
+                                | ParserPlaceholder::Loop(LoopSlot::Index)
+                                | ParserPlaceholder::Loop(LoopSlot::Value)
+                                | ParserPlaceholder::EmptyInterpolation { source: _ },
                             ),
                         ) => None,
                     };
@@ -3437,7 +3521,7 @@ fn expand_module_composition(
 /// arguments that were unavailable during the nested module's first
 /// expansion.
 fn settle_prefixed_composition_constraints(
-    composition: &mut crate::resource::ExpandedLiveComposition,
+    composition: &mut ModuleResolvedLiveComposition,
     record_outcomes: bool,
 ) -> Result<Option<ModuleCallConstraintReport>, ModuleError> {
     if composition.signature.pending_constraints.is_empty() {
@@ -3514,9 +3598,9 @@ fn settle_prefixed_composition_constraints(
     }
 }
 
-fn check_composition_argument_type(
+fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: BindingAddress>(
     parameter: &str,
-    argument: &crate::resource::LiveCompositionArgument,
+    argument: &crate::resource::LiveCompositionArgument<P, B>,
     config: crate::validation::typecheck::TypecheckProviderContext<'_>,
     line: usize,
 ) -> Result<(), ArgumentSubstitutionError> {
@@ -3564,9 +3648,12 @@ fn check_composition_argument_type(
 }
 
 fn resolve_module_constraint_expression(
-    expression: &crate::parser::ValidateExpr,
+    expression: &crate::parser::ValidateExpr<ParserPlaceholder, RelativeBindingName>,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<crate::parser::ValidateExpr<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+) -> Result<
+    crate::parser::ValidateExpr<ParserPlaceholder, AbsoluteBindingAddress>,
+    ArgumentSubstitutionError,
+> {
     use crate::parser::ValidateExpr;
 
     Ok(match expression {
@@ -3628,11 +3715,14 @@ fn resolve_module_constraint_expression(
 }
 
 fn expand_parsed_deferred_for_expression(
-    deferred: &ParsedDeferredForExpression<RelativeBindingName>,
+    deferred: &ParsedDeferredForExpression<ParserPlaceholder, RelativeBindingName>,
     dependency_values: Option<&IndexMap<String, Value>>,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<ParsedDeferredForExpression<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+) -> Result<
+    ParsedDeferredForExpression<ParserPlaceholder, AbsoluteBindingAddress>,
+    ArgumentSubstitutionError,
+> {
     let ParsedDeferredForExpression {
         file,
         line,
@@ -3877,13 +3967,17 @@ fn select_authored_module_ifs_for_test(
             let _dependency = expanded_unknown_dependency(reason);
             value.clone()
         }
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            let _dependency = expanded_placeholder_dependency(placeholder);
+            value.clone()
+        }
     })
 }
 
 fn substitute_function_argument<B: BindingAddress>(
-    argument: &crate::resource::FunctionArgument<B>,
+    argument: &crate::resource::FunctionArgument<ParserPlaceholder, B>,
     arguments: ArgumentSubstitutions<'_, B>,
-) -> Result<crate::resource::FunctionArgument<B>, ArgumentSubstitutionError> {
+) -> Result<crate::resource::FunctionArgument<ParserPlaceholder, B>, ArgumentSubstitutionError> {
     if let Some(name) = argument.pending_parameter()
         && let Some(substitution) = arguments.arguments.get(name)
     {
@@ -3915,10 +4009,10 @@ fn substitute_function_argument<B: BindingAddress>(
 }
 
 fn substitute_module_if_paths_in_secret<B: BindingAddress>(
-    value: &crate::resource::Value<B>,
+    value: &crate::resource::Value<ParserPlaceholder, B>,
     arguments: ArgumentSubstitutions<'_, B>,
     position: ArgumentSubstitutionPosition,
-) -> Result<crate::resource::Value<B>, ArgumentSubstitutionError> {
+) -> Result<crate::resource::Value<ParserPlaceholder, B>, ArgumentSubstitutionError> {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
     if !super::deferred_if::value_contains_module_if(value) {
@@ -4075,14 +4169,18 @@ fn substitute_module_if_paths_in_secret<B: BindingAddress>(
             let _dependency = expanded_unknown_dependency(reason);
             value.clone()
         }
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            let _dependency = expanded_placeholder_dependency(placeholder);
+            value.clone()
+        }
     })
 }
 
 fn substitute_arguments_with_position<B: BindingAddress>(
-    value: &crate::resource::Value<B>,
+    value: &crate::resource::Value<ParserPlaceholder, B>,
     arguments: ArgumentSubstitutions<'_, B>,
     position: ArgumentSubstitutionPosition,
-) -> Result<crate::resource::Value<B>, ArgumentSubstitutionError> {
+) -> Result<crate::resource::Value<ParserPlaceholder, B>, ArgumentSubstitutionError> {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
     let substituted = match value {
@@ -4104,75 +4202,62 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 substitute_arguments_with_position(deferred.else_value(), arguments, position)?,
             ))))
         }
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument {
-                name,
-                source_line,
-                diagnostic_name,
-            },
-        )) => {
+        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+            name,
+            diagnostic,
+        })) => {
             let Some(argument) = arguments.arguments.get(name) else {
                 return Ok(value.clone());
             };
-            let line = source_line
-                .get()
+            let line = diagnostic
+                .source_line()
                 .unwrap_or_else(|| argument.source_line(arguments.default_line));
+            let source_file = diagnostic
+                .authored_location()
+                .map(|(source_file, _)| source_file.to_path_buf());
             match argument.value_ref() {
-                StructuralOperandRef::Value(value) => {
-                    let mut substituted = value.clone();
-                    if let Value::Deferred(DeferredValue::Unknown(
-                        crate::resource::UnknownReason::ModuleArgument {
-                            name: _,
-                            source_line: substituted_line,
-                            diagnostic_name: substituted_diagnostic,
-                        },
-                    )) = &mut substituted
-                    {
-                        *substituted_line = *source_line;
-                        *substituted_diagnostic = diagnostic_name.clone();
-                    }
-                    substituted
-                }
-                StructuralOperandRef::Handle {
-                    handle: _,
-                    access_base: _,
-                } if matches!(position, ArgumentSubstitutionPosition::Value) => {
+                StructuralOperandRef::Value(value) => value.clone(),
+                StructuralOperandRef::Handle { .. }
+                    if matches!(position, ArgumentSubstitutionPosition::Value) =>
+                {
                     return Err(ArgumentSubstitutionError {
-                        source_file: None,
+                        source_file,
                         line,
                         message: BareStructuralHandle {
-                            binding: diagnostic_name.as_deref().unwrap_or(name).to_string(),
+                            binding: diagnostic.diagnostic_name().unwrap_or(name).to_string(),
                             kind: StructuralHandleKind::ModuleParameter,
                         }
                         .to_string(),
                         parse_error: None,
                     });
                 }
-                StructuralOperandRef::Handle {
-                    handle: _,
-                    access_base,
-                } => access_base.clone(),
+                StructuralOperandRef::Handle { access_base, .. } => access_base.clone(),
                 StructuralOperandRef::Parameter {
                     name: _,
                     access_base,
                 } => {
                     let mut forwarded_value = access_base.clone();
-                    if let Value::Deferred(DeferredValue::Unknown(
-                        crate::resource::UnknownReason::ModuleArgument {
-                            name: _,
-                            source_line: forwarded_line,
-                            diagnostic_name: forwarded_diagnostic,
+                    if let Value::Deferred(DeferredValue::Placeholder(
+                        ParserPlaceholder::ModuleArgument {
+                            diagnostic: forwarded_diagnostic,
+                            ..
                         },
                     )) = &mut forwarded_value
                     {
-                        *forwarded_line = line.into();
-                        *forwarded_diagnostic =
-                            Some(diagnostic_name.as_deref().unwrap_or(name).to_string());
+                        forwarded_diagnostic.forward_from(diagnostic, name);
                     }
                     forwarded_value
                 }
             }
         }
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::FnParam { name: _ }
+            | ParserPlaceholder::FnLocal { name: _ }
+            | ParserPlaceholder::Loop(LoopSlot::Key)
+            | ParserPlaceholder::Loop(LoopSlot::Index)
+            | ParserPlaceholder::Loop(LoopSlot::Value)
+            | ParserPlaceholder::EmptyInterpolation { source: _ },
+        )) => value.clone(),
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             let Some(argument) = arguments.arguments.get(binding.as_str()) else {
                 return Ok(value.clone());
@@ -4415,15 +4500,17 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             },
         ) = binding_index.postfix_ref_type(append_reference_path(reference, &postfix).as_ref())
     {
-        let line = match value {
-            Value::Deferred(DeferredValue::Access(access)) => access.source_line(),
-            Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ModuleArgument {
-                    name: _,
-                    source_line,
-                    diagnostic_name: _,
-                },
-            )) => source_line.get().unwrap_or(arguments.default_line),
+        let (source_file, line) = match value {
+            Value::Deferred(DeferredValue::Access(access)) => (None, access.source_line()),
+            Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+                name: _,
+                diagnostic,
+            })) => (
+                diagnostic
+                    .authored_location()
+                    .map(|(source_file, _)| source_file.to_path_buf()),
+                diagnostic.source_line().unwrap_or(arguments.default_line),
+            ),
             Value::Concrete(
                 ConcreteValue::String(_)
                 | ConcreteValue::EnumIdentifier(_)
@@ -4466,20 +4553,22 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 | DeferredValue::Secret(_)
                 | DeferredValue::RedactedSecret { hash: _ }
                 | DeferredValue::Unknown(
-                    crate::resource::UnknownReason::UpstreamExport { path: _ }
-                    | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-                    | crate::resource::UnknownReason::ForKey
-                    | crate::resource::UnknownReason::ForIndex
-                    | crate::resource::UnknownReason::ForValue
-                    | crate::resource::UnknownReason::FnParam { name: _ }
-                    | crate::resource::UnknownReason::FnLocal { name: _ }
-                    | crate::resource::UnknownReason::EmptyInterpolation
-                    | crate::resource::UnknownReason::PendingReRead(_),
+                    ApplyTimeUnknown::UpstreamExport { path: _ }
+                    | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
+                    | ApplyTimeUnknown::PendingReRead(_),
+                )
+                | DeferredValue::Placeholder(
+                    ParserPlaceholder::FnParam { name: _ }
+                    | ParserPlaceholder::FnLocal { name: _ }
+                    | ParserPlaceholder::Loop(LoopSlot::Key)
+                    | ParserPlaceholder::Loop(LoopSlot::Index)
+                    | ParserPlaceholder::Loop(LoopSlot::Value)
+                    | ParserPlaceholder::EmptyInterpolation { source: _ },
                 ),
-            ) => arguments.default_line,
+            ) => (None, arguments.default_line),
         };
         return Err(ArgumentSubstitutionError {
-            source_file: None,
+            source_file,
             line,
             message: error.to_string(),
             parse_error: None,
@@ -4547,12 +4636,20 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// `find_state_names_by_type` returns every state resource name for a given
 /// `(provider, resource_type)` — the reconciler uses them to discover which
 /// instance prefixes already exist in state.
-pub fn reconcile_anonymous_module_instances<E>(
-    file: &mut crate::parser::ModuleResolvedFile<E>,
+pub fn reconcile_anonymous_module_instances<E, P, T>(
+    file: &mut crate::parser::File<
+        E,
+        P,
+        T,
+        crate::parser::ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>,
+        AbsoluteBindingAddress,
+    >,
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
     claims: &crate::identifier::StateBlockClaims,
 ) where
-    E: crate::parser::ExportParamLike<Binding = AbsoluteBindingAddress>,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    E: crate::parser::ExportParamLike<P, AbsoluteBindingAddress>,
 {
     use std::collections::{HashMap, HashSet};
 
@@ -4841,7 +4938,11 @@ mod tests {
         let state_hash = current_hash.with_flipped_mask_for_test(1);
         let current_prefix = format!("web_{current_hash:016x}");
         let state_prefix = format!("web_{state_hash:016x}");
-        let mut resource = Resource::with_provider(
+        let mut resource: crate::resource::Resource<
+            ModuleSource,
+            ParserPlaceholder,
+            AbsoluteBindingAddress,
+        > = crate::resource::Resource::with_provider(
             "mock",
             "test.Leaf",
             ResourceIdentity::new(format!("{current_prefix}.leaf")),
@@ -4854,7 +4955,7 @@ mod tests {
         ));
         resource.loop_provenance = provenance;
         let mut file = crate::parser::ModuleResolvedParsedFile {
-            resources: vec![resource.resolve_root(&crate::resource::RootScope::new())],
+            resources: vec![resource],
             ..Default::default()
         };
 
@@ -4905,7 +5006,11 @@ mod tests {
         let state_prefix = format!("web_{state_hash:016x}");
         direct.prefix_legacy(&ResourceIdentity::new(current_prefix.clone()));
 
-        let mut resource = Resource::with_provider(
+        let mut resource: crate::resource::Resource<
+            ModuleSource,
+            ParserPlaceholder,
+            AbsoluteBindingAddress,
+        > = crate::resource::Resource::with_provider(
             "mock",
             "test.Leaf",
             ResourceIdentity::new(format!("{current_prefix}.leaf")),
@@ -4913,7 +5018,7 @@ mod tests {
         );
         resource.loop_provenance = crate::resource::LoopProvenance::direct(direct);
         let mut file = crate::parser::ModuleResolvedParsedFile {
-            resources: vec![resource.resolve_root(&crate::resource::RootScope::new())],
+            resources: vec![resource],
             ..Default::default()
         };
 

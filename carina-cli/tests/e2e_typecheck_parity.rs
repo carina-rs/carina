@@ -136,7 +136,7 @@ fn cli_diagnostics_at(
 fn cli_validated_file(
     factories: Vec<Box<dyn ProviderFactory>>,
     fixture: &TempDir,
-) -> carina_core::parser::ModuleResolvedInferredFile {
+) -> carina_core::parser::ExpandedInferredFile {
     let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
         &carina_core::parser::ProviderContext::default(),
@@ -145,7 +145,7 @@ fn cli_validated_file(
     .expect("load CLI fixture");
     let parsed = loaded.parsed;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let providers = carina_cli::wiring::ProviderLoad::for_test(
+    let providers = carina_cli::wiring::ProviderLoad::for_test_with_provider_phase(
         carina_cli::wiring::LoadedProviderFactory::for_test(factories),
         &parsed.providers,
     );
@@ -3855,7 +3855,7 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
     let schema = ResourceSchema::new("route53.Record")
         .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("hosted_zone_id", hosted_zone_id).build());
-    let attributes = HashMap::from([
+    let attributes: HashMap<String, Value> = HashMap::from([
         (
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("record".into())),

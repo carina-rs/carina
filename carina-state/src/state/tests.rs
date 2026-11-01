@@ -4697,7 +4697,9 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
     resource.set_attr(
         "vpc_id".to_string(),
         carina_core::resource::AuthoredValue::resource_ref("my_vpc", "vpc_id", vec![])
-            .resolve_root_for_test(),
+            .resolve_root_for_test()
+            .into_expanded()
+            .expect("resource reference contains no parser placeholder"),
     );
 
     let provider_state = ProviderState {
@@ -8477,7 +8479,9 @@ fn published_null_export_is_absent_for_coalesce_resolution() {
     let expression = Value::Deferred(DeferredValue::Coalesce {
         value: Box::new(
             carina_core::resource::AuthoredValue::resource_ref("up", "accounts", Vec::new())
-                .resolve_root_for_test(),
+                .resolve_root_for_test()
+                .into_expanded()
+                .expect("upstream reference contains no parser placeholder"),
         ),
         default: Box::new(default.clone()),
     });

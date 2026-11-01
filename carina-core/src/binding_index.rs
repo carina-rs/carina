@@ -43,12 +43,13 @@
 //! ```
 
 use crate::data_source_value::{DataSourceValue, DataSourceValues};
-use crate::parser::{DeferredIfBody, RelativeBindingName, ResourceRef};
+use crate::parser::{DeferredIfBody, TopLevelResourceRef};
 use crate::resource::composition::CompositionRuntimeRef;
 use crate::resource::{
-    AbsoluteBindingAddress, AccessPath, BindingAddress, LiveComposition, PathSegment,
-    PlanInputCurrent, ReferencePathRef, Resource, ResourceId, SavedComposition, SavedModuleSource,
-    SavedResource, State, Subscript, Value,
+    AbsoluteBindingAddress, AccessPath, BindingAddress, LiveComposition, ParserPlaceholder,
+    PathSegment, PlaceholderKind, PlanInputCurrent, ReferencePathRef, RelativeBindingName,
+    Resource, ResourceId, SavedComposition, SavedModuleSource, SavedResource, State, Subscript,
+    Value,
 };
 use crate::schema::{
     AttributeType, ResourceSchema, SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
@@ -59,7 +60,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Debug)]
 pub enum BindingTarget<'a, B: BindingAddress = RelativeBindingName> {
     Schema(&'a ResourceSchema),
-    LiveComposition(&'a LiveComposition<B>),
+    LiveComposition(&'a LiveComposition<ParserPlaceholder, B>),
     ModuleCall(&'a crate::module_resolver::ResolvedModuleSignature),
     Argument(&'a crate::parser::TypeExpr),
     UpstreamState(&'a crate::upstream_exports::UpstreamExportEntries),
@@ -471,9 +472,12 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     /// types as a separate diagnostic, so reporting them again here would
     /// double-count. LiveComposition bindings do not need a registry lookup.
     pub fn from_parsed<E, D>(
-        parsed: &'a crate::parser::File<E, B, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self::build(parsed, registry, None, None)
     }
 
@@ -482,10 +486,13 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     /// the module call is not a [`LiveComposition`] yet, but its imported
     /// signature already declares the output type.
     pub fn from_parsed_with_module_signatures<E, D>(
-        parsed: &'a crate::parser::File<E, B, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self::build(parsed, registry, None, Some(module_signatures))
     }
 
@@ -493,20 +500,26 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     /// Bindings whose source could not be loaded are still recorded as known
     /// and therefore resolve to [`RefType::Unchecked`].
     pub fn from_parsed_with_upstream_exports<E, D>(
-        parsed: &'a crate::parser::File<E, B, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-        upstream_exports: &'a crate::upstream_exports::UpstreamExports,
-    ) -> Self {
+        upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self::build(parsed, registry, Some(upstream_exports), None)
     }
 
     /// Build the complete pre-expansion validation index used by the LSP.
     pub fn from_parsed_with_upstream_exports_and_module_signatures<E, D>(
-        parsed: &'a crate::parser::File<E, B, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-        upstream_exports: &'a crate::upstream_exports::UpstreamExports,
+        upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self::build(
             parsed,
             registry,
@@ -516,11 +529,14 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     }
 
     fn build<E, D>(
-        parsed: &'a crate::parser::File<E, B, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-        upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports>,
+        upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
         module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
         let mut resource_handles = HashMap::new();
@@ -540,7 +556,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                 continue;
             };
             known_names.insert(binding_name.to_string());
-            if !matches!(rref, ResourceRef::LiveComposition(_)) {
+            if !matches!(rref, TopLevelResourceRef::LiveComposition(_)) {
                 let id = rref.id();
                 resource_handles.insert(
                     binding_name.to_string(),
@@ -551,19 +567,13 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             // via `get_for`, data sources via `get_for_data_source`.
             // Compositions carry their own statically known attribute map.
             let target = match rref {
-                ResourceRef::Resource(m) => registry
+                TopLevelResourceRef::Resource(m) => registry
                     .get_for(m)
                     .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
-                ResourceRef::Deferred {
-                    resource: m,
-                    deferred: _deferred,
-                } => registry
-                    .get_for(m)
-                    .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
-                ResourceRef::DataSource(d) => registry
+                TopLevelResourceRef::DataSource(d) => registry
                     .get_for_data_source(d)
                     .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
-                ResourceRef::LiveComposition(c) => Some(BindingTarget::LiveComposition(c)),
+                TopLevelResourceRef::LiveComposition(c) => Some(BindingTarget::LiveComposition(c)),
             };
             let Some(target) = target else {
                 continue;
@@ -637,6 +647,19 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                             });
                     }
                 }
+                DeferredIfBody::ExpandedModuleCall(contribution) => {
+                    for composition in &contribution.compositions {
+                        let Some(binding_name) = composition.binding.as_ref() else {
+                            continue;
+                        };
+                        known_names.insert(binding_name.to_string());
+                        entries
+                            .entry(binding_name.to_string())
+                            .or_insert(BindingEntry {
+                                target: BindingTarget::LiveComposition(composition),
+                            });
+                    }
+                }
             }
         }
         // Module-call bindings expose the imported module's declared output
@@ -698,7 +721,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         for upstream in &parsed.upstream_states {
             known_names.insert(upstream.binding.to_string());
             if let Some(exports) =
-                upstream_exports.and_then(|all_exports| all_exports.get(upstream.binding.as_str()))
+                upstream_exports.and_then(|all_exports| all_exports.get(&upstream.binding))
             {
                 entries
                     .entry(upstream.binding.to_string())
@@ -1173,16 +1196,12 @@ fn narrow_type<'a>(
 /// identifiers that the resolver/executor never need to look up
 /// attributes on.
 ///
-/// `#[non_exhaustive]` so adding a new declaration form (a future
-/// `data` block, etc.) does not break downstream `match` arms.
-///
 /// Not `Copy`: `Wait` carries an owned `RelativeBindingName` (the wait→target
 /// edge is a typed value, carina#3085 — not a string convention). The
 /// enum is read out by reference (`kind()` / `iter()`); the only
 /// in-crate consumers are within this module, so dropping `Copy` is
 /// contained.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum BindingNameKind {
     /// `let <name> = ...` resource binding.
     Resource,
@@ -1251,7 +1270,22 @@ impl BindingNameSet {
     /// — keeps `Variable` last because `parsed.variables` is the
     /// catch-all "any `let`-RHS placeholder lives here" map, while the
     /// preceding sources are narrower declaration forms.
-    pub fn from_parsed<E, D>(parsed: &crate::parser::File<E, RelativeBindingName, D>) -> Self {
+    pub fn from_parsed<E, D>(
+        parsed: &crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+            RelativeBindingName,
+        >,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                crate::resource::ParserPlaceholder,
+                crate::resource::ParserPlaceholder,
+                RelativeBindingName,
+            >,
+    {
         let mut by_name: HashMap<String, BindingNameKind> = HashMap::new();
 
         // carina#3181: walk the typed top-level slices — managed
@@ -1281,7 +1315,7 @@ impl BindingNameSet {
                 });
         }
         for call in &parsed.module_calls {
-            if let Some(name) = call.binding_name.as_deref() {
+            if let Some(name) = call.binding_name.as_ref() {
                 by_name
                     .entry(name.to_string())
                     .or_insert(BindingNameKind::ModuleCall);
@@ -1363,8 +1397,7 @@ impl BindingNameSet {
 
 /// A `wait` binding's value-layer contract: `binding`'s
 /// `<binding>.<attr>` is a passthrough to `<target>.<attr>`
-/// (carina#3085). Both sides use the binding phase carried by `B`, so authored
-/// declarations remain relative and planned aliases remain absolute.
+/// (carina#3085). Both sides are the typed [`BindingName`] newtype so
 /// the wait→target edge cannot be confused with an arbitrary string.
 ///
 /// This is the *only* thing `ResolvedBindings` needs from a wait
@@ -1398,18 +1431,12 @@ impl<B: BindingAddress> From<&crate::parser::WaitBinding<B>> for WaitAliasSpec<B
 /// in the current configuration; `Upstream` means an `upstream_state` data
 /// source bringing values in from another state file.
 ///
-/// Marked `#[non_exhaustive]` because #2301 will introduce structural
-/// sources (`for` / `if` / module) — flagging the intent now keeps
-/// downstream `match` arms from becoming exhaustive against the current
-/// two variants.
-///
 /// Not `Copy`: `WaitAlias` carries an owned absolute binding address (the
 /// wait→target edge is a typed value, carina#3085). `source()` returns
 /// a borrow; the only in-crate value-position use is a `matches!`
 /// (`Copy`-independent), so dropping `Copy` is contained.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BindingValueSource {
+pub enum BindingValueSource<B: BindingAddress = AbsoluteBindingAddress> {
     Local,
     Upstream,
     /// The binding is a `wait` binding whose `<name>.<attr>` is a
@@ -1424,7 +1451,7 @@ pub enum BindingValueSource {
     /// `Effect::Wait` lowering and is not affected by this value-layer
     /// alias.
     WaitAlias {
-        target: AbsoluteBindingAddress,
+        target: B,
     },
 }
 
@@ -1470,9 +1497,12 @@ pub enum ManagedBindingStability {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResolvedBinding {
-    pub attributes: HashMap<String, Value>,
-    pub source: BindingValueSource,
+pub struct ResolvedBinding<
+    P: PlaceholderKind = crate::resource::NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    pub attributes: HashMap<String, Value<P, B>>,
+    pub source: BindingValueSource<B>,
     pub completeness: BindingCompleteness,
     /// Attributes whose present values are authoritative even when the
     /// surrounding snapshot is incomplete. For managed resources these are
@@ -1539,9 +1569,88 @@ impl SecretPreservingAttributes {
 /// upstream `HashMap<String, HashMap<String, Value>>` already on hand to
 /// borrow from. Owning the merged map avoids a self-referential
 /// structure.
-#[derive(Debug, Default, Clone)]
-pub struct ResolvedBindings {
-    by_name: HashMap<String, ResolvedBinding>,
+#[derive(Debug, Clone)]
+pub struct ResolvedBindings<
+    P: PlaceholderKind = crate::resource::NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    by_name: HashMap<String, ResolvedBinding<P, B>>,
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> Default for ResolvedBindings<P, B> {
+    fn default() -> Self {
+        Self {
+            by_name: HashMap::new(),
+        }
+    }
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> ResolvedBindings<P, B> {
+    pub fn get(&self, name: &str) -> Option<&HashMap<String, Value<P, B>>> {
+        self.by_name.get(name).map(|binding| &binding.attributes)
+    }
+
+    pub fn source(&self, name: &str) -> Option<&BindingValueSource<B>> {
+        self.by_name.get(name).map(|binding| &binding.source)
+    }
+
+    pub fn completeness(&self, name: &str) -> Option<BindingCompleteness> {
+        self.by_name.get(name).map(|binding| binding.completeness)
+    }
+
+    /// Whether a present attribute value can be consumed before apply.
+    pub fn attribute_value_is_definitive(&self, name: &str, attribute: &str) -> bool {
+        self.by_name.get(name).is_some_and(|binding| {
+            binding.definitive_attributes.contains(attribute)
+                || (!binding.changed_attributes.contains(attribute)
+                    && binding.completeness == BindingCompleteness::Complete)
+        })
+    }
+
+    /// Whether a missing attribute is definitive absence.
+    pub fn attribute_absence_is_definitive(&self, name: &str, attribute: &str) -> bool {
+        self.by_name.get(name).is_some_and(|binding| {
+            (binding.changed_attributes.contains(attribute)
+                && !binding.definitive_attributes.contains(attribute))
+                || (self.attribute_value_is_definitive(name, attribute)
+                    && !binding.refreshable_attributes.contains(attribute))
+        })
+    }
+
+    pub fn removed_attribute_was_sensitive(&self, name: &str, attribute: &str) -> bool {
+        self.by_name
+            .get(name)
+            .is_some_and(|binding| binding.removed_sensitive_attributes.contains(attribute))
+    }
+
+    pub fn binding_is_fully_definitive(&self, name: &str) -> bool {
+        self.by_name.get(name).is_some_and(|binding| {
+            binding.completeness == BindingCompleteness::Complete
+                && binding.refreshable_attributes.is_empty()
+        })
+    }
+
+    fn layer_typed_wait_aliases(&mut self, wait_aliases: &[WaitAliasSpec<B>]) {
+        for spec in wait_aliases {
+            let Some(target) = self.by_name.get(spec.target.as_str()).cloned() else {
+                continue;
+            };
+            self.by_name.insert(
+                spec.binding.as_str().to_string(),
+                ResolvedBinding {
+                    attributes: target.attributes,
+                    source: BindingValueSource::WaitAlias {
+                        target: spec.target.clone(),
+                    },
+                    completeness: target.completeness,
+                    definitive_attributes: target.definitive_attributes,
+                    changed_attributes: target.changed_attributes,
+                    refreshable_attributes: target.refreshable_attributes,
+                    removed_sensitive_attributes: target.removed_sensitive_attributes,
+                },
+            );
+        }
+    }
 }
 
 /// Required inputs for [`ResolvedBindings::pre_apply`] (carina#3248).
@@ -1590,22 +1699,29 @@ pub struct LivePreDataSourceReadInputs<'a> {
     pub wait_aliases: &'a [WaitAliasSpec],
 }
 
-impl ResolvedBindings {
-    /// Build the value-level binding view used by validation and editor
-    /// diagnostics.
-    ///
-    /// Unlike plan/apply there is no provider state to layer in: the DSL's
-    /// managed resources, data sources, expanded compositions, and wait
-    /// aliases are the complete value authority available at this phase.
-    /// Keeping this constructor next to [`Self::pre_apply`] prevents CLI and
-    /// LSP validation from assembling subtly different binding maps.
-    pub(crate) fn for_root_validation<E>(
-        parsed: &crate::parser::File<E>,
+impl ResolvedBindings<ParserPlaceholder> {
+    /// Build the parser-placeholder validation view while resolving every
+    /// authored binding name into the caller-provided root scope.
+    pub(crate) fn for_root_validation<E, D>(
+        parsed: &crate::parser::File<
+            E,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            RelativeBindingName,
+        >,
         root: &crate::resource::RootScope,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                ParserPlaceholder,
+                ParserPlaceholder,
+                RelativeBindingName,
+            >,
+    {
         Self::build_validation(
             parsed,
-            |value: &Value<RelativeBindingName>| {
+            |value: &Value<ParserPlaceholder, RelativeBindingName>| {
                 value
                     .clone()
                     .resolve_bindings(&mut |binding| root.resolve(binding))
@@ -1614,11 +1730,14 @@ impl ResolvedBindings {
         )
     }
 
-    fn build_validation<E, B: BindingAddress, D>(
-        parsed: &crate::parser::File<E, B, D>,
-        mut map_value: impl FnMut(&Value<B>) -> Value,
-        mut map_binding: impl FnMut(&B) -> AbsoluteBindingAddress,
-    ) -> Self {
+    fn build_validation<E, B: BindingAddress, Out: BindingAddress, D>(
+        parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        mut map_value: impl FnMut(&Value<ParserPlaceholder, B>) -> Value<ParserPlaceholder, Out>,
+        mut map_binding: impl FnMut(&B) -> Out,
+    ) -> ResolvedBindings<ParserPlaceholder, Out>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         let mut by_name = HashMap::new();
 
         for resource in &parsed.resources {
@@ -1644,6 +1763,7 @@ impl ResolvedBindings {
                 },
             );
         }
+
         for data_source in &parsed.data_sources {
             let Some(binding) = data_source.binding.as_ref() else {
                 continue;
@@ -1667,6 +1787,7 @@ impl ResolvedBindings {
                 },
             );
         }
+
         for composition in &parsed.compositions {
             let Some(binding) = composition.binding.as_ref() else {
                 continue;
@@ -1695,7 +1816,7 @@ impl ResolvedBindings {
             );
         }
 
-        let mut bindings = Self { by_name };
+        let mut bindings = ResolvedBindings { by_name };
         let wait_aliases = parsed
             .wait_bindings
             .iter()
@@ -1704,17 +1825,64 @@ impl ResolvedBindings {
                 target: map_binding(&wait.target),
             })
             .collect::<Vec<_>>();
-        bindings.layer_wait_aliases(&wait_aliases);
+        bindings.layer_typed_wait_aliases(&wait_aliases);
         bindings
     }
 
     /// Build the same incomplete validation view after scope expansion.
     pub fn for_expanded_validation<E, D>(
-        parsed: &crate::parser::File<E, AbsoluteBindingAddress, D>,
-    ) -> Self {
-        Self::build_validation(parsed, |value| value.clone(), |binding| binding.clone())
+        parsed: &crate::parser::File<
+            E,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            AbsoluteBindingAddress,
+        >,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                ParserPlaceholder,
+                ParserPlaceholder,
+                AbsoluteBindingAddress,
+            >,
+    {
+        ResolvedBindings::<ParserPlaceholder>::build_validation(
+            parsed,
+            |value| value.clone(),
+            |binding| binding.clone(),
+        )
     }
+}
 
+impl ResolvedBindings<ParserPlaceholder, RelativeBindingName> {
+    /// Build the incomplete validation view without crossing the root-binding
+    /// expansion seam. Editor/source diagnostics use this view while their
+    /// values still carry authored relative names.
+    pub fn for_authored_validation<E, D>(
+        parsed: &crate::parser::File<
+            E,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            RelativeBindingName,
+        >,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                ParserPlaceholder,
+                ParserPlaceholder,
+                RelativeBindingName,
+            >,
+    {
+        ResolvedBindings::<ParserPlaceholder>::build_validation(
+            parsed,
+            |value| value.clone(),
+            |binding| binding.clone(),
+        )
+    }
+}
+
+impl ResolvedBindings {
     /// Build the explicitly incomplete value view used to resolve query
     /// inputs before provider reads run.
     pub fn pre_data_source_read_live(inputs: LivePreDataSourceReadInputs<'_>) -> Self {
@@ -2180,58 +2348,6 @@ impl ResolvedBindings {
                 },
             );
         }
-    }
-
-    pub fn get(&self, name: &str) -> Option<&HashMap<String, Value>> {
-        self.by_name.get(name).map(|b| &b.attributes)
-    }
-
-    pub fn source(&self, name: &str) -> Option<&BindingValueSource> {
-        self.by_name.get(name).map(|b| &b.source)
-    }
-
-    pub fn completeness(&self, name: &str) -> Option<BindingCompleteness> {
-        self.by_name.get(name).map(|b| b.completeness)
-    }
-
-    /// Whether a present attribute value can be consumed before apply.
-    pub fn attribute_value_is_definitive(&self, name: &str, attribute: &str) -> bool {
-        self.by_name.get(name).is_some_and(|binding| {
-            binding.definitive_attributes.contains(attribute)
-                || (!binding.changed_attributes.contains(attribute)
-                    && binding.completeness == BindingCompleteness::Complete)
-        })
-    }
-
-    /// Whether a missing attribute is definitive absence. Provider-populated
-    /// attributes may appear during an update, so their prior absence remains
-    /// unknown even though an already-present prior value is usable.
-    pub fn attribute_absence_is_definitive(&self, name: &str, attribute: &str) -> bool {
-        self.by_name.get(name).is_some_and(|binding| {
-            (binding.changed_attributes.contains(attribute)
-                && !binding.definitive_attributes.contains(attribute))
-                || (self.attribute_value_is_definitive(name, attribute)
-                    && !binding.refreshable_attributes.contains(attribute))
-        })
-    }
-
-    /// Whether a required reference targets a secret-bearing refreshed value
-    /// that this plan removes from the effective desired view.
-    ///
-    /// Resolution still treats the key as absent (so a direct coalesce may
-    /// select its fallback), but validation must not lose the sensitivity of
-    /// a bare unresolved reference before the removal has run.
-    pub fn removed_attribute_was_sensitive(&self, name: &str, attribute: &str) -> bool {
-        self.by_name
-            .get(name)
-            .is_some_and(|binding| binding.removed_sensitive_attributes.contains(attribute))
-    }
-
-    pub fn binding_is_fully_definitive(&self, name: &str) -> bool {
-        self.by_name.get(name).is_some_and(|binding| {
-            binding.completeness == BindingCompleteness::Complete
-                && binding.refreshable_attributes.is_empty()
-        })
     }
 
     /// Apply the final plan's managed-resource effects to an existing binding
@@ -2810,11 +2926,17 @@ let existing = read aws.ec2.Vpc {
             binding: RelativeBindingName::from("ready"),
             target: RelativeBindingName::from("instance"),
             until_raw: "instance.target_group_arn == 'ready'".to_string(),
-            until_predicate: UntilPredicateAst {
-                root: RelativeBindingName::new("instance"),
-                attribute_segments: vec!["target_group_arn".to_string()],
-                rhs: Value::Concrete(ConcreteValue::String("ready".into())),
-            },
+            until_predicate:
+                UntilPredicateAst {
+                    root: RelativeBindingName::new("instance"),
+                    attribute_segments: vec!["target_group_arn".to_string()],
+                    rhs: crate::resource::Value::<
+                        crate::resource::NoPlaceholder,
+                        RelativeBindingName,
+                    >::Concrete(crate::resource::ConcreteValue::String(
+                        "ready".into(),
+                    )),
+                },
             timeout_secs: None,
             depends_on: Vec::new(),
             line: 1,
@@ -3316,7 +3438,7 @@ let vpc = aws.ec2.Vpc {
             source: "../upstream".into(),
         });
         let exports = HashMap::from([(
-            "up".to_string(),
+            RelativeBindingName::new("up"),
             HashMap::from([(
                 "vpc".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
@@ -3362,7 +3484,7 @@ let vpc = aws.ec2.Vpc {
             source: "../upstream".into(),
         });
         let exports = HashMap::from([(
-            "up".to_string(),
+            RelativeBindingName::new("up"),
             HashMap::from([(
                 "opaque".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
@@ -3452,10 +3574,9 @@ mod resolved_bindings_tests {
     use super::*;
     use crate::data_source_value::{DataSourceValue, DataSourceValues};
     use crate::resource::{
-        ExpandedConcreteValue as ConcreteValue, ExpandedDataSource as DataSource,
+        ApplyTimeUnknown, ExpandedConcreteValue as ConcreteValue, ExpandedDataSource as DataSource,
         ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource,
-        ExpandedUnknownReason as UnknownReason, ExpandedValue as Value, PartialReadMarker,
-        PendingReRead, ResourceId, RootScope, State,
+        ExpandedValue as Value, PartialReadMarker, PendingReRead, ResourceId, RootScope, State,
     };
     use std::collections::BTreeSet;
 
@@ -3632,7 +3753,7 @@ mod resolved_bindings_tests {
             .expect("partial-read missing attribute must be materialized");
         assert!(matches!(
             a_dns_name,
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending)))
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
                 if pending == &PendingReRead::incomplete("read after create did not return dns_name")
         ));
 
@@ -3644,7 +3765,7 @@ mod resolved_bindings_tests {
             .expect("target attribute should remain present");
         assert!(matches!(
             target,
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending)))
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
                 if pending == &PendingReRead::incomplete("read after create did not return dns_name")
         ));
     }

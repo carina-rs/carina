@@ -2,8 +2,10 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use crate::parser::ParsedValue as Value;
+use crate::parser::ParserStateBlock as StateBlock;
 use crate::parser::Rule;
-use crate::parser::ast::{MovedAddresses, StateBlock, StateBlockAddress};
+use crate::parser::ast::{MovedAddresses, StateBlockAddress};
 use crate::parser::context::first_inner;
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_value;
@@ -18,7 +20,7 @@ pub(in crate::parser) fn parse_import_state_block(
 ) -> Result<StateBlock, ParseError> {
     let mut to: Option<StateBlockAddress> = None;
     let mut to_span: Option<SourceSpan> = None;
-    let mut id: Option<crate::resource::AuthoredValue> = None;
+    let mut id: Option<Value> = None;
 
     for attr in pair.into_inner() {
         if attr.as_rule() == Rule::import_state_attr {

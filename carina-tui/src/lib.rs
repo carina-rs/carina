@@ -303,6 +303,8 @@ mod tests {
     fn root_ref(binding: &str, attribute: &str) -> Value {
         carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
             .resolve_root_for_test()
+            .into_expanded()
+            .expect("TUI fixture contains no parser placeholder")
     }
 
     fn make_app() -> App {

@@ -5,7 +5,9 @@
 //! before parsing begins.
 
 use crate::parser::ProviderContext;
-use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Value, ValueString};
+use crate::resource::{
+    BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Value, ValueString,
+};
 
 use super::value_type_name;
 
@@ -14,7 +16,9 @@ use super::value_type_name;
 /// This is the fallback entry point used by `evaluate_builtin` (no config).
 /// It always returns an error since the decryptor is only available via `ProviderContext`.
 /// Use `builtin_decrypt_with_config` for the config-aware version.
-pub(crate) fn builtin_decrypt<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_decrypt<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     // Validate arguments for better error messages
     let (_ciphertext, _key) = parse_decrypt_args(args)?;
 
@@ -27,9 +31,9 @@ pub(crate) fn builtin_decrypt<B: BindingAddress>(args: &[Value<B>]) -> Result<Va
 
 /// `decrypt()` implementation that uses the decryptor from [`ProviderContext`].
 pub(crate) fn builtin_decrypt_with_config<B: BindingAddress>(
-    args: &[Value<B>],
+    args: &[Value<NoPlaceholder, B>],
     config: &ProviderContext,
-) -> Result<Value<B>, String> {
+) -> Result<Value<NoPlaceholder, B>, String> {
     let (ciphertext, key) = parse_decrypt_args(args)?;
     let decryptor = config.decryptor.as_ref().ok_or_else(|| {
         "decrypt() requires a configured provider with encryption support. \
@@ -58,7 +62,7 @@ pub(crate) fn builtin_decrypt_with_config<B: BindingAddress>(
 ///
 /// Returns `(ciphertext, optional_key)` or an error.
 fn parse_decrypt_args<B: BindingAddress>(
-    args: &[Value<B>],
+    args: &[Value<NoPlaceholder, B>],
 ) -> Result<(&ValueString, Option<&ValueString>), String> {
     if args.is_empty() || args.len() > 2 {
         return Err(format!(

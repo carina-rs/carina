@@ -714,7 +714,9 @@ fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
     )
     .expect("multi-file collision fixture parses");
     let parsed = crate::module_resolver::resolve_modules_providerless(parsed, &directory)
-        .expect("multi-file collision fixture crosses root expansion");
+        .expect("multi-file collision fixture crosses root expansion")
+        .into_expanded()
+        .expect("collision fixture contains no parser placeholders");
     let mut unresolved = parsed.resources;
 
     let anonymous = unresolved

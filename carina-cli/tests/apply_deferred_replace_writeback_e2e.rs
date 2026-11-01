@@ -15,23 +15,24 @@ use carina_core::parser::{
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Directives, LoopSlot, NoPlaceholder,
+    RelativeBindingName, ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
 use indexmap::IndexMap;
 use tempfile::TempDir;
 
-fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
-    carina_core::resource::absolute_binding_address_for_test(name)
-}
-
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
+fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
-    parsed.providers = vec![carina_core::parser::ExpandedProviderConfig {
+    parsed.providers = vec![ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -216,18 +217,32 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         Value::Concrete(ConcreteValue::String("alias".into())),
     );
 
-    let template_resource = mock_resource("validation_records", "validation_records");
-    let template: carina_core::parser::ExpandedDeferredForExpression = DeferredForExpression {
+    let mut template_resource: carina_core::resource::Resource<
+        carina_core::resource::ModuleSource,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    > = carina_core::resource::Resource::with_provider(
+        "mock",
+        "test.resource",
+        carina_core::resource::ResourceIdentity::try_from("validation_records".to_string())
+            .unwrap(),
+        None,
+    );
+    template_resource.binding = Some(absolute_binding("validation_records"));
+    let template = DeferredForExpression {
         file: Some("main.crn".to_string()),
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "mock.test.resource".to_string(),
-        attributes: vec![],
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: absolute_binding("validation_records"),
         },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new())
-            .resolve_root_for_test(),
+        iterable: Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+            "cert",
+            "domain_validation_options",
+            Vec::new(),
+        )
+        .resolve_root_for_test(),
         binding: ForBinding::Simple("opt".to_string()),
         template_resource,
     };

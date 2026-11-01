@@ -6,8 +6,9 @@ use crate::plan_summary::PlanChangeSummary;
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::plan::Plan;
 use carina_core::resource::{
-    AccessMissPolicy, ConcreteValue, DeferredValue, Directives, InterpolationPart, PathSegment,
-    ResolvedResource, Resource, ResourceId, State, UnknownReason, Value, apply_postfix_access,
+    AccessMissPolicy, ConcreteValue, DeferredValue, Directives, InterpolationPart, LoopSlot,
+    ModuleSource, PathSegment, ResolvedResource, Resource, ResourceId, State, Value,
+    apply_postfix_access,
 };
 use carina_core::value::{PrettyLayout, PrettyValue, render_value};
 
@@ -49,9 +50,9 @@ fn format_plan_for_test<S, D: HistoricalDisplaySource<S> + ?Sized>(
     .expect("display fixture must have an initialized provider route")
 }
 
-fn for_value_access(fields: &[&str]) -> Value {
+fn for_value_access(fields: &[&str]) -> Value<LoopSlot> {
     fields.iter().fold(
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         |base, field| {
             apply_postfix_access(
                 base,
@@ -820,7 +821,8 @@ fn test_extract_compact_hint_considers_all_resource_attributes() {
 
 #[test]
 fn test_deferred_create_renders_deferred_until_apply_marker() {
-    let mut template_resource: Resource = Resource::new("route53.Record", "validation_records");
+    let mut template_resource: Resource<ModuleSource, LoopSlot> =
+        Resource::new("route53.Record", "validation_records");
     template_resource.binding = Some(absolute_binding("validation_records"));
     template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
 
@@ -830,11 +832,6 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
-            attributes: template_resource
-                .attributes
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
             target: carina_core::parser::DeferredForTarget::Bound {
                 binding: absolute_binding("validation_records"),
             },
@@ -881,7 +878,8 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
 }
 
 fn deferred_validation_records_effect() -> Effect {
-    let mut template_resource: Resource = Resource::new("route53.Record", "validation_records");
+    let mut template_resource: Resource<ModuleSource, LoopSlot> =
+        Resource::new("route53.Record", "validation_records");
     template_resource.binding = Some(absolute_binding("validation_records"));
     template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
 
@@ -891,11 +889,6 @@ fn deferred_validation_records_effect() -> Effect {
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
-            attributes: template_resource
-                .attributes
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
             target: carina_core::parser::DeferredForTarget::Bound {
                 binding: absolute_binding("validation_records"),
             },
@@ -1733,7 +1726,8 @@ fn plan_export_shows_env_plaintext() {
 #[test]
 fn format_deferred_value_duration_renders_canonical() {
     // Same canonical formatter, with the deferred-for context applied.
-    let v: Value = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
+    let v: Value<LoopSlot> =
+        Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
     let result = carina_core::plan_tree::render_deferred_for_template_value(&v, "cert", "applies");
     // The deferred path may inject ANSI dimming for Unknown variants,
     // but a resolved Duration must render verbatim.

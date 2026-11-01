@@ -22,7 +22,7 @@ use carina_core::parser::ProviderConfig;
 use carina_core::provider_source::{
     FileSource, GithubSource, ProviderSource, RegistrySource, RemoteSource, RemoteSourceKey,
 };
-use carina_core::resource::BindingAddress;
+use carina_core::resource::{BindingAddress, PlaceholderKind};
 use carina_core::version_constraint::VersionConstraint;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -8646,9 +8646,9 @@ pub fn find_file_provider_source(
     InstalledProvider::file_source(path, config.name.clone(), file_source, base_dir)
 }
 
-fn select_locked_artifact<'lock, B: BindingAddress>(
+fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
     base_dir: &Path,
-    config: &ProviderConfig<B>,
+    config: &ProviderConfig<P, B>,
     remote_source: &RemoteSource,
     lock_file: &'lock LockFile,
 ) -> Result<Option<LockArtifactSelection<'lock>>, FindInstalledProviderError> {
@@ -8878,9 +8878,9 @@ pub fn provider_artifact_fingerprint(
 /// the returned artifact always retains the lock/file provenance that selected
 /// it. This is used by the LSP to avoid editor-triggered downloads as well as
 /// by CLI load paths after `carina init` has installed the artifact.
-pub fn find_installed_provider<B: BindingAddress>(
+pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &Path,
-    config: &ProviderConfig<B>,
+    config: &ProviderConfig<P, B>,
 ) -> Result<InstalledProvider, FindInstalledProviderError> {
     let source = config
         .source
@@ -9685,9 +9685,9 @@ where
 ///
 /// Called before plan/apply to catch cases where the lock file and constraints have
 /// drifted out of sync (e.g., the user tightened a constraint after last `carina init`).
-pub fn validate_lock_constraints<B: BindingAddress>(
+pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &Path,
-    providers: &[ProviderConfig<B>],
+    providers: &[ProviderConfig<P, B>],
 ) -> Result<(), LockConstraintError> {
     let lock_file = match load_lock_file(base_dir)? {
         Some(lf) => lf,

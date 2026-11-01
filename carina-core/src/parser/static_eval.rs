@@ -6,11 +6,13 @@
 
 use super::ProviderContext;
 use super::error::ParseError;
-use crate::eval_value::AuthoredEvalValue as EvalValue;
+use crate::eval_value::EvalValue;
+use crate::parser::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use crate::resource::{
     AccessMissPolicy, AuthoredConcreteValue as ConcreteValue,
-    AuthoredDeferredValue as DeferredValue, AuthoredFunctionArgument as FunctionArgument,
-    AuthoredInterpolationPart as InterpolationPart, AuthoredValue as Value,
+    AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
+    BindingAddress, ConcreteValue as GenericConcreteValue, DeferredValue as GenericDeferredValue,
+    InterpolationPart as GenericInterpolationPart, ParserPlaceholder, Value as GenericValue,
 };
 use std::collections::HashSet;
 
@@ -31,12 +33,6 @@ impl IfConditionDependency {
     }
 }
 
-/// Classify the dependencies of an `if` condition without evaluating it.
-///
-/// `is_static_value` remains the compatibility authority for eager root
-/// conditions. Only values that authority rejects are inspected for the
-/// narrower module-template case: every non-static leaf must be a module
-/// argument (possibly composed through collections, access, or pure calls).
 pub(crate) fn classify_if_condition(value: &Value) -> IfConditionDependency {
     if is_static_value(value) {
         IfConditionDependency::Static
@@ -54,82 +50,46 @@ fn classify_non_static_if_condition(
         return IfConditionDependency::Static;
     }
 
+    let classify = |value, visiting_functions: &mut HashSet<usize>| {
+        classify_non_static_if_condition(value, function_placeholders_static, visiting_functions)
+    };
     match value {
-        Value::Concrete(ConcreteValue::List(items)) => {
-            items
-                .iter()
-                .fold(IfConditionDependency::Static, |dependency, item| {
-                    dependency.combine(classify_non_static_if_condition(
-                        item,
-                        function_placeholders_static,
-                        visiting_functions,
-                    ))
-                })
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            map.values()
-                .fold(IfConditionDependency::Static, |dependency, item| {
-                    dependency.combine(classify_non_static_if_condition(
-                        item,
-                        function_placeholders_static,
-                        visiting_functions,
-                    ))
-                })
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        ) => IfConditionDependency::Static,
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred.values().into_iter().fold(
-            IfConditionDependency::Static,
-            |dependency, value| {
-                dependency.combine(classify_non_static_if_condition(
-                    value,
-                    function_placeholders_static,
-                    visiting_functions,
-                ))
-            },
-        ),
-        Value::Deferred(DeferredValue::FunctionCall {
-            name: _,
-            args,
-            source_line: _,
-        }) => args
+        Value::Concrete(ConcreteValue::List(items)) => items
             .iter()
-            .fold(IfConditionDependency::Static, |dependency, argument| {
-                if argument.handle().is_some() {
-                    dependency
-                } else {
-                    dependency.combine(classify_non_static_if_condition(
-                        argument.walker_value(),
-                        function_placeholders_static,
-                        visiting_functions,
-                    ))
-                }
+            .fold(IfConditionDependency::Static, |dependency, item| {
+                dependency.combine(classify(item, visiting_functions))
             }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions: _,
-            args,
-            source_line: _,
-        }) => {
+        Value::Concrete(ConcreteValue::Map(map)) => map
+            .values()
+            .fold(IfConditionDependency::Static, |dependency, item| {
+                dependency.combine(classify(item, visiting_functions))
+            }),
+        Value::Concrete(_) => IfConditionDependency::Static,
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .fold(IfConditionDependency::Static, |dependency, value| {
+                dependency.combine(classify(value, visiting_functions))
+            }),
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            args.iter()
+                .fold(IfConditionDependency::Static, |dependency, argument| {
+                    if argument.handle().is_some() {
+                        dependency
+                    } else {
+                        dependency.combine(classify(argument.walker_value(), visiting_functions))
+                    }
+                })
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
             let argument_dependency =
                 args.iter()
                     .fold(IfConditionDependency::Static, |dependency, argument| {
                         if argument.handle().is_some() {
                             dependency
                         } else {
-                            dependency.combine(classify_non_static_if_condition(
-                                argument.walker_value(),
-                                function_placeholders_static,
-                                visiting_functions,
-                            ))
+                            dependency
+                                .combine(classify(argument.walker_value(), visiting_functions))
                         }
                     });
             if argument_dependency == IfConditionDependency::Runtime {
@@ -155,85 +115,39 @@ fn classify_non_static_if_condition(
             visiting_functions.remove(&function_id);
             argument_dependency.combine(body_dependency)
         }
-        Value::Deferred(DeferredValue::Access(access)) => classify_non_static_if_condition(
-            access.base(),
-            function_placeholders_static,
-            visiting_functions,
-        ),
+        Value::Deferred(DeferredValue::Access(access)) => {
+            classify(access.base(), visiting_functions)
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().fold(
             IfConditionDependency::Static,
             |dependency, part| match part {
                 InterpolationPart::Literal(_) => dependency,
                 InterpolationPart::Expr(value) => {
-                    dependency.combine(classify_non_static_if_condition(
-                        value,
-                        function_placeholders_static,
-                        visiting_functions,
-                    ))
+                    dependency.combine(classify(value, visiting_functions))
                 }
             },
         ),
-        Value::Deferred(DeferredValue::Secret(inner)) => classify_non_static_if_condition(
-            inner,
-            function_placeholders_static,
-            visiting_functions,
-        ),
+        Value::Deferred(DeferredValue::Secret(inner)) => classify(inner, visiting_functions),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            classify_non_static_if_condition(
-                value,
-                function_placeholders_static,
-                visiting_functions,
-            )
-            .combine(classify_non_static_if_condition(
-                default,
-                function_placeholders_static,
-                visiting_functions,
-            ))
+            classify(value, visiting_functions).combine(classify(default, visiting_functions))
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            classify_non_static_if_condition(
-                expression.lhs(),
-                function_placeholders_static,
-                visiting_functions,
-            )
-            .combine(classify_non_static_if_condition(
-                expression.rhs(),
-                function_placeholders_static,
-                visiting_functions,
-            ))
+            classify(expression.lhs(), visiting_functions)
+                .combine(classify(expression.rhs(), visiting_functions))
         }
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument {
-                name: _,
-                source_line: _,
-                diagnostic_name: _,
-            },
-        )) => IfConditionDependency::ModuleDependent,
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::FnParam { name: _ }
-            | crate::resource::UnknownReason::FnLocal { name: _ },
+        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+            ..
+        })) => IfConditionDependency::ModuleDependent,
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::FnParam { .. } | ParserPlaceholder::FnLocal { .. },
         )) if function_placeholders_static => IfConditionDependency::Static,
         Value::Deferred(
-            DeferredValue::ResourceRef { path: _ }
-            | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::Unavailable {
-                name: _,
-                args: _,
-                reason: _,
-                source_line: _,
-            }
-            | DeferredValue::RedactedSecret { hash: _ }
-            | DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamExport { path: _ }
-                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-                | crate::resource::UnknownReason::ForKey
-                | crate::resource::UnknownReason::ForIndex
-                | crate::resource::UnknownReason::ForValue
-                | crate::resource::UnknownReason::FnParam { name: _ }
-                | crate::resource::UnknownReason::FnLocal { name: _ }
-                | crate::resource::UnknownReason::EmptyInterpolation
-                | crate::resource::UnknownReason::PendingReRead(_),
-            ),
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => IfConditionDependency::Runtime,
     }
 }
@@ -279,8 +193,6 @@ impl std::fmt::Display for IfConditionDecisionError {
     }
 }
 
-/// Decide a condition that is either eager-static or a reusable module
-/// template. `None` means argument substitution must decide it later.
 pub(crate) fn decide_if_condition(
     value: &Value,
     config: &ProviderContext,
@@ -302,42 +214,49 @@ pub(crate) fn decide_if_condition(
 }
 
 /// Check whether a Value is fully static (no runtime dependencies).
-pub(crate) fn is_static_value(value: &Value) -> bool {
+pub(crate) fn is_static_value<B: BindingAddress>(
+    value: &GenericValue<ParserPlaceholder, B>,
+) -> bool {
     match value {
-        Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-        | Value::Concrete(ConcreteValue::Int(_))
-        | Value::Concrete(ConcreteValue::Float(_))
-        | Value::Concrete(ConcreteValue::Bool(_))
-        | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Concrete(ConcreteValue::StringList(_)) => true,
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_static_value),
-        Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_static_value),
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+        GenericValue::Concrete(GenericConcreteValue::String(_))
+        | GenericValue::Concrete(GenericConcreteValue::EnumIdentifier(_))
+        | GenericValue::Concrete(GenericConcreteValue::CanonicalEnum(_))
+        | GenericValue::Concrete(GenericConcreteValue::Int(_))
+        | GenericValue::Concrete(GenericConcreteValue::Float(_))
+        | GenericValue::Concrete(GenericConcreteValue::Bool(_))
+        | GenericValue::Concrete(GenericConcreteValue::Duration(_))
+        | GenericValue::Concrete(GenericConcreteValue::StringList(_)) => true,
+        GenericValue::Concrete(GenericConcreteValue::List(items)) => {
+            items.iter().all(is_static_value)
+        }
+        GenericValue::Concrete(GenericConcreteValue::Map(map)) => map.values().all(is_static_value),
+        GenericValue::Deferred(
+            GenericDeferredValue::FunctionCall { args, .. }
+            | GenericDeferredValue::ResolvedFunctionCall { args, .. },
         ) => args.iter().all(|argument| {
             argument.handle().is_some() || argument.value().is_some_and(is_static_value)
         }),
-        Value::Deferred(DeferredValue::Access(access)) => is_static_value(access.base()),
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+        GenericValue::Deferred(GenericDeferredValue::Access(access)) => {
+            is_static_value(access.base())
+        }
+        GenericValue::Deferred(GenericDeferredValue::IntegerArithmetic(expression)) => {
             is_static_value(expression.lhs()) && is_static_value(expression.rhs())
         }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+        GenericValue::Deferred(GenericDeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {
-                InterpolationPart::Literal(_) => true,
-                InterpolationPart::Expr(value) => is_static_value(value),
+                GenericInterpolationPart::Literal(_) => true,
+                GenericInterpolationPart::Expr(value) => is_static_value(value),
             })
         }
-        Value::Deferred(DeferredValue::ModuleIf(_))
-        | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::Coalesce { .. })
-        | Value::Deferred(DeferredValue::Unavailable { .. })
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => false,
-        Value::Deferred(DeferredValue::Secret(inner)) => is_static_value(inner),
+        GenericValue::Deferred(GenericDeferredValue::ModuleIf(_))
+        | GenericValue::Deferred(GenericDeferredValue::ResourceRef { .. })
+        | GenericValue::Deferred(GenericDeferredValue::BindingRef { .. })
+        | GenericValue::Deferred(GenericDeferredValue::Coalesce { .. })
+        | GenericValue::Deferred(GenericDeferredValue::Unavailable { .. })
+        | GenericValue::Deferred(GenericDeferredValue::RedactedSecret { .. })
+        | GenericValue::Deferred(GenericDeferredValue::Unknown(_))
+        | GenericValue::Deferred(GenericDeferredValue::Placeholder(_)) => false,
+        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => is_static_value(inner),
     }
 }
 
@@ -474,9 +393,9 @@ pub(crate) fn evaluate_static_value(
         }
         Value::Deferred(DeferredValue::Unavailable {
             name,
-            args: _,
             reason,
             source_line,
+            ..
         }) => Err(ParseError::InvalidExpression {
             line: source_line.get().unwrap_or(0),
             message: format!("{name}(): {reason}"),
@@ -493,29 +412,12 @@ pub(crate) fn evaluate_static_value(
         )
         | value @ Value::Deferred(
             DeferredValue::ModuleIf(_)
-            | DeferredValue::ResourceRef { path: _ }
-            | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::Coalesce {
-                value: _,
-                default: _,
-            }
-            | DeferredValue::RedactedSecret { hash: _ }
-            | DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamExport { path: _ }
-                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-                | crate::resource::UnknownReason::ForKey
-                | crate::resource::UnknownReason::ForIndex
-                | crate::resource::UnknownReason::ForValue
-                | crate::resource::UnknownReason::FnParam { name: _ }
-                | crate::resource::UnknownReason::ModuleArgument {
-                    name: _,
-                    source_line: _,
-                    diagnostic_name: _,
-                }
-                | crate::resource::UnknownReason::FnLocal { name: _ }
-                | crate::resource::UnknownReason::EmptyInterpolation
-                | crate::resource::UnknownReason::PendingReRead(_),
-            ),
+            | DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => Ok(value),
     }
 }

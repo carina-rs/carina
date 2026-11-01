@@ -155,9 +155,9 @@ fn invalid_enum_variant_bare_display() {
         None,
     );
     let err = pathless_test_type(t.clone())
-        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
-            "zzz".to_string(),
-        )))
+        .validate(&Value::<carina_core::resource::NoPlaceholder>::Concrete(
+            ConcreteValue::enum_identifier("zzz".to_string()),
+        ))
         .unwrap_err();
     insta::assert_snapshot!(err.to_string());
 }
@@ -176,9 +176,9 @@ fn invalid_enum_variant_with_dsl_aliases_display() {
         None,
     );
     let err = pathless_test_type(t.clone())
-        .validate(&Value::Concrete(ConcreteValue::enum_identifier(
-            "zzz".to_string(),
-        )))
+        .validate(&Value::<carina_core::resource::NoPlaceholder>::Concrete(
+            ConcreteValue::enum_identifier("zzz".to_string()),
+        ))
         .unwrap_err();
     insta::assert_snapshot!(err.to_string());
 }

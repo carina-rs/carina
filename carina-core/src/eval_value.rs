@@ -22,9 +22,12 @@
 
 use crate::parser::{PendingValueSlot, ResourceTypePath};
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, PathSegment, RelativeBindingName, Subscript, Value,
+    AbsoluteBindingAddress, BindingAddress, DiagnosticSourceSpan, LoopSlot, NoPlaceholder,
+    ParserPlaceholder, PathSegment, RelativeBindingName, Subscript, Value as GenericValue,
 };
 use indexmap::IndexMap;
+
+type Value<B = RelativeBindingName> = GenericValue<ParserPlaceholder, B>;
 
 /// Parser-only representation of a structural binding used as an operand.
 ///
@@ -34,12 +37,10 @@ use indexmap::IndexMap;
 /// The argument shape stays typed independently of its annotation; every
 /// ordinary value boundary rejects a bare handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StructuralHandle<B: BindingAddress = AbsoluteBindingAddress> {
+pub(crate) struct StructuralHandle<B: BindingAddress = RelativeBindingName> {
     reference: StructuralReference<B>,
     kind: StructuralHandleKind,
 }
-
-pub(crate) type AuthoredStructuralHandle = StructuralHandle<RelativeBindingName>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructuralHandleKind {
@@ -109,7 +110,7 @@ impl StructuralHandleKind {
 /// resolves it to ordinary value data or rejects it once the referenced name
 /// is known to be a structural handle.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StructuralHandleMetadata<B: BindingAddress = AbsoluteBindingAddress> {
+pub(crate) enum StructuralHandleMetadata<B: BindingAddress = RelativeBindingName> {
     Handle {
         access_base: Option<Value<B>>,
     },
@@ -120,8 +121,6 @@ pub(crate) enum StructuralHandleMetadata<B: BindingAddress = AbsoluteBindingAddr
     /// the scalar result itself look like a handle alias.
     ExpressionOperands(Vec<StructuralHandleMetadata<B>>),
 }
-
-pub(crate) type AuthoredStructuralHandleMetadata = StructuralHandleMetadata<RelativeBindingName>;
 
 impl<B: BindingAddress> StructuralHandleMetadata<B> {
     pub(crate) fn is_handle(&self) -> bool {
@@ -328,17 +327,14 @@ impl<B: BindingAddress> StructuralHandle<B> {
     pub(crate) fn access_base_value(&self) -> Value<B> {
         let binding = self.canonical_binding_name();
         match &self.kind {
-            StructuralHandleKind::ModuleParameter => {
-                Value::Deferred(crate::resource::DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument {
-                        name: binding.to_string(),
-                        source_line: (0).into(),
-                        diagnostic_name: None,
-                    },
-                ))
-            }
+            StructuralHandleKind::ModuleParameter => Value::Deferred(
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+                    name: binding.to_string(),
+                    diagnostic: Default::default(),
+                }),
+            ),
             StructuralHandleKind::FunctionParameter => Value::Deferred(
-                crate::resource::DeferredValue::Unknown(crate::resource::UnknownReason::FnParam {
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::FnParam {
                     name: binding.to_string(),
                 }),
             ),
@@ -363,8 +359,7 @@ impl<B: BindingAddress> StructuralHandle<B> {
         self,
         map: &mut impl FnMut(B) -> T,
     ) -> StructuralHandle<T> {
-        let Self { reference, kind } = self;
-        let reference = match reference {
+        let reference = match self.reference {
             StructuralReference::Addressable(binding) => {
                 StructuralReference::Addressable(map(binding))
             }
@@ -373,7 +368,10 @@ impl<B: BindingAddress> StructuralHandle<B> {
                 target: map(target),
             },
         };
-        StructuralHandle { reference, kind }
+        StructuralHandle {
+            reference,
+            kind: self.kind,
+        }
     }
 }
 
@@ -387,8 +385,8 @@ impl StructuralHandle<RelativeBindingName> {
 
     pub(crate) fn resolve_bindings(
         self,
-        resolve: &mut impl FnMut(RelativeBindingName) -> crate::resource::AbsoluteBindingAddress,
-    ) -> StructuralHandle<crate::resource::AbsoluteBindingAddress> {
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> StructuralHandle<AbsoluteBindingAddress> {
         self.map_bindings(resolve)
     }
 }
@@ -398,7 +396,12 @@ impl StructuralHandle<AbsoluteBindingAddress> {
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
-        *self = self.clone().map_bindings(&mut |binding| map(&binding));
+        match &mut self.reference {
+            StructuralReference::Addressable(binding)
+            | StructuralReference::Alias {
+                target: binding, ..
+            } => *binding = map(binding),
+        }
     }
 }
 
@@ -424,7 +427,7 @@ impl std::fmt::Display for BareStructuralHandle {
 /// variants whose type information must survive until a deliberate lowering
 /// boundary.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum EvalValue<B: BindingAddress = AbsoluteBindingAddress> {
+pub(crate) enum EvalValue<B: BindingAddress = RelativeBindingName> {
     /// A user-facing value. Anything reachable from `Value` is reachable
     /// here without loss.
     User(Value<B>),
@@ -455,8 +458,8 @@ pub(crate) enum EvalValue<B: BindingAddress = AbsoluteBindingAddress> {
     /// Deferred-for loop value before the iterable is available. Keeping the
     /// authored binding name on the evaluator axis lets a postfix chain retain
     /// `item.missing` for plan display without resurrecting the removed
-    /// path-carrying `UnknownReason` variant.
-    DeferredForValue { binding: String },
+    /// path-carrying `ApplyTimeUnknown` variant.
+    DeferredForValue { binding: String, slot: LoopSlot },
 
     /// A partially applied function. Lives strictly inside the evaluator.
     /// Constructed when `evaluate_builtin` or a user-function call sees
@@ -471,8 +474,6 @@ pub(crate) enum EvalValue<B: BindingAddress = AbsoluteBindingAddress> {
         remaining_arity: usize,
     },
 }
-
-pub(crate) type AuthoredEvalValue = EvalValue<RelativeBindingName>;
 
 /// Returned by `EvalValue::into_value` when an evaluator-only value would
 /// otherwise escape into the public [`Value`] model.
@@ -509,18 +510,20 @@ impl std::fmt::Display for EvalValueError {
 /// Result of lowering an expression at a typed resource-attribute or
 /// module-argument boundary.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ParsedSinkValue<B: BindingAddress = AbsoluteBindingAddress> {
+pub(crate) enum ParsedSinkValue<B: BindingAddress = RelativeBindingName> {
     Ready(Value<B>),
     Pending(PendingValueSlot),
 }
-
-pub(crate) type AuthoredParsedSinkValue = ParsedSinkValue<RelativeBindingName>;
 
 impl<B: BindingAddress> EvalValue<B> {
     /// Wrap a user-facing `Value`. This is the cheap, infallible
     /// direction — every `Value` is a valid `EvalValue`.
     pub(crate) fn from_value(value: Value<B>) -> Self {
         Self::User(value)
+    }
+
+    pub(crate) fn from_expanded_value(value: GenericValue<NoPlaceholder, B>) -> Self {
+        Self::User(value.into_placeholder_type())
     }
 
     /// Build a closure value from its parts.
@@ -546,12 +549,12 @@ impl<B: BindingAddress> EvalValue<B> {
 
     /// Stamp a neutral module-parameter placeholder with the authored use
     /// site. Other evaluator values pass through unchanged.
-    pub(crate) fn with_reference_source_line(mut self, line: usize) -> Self {
-        if let Self::User(Value::Deferred(crate::resource::DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { source_line, .. },
+    pub(crate) fn with_reference_source(mut self, source: DiagnosticSourceSpan) -> Self {
+        if let Self::User(Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument { diagnostic, .. },
         ))) = &mut self
         {
-            *source_line = line.into();
+            diagnostic.stamp_authored_source(source);
         }
         self
     }
@@ -563,9 +566,10 @@ impl<B: BindingAddress> EvalValue<B> {
         }
     }
 
-    pub(crate) fn deferred_for_value(binding: impl Into<String>) -> Self {
+    pub(crate) fn deferred_for_value(binding: impl Into<String>, slot: LoopSlot) -> Self {
         Self::DeferredForValue {
             binding: binding.into(),
+            slot,
         }
     }
 
@@ -623,9 +627,9 @@ impl<B: BindingAddress> EvalValue<B> {
                 ))
             }
             Self::ComputedWithStructuralHandles { value, metadata } => Ok((value, Some(metadata))),
-            Self::DeferredForValue { .. } => Ok((
-                Value::Deferred(crate::resource::DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValue,
+            Self::DeferredForValue { slot, .. } => Ok((
+                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                    ParserPlaceholder::Loop(slot),
                 )),
                 None,
             )),
@@ -697,8 +701,8 @@ impl<B: BindingAddress> EvalValue<B> {
                 crate::resource::DeferredValue::BindingRef { binding },
             )),
             Self::ComputedWithStructuralHandles { value, .. } => Ok(value),
-            Self::DeferredForValue { .. } => Ok(Value::Deferred(
-                crate::resource::DeferredValue::Unknown(crate::resource::UnknownReason::ForValue),
+            Self::DeferredForValue { slot, .. } => Ok(Value::Deferred(
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::Loop(slot)),
             )),
             Self::Closure {
                 name,
@@ -709,6 +713,13 @@ impl<B: BindingAddress> EvalValue<B> {
                 remaining_arity,
             })),
         }
+    }
+
+    pub(crate) fn into_expanded_value(self) -> Result<GenericValue<NoPlaceholder, B>, String> {
+        self.into_value()
+            .map_err(|error| error.to_string())?
+            .into_expanded()
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -729,7 +740,7 @@ impl<B: BindingAddress> From<Value<B>> for EvalValue<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
+    use crate::resource::{AuthoredConcreteValue as ConcreteValue, AuthoredValue as Value};
 
     #[test]
     fn user_round_trips() {

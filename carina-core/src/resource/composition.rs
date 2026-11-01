@@ -24,13 +24,14 @@ use serde::{Deserialize, Serialize};
 use crate::parser::ValidateExpr;
 use crate::static_type::ConsumerStaticType;
 
-use super::{
-    AbsoluteBindingAddress, AccessPath, BindingAddress, DeferredValue, ModuleInstanceScope,
-    RelativeBindingName, ResolvedResourceId, StructuralOperand, StructuralOperandRef, Value,
-};
-
 #[cfg(test)]
 use super::RootScope;
+use super::{
+    AbsoluteBindingAddress, AccessPath, BindingAddress, DeferredValue, LeftoverPlaceholder,
+    LeftoverPlaceholderContext, LeftoverPlaceholderPolicy, ModuleInstanceScope, NoPlaceholder,
+    ParserPlaceholder, PlaceholderKind, RelativeBindingName, ResolvedResourceId, StructuralOperand,
+    Value,
+};
 
 /// How a composition attribute is produced from the rest of the
 /// IR.
@@ -60,13 +61,16 @@ use super::RootScope;
 /// `Forwarded(NodeId, AttrPath)` once a name → `NodeId` index is
 /// available at expansion time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-enum CompositionAttributeValue<B: BindingAddress = AbsoluteBindingAddress> {
+enum CompositionAttributeValue<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     /// Single-hop alias to another node's attribute, by path.
     Forwarded(AccessPath<B>),
     /// Multi-source expression: a literal, interpolation, function
     /// call, or any other `Value` shape that is not a bare
     /// single-hop reference.
-    Derived(Value<B>),
+    Derived(Value<P, B>),
 }
 
 /// One module output together with its declared boundary type.
@@ -79,8 +83,11 @@ enum CompositionAttributeValue<B: BindingAddress = AbsoluteBindingAddress> {
 /// execution has already passed validation and therefore does not need this
 /// metadata.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LiveCompositionAttribute<B: BindingAddress = AbsoluteBindingAddress> {
-    value: CompositionAttributeValue<B>,
+pub struct LiveCompositionAttribute<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    value: CompositionAttributeValue<P, B>,
     declared_type: Option<ConsumerStaticType>,
     /// The module argument directly forwarded by this output before call-site
     /// substitution. Validation checks that declaration in the module's own
@@ -89,10 +96,12 @@ pub struct LiveCompositionAttribute<B: BindingAddress = AbsoluteBindingAddress> 
     source_argument: Option<String>,
 }
 
-pub type AuthoredLiveCompositionAttribute = LiveCompositionAttribute<RelativeBindingName>;
-pub type ExpandedLiveCompositionAttribute = LiveCompositionAttribute<AbsoluteBindingAddress>;
+pub type AuthoredLiveCompositionAttribute =
+    LiveCompositionAttribute<ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedLiveCompositionAttribute =
+    LiveCompositionAttribute<NoPlaceholder, AbsoluteBindingAddress>;
 
-impl<B: BindingAddress> LiveCompositionAttribute<B> {
+impl<P: PlaceholderKind, B: BindingAddress> LiveCompositionAttribute<P, B> {
     /// Whether this output contains a saved-plan secret placeholder.
     ///
     /// Keep the destructuring exhaustive so adding another field or value
@@ -105,27 +114,27 @@ impl<B: BindingAddress> LiveCompositionAttribute<B> {
             source_argument: _source_argument,
         } = self;
         match value {
-            CompositionAttributeValue::Forwarded(_) => false,
+            CompositionAttributeValue::Forwarded(_path) => false,
             CompositionAttributeValue::Derived(value) => {
                 crate::value::contains_redacted_secret(value)
             }
         }
     }
+}
 
+impl<P: PlaceholderKind + PartialEq, B: BindingAddress> LiveCompositionAttribute<P, B> {
     /// Classify a `Value` into the appropriate
     /// [`LiveCompositionAttribute`] variant.
     ///
     /// `Value::Deferred(DeferredValue::ResourceRef { path })` is a
-    /// single-hop alias and is classified as forwarded.
-    /// Every other `Value` shape is multi-source (literal,
-    /// interpolation, function call, etc.) and lifts into
-    /// classified as derived.
-    pub fn from_value(value: Value<B>, declared_type: Option<ConsumerStaticType>) -> Self {
+    /// single-hop alias and is classified as forwarded. Every other
+    /// `Value` shape is classified as derived.
+    pub fn from_value(value: Value<P, B>, declared_type: Option<ConsumerStaticType>) -> Self {
         Self::from_value_with_static_type(value, declared_type)
     }
 
     pub fn from_value_with_static_type(
-        value: Value<B>,
+        value: Value<P, B>,
         declared_type: Option<ConsumerStaticType>,
     ) -> Self {
         let value = match value {
@@ -164,7 +173,7 @@ impl<B: BindingAddress> LiveCompositionAttribute<B> {
     }
 
     /// Reclassify a rewritten value while preserving its declaration.
-    pub fn with_value(&self, value: Value<B>) -> Self {
+    pub fn with_value(&self, value: Value<P, B>) -> Self {
         Self::from_value_with_static_type(value, self.declared_type.clone())
             .with_source_argument(self.source_argument.clone())
     }
@@ -177,7 +186,7 @@ impl<B: BindingAddress> LiveCompositionAttribute<B> {
     /// the type-level split without rewriting every consumer in one
     /// commit. Each subsequent migration replaces a `.to_value()` site
     /// with a direct match on `LiveCompositionAttribute`.
-    pub fn to_value(&self) -> Value<B> {
+    pub fn to_value(&self) -> Value<P, B> {
         match &self.value {
             CompositionAttributeValue::Forwarded(path) => {
                 Value::Deferred(DeferredValue::ResourceRef { path: path.clone() })
@@ -187,11 +196,11 @@ impl<B: BindingAddress> LiveCompositionAttribute<B> {
     }
 }
 
-impl LiveCompositionAttribute<RelativeBindingName> {
+impl<P: PlaceholderKind> LiveCompositionAttribute<P, RelativeBindingName> {
     pub(crate) fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> LiveCompositionAttribute<AbsoluteBindingAddress> {
+    ) -> LiveCompositionAttribute<P, AbsoluteBindingAddress> {
         let Self {
             value,
             declared_type,
@@ -213,7 +222,7 @@ impl LiveCompositionAttribute<RelativeBindingName> {
     }
 }
 
-impl LiveCompositionAttribute<AbsoluteBindingAddress> {
+impl<P: PlaceholderKind> LiveCompositionAttribute<P, AbsoluteBindingAddress> {
     fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
@@ -254,7 +263,10 @@ impl SavedCompositionAttribute {
     pub fn contains_redacted_secret_placeholder(&self) -> bool {
         let Self { value } = self;
         match value {
-            CompositionAttributeValue::Forwarded(_) => false,
+            CompositionAttributeValue::Forwarded(path) => {
+                let _path = path;
+                false
+            }
             CompositionAttributeValue::Derived(value) => {
                 crate::value::contains_redacted_secret(value)
             }
@@ -264,7 +276,10 @@ impl SavedCompositionAttribute {
     pub fn forwarded_path(&self) -> Option<&AccessPath> {
         match &self.value {
             CompositionAttributeValue::Forwarded(path) => Some(path),
-            CompositionAttributeValue::Derived(_) => None,
+            CompositionAttributeValue::Derived(value) => {
+                let _value = value;
+                None
+            }
         }
     }
 
@@ -291,13 +306,13 @@ impl SavedCompositionAttribute {
 /// plans keep the historical value-only shape and deserialize into the
 /// explicitly metadata-free state.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LiveCompositionArgument<B: BindingAddress = AbsoluteBindingAddress> {
-    operand: StructuralOperand<B>,
+pub struct LiveCompositionArgument<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    operand: StructuralOperand<P, B>,
     metadata: LiveCompositionArgumentMetadata,
 }
-
-pub type AuthoredLiveCompositionArgument = LiveCompositionArgument<RelativeBindingName>;
-pub type ExpandedLiveCompositionArgument = LiveCompositionArgument<AbsoluteBindingAddress>;
 
 #[derive(Debug, Clone, PartialEq)]
 struct LiveCompositionArgumentMetadata {
@@ -305,7 +320,12 @@ struct LiveCompositionArgumentMetadata {
     origin: crate::parser::ArgumentOrigin,
 }
 
-impl<B: BindingAddress> LiveCompositionArgument<B> {
+pub type AuthoredLiveCompositionArgument =
+    LiveCompositionArgument<ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedLiveCompositionArgument =
+    LiveCompositionArgument<NoPlaceholder, AbsoluteBindingAddress>;
+
+impl<P: PlaceholderKind, B: BindingAddress> LiveCompositionArgument<P, B> {
     /// Whether this argument contains a saved-plan secret placeholder.
     ///
     /// The exhaustive destructuring makes new fields part of the saved-plan
@@ -319,9 +339,11 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
         let _validation_metadata = (declared_type, origin);
         crate::value::contains_redacted_secret(operand.traversal_value())
     }
+}
 
+impl<P: PlaceholderKind + PartialEq, B: BindingAddress> LiveCompositionArgument<P, B> {
     pub fn from_value(
-        value: Value<B>,
+        value: Value<P, B>,
         declared_type: ConsumerStaticType,
         origin: crate::parser::ArgumentOrigin,
     ) -> Self {
@@ -329,7 +351,7 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
     }
 
     pub fn from_value_with_static_type(
-        value: Value<B>,
+        value: Value<P, B>,
         declared_type: ConsumerStaticType,
         origin: crate::parser::ArgumentOrigin,
     ) -> Self {
@@ -343,7 +365,7 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
     }
 
     pub(crate) fn from_handle_with_static_type(
-        value: Value<B>,
+        value: Value<P, B>,
         declared_type: ConsumerStaticType,
         handle: crate::eval_value::StructuralHandle<B>,
         origin: crate::parser::ArgumentOrigin,
@@ -357,13 +379,13 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
         }
     }
 
-    pub fn value(&self) -> &Value<B> {
+    pub fn value(&self) -> &Value<P, B> {
         self.operand.traversal_value()
     }
 
     pub(crate) fn try_visit_values<E>(
         &self,
-        visit: &mut impl FnMut(&Value<B>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<P, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         self.operand.try_visit_values(visit)
     }
@@ -382,12 +404,12 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
         self.metadata()
     }
 
-    pub(crate) fn operand_ref(&self) -> StructuralOperandRef<'_, B> {
+    pub(crate) fn operand_ref(&self) -> crate::resource::StructuralOperandRef<'_, P, B> {
         self.operand.value_ref()
     }
 
     /// Rewrite a prefixed/substituted value without dropping its declaration.
-    pub fn with_value(&self, value: Value<B>) -> Self {
+    pub fn with_value(&self, value: Value<P, B>) -> Self {
         let operand = match self.operand.handle() {
             Some(handle) => StructuralOperand::from_handle_with_access_base(handle.clone(), value),
             None => StructuralOperand::from_value(value),
@@ -399,20 +421,20 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
     }
 }
 
-impl LiveCompositionArgument<RelativeBindingName> {
+impl<P: PlaceholderKind> LiveCompositionArgument<P, RelativeBindingName> {
     fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> LiveCompositionArgument<AbsoluteBindingAddress> {
+    ) -> LiveCompositionArgument<P, AbsoluteBindingAddress> {
         let Self { operand, metadata } = self;
         LiveCompositionArgument {
-            operand: operand.resolve_bindings(resolve),
+            operand: operand.map_bindings(resolve),
             metadata,
         }
     }
 }
 
-impl LiveCompositionArgument<AbsoluteBindingAddress> {
+impl<P: PlaceholderKind> LiveCompositionArgument<P, AbsoluteBindingAddress> {
     fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
@@ -519,37 +541,26 @@ impl ModuleConstraintId {
 /// A module constraint whose referenced arguments were not fully known at
 /// expansion time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PendingModuleConstraint<B: BindingAddress = AbsoluteBindingAddress> {
+pub struct PendingModuleConstraint<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     pub id: ModuleConstraintId,
-    pub expression: ValidateExpr<B>,
+    pub expression: ValidateExpr<P, B>,
     pub message: String,
 }
 
-impl<B: BindingAddress> PendingModuleConstraint<B> {
+impl<P: PlaceholderKind, B: BindingAddress> PendingModuleConstraint<P, B> {
     pub fn id(&self) -> &ModuleConstraintId {
         &self.id
     }
 
-    pub fn expression(&self) -> &ValidateExpr<B> {
+    pub fn expression(&self) -> &ValidateExpr<P, B> {
         &self.expression
     }
 
     pub fn message(&self) -> &str {
         &self.message
-    }
-}
-
-impl PendingModuleConstraint<AbsoluteBindingAddress> {
-    fn map_absolute_bindings(
-        &mut self,
-        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
-    ) {
-        let Self {
-            id: _id,
-            expression,
-            message: _message,
-        } = self;
-        expression.map_absolute_bindings(map);
     }
 }
 
@@ -576,29 +587,34 @@ impl PendingModuleConstraint<AbsoluteBindingAddress> {
 /// (`notes/specs/2026-05-25-composition-graph-node-design.md`, PR
 /// #3301) for the rationale.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LiveCompositionSignature<B: BindingAddress = AbsoluteBindingAddress> {
+pub struct LiveCompositionSignature<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     /// Resolved call-site arguments. Empty when the composition was
     /// produced by a module that does not declare any `argument`
     /// parameters, or when the call site passed no arguments.
-    pub arguments: IndexMap<String, LiveCompositionArgument<B>>,
+    pub arguments: IndexMap<String, LiveCompositionArgument<P, B>>,
     /// Module-output values classified by how they are produced
     /// (#3294): forwarded values are single-hop aliases and derived values are
     /// multi-source expressions. Each entry also carries its optional declared
     /// [`crate::parser::TypeExpr`] for validation.
-    pub attributes: IndexMap<String, LiveCompositionAttribute<B>>,
+    pub attributes: IndexMap<String, LiveCompositionAttribute<P, B>>,
     /// Constraints deferred until all referenced argument values are known.
-    pub pending_constraints: Vec<PendingModuleConstraint<B>>,
+    pub pending_constraints: Vec<PendingModuleConstraint<P, B>>,
 }
 
-pub type AuthoredLiveCompositionSignature = LiveCompositionSignature<RelativeBindingName>;
-pub type ExpandedLiveCompositionSignature = LiveCompositionSignature<AbsoluteBindingAddress>;
+pub type AuthoredLiveCompositionSignature =
+    LiveCompositionSignature<ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedLiveCompositionSignature =
+    LiveCompositionSignature<NoPlaceholder, AbsoluteBindingAddress>;
 
 /// Value-only function boundary persisted in a saved plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedCompositionSignature {
     pub arguments: IndexMap<String, SavedCompositionArgument>,
     pub attributes: IndexMap<String, SavedCompositionAttribute>,
-    pub pending_constraints: Vec<PendingModuleConstraint<AbsoluteBindingAddress>>,
+    pub pending_constraints: Vec<PendingModuleConstraint>,
 }
 
 /// Structural identity for one module call that produced a composition.
@@ -624,57 +640,6 @@ pub struct CompositionCall<B: BindingAddress = AbsoluteBindingAddress> {
 
 pub type AuthoredCompositionCall = CompositionCall<RelativeBindingName>;
 pub type ExpandedCompositionCall = CompositionCall<AbsoluteBindingAddress>;
-
-impl CompositionCall<RelativeBindingName> {
-    pub(crate) fn resolve_bindings(
-        self,
-        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> CompositionCall<AbsoluteBindingAddress> {
-        let Self {
-            id,
-            module_name,
-            binding,
-            instance,
-            module_source,
-            module_directory,
-            loop_origin,
-        } = self;
-        CompositionCall {
-            id,
-            module_name,
-            binding: binding.map(resolve),
-            instance,
-            module_source,
-            module_directory,
-            loop_origin,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resolve_root(self, scope: &RootScope) -> CompositionCall<AbsoluteBindingAddress> {
-        self.resolve_bindings(&mut |binding| scope.resolve(binding))
-    }
-}
-
-impl CompositionCall<AbsoluteBindingAddress> {
-    fn map_absolute_bindings(
-        &mut self,
-        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
-    ) {
-        let Self {
-            id: _id,
-            module_name: _module_name,
-            binding,
-            instance: _instance,
-            module_source: _module_source,
-            module_directory: _module_directory,
-            loop_origin: _loop_origin,
-        } = self;
-        if let Some(binding) = binding {
-            *binding = map(binding);
-        }
-    }
-}
 
 impl<B: BindingAddress> PartialEq for CompositionCall<B> {
     fn eq(&self, other: &Self) -> bool {
@@ -712,7 +677,9 @@ impl<B: BindingAddress> CompositionCall<B> {
 
     /// Project an authored parser call onto this display authority. Fields
     /// unrelated to labels are intentionally empty and never escape this call.
-    pub(crate) fn display_label_for_module_call(call: &crate::parser::ModuleCall) -> String {
+    pub(crate) fn display_label_for_module_call(
+        call: &crate::parser::ModuleCall<ParserPlaceholder, RelativeBindingName>,
+    ) -> String {
         CompositionCall::<RelativeBindingName> {
             id: call.id().clone(),
             module_name: call.module_name.clone(),
@@ -723,6 +690,52 @@ impl<B: BindingAddress> CompositionCall<B> {
             loop_origin: None,
         }
         .display_label()
+    }
+}
+
+impl CompositionCall<RelativeBindingName> {
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> CompositionCall<AbsoluteBindingAddress> {
+        let Self {
+            id,
+            module_name,
+            binding,
+            instance,
+            module_source,
+            module_directory,
+            loop_origin,
+        } = self;
+        CompositionCall {
+            id,
+            module_name,
+            binding: binding.map(resolve),
+            instance,
+            module_source,
+            module_directory,
+            loop_origin,
+        }
+    }
+}
+
+impl CompositionCall<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            id: _id,
+            module_name: _module_name,
+            binding,
+            instance: _instance,
+            module_source: _module_source,
+            module_directory: _module_directory,
+            loop_origin: _loop_origin,
+        } = self;
+        if let Some(binding) = binding {
+            *binding = map(binding);
+        }
     }
 }
 
@@ -1278,9 +1291,12 @@ impl SavedCompositionOriginId {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct LiveComposition<B: BindingAddress = AbsoluteBindingAddress> {
+pub struct LiveComposition<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     pub id: ResolvedResourceId,
-    pub signature: LiveCompositionSignature<B>,
+    pub signature: LiveCompositionSignature<P, B>,
     /// Binding name from `let` bindings in DSL.
     pub binding: Option<B>,
     /// Binding names this composition depends on.
@@ -1297,10 +1313,10 @@ pub struct LiveComposition<B: BindingAddress = AbsoluteBindingAddress> {
     pub quoted_string_attrs: HashSet<String>,
 }
 
-pub type AuthoredLiveComposition = LiveComposition<RelativeBindingName>;
-pub type ExpandedLiveComposition = LiveComposition<AbsoluteBindingAddress>;
+pub type AuthoredLiveComposition = LiveComposition<ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedLiveComposition = LiveComposition<NoPlaceholder, AbsoluteBindingAddress>;
 
-impl<B: BindingAddress> PartialEq for LiveComposition<B> {
+impl<P: PlaceholderKind + PartialEq, B: BindingAddress> PartialEq for LiveComposition<P, B> {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
             && self.signature == other.signature
@@ -1313,7 +1329,7 @@ impl<B: BindingAddress> PartialEq for LiveComposition<B> {
     }
 }
 
-impl<B: BindingAddress> LiveComposition<B> {
+impl<P: PlaceholderKind, B: BindingAddress> LiveComposition<P, B> {
     /// The composition's id wrapped as an [`EphemeralId`](super::EphemeralId).
     ///
     /// A composition is plan-scoped and never persists in state, so its
@@ -1329,18 +1345,184 @@ impl<B: BindingAddress> LiveComposition<B> {
     }
 }
 
-impl LiveComposition<RelativeBindingName> {
+impl<B: BindingAddress> LiveComposition<ParserPlaceholder, B> {
+    pub(crate) fn collect_leftover_placeholders(
+        &self,
+        policy: LeftoverPlaceholderPolicy,
+        errors: &mut Vec<LeftoverPlaceholder>,
+    ) {
+        let Self {
+            id,
+            signature,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            call_path,
+            quoted_string_attrs,
+        } = self;
+        let _non_value_fields = (
+            binding,
+            dependency_bindings,
+            module_name,
+            call_path,
+            quoted_string_attrs,
+        );
+        let LiveCompositionSignature {
+            arguments,
+            attributes,
+            pending_constraints,
+        } = signature;
+
+        for (argument_name, argument) in arguments {
+            let LiveCompositionArgument { operand, metadata } = argument;
+            let LiveCompositionArgumentMetadata {
+                declared_type,
+                origin,
+            } = metadata;
+            let _validation_metadata = (declared_type, origin);
+            operand.visit_values(&mut |value| {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ModuleCallArgument {
+                        module_call: instance.clone(),
+                        argument: argument_name.clone(),
+                    },
+                    policy,
+                    errors,
+                );
+            });
+        }
+
+        for (attribute_name, attribute) in attributes {
+            let LiveCompositionAttribute {
+                value,
+                declared_type,
+                source_argument,
+            } = attribute;
+            let _validation_metadata = (declared_type, source_argument);
+            match value {
+                CompositionAttributeValue::Forwarded(_path) => {}
+                CompositionAttributeValue::Derived(value) => {
+                    value.collect_leftover_placeholders(
+                        LeftoverPlaceholderContext::ResourceAttribute {
+                            resource: id.to_string(),
+                            attribute: attribute_name.clone(),
+                        },
+                        policy,
+                        errors,
+                    );
+                }
+            }
+        }
+
+        for constraint in pending_constraints {
+            let PendingModuleConstraint {
+                id: constraint_id,
+                expression,
+                message,
+            } = constraint;
+            let _message = message;
+            expression.collect_leftover_placeholders(
+                &LeftoverPlaceholderContext::Require {
+                    label: format!("{} {}", instance, constraint_id.as_str()),
+                },
+                policy,
+                errors,
+            );
+        }
+    }
+
+    pub(crate) fn into_expanded(
+        self,
+    ) -> Result<LiveComposition<NoPlaceholder, B>, LeftoverPlaceholder> {
+        let Self {
+            id,
+            signature,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            call_path,
+            quoted_string_attrs,
+        } = self;
+        let LiveCompositionSignature {
+            arguments,
+            attributes,
+            pending_constraints,
+        } = signature;
+        let arguments = arguments
+            .into_iter()
+            .map(|(name, argument)| {
+                let LiveCompositionArgument { operand, metadata } = argument;
+                let operand = operand.try_map_stage(&mut Value::into_expanded)?;
+                Ok((name, LiveCompositionArgument { operand, metadata }))
+            })
+            .collect::<Result<_, LeftoverPlaceholder>>()?;
+        let attributes = attributes
+            .into_iter()
+            .map(|(name, attribute)| {
+                let LiveCompositionAttribute {
+                    value,
+                    declared_type,
+                    source_argument,
+                } = attribute;
+                let value = match value {
+                    CompositionAttributeValue::Forwarded(path) => {
+                        CompositionAttributeValue::Forwarded(path)
+                    }
+                    CompositionAttributeValue::Derived(value) => {
+                        CompositionAttributeValue::Derived(value.into_expanded()?)
+                    }
+                };
+                Ok((
+                    name,
+                    LiveCompositionAttribute {
+                        value,
+                        declared_type,
+                        source_argument,
+                    },
+                ))
+            })
+            .collect::<Result<_, LeftoverPlaceholder>>()?;
+        let pending_constraints = pending_constraints
+            .into_iter()
+            .map(|constraint| {
+                Ok(PendingModuleConstraint {
+                    id: constraint.id,
+                    expression: constraint.expression.into_expanded()?,
+                    message: constraint.message,
+                })
+            })
+            .collect::<Result<_, LeftoverPlaceholder>>()?;
+        Ok(LiveComposition {
+            id,
+            signature: LiveCompositionSignature {
+                arguments,
+                attributes,
+                pending_constraints,
+            },
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            call_path,
+            quoted_string_attrs,
+        })
+    }
+}
+
+impl<P: PlaceholderKind> LiveComposition<P, RelativeBindingName> {
     pub fn resolve_module(
         self,
         scope: &ModuleInstanceScope,
-    ) -> LiveComposition<AbsoluteBindingAddress> {
+    ) -> LiveComposition<P, AbsoluteBindingAddress> {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
 
     pub(crate) fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> LiveComposition<AbsoluteBindingAddress> {
+    ) -> LiveComposition<P, AbsoluteBindingAddress> {
         let Self {
             id,
             signature,
@@ -1369,17 +1551,10 @@ impl LiveComposition<RelativeBindingName> {
                     .collect(),
                 pending_constraints: pending_constraints
                     .into_iter()
-                    .map(|constraint| {
-                        let PendingModuleConstraint {
-                            id,
-                            expression,
-                            message,
-                        } = constraint;
-                        PendingModuleConstraint {
-                            id,
-                            expression: expression.resolve_bindings(resolve),
-                            message,
-                        }
+                    .map(|constraint| PendingModuleConstraint {
+                        id: constraint.id,
+                        expression: constraint.expression.resolve_bindings(resolve),
+                        message: constraint.message,
                     })
                     .collect(),
             },
@@ -1393,7 +1568,7 @@ impl LiveComposition<RelativeBindingName> {
     }
 }
 
-impl LiveComposition<AbsoluteBindingAddress> {
+impl<P: PlaceholderKind> LiveComposition<P, AbsoluteBindingAddress> {
     pub(crate) fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
@@ -1420,7 +1595,7 @@ impl LiveComposition<AbsoluteBindingAddress> {
             attribute.map_absolute_bindings(map);
         }
         for constraint in pending_constraints {
-            constraint.map_absolute_bindings(map);
+            constraint.expression.map_absolute_bindings(map);
         }
         if let Some(binding) = binding {
             *binding = map(binding);
@@ -1431,7 +1606,9 @@ impl LiveComposition<AbsoluteBindingAddress> {
             .collect();
         call_path.map_absolute_bindings(map);
     }
+}
 
+impl LiveComposition<NoPlaceholder, AbsoluteBindingAddress> {
     pub fn into_saved_with_resolver(
         self,
         resolver: &mut CompositionSourceIdentityResolver,
@@ -1712,7 +1889,7 @@ mod tests {
                 loop_origin: None,
             })
         };
-        let left = LiveComposition {
+        let left: LiveComposition = LiveComposition {
             id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "call")),
             signature: LiveCompositionSignature {
                 arguments: IndexMap::new(),
@@ -1826,7 +2003,7 @@ mod tests {
     /// layers rely on while migrating to per-variant dispatch.
     #[test]
     fn from_value_to_value_round_trip() {
-        let cases = vec![
+        let cases: Vec<Value> = vec![
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::root("a", "b"),
             }),
@@ -1842,7 +2019,7 @@ mod tests {
     #[test]
     fn declared_type_is_carried_with_value_rewrites() {
         let declared = TypeExpr::String;
-        let attr = LiveCompositionAttribute::from_value(
+        let attr: LiveCompositionAttribute = LiveCompositionAttribute::from_value(
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::root("svc", "endpoint"),
             }),
@@ -1880,7 +2057,7 @@ mod tests {
                 crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
             ),
         };
-        let argument = LiveCompositionArgument::from_value(
+        let argument: LiveCompositionArgument = LiveCompositionArgument::from_value(
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::root("vpc", "vpc_id"),
             }),
@@ -2022,7 +2199,7 @@ mod tests {
                 module_directory: None,
                 loop_origin: None,
             }
-            .resolve_root(&RootScope::new()),
+            .resolve_bindings(&mut |binding| RootScope::new().resolve(binding)),
         );
         let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
             .expect("create composition source identity resolver");
@@ -2088,7 +2265,7 @@ mod tests {
                 module_directory: None,
                 loop_origin: None,
             }
-            .resolve_root(&RootScope::new()),
+            .resolve_bindings(&mut |binding| RootScope::new().resolve(binding)),
         );
         let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
             .expect("create composition source identity resolver");

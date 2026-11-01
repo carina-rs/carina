@@ -119,8 +119,8 @@ use crate::provider::{
     UpdateRequest,
 };
 use crate::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ModuleSource,
-    ResolvedResource, Resource, ResourceId, SavedModuleSource, State, UnknownReason, Value,
+    ApplyTimeUnknown, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
+    ModuleSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -456,7 +456,10 @@ pub struct LiveExecutionInput<'a> {
     pub normalizer: &'a dyn ProviderNormalizer,
     /// Provider configs whose default_tags participate in desired-side
     /// normalization before provider patch construction.
-    pub provider_configs: &'a [ProviderConfig<crate::resource::AbsoluteBindingAddress>],
+    pub provider_configs: &'a [ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
     /// Provider factories used for provider-defined custom type validation at
     /// the apply boundary. Enum resolution uses the schema registry below and
     /// never delegates spelling conversion to a factory.
@@ -487,7 +490,10 @@ pub struct SavedExecutionInput<'a> {
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_values: crate::data_source_value::ExecutableDataSourceValues<SavedModuleSource>,
     pub normalizer: &'a dyn ProviderNormalizer,
-    pub provider_configs: &'a [ProviderConfig<crate::resource::AbsoluteBindingAddress>],
+    pub provider_configs: &'a [ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
     pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub schemas: &'a crate::schema::SchemaRegistry,
     pub parallelism: NonZeroUsize,
@@ -542,7 +548,10 @@ pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
     pub(super) managed_current: HashMap<ResourceId, Current>,
     pub(super) data_source_values: crate::data_source_value::ExecutableDataSourceValues<S>,
     pub(super) normalizer: &'a dyn ProviderNormalizer,
-    pub(super) provider_configs: &'a [ProviderConfig<crate::resource::AbsoluteBindingAddress>],
+    pub(super) provider_configs: &'a [ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,
     pub(super) parallelism: NonZeroUsize,
@@ -708,7 +717,7 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
     }
 }
 
-fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
+fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => f(reason),
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -757,6 +766,7 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 

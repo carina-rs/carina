@@ -1,6 +1,6 @@
 //! `min(a, b)` and `max(a, b)` built-in functions
 
-use crate::resource::{BindingAddress, ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
 
 use super::value_type_name;
 
@@ -16,7 +16,9 @@ use super::value_type_name;
 /// min(2.5, 1.0)  // => 1.0
 /// min(1, 2.5)    // => 1.0
 /// ```
-pub(crate) fn builtin_min<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_min<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!("min() expects 2 arguments, got {}", args.len()));
     }
@@ -35,7 +37,9 @@ pub(crate) fn builtin_min<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<
 /// max(2.5, 1.0)  // => 2.5
 /// max(1, 2.5)    // => 2.5
 /// ```
-pub(crate) fn builtin_max<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_max<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!("max() expects 2 arguments, got {}", args.len()));
     }
@@ -45,11 +49,11 @@ pub(crate) fn builtin_max<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<
 /// Compare two numeric values using the given predicate.
 /// Returns the first value if `prefer_first(a, b)` is true, otherwise the second.
 fn compare_values<B: BindingAddress>(
-    a: &Value<B>,
-    b: &Value<B>,
+    a: &Value<NoPlaceholder, B>,
+    b: &Value<NoPlaceholder, B>,
     func_name: &str,
     prefer_first: fn(f64, f64) -> bool,
-) -> Result<Value<B>, String> {
+) -> Result<Value<NoPlaceholder, B>, String> {
     match (a, b) {
         (Value::Concrete(ConcreteValue::Int(x)), Value::Concrete(ConcreteValue::Int(y))) => {
             let (fx, fy) = (*x as f64, *y as f64);

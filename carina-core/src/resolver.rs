@@ -4,8 +4,6 @@
 //! from both the DSL definition and current infrastructure state.
 
 use std::collections::HashMap;
-use std::fmt;
-use std::path::PathBuf;
 
 use indexmap::IndexMap;
 
@@ -14,124 +12,11 @@ use crate::integer_arithmetic::IntegerExpressionError;
 #[cfg(test)]
 use crate::resource::State;
 use crate::resource::{
-    AbsoluteBindingAddress, AccessMissPolicy, ConcreteValue, DataSource, DeferredValue,
-    FunctionArgument, InterpolationPart, LiveComposition, PlanInputCurrent, Resource, ResourceId,
-    Value, ValueAccessError, ValuePathSegmentResult, apply_value_path_segment,
+    AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue, DataSource,
+    DeferredValue, InterpolationPart, LiveComposition, NoPlaceholder, PlaceholderKind,
+    PlanInputCurrent, Resource, ResourceId, Value, ValueAccessError, ValuePathSegmentResult,
+    apply_value_path_segment,
 };
-
-/// Internal resolver failure with optional authored source provenance.
-///
-/// Public resolver entry points keep their historical `String` error shape.
-/// Parser-facing seams can instead recover a typed [`crate::parser::ParseError`]
-/// so expanding authored values does not erase their diagnostic location.
-#[derive(Debug)]
-enum ResolveValueDiagnostic {
-    Runtime {
-        message: String,
-        line: Option<usize>,
-        path: Option<PathBuf>,
-    },
-    Parse(crate::parser::ParseError),
-}
-
-impl ResolveValueDiagnostic {
-    fn runtime(message: impl Into<String>) -> Self {
-        Self::Runtime {
-            message: message.into(),
-            line: None,
-            path: None,
-        }
-    }
-
-    fn at_source_line(self, source_line: crate::resource::DiagnosticSourceLine) -> Self {
-        match self {
-            Self::Runtime {
-                message,
-                line,
-                path,
-            } => Self::Runtime {
-                message,
-                line: line.or_else(|| source_line.get()),
-                path,
-            },
-            Self::Parse(error) => Self::Parse(error),
-        }
-    }
-
-    fn at_line(self, authored_line: usize) -> Self {
-        match self {
-            Self::Runtime {
-                message,
-                line,
-                path,
-            } => Self::Runtime {
-                message,
-                line: line.or(Some(authored_line)),
-                path,
-            },
-            Self::Parse(error) => Self::Parse(error),
-        }
-    }
-
-    fn in_file(self, source_file: Option<&std::path::Path>) -> Self {
-        let Some(source_file) = source_file else {
-            return self;
-        };
-        match self {
-            Self::Runtime {
-                message,
-                line,
-                path,
-            } => Self::Runtime {
-                message,
-                line,
-                path: path.or_else(|| Some(source_file.to_path_buf())),
-            },
-            Self::Parse(error) => Self::Parse(error.in_file(source_file)),
-        }
-    }
-
-    fn into_parse_error(self) -> crate::parser::ParseError {
-        match self {
-            Self::Runtime {
-                message,
-                line,
-                path,
-            } => {
-                let error = crate::parser::ParseError::InvalidExpression {
-                    line: line.unwrap_or(0),
-                    message,
-                };
-                match path {
-                    Some(path) => error.in_file(path),
-                    None => error,
-                }
-            }
-            Self::Parse(error) => error,
-        }
-    }
-}
-
-impl fmt::Display for ResolveValueDiagnostic {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Runtime { message, .. } => formatter.write_str(message),
-            Self::Parse(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl From<String> for ResolveValueDiagnostic {
-    fn from(message: String) -> Self {
-        Self::runtime(message)
-    }
-}
-
-impl From<crate::parser::ParseError> for ResolveValueDiagnostic {
-    fn from(error: crate::parser::ParseError) -> Self {
-        Self::Parse(error)
-    }
-}
 
 /// Resolve all ResourceRef values in resources using current state.
 ///
@@ -173,7 +58,7 @@ pub fn resolve_refs_with_state(
 /// plan path — it additionally stamps any surviving
 /// `ResourceRef` whose root binding is named in
 /// `bindings_upstream_keys` as
-/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))` so plan
+/// `Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport { path }))` so plan
 /// display can render it as `(known after upstream apply: <ref>)`
 /// instead of the raw dot-form.
 pub fn resolve_refs_with_state_and_remote(
@@ -187,7 +72,7 @@ pub fn resolve_refs_with_state_and_remote(
 /// Same input/output shape (pre-built `ResolvedBindings`), with the
 /// addition of `unresolved_upstream_bindings`: the set of upstream-
 /// state binding names whose surviving refs should be stamped as
-/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))` for display.
+/// `Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport { path }))` for display.
 /// `apply` continues to call the strict variant. See #2366 / RFC #2371.
 pub fn resolve_refs_for_plan(
     resources: &mut [Resource],
@@ -206,9 +91,18 @@ fn resolve_refs_inner(
     // This metadata is used by plan tree building to recover parent-child
     // relationships (see build_plan_tree in display.rs and app.rs).
     for resource in resources.iter_mut() {
-        let deps = crate::deps::get_resource_value_ref_dependencies(
-            crate::parser::ResourceRef::Resource(resource),
-        );
+        let deps = crate::deps::get_resource_value_ref_dependencies(crate::parser::ResourceRef::<
+            '_,
+            crate::resource::ModuleSource,
+            NoPlaceholder,
+            NoPlaceholder,
+            crate::parser::ResolvedDeferredForPhase<
+                NoPlaceholder,
+                NoPlaceholder,
+                AbsoluteBindingAddress,
+            >,
+            AbsoluteBindingAddress,
+        >::Resource(resource));
         if !deps.is_empty() {
             resource.dependency_bindings = deps.into_iter().collect();
         }
@@ -279,7 +173,7 @@ pub fn resolve_data_source_refs(
 /// Plan-only counterpart of [`resolve_data_source_refs`]. Mirrors
 /// [`resolve_refs_for_plan`]: takes the set of upstream-binding
 /// names whose surviving refs should be stamped as
-/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))`.
+/// `Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport { path }))`.
 pub fn resolve_data_source_refs_for_plan(
     data_sources: &mut [DataSource],
     bindings: &ResolvedBindings,
@@ -294,9 +188,19 @@ fn resolve_data_source_refs_inner(
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
     for data_source in data_sources.iter_mut() {
-        let deps = crate::deps::get_resource_value_ref_dependencies(
-            crate::parser::ResourceRef::DataSource(data_source),
-        );
+        let deps =
+            crate::deps::get_resource_value_ref_dependencies(crate::parser::ResourceRef::<
+                '_,
+                crate::resource::ModuleSource,
+                NoPlaceholder,
+                NoPlaceholder,
+                crate::parser::ResolvedDeferredForPhase<
+                    NoPlaceholder,
+                    NoPlaceholder,
+                    AbsoluteBindingAddress,
+                >,
+                AbsoluteBindingAddress,
+            >::DataSource(data_source));
         if !deps.is_empty() {
             data_source.dependency_bindings = deps.into_iter().collect();
         }
@@ -417,14 +321,14 @@ fn stamp_unresolved_upstream(
             if upstream_binding_names.contains(path.binding()) =>
         {
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamExport { path },
+                crate::resource::ApplyTimeUnknown::UpstreamExport { path },
             ))
         }
         Value::Deferred(DeferredValue::BindingRef { binding })
             if upstream_binding_names.contains(binding.as_str()) =>
         {
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamAllExports { binding },
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports { binding },
             ))
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
@@ -529,6 +433,7 @@ fn stamp_unresolved_upstream(
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => value,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match never {},
     })
 }
 
@@ -567,25 +472,31 @@ pub fn resolve_value_for_plan(
 ///
 /// If the referenced binding or attribute is not found, the value is returned as-is.
 /// Returns an error if a builtin function fails with fully-resolved arguments.
-pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<Value, String> {
-    resolve_ref_value_inner(value, bindings, None).map_err(|error| error.to_string())
+pub fn resolve_ref_value<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
+) -> Result<Value<P, B>, String> {
+    resolve_ref_value_inner(value, bindings, None)
 }
 
 /// Three-state result used by null/missing coalescing. A missing value is not
 /// interchangeable with a value whose producing snapshot is still incomplete.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ValueResolution {
-    Present(Value),
+pub enum ValueResolution<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    Present(Value<P, B>),
     Absent,
-    Unknown(Value),
+    Unknown(Value<P, B>),
 }
 
 /// Resolve a value while preserving the distinction required by `??`.
-pub fn resolve_ref_value_status(
-    value: &Value,
-    bindings: &ResolvedBindings,
-) -> Result<ValueResolution, String> {
-    resolve_ref_value_status_inner(value, bindings, None, false).map_err(|error| error.to_string())
+pub fn resolve_ref_value_status<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
+) -> Result<ValueResolution<P, B>, String> {
+    resolve_ref_value_status_inner(value, bindings, None, false)
 }
 
 /// Resolve a value using binding data and a provider-aware builtin context.
@@ -593,28 +504,20 @@ pub fn resolve_ref_value_status(
 /// Export validation uses this entry point because a reference may become an
 /// argument to `decrypt()` (or another context-sensitive builtin) only after
 /// its binding has been substituted.
-pub fn resolve_ref_value_with_config(
-    value: &Value,
-    bindings: &ResolvedBindings,
+pub fn resolve_ref_value_with_config<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
     config: &crate::parser::ProviderContext,
-) -> Result<Value, String> {
-    resolve_ref_value_inner(value, bindings, Some(config)).map_err(|error| error.to_string())
-}
-
-/// Parser-facing counterpart of [`resolve_ref_value_with_config`] that keeps
-/// authored source provenance attached to evaluation failures.
-pub(crate) fn resolve_ref_value_with_config_diagnostic(
-    value: &Value,
-    bindings: &ResolvedBindings,
-    config: &crate::parser::ProviderContext,
-) -> Result<Value, crate::parser::ParseError> {
+) -> Result<Value<P, B>, String> {
     resolve_ref_value_inner(value, bindings, Some(config))
-        .map_err(ResolveValueDiagnostic::into_parse_error)
 }
 
 /// Select the miss policy for a path-shaped reference. A missing source is not
 /// evidence of a partially-known local value, so it uses the strict policy.
-fn binding_access_miss_policy(binding: &str, bindings: &ResolvedBindings) -> AccessMissPolicy {
+fn binding_access_miss_policy<P: PlaceholderKind, B: BindingAddress>(
+    binding: &str,
+    bindings: &ResolvedBindings<P, B>,
+) -> AccessMissPolicy {
     let Some(source) = bindings.source(binding) else {
         return AccessMissPolicy::Error;
     };
@@ -632,18 +535,16 @@ fn missing_access(error: &ValueAccessError) -> bool {
     )
 }
 
-fn resolve_ref_value_status_inner(
-    value: &Value,
-    bindings: &ResolvedBindings,
+fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
     config: Option<&crate::parser::ProviderContext>,
     allow_absent_default: bool,
-) -> Result<ValueResolution, ResolveValueDiagnostic> {
+) -> Result<ValueResolution<P, B>, String> {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(
-            "unresolved module-template conditional reached runtime resolver"
-                .to_string()
-                .into(),
-        ),
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err("unresolved module-template conditional reached runtime resolver".to_string())
+        }
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
@@ -711,9 +612,7 @@ fn resolve_ref_value_status_inner(
                     Err(error) if missing_access(&error) => {
                         return Ok(ValueResolution::Unknown(value.clone()));
                     }
-                    Err(error) => {
-                        return Err(error.format_for_path(&path.to_string()).into());
-                    }
+                    Err(error) => return Err(error.format_for_path(&path.to_string())),
                 }
             }
             Ok(ValueResolution::Present(resolved))
@@ -763,21 +662,13 @@ fn resolve_ref_value_status_inner(
                     ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
                 ) => Ok(ValueResolution::Unknown(value.clone())),
                 Err(error) if missing_access(&error) => Ok(ValueResolution::Absent),
-                Err(error) => Err(error
-                    .format_for_path(&crate::value::format_value(value))
-                    .into()),
+                Err(error) => Err(error.format_for_path(&crate::value::format_value(value))),
             }
         }
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(ValueResolution::Unknown(value.clone())),
-        Value::Deferred(DeferredValue::Unavailable {
-            name,
-            reason,
-            source_line,
-            ..
-        }) => Err(
-            ResolveValueDiagnostic::runtime(format!("{name}(): {reason}"))
-                .at_source_line(*source_line),
-        ),
+        Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
+            Err(format!("{name}(): {reason}"))
+        }
         Value::Concrete(_)
         | Value::Deferred(
             DeferredValue::Interpolation(_)
@@ -794,16 +685,19 @@ fn resolve_ref_value_status_inner(
                 Ok(ValueResolution::Present(resolved))
             }
         }
+        Value::Deferred(DeferredValue::Placeholder(_)) => {
+            Ok(ValueResolution::Unknown(value.clone()))
+        }
     }
 }
 
 /// Resolve a required expression without interpreting a direct miss as the
 /// absence of an enclosing coalesce operand.
-fn resolve_required_value_status(
-    value: &Value,
-    bindings: &ResolvedBindings,
+fn resolve_required_value_status<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
     config: Option<&crate::parser::ProviderContext>,
-) -> Result<ValueResolution, ResolveValueDiagnostic> {
+) -> Result<ValueResolution<P, B>, String> {
     let resolved = resolve_ref_value_inner(value, bindings, config)?;
     if resolved.is_fully_resolved() {
         Ok(ValueResolution::Present(resolved))
@@ -812,27 +706,49 @@ fn resolve_required_value_status(
     }
 }
 
-fn evaluate_runtime_user_function(
-    function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
-    args: &[FunctionArgument<AbsoluteBindingAddress>],
-    bindings: &ResolvedBindings,
+fn locate_user_function_error<B: BindingAddress>(
+    function: &crate::parser::UserFunction<B>,
+    error: crate::parser::ParseError,
+) -> crate::parser::ParseError {
+    match &function.body.source_file {
+        Some(path) => error.in_file(path.clone()),
+        None => error,
+    }
+}
+
+fn user_function_runtime_error(
+    line: usize,
+    message: impl Into<String>,
+) -> crate::parser::ParseError {
+    crate::parser::ParseError::InvalidExpression {
+        line,
+        message: message.into(),
+    }
+}
+
+fn evaluate_runtime_user_function<B: BindingAddress>(
+    function: &crate::parser::UserFunction<B>,
+    args: &[crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>],
+    bindings: &ResolvedBindings<crate::resource::ParserPlaceholder, B>,
     config: Option<&crate::parser::ProviderContext>,
     call_line: usize,
-) -> Result<Value, ResolveValueDiagnostic> {
+) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
     let required = function
         .params
         .iter()
         .filter(|parameter| parameter.default.is_none())
         .count();
     if args.len() < required || args.len() > function.params.len() {
-        return Err(ResolveValueDiagnostic::runtime(format!(
-            "function '{}' expects {}..={} argument(s), got {}",
-            function.name,
-            required,
-            function.params.len(),
-            args.len()
-        ))
-        .at_line(call_line));
+        return Err(user_function_runtime_error(
+            call_line,
+            format!(
+                "function '{}' expects {}..={} argument(s), got {}",
+                function.name,
+                required,
+                function.params.len(),
+                args.len()
+            ),
+        ));
     }
 
     let default_config = crate::parser::ProviderContext::default();
@@ -841,35 +757,40 @@ fn evaluate_runtime_user_function(
     for (index, parameter) in function.params.iter().enumerate() {
         let argument = match args.get(index) {
             Some(argument) => argument.clone(),
-            None => FunctionArgument::from_value(
+            None => crate::resource::FunctionArgument::from_value(
                 parameter
                     .default
                     .clone()
                     .expect("required function arguments were checked"),
             ),
         };
-        let argument =
-            argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))?;
+        let argument = argument
+            .try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
+            .map_err(|message| user_function_runtime_error(call_line, message))?;
         if let Some(expected) = &parameter.param_type {
             let resolved_parameter =
                 crate::validation::resolve_parameter_type_for_check(expected, provider_config)
                     .map_err(|message| {
-                        ResolveValueDiagnostic::runtime(format!(
-                            "function '{}': parameter '{}': {message}",
-                            function.name, parameter.name
-                        ))
-                        .at_line(call_line)
+                        user_function_runtime_error(
+                            call_line,
+                            format!(
+                                "function '{}': parameter '{}': {message}",
+                                function.name, parameter.name
+                            ),
+                        )
                     })?;
             if let (Some(resolved_parameter), Some(handle)) =
                 (resolved_parameter.as_ref(), argument.handle())
             {
                 crate::validation::check_handle_sink(handle, resolved_parameter).map_err(
                     |error| {
-                        ResolveValueDiagnostic::runtime(format!(
-                            "function '{}': parameter '{}': {error}",
-                            function.name, parameter.name
-                        ))
-                        .at_line(call_line)
+                        user_function_runtime_error(
+                            call_line,
+                            format!(
+                                "function '{}': parameter '{}': {error}",
+                                function.name, parameter.name
+                            ),
+                        )
                     },
                 )?;
             } else if argument.pending_parameter().is_none()
@@ -883,11 +804,13 @@ fn evaluate_runtime_user_function(
                     crate::validation::typecheck::TypecheckInference::Unavailable,
                 )
                 .map_err(|error| {
-                    ResolveValueDiagnostic::runtime(format!(
-                        "function '{}': parameter '{}': {error}",
-                        function.name, parameter.name
-                    ))
-                    .at_line(call_line)
+                    user_function_runtime_error(
+                        call_line,
+                        format!(
+                            "function '{}': parameter '{}': {error}",
+                            function.name, parameter.name
+                        ),
+                    )
                 })?;
             }
         }
@@ -896,15 +819,15 @@ fn evaluate_runtime_user_function(
 
     for (name, expression, source_line) in &function.local_lets {
         let substituted =
-            crate::parser::substitute_fn_params(expression, &substitutions, *source_line).map_err(
-                |error| {
-                    ResolveValueDiagnostic::from(error)
-                        .in_file(function.body.source_file.as_deref())
-                },
-            )?;
+            crate::parser::substitute_fn_params(expression, &substitutions, *source_line)
+                .map_err(|error| locate_user_function_error(function, error))?;
         let resolved = resolve_ref_value_inner(&substituted, bindings, config)
-            .map_err(|error| error.in_file(function.body.source_file.as_deref()))?;
-        substitutions.insert(name.clone(), FunctionArgument::from_value(resolved));
+            .map_err(|message| user_function_runtime_error(*source_line, message))
+            .map_err(|error| locate_user_function_error(function, error))?;
+        substitutions.insert(
+            name.clone(),
+            crate::resource::FunctionArgument::from_value(resolved),
+        );
     }
 
     let substituted = crate::parser::substitute_fn_params(
@@ -912,11 +835,10 @@ fn evaluate_runtime_user_function(
         &substitutions,
         function.body.source_line,
     )
-    .map_err(|error| {
-        ResolveValueDiagnostic::from(error).in_file(function.body.source_file.as_deref())
-    })?;
+    .map_err(|error| locate_user_function_error(function, error))?;
     let result = resolve_ref_value_inner(&substituted, bindings, config)
-        .map_err(|error| error.in_file(function.body.source_file.as_deref()))?;
+        .map_err(|message| user_function_runtime_error(function.body.source_line, message))
+        .map_err(|error| locate_user_function_error(function, error))?;
     if let Some(expected) = &function.return_type {
         crate::validation::typecheck::check_type_expr_value_providerless(
             expected,
@@ -925,13 +847,12 @@ fn evaluate_runtime_user_function(
             crate::validation::typecheck::TypecheckInference::Unavailable,
         )
         .map_err(|error| {
-            ResolveValueDiagnostic::runtime(format!(
-                "function '{}': return value: {error}",
-                function.name
-            ))
-            .at_line(function.body.source_line)
-            .in_file(function.body.source_file.as_deref())
-        })?;
+            user_function_runtime_error(
+                function.body.source_line,
+                format!("function '{}': return value: {error}", function.name),
+            )
+        })
+        .map_err(|error| locate_user_function_error(function, error))?;
     }
 
     Ok(result)
@@ -939,10 +860,16 @@ fn evaluate_runtime_user_function(
 
 pub(crate) fn evaluate_module_resolved_user_function(
     function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
-    arguments: &[FunctionArgument<AbsoluteBindingAddress>],
+    arguments: &[crate::resource::FunctionArgument<
+        crate::resource::ParserPlaceholder,
+        AbsoluteBindingAddress,
+    >],
     config: &crate::parser::ProviderContext,
     call_line: usize,
-) -> Result<Value, crate::parser::ParseError> {
+) -> Result<
+    Value<crate::resource::ParserPlaceholder, AbsoluteBindingAddress>,
+    crate::parser::ParseError,
+> {
     evaluate_runtime_user_function(
         function,
         arguments,
@@ -950,20 +877,60 @@ pub(crate) fn evaluate_module_resolved_user_function(
         Some(config),
         call_line,
     )
-    .map_err(ResolveValueDiagnostic::into_parse_error)
 }
 
-fn resolve_ref_value_inner(
-    value: &Value,
-    bindings: &ResolvedBindings,
+fn parser_stage_function_arguments<P: PlaceholderKind, B: BindingAddress>(
+    args: &[crate::resource::FunctionArgument<P, B>],
+) -> Option<Vec<crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>>> {
+    let expanded = args
+        .iter()
+        .cloned()
+        .map(crate::resource::FunctionArgument::try_into_expanded)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(
+        expanded
+            .into_iter()
+            .map(crate::resource::FunctionArgument::into_placeholder_type)
+            .collect(),
+    )
+}
+
+enum FunctionArgumentResolution<P: PlaceholderKind, B: BindingAddress> {
+    Deferred(Vec<crate::resource::FunctionArgument<P, B>>),
+    FullyResolved(Vec<crate::resource::FunctionArgument<P, B>>),
+}
+
+fn resolve_function_arguments<P: PlaceholderKind, B: BindingAddress>(
+    args: &[crate::resource::FunctionArgument<P, B>],
+    bindings: &ResolvedBindings<P, B>,
     config: Option<&crate::parser::ProviderContext>,
-) -> Result<Value, ResolveValueDiagnostic> {
+) -> Result<FunctionArgumentResolution<P, B>, String> {
+    let args = args
+        .iter()
+        .map(|argument| {
+            argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if args.iter().all(|argument| {
+        argument.handle().is_some() || argument.value().is_some_and(Value::is_fully_resolved)
+    }) {
+        Ok(FunctionArgumentResolution::FullyResolved(args))
+    } else {
+        Ok(FunctionArgumentResolution::Deferred(args))
+    }
+}
+
+fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
+    config: Option<&crate::parser::ProviderContext>,
+) -> Result<Value<P, B>, String> {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(
-            "unresolved module-template conditional reached runtime resolver"
-                .to_string()
-                .into(),
-        ),
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err("unresolved module-template conditional reached runtime resolver".to_string())
+        }
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             match resolve_ref_value_status_inner(value, bindings, config, false)? {
                 ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),
@@ -993,9 +960,7 @@ fn resolve_ref_value_inner(
                             ValuePathSegmentResult::Deferred(_)
                             | ValuePathSegmentResult::DeferredMiss(_),
                         ) => return Ok(value.clone()),
-                        Err(error) => {
-                            return Err(error.format_for_path(&path.to_string()).into());
-                        }
+                        Err(error) => return Err(error.format_for_path(&path.to_string())),
                     }
                 }
 
@@ -1011,32 +976,31 @@ fn resolve_ref_value_inner(
                 .evaluate_with_operands(lhs, rhs)
                 .map_err(|error| {
                     let span = expression.operator_span();
-                    let message = match (span.line(), span.column()) {
+                    match (span.line(), span.column()) {
                         (Some(line), Some(column)) => {
                             format!("at line {line}, column {column}: {error}")
                         }
                         _ => error.to_string(),
-                    };
-                    ResolveValueDiagnostic::runtime(message)
+                    }
                 })
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::List(items)) => {
-            let resolved: Result<Vec<Value>, ResolveValueDiagnostic> = items
+            let resolved: Result<Vec<Value<P, B>>, String> = items
                 .iter()
                 .map(|v| resolve_ref_value_inner(v, bindings, config))
                 .collect();
             Ok(Value::Concrete(ConcreteValue::List(resolved?)))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let mut resolved: IndexMap<String, Value> = IndexMap::new();
+            let mut resolved: IndexMap<String, Value<P, B>> = IndexMap::new();
             for (k, v) in map {
                 resolved.insert(k.clone(), resolve_ref_value_inner(v, bindings, config)?);
             }
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let resolved_parts: Result<Vec<InterpolationPart>, ResolveValueDiagnostic> = parts
+            let resolved_parts: Result<Vec<InterpolationPart<P, B>>, String> = parts
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
@@ -1052,105 +1016,96 @@ fn resolve_ref_value_inner(
             args,
             source_line,
         }) => {
-            // First, resolve all arguments
-            let resolved_args: Result<
-                Vec<crate::resource::FunctionArgument>,
-                ResolveValueDiagnostic,
-            > = args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
-                })
-                .collect();
-            let resolved_args = resolved_args?;
-
-            // Check if all args are fully resolved (no remaining refs)
-            let all_resolved = resolved_args.iter().all(|argument| {
-                argument.handle().is_some()
-                    || argument.value().is_some_and(Value::is_fully_resolved)
-            });
-
-            if all_resolved {
-                // Evaluate the built-in function; propagate errors since args are resolved.
-                // The evaluator boundary is `EvalValue::into_value` — a closure
-                // returned here would mean `evaluate_builtin` saw fewer args
-                // than the function's arity, which can only happen if a
-                // partial application leaked through parsing. The parser is
-                // supposed to surface that as a parse error, so treat any
-                // closure here as a resolver-level invariant break.
-                use crate::eval_value::EvalValue;
-                let eval_args: Vec<EvalValue> = resolved_args
-                    .iter()
-                    .map(crate::parser::function_argument_as_eval)
-                    .collect();
-                let evaluated = match config {
-                    Some(config) => {
-                        crate::builtins::evaluate_builtin_with_config(name, &eval_args, config)
-                    }
-                    None => crate::builtins::evaluate_builtin(name, &eval_args),
-                };
-                match evaluated {
-                    Ok(result) => result.into_value().map_err(|error| {
-                        ResolveValueDiagnostic::runtime(format!("{name}(): {error}"))
-                            .at_source_line(*source_line)
-                    }),
-                    Err(error) => Err(ResolveValueDiagnostic::runtime(format!(
-                        "{name}(): {error}"
-                    ))
-                    .at_source_line(*source_line)),
+            let resolved_args = match resolve_function_arguments(args, bindings, config)? {
+                FunctionArgumentResolution::FullyResolved(args) => args,
+                FunctionArgumentResolution::Deferred(args) => {
+                    return Ok(Value::Deferred(DeferredValue::FunctionCall {
+                        name: *name,
+                        args,
+                        source_line: *source_line,
+                    }));
                 }
-            } else {
-                // Keep as FunctionCall with partially resolved args
-                Ok(Value::Deferred(DeferredValue::FunctionCall {
+            };
+
+            // Evaluate the built-in function; propagate errors since args are resolved.
+            // The evaluator boundary is `EvalValue::into_value` — a closure
+            // returned here would mean `evaluate_builtin` saw fewer args
+            // than the function's arity, which can only happen if a
+            // partial application leaked through parsing. The parser is
+            // supposed to surface that as a parse error, so treat any
+            // closure here as a resolver-level invariant break.
+            use crate::eval_value::EvalValue;
+            let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
+                return Ok(Value::Deferred(DeferredValue::FunctionCall {
                     name: *name,
                     args: resolved_args,
                     source_line: *source_line,
-                }))
+                }));
+            };
+            let eval_args: Vec<EvalValue<B>> = parser_args
+                .iter()
+                .map(crate::parser::function_argument_as_eval)
+                .collect();
+            let evaluated = match config {
+                Some(config) => {
+                    crate::builtins::evaluate_builtin_with_config(name, &eval_args, config)
+                }
+                None => crate::builtins::evaluate_builtin(name, &eval_args),
+            };
+            match evaluated {
+                Ok(result) => result
+                    .into_value()
+                    .map_err(|error| format!("{name}(): {error}"))?
+                    .into_expanded()
+                    .map(|value| value.into_placeholder_type())
+                    .map_err(|error| format!("{name}(): {error}")),
+                Err(e) => Err(format!("{}(): {}", name, e)),
             }
         }
-        Value::Deferred(DeferredValue::Unavailable {
-            name,
-            reason,
-            source_line,
-            ..
-        }) => Err(
-            ResolveValueDiagnostic::runtime(format!("{name}(): {reason}"))
-                .at_source_line(*source_line),
-        ),
+        Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
+            Err(format!("{name}(): {reason}"))
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
             args,
             source_line,
         }) => {
-            let resolved_args = args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let all_resolved = resolved_args.iter().all(|argument| {
-                argument.handle().is_some()
-                    || argument.value().is_some_and(Value::is_fully_resolved)
-            });
-            if !all_resolved {
+            let resolved_args = match resolve_function_arguments(args, bindings, config)? {
+                FunctionArgumentResolution::FullyResolved(args) => args,
+                FunctionArgumentResolution::Deferred(args) => {
+                    return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                        function: function.clone(),
+                        functions: functions.clone(),
+                        args,
+                        source_line: *source_line,
+                    }));
+                }
+            };
+
+            let default_config = crate::parser::ProviderContext::default();
+            let config = config.unwrap_or(&default_config);
+            let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
                 return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
                     function: function.clone(),
                     functions: functions.clone(),
                     args: resolved_args,
                     source_line: *source_line,
                 }));
-            }
-
-            let default_config = crate::parser::ProviderContext::default();
-            let config = config.unwrap_or(&default_config);
-            evaluate_runtime_user_function(
+            };
+            let evaluated = evaluate_runtime_user_function(
                 function,
-                &resolved_args,
-                bindings,
+                &parser_args,
+                &ResolvedBindings::default(),
                 Some(config),
                 source_line.get().unwrap_or(function.body.source_line),
             )
+            .map_err(|error| error.to_string())?;
+            let evaluated = evaluated
+                .into_expanded()
+                .map(Value::into_placeholder_type)
+                .map_err(|error| error.to_string())?;
+            resolve_ref_value_inner(&evaluated, bindings, Some(config))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let access_expression = crate::value::format_value(value);
@@ -1162,12 +1117,11 @@ fn resolve_ref_value_inner(
                 .rebuild_with_base(resolved_base, AccessMissPolicy::Error)
                 .map_err(|error| {
                     let message = error.format_for_path(&access_expression);
-                    let message = if access.source_line() == 0 {
+                    if access.source_line() == 0 {
                         message
                     } else {
                         format!("at line {}: {message}", access.source_line())
-                    };
-                    ResolveValueDiagnostic::runtime(message)
+                    }
                 })
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
@@ -1190,6 +1144,7 @@ fn resolve_ref_value_inner(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(value.clone()),
+        Value::Deferred(DeferredValue::Placeholder(_)) => Ok(value.clone()),
     }
 }
 
@@ -1464,7 +1419,7 @@ mod tests {
 
     #[test]
     fn coalesce_does_not_treat_explicit_unknown_as_absent() {
-        let unknown_reason = crate::resource::UnknownReason::PendingReRead(
+        let unknown_reason = crate::resource::ApplyTimeUnknown::PendingReRead(
             crate::resource::PendingReRead::incomplete("provider read incomplete"),
         );
         let expression = coalesce(
@@ -1486,7 +1441,7 @@ mod tests {
             name: crate::builtins::BuiltinFunction::upper,
             args: vec![
                 Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::PendingReRead(
+                    crate::resource::ApplyTimeUnknown::PendingReRead(
                         crate::resource::PendingReRead::incomplete("producer still running"),
                     ),
                 ))
@@ -2536,7 +2491,7 @@ mod tests {
 
     #[test]
     fn test_unresolved_ref_stays_as_is() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         let ref_value =
             Value::root_resource_ref("nonexistent".to_string(), "id".to_string(), vec![]);
@@ -2573,7 +2528,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpolation_partially_unresolved() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("subnet-".into()),
@@ -2594,7 +2549,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpolation_with_non_string_types() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("port-".into()),
@@ -2670,7 +2625,7 @@ mod tests {
 
     #[test]
     fn test_resolve_function_call_join() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         let func = Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::join,
@@ -2985,7 +2940,7 @@ mod tests {
 
     #[test]
     fn test_resolve_function_call_unresolved_ref_kept() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         // If a ResourceRef in the args can't be resolved, the FunctionCall is kept
         let func = Value::Deferred(DeferredValue::FunctionCall {
@@ -3093,7 +3048,7 @@ mod tests {
     #[test]
     fn resolve_builtin_error_propagated_when_args_resolved() {
         // env() with a var name that is extremely unlikely to be set should propagate error
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
         let value = Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::env,
             args: vec![
@@ -3124,7 +3079,7 @@ mod tests {
     #[test]
     fn resolve_builtin_with_unresolved_ref_stays_as_function_call() {
         // join("-", vpc.tags) should stay as FunctionCall when vpc.tags is unresolved
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
         let value = Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::join,
             args: vec![
@@ -3578,10 +3533,10 @@ mod tests {
 
     /// `resolve_refs_for_plan` stamps any surviving `ResourceRef` whose
     /// root binding is in `remote_bindings.keys()` as
-    /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))`.
+    /// `Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport { path }))`.
     #[test]
     fn test_resolve_refs_for_plan_stamps_top_level_unresolved_upstream() {
-        use crate::resource::UnknownReason;
+        use crate::resource::ApplyTimeUnknown;
         let mut resources = vec![make_resource(
             "web-sg",
             None,
@@ -3601,7 +3556,7 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("vpc_id") {
-            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+            Some(Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
                 path,
             }))) => {
                 assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
@@ -3654,7 +3609,7 @@ mod tests {
     /// `(known after upstream apply: bootstrap)` form. #2876.
     #[test]
     fn test_resolve_refs_for_plan_stamps_upstream_all_exports_ref() {
-        use crate::resource::UnknownReason;
+        use crate::resource::ApplyTimeUnknown;
         let mut resources = vec![make_resource(
             "consumer",
             None,
@@ -3672,9 +3627,9 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("raw") {
-            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
-                binding,
-            }))) => {
+            Some(Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamAllExports { binding },
+            ))) => {
                 assert_eq!(binding.as_str(), "bootstrap");
             }
             other => panic!(
@@ -3690,7 +3645,7 @@ mod tests {
     /// above. #2876.
     #[test]
     fn test_resolve_refs_for_plan_stamps_upstream_all_exports_inside_list() {
-        use crate::resource::UnknownReason;
+        use crate::resource::ApplyTimeUnknown;
         let mut resources = vec![make_resource(
             "consumer",
             None,
@@ -3720,7 +3675,7 @@ mod tests {
                     .iter()
                     .map(|v| match v {
                         Value::Deferred(DeferredValue::Unknown(
-                            UnknownReason::UpstreamAllExports { binding },
+                            ApplyTimeUnknown::UpstreamAllExports { binding },
                         )) => binding.as_str(),
                         other => panic!("expected UpstreamAllExports, got {:?}", other),
                     })

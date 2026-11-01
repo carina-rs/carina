@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::binding_index::ResolvedBindings;
 use crate::effect::{Effect, SchedulerKey};
 use crate::parser::DeferredForExpression;
-use crate::resource::{AbsoluteBindingAddress, ResourceId};
+use crate::resource::ResourceId;
 
 use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
@@ -21,7 +21,7 @@ pub(super) struct SchedulerDeps {
 
 pub(super) struct PureMetaStep<'a, S> {
     effect: &'a Effect<S>,
-    template: &'a DeferredForExpression<S, AbsoluteBindingAddress>,
+    template: &'a DeferredForExpression<S>,
 }
 
 impl<'a, S> PureMetaStep<'a, S> {
@@ -346,7 +346,9 @@ mod tests {
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
             std::path::Path::new("."),
         )
-        .expect("deferred fixture crosses the module-resolution seam");
+        .expect("deferred fixture crosses the module-resolution seam")
+        .into_expanded()
+        .expect("deferred-loop fixture contains no parser placeholders");
         let template = parsed.deferred_for_expressions()[0].clone();
         let scheduler_key = template.target.scheduler_key().to_string();
         assert!(scheduler_key.starts_with("_loop_"));

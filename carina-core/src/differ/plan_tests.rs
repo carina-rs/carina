@@ -4085,8 +4085,8 @@ fn data_source_wait_is_a_plan_error_and_emits_no_wait_effect() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::resource::ExpandedDataSource as DataSource;
 
-    let lookup =
-        DataSource::with_provider("test", "lookup.Job", "lookup", None).with_root_binding("lookup");
+    let mut lookup = DataSource::with_provider("test", "lookup.Job", "lookup", None);
+    lookup.binding = Some(absolute_binding("lookup"));
     let identity_collision =
         Resource::with_provider("test", "managed.Job", "lookup", None).with_root_binding("managed");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
@@ -4222,8 +4222,14 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         }
         "#,
     )
-    .expect("parsed file should be valid")
-    .resolve_root(&crate::resource::RootScope::new());
+    .expect("parsed file should be valid");
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("plan fixture crosses the module-resolution seam")
+    .into_expanded()
+    .expect("plan fixture contains no parser placeholders");
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("validation_records".to_string())],
     };

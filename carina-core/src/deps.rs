@@ -14,7 +14,9 @@ use crate::resource::{AbsoluteBindingAddress, BindingAddress, Resource, Value};
 ///
 /// Both sources are always merged because partial resolution can cause
 /// ResourceRef bindings to differ from the original direct dependencies.
-pub fn get_resource_dependencies<S, B: BindingAddress>(resource: &Resource<S, B>) -> HashSet<B> {
+pub fn get_resource_dependencies<S, P: crate::resource::PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
+) -> HashSet<B> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -70,8 +72,8 @@ pub(crate) fn get_composition_runtime_dependencies(
 /// `dependency_bindings` ∪ `directives.depends_on`" — structurally the
 /// same union [`get_resource_dependencies`] computes for a managed
 /// resource.
-pub fn get_data_source_dependencies<S, B: BindingAddress>(
-    data_source: &crate::resource::DataSource<S, B>,
+pub fn get_data_source_dependencies<S, P: crate::resource::PlaceholderKind, B: BindingAddress>(
+    data_source: &crate::resource::DataSource<S, P, B>,
 ) -> HashSet<B> {
     let mut deps = HashSet::new();
     for value in data_source.attributes.values() {
@@ -93,7 +95,10 @@ pub fn get_data_source_dependencies<S, B: BindingAddress>(
 /// resource depends on the named binding. The two parse to different
 /// `Value` variants since #2847 (`ResourceRef` vs. `BindingRef`), so
 /// the walker visits both forms here.
-pub(crate) fn collect_dependencies<B: BindingAddress>(value: &Value<B>, deps: &mut HashSet<B>) {
+pub(crate) fn collect_dependencies<P: crate::resource::PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    deps: &mut HashSet<B>,
+) {
     value.visit_resource_refs(&mut |path| {
         deps.insert(path.binding_address().clone());
     });
@@ -113,9 +118,17 @@ pub(crate) fn collect_dependencies<B: BindingAddress>(value: &Value<B>, deps: &m
 /// can compute the snapshot for any node kind ([`Resource`],
 /// [`DataSource`], [`LiveComposition`](crate::resource::LiveComposition))
 /// uniformly (carina#3181 / #3308).
-pub fn get_resource_value_ref_dependencies<S, B: BindingAddress>(
-    resource: crate::parser::ResourceRef<'_, S, B>,
-) -> HashSet<B> {
+pub fn get_resource_value_ref_dependencies<
+    S,
+    P: crate::resource::PlaceholderKind,
+    D,
+    B: BindingAddress,
+>(
+    resource: crate::parser::ResourceRef<'_, S, P, P, D, B>,
+) -> HashSet<B>
+where
+    D: crate::parser::DeferredForPhaseTraversal<P, P, B>,
+{
     let mut deps = HashSet::new();
     let attrs = resource.attributes();
     for value in attrs.values() {
@@ -135,16 +148,20 @@ pub fn get_resource_value_ref_dependencies<S, B: BindingAddress>(
 ///
 /// Returns an error if a circular dependency is detected, with a message
 /// showing the cycle path (e.g., "Circular dependency detected: a -> b -> c -> a").
-pub fn sort_resources_by_dependencies<S: Clone, B: BindingAddress>(
-    resources: &[Resource<S, B>],
-) -> Result<Vec<Resource<S, B>>, String> {
+pub fn sort_resources_by_dependencies<
+    S: Clone,
+    P: crate::resource::PlaceholderKind,
+    B: BindingAddress,
+>(
+    resources: &[Resource<S, P, B>],
+) -> Result<Vec<Resource<S, P, B>>, String> {
     topological_sort(resources)
 }
 
 /// Internal topological sort for creation ordering.
-fn topological_sort<S: Clone, B: BindingAddress>(
-    resources: &[Resource<S, B>],
-) -> Result<Vec<Resource<S, B>>, String> {
+fn topological_sort<S: Clone, P: crate::resource::PlaceholderKind, B: BindingAddress>(
+    resources: &[Resource<S, P, B>],
+) -> Result<Vec<Resource<S, P, B>>, String> {
     // Build binding name to input index mapping. Graph membership is indexed
     // by declaration position so two anonymous resources cannot collapse.
     let mut binding_to_index: HashMap<B, usize> = HashMap::new();
@@ -159,7 +176,9 @@ fn topological_sort<S: Clone, B: BindingAddress>(
     let mut visited: HashSet<usize> = HashSet::new();
     let mut visiting: Vec<usize> = Vec::new();
 
-    fn label<S, B: BindingAddress>(resource: &Resource<S, B>) -> String {
+    fn label<S, P: crate::resource::PlaceholderKind, B: BindingAddress>(
+        resource: &Resource<S, P, B>,
+    ) -> String {
         resource
             .binding
             .as_ref()
@@ -167,13 +186,13 @@ fn topological_sort<S: Clone, B: BindingAddress>(
             .unwrap_or_else(|| resource.id.to_string())
     }
 
-    fn visit<S: Clone, B: BindingAddress>(
+    fn visit<S: Clone, P: crate::resource::PlaceholderKind, B: BindingAddress>(
         index: usize,
-        resources: &[Resource<S, B>],
+        resources: &[Resource<S, P, B>],
         binding_to_index: &HashMap<B, usize>,
         visited: &mut HashSet<usize>,
         visiting: &mut Vec<usize>,
-        sorted: &mut Vec<Resource<S, B>>,
+        sorted: &mut Vec<Resource<S, P, B>>,
     ) -> Result<(), String> {
         if visited.contains(&index) {
             return Ok(());

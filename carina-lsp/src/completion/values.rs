@@ -2266,8 +2266,9 @@ fn infer_for_binding_type(
     let exports = exports_cache
         .entry(iterable.binding.clone())
         .or_insert_with(|| {
+            let binding = carina_core::resource::RelativeBindingName::new(iterable.binding.clone());
             let upstream = carina_core::parser::UpstreamState {
-                binding: carina_core::resource::RelativeBindingName::new(iterable.binding.clone()),
+                binding: binding.clone(),
                 source: std::path::PathBuf::from(source),
             };
             let (mut resolved, _errors) =
@@ -2279,7 +2280,7 @@ fn infer_for_binding_type(
                 );
             // Move the entry out of `resolved` rather than cloning so we
             // don't pay a deep `Value` clone on the per-keystroke path.
-            resolved.remove(&iterable.binding).unwrap_or_default()
+            resolved.remove(&binding).unwrap_or_default()
         });
     let export_type =
         structural_type_for_completion(exports.get(&iterable.export)?).structural_type()?;

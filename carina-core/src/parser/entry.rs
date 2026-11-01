@@ -3,11 +3,10 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use super::ParserWaitBinding as WaitBinding;
 use super::ProviderContext;
 use super::Rule;
-use super::ast::{
-    ParsedFile, ParserBindingMetadata, TypeExpr, UpstreamState, UserFunction, WaitBinding,
-};
+use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction};
 use super::blocks::attributes::{
     ParsedArgumentsBlock, parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
@@ -30,14 +29,12 @@ use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
 use crate::eval_value::{
-    AuthoredEvalValue as EvalValue, AuthoredParsedSinkValue as ParsedSinkValue,
-    AuthoredStructuralHandle as StructuralHandle,
-    AuthoredStructuralHandleMetadata as StructuralHandleMetadata, EvalValueError,
+    EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
 };
-use crate::resource::{
-    AuthoredDataSource as DataSource, AuthoredResource as Resource, AuthoredValue as Value,
-    LegacyLoopAddress, LoopKind,
+use crate::parser::{
+    ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
 };
+use crate::resource::{LegacyLoopAddress, LoopKind, RelativeBindingName};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -55,9 +52,7 @@ pub(crate) enum SeedKind<'a> {
         value: &'a Value,
         structural_handles: Option<&'a StructuralHandleMetadata>,
     },
-    ModuleParameter {
-        declared_type: Option<&'a TypeExpr>,
-    },
+    ModuleParameter,
     TypedStructural(&'a StructuralHandle),
     Provisional,
     StructuralAlias(&'a StructuralHandle),
@@ -125,10 +120,10 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn module_parameter(name: &'a str, declared_type: Option<&'a TypeExpr>) -> Self {
+    pub(crate) fn module_parameter(name: &'a str) -> Self {
         Self {
             name,
-            kind: SeedKind::ModuleParameter { declared_type },
+            kind: SeedKind::ModuleParameter,
         }
     }
 
@@ -175,7 +170,7 @@ pub fn parse_file(
     path: &std::path::Path,
     config: &ProviderContext,
 ) -> Result<ParsedFile, ParseError> {
-    let user_functions = resolve_top_level_user_functions(&[(Some(path), input)], config)?;
+    let user_functions = resolve_top_level_user_functions(&[(path, input)], config)?;
     let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
@@ -427,7 +422,7 @@ pub(crate) fn top_level_user_functions(
     input: &str,
     config: &ProviderContext,
 ) -> Result<HashMap<String, UserFunction>, ParseError> {
-    resolve_top_level_user_functions(&[(None, input)], config)
+    resolve_top_level_user_functions(&[(Path::new("test.crn"), input)], config)
 }
 
 /// Parse the directory's function declarations as one lexical scope.
@@ -441,13 +436,13 @@ pub(crate) fn top_level_user_functions_in_files(
 ) -> Result<HashMap<String, UserFunction>, ParseError> {
     let sources = files
         .iter()
-        .map(|(path, input)| (Some(path.as_path()), input.as_str()))
+        .map(|(path, input)| (path.as_path(), input.as_str()))
         .collect::<Vec<_>>();
     resolve_top_level_user_functions(&sources, config)
 }
 
 fn resolve_top_level_user_functions(
-    sources: &[(Option<&Path>, &str)],
+    sources: &[(&Path, &str)],
     config: &ProviderContext,
 ) -> Result<HashMap<String, UserFunction>, ParseError> {
     // Preserve the old directory behavior for duplicate names: a later file
@@ -455,10 +450,10 @@ fn resolve_top_level_user_functions(
     let mut owners = HashMap::<String, usize>::new();
     for (source_index, (path, input)) in sources.iter().enumerate() {
         let preprocessed_file =
-            super::preprocess_file(input).map_err(|error| locate_function_error(error, *path))?;
+            super::preprocess_file(input).map_err(|error| locate_function_error(error, path))?;
         let pairs = preprocessed_file
             .parse()
-            .map_err(|error| locate_function_error(error, *path))?;
+            .map_err(|error| locate_function_error(error, path))?;
         let mut local_names = HashSet::new();
         for pair in pairs {
             if pair.as_rule() != Rule::file {
@@ -483,7 +478,7 @@ fn resolve_top_level_user_functions(
                         ParseError::UserFunctionError(
                             "duplicate function definition in one file".to_string(),
                         ),
-                        *path,
+                        path,
                     ));
                 }
                 owners.insert(name, source_index);
@@ -492,17 +487,27 @@ fn resolve_top_level_user_functions(
     }
 
     let mut pending = owners.keys().cloned().collect::<HashSet<_>>();
-    let mut ctx = ParseContext::new(config);
+    let Some((initial_path, initial_input)) = sources.first() else {
+        return Ok(HashMap::new());
+    };
+    let initial_file = Arc::new(
+        super::preprocess_file(initial_input)
+            .map_err(|error| locate_function_error(error, initial_path))?,
+    );
+    let mut ctx = ParseContext::new(config, initial_path, initial_file);
     let mut functions = HashMap::new();
 
     while !pending.is_empty() {
         let mut made_progress = false;
         for (source_index, (path, input)) in sources.iter().enumerate() {
-            let preprocessed_file = super::preprocess_file(input)
-                .map_err(|error| locate_function_error(error, *path))?;
+            let preprocessed_file = Arc::new(
+                super::preprocess_file(input)
+                    .map_err(|error| locate_function_error(error, path))?,
+            );
             let pairs = preprocessed_file
                 .parse()
-                .map_err(|error| locate_function_error(error, *path))?;
+                .map_err(|error| locate_function_error(error, path))?;
+            ctx.set_source_scope(path, Arc::clone(&preprocessed_file));
             for pair in pairs {
                 if pair.as_rule() != Rule::file {
                     continue;
@@ -529,7 +534,7 @@ fn resolve_top_level_user_functions(
                     ctx.set_preprocessed_file(&preprocessed_file);
                     match parse_fn_def(statement, &ctx, &mut warnings, &preprocessed_file) {
                         Ok(mut function) => {
-                            function.body.source_file = path.map(Path::to_path_buf);
+                            function.body.source_file = Some((*path).to_path_buf());
                             ctx.insert_user_function(name.clone(), function.clone());
                             // Calls made while parsing another declaration must
                             // remain deferred until the complete table exists.
@@ -544,7 +549,7 @@ fn resolve_top_level_user_functions(
                             // The dependency is declared but has not been parsed
                             // yet. A later pass will retry this body.
                         }
-                        Err(error) => return Err(locate_function_error(error, *path)),
+                        Err(error) => return Err(locate_function_error(error, path)),
                     }
                 }
             }
@@ -568,11 +573,8 @@ fn resolve_top_level_user_functions(
     Ok(functions)
 }
 
-fn locate_function_error(error: ParseError, path: Option<&Path>) -> ParseError {
-    match path {
-        Some(path) => error.in_file(path.to_path_buf()),
-        None => error,
-    }
+fn locate_function_error(error: ParseError, path: &Path) -> ParseError {
+    error.in_file(path.to_path_buf())
 }
 
 pub(crate) fn top_level_argument_names(input: &str) -> Result<Vec<String>, ParseError> {
@@ -629,7 +631,7 @@ fn parse_with_seeded_bindings_inner(
     bindings_fully_classified: bool,
     source_file: &std::path::Path,
 ) -> Result<ParsedFile, ParseError> {
-    let preprocessed_file = super::preprocess_file(input)?;
+    let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
@@ -640,9 +642,7 @@ fn parse_with_seeded_bindings_inner(
         Vec::new()
     };
 
-    let mut ctx = ParseContext::new(config);
-    ctx.set_preprocessed_file(&preprocessed_file);
-    ctx.set_source_scope(source_file);
+    let mut ctx = ParseContext::new(config, source_file, Arc::clone(&preprocessed_file));
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.extend_warnings(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
@@ -821,9 +821,10 @@ fn parse_with_seeded_bindings_inner(
                                 };
                                 let fn_name = user_fn.name.clone();
                                 // Check for shadowing builtins
-                                if crate::builtins::evaluate_builtin::<
-                                    crate::resource::RelativeBindingName,
-                                >(&fn_name, &[])
+                                if crate::builtins::evaluate_builtin::<RelativeBindingName>(
+                                    &fn_name,
+                                    &[],
+                                )
                                 .is_ok()
                                     || crate::builtins::builtin_functions()
                                         .iter()
@@ -1071,11 +1072,23 @@ fn parse_with_seeded_bindings_inner(
         let ParseBinding::Value {
             value: eval,
             source_line,
-            ..
+            declaration,
+            shared_value: _,
+            declared_type: _,
+            scope: _,
         } = binding
         else {
             continue;
         };
+        // Argument bindings are lexical parser inputs, not authored `let`
+        // variables. Their declaration already lives in `arguments`, and
+        // retaining a second value-shaped copy here makes later boundary
+        // walkers distinguish the two by string name. Keep the typed
+        // declaration provenance as the discriminator and omit the duplicate
+        // from the final AST.
+        if matches!(declaration, crate::schema::BindingKind::Argument) {
+            continue;
+        }
         match (*eval).into_value() {
             Ok(value) => {
                 variables.insert(name, value);
@@ -1224,17 +1237,15 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                     EvalValue::computed(value.clone(), structural_handles.cloned()),
                 );
             }
-            SeedKind::ModuleParameter { declared_type } => {
-                ctx.set_argument_variable(
+            SeedKind::ModuleParameter => {
+                ctx.set_variable(
                     seed.name().to_string(),
-                    Value::Deferred(crate::resource::DeferredValue::Unknown(
-                        crate::resource::UnknownReason::ModuleArgument {
+                    Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                        crate::resource::ParserPlaceholder::ModuleArgument {
                             name: seed.name().to_string(),
-                            source_line: (0).into(),
-                            diagnostic_name: None,
+                            diagnostic: Default::default(),
                         },
                     )),
-                    declared_type.cloned(),
                 );
             }
             SeedKind::TypedStructural(handle) => {

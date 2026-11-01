@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 
-use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -20,7 +20,9 @@ use super::value_type_name;
 /// map(".id", [{name: "a", id: "1"}, {name: "b", id: "2"}])  // => ["1", "2"]
 /// subnets |> map(".subnet_id")  // pipe syntax
 /// ```
-pub(crate) fn builtin_map<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_map<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!("map() requires 2 arguments, got {}", args.len()));
     }
@@ -37,7 +39,7 @@ pub(crate) fn builtin_map<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<
 
     match &args[1] {
         Value::Concrete(ConcreteValue::List(items)) => {
-            let mapped: Result<Vec<Value<B>>, String> = items
+            let mapped: Result<Vec<Value<NoPlaceholder, B>>, String> = items
                 .iter()
                 .map(|item| match item {
                     Value::Concrete(ConcreteValue::Map(map)) => map
@@ -53,7 +55,7 @@ pub(crate) fn builtin_map<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<
             Ok(Value::Concrete(ConcreteValue::List(mapped?)))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let mapped: Result<IndexMap<String, Value<B>>, String> = map
+            let mapped: Result<IndexMap<String, Value<NoPlaceholder, B>>, String> = map
                 .iter()
                 .map(|(k, v)| match v {
                     Value::Concrete(ConcreteValue::Map(inner)) => inner

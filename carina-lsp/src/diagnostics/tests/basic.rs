@@ -84,6 +84,23 @@ fn provider_config_enum_accepts_identity_or_configured_provider_namespace_only()
 }
 
 #[test]
+fn provider_placeholder_attribute_does_not_hide_invalid_region() {
+    let engine = test_engine_with_region_config_provider("awscc");
+    let doc = create_document(
+        "provider awscc {\n  profile = \"${}\"\n  region = \"invalid-region\"\n}\n",
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("provider awscc: region:")
+                && diagnostic.message.contains("invalid-region")
+        }),
+        "the placeholder in profile must not suppress validation of region: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn reserved_resource_attribute_surfaces_parser_diagnostic() {
     let engine = test_engine();
     let doc = create_document("let bucket = aws.s3.Bucket {\n  \"_x\" = 1\n}\n");

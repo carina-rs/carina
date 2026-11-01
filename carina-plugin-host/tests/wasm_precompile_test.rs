@@ -564,9 +564,8 @@ async fn test_precompiled_factory_creates_provider() {
         .expect("from_precompiled should succeed");
 
     // Verify the factory can actually create a working provider
-    let parsed = carina_core::parser::InferredFile::default().resolve_root_for_test();
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
+        &carina_core::parser::ExpandedInferredFile::default(),
         &std::collections::HashMap::new(),
         &carina_core::parser::ProviderContext::default(),
     )

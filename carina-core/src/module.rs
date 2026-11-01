@@ -5,9 +5,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::parser::{
-    ResourceTypePath, TypeExpr, display_double_quoted_literal_part, display_string_literal,
+    ParsedResource as Resource, ParsedValue as Value, ResourceTypePath, TypeExpr,
+    display_double_quoted_literal_part, display_string_literal,
 };
-use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue};
 use crate::static_type::{ConsumerStaticType, consumer_static_type_label};
 
 /// Dependency between resources
@@ -119,7 +120,7 @@ impl DependencyGraph {
 }
 
 /// Format a Value for display
-fn format_value<B: BindingAddress>(value: &Value<B>) -> String {
+fn format_value(value: &Value) -> String {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
             "if {} {{ {} }} else {{ {} }}",
@@ -219,18 +220,24 @@ fn format_value<B: BindingAddress>(value: &Value<B>) -> String {
             format!("{}({})", function.name, arg_strs.join(", "))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            if access.display_root().is_some() {
+            if access.has_authored_loop_path() {
                 crate::value::format_value(value)
-            } else if let Some(reason) = crate::value::access_chain_unknown_root(access.base()) {
-                crate::value::render_unknown(reason)
             } else {
-                format!("{}{}", format_value(access.base()), access.step())
+                match crate::value::access_chain_root(access.base()) {
+                    Some(crate::value::AccessChainRoot::Unknown(reason)) => {
+                        crate::value::render_unknown(reason)
+                    }
+                    Some(crate::value::AccessChainRoot::LoopSlot(_)) | None => {
+                        format!("{}{}", format_value(access.base()), access.step())
+                    }
+                }
             }
         }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
             "(secret)".to_string()
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => crate::value::render_unknown(reason),
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
     }
 }
 
@@ -388,10 +395,7 @@ pub struct ModuleCallInfo {
     pub arguments: Vec<String>,
 }
 
-fn resource_graph_binding<S, B: BindingAddress>(
-    resource: &Resource<S, B>,
-    declaration_index: usize,
-) -> String {
+fn resource_graph_binding(resource: &Resource, declaration_index: usize) -> String {
     resource
         .binding
         .as_ref()
@@ -401,10 +405,7 @@ fn resource_graph_binding<S, B: BindingAddress>(
 
 impl RootConfigSignature {
     /// Build a root config signature from a parsed file
-    pub fn from_parsed_file<E, B: BindingAddress>(
-        parsed: &crate::parser::File<E, B>,
-        file_name: &str,
-    ) -> Self {
+    pub fn from_parsed_file<E>(parsed: &crate::parser::File<E>, file_name: &str) -> Self {
         // Build imports
         let imports: Vec<ImportInfo> = parsed
             .uses
@@ -482,10 +483,10 @@ impl RootConfigSignature {
         }
     }
 
-    fn collect_typed_dependencies<B: BindingAddress>(
+    fn collect_typed_dependencies(
         from: &str,
         attr_key: &str,
-        value: &Value<B>,
+        value: &Value,
         graph: &mut TypedDependencyGraph,
         binding_types: &HashMap<String, ResourceTypePath>,
     ) {
@@ -607,6 +608,7 @@ impl RootConfigSignature {
             Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
                 // Saved-plan placeholders never carry dependency expressions.
             }
+            Value::Deferred(DeferredValue::Placeholder(_)) => {}
         }
     }
 
@@ -923,8 +925,8 @@ impl ModuleSignature {
     }
 
     /// Build a module signature from a directory-based module (ParsedFile with top-level arguments/attributes)
-    pub fn from_directory_module<E, B: BindingAddress, D>(
-        parsed: &crate::parser::File<E, B, D>,
+    pub fn from_directory_module<E>(
+        parsed: &crate::parser::File<E>,
         module_name: &str,
         config: &crate::parser::ProviderContext,
     ) -> Self {
@@ -1037,10 +1039,10 @@ impl ModuleSignature {
         }
     }
 
-    fn collect_typed_dependencies<B: BindingAddress>(
+    fn collect_typed_dependencies(
         from: &str,
         attr_key: &str,
-        value: &Value<B>,
+        value: &Value,
         graph: &mut TypedDependencyGraph,
         binding_types: &HashMap<String, ResourceTypePath>,
         argument_types: &HashMap<String, TypeExpr>,
@@ -1220,8 +1222,8 @@ impl ModuleSignature {
                     argument_types,
                 );
             }
-            Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ModuleArgument { name, .. },
+            Value::Deferred(DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::ModuleArgument { name, .. },
             )) => {
                 let target_type = argument_types
                     .get(name)
@@ -1236,6 +1238,12 @@ impl ModuleSignature {
                     },
                 );
             }
+            Value::Deferred(DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::FnParam { .. }
+                | crate::resource::ParserPlaceholder::FnLocal { .. }
+                | crate::resource::ParserPlaceholder::Loop(_)
+                | crate::resource::ParserPlaceholder::EmptyInterpolation { .. },
+            )) => {}
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 // Other unknowns are upstream-deferred and carry no
                 // resource-binding edge.
@@ -1526,9 +1534,9 @@ mod tests {
     use super::*;
     use crate::parser::TypeExpr;
 
-    type Value = crate::resource::ExpandedValue;
-    type ConcreteValue = crate::resource::ExpandedConcreteValue;
-    type DeferredValue = crate::resource::ExpandedDeferredValue;
+    type Value = crate::resource::AuthoredValue;
+    type ConcreteValue = crate::resource::AuthoredConcreteValue;
+    type DeferredValue = crate::resource::AuthoredDeferredValue;
 
     #[test]
     fn format_value_uses_canonical_string_literals() {
@@ -1545,10 +1553,10 @@ mod tests {
         );
         assert_eq!(
             format_value(&Value::Deferred(DeferredValue::Interpolation(vec![
-                crate::resource::InterpolationPart::Literal("prefix-".into()),
-                crate::resource::InterpolationPart::Expr(Value::Deferred(
+                crate::resource::AuthoredInterpolationPart::Literal("prefix-".into()),
+                crate::resource::AuthoredInterpolationPart::Expr(Value::Deferred(
                     DeferredValue::BindingRef {
-                        binding: crate::resource::RootScope::new().resolve("name".into()),
+                        binding: "name".into(),
                     },
                 )),
             ]))),
@@ -1556,10 +1564,10 @@ mod tests {
         );
         assert_eq!(
             format_value(&Value::Deferred(DeferredValue::Interpolation(vec![
-                crate::resource::InterpolationPart::Literal(r#"prefix-${literal}""#.into(),),
-                crate::resource::InterpolationPart::Expr(Value::Deferred(
+                crate::resource::AuthoredInterpolationPart::Literal(r#"prefix-${literal}""#.into(),),
+                crate::resource::AuthoredInterpolationPart::Expr(Value::Deferred(
                     DeferredValue::BindingRef {
-                        binding: crate::resource::RootScope::new().resolve("name".into()),
+                        binding: "name".into(),
                     },
                 )),
             ]))),
@@ -1851,22 +1859,20 @@ mod tests {
         let values = [
             (
                 "resource ref",
-                crate::resource::AuthoredValue::resource_ref("vpc", "id", vec![])
-                    .resolve_root(&crate::resource::RootScope::new()),
+                crate::resource::AuthoredValue::resource_ref("vpc", "id", vec![]),
             ),
             (
                 "bare binding ref",
                 Value::Deferred(DeferredValue::BindingRef {
-                    binding: crate::resource::RootScope::new().resolve("vpc".into()),
+                    binding: "vpc".into(),
                 }),
             ),
             (
                 "module argument placeholder",
-                Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument {
+                Value::Deferred(DeferredValue::Placeholder(
+                    crate::resource::ParserPlaceholder::ModuleArgument {
                         name: "vpc".to_string(),
-                        source_line: 1.into(),
-                        diagnostic_name: None,
+                        diagnostic: Default::default(),
                     },
                 )),
             ),

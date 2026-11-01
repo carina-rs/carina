@@ -2,12 +2,12 @@ use super::*;
 use crate::parser::ExpandedProviderConfig as ProviderConfig;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    AbsoluteBindingAddress, ExpandedAccessPath as AccessPath,
+    AbsoluteBindingAddress, ApplyTimeUnknown, ExpandedAccessPath as AccessPath,
     ExpandedCompositionCall as CompositionCall, ExpandedCompositionCallPath as CompositionCallPath,
     ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
-    ExpandedResource as Resource, ExpandedUnknownReason as UnknownReason, ExpandedValue as Value,
-    LoopModulePrefixOrigin, LoopProvenance, ModuleInstanceScope, ModuleSource, PendingReRead,
-    ReReadReason, RelativeBindingName, ResourceIdentity, RootScope, Subscript, ValueString,
+    ExpandedResource as Resource, ExpandedValue as Value, LoopModulePrefixOrigin, LoopProvenance,
+    ModuleInstanceScope, ModuleSource, PendingReRead, ReReadReason, RelativeBindingName,
+    ResourceIdentity, RootScope, Subscript, ValueString,
 };
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate,
@@ -120,13 +120,19 @@ fn live_module_source(name: &str, instance: &str) -> ModuleSource {
 }
 
 fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
-    crate::parser::parse_file(
+    let parsed = crate::parser::parse_file(
         source,
         Path::new(file),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("valid loop fixture")
-    .resolve_root(&RootScope::new())
+    .expect("valid loop fixture");
+    crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        Path::new("."),
+    )
+    .expect("loop fixture crosses the module-resolution seam")
+    .into_expanded()
+    .expect("loop fixture contains no parser placeholders")
     .resources
 }
 
@@ -249,7 +255,7 @@ fn pending_reread_identifier_material_has_stable_typed_bytes() {
     ];
 
     for (pending, expected) in cases {
-        let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(
+        let value = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
             pending,
         )));
         assert_eq!(
@@ -3632,7 +3638,7 @@ fn canonical_enum_create_only_comparison_preserves_identity_hash_material() {
 
 #[test]
 fn upstream_unknown_identity_hash_strings_remain_stable() {
-    let export = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let export = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: AccessPath::root("network", "vpc_id"),
     }));
     assert_eq!(
@@ -3640,9 +3646,11 @@ fn upstream_unknown_identity_hash_strings_remain_stable() {
         "Unknown(UpstreamRef(network.vpc_id))"
     );
 
-    let all_exports = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
-        binding: absolute_binding("network"),
-    }));
+    let all_exports = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: absolute_binding("network"),
+        },
+    ));
     assert_eq!(
         deterministic_value_string(&all_exports),
         "Unknown(UpstreamBareRef(network))"
@@ -5245,8 +5253,7 @@ fn detect_reference_form_rename(
         .map(|resource| resource.id.clone())
         .collect::<HashSet<_>>();
     let claimed_origins = AnonymousToNamedClaimedOrigins::default();
-    let providers =
-        CanonicalizedProviderConfigs::<AbsoluteBindingAddress>::from_configs_for_test(Vec::new());
+    let providers = CanonicalizedProviderConfigs::from_configs_for_test(Vec::new());
     let scope = crate::provider::ReferenceScope::available("aws", "us-east-1", "123456789012")
         .expect("reference scope must be valid");
     let (_, comparison_provider) = crate::provider::comparison_fixture_with_scope_for_test(
@@ -7166,13 +7173,15 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         "for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}\n",
     )
     .expect("write loop fixture");
-    let mut parsed = crate::config_loader::parse_directory(
+    let parsed = crate::config_loader::parse_directory(
         fixture.path(),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("directory parses")
-    .into_parsed()
-    .resolve_root(&RootScope::new());
+    .expect("directory parses");
+    let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
+        .expect("directory fixture crosses the module-resolution seam")
+        .into_expanded()
+        .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =

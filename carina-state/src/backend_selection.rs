@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use carina_core::parser::BackendConfig as ParserBackendConfig;
-use carina_core::resource::BindingAddress;
+use carina_core::resource::{BindingAddress, PlaceholderKind};
 use thiserror::Error;
 
 use crate::backend::{BackendError, BackendResult};
@@ -251,9 +251,9 @@ impl BackendSelection {
     /// A pending migration selects the old backend recorded in the lock and
     /// returns its drift metadata without printing. Missing locks are allowed
     /// here so the command layer can retain command-specific policy.
-    pub fn for_read<B: BindingAddress>(
+    pub fn for_read<P: PlaceholderKind, B: BindingAddress>(
         project_dir: &Path,
-        configured: Option<&ParserBackendConfig<B>>,
+        configured: Option<&ParserBackendConfig<P, B>>,
     ) -> BackendResult<ReadBackendSelection> {
         let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
         Self::for_read_inspection(inspection)
@@ -280,9 +280,9 @@ impl BackendSelection {
     /// Select a backend for an operation that may mutate state.
     ///
     /// Only the `Verified` result carries a constructible backend token.
-    pub fn verified_for_mutation<B: BindingAddress>(
+    pub fn verified_for_mutation<P: PlaceholderKind, B: BindingAddress>(
         project_dir: &Path,
-        configured: Option<&ParserBackendConfig<B>>,
+        configured: Option<&ParserBackendConfig<P, B>>,
     ) -> BackendResult<MutationBackendSelection> {
         let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
         Self::verified_for_mutation_inspection(inspection)
@@ -356,9 +356,9 @@ impl BackendSelection {
 
     /// Force-release a backend lock, selecting the old locked backend during
     /// pending migration without exposing a general backend capability.
-    pub async fn force_unlock(
+    pub async fn force_unlock<P: PlaceholderKind, B: BindingAddress>(
         project_dir: &Path,
-        configured: Option<&ParserBackendConfig>,
+        configured: Option<&ParserBackendConfig<P, B>>,
         lock_id: &str,
     ) -> BackendResult<()> {
         let selected = Self::for_read(project_dir, configured)?;
@@ -387,16 +387,16 @@ impl BackendSelection {
 }
 
 /// Inspect backend drift without constructing a backend.
-pub fn inspect_backend_drift(
+pub fn inspect_backend_drift<P: PlaceholderKind, B: BindingAddress>(
     project_dir: &Path,
-    configured: Option<&ParserBackendConfig>,
+    configured: Option<&ParserBackendConfig<P, B>>,
 ) -> BackendResult<BackendDriftStatus> {
     inspect(project_dir, configured).map(|inspection| inspection.status)
 }
 
-fn inspect<B: BindingAddress>(
+fn inspect<P: PlaceholderKind, B: BindingAddress>(
     project_dir: &Path,
-    configured: Option<&ParserBackendConfig<B>>,
+    configured: Option<&ParserBackendConfig<P, B>>,
 ) -> BackendResult<BackendInspection> {
     let configured = configured
         .map(BackendConfig::try_from)

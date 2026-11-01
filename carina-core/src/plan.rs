@@ -1500,7 +1500,6 @@ mod tests {
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.RecordSet".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: absolute("validation_records"),
             },
@@ -1545,7 +1544,6 @@ mod tests {
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.RecordSet".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: absolute("validation_records"),
             },

@@ -18,10 +18,10 @@
 //! binding LHS) is enforced upstream by `parse_wait_expr`; the parse
 //! error surfaces via the regular parser diagnostic path.
 
-use crate::parser::{File, ResourceRef};
+use crate::parser::{File, TopLevelResourceRef};
 use crate::resource::BindingAddress;
 use crate::schema::{SchemaKind, SchemaRegistry};
-use crate::wait::predicate::resolve_wait_predicate;
+use crate::wait::predicate::validate_wait_predicate;
 
 enum WaitTarget {
     Pollable {
@@ -47,14 +47,18 @@ pub struct WaitDiagnostic {
 
 /// Run all wait diagnostics against a parsed file + schema registry.
 /// Returns the full list of errors; callers decide how to surface them.
-pub fn validate_wait_bindings<
-    E,
-    B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<B>,
->(
-    parsed: &File<E, B, D>,
+pub fn validate_wait_bindings<E, D, B>(
+    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D, B>,
     schemas: &SchemaRegistry,
-) -> Vec<WaitDiagnostic> {
+) -> Vec<WaitDiagnostic>
+where
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
     if parsed.wait_bindings.is_empty() {
         return Vec::new();
     }
@@ -64,32 +68,24 @@ pub fn validate_wait_bindings<
     // Walk the typed top-level slices so unsupported data-source and
     // composition targets remain distinct from a missing binding. Both are
     // rejected explicitly before managed-resource predicate validation.
-    let mut by_binding: std::collections::HashMap<String, WaitTarget> =
-        std::collections::HashMap::new();
+    let mut by_binding: std::collections::HashMap<B, WaitTarget> = std::collections::HashMap::new();
     for rref in parsed.iter_top_level_resources() {
-        if let Some(b) = rref.binding() {
+        if let Some(b) = rref.binding_address() {
             let id = rref.id();
             let target = match rref {
-                ResourceRef::Resource(_) => WaitTarget::Pollable {
+                TopLevelResourceRef::Resource(_) => WaitTarget::Pollable {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
                 },
-                ResourceRef::Deferred {
-                    resource: _resource,
-                    deferred: _deferred,
-                } => WaitTarget::Pollable {
-                    provider: id.provider.clone(),
-                    resource_type: id.resource_type.clone(),
-                },
-                ResourceRef::DataSource(_) => WaitTarget::DataSource,
-                ResourceRef::LiveComposition(_) => WaitTarget::LiveComposition,
+                TopLevelResourceRef::DataSource(_) => WaitTarget::DataSource,
+                TopLevelResourceRef::LiveComposition(_) => WaitTarget::LiveComposition,
             };
-            by_binding.insert(b.to_string(), target);
+            by_binding.insert(b.clone(), target);
         }
     }
 
     for wb in &parsed.wait_bindings {
-        let Some(target) = by_binding.get(wb.target.as_str()) else {
+        let Some(target) = by_binding.get(&wb.target) else {
             out.push(WaitDiagnostic {
                 message: format!(
                     "wait `{}`: target binding `{}` is not a known resource",
@@ -135,10 +131,10 @@ pub fn validate_wait_bindings<
             // diagnostic from the upstream identifier-scope pass.
             continue;
         };
-        if let Err(error) = resolve_wait_predicate(
+        if let Err(error) = validate_wait_predicate(
             &wb.until_predicate.root,
             &wb.until_predicate.attribute_segments,
-            wb.until_predicate.rhs.clone(),
+            &wb.until_predicate.rhs,
             Some(schema.schema()),
         ) {
             let attribute = (!wb.until_predicate.attribute_segments.is_empty())

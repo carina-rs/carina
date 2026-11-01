@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::detail_rows::DetailRow;
 use crate::effect::{Effect, SchedulerKey};
 use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, ReplaceDisplayInfo};
-use crate::resource::{AbsoluteBindingAddress, ConcreteValue, DeferredValue, Value};
+use crate::resource::{AbsoluteBindingAddress, ConcreteValue, DeferredValue, LoopSlot, Value};
 use crate::value::{
     RenderedValue, is_upstream_deferred_marker_value, render_value_with_upstream_deferred_label,
 };
@@ -71,14 +71,24 @@ pub fn deferred_summary_for_plan<S>(plan: &Plan<S>) -> DeferredSummaryForPlan {
 }
 
 pub fn deferred_for_source<S>(
-    template: &crate::parser::DeferredForExpression<S, AbsoluteBindingAddress>,
+    template: &crate::parser::DeferredForExpression<
+        S,
+        crate::resource::NoPlaceholder,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    >,
 ) -> String {
     crate::value::format_value(&template.iterable)
 }
 
 pub fn deferred_for_verb<S>(
     plan: &Plan<S>,
-    template: &crate::parser::DeferredForExpression<S, AbsoluteBindingAddress>,
+    template: &crate::parser::DeferredForExpression<
+        S,
+        crate::resource::NoPlaceholder,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    >,
 ) -> &'static str {
     let roots = template.root_bindings();
     if plan.effects().iter().any(|effect| {
@@ -93,7 +103,12 @@ pub fn deferred_for_verb<S>(
 }
 
 pub fn deferred_for_display_name<S>(
-    template: &crate::parser::DeferredForExpression<S, AbsoluteBindingAddress>,
+    template: &crate::parser::DeferredForExpression<
+        S,
+        crate::resource::NoPlaceholder,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    >,
     verb: &str,
 ) -> String {
     let upstream_binding = template.binding_description();
@@ -107,15 +122,20 @@ pub fn deferred_for_display_name<S>(
 }
 
 pub fn deferred_for_detail_rows<S>(
-    template: &crate::parser::DeferredForExpression<S, AbsoluteBindingAddress>,
+    template: &crate::parser::DeferredForExpression<
+        S,
+        crate::resource::NoPlaceholder,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    >,
     upstream_binding: &str,
     verb: &str,
 ) -> Vec<DetailRow> {
     let mut rows = vec![DetailRow::Text {
         text: format!("<- {}", template.header),
     }];
-    let mut attrs: Vec<_> = template.attributes.iter().collect();
-    attrs.sort_by_key(|(key, _)| key.clone());
+    let mut attrs: Vec<_> = template.template_resource.attributes.iter().collect();
+    attrs.sort_by_key(|(name, _)| *name);
     rows.extend(attrs.into_iter().map(|(key, value)| DetailRow::Attribute {
         key: key.clone(),
         value: render_deferred_for_template_value(value, upstream_binding, verb),
@@ -126,7 +146,7 @@ pub fn deferred_for_detail_rows<S>(
 }
 
 pub fn render_deferred_for_template_value(
-    value: &Value,
+    value: &Value<LoopSlot, AbsoluteBindingAddress>,
     upstream_binding: &str,
     verb: &str,
 ) -> RenderedValue {
@@ -185,10 +205,7 @@ where
             continue;
         }
 
-        let (resource, mut deps): (
-            Option<crate::parser::ResourceRef<'_, S, AbsoluteBindingAddress>>,
-            HashSet<String>,
-        ) = match effect {
+        let (resource, mut deps) = match effect {
             // carina#3181 PR D / #3308: `Create`/`Update`/`Read`
             // all carry a typestate struct — reach them through the
             // shared `ResourceRef` view, and assemble the dependency
@@ -200,7 +217,7 @@ where
                 let rl = effect
                     .as_resource_ref()
                     .expect("variant carries a resource");
-                let deps = effect
+                let deps: HashSet<String> = effect
                     .blocking_keys()
                     .into_iter()
                     .map(|key| match key {
@@ -265,7 +282,7 @@ where
                 target_id,
                 ..
             } => {
-                // Scheduling uses `Effect::blocking_keys()` so
+                // Scheduling uses `Effect::blocking_bindings()` so
                 // wait targets and explicit wait-block dependencies
                 // both block dispatch. The display tree intentionally
                 // uses only the target edge because it visualizes the
@@ -533,8 +550,8 @@ pub fn build_single_parent_tree<S>(
 ///
 /// `parent_binding` is the binding name of the parent resource in the tree, used to
 /// skip ResourceRef attributes that redundantly reference the parent.
-pub fn extract_compact_hint<S, B: crate::resource::BindingAddress>(
-    resource: crate::parser::ResourceRef<'_, S, B>,
+pub fn extract_compact_hint<S>(
+    resource: crate::parser::ResourceRef<'_, S>,
     parent_binding: Option<&str>,
 ) -> Option<String> {
     let attrs = resource.attributes();
@@ -619,12 +636,17 @@ mod tests {
     use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
     use crate::resource::{
         Directives, ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
-        ExpandedInterpolationPart as InterpolationPart, ExpandedUnknownReason as UnknownReason,
-        ExpandedValue as Value, PathSegment, RelativeBindingName, ResolvedResource, Resource,
-        ResourceId, RootScope, State, Subscript,
+        ExpandedValue as Value, LoopSlot, PathSegment, RelativeBindingName, ResolvedResource,
+        Resource, ResourceId, RootScope, State, Subscript,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::time::Duration;
+
+    type LoopValue = crate::resource::Value<LoopSlot>;
+    type LoopConcreteValue = crate::resource::ConcreteValue<LoopSlot>;
+    type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
+    type LoopInterpolationPart = crate::resource::InterpolationPart<LoopSlot>;
+    type LoopResource = crate::resource::Resource<crate::resource::ModuleSource, LoopSlot>;
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
@@ -636,13 +658,12 @@ mod tests {
 
     #[test]
     fn deferred_for_source_renders_the_complete_coalesce_expression() {
-        let template_resource = Resource::new("test.Child", "children");
+        let template_resource = LoopResource::new("test.Child", "children");
         let deferred = DeferredForExpression {
             file: None,
             line: 1,
             header: "for x in (up.items ?? fallback.items)".to_string(),
             resource_type: "test.Child".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: absolute("children"),
             },
@@ -659,7 +680,7 @@ mod tests {
 
     #[test]
     fn deferred_for_display_hides_direct_placeholder_access_but_keeps_expressions() {
-        let placeholder = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+        let placeholder = LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value));
         let direct_access = crate::resource::apply_postfix_access(
             crate::resource::apply_postfix_access(
                 placeholder.clone(),
@@ -683,7 +704,7 @@ mod tests {
         );
         assert_eq!(
             render_deferred_for_template_value(
-                &Value::Concrete(ConcreteValue::List(vec![direct_access])),
+                &LoopValue::Concrete(LoopConcreteValue::List(vec![direct_access])),
                 "cert",
                 "applies",
             )
@@ -692,10 +713,10 @@ mod tests {
         );
 
         let expression = crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::FunctionCall {
+            LoopValue::Deferred(LoopDeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    LoopValue::Concrete(LoopConcreteValue::String("/".into())).into(),
                     placeholder.into(),
                 ],
                 source_line: (0).into(),
@@ -715,7 +736,7 @@ mod tests {
 
     #[test]
     fn deferred_for_display_does_not_rewrite_marker_text_inside_strings() {
-        let value = Value::Concrete(ConcreteValue::String(
+        let value = LoopValue::Concrete(LoopConcreteValue::String(
             "(known after upstream apply: user text)".into(),
         ));
 
@@ -727,9 +748,9 @@ mod tests {
 
     #[test]
     fn deferred_for_display_does_not_rewrite_marker_text_inside_map_keys() {
-        let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+        let value = LoopValue::Concrete(LoopConcreteValue::Map(indexmap::IndexMap::from([(
             "(known after upstream apply: x)".to_string(),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
         )])));
 
         assert_eq!(
@@ -741,7 +762,7 @@ mod tests {
     #[test]
     fn deferred_for_display_rewrites_access_inside_interpolation() {
         let access = crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
             PathSegment::Field {
                 name: "resource_record_name".to_string(),
             },
@@ -749,9 +770,9 @@ mod tests {
             crate::resource::AccessMissPolicy::Error,
         )
         .unwrap();
-        let value = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(access),
-            InterpolationPart::Literal(".example".into()),
+        let value = LoopValue::Deferred(LoopDeferredValue::Interpolation(vec![
+            LoopInterpolationPart::Expr(access),
+            LoopInterpolationPart::Literal(".example".into()),
         ]));
 
         assert_eq!(
@@ -930,14 +951,13 @@ mod tests {
 
     #[test]
     fn child_render_items_renders_deferred_replace_normally() {
-        let template_resource = Resource::new("route53.Record", "validation_records")
-            .with_root_binding("validation_records");
+        let mut template_resource = LoopResource::new("route53.Record", "validation_records");
+        template_resource.binding = Some(absolute("validation_records"));
         let deferred = DeferredForExpression {
             file: None,
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: absolute("validation_records"),
             },
@@ -1006,14 +1026,13 @@ mod tests {
 
     #[test]
     fn dependency_graph_indexes_deferred_replace_delete_bindings() {
-        let template_resource = Resource::new("route53.Record", "validation_records")
-            .with_root_binding("validation_records");
+        let mut template_resource = LoopResource::new("route53.Record", "validation_records");
+        template_resource.binding = Some(absolute("validation_records"));
         let deferred = DeferredForExpression {
             file: None,
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: absolute("validation_records"),
             },

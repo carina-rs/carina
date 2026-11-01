@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 
 use crate::binding_index::BindingNameSet;
 use crate::parser::{self, File, ParsedFile, ProviderContext};
-use crate::resource::{AuthoredValue as Value, BindingAddress};
+use crate::resource::{BindingAddress, ParserPlaceholder};
 use crate::schema::SchemaRegistry;
 
 /// The syntactic kind of one named declaration.
@@ -330,9 +330,6 @@ impl<E> RootDirectoryParse<E> {
 
 impl RootDirectoryParse<crate::parser::InferredExportParam> {
     /// Retry export inference with the provider schemas loaded for this root.
-    ///
-    /// Keeping this transition on the witness lets frontends enrich a parsed
-    /// root without exposing general mutable access to the wrapped file.
     pub fn retry_unchecked_export_inference(
         &mut self,
         schemas: &crate::provider::ProviderLoadedSchemaRegistry,
@@ -340,8 +337,7 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
         crate::validation::inference::retry_unchecked_export_inference(&mut self.parsed, schemas)
     }
 
-    /// Resolve root-owned type declarations against the loaded provider
-    /// context while preserving the directory-parse witness.
+    /// Resolve root-owned type declarations while preserving this witness.
     pub fn resolve_type_exprs_report(
         &mut self,
         config: &ProviderContext,
@@ -349,8 +345,7 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
         crate::validation::resolve_file_type_exprs_report(&mut self.parsed, config, None)
     }
 
-    /// Resolve root-relative resource references after provider loading while
-    /// preserving the directory-parse witness.
+    /// Resolve root-relative resource references while preserving this witness.
     pub fn resolve_resource_refs_with_config(
         &mut self,
         config: &ProviderContext,
@@ -360,8 +355,6 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
 }
 
 impl<E> RootDirectoryParse<E> {
-    /// Resolve deferred provider attributes without exposing general mutable
-    /// access to the loader-owned root file.
     pub fn resolve_provider_unresolved_attributes(
         &mut self,
         config: &ProviderContext,
@@ -369,8 +362,6 @@ impl<E> RootDirectoryParse<E> {
         parser::resolve_provider_unresolved_attributes(&mut self.parsed, config)
     }
 
-    /// Promote resolved provider attributes into their typed fields while
-    /// preserving the root-directory witness.
     pub fn finalize_provider_configs(&mut self) -> Result<(), parser::ParseError> {
         parser::finalize_provider_configs(&mut self.parsed)
     }
@@ -425,14 +416,8 @@ pub struct LoadedConfig {
 }
 
 impl LoadedConfig {
-    /// Cross root binding resolution for a configuration produced by the
-    /// directory loader, without expanding module calls.
-    pub fn into_root_expanded(
-        self,
-    ) -> crate::parser::File<
-        crate::parser::ExpandedInferredExportParam,
-        crate::resource::AbsoluteBindingAddress,
-    > {
+    /// Cross root binding resolution without expanding module calls.
+    pub fn into_root_expanded(self) -> crate::parser::RootBindingResolvedInferredFile {
         crate::module_resolver::expand_root_directory_file(self.parsed.into_parsed())
     }
 }
@@ -819,16 +804,15 @@ impl DirectoryParseResult {
     }
 
     /// Cross root binding resolution for the merged directory parse.
-    pub fn root_expanded(&self) -> crate::parser::ExpandedParsedFile {
+    pub fn root_expanded(&self) -> crate::parser::RootBindingResolvedParsedFile {
         crate::module_resolver::expand_root_directory_file(self.parsed.parsed().clone())
     }
 
-    /// Cross root binding resolution for one real file from this directory.
-    /// The file must have been retained by the diagnostic parse itself.
+    /// Cross root binding resolution for one real file retained by this parse.
     pub fn root_expanded_semantic_file(
         &self,
         path: &Path,
-    ) -> Option<crate::parser::ExpandedParsedFile> {
+    ) -> Option<crate::parser::RootBindingResolvedParsedFile> {
         self.semantic_file(path)
             .cloned()
             .map(crate::module_resolver::expand_root_directory_file)
@@ -1005,9 +989,21 @@ fn parse_directory_with_overrides_impl(
 /// a future caller that violates the precondition; not reachable from
 /// the sole current caller (`expand_module_call` pins
 /// `export_params: Vec::new()`).
-pub(crate) fn relabel_export_phase<A, B, P: crate::resource::BindingAddress>(
-    f: File<A, P>,
-) -> File<B, P> {
+pub(crate) fn relabel_export_phase<A, B, C: BindingAddress>(
+    f: File<
+        A,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase<ParserPlaceholder, C>,
+        C,
+    >,
+) -> File<
+    B,
+    ParserPlaceholder,
+    ParserPlaceholder,
+    crate::parser::ParsedDeferredForPhase<ParserPlaceholder, C>,
+    C,
+> {
     f.map_export_params(|export_params| {
         // Tripwire for a future caller that violates the precondition.
         // `debug_assert!` (not `assert!`): carina-core is a library;
@@ -1031,9 +1027,21 @@ pub(crate) fn relabel_export_phase<A, B, P: crate::resource::BindingAddress>(
 /// [`File::merge_from`] performs the exhaustive private-field-preserving
 /// merge. Keeping this wrapper generic over the export-param phase lets the
 /// parser and inferred phases share that single merge contract.
-pub(crate) fn merge_parsed_file<E, B: crate::resource::BindingAddress>(
-    target: &mut File<E, B>,
-    source: File<E, B>,
+pub(crate) fn merge_parsed_file<E, B: BindingAddress>(
+    target: &mut File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase<ParserPlaceholder, B>,
+        B,
+    >,
+    source: File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase<ParserPlaceholder, B>,
+        B,
+    >,
 ) {
     target.merge_from(source);
 }
@@ -1072,7 +1080,7 @@ pub(crate) fn merge_parsed_file<E, B: crate::resource::BindingAddress>(
 /// `parse(input, config)` wrapper) pay zero overhead.
 #[derive(Clone, PartialEq)]
 struct DirectorySeedState {
-    variables: IndexMap<String, Value>,
+    variables: IndexMap<String, parser::ParsedValue>,
     metadata: crate::parser::ParserBindingMetadata,
 }
 
@@ -1170,7 +1178,7 @@ pub(crate) fn parse_directory_files_located_from_root(
     provisional_seeds.extend(
         directory_module_parameters
             .iter()
-            .map(|name| parser::BindingSeed::module_parameter(name, None)),
+            .map(|name| parser::BindingSeed::module_parameter(name)),
     );
 
     // Pass 1.a: classify declarations with the complete syntactic scope.
@@ -1193,10 +1201,10 @@ pub(crate) fn parse_directory_files_located_from_root(
         merge_parsed_file(&mut pass1_union, parsed);
     }
     let structural = pass1_union.structural_binding_names();
-    let module_parameters: HashMap<&str, &parser::TypeExpr> = pass1_union
+    let module_parameters: HashSet<&str> = pass1_union
         .arguments
         .iter()
-        .map(|argument| (argument.name.as_str(), &argument.static_type))
+        .map(|argument| argument.name.as_str())
         .collect();
     parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
         .map_err(LocatedParseError::directory_wide)?;
@@ -1327,6 +1335,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
                     parser::DeferredIfBody::Resource(resource) => Some(resource.id.clone()),
                     parser::DeferredIfBody::DataSource(data_source) => Some(data_source.id.clone()),
                     parser::DeferredIfBody::ModuleCall(_) => None,
+                    parser::DeferredIfBody::ExpandedModuleCall(_) => None,
                 }),
         )
         .collect::<Vec<_>>();
@@ -1378,6 +1387,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
                         origin.set_display_file(&display_file);
                     }
                 }
+                parser::DeferredIfBody::ExpandedModuleCall(_) => {}
             }
         }
     }
@@ -1401,7 +1411,7 @@ fn local_variable_names(parsed: &ParsedFile) -> HashSet<String> {
                 .parser_binding_metadata
                 .structural_handles()
                 .keys()
-                .map(BindingAddress::as_str),
+                .map(crate::resource::BindingAddress::as_str),
         )
         .map(str::to_owned)
         .collect()
@@ -1518,7 +1528,7 @@ pub fn find_crn_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
 mod tests {
     use super::*;
     use crate::parser::ModuleCall;
-    use crate::resource::DeferredValue;
+    use crate::resource::{DeferredValue, Value};
     use std::fs;
 
     /// Helper to create a temporary directory for tests
@@ -2272,6 +2282,9 @@ for account_id in orgs.accounts {
                     ),
                 )]),
             )]));
+        let mut parsed = parsed
+            .into_expanded()
+            .expect("directory fixture must contain no parser placeholders");
         parsed
             .expand_deferred_for_expressions(&bindings)
             .expect("resolved upstream iterable expands");
@@ -2746,8 +2759,8 @@ let orgs = upstream_state {
         );
         assert!(matches!(
             deferred.template_resource.get_attr("comment"),
-            Some(crate::resource::ExpandedValue::Deferred(
-                crate::resource::ExpandedDeferredValue::Secret(_)
+            Some(crate::resource::Value::Deferred(
+                crate::resource::DeferredValue::Secret(_)
             ))
         ));
     }

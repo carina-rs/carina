@@ -1,6 +1,6 @@
 //! `env(name)` built-in function
 
-use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -15,7 +15,9 @@ use super::value_type_name;
 /// env("HOME")          // => "/home/user"
 /// env("DB_PASSWORD")   // => "s3cret"
 /// ```
-pub(crate) fn builtin_env<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_env<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!(
             "env() expects 1 argument (variable name), got {}",

@@ -36,7 +36,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::parser::File;
 use crate::resource::{
-    AccessPath, BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Value,
+    AccessPath, BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, ParserPlaceholder,
+    PathSegment, Value,
 };
 use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
 
@@ -68,22 +69,19 @@ pub struct DeferredPopulateDiagnostic {
 pub fn validate_deferred_populate_refs<
     E,
     B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<B>,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    parsed: &File<E, B, D>,
+    parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &SchemaRegistry,
 ) -> Vec<DeferredPopulateDiagnostic> {
     // binding name → (provider, resource_type) for schema lookup.
     // Walks both top-level resources and for-expression bodies so a
     // chained ref inside a `for` body still finds its target binding.
-    let mut by_binding: HashMap<String, (String, String)> = HashMap::new();
+    let mut by_binding: HashMap<B, (String, String)> = HashMap::new();
     for rref in parsed.iter_all_resources() {
-        if let Some(b) = rref.binding() {
+        if let Some(b) = rref.binding_address() {
             let id = rref.id();
-            by_binding.insert(
-                b.to_string(),
-                (id.provider.clone(), id.resource_type.clone()),
-            );
+            by_binding.insert(b.clone(), (id.provider.clone(), id.resource_type.clone()));
         }
     }
     if by_binding.is_empty() {
@@ -93,10 +91,10 @@ pub fn validate_deferred_populate_refs<
     // Set of binding names that have a `wait` block declared against
     // them in the same directory. A wait on binding `cert` satisfies
     // the rule for ANY chained access on `cert` (see module doc).
-    let synchronized: HashSet<&str> = parsed
+    let synchronized: HashSet<B> = parsed
         .wait_bindings
         .iter()
-        .map(|wb| wb.target.as_str())
+        .map(|wb| wb.target.clone())
         .collect();
 
     let mut out: Vec<DeferredPopulateDiagnostic> = Vec::new();
@@ -106,7 +104,7 @@ pub fn validate_deferred_populate_refs<
             collect_unsynchronized_refs(
                 value,
                 key,
-                rref.binding(),
+                rref.binding_address(),
                 &by_binding,
                 &synchronized,
                 schemas,
@@ -121,11 +119,11 @@ pub fn validate_deferred_populate_refs<
 /// that targets a deferred-populate-flagged attribute on an
 /// unsynchronized binding.
 fn collect_unsynchronized_refs<B: BindingAddress>(
-    value: &Value<B>,
+    value: &Value<ParserPlaceholder, B>,
     attribute_key: &str,
-    holder_binding: Option<&str>,
-    by_binding: &HashMap<String, (String, String)>,
-    synchronized: &HashSet<&str>,
+    holder_binding: Option<&B>,
+    by_binding: &HashMap<B, (String, String)>,
+    synchronized: &HashSet<B>,
     schemas: &SchemaRegistry,
     out: &mut Vec<DeferredPopulateDiagnostic>,
 ) {
@@ -288,6 +286,7 @@ fn collect_unsynchronized_refs<B: BindingAddress>(
         }
         Value::Deferred(
             DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_)
             | DeferredValue::BindingRef { .. }
             | DeferredValue::RedactedSecret { .. },
         ) => {
@@ -301,13 +300,13 @@ fn collect_unsynchronized_refs<B: BindingAddress>(
 fn check_ref<B: BindingAddress>(
     path: &AccessPath<B>,
     attribute_key: &str,
-    holder_binding: Option<&str>,
-    by_binding: &HashMap<String, (String, String)>,
-    synchronized: &HashSet<&str>,
+    holder_binding: Option<&B>,
+    by_binding: &HashMap<B, (String, String)>,
+    synchronized: &HashSet<B>,
     schemas: &SchemaRegistry,
     out: &mut Vec<DeferredPopulateDiagnostic>,
 ) {
-    let target = path.binding();
+    let target = path.binding_address();
     if synchronized.contains(target) {
         return;
     }
@@ -331,10 +330,10 @@ fn check_ref<B: BindingAddress>(
                  Add a `wait {target} {{ until = ... }}` block in this directory before downstream resources read this attribute.",
                 path.to_dot_string(),
             ),
-            holder_binding: holder_binding.map(str::to_string),
+            holder_binding: holder_binding.map(|binding| binding.as_str().to_string()),
             attribute_key: attribute_key.to_string(),
             unresolved_path: path.to_dot_string(),
-            target_binding: target.to_string(),
+            target_binding: target.as_str().to_string(),
         });
     }
 }
@@ -597,7 +596,12 @@ mod tests {
             until_predicate: crate::parser::UntilPredicateAst {
                 root: "cert".into(),
                 attribute_segments: vec!["status".to_string()],
-                rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                rhs: crate::resource::Value::<
+                    crate::resource::NoPlaceholder,
+                    crate::resource::RelativeBindingName,
+                >::Concrete(crate::resource::ConcreteValue::String(
+                    "ISSUED".into(),
+                )),
             },
             timeout_secs: None,
             depends_on: vec![],

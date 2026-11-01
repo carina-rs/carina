@@ -1186,7 +1186,9 @@ mod tests {
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
             std::path::Path::new("."),
         )
-        .expect("deferred fixture crosses the module-resolution seam");
+        .expect("deferred fixture crosses the module-resolution seam")
+        .into_expanded()
+        .expect("deferred fixture crosses the placeholder boundary");
         parsed
             .into_deferred_for_expressions()
             .into_iter()

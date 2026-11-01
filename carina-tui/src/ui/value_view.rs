@@ -126,7 +126,9 @@ mod tests {
             Value::Concrete(ConcreteValue::Int(42)),
             Value::Concrete(ConcreteValue::enum_identifier("Mode.enabled")),
             carina_core::resource::AuthoredValue::resource_ref("server", "id", Vec::new())
-                .resolve_root_for_test(),
+                .resolve_root_for_test()
+                .into_expanded()
+                .expect("value-view fixture contains no parser placeholder"),
         ])));
         let spans = value_spans(&rendered);
 

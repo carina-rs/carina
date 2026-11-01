@@ -28,7 +28,6 @@ use std::path::{Path, PathBuf};
 
 use carina_cli::wiring::{
     OverrideAwareBuildMode, OverrideAwareResources, PlanPreprocessor, ProviderLoad,
-    resolve_expanded_config_block_names_for_test,
 };
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -327,7 +326,7 @@ fn apply_path_propagates_module_wait_binding() {
     .expect("load_configuration_with_config should succeed");
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
-    let providers = ProviderLoad::for_test(
+    let providers = ProviderLoad::for_test_with_provider_phase(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
@@ -380,9 +379,7 @@ fn apply_path_propagates_module_wait_binding() {
         .iter()
         .find(|r| r.id.resource_type == "cloudfront.Distribution")
         .expect("expanded Distribution must be present");
-    let deps = carina_core::deps::get_resource_value_ref_dependencies(
-        carina_core::parser::ResourceRef::Resource(dist),
-    );
+    let deps = carina_core::deps::get_resource_dependencies(dist);
     assert!(
         deps.contains(&carina_core::resource::absolute_binding_address_for_test(
             "r.cert_issued",
@@ -397,8 +394,11 @@ fn apply_path_propagates_module_wait_binding() {
     // `certificate_arn` via the module's `attributes` block) instead
     // of `r.cert_issued` (the wait binding). Dump the actual
     // AccessPath and whether a composition `r` shadows it.
-    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-    fn find_ref<'a>(v: &'a Value, acc: &mut Vec<&'a carina_core::resource::AccessPath>) {
+    use carina_core::resource::{ConcreteValue, DeferredValue, PlaceholderKind, Value};
+    fn find_ref<'a, P: PlaceholderKind>(
+        v: &'a Value<P>,
+        acc: &mut Vec<&'a carina_core::resource::AccessPath>,
+    ) {
         match v {
             Value::Deferred(DeferredValue::ResourceRef { path }) => acc.push(path),
             Value::Concrete(ConcreteValue::Map(m)) => m.values().for_each(|x| find_ref(x, acc)),
@@ -449,7 +449,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
     .expect("load_configuration_with_config should succeed");
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
-    let providers = ProviderLoad::for_test(
+    let providers = ProviderLoad::for_test_with_provider_phase(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
@@ -521,7 +521,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
-    let providers = ProviderLoad::for_test(
+    let providers = ProviderLoad::for_test_with_provider_phase(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
@@ -562,15 +562,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("resolve_refs");
 
     let resource_origins = sorted_resources.clone();
-    let mut canonical_for_plan = parsed.clone();
+    let mut canonical_for_plan = carina_core::parser::ExpandedParsedFile::default();
     canonical_for_plan.resources = resources_for_plan.clone();
-    let unresolved_for_plan = canonical_for_plan.clone();
-    let canonical_unresolved = resolve_expanded_config_block_names_for_test(
+    let canonical_unresolved = carina_cli::wiring::CanonicalResourcePair::for_test(
         canonical_for_plan,
-        unresolved_for_plan,
-        ctx.schemas(),
-    )
-    .expect("block-name resolution");
+        resources_for_plan.clone(),
+    );
     let (mut override_aware_resources, _) =
         OverrideAwareResources::build_pair_without_state_for_test(
             &canonical_unresolved,

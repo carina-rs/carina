@@ -1,10 +1,10 @@
 {
-  "version": 35,
+  "version": 36,
   "carina_version": "0.9.0",
-  "timestamp": "2026-10-31T10:49:11.791567+00:00",
+  "timestamp": "2026-11-01T02:20:07.337234+00:00",
   "source_path": "carina-cli/tests/fixtures/module_binding_wire_compat",
-  "state_lineage": "3ece2d76-0686-41a1-a096-960716c688de",
-  "state_serial": 4,
+  "state_lineage": "c2b6fa7f-22a0-447b-bfb1-574889c55962",
+  "state_serial": 3,
   "provider_configs": [
     {
       "name": "mock",
@@ -93,16 +93,16 @@
             },
             "identifier": "mock-id",
             "attributes": {
-              "identifier": {
-                "String": "direct-consumer-id"
+              "name": {
+                "String": "direct-consumer"
               },
               "comment": {
                 "RedactedSecret": {
-                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
+                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$U3LtYg+6DE/6f7Uvj2eVGQ$wmL3Q64d//mG5QwAHWm6OhhV3MWUUxMV8xvwyC6yqhQ"
                 }
               },
-              "name": {
-                "String": "direct-consumer"
+              "identifier": {
+                "String": "direct-consumer-id"
               }
             },
             "exists": true,
@@ -197,16 +197,16 @@
             },
             "identifier": "mock-id",
             "attributes": {
-              "identifier": {
-                "String": "loop-consumer-id"
-              },
               "name": {
                 "String": "loop-consumer"
               },
               "comment": {
                 "RedactedSecret": {
-                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
+                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$LbFW9oG/ehwoFzDBwJOJKA$nIMwiMLnbHRJ1HEUMeoESsgejhfAbv/Sn96iAyMOJBg"
                 }
+              },
+              "identifier": {
+                "String": "loop-consumer-id"
               }
             },
             "exists": true,
@@ -1096,6 +1096,43 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.consumer"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "identifier": {
+              "String": "direct-consumer-id"
+            },
+            "comment": {
+              "RedactedSecret": {
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$U3LtYg+6DE/6f7Uvj2eVGQ$wmL3Q64d//mG5QwAHWm6OhhV3MWUUxMV8xvwyC6yqhQ"
+              }
+            },
+            "name": {
+              "String": "direct-consumer"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "direct.seed",
+            "root"
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
         "identity": "looped[0].nested.leaf"
       },
       "current": {
@@ -1127,7 +1164,7 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
-        "identity": "direct.consumer"
+        "identity": "root"
       },
       "current": {
         "status": "present",
@@ -1135,85 +1172,18 @@
           "id": {
             "provider": "mock",
             "resource_type": "test.resource",
-            "identity": "direct.consumer"
+            "identity": "root"
           },
           "identifier": "mock-id",
           "attributes": {
-            "comment": {
-              "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
-              }
+            "identifier": {
+              "String": "root-id"
             },
             "name": {
-              "String": "direct-consumer"
-            },
-            "identifier": {
-              "String": "direct-consumer-id"
+              "String": "root"
             }
           },
           "exists": true,
-          "dependency_bindings": [
-            "direct.seed",
-            "root"
-          ]
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "looped[0].consumer"
-      },
-      "current": {
-        "status": "present",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "looped[0].consumer"
-          },
-          "identifier": "mock-id",
-          "attributes": {
-            "name": {
-              "String": "loop-consumer"
-            },
-            "comment": {
-              "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
-              }
-            },
-            "identifier": {
-              "String": "loop-consumer-id"
-            }
-          },
-          "exists": true,
-          "dependency_bindings": [
-            "looped[0].seed",
-            "root"
-          ]
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "looped[0].after_ready"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "looped[0].after_ready"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
           "dependency_bindings": []
         }
       }
@@ -1240,35 +1210,6 @@
             },
             "name": {
               "String": "loop-seed"
-            }
-          },
-          "exists": true,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "root"
-      },
-      "current": {
-        "status": "present",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "root"
-          },
-          "identifier": "mock-id",
-          "attributes": {
-            "identifier": {
-              "String": "root-id"
-            },
-            "name": {
-              "String": "root"
             }
           },
           "exists": true,
@@ -1344,16 +1285,75 @@
           },
           "identifier": "mock-id",
           "attributes": {
-            "name": {
-              "String": "direct-nested"
-            },
             "identifier": {
               "String": "direct-nested-id"
+            },
+            "name": {
+              "String": "direct-nested"
             }
           },
           "exists": true,
           "dependency_bindings": [
             "direct.consumer"
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].after_ready"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].after_ready"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].consumer"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "identifier": {
+              "String": "loop-consumer-id"
+            },
+            "comment": {
+              "RedactedSecret": {
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$LbFW9oG/ehwoFzDBwJOJKA$nIMwiMLnbHRJ1HEUMeoESsgejhfAbv/Sn96iAyMOJBg"
+              }
+            },
+            "name": {
+              "String": "loop-consumer"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "looped[0].seed",
+            "root"
           ]
         }
       }

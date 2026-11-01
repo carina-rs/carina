@@ -14,12 +14,10 @@ use std::ops::Deref;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(test, feature = "test-support"))]
-use super::RootScope;
 use super::{
-    AbsoluteBindingAddress, BindingAddress, Directives, ModuleSource, ProviderModuleSource,
-    RelativeBindingName, ResourceId, ResourceIdentity, ResourceIdentityState, SavedModuleSource,
-    Value,
+    AbsoluteBindingAddress, BindingAddress, Directives, LeftoverPlaceholder, ModuleSource,
+    NoPlaceholder, ParserPlaceholder, PlaceholderKind, ProviderModuleSource, RelativeBindingName,
+    ResourceId, ResourceIdentity, ResourceIdentityState, SavedModuleSource, Value,
 };
 
 /// A read-only resource (data source).
@@ -57,16 +55,20 @@ use super::{
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize, B: Serialize",
-    deserialize = "S: Deserialize<'de>, B: Deserialize<'de>"
+    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize",
+    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>"
 ))]
-pub struct DataSource<S = ModuleSource, B: BindingAddress = AbsoluteBindingAddress> {
+pub struct DataSource<
+    S = ModuleSource,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
-    pub attributes: IndexMap<String, Value<B>>,
+    pub attributes: IndexMap<String, Value<P, B>>,
     /// `directives` meta-argument block — `depends_on` and
     /// `provider_instance` are meaningful for data sources too.
-    #[serde(default = "Directives::<B>::default")]
+    #[serde(default)]
     pub directives: Directives<B>,
     /// Binding name from `let` bindings in DSL.
     #[serde(default)]
@@ -87,91 +89,10 @@ pub struct DataSource<S = ModuleSource, B: BindingAddress = AbsoluteBindingAddre
 /// Persisted data-source representation used by saved plans.
 pub type SavedDataSource = DataSource<SavedModuleSource>;
 
-/// Parser/module-definition form before scope expansion.
-pub type AuthoredDataSource<S = ModuleSource> = DataSource<S, RelativeBindingName>;
-pub type ExpandedDataSource<S = ModuleSource> = DataSource<S, AbsoluteBindingAddress>;
-
-impl<S> DataSource<S, RelativeBindingName> {
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn resolve_root(self, scope: &RootScope) -> DataSource<S, AbsoluteBindingAddress> {
-        self.resolve_bindings(&mut |binding| scope.resolve(binding))
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn resolve_root_for_test(self) -> DataSource<S, AbsoluteBindingAddress> {
-        self.resolve_root(&RootScope::new())
-    }
-
-    pub fn resolve_module(
-        self,
-        scope: &super::ModuleInstanceScope,
-    ) -> DataSource<S, AbsoluteBindingAddress> {
-        self.resolve_bindings(&mut |binding| scope.resolve(binding))
-    }
-
-    pub(crate) fn resolve_bindings(
-        self,
-        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> DataSource<S, AbsoluteBindingAddress> {
-        let Self {
-            id,
-            attributes,
-            directives,
-            binding,
-            dependency_bindings,
-            module_source,
-            quoted_string_attrs,
-        } = self;
-        DataSource {
-            id,
-            attributes: attributes
-                .into_iter()
-                .map(|(name, value)| (name, value.resolve_bindings(resolve)))
-                .collect(),
-            directives: directives.resolve_bindings(resolve),
-            binding: binding.map(&mut *resolve),
-            dependency_bindings: dependency_bindings.into_iter().map(resolve).collect(),
-            module_source,
-            quoted_string_attrs,
-        }
-    }
-
-    pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
-        self.binding = Some(RelativeBindingName::new(binding.into()));
-        self
-    }
-}
-
-impl DataSource<ModuleSource, AbsoluteBindingAddress> {
-    pub(crate) fn map_absolute_bindings(
-        &mut self,
-        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
-    ) {
-        let Self {
-            id: _id,
-            attributes,
-            directives,
-            binding,
-            dependency_bindings,
-            module_source,
-            quoted_string_attrs: _quoted_string_attrs,
-        } = self;
-        for value in attributes.values_mut() {
-            value.map_absolute_bindings(map);
-        }
-        directives.map_absolute_bindings(map);
-        if let Some(binding) = binding {
-            *binding = map(binding);
-        }
-        *dependency_bindings = std::mem::take(dependency_bindings)
-            .into_iter()
-            .map(|binding| map(&binding))
-            .collect();
-        if let Some(source) = module_source {
-            source.map_absolute_bindings(map);
-        }
-    }
-}
+pub type AuthoredDataSource<S = ModuleSource> =
+    DataSource<S, ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedDataSource<S = ModuleSource> =
+    DataSource<S, NoPlaceholder, AbsoluteBindingAddress>;
 
 /// Source-neutral data-source payload exposed to providers.
 pub type ProviderDataSource = DataSource<ProviderModuleSource>;
@@ -199,7 +120,7 @@ impl From<DataSource> for SavedDataSource {
     }
 }
 
-impl<S, B: BindingAddress> DataSource<S, B> {
+impl<P: PlaceholderKind, B: BindingAddress> DataSource<ModuleSource, P, B> {
     /// Create a pending data source with an empty attribute map.
     pub fn pending(resource_type: impl Into<String>) -> Self {
         Self {
@@ -231,6 +152,10 @@ impl<S, B: BindingAddress> DataSource<S, B> {
     ///
     /// `DataSource` is a leaf node and persists in state (as a
     /// snapshot), so its id is `PersistentId`-typed.
+    pub fn persistent_id(&self) -> super::PersistentId {
+        super::PersistentId::new(self.id.clone())
+    }
+
     /// Create a data source with a provider-qualified id.
     pub fn with_provider(
         provider: impl Into<String>,
@@ -272,11 +197,7 @@ impl<S, B: BindingAddress> DataSource<S, B> {
     }
 }
 
-impl<S: Clone, B: BindingAddress> DataSource<S, B> {
-    pub fn persistent_id(&self) -> super::PersistentId {
-        super::PersistentId::new(self.id.clone())
-    }
-
+impl<S: Clone, P: PlaceholderKind, B: BindingAddress> DataSource<S, P, B> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_pending();
@@ -290,22 +211,33 @@ impl<S: Clone, B: BindingAddress> DataSource<S, B> {
     }
 }
 
-impl<S, B: BindingAddress> DataSource<S, B> {
-    pub fn get_attr(&self, key: &str) -> Option<&Value<B>> {
-        self.attributes.get(key)
-    }
-
-    pub fn set_attr(&mut self, key: impl Into<String>, value: Value<B>) {
-        self.attributes.insert(key.into(), value);
-    }
-
-    pub fn with_attribute(mut self, key: impl Into<String>, value: Value<B>) -> Self {
-        self.attributes.insert(key.into(), value);
-        self
+impl<S, B: BindingAddress> DataSource<S, ParserPlaceholder, B> {
+    pub(crate) fn into_expanded(
+        self,
+    ) -> Result<DataSource<S, NoPlaceholder, B>, LeftoverPlaceholder> {
+        let DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs,
+        } = self;
+        let attributes = super::into_expanded_value_map(attributes, Some(&id))?;
+        Ok(DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs,
+        })
     }
 }
 
-impl<S> DataSource<S> {
+impl<S> DataSource<S, NoPlaceholder, AbsoluteBindingAddress> {
     /// Remove module provenance while crossing into provider-owned code.
     pub(crate) fn into_provider_data_source(self) -> ProviderDataSource {
         let DataSource {
@@ -327,19 +259,85 @@ impl<S> DataSource<S> {
             quoted_string_attrs,
         }
     }
+}
 
-    pub fn with_absolute_binding(mut self, binding: AbsoluteBindingAddress) -> Self {
-        self.binding = Some(binding);
+impl<S, P: PlaceholderKind, B: BindingAddress> DataSource<S, P, B> {
+    pub fn get_attr(&self, key: &str) -> Option<&Value<P, B>> {
+        self.attributes.get(key)
+    }
+
+    pub fn set_attr(&mut self, key: impl Into<String>, value: Value<P, B>) {
+        self.attributes.insert(key.into(), value);
+    }
+
+    pub fn with_attribute(mut self, key: impl Into<String>, value: Value<P, B>) -> Self {
+        self.attributes.insert(key.into(), value);
         self
     }
 }
 
-#[cfg(test)]
-impl<S> DataSource<S> {
-    pub fn with_root_binding(self, binding: impl Into<String>) -> Self {
-        self.with_absolute_binding(
-            RootScope::new().resolve(RelativeBindingName::new(binding.into())),
-        )
+impl<S, P: PlaceholderKind> DataSource<S, P, RelativeBindingName> {
+    pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
+        self.binding = Some(RelativeBindingName::new(binding.into()));
+        self
+    }
+
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> DataSource<S, P, AbsoluteBindingAddress> {
+        let Self {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs,
+        } = self;
+        DataSource {
+            id,
+            attributes: attributes
+                .into_iter()
+                .map(|(name, value)| (name, value.resolve_bindings(resolve)))
+                .collect(),
+            directives: directives.resolve_bindings(resolve),
+            binding: binding.map(&mut *resolve),
+            dependency_bindings: dependency_bindings.into_iter().map(resolve).collect(),
+            module_source,
+            quoted_string_attrs,
+        }
+    }
+}
+
+impl<P: PlaceholderKind> DataSource<ModuleSource, P, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            id: _id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = self;
+        for value in attributes.values_mut() {
+            value.map_absolute_bindings(map);
+        }
+        directives.map_absolute_bindings(map);
+        if let Some(binding) = binding {
+            *binding = map(binding);
+        }
+        *dependency_bindings = std::mem::take(dependency_bindings)
+            .into_iter()
+            .map(|binding| map(&binding))
+            .collect();
+        if let Some(source) = module_source {
+            source.map_absolute_bindings(map);
+        }
     }
 }
 

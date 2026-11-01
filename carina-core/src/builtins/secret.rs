@@ -1,6 +1,6 @@
 //! `secret(value)` built-in function
 
-use crate::resource::{BindingAddress, DeferredValue, Value};
+use crate::resource::{BindingAddress, DeferredValue, NoPlaceholder, Value};
 
 /// `secret(value)` - Mark a value as secret.
 ///
@@ -12,7 +12,9 @@ use crate::resource::{BindingAddress, DeferredValue, Value};
 /// secret("my-password")       // => Value::Deferred(DeferredValue::Secret(Value::String("my-password")))
 /// secret(env("DB_PASSWORD"))  // => Value::Deferred(DeferredValue::Secret(Value::String(<env value>)))
 /// ```
-pub(crate) fn builtin_secret<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_secret<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!("secret() expects 1 argument, got {}", args.len()));
     }

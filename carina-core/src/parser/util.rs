@@ -6,11 +6,9 @@ use super::Rule;
 use super::context::next_pair;
 use super::error::ParseError;
 use super::expressions::string_literal::parse_string_literal;
-use crate::eval_value::AuthoredEvalValue as EvalValue;
-use crate::resource::{
-    AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
-    AuthoredValue as Value,
-};
+use crate::eval_value::EvalValue;
+use crate::parser::ParsedValue as Value;
+use crate::resource::{ConcreteValue, DeferredValue};
 
 /// Convert PascalCase to snake_case (e.g., "VpcId" → "vpc_id", "AwsAccountId" → "aws_account_id").
 pub fn pascal_to_snake(s: &str) -> String {
@@ -76,6 +74,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "redacted secret",
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
+        Value::Deferred(DeferredValue::Placeholder(_)) => "placeholder",
     }
 }
 

@@ -41,55 +41,41 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
         .collect()
 }
 
+fn mixed_tag_key_style_warnings_for_population<E, D, B: carina_core::resource::BindingAddress>(
+    root_inputs: &[(PathBuf, String)],
+    parsed: &carina_core::parser::File<
+        E,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    base_dir: &Path,
+) -> Vec<LintWarning> {
+    let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
+    mixed_tag_key_style_warnings(&tag_keys)
+}
+
 enum LintFile {
-    Blocked(carina_core::parser::InferredFile),
+    Blocked(carina_core::config_loader::InferredRootDirectory),
     Resolved(carina_core::parser::ModuleResolvedInferredFile),
 }
 
-fn collect_list_struct_schema_metadata<E, B: carina_core::resource::BindingAddress, D>(
-    parsed: &carina_core::parser::File<E, B, D>,
-    schemas: &carina_core::schema::SchemaRegistry,
-    all_list_struct_attrs: &mut HashSet<String>,
-    block_name_suggestions: &mut HashMap<String, String>,
-) {
-    for rref in parsed.iter_top_level_resources() {
-        let schema = match rref {
-            carina_core::parser::ResourceRef::Resource(resource) => schemas.get_for(resource),
-            carina_core::parser::ResourceRef::DataSource(data_source) => {
-                schemas.get_for_data_source(data_source)
-            }
-            carina_core::parser::ResourceRef::LiveComposition(_) => None,
-            carina_core::parser::ResourceRef::Deferred { resource, .. } => {
-                schemas.get_for(resource)
-            }
-        };
-        if let Some(schema) = schema {
-            let schema = schema.as_schema();
-            all_list_struct_attrs.extend(list_struct_attr_names(schema));
-            for (attr_name, attr_schema) in schema.attributes() {
-                if let Some(block_name) = attr_schema.block_name() {
-                    block_name_suggestions.insert(attr_name.clone(), block_name.to_string());
-                }
-            }
-        }
-    }
-}
-
 impl LintFile {
-    fn collect_list_struct_schema_metadata(
+    fn collect_list_struct_attrs(
         &self,
         schemas: &carina_core::schema::SchemaRegistry,
         all_list_struct_attrs: &mut HashSet<String>,
         block_name_suggestions: &mut HashMap<String, String>,
     ) {
         match self {
-            Self::Blocked(parsed) => collect_list_struct_schema_metadata(
-                parsed,
+            Self::Blocked(parsed) => collect_list_struct_attrs_for_population(
+                parsed.parsed(),
                 schemas,
                 all_list_struct_attrs,
                 block_name_suggestions,
             ),
-            Self::Resolved(parsed) => collect_list_struct_schema_metadata(
+            Self::Resolved(parsed) => collect_list_struct_attrs_for_population(
                 parsed,
                 schemas,
                 all_list_struct_attrs,
@@ -105,12 +91,44 @@ impl LintFile {
     ) -> Vec<LintWarning> {
         match self {
             Self::Blocked(parsed) => {
-                let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
-                mixed_tag_key_style_warnings(&tag_keys)
+                mixed_tag_key_style_warnings_for_population(root_inputs, parsed.parsed(), base_dir)
             }
             Self::Resolved(parsed) => {
-                let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
-                mixed_tag_key_style_warnings(&tag_keys)
+                mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+            }
+        }
+    }
+}
+
+fn collect_list_struct_attrs_for_population<E, D, B: carina_core::resource::BindingAddress>(
+    parsed: &carina_core::parser::File<
+        E,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    schemas: &carina_core::schema::SchemaRegistry,
+    all_list_struct_attrs: &mut HashSet<String>,
+    block_name_suggestions: &mut HashMap<String, String>,
+) {
+    for resource in parsed.iter_top_level_resources() {
+        let schema = match resource {
+            carina_core::parser::TopLevelResourceRef::Resource(resource) => {
+                schemas.get_for(resource)
+            }
+            carina_core::parser::TopLevelResourceRef::DataSource(data_source) => {
+                schemas.get_for_data_source(data_source)
+            }
+            carina_core::parser::TopLevelResourceRef::LiveComposition(_) => None,
+        };
+        if let Some(schema) = schema {
+            let schema = schema.as_schema();
+            all_list_struct_attrs.extend(list_struct_attr_names(schema));
+            for (attribute_name, attribute_schema) in schema.attributes() {
+                if let Some(block_name) = attribute_schema.block_name() {
+                    block_name_suggestions.insert(attribute_name.clone(), block_name.to_string());
+                }
             }
         }
     }
@@ -180,7 +198,7 @@ pub fn run_lint(
             )
         })?)
     } else {
-        LintFile::Blocked(parsed.into_parsed())
+        LintFile::Blocked(parsed)
     };
 
     // Collect source texts for each .crn file
@@ -200,9 +218,9 @@ pub fn run_lint(
     let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
     let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
     // carina#3181: walk every top-level resource — managed and data
-    // source schemas can both carry List<Struct> attributes. Compositions
-    // have no provider schema.
-    parsed.collect_list_struct_schema_metadata(
+    // source schemas can both carry List<Struct> attributes. compositions
+    // have no schema, so `get_for` returns `None` for them.
+    parsed.collect_list_struct_attrs(
         schemas,
         &mut all_list_struct_attrs,
         &mut block_name_suggestions,
@@ -449,8 +467,8 @@ attributes {
         );
         let root_inputs = vec![(root_file, root_source.to_string())];
 
-        let tag_keys = collect_all_tag_keys(&root_inputs, &parsed, temp.path());
-        let warnings = mixed_tag_key_style_warnings(&tag_keys);
+        let warnings =
+            mixed_tag_key_style_warnings_for_population(&root_inputs, &parsed, temp.path());
 
         assert_eq!(warnings.len(), 2);
         assert!(warnings.iter().all(|warning| warning.file == module_file));
@@ -477,8 +495,8 @@ attributes {
             (db_file.clone(), db_source.to_string()),
         ];
 
-        let tag_keys = collect_all_tag_keys(&root_inputs, &parsed, temp.path());
-        let warnings = mixed_tag_key_style_warnings(&tag_keys);
+        let warnings =
+            mixed_tag_key_style_warnings_for_population(&root_inputs, &parsed, temp.path());
 
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].file, db_file);

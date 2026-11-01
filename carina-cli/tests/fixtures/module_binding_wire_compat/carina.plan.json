@@ -1,7 +1,7 @@
 {
-  "version": 35,
+  "version": 36,
   "carina_version": "0.9.0",
-  "timestamp": "2026-10-31T10:49:00.525196+00:00",
+  "timestamp": "2026-11-01T02:19:34.045464+00:00",
   "source_path": "carina-cli/tests/fixtures/module_binding_wire_compat",
   "state_lineage": null,
   "state_serial": null,
@@ -151,7 +151,7 @@
             },
             "comment": {
               "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$U3LtYg+6DE/6f7Uvj2eVGQ$wmL3Q64d//mG5QwAHWm6OhhV3MWUUxMV8xvwyC6yqhQ"
               }
             }
           },
@@ -255,7 +255,7 @@
             },
             "comment": {
               "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$LbFW9oG/ehwoFzDBwJOJKA$nIMwiMLnbHRJ1HEUMeoESsgejhfAbv/Sn96iAyMOJBg"
               }
             }
           },
@@ -382,7 +382,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$U3LtYg+6DE/6f7Uvj2eVGQ$wmL3Q64d//mG5QwAHWm6OhhV3MWUUxMV8xvwyC6yqhQ"
           }
         }
       },
@@ -480,7 +480,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$LbFW9oG/ehwoFzDBwJOJKA$nIMwiMLnbHRJ1HEUMeoESsgejhfAbv/Sn96iAyMOJBg"
           }
         }
       },
@@ -603,7 +603,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$RZXm9xMnMYh3qIGSjz0d+Q$I/xb2LHHE/F3uy7PliwuTnCCIC9VU0eBplti1kExJxU"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$xduE59zIEGDcs79VmCe+fQ$sSJ+W+rH1nz9AIdn0V3+8xuUSEe/6fC1NhDYe7YJOEw"
           }
         }
       },
@@ -701,7 +701,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$T56ARGHyXBlrcK5VsCs8zA$zVlhVKMQqbNuGXZqK5uYFIdvNmxmBZVih069eS6+QuA"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$jyGs0jshjZmYM5KSdYbguw$ufniXFH/ViiTU3v6vXAgM3db0jL6BmlO75vEtVvFy8k"
           }
         }
       },
@@ -1156,50 +1156,6 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
-        "identity": "direct.nested.leaf"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.nested.leaf"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "looped[0].consumer"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "looped[0].consumer"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
         "identity": "direct.seed"
       },
       "current": {
@@ -1222,7 +1178,7 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
-        "identity": "looped[0].seed"
+        "identity": "direct.nested.leaf"
       },
       "current": {
         "status": "absent",
@@ -1230,7 +1186,7 @@
           "id": {
             "provider": "mock",
             "resource_type": "test.resource",
-            "identity": "looped[0].seed"
+            "identity": "direct.nested.leaf"
           },
           "identifier": null,
           "attributes": {},
@@ -1266,6 +1222,28 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].consumer"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
         "identity": "looped[0].nested.leaf"
       },
       "current": {
@@ -1275,6 +1253,28 @@
             "provider": "mock",
             "resource_type": "test.resource",
             "identity": "looped[0].nested.leaf"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].seed"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].seed"
           },
           "identifier": null,
           "attributes": {},

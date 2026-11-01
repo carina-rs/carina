@@ -1,6 +1,6 @@
 //! `replace(search, replacement, string)` built-in function
 
-use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -19,7 +19,9 @@ use super::value_type_name;
 /// replace("-", "_", "hello-world")  // => "hello_world"
 /// "hello-world" |> replace("-", "_") // => "hello_world" (pipe form)
 /// ```
-pub(crate) fn builtin_replace<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_replace<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 3 {
         return Err(format!(
             "replace() expects 3 arguments (search, replacement, string), got {}",

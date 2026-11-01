@@ -1174,8 +1174,11 @@ mod tests {
     }
 
     fn root_resource_ref(binding: &str, attribute: &str) -> Value {
-        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
-            .resolve_root_for_test()
+        carina_core::resource::Value::<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::RelativeBindingName,
+        >::resource_ref(binding, attribute, Vec::new())
+        .resolve_root_for_test()
     }
 
     fn fixture_svg_with_theme(name: &str, theme: SvgTheme) -> String {

@@ -4,6 +4,7 @@ use std::path::Path;
 use indexmap::IndexMap;
 
 use crate::parser::{ConsumerArgumentParameter, File, ParsedFile, ProviderContext, RequireBlock};
+use crate::resource::{ParserPlaceholder, RelativeBindingName};
 use crate::static_type::ConsumerStaticType;
 
 use super::resolver::{StrictTypeResolution, TypeResolutionPolicy};
@@ -14,7 +15,7 @@ use super::resolver::{StrictTypeResolution, TypeResolutionPolicy};
 pub struct ResolvedModuleSignature {
     pub arguments: Vec<ConsumerArgumentParameter>,
     pub attributes: IndexMap<String, Option<ConsumerStaticType>>,
-    pub requires: Vec<RequireBlock>,
+    pub requires: Vec<RequireBlock<ParserPlaceholder, RelativeBindingName>>,
 }
 
 /// Imported module alias to its resolved argument/output signature.
@@ -67,14 +68,11 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
 }
 
 /// Load and resolve every module signature imported by `parsed`.
-pub fn load_resolved_module_signatures<E, B, D>(
-    parsed: &File<E, B, D>,
+pub fn load_resolved_module_signatures<E, B: crate::resource::BindingAddress, D>(
+    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D, B>,
     base_dir: &Path,
     config: &ProviderContext,
-) -> ResolvedModuleSignatures
-where
-    B: crate::resource::BindingAddress,
-{
+) -> ResolvedModuleSignatures {
     parsed
         .uses
         .iter()

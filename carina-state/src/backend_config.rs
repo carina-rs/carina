@@ -1,7 +1,10 @@
 //! Schema-backed state backend configuration.
 
 use carina_core::parser;
-use carina_core::resource::{BindingAddress, ConcreteValue, Value, ValueString};
+use carina_core::resource::{
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, NoPlaceholder, PlaceholderKind, Value,
+    ValueString,
+};
 use carina_core::schema::{
     AttributeType, DslTransform, TypeError, TypeIdentity, ValidatedConfigSchema,
 };
@@ -32,7 +35,7 @@ impl BackendConfig {
 
     /// Convert the checked representation to the parser shape used by saved
     /// plans. Enum values use API spelling.
-    pub fn to_parser_config(&self) -> parser::ExpandedBackendConfig {
+    pub fn to_parser_config(&self) -> parser::BackendConfig<NoPlaceholder, AbsoluteBindingAddress> {
         match self {
             Self::S3(settings) => {
                 let mut attributes = HashMap::from([
@@ -269,11 +272,11 @@ fn local_schema() -> ValidatedConfigSchema {
     .expect("the built-in local backend config schema must be valid")
 }
 
-fn canonicalize_attributes<B: BindingAddress>(
-    config: &parser::BackendConfig<B>,
+fn canonicalize_attributes<P: PlaceholderKind, B: BindingAddress>(
+    config: &parser::BackendConfig<P, B>,
     schema: &ValidatedConfigSchema,
     required: &[&'static str],
-) -> (HashMap<String, Value<B>>, Vec<BackendAttributeError>) {
+) -> (HashMap<String, Value<P, B>>, Vec<BackendAttributeError>) {
     let mut errors = Vec::new();
     for attribute in required {
         if !config.attributes.contains_key(*attribute) {
@@ -308,7 +311,7 @@ fn canonicalize_attributes<B: BindingAddress>(
                     continue;
                 }
             };
-        if let Err(error) = rootless_type.validate_in_phase(&canonical) {
+        if let Err(error) = rootless_type.validate(&canonical) {
             errors.push(BackendAttributeError::InvalidAttribute {
                 backend_type: config.backend_type.clone(),
                 attribute: attribute.clone(),
@@ -322,11 +325,11 @@ fn canonicalize_attributes<B: BindingAddress>(
     (canonicalized, errors)
 }
 
-fn invalid_resolved_shape<B: BindingAddress>(
+fn invalid_resolved_shape<P: PlaceholderKind, B: BindingAddress>(
     backend_type: &str,
     attribute: &str,
     expected: &str,
-    value: &Value<B>,
+    value: &Value<P, B>,
 ) -> BackendAttributeError {
     BackendAttributeError::InvalidAttribute {
         backend_type: backend_type.to_string(),
@@ -338,8 +341,8 @@ fn invalid_resolved_shape<B: BindingAddress>(
     }
 }
 
-fn take_string<B: BindingAddress>(
-    attributes: &mut HashMap<String, Value<B>>,
+fn take_string<P: PlaceholderKind, B: BindingAddress>(
+    attributes: &mut HashMap<String, Value<P, B>>,
     backend_type: &str,
     attribute: &str,
 ) -> Result<Option<ValueString>, BackendAttributeError> {
@@ -357,8 +360,8 @@ fn take_string<B: BindingAddress>(
     }
 }
 
-fn take_bool<B: BindingAddress>(
-    attributes: &mut HashMap<String, Value<B>>,
+fn take_bool<P: PlaceholderKind, B: BindingAddress>(
+    attributes: &mut HashMap<String, Value<P, B>>,
     backend_type: &str,
     attribute: &str,
 ) -> Result<Option<bool>, BackendAttributeError> {
@@ -389,8 +392,8 @@ fn collect_attribute<T>(
     }
 }
 
-fn resolve_s3_backend<B: BindingAddress>(
-    config: &parser::BackendConfig<B>,
+fn resolve_s3_backend<P: PlaceholderKind, B: BindingAddress>(
+    config: &parser::BackendConfig<P, B>,
 ) -> Result<BackendConfig, BackendConfigError> {
     let (mut attributes, mut errors) =
         canonicalize_attributes(config, &s3_schema(), &["bucket", "key"]);
@@ -440,8 +443,8 @@ fn resolve_s3_backend<B: BindingAddress>(
     }))
 }
 
-fn resolve_local_backend<B: BindingAddress>(
-    config: &parser::BackendConfig<B>,
+fn resolve_local_backend<P: PlaceholderKind, B: BindingAddress>(
+    config: &parser::BackendConfig<P, B>,
 ) -> Result<BackendConfig, BackendConfigError> {
     let (mut attributes, mut errors) = canonicalize_attributes(config, &local_schema(), &[]);
     let path = collect_attribute(
@@ -455,10 +458,12 @@ fn resolve_local_backend<B: BindingAddress>(
     Ok(BackendConfig::Local(LocalBackendSettings { path }))
 }
 
-impl<B: BindingAddress> TryFrom<&parser::BackendConfig<B>> for BackendConfig {
+impl<P: PlaceholderKind, B: BindingAddress> TryFrom<&parser::BackendConfig<P, B>>
+    for BackendConfig
+{
     type Error = BackendConfigError;
 
-    fn try_from(config: &parser::BackendConfig<B>) -> Result<Self, Self::Error> {
+    fn try_from(config: &parser::BackendConfig<P, B>) -> Result<Self, Self::Error> {
         match config.backend_type.as_str() {
             S3_BACKEND_TYPE => resolve_s3_backend(config),
             LOCAL_BACKEND_TYPE => resolve_local_backend(config),
@@ -470,6 +475,7 @@ impl<B: BindingAddress> TryFrom<&parser::BackendConfig<B>> for BackendConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::NoPlaceholder;
 
     fn resolve(source: &str) -> Result<BackendConfig, BackendConfigError> {
         let parsed = carina_core::parser::parse_file(
@@ -523,9 +529,7 @@ mod tests {
             .expect("S3 schema must contain region")
             .canonicalize_provider_config(
                 AWS_PROVIDER_NAME,
-                carina_core::resource::ExpandedValue::Concrete(
-                    carina_core::resource::ExpandedConcreteValue::String("us_west_2".into()),
-                ),
+                Value::<NoPlaceholder>::Concrete(ConcreteValue::String("us_west_2".into())),
             )
             .unwrap();
         let Value::Concrete(ConcreteValue::CanonicalEnum(expected)) = provider_value else {

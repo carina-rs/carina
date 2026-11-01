@@ -11,7 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, Value,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, InterpolationPart,
+    NoPlaceholder, Value,
 };
 use crate::schema::{AttributePathTypeError, ValidatedResourceSchema};
 
@@ -61,8 +62,8 @@ impl AttrPath {
     /// or `None` if any segment is missing or not a map at a non-leaf.
     pub(crate) fn resolve<'a, B: BindingAddress>(
         &self,
-        attrs: &'a HashMap<String, Value<B>>,
-    ) -> Option<&'a Value<B>> {
+        attrs: &'a HashMap<String, Value<NoPlaceholder, B>>,
+    ) -> Option<&'a Value<NoPlaceholder, B>> {
         let (first, rest) = self.segments().split_first()?;
         let mut current = attrs.get(first)?;
         for segment in rest {
@@ -163,7 +164,7 @@ impl WaitResolutionError {
 pub fn resolve_wait_predicate<B: BindingAddress>(
     root: &B,
     attribute_segments: &[String],
-    value: Value<B>,
+    value: Value<NoPlaceholder, B>,
     schema: Option<&ValidatedResourceSchema>,
 ) -> Result<WaitPredicate<B>, WaitResolutionError> {
     let target = root.as_str();
@@ -220,6 +221,77 @@ pub fn resolve_wait_predicate<B: BindingAddress>(
     })
 }
 
+/// Validate a parser-stage wait RHS without converting the surrounding value
+/// tree to the post-expansion stage.
+pub(crate) fn validate_wait_predicate<B: BindingAddress>(
+    root: &B,
+    attribute_segments: &[String],
+    value: &Value<NoPlaceholder, B>,
+    schema: Option<&ValidatedResourceSchema>,
+) -> Result<(), WaitResolutionError> {
+    let target = root.as_str();
+    let attr =
+        AttrPath::try_new(attribute_segments.to_vec()).map_err(WaitResolutionError::InvalidPath)?;
+    let attribute = attr.segments().join(".");
+
+    if let Some(schema) = schema {
+        let effective_type = schema
+            .effective_type_at_attribute_path(attr.segments())
+            .map_err(|error| match error {
+                AttributePathTypeError::Empty => {
+                    WaitResolutionError::InvalidPath(AttrPathError::Empty)
+                }
+                AttributePathTypeError::UnknownAttribute { attribute } => {
+                    WaitResolutionError::UnknownAttribute {
+                        target: target.to_string(),
+                        attribute,
+                        resource_type: schema.as_schema().resource_type().to_string(),
+                    }
+                }
+                AttributePathTypeError::UnknownStructField {
+                    parent_path,
+                    field,
+                    struct_name,
+                } => WaitResolutionError::UnknownStructField {
+                    target: target.to_string(),
+                    full_path: format!("{parent_path}.{field}"),
+                    struct_name,
+                },
+                AttributePathTypeError::CannotTraverse { path, type_name } => {
+                    WaitResolutionError::CannotTraverse {
+                        target: target.to_string(),
+                        full_path: attribute.clone(),
+                        traversed: path,
+                        type_name,
+                    }
+                }
+            })?;
+        if let Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) = value {
+            let resolved: Value<NoPlaceholder, B> = crate::value::canonicalize_wait_rhs_with_type(
+                Value::Concrete(ConcreteValue::EnumIdentifier(identifier.clone())),
+                &effective_type,
+            );
+            if let Some(identifier) = unresolved_enum_identifier(&resolved) {
+                return Err(WaitResolutionError::UnresolvedEnumIdentifier {
+                    target: target.to_string(),
+                    attribute,
+                    identifier: identifier.to_string(),
+                });
+            }
+            return Ok(());
+        }
+    }
+
+    if let Some(identifier) = unresolved_enum_identifier(value) {
+        return Err(WaitResolutionError::UnresolvedEnumIdentifier {
+            target: target.to_string(),
+            attribute,
+            identifier: identifier.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// A wait RHS that is safe to persist and evaluate.
 ///
 /// The inner value is private so an unresolved [`ConcreteValue::EnumIdentifier`]
@@ -227,18 +299,18 @@ pub fn resolve_wait_predicate<B: BindingAddress>(
 /// deserialization. Build predicates with [`WaitPredicate::equals`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct WaitPredicateValue<B: BindingAddress = AbsoluteBindingAddress>(Value<B>);
+pub struct WaitPredicateValue<B: BindingAddress = AbsoluteBindingAddress>(Value<NoPlaceholder, B>);
 
 impl<B: BindingAddress> WaitPredicateValue<B> {
-    pub fn as_value(&self) -> &Value<B> {
+    pub fn as_value(&self) -> &Value<NoPlaceholder, B> {
         &self.0
     }
 }
 
-impl<B: BindingAddress> TryFrom<Value<B>> for WaitPredicateValue<B> {
+impl<B: BindingAddress> TryFrom<Value<NoPlaceholder, B>> for WaitPredicateValue<B> {
     type Error = WaitPredicateError;
 
-    fn try_from(value: Value<B>) -> Result<Self, Self::Error> {
+    fn try_from(value: Value<NoPlaceholder, B>) -> Result<Self, Self::Error> {
         if let Some(identifier) = unresolved_enum_identifier(&value) {
             return Err(WaitPredicateError::UnresolvedEnumIdentifier {
                 identifier: identifier.to_string(),
@@ -253,12 +325,12 @@ where
     B: BindingAddress + Deserialize<'de>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::<B>::deserialize(deserializer)?;
+        let value = Value::<NoPlaceholder, B>::deserialize(deserializer)?;
         Self::try_from(value).map_err(serde::de::Error::custom)
     }
 }
 
-fn unresolved_enum_identifier<B: BindingAddress>(value: &Value<B>) -> Option<&str> {
+fn unresolved_enum_identifier<B: BindingAddress>(value: &Value<NoPlaceholder, B>) -> Option<&str> {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
             .values()
@@ -307,7 +379,8 @@ fn unresolved_enum_identifier<B: BindingAddress>(value: &Value<B>) -> Option<&st
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => None,
     }
 }
@@ -323,14 +396,17 @@ pub enum WaitPredicate<B: BindingAddress = AbsoluteBindingAddress> {
 }
 
 impl<B: BindingAddress> WaitPredicate<B> {
-    pub fn equals(attr: AttrPath, value: Value<B>) -> Result<Self, WaitPredicateError> {
+    pub fn equals(
+        attr: AttrPath,
+        value: Value<NoPlaceholder, B>,
+    ) -> Result<Self, WaitPredicateError> {
         Ok(Self::Equals {
             attr,
             value: WaitPredicateValue::try_from(value)?,
         })
     }
 
-    pub fn value(&self) -> &Value<B> {
+    pub fn value(&self) -> &Value<NoPlaceholder, B> {
         match self {
             Self::Equals { value, .. } => value.as_value(),
         }
@@ -349,7 +425,7 @@ impl<B: BindingAddress> WaitPredicate<B> {
     /// Evaluate against the target's `read()` attribute map. Returns
     /// `true` when the predicate is satisfied; missing attributes and
     /// type mismatches both yield `false` (the wait keeps polling).
-    pub fn evaluate(&self, attrs: &HashMap<String, Value<B>>) -> bool {
+    pub fn evaluate(&self, attrs: &HashMap<String, Value<NoPlaceholder, B>>) -> bool {
         match self {
             WaitPredicate::Equals { attr, value } => attr
                 .resolve(attrs)
@@ -365,7 +441,10 @@ impl<B: BindingAddress> WaitPredicate<B> {
 /// expected value authorizes case-insensitive enum comparison. An expected
 /// string is a quoted literal and therefore compares exactly, regardless of
 /// whether the observed API value has already been lifted to `CanonicalEnum`.
-fn wait_values_equal<B: BindingAddress>(observed: &Value<B>, expected: &Value<B>) -> bool {
+fn wait_values_equal<B: BindingAddress>(
+    observed: &Value<NoPlaceholder, B>,
+    expected: &Value<NoPlaceholder, B>,
+) -> bool {
     match (observed, expected) {
         (
             Value::Concrete(ConcreteValue::String(observed)),

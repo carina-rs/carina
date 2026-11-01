@@ -18,9 +18,9 @@ use carina_core::provider::{
     UnobservedReason, UpdateRequest, hydrate_provider_states, normalize_provider_states,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, EnumValueResolver, ProviderResource,
-    RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource, ResourceId, State,
-    UnknownReason, Value,
+    ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue, EnumValueResolver,
+    ProviderResource, RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource,
+    ResourceId, State, Value, absolute_binding_address_for_test,
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
@@ -60,6 +60,8 @@ fn provider_resources(resources: Vec<Resource>) -> Vec<ProviderResource> {
 fn root_resource_ref(binding: &str, attribute: &str) -> Value {
     carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
         .resolve_root_for_test()
+        .into_expanded()
+        .expect("root resource reference contains no placeholders")
 }
 
 fn create_state_for_writeback(outcome: CreateOutcome) -> State {
@@ -749,7 +751,7 @@ async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_overri
         .expect("mock SDK validator schema must cross the host boundary");
     let custom_types =
         carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
-    let attributes = HashMap::from([(
+    let attributes: HashMap<String, Value> = HashMap::from([(
         "guarded".to_string(),
         Value::Concrete(ConcreteValue::String("rejected".into())),
     )]);
@@ -2680,7 +2682,7 @@ async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout()
         carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
     schema
         .validate_with_resolver(
-            &HashMap::from([(
+            &HashMap::<String, Value>::from([(
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String("clean".into())),
             )]),
@@ -2712,7 +2714,7 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
         carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
     let validate = |value: &str| {
         schema.validate_with_resolver(
-            &HashMap::from([(
+            &HashMap::<String, Value>::from([(
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String(value.to_string().into())),
             )]),
@@ -3425,7 +3427,9 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
     resource.set_attr(
         "pending",
         Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-            DeferredValue::Unknown(UnknownReason::ForValue),
+            DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
+                binding: absolute_binding_address_for_test("pending"),
+            }),
         )])),
     );
     let mut resources = provider_resources(vec![resource]);
@@ -3445,7 +3449,9 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
         Some(Value::Concrete(ConcreteValue::List(values)))
             if matches!(
                 values.as_slice(),
-                [Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))]
+                [Value::Deferred(DeferredValue::Unknown(
+                    ApplyTimeUnknown::UpstreamAllExports { binding }
+                ))] if binding.as_str() == "pending"
             )
     ));
     assert_eq!(

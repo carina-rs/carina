@@ -2,7 +2,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -20,8 +20,8 @@ use super::value_type_name;
 /// cidr_subnet("10.0.0.0/16", 8, 255) // => "10.0.255.0/24"
 /// ```
 pub(crate) fn builtin_cidr_subnet<B: BindingAddress>(
-    args: &[Value<B>],
-) -> Result<Value<B>, String> {
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 3 {
         return Err(format!(
             "cidr_subnet() expects 3 arguments (prefix, newbits, netnum), got {}",

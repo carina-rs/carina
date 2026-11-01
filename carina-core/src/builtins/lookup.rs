@@ -1,6 +1,6 @@
 //! `lookup(map, key, default)` built-in function
 
-use crate::resource::{BindingAddress, ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
 
 use super::value_type_name;
 
@@ -16,7 +16,9 @@ use super::value_type_name;
 /// lookup({a: "one", b: "two"}, "a", "default")  // => "one"
 /// lookup({a: "one", b: "two"}, "c", "default")  // => "default"
 /// ```
-pub(crate) fn builtin_lookup<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_lookup<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 3 {
         return Err(format!(
             "lookup() expects 3 arguments (map, key, default), got {}",

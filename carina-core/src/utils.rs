@@ -318,10 +318,10 @@ fn is_intermediate_segment(s: &str) -> bool {
 ///
 /// Used by both `AttributeType::resolve_value` and the LSP diagnostic
 /// pipeline so the two paths cannot drift.
-pub fn expand_enum_shorthand<B: BindingAddress>(
-    value: &Value<B>,
+pub fn expand_enum_shorthand<P: crate::resource::PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
     identity: &crate::schema::TypeIdentity,
-) -> Value<B> {
+) -> Value<P, B> {
     // Only the parser's typed `EnumIdentifier` form is eligible for namespace
     // expansion. Quoted strings remain literal even when their text resembles
     // `TypeName.member`.

@@ -1689,6 +1689,7 @@ fn deferred_value_variant(value: &DeferredValue) -> &'static str {
         DeferredValue::Secret(_inner) => "Secret",
         DeferredValue::RedactedSecret { hash: _hash } => "RedactedSecret",
         DeferredValue::Unknown(_reason) => "Unknown",
+        DeferredValue::Placeholder(never) => match *never {},
     }
 }
 
@@ -2484,6 +2485,11 @@ mod tests {
         TypeIdentity::new(Some("aws"), ["lambda", "Function"], kind)
     }
 
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
+
     fn reference_form() -> ReferenceForm {
         ReferenceForm::Template {
             long: ReferenceTemplate::new(
@@ -2882,7 +2888,9 @@ mod tests {
             Err(ProtocolConvertError::DurationOutOfRange)
         ));
 
-        let resolved_function = std::sync::Arc::new(crate::parser::UserFunction {
+        let resolved_function: std::sync::Arc<
+            crate::parser::UserFunction<crate::resource::AbsoluteBindingAddress>,
+        > = std::sync::Arc::new(crate::parser::UserFunction {
             name: "fixture".to_string(),
             params: Vec::new(),
             return_type: None,
@@ -2895,7 +2903,9 @@ mod tests {
         });
         let access = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue,
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: absolute_binding("upstream"),
+                },
             )),
             crate::resource::PathSegment::Field {
                 name: "field".to_string(),
@@ -2910,13 +2920,17 @@ mod tests {
         let non_wire = [
             Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
             crate::resource::AuthoredValue::resource_ref("source", "value", Vec::new())
-                .resolve_root(&crate::resource::RootScope::new()),
+                .resolve_root(&crate::resource::RootScope::new())
+                .into_expanded()
+                .expect("protocol fixture contains no parser placeholder"),
             Value::Deferred(DeferredValue::BindingRef {
-                binding: crate::resource::RootScope::new().resolve("source".into()),
+                binding: absolute_binding("source"),
             }),
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValue,
+                    crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                        binding: absolute_binding("upstream"),
+                    },
                 ))),
                 default: Box::new(Value::Concrete(ConcreteValue::Int(1))),
             }),
@@ -2946,7 +2960,9 @@ mod tests {
             )))),
             Value::Deferred(DeferredValue::RedactedSecret { hash }),
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue,
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: absolute_binding("upstream"),
+                },
             )),
         ];
 

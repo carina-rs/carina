@@ -200,18 +200,19 @@ mod tests {
             line: 1,
             header: "for item in upstream.items".to_string(),
             resource_type: "test.Widget".to_string(),
-            attributes: Vec::new(),
             target: carina_core::parser::DeferredForTarget::Bound {
                 binding: carina_core::resource::absolute_binding_address_for_test("widgets"),
             },
-            iterable: carina_core::resource::AuthoredValue::resource_ref(
-                "upstream",
-                "items",
-                Vec::new(),
-            )
+            iterable: carina_core::resource::Value::<
+                carina_core::resource::NoPlaceholder,
+                carina_core::resource::RelativeBindingName,
+            >::resource_ref("upstream", "items", Vec::new())
             .resolve_root_for_test(),
             binding: ForBinding::Simple("item".to_string()),
-            template_resource: Resource::new("test.Widget", "widgets"),
+            template_resource: Resource::<
+                carina_core::resource::ModuleSource,
+                carina_core::resource::LoopSlot,
+            >::new("test.Widget", "widgets"),
         }
     }
 

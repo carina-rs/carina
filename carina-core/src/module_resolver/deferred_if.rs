@@ -2,18 +2,57 @@
 
 use std::collections::HashSet;
 
-use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, Value};
+use crate::resource::{
+    ApplyTimeUnknown, BindingAddress, ConcreteValue, DeferredValue, LoopSlot, NoPlaceholder,
+    ParserPlaceholder, PlaceholderKind, Value,
+};
+
+pub(super) trait ModuleIfAuditPlaceholder: PlaceholderKind {
+    fn contains_module_if(&self) -> bool;
+}
+impl ModuleIfAuditPlaceholder for ParserPlaceholder {
+    fn contains_module_if(&self) -> bool {
+        match self {
+            Self::FnParam { name: _ }
+            | Self::ModuleArgument {
+                name: _,
+                diagnostic: _,
+            }
+            | Self::FnLocal { name: _ }
+            | Self::Loop(LoopSlot::Key)
+            | Self::Loop(LoopSlot::Index)
+            | Self::Loop(LoopSlot::Value)
+            | Self::EmptyInterpolation { source: _ } => false,
+        }
+    }
+}
+
+impl ModuleIfAuditPlaceholder for NoPlaceholder {
+    fn contains_module_if(&self) -> bool {
+        match *self {}
+    }
+}
+
+impl ModuleIfAuditPlaceholder for LoopSlot {
+    fn contains_module_if(&self) -> bool {
+        match self {
+            Self::Key | Self::Index | Self::Value => false,
+        }
+    }
+}
 
 /// Return whether a value still contains a parser-only module `if`.
 ///
 /// The publication gate uses this after expansion. The traversal is
 /// exhaustive so adding a value shape requires an explicit classification.
-pub(super) fn value_contains_module_if<B: BindingAddress>(value: &Value<B>) -> bool {
+pub(super) fn value_contains_module_if<P: ModuleIfAuditPlaceholder, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> bool {
     value_contains_module_if_inner(value, &mut HashSet::new(), &mut HashSet::new())
 }
 
-fn value_contains_module_if_inner<B: BindingAddress>(
-    value: &Value<B>,
+fn value_contains_module_if_inner<P: ModuleIfAuditPlaceholder, B: BindingAddress>(
+    value: &Value<P, B>,
     functions: &mut HashSet<usize>,
     function_scopes: &mut HashSet<usize>,
 ) -> bool {
@@ -119,27 +158,17 @@ fn value_contains_module_if_inner<B: BindingAddress>(
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             unknown_reason_contains_module_if(reason)
         }
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            placeholder.contains_module_if()
+        }
     }
 }
 
-fn unknown_reason_contains_module_if<B: BindingAddress>(
-    reason: &crate::resource::UnknownReason<B>,
-) -> bool {
+fn unknown_reason_contains_module_if<B: BindingAddress>(reason: &ApplyTimeUnknown<B>) -> bool {
     match reason {
-        crate::resource::UnknownReason::UpstreamExport { path: _ }
-        | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
-        | crate::resource::UnknownReason::ForKey
-        | crate::resource::UnknownReason::ForIndex
-        | crate::resource::UnknownReason::ForValue
-        | crate::resource::UnknownReason::FnParam { name: _ }
-        | crate::resource::UnknownReason::ModuleArgument {
-            name: _,
-            source_line: _,
-            diagnostic_name: _,
-        }
-        | crate::resource::UnknownReason::FnLocal { name: _ }
-        | crate::resource::UnknownReason::EmptyInterpolation
-        | crate::resource::UnknownReason::PendingReRead(_) => false,
+        ApplyTimeUnknown::UpstreamExport { path: _ }
+        | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
+        | ApplyTimeUnknown::PendingReRead(_) => false,
     }
 }
 

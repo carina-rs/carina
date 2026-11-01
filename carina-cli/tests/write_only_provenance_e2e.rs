@@ -952,7 +952,7 @@ fn saved_plan_apply_re_resolves_tampered_authored_ignore_paths() {
 }
 
 #[test]
-fn v32_saved_plan_is_rejected_after_keyed_release_format_bump() {
+fn v33_saved_plan_is_rejected_after_deferred_value_stage_format_bump() {
     let scenario = Scenario::new();
     scenario.write_readable_ignore_config("configured", None);
     assert_success("carina init", &scenario.init());
@@ -965,7 +965,7 @@ fn v32_saved_plan_is_rejected_after_keyed_release_format_bump() {
     let mut saved: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("read current saved plan"))
             .expect("parse current saved plan");
-    saved["version"] = serde_json::json!(32);
+    saved["version"] = serde_json::json!(33);
     fs::write(
         &path,
         serde_json::to_vec_pretty(&saved).expect("serialize old saved plan"),
@@ -976,10 +976,10 @@ fn v32_saved_plan_is_rejected_after_keyed_release_format_bump() {
     let rendered = output_text(&apply);
     assert!(
         !apply.status.success(),
-        "v32 saved plan applied:\n{rendered}"
+        "v33 saved plan applied:\n{rendered}"
     );
     assert!(
-        rendered.contains("Unsupported plan file version: 32") && rendered.contains("plan --out"),
+        rendered.contains("Unsupported plan file version: 33") && rendered.contains("plan --out"),
         "old plan must fail with replan guidance:\n{rendered}"
     );
 }

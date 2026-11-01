@@ -5,9 +5,8 @@
 //! partial-application handling), variable references with field/index
 //! access chains, and value-position `if` expressions.
 
-use crate::eval_value::{
-    AuthoredEvalValue as EvalValue, AuthoredStructuralHandleMetadata as StructuralHandleMetadata,
-};
+use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::parser::ParsedValue as Value;
 use crate::parser::context::{ExpressionMode, ParseBindingRef};
 use crate::parser::expressions::if_expr::parse_if_value_expr_with_mode;
 use crate::parser::expressions::string_literal::parse_string_value;
@@ -19,7 +18,7 @@ use crate::parser::{
 };
 use crate::resource::{
     AccessMissPolicy, AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
-    AuthoredDeferredValue as DeferredValue, AuthoredValue as Value, PathSegment, Subscript,
+    AuthoredDeferredValue as DeferredValue, PathSegment, RelativeBindingName, Subscript,
     ValuePathSegmentResult, ValueString, apply_value_path_segment,
 };
 use indexmap::IndexMap;
@@ -126,7 +125,6 @@ pub(crate) fn apply_postfix_path_segment(
     step: PathSegment,
     line: usize,
 ) -> Result<EvalValue, ParseError> {
-    let mut display_root = None;
     let base = match value {
         EvalValue::User(base) => base,
         EvalValue::StructuralHandle(handle) => {
@@ -141,7 +139,7 @@ pub(crate) fn apply_postfix_path_segment(
                 };
                 return Ok(EvalValue::from_value(Value::Deferred(
                     DeferredValue::BindingRef {
-                        binding: crate::resource::RelativeBindingName::new(binding),
+                        binding: RelativeBindingName::new(binding),
                     },
                 )));
             }
@@ -172,11 +170,10 @@ pub(crate) fn apply_postfix_path_segment(
                     message: error.to_string(),
                 });
         }
-        EvalValue::DeferredForValue { binding } => {
-            display_root = Some(binding);
-            Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue,
-            ))
+        EvalValue::DeferredForValue { binding, slot } => {
+            return Ok(EvalValue::from_value(
+                crate::resource::parser_deferred_for_access(binding, slot, step, line),
+            ));
         }
         EvalValue::Closure {
             name,
@@ -194,10 +191,6 @@ pub(crate) fn apply_postfix_path_segment(
     };
     apply_value_path_segment(base, step, line, AccessMissPolicy::Error)
         .and_then(ValuePathSegmentResult::into_value)
-        .map(|value| match display_root {
-            Some(root) => value.with_access_display_root(root),
-            None => value,
-        })
         .map(EvalValue::from_value)
         .map_err(|error| ParseError::InvalidExpression {
             line,
@@ -324,7 +317,9 @@ fn parse_namespaced_id_value(
             // access, not a resource path. Apply every `.field` and trailing
             // subscript through the same postfix primitive used by
             // `postfix_expr`.
-            let mut value = bound.clone();
+            let mut value = bound
+                .clone()
+                .with_reference_source(ctx.diagnostic_source_span(&pair));
             for field in &parts[1..] {
                 value = apply_postfix_path_segment(
                     value,
@@ -716,9 +711,9 @@ pub(crate) fn parse_primary_eval_with_mode(
                 // above — we only reach the `None` branch when the parser
                 // has no in-scope variable / let-binding for this name.
                 match ctx.lookup_binding(first_ident) {
-                    ParseBindingRef::Value { value, .. } => {
-                        Ok(value.clone().with_reference_source_line(line))
-                    }
+                    ParseBindingRef::Value { value, .. } => Ok(value
+                        .clone()
+                        .with_reference_source(ctx.diagnostic_source_span(&first_ident_pair))),
                     ParseBindingRef::Structural(handle) => {
                         Ok(EvalValue::structural_handle(handle.clone()))
                     }
@@ -730,7 +725,9 @@ pub(crate) fn parse_primary_eval_with_mode(
                 match ctx.lookup_binding(first_ident) {
                     ParseBindingRef::Value { value: bound, .. } => {
                         return apply_postfix_steps(
-                            bound.clone().with_reference_source_line(line),
+                            bound.clone().with_reference_source(
+                                ctx.diagnostic_source_span(&first_ident_pair),
+                            ),
                             access_steps,
                             ctx,
                         );
@@ -835,7 +832,7 @@ pub(crate) fn parse_primary_eval_with_mode(
                     ) {
                         return Ok(EvalValue::from_value(Value::Deferred(
                             DeferredValue::BindingRef {
-                                binding: crate::resource::RelativeBindingName::new(binding_name),
+                                binding: RelativeBindingName::new(binding_name),
                             },
                         )));
                     }
@@ -852,14 +849,14 @@ pub(crate) fn parse_primary_eval_with_mode(
                         }
                         ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => Ok(
                             EvalValue::from_value(Value::Deferred(DeferredValue::BindingRef {
-                                binding: crate::resource::RelativeBindingName::new(binding_name),
+                                binding: RelativeBindingName::new(binding_name),
                             })),
                         ),
                     }
                 } else {
                     let attribute_name = field_names.remove(0);
                     let path = AccessPath::with_fields_and_subscripts(
-                        binding_name,
+                        binding_name.clone(),
                         attribute_name,
                         field_names,
                         subscripts,

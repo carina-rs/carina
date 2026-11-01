@@ -33,6 +33,13 @@ use std::num::NonZeroUsize;
 pub const DEFAULT_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 #[cfg(test)]
+pub(crate) fn absolute_binding_for_test(
+    name: impl Into<String>,
+) -> carina_core::resource::AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
+#[cfg(test)]
 pub(crate) fn test_composition_call_path() -> carina_core::resource::CompositionCallPath {
     test_composition_call_path_in(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),

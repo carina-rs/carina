@@ -28,9 +28,8 @@ use crate::resource::{
     AbsoluteBindingAddress, ExpandedAccessPath as AccessPath,
     ExpandedConcreteValue as ConcreteValue, ExpandedDataSource as DataSource,
     ExpandedDeferredValue as DeferredValue, ExpandedDirectives as Directives,
-    ExpandedResource as Resource, ExpandedUnknownReason as UnknownReason, ExpandedValue as Value,
-    PathSegment, RelativeBindingName, ResolvedDataSource, ResolvedResource, ResourceIdentity,
-    RootScope,
+    ExpandedResource as Resource, ExpandedValue as Value, LoopSlot, ModuleSource, PathSegment,
+    RelativeBindingName, ResolvedDataSource, ResolvedResource, ResourceIdentity, RootScope,
 };
 use crate::value::SerializationError;
 use parallel::build_dependency_levels;
@@ -109,9 +108,11 @@ fn create_effect(resource: Resource) -> Effect {
     Effect::Create(resolved(resource))
 }
 
-fn for_value_access(fields: &[&str]) -> Value {
+fn for_value_access(fields: &[&str]) -> crate::resource::Value<LoopSlot, AbsoluteBindingAddress> {
     fields.iter().fold(
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            LoopSlot::Value,
+        )),
         |base, field| {
             crate::resource::apply_postfix_access(
                 base,
@@ -127,7 +128,11 @@ fn for_value_access(fields: &[&str]) -> Value {
 }
 
 fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExpression {
-    let mut template_resource = Resource::new("test", "validation_records");
+    let mut template_resource: crate::resource::Resource<
+        ModuleSource,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    > = crate::resource::Resource::new("test", "validation_records");
     template_resource.binding = Some(absolute_binding("validation_records"));
     template_resource
         .dependency_bindings
@@ -140,11 +145,6 @@ fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExp
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "test.ValidationRecord".to_string(),
-        attributes: template_resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
         target: crate::parser::DeferredForTarget::Bound {
             binding: absolute_binding("validation_records"),
         },
@@ -173,7 +173,9 @@ fn anonymous_deferred_collision_fixture() -> (
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )
-    .expect("deferred fixture crosses the module-resolution seam");
+    .expect("deferred fixture crosses the module-resolution seam")
+    .into_expanded()
+    .expect("deferred-loop fixture contains no parser placeholders");
     let template = parsed.deferred_for_expressions()[0].clone();
     let mut bindings = ResolvedBindings::default();
     bindings.set_with_completeness(
@@ -896,21 +898,6 @@ fn resource_with_attr(value: Value) -> Resource {
     resource
 }
 
-fn for_value_path_unknown() -> Value {
-    for_value_access(&["resource_record", "name"])
-}
-
-#[test]
-fn resolved_resource_constructor_rejects_value_unknown() {
-    let err = basic::resolved_resource(resource_with_attr(for_value_path_unknown()))
-        .expect_err("deferred unknown must not construct a ResolvedResource");
-
-    assert!(
-        matches!(err, SerializationError::UnresolvedAccess { .. }),
-        "expected UnresolvedAccess, got {err:?}"
-    );
-}
-
 #[test]
 fn resolved_resource_constructor_rejects_resource_ref() {
     let value = Value::Deferred(DeferredValue::ResourceRef {
@@ -931,7 +918,11 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
     let mut map = indexmap::IndexMap::new();
     map.insert(
         "secret".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(for_value_path_unknown()))),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+            DeferredValue::ResourceRef {
+                path: AccessPath::root("cert", "domain_validation_options"),
+            },
+        )))),
     );
     let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(map),
@@ -941,8 +932,8 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
         .expect_err("nested deferred values must not construct a ResolvedResource");
 
     assert!(
-        matches!(err, SerializationError::UnresolvedAccess { .. }),
-        "expected UnresolvedAccess, got {err:?}"
+        matches!(err, SerializationError::UnresolvedResourceRef { .. }),
+        "expected UnresolvedResourceRef, got {err:?}"
     );
 }
 
@@ -6746,7 +6737,13 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
     .expect("reference alias source parses");
     crate::parser::resolve_resource_refs(&mut parsed)
         .expect("pre-apply reference resolution succeeds");
-    let parsed = parsed.resolve_root(&RootScope::new());
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("reference alias fixture crosses the module-resolution seam")
+    .into_expanded()
+    .expect("reference alias fixture contains no parser placeholders");
 
     let role = parsed
         .resources
@@ -9031,11 +9028,13 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     // (resolver.rs:70 -> get_resource_value_ref_dependencies), instead
     // of hand-setting the set. This is the load-bearing difference from
     // the existing flat-ref test.
-    dist.dependency_bindings = crate::deps::get_resource_value_ref_dependencies(
-        crate::parser::ResourceRef::Resource(&dist),
-    )
-    .into_iter()
-    .collect();
+    dist.dependency_bindings =
+        crate::deps::get_resource_value_ref_dependencies(crate::parser::ResourceRef::<
+            ModuleSource,
+            crate::resource::NoPlaceholder,
+        >::Resource(&dist))
+        .into_iter()
+        .collect();
     let dist_id = dist.id.clone();
 
     // Sanity: the resolver helper must have recovered the wait binding

@@ -211,7 +211,7 @@ mod tests {
         UpdateRequest,
     };
     use carina_core::resource::{
-        ConcreteValue, DeferredValue, InterpolationPart, ResourceId, State, UnknownReason, Value,
+        ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, ResourceId, State, Value,
     };
     use futures::future::BoxFuture;
     use std::collections::{HashMap, HashSet};
@@ -363,7 +363,7 @@ mod tests {
         let id = ResourceId::with_identity("aws.route53.RecordSet", "r");
         let deferred = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamAllExports {
+                ApplyTimeUnknown::UpstreamAllExports {
                     binding: carina_core::resource::absolute_binding_address_for_test(
                         "management_route53",
                     ),

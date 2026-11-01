@@ -1,6 +1,6 @@
 //! `keys(map)` and `values(map)` built-in functions
 
-use crate::resource::{BindingAddress, ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
 
 use super::value_type_name;
 
@@ -14,7 +14,9 @@ use super::value_type_name;
 /// keys({b: 2, a: 1})  // => ["a", "b"]
 /// keys({})             // => []
 /// ```
-pub(crate) fn builtin_keys<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_keys<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!("keys() expects 1 argument, got {}", args.len()));
     }
@@ -46,7 +48,9 @@ pub(crate) fn builtin_keys<B: BindingAddress>(args: &[Value<B>]) -> Result<Value
 /// values({b: 2, a: 1})  // => [1, 2]
 /// values({})             // => []
 /// ```
-pub(crate) fn builtin_values<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_values<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!("values() expects 1 argument, got {}", args.len()));
     }

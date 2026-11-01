@@ -4978,8 +4978,10 @@ impl ProviderInstanceKey {
     }
 }
 
-impl<B: crate::resource::BindingAddress> From<&ProviderConfig<B>> for ProviderInstanceKey {
-    fn from(config: &ProviderConfig<B>) -> Self {
+impl<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>
+    From<&ProviderConfig<P, B>> for ProviderInstanceKey
+{
+    fn from(config: &ProviderConfig<P, B>) -> Self {
         Self::new(
             config.name.clone(),
             config.binding.as_ref().map(ToString::to_string),
@@ -5045,6 +5047,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Deferred(DeferredValue::Unknown(_)) => {
             crate::resource::assert_value_fully_resolved(value)
         }
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -5077,7 +5080,10 @@ impl std::error::Error for DefaultTagEncodingError {}
 /// Records which tag keys came from defaults as host-owned provenance on the
 /// resource, separate from provider-facing attributes.
 pub fn merge_default_tags<S>(
-    config: &ProviderConfig<crate::resource::AbsoluteBindingAddress>,
+    config: &ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >,
     resources: &mut [Resource<S>],
     registry: &SchemaRegistry,
 ) -> ProviderResult<()> {
@@ -5666,9 +5672,12 @@ impl ProviderRouter {
 
     /// Register a provider under the same route derived from its config by
     /// host-owned normalization.
-    pub fn add_provider_config<B: crate::resource::BindingAddress>(
+    pub fn add_provider_config<
+        P: crate::resource::PlaceholderKind,
+        B: crate::resource::BindingAddress,
+    >(
         &mut self,
-        config: &ProviderConfig<B>,
+        config: &ProviderConfig<P, B>,
         provider: InitializedProvider,
     ) {
         self.providers
@@ -7391,6 +7400,11 @@ mod tests {
     type ConcreteValue = crate::resource::ExpandedConcreteValue;
     type DeferredValue = crate::resource::ExpandedDeferredValue;
 
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
+
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::unavailable(Box::new(provider))
     }
@@ -8264,12 +8278,12 @@ mod tests {
 
     #[test]
     fn enum_canonicalization_error_renders_its_reason_once() {
-        let resource: Resource = Resource::with_provider("test", "widget", "example", None)
-            .with_attribute(
+        let mut resources: Vec<Resource> = vec![
+            Resource::with_provider("test", "widget", "example", None).with_attribute(
                 "mode",
                 Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.invalid")),
-            );
-        let mut resources = vec![resource];
+            ),
+        ];
         let error = crate::value::canonicalize_resources_with_schemas(
             &mut resources,
             &SchemaRegistry::new(),
@@ -9258,7 +9272,7 @@ mod tests {
 
     #[test]
     fn partial_create_and_update_share_the_canonical_pending_reread_value() {
-        use crate::resource::{PendingReRead, ReReadReason, UnknownReason};
+        use crate::resource::{ApplyTimeUnknown, PendingReRead, ReReadReason};
 
         fn assert_materialized(mut state: State, expected: &PendingReRead) {
             let marker = state
@@ -9276,7 +9290,7 @@ mod tests {
                 .attributes
                 .get("computed")
                 .expect("missing attribute is materialized");
-            let Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending))) =
+            let Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending))) =
                 unknown
             else {
                 panic!(
@@ -9284,9 +9298,10 @@ mod tests {
                 );
             };
             assert_eq!(pending, expected);
-            let rendered = crate::value::render_unknown::<crate::resource::AbsoluteBindingAddress>(
-                &UnknownReason::PendingReRead(pending.clone()),
-            );
+            let rendered =
+                crate::value::render_unknown(&ApplyTimeUnknown::<
+                    crate::resource::AbsoluteBindingAddress,
+                >::PendingReRead(pending.clone()));
             assert_eq!(
                 rendered,
                 "(unknown until next refresh: read after apply was incomplete — provider returned a partial read)"
@@ -10975,7 +10990,10 @@ mod tests {
             "mock".to_string(),
             initialized(TaggedProvider { tag: "default" }),
         );
-        let named_config: ProviderConfig<crate::resource::RelativeBindingName> = ProviderConfig {
+        let named_config: ProviderConfig<
+            crate::resource::NoPlaceholder,
+            crate::resource::RelativeBindingName,
+        > = ProviderConfig {
             name: "mock".to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
@@ -11649,7 +11667,9 @@ mod tests {
 
         let peer_ref = Value::root_resource_ref("peer", "identifier", Vec::new());
         let pending = Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ForValue,
+            crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                binding: absolute_binding("upstream"),
+            },
         ));
         let resource: Resource = Resource::with_provider("normalizing", "test", "example", None)
             .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
@@ -11665,7 +11685,7 @@ mod tests {
         assert!(matches!(
             resources[0].get_attr("pending"),
             Some(Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports { .. }
             )))
         ));
     }

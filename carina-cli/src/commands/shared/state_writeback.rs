@@ -21,8 +21,8 @@ use carina_core::provider::{
 #[cfg(test)]
 use carina_core::resource::PersistedDirectiveField;
 use carina_core::resource::{
-    ConcreteValue, Current, ModuleSource, PersistedDirectiveFieldChange, PersistedDirectives,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, ModuleSource, PersistedDirectiveFieldChange,
+    PersistedDirectives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -34,9 +34,6 @@ use carina_state::{
 };
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
-
-#[cfg(test)]
-use carina_core::resource::AbsoluteBindingAddress;
 
 use crate::commands::plan::MovedOrigins;
 use crate::commands::shared::incremental_state_saver::FinalStateBase;
@@ -54,8 +51,11 @@ fn root_resource_ref(
     attribute: impl Into<String>,
     fields: Vec<String>,
 ) -> Value {
-    carina_core::resource::AuthoredValue::resource_ref(binding.into(), attribute.into(), fields)
-        .resolve_root_for_test()
+    carina_core::resource::Value::<
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::RelativeBindingName,
+    >::resource_ref(binding.into(), attribute.into(), fields)
+    .resolve_root_for_test()
 }
 
 #[cfg(test)]
@@ -64,7 +64,7 @@ trait WithTestBinding {
 }
 
 #[cfg(test)]
-impl<S> WithTestBinding for Resource<S> {
+impl<S, P: carina_core::resource::PlaceholderKind> WithTestBinding for Resource<S, P> {
     fn with_test_binding(mut self, binding: impl Into<String>) -> Self {
         self.binding = Some(absolute_binding(binding));
         self
@@ -1043,7 +1043,7 @@ struct ReplacementDeleteInput<'a> {
     identifier: &'a str,
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
-    fallback_dependency_bindings: BTreeSet<carina_core::resource::AbsoluteBindingAddress>,
+    fallback_dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
 
@@ -2092,8 +2092,8 @@ mod apply_state_save_tests {
     use carina_core::plan::Plan;
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
-        ConcreteValue, DeferredValue, Directives, ResolvedResourceId, Resource, ResourceId, State,
-        UnknownReason, Value,
+        ApplyTimeUnknown, ConcreteValue, DeferredValue, Directives, ResolvedResourceId, Resource,
+        ResourceId, State, Value,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
     use carina_state::{CurrentInstance, DeposedInstance, DeposedKey, NameOverride};
@@ -2358,18 +2358,10 @@ mod apply_state_save_tests {
                 line: 1,
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.Record".to_string(),
-                attributes: Vec::new(),
                 target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: carina_core::resource::absolute_binding_address_for_test(
-                        "validation_records",
-                    ),
+                    binding: absolute_binding("validation_records"),
                 },
-                iterable: carina_core::resource::AuthoredValue::resource_ref(
-                    "cert",
-                    "domain_validation_options",
-                    Vec::new(),
-                )
-                .resolve_root_for_test(),
+                iterable: root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 binding: ForBinding::Simple("opt".to_string()),
                 // Saved deferred templates are reconstructed before their
                 // runtime element identity exists. Comparison pre-resolution
@@ -4999,7 +4991,6 @@ mod apply_state_save_tests {
                 line: 1,
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.Record".to_string(),
-                attributes: vec![],
                 target: carina_core::parser::DeferredForTarget::Bound {
                     binding: absolute_binding("validation_records"),
                 },
@@ -5081,7 +5072,6 @@ mod apply_state_save_tests {
                 line: 1,
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.Record".to_string(),
-                attributes: vec![],
                 target: carina_core::parser::DeferredForTarget::Bound {
                     binding: absolute_binding("validation_records"),
                 },
@@ -6480,7 +6470,14 @@ mod apply_state_save_tests {
                 ),
                 (
                     "unknown".to_string(),
-                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                    Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
+                        path: carina_core::resource::AccessPath::with_fields(
+                            "bootstrap",
+                            "network",
+                            vec!["unknown".into()],
+                        )
+                        .resolve_root_for_test(),
+                    })),
                 ),
             ]),
         )
@@ -7215,13 +7212,16 @@ mod export_writeback_tests {
         ExpandedInferredExportParam, InferredExportParam, ResolveExportBindingPhase,
     };
     use carina_core::resource::{
-        AuthoredValue, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
-        PendingReRead, UnknownReason, Value,
+        ApplyTimeUnknown, AuthoredAccessPath, ConcreteValue, DeferredValue, InterpolationPart,
+        NoPlaceholder, PartialReadMarker, PendingReRead, RelativeBindingName, Value,
     };
     use carina_state::{ResourceState, StateFile};
 
-    fn export_param(name: &str, value: AuthoredValue) -> ExpandedInferredExportParam {
-        InferredExportParam {
+    fn export_param(
+        name: &str,
+        value: Value<NoPlaceholder, RelativeBindingName>,
+    ) -> ExpandedInferredExportParam {
+        InferredExportParam::<NoPlaceholder, RelativeBindingName> {
             name: name.to_string(),
             static_type: carina_core::static_type::ExportStaticType::Inferred(
                 carina_core::static_type::StaticType::Unchecked(
@@ -7292,8 +7292,11 @@ mod export_writeback_tests {
 
         let resource = Resource::with_provider("mock", "test.Resource", "main", None)
             .with_test_binding("instance");
-        let reference =
-            carina_core::resource::AuthoredValue::resource_ref("instance", "computed", vec![]);
+        let reference = Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+            "instance",
+            "computed",
+            vec![],
+        );
         let export_params = [export_param("computed", reference.clone())];
         let checked = carina_core::validation::check_export_values_pre_apply(
             &export_params,
@@ -7347,7 +7350,7 @@ mod export_writeback_tests {
         assert!(matches!(
             &values.as_slice()[0].value,
             Some(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::PendingReRead(pending)
+                ApplyTimeUnknown::PendingReRead(pending)
             ))) if pending == &PendingReRead::incomplete(
                 "provider read after create did not return every attribute"
             )
@@ -7368,7 +7371,7 @@ mod export_writeback_tests {
             export_param(
                 "target_group_arn",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: carina_core::resource::AuthoredAccessPath::with_fields(
+                    path: AuthoredAccessPath::with_fields(
                         "registry_publish",
                         "target_group",
                         vec!["arn".into()],
@@ -7412,7 +7415,7 @@ mod export_writeback_tests {
             export_param(
                 "first_missing",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: carina_core::resource::AuthoredAccessPath::new("first", "id"),
+                    path: AuthoredAccessPath::new("first", "id"),
                 }),
             ),
             export_param(
@@ -7422,7 +7425,7 @@ mod export_writeback_tests {
             export_param(
                 "second_missing",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: carina_core::resource::AuthoredAccessPath::new("second", "id"),
+                    path: AuthoredAccessPath::new("second", "id"),
                 }),
             ),
         ];
@@ -7446,7 +7449,7 @@ mod export_writeback_tests {
             Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("x".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                    path: carina_core::resource::AuthoredAccessPath::new("missing", "value"),
+                    path: AuthoredAccessPath::new("missing", "value"),
                 })),
             ])),
         )];
@@ -7469,9 +7472,7 @@ mod export_writeback_tests {
                     Value::Concrete(ConcreteValue::String("-".into())).into(),
                     Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
                         DeferredValue::ResourceRef {
-                            path: carina_core::resource::AuthoredAccessPath::new(
-                                "missing", "value",
-                            ),
+                            path: AuthoredAccessPath::new("missing", "value"),
                         },
                     )]))
                     .into(),
@@ -7534,7 +7535,9 @@ mod export_writeback_tests {
 #[cfg(test)]
 mod stage4_unknown_err_tests {
     use super::*;
-    use carina_core::resource::{AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value};
+    use carina_core::resource::{
+        AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, Value,
+    };
     use carina_core::value::{SerializationContext, SerializationError};
 
     /// RFC #2371 stage 4 contract pin: the persisted export encoder returns
@@ -7545,7 +7548,7 @@ mod stage4_unknown_err_tests {
     fn unknown_returns_err_from_persisted_export_encode() {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
             .resolve_root_for_test();
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        let v = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = PersistedExportValue::encode(&v).unwrap_err();
@@ -7553,12 +7556,19 @@ mod stage4_unknown_err_tests {
             SerializationError::UnknownNotAllowed {
                 reason,
                 context: SerializationContext::StateWriteback,
-            } => {
-                let UnknownReason::UpstreamExport { path: actual } = reason.as_ref() else {
-                    panic!("expected UpstreamExport reason, got: {reason:?}");
-                };
-                assert_eq!(actual, &path);
-            }
+            } => match *reason {
+                ApplyTimeUnknown::UpstreamExport {
+                    path: persisted_path,
+                } => {
+                    assert_eq!(persisted_path, path)
+                }
+                ApplyTimeUnknown::UpstreamAllExports { binding } => {
+                    panic!("expected an upstream export path, got all exports for {binding}")
+                }
+                ApplyTimeUnknown::PendingReRead(pending) => {
+                    panic!("expected an upstream export path, got pending reread: {pending}")
+                }
+            },
             other => {
                 panic!("expected UnknownNotAllowed/UpstreamExport/StateWriteback, got: {other:?}")
             }

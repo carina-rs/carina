@@ -1,18 +1,28 @@
 use super::*;
 use crate::parser::{
     ArgumentOrigin, LoadedProviderContext, ModuleArgument, ParsedFile, ProviderContext,
-    RelativeBindingName, ResolveExportBindingPhase, UntilPredicateAst, WaitBinding,
+    RelativeBindingName, UntilPredicateAst, WaitBinding,
 };
 use crate::resource::{
-    AuthoredCompositionCall as CompositionCall, AuthoredCompositionCallPath as CompositionCallPath,
-    AuthoredDataSource as DataSource, AuthoredLiveComposition as LiveComposition,
+    AbsoluteBindingAddress, AuthoredCompositionCall as CompositionCall,
+    AuthoredCompositionCallPath as CompositionCallPath, AuthoredDataSource as DataSource,
+    AuthoredLiveComposition as LiveComposition,
     AuthoredLiveCompositionArgument as LiveCompositionArgument,
     AuthoredLiveCompositionAttribute as LiveCompositionAttribute,
     AuthoredLiveCompositionSignature as LiveCompositionSignature, AuthoredResource as Resource,
-    RootScope,
+    NoPlaceholder, RootScope,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+type RuntimeValue = GenericValue<NoPlaceholder, AbsoluteBindingAddress>;
+type RuntimeConcreteValue = crate::resource::ConcreteValue<NoPlaceholder, AbsoluteBindingAddress>;
+type RuntimeDeferredValue = crate::resource::DeferredValue<NoPlaceholder, AbsoluteBindingAddress>;
+type RuntimeInterpolationPart =
+    crate::resource::InterpolationPart<NoPlaceholder, AbsoluteBindingAddress>;
+type RuntimeInferredExportParam =
+    crate::parser::InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
+type RelativeRuntimeValue = GenericValue<NoPlaceholder, RelativeBindingName>;
 
 fn local_type(type_expr: TypeExpr) -> TypeExpr {
     type_expr
@@ -99,7 +109,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
         static_type: unknown.clone(),
         default: None,
         description: None,
-        validations: Vec::<ValidationBlock>::new(),
+        validations: Vec::<ValidationBlock<ParserPlaceholder, RelativeBindingName>>::new(),
     });
     parsed
         .attribute_params
@@ -154,12 +164,12 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     };
     let inferred = ParsedFile::default().map_export_params(|_exports| {
         vec![
-            InferredExportParam::<RelativeBindingName> {
+            InferredExportParam::<ParserPlaceholder, RelativeBindingName> {
                 name: "inferred_export".to_string(),
                 static_type: ExportStaticType::Inferred(StaticType::Known(unknown.clone())),
                 value: None,
             },
-            InferredExportParam::<RelativeBindingName> {
+            InferredExportParam::<ParserPlaceholder, RelativeBindingName> {
                 name: "failed_export".to_string(),
                 static_type: ExportStaticType::Inferred(StaticType::Unchecked(
                     InferredUncheckedReason::InferenceFailed(failure.clone()),
@@ -223,9 +233,47 @@ fn empty_parsed() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: Vec::new(),
         deferred_for_phase: crate::parser::ParsedDeferredForPhase::default(),
+        template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
+}
+
+#[test]
+fn anonymous_schema_error_groups_plain_and_deferred_template_resources() {
+    let parsed = crate::parser::parse(
+        r#"
+mock.test.Thing { name = "one" }
+mock.test.Thing { name = "two" }
+
+let upstream = upstream_state { source = "../upstream" }
+for item in upstream.items {
+    mock.test.Thing { name = item.name }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture parses");
+    assert_eq!(parsed.iter_top_level_resources().count(), 2);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+
+    let error = validate_resources(
+        &parsed,
+        &SchemaRegistry::new(),
+        &HashSet::new(),
+        &ProviderContext::default(),
+    )
+    .expect_err("an unloaded provider cannot derive anonymous identities");
+
+    assert_eq!(
+        error
+            .lines()
+            .filter(|line| line.contains("anonymous mock.test.Thing"))
+            .collect::<Vec<_>>(),
+        vec![
+            "3 anonymous mock.test.Thing resources need provider 'mock', which is not declared or could not be loaded; declare provider 'mock' so its schema is available"
+        ],
+    );
 }
 
 fn module_call_findings_for_test(
@@ -281,7 +329,7 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
 }
 
 fn validate_resource_ref_types_for_test<
-    E: crate::parser::ExportParamLike<Binding = RelativeBindingName>,
+    E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
 >(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
@@ -721,7 +769,8 @@ fn context_with_iam_policy_arn_validator() -> LoadedProviderContext {
                 if target.identity() != &identity {
                     return Ok(());
                 }
-                let PhaseValue::Concrete(PhaseConcreteValue::String(s)) = value else {
+                let GenericValue::Concrete(crate::resource::ConcreteValue::String(s)) = value
+                else {
                     return Err(crate::parser::fixture_custom_type_rejection(
                         target,
                         "Expected string",
@@ -2191,7 +2240,9 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
         until_predicate: UntilPredicateAst {
             root: "cert".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -2265,7 +2316,9 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
         until_predicate: UntilPredicateAst {
             root: "cert".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -2489,7 +2542,9 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
         until_predicate: UntilPredicateAst {
             root: "cert".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -3062,7 +3117,7 @@ fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
     }
 }
 
-fn provider(name: &str) -> crate::parser::ProviderConfig {
+fn provider(name: &str) -> crate::parser::ProviderConfig<ParserPlaceholder> {
     crate::parser::ProviderConfig {
         name: name.to_string(),
         attributes: IndexMap::new(),
@@ -4399,10 +4454,12 @@ child { values = [vpc] }
     );
     assert!(!report.is_ready(), "fixture must produce a binding finding");
 
-    let findings = check_expanded_module_calls(ExpandedModuleCallCheckInput::BindingUses {
-        binding_use_report: &report,
-        compositions: &[],
-    });
+    let findings = check_expanded_module_calls::<crate::resource::ParserPlaceholder>(
+        ExpandedModuleCallCheckInput::BindingUses {
+            binding_use_report: &report,
+            compositions: &[],
+        },
+    );
 
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
     assert_eq!(findings[0].kind(), ModuleCallFindingKind::BindingUse);
@@ -4471,10 +4528,12 @@ let child = child_module { value = forwarded }
         bindings: &bindings,
         reference_checks: ModuleCallReferenceChecks::Enabled,
     });
-    let expanded = check_expanded_module_calls(ExpandedModuleCallCheckInput::BindingUses {
-        binding_use_report: &report,
-        compositions: &[],
-    });
+    let expanded = check_expanded_module_calls::<crate::resource::ParserPlaceholder>(
+        ExpandedModuleCallCheckInput::BindingUses {
+            binding_use_report: &report,
+            compositions: &[],
+        },
+    );
     assert_eq!(
         authored.len(),
         1,
@@ -4543,7 +4602,7 @@ fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() 
 #[test]
 fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary() {
     use crate::binding_index::ResolvedBindings;
-    use crate::parser::{ArgumentParameter, AttributeParameter, InferredExportParam};
+    use crate::parser::{ArgumentParameter, AttributeParameter};
     use std::sync::{Arc, Mutex};
 
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
@@ -4619,12 +4678,16 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
     )
     .expect("attribute parameter must validate");
 
-    let exports = [InferredExportParam {
+    let exports = [RuntimeInferredExportParam {
         name: "mode".to_string(),
         static_type: crate::static_type::ExportStaticType::Declared(local_type(schema_type)),
-        value: Some(authored()),
-    }
-    .resolve_root(&RootScope::new())];
+        value: Some(
+            authored()
+                .resolve_root(&RootScope::new())
+                .into_expanded()
+                .expect("authored enum contains no parser placeholders"),
+        ),
+    }];
     check_export_values_pre_apply(&exports, &ResolvedBindings::default(), &config)
         .expect("export must validate");
 
@@ -5426,7 +5489,9 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         until_predicate: UntilPredicateAst {
             root: "cert".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -5724,10 +5789,27 @@ fn resolve_and_validate_export_params(
     let exports = exports
         .iter()
         .cloned()
-        .map(|export| export.resolve_root(&RootScope::new()))
-        .collect::<Vec<_>>();
+        .map(|export| {
+            Ok::<_, crate::resource::LeftoverPlaceholder>(RuntimeInferredExportParam {
+                name: export.name,
+                static_type: export.static_type,
+                value: export
+                    .value
+                    .map(|value| value.resolve_root(&RootScope::new()).into_expanded())
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    resolve_and_validate_expanded_export_params(&exports, config)
+}
+
+fn resolve_and_validate_expanded_export_params(
+    exports: &[RuntimeInferredExportParam],
+    config: &LoadedProviderContext,
+) -> Result<(), String> {
     check_export_values_pre_apply(
-        &exports,
+        exports,
         &crate::binding_index::ResolvedBindings::default(),
         config,
     )
@@ -5739,12 +5821,13 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     use crate::binding_index::ResolvedBindings;
     use crate::parser::InferredExportParam;
 
-    let builtin = InferredExportParam {
+    let builtin: RuntimeInferredExportParam = InferredExportParam {
         name: "flag".to_string(),
         static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::Bool),
-        value: Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
-    }
-    .resolve_root(&RootScope::new());
+        value: Some(RuntimeValue::Concrete(RuntimeConcreteValue::String(
+            "not-a-bool".into(),
+        ))),
+    };
     let error = check_export_values_pre_apply_providerless(
         std::slice::from_ref(&builtin),
         &ResolvedBindings::default(),
@@ -5754,7 +5837,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     .to_string();
     assert!(error.contains("expected Bool, got string"), "error={error}");
 
-    let custom = InferredExportParam {
+    let custom: RuntimeInferredExportParam = InferredExportParam {
         name: "identifiers".to_string(),
         static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::List(Box::new(
             TypeExpr::SchemaType {
@@ -5764,11 +5847,10 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
                 ),
             },
         ))),
-        value: Some(Value::Concrete(ConcreteValue::StringList(vec![
-            "identifier".to_string().into(),
-        ]))),
-    }
-    .resolve_root(&RootScope::new());
+        value: Some(RuntimeValue::Concrete(RuntimeConcreteValue::StringList(
+            vec!["identifier".to_string().into()],
+        ))),
+    };
     check_export_values_pre_apply_providerless(
         std::slice::from_ref(&custom),
         &ResolvedBindings::default(),
@@ -5776,16 +5858,15 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     )
     .expect("providerless export checks must skip only the custom-type leaf");
 
-    let builtin_custom = InferredExportParam {
+    let builtin_custom: RuntimeInferredExportParam = InferredExportParam {
         name: "cidr".to_string(),
         static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::Simple(
             "ipv4_cidr".to_string(),
         )),
-        value: Some(Value::Concrete(ConcreteValue::String(
+        value: Some(RuntimeValue::Concrete(RuntimeConcreteValue::String(
             "10.0.0.0/16".to_string().into(),
         ))),
-    }
-    .resolve_root(&RootScope::new());
+    };
     check_export_values_pre_apply_providerless(
         std::slice::from_ref(&builtin_custom),
         &ResolvedBindings::default(),
@@ -5894,8 +5975,6 @@ fn validate_export_params_rejects_type_mismatch() {
 
 #[test]
 fn validate_export_params_rejects_decrypt_result_as_secret_export() {
-    use crate::parser::InferredExportParam;
-
     let plaintext = "hunter2SECRET";
     let config = loaded_context_for_test(ProviderContext {
         decryptor: Some(Box::new(move |_, _| Ok(plaintext.to_string()))),
@@ -5903,17 +5982,19 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
     });
     let value = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
-        &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
+        &[RuntimeValue::Concrete(RuntimeConcreteValue::String(
+            "ciphertext".into(),
+        ))],
         &config,
     )
     .expect("test decryptor");
-    let exports = vec![InferredExportParam {
+    let exports = vec![RuntimeInferredExportParam {
         name: "count".to_string(),
         static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Int)),
         value: Some(value),
     }];
 
-    let error = resolve_and_validate_export_params(&exports, &config)
+    let error = resolve_and_validate_expanded_export_params(&exports, &config)
         .expect_err("secret cannot be exported");
 
     assert_eq!(error, "export 'count' cannot hold a secret value");
@@ -5922,15 +6003,12 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
 
 #[test]
 fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
-    use crate::parser::InferredExportParam;
-    use crate::resource::InterpolationPart;
-
-    fn secret(value: Value) -> Value {
-        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+    fn secret(value: RuntimeValue) -> RuntimeValue {
+        RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(value)))
     }
 
     let secret_string = || {
-        secret(Value::Concrete(ConcreteValue::String(
+        secret(RuntimeValue::Concrete(RuntimeConcreteValue::String(
             "topsecretXYZ".into(),
         )))
     };
@@ -5942,53 +6020,58 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
     });
     let decrypt = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
-        &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
+        &[RuntimeValue::Concrete(RuntimeConcreteValue::String(
+            "ciphertext".into(),
+        ))],
         &config,
     )
     .expect("test decryptor");
     let exports = vec![
-        InferredExportParam {
+        RuntimeInferredExportParam {
             name: "direct".into(),
             static_type: crate::static_type::ExportStaticType::Declared(local_type(
                 TypeExpr::String,
             )),
             value: Some(secret_string()),
         },
-        InferredExportParam {
+        RuntimeInferredExportParam {
             name: "builtin".into(),
             static_type: crate::static_type::ExportStaticType::Declared(local_type(
                 TypeExpr::String,
             )),
             value: Some(builtin),
         },
-        InferredExportParam {
+        RuntimeInferredExportParam {
             name: "interpolated".into(),
             static_type: crate::static_type::ExportStaticType::Declared(local_type(
                 TypeExpr::String,
             )),
-            value: Some(Value::Deferred(DeferredValue::Interpolation(vec![
-                InterpolationPart::Literal("prefix-".into()),
-                InterpolationPart::Expr(secret_string()),
-            ]))),
+            value: Some(RuntimeValue::Deferred(RuntimeDeferredValue::Interpolation(
+                vec![
+                    RuntimeInterpolationPart::Literal("prefix-".into()),
+                    RuntimeInterpolationPart::Expr(secret_string()),
+                ],
+            ))),
         },
-        InferredExportParam {
+        RuntimeInferredExportParam {
             name: "nested_list".into(),
             static_type: crate::static_type::ExportStaticType::Declared(local_type(
                 TypeExpr::List(Box::new(TypeExpr::String)),
             )),
-            value: Some(Value::Concrete(ConcreteValue::List(vec![secret_string()]))),
+            value: Some(RuntimeValue::Concrete(RuntimeConcreteValue::List(vec![
+                secret_string(),
+            ]))),
         },
-        InferredExportParam {
+        RuntimeInferredExportParam {
             name: "nested_map".into(),
             static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Map(
                 Box::new(TypeExpr::String),
             ))),
-            value: Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                "key".into(),
-                secret_string(),
-            )])))),
+            value: Some(RuntimeValue::Concrete(RuntimeConcreteValue::Map(
+                IndexMap::from([("key".into(), secret_string())]),
+            ))),
         },
-        InferredExportParam {
+        RuntimeInferredExportParam {
             name: "decrypted".into(),
             static_type: crate::static_type::ExportStaticType::Declared(local_type(
                 TypeExpr::String,
@@ -5997,7 +6080,7 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
         },
     ];
 
-    let error = resolve_and_validate_export_params(&exports, &config)
+    let error = resolve_and_validate_expanded_export_params(&exports, &config)
         .expect_err("secrets cannot be exported");
 
     for name in [
@@ -6020,7 +6103,6 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
 #[test]
 fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
-    use crate::parser::InferredExportParam;
 
     fn bindings(identifier: &str) -> ResolvedBindings {
         let resource = Resource::with_provider("mock", "test.resource", "resource", None)
@@ -6029,7 +6111,9 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
                 "identifier",
                 Value::Concrete(ConcreteValue::String(identifier.into())),
             )
-            .resolve_root(&RootScope::new());
+            .resolve_root(&RootScope::new())
+            .into_expanded()
+            .expect("resource fixture contains no parser placeholder");
         ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[resource],
             compositions: &[],
@@ -6040,20 +6124,19 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
         })
     }
 
-    let exports = [InferredExportParam {
+    let exports = [RuntimeInferredExportParam {
         name: "id".into(),
         static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
-        value: Some(Value::resource_ref("r", "identifier", vec![])),
-    }
-    .resolve_root(&RootScope::new())];
+        value: Some(RuntimeValue::root_resource_ref("r", "identifier", vec![])),
+    }];
     let provider_context = loaded_context_for_test(ProviderContext::default());
     let pre_apply =
         check_export_values_pre_apply(&exports, &bindings("alpha-id"), &provider_context)
             .expect("pre-apply export check");
     assert_eq!(
         pre_apply.display_values()[0].value,
-        Some(PhaseValue::Concrete(PhaseConcreteValue::String(
-            "alpha-id".into()
+        Some(RuntimeValue::Concrete(RuntimeConcreteValue::String(
+            "alpha-id".into(),
         ))),
     );
 
@@ -6062,8 +6145,8 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
             .expect("post-apply export resolution");
     assert_eq!(
         post_apply.as_slice()[0].value,
-        Some(PhaseValue::Concrete(PhaseConcreteValue::String(
-            "beta-id".into()
+        Some(RuntimeValue::Concrete(RuntimeConcreteValue::String(
+            "beta-id".into(),
         ))),
     );
 }
@@ -6703,7 +6786,9 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         until_predicate: UntilPredicateAst {
             root: "cert".into(),
             attribute_segments: vec!["status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -7298,10 +7383,14 @@ fn rendered_typecheck_result_skips_value_unknown() {
     // (e.g. from a deferred-for body where a typed module-call argument
     // is bound to the loop var) must short-circuit rather than emit
     // `expected <type>, got unknown`.
-    use crate::resource::{DeferredValue, UnknownReason, Value};
+    use crate::resource::{AuthoredApplyTimeUnknown as ApplyTimeUnknown, DeferredValue};
     use crate::validation::TypeExpr;
 
-    let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+    let unknown = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: "upstream".into(),
+        },
+    ));
     let cfg = ProviderContext::default();
 
     assert!(rendered_typecheck_result(&TypeExpr::String, &unknown, &cfg).is_none());
@@ -7313,7 +7402,7 @@ fn rendered_typecheck_result_skips_value_unknown() {
     };
     assert!(rendered_typecheck_result(&struct_ty, &unknown, &cfg).is_none());
 
-    let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let upstream = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: crate::resource::AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
     }));
     assert!(rendered_typecheck_result(&TypeExpr::String, &upstream, &cfg).is_none());
@@ -7571,7 +7660,7 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
     );
 }
 
-type ValidateConfigCallLog = std::sync::Arc<std::sync::Mutex<Vec<IndexMap<String, PhaseValue>>>>;
+type ValidateConfigCallLog = std::sync::Arc<std::sync::Mutex<Vec<IndexMap<String, RuntimeValue>>>>;
 
 /// Test-only factory that records every call to `validate_config` so a
 /// test can assert what attributes did or didn't cross the WASM-equivalent
@@ -7616,7 +7705,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, PhaseValue>) -> String {
+    fn extract_region(&self, _attributes: &IndexMap<String, RuntimeValue>) -> String {
         String::new()
     }
 
@@ -7753,7 +7842,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, PhaseValue>) -> String {
+        fn extract_region(&self, _attributes: &IndexMap<String, RuntimeValue>) -> String {
             String::new()
         }
 
@@ -7810,7 +7899,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
     let calls = seen.lock().unwrap();
     assert!(matches!(
         calls.last().and_then(|attrs| attrs.get("region")),
-        Some(PhaseValue::Concrete(PhaseConcreteValue::CanonicalEnum(value)))
+        Some(RuntimeValue::Concrete(RuntimeConcreteValue::CanonicalEnum(value)))
             if value.api_value() == "ap-northeast-1"
     ));
 }
@@ -7821,18 +7910,18 @@ fn value_contains_unresolved_ref_detects_nested_resource_ref() {
     // `assume_role = { role_arn = upstream.arn }` shape) must be
     // detected so the validate path drops that attribute from the
     // WASM `validate_config` payload.
-    use crate::resource::{AccessPath, DeferredValue};
+    use crate::resource::AccessPath;
 
-    let role_arn = Value::Deferred(DeferredValue::ResourceRef {
-        path: AccessPath::new("mgmt", "role_arn"),
+    let role_arn = RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
+        path: AccessPath::root("mgmt", "role_arn"),
     });
-    let mut inner: IndexMap<String, Value> = IndexMap::new();
+    let mut inner: IndexMap<String, RuntimeValue> = IndexMap::new();
     inner.insert("role_arn".to_string(), role_arn);
     inner.insert(
         "session_name".to_string(),
-        Value::Concrete(ConcreteValue::String("sess".into())),
+        RuntimeValue::Concrete(RuntimeConcreteValue::String("sess".into())),
     );
-    let assume_role = Value::Concrete(ConcreteValue::Map(inner));
+    let assume_role = RuntimeValue::Concrete(RuntimeConcreteValue::Map(inner));
 
     assert!(
         value_contains_unresolved_ref(&assume_role),
@@ -7842,12 +7931,12 @@ fn value_contains_unresolved_ref_detects_nested_resource_ref() {
 
 #[test]
 fn value_contains_unresolved_ref_false_for_pure_literal() {
-    let mut m: IndexMap<String, Value> = IndexMap::new();
+    let mut m: IndexMap<String, RuntimeValue> = IndexMap::new();
     m.insert(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+        RuntimeValue::Concrete(RuntimeConcreteValue::String("ap-northeast-1".into())),
     );
-    let v = Value::Concrete(ConcreteValue::Map(m));
+    let v = RuntimeValue::Concrete(RuntimeConcreteValue::Map(m));
 
     assert!(
         !value_contains_unresolved_ref(&v),
@@ -7857,12 +7946,12 @@ fn value_contains_unresolved_ref_false_for_pure_literal() {
 
 #[test]
 fn value_contains_unresolved_ref_detects_list_element() {
-    use crate::resource::{AccessPath, DeferredValue};
+    use crate::resource::AccessPath;
 
-    let v = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("ok".into())),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("x", "y"),
+    let v = RuntimeValue::Concrete(RuntimeConcreteValue::List(vec![
+        RuntimeValue::Concrete(RuntimeConcreteValue::String("ok".into())),
+        RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
+            path: AccessPath::root("x", "y"),
         }),
     ]));
     assert!(
@@ -7873,21 +7962,21 @@ fn value_contains_unresolved_ref_detects_list_element() {
 
 #[test]
 fn value_contains_unresolved_ref_unwraps_secret() {
-    use crate::resource::{AccessPath, DeferredValue};
+    use crate::resource::AccessPath;
 
-    let secret_with_ref = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-        DeferredValue::ResourceRef {
-            path: AccessPath::new("vault", "token"),
-        },
-    ))));
+    let secret_with_ref = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(
+        RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
+            path: AccessPath::root("vault", "token"),
+        }),
+    )));
     assert!(
         value_contains_unresolved_ref(&secret_with_ref),
         "Secret(ResourceRef) must propagate the unresolved signal",
     );
 
-    let secret_literal = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("plaintext".into()),
-    ))));
+    let secret_literal = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(
+        RuntimeValue::Concrete(RuntimeConcreteValue::String("plaintext".into())),
+    )));
     assert!(
         !value_contains_unresolved_ref(&secret_literal),
         "Secret(literal) must not be flagged",

@@ -313,7 +313,7 @@ pub struct DeferredReplacePayload<S = ModuleSource> {
     /// Synthetic id used for plan-tree display and progress.
     pub id: ResolvedResourceId,
     /// The for-expression body, replayed against the upstream state.
-    pub template: Box<DeferredForExpression<S, AbsoluteBindingAddress>>,
+    pub template: Box<DeferredForExpression<S>>,
 }
 
 /// One keyed list entry released from Carina's authored-value projection.
@@ -797,7 +797,7 @@ pub enum EffectWithSource<S> {
         /// Synthetic id used for plan-tree display and progress.
         id: ResolvedResourceId,
         /// The for-expression body, replayed against the upstream state.
-        template: Box<DeferredForExpression<S, AbsoluteBindingAddress>>,
+        template: Box<DeferredForExpression<S>>,
     },
 
     /// A deferred-for replacement whose delete side is known at plan time
@@ -876,7 +876,7 @@ pub enum UnresolvedSavedEffect {
     },
     DeferredCreate {
         id: ResolvedResourceId,
-        template: Box<DeferredForExpression<SavedModuleSource, AbsoluteBindingAddress>>,
+        template: Box<DeferredForExpression<SavedModuleSource>>,
     },
     DeferredReplace(Box<DeferredReplacePayload<SavedModuleSource>>),
 }
@@ -1389,7 +1389,7 @@ impl EffectWithSource<ModuleSource> {
 
     #[cfg(test)]
     fn display_glyph_effects() -> Vec<Self> {
-        use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
+        use crate::resource::{ConcreteValue, Value};
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
@@ -1523,7 +1523,6 @@ impl EffectWithSource<ModuleSource> {
                         line: 12,
                         header: "for opt in cert.domain_validation_options".to_string(),
                         resource_type: "route53.Record".to_string(),
-                        attributes: vec![],
                         target: crate::parser::DeferredForTarget::Bound {
                             binding: absolute_binding("validation_records"),
                         },
@@ -1562,7 +1561,6 @@ impl EffectWithSource<ModuleSource> {
                         line: 12,
                         header: "for opt in cert.domain_validation_options".to_string(),
                         resource_type: "route53.Record".to_string(),
-                        attributes: vec![],
                         target: crate::parser::DeferredForTarget::Bound {
                             binding: absolute_binding("validation_records"),
                         },
@@ -1833,9 +1831,7 @@ impl<S> EffectWithSource<S> {
     /// type match the variant directly; this helper covers the
     /// shared id/attributes/binding/dependency_bindings accessors
     /// through the borrowing `ResourceRef` enum.
-    pub fn as_resource_ref(
-        &self,
-    ) -> Option<crate::parser::ResourceRef<'_, S, AbsoluteBindingAddress>> {
+    pub fn as_resource_ref(&self) -> Option<crate::parser::ResourceRef<'_, S>> {
         match self {
             Effect::Create(resource) => Some(crate::parser::ResourceRef::Resource(resource)),
             Effect::ResumeCreate { resource, .. } => {
@@ -2308,7 +2304,6 @@ mod tests {
             line: 12,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "route53.Record".to_string(),
-            attributes: vec![],
             target: crate::parser::DeferredForTarget::Bound {
                 binding: absolute_binding("validation_records"),
             },
@@ -2486,11 +2481,11 @@ mod tests {
         // would wrap the nested value as a DSL string literal with
         // surrounding `"…"` quotes and `${…}` syntax).
         use crate::resource::{
-            ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+            ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Value,
         };
         let inner = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamAllExports {
+                ApplyTimeUnknown::UpstreamAllExports {
                     binding: absolute_binding("u"),
                 },
             ))),
@@ -2533,11 +2528,11 @@ mod tests {
         // interpolation; the helper now gates that path through the
         // `Value` type.
         use crate::resource::{
-            ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+            ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Value,
         };
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamAllExports {
+                ApplyTimeUnknown::UpstreamAllExports {
                     binding: absolute_binding("upstream"),
                 },
             ))),

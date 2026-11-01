@@ -4,13 +4,17 @@
 //! design. The grammar piece lives in `carina.pest::wait_expr`.
 
 use super::primary::parse_duration_secs;
-use crate::parser::ast::{UntilPredicateAst, WaitBinding};
 use crate::parser::error::ParseError;
+use crate::parser::{ParserUntilPredicate as UntilPredicateAst, ParserWaitBinding as WaitBinding};
 use crate::parser::{Rule, first_inner};
 use crate::resource::{
-    AuthoredConcreteValue as ConcreteValue, AuthoredValue as Value, RelativeBindingName,
+    ConcreteValue as GenericConcreteValue, NoPlaceholder, RelativeBindingName,
+    Value as GenericValue,
 };
 use pest::iterators::Pair;
+
+type Value = GenericValue<NoPlaceholder, RelativeBindingName>;
+type ConcreteValue = GenericConcreteValue<NoPlaceholder, RelativeBindingName>;
 
 /// Parse a `wait` expression into a [`WaitBinding`].
 ///

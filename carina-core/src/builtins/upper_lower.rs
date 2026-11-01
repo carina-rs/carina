@@ -1,6 +1,6 @@
 //! `upper(string)` and `lower(string)` built-in functions
 
-use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -13,7 +13,9 @@ use super::value_type_name;
 /// ```text
 /// upper("hello")  // => "HELLO"
 /// ```
-pub(crate) fn builtin_upper<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_upper<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!(
             "upper() expects 1 argument (string), got {}",
@@ -41,7 +43,9 @@ pub(crate) fn builtin_upper<B: BindingAddress>(args: &[Value<B>]) -> Result<Valu
 /// ```text
 /// lower("HELLO")  // => "hello"
 /// ```
-pub(crate) fn builtin_lower<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_lower<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!(
             "lower() expects 1 argument (string), got {}",

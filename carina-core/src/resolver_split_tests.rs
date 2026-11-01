@@ -34,6 +34,8 @@ fn s(s: &str) -> Value {
 fn ref_to(binding: &str, attr: &str) -> Value {
     crate::resource::AuthoredValue::resource_ref(binding, attr, Vec::new())
         .resolve_root(&RootScope::new())
+        .into_expanded()
+        .expect("resolver fixture contains no parser placeholder")
 }
 
 fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {

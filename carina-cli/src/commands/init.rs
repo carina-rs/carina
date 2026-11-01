@@ -115,7 +115,8 @@ async fn run_init_with_provider_resolver(
                 base_dir.display()
             )
         })?;
-        let resolved_count = resolve_providers(&install_lock, &loaded.parsed.providers, mode)?;
+        let provider_configs = crate::wiring::provider_loading_configs(&loaded.parsed.providers);
+        let resolved_count = resolve_providers(&install_lock, &provider_configs, mode)?;
 
         println!(
             "{}",
@@ -127,7 +128,14 @@ async fn run_init_with_provider_resolver(
         );
     }
 
-    let backend_config = loaded.parsed.backend.as_ref();
+    let backend_config = loaded
+        .parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let backend_config = backend_config.as_ref();
     let mut migration_pending = false;
 
     match inspect_backend_drift(base_dir, backend_config).map_err(|e| e.to_string())? {

@@ -1687,8 +1687,12 @@ fn project_legacy_value(value: Value, explicit: &ExplicitFields) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::{DeferredValue, UnknownReason};
+    use crate::resource::{ApplyTimeUnknown, DeferredValue, RelativeBindingName, RootScope};
     use indexmap::IndexMap;
+
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
+    }
 
     fn build_carried_from_resource_for_stored_values<S>(
         resource: &Resource<S>,
@@ -2608,7 +2612,9 @@ mod tests {
         );
         assert_eq!(
             build_from_value(&Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::ForValue,
+                ApplyTimeUnknown::UpstreamAllExports {
+                    binding: absolute_binding("upstream"),
+                },
             ))),
             ExplicitFields::Leaf
         );
@@ -2856,7 +2862,11 @@ mod tests {
     #[test]
     fn aligned_builder_deferred_unknown_desired_value_is_leaf() {
         let aligned = build_attribute_explicit(
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamAllExports {
+                    binding: absolute_binding("upstream"),
+                },
+            )),
             Some(Value::Concrete(ConcreteValue::List(vec![rule(
                 80,
                 Some("provider-default"),
@@ -3484,7 +3494,9 @@ mod tests {
         let current_item = Value::Concrete(ConcreteValue::String("rtb-1".into()));
         let current = Value::Concrete(ConcreteValue::List(vec![current_item.clone()]));
         let desired = Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-            DeferredValue::Unknown(UnknownReason::ForValue),
+            DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
+                binding: absolute_binding("upstream"),
+            }),
         )]));
         let explicit = ExplicitFields::ListElements {
             elements: vec![ExplicitFields::Unrecorded],

@@ -676,9 +676,7 @@ impl StateBackend for LocalBackend {
 mod tests {
     use super::*;
     use crate::state::ResourceState;
-    use carina_core::resource::{
-        AuthoredConcreteValue as ConcreteValue, AuthoredValue as Value, RelativeBindingName,
-    };
+    use carina_core::resource::{ConcreteValue, NoPlaceholder, Value};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier, Condvar, Mutex};
@@ -689,16 +687,15 @@ mod tests {
             .map(|path| {
                 HashMap::from([(
                     "path".to_string(),
-                    Value::Concrete(ConcreteValue::String(path.into())),
+                    Value::<NoPlaceholder>::Concrete(ConcreteValue::String(path.into())),
                 )])
             })
             .unwrap_or_default();
-        let raw: carina_core::parser::BackendConfig<RelativeBindingName> =
-            carina_core::parser::BackendConfig {
-                backend_type: "local".to_string(),
-                attributes,
-                attribute_spans: HashMap::new(),
-            };
+        let raw = carina_core::parser::BackendConfig {
+            backend_type: "local".to_string(),
+            attributes,
+            attribute_spans: HashMap::new(),
+        };
         match crate::BackendConfig::try_from(&raw).unwrap() {
             crate::BackendConfig::Local(settings) => settings,
             crate::BackendConfig::S3(_) => unreachable!(),

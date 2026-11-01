@@ -7,9 +7,7 @@
 //! a later pass can finish the expansion once the upstream value
 //! resolves.
 
-use crate::eval_value::{
-    AuthoredEvalValue as EvalValue, AuthoredStructuralHandleMetadata as StructuralHandleMetadata,
-};
+use crate::eval_value::{EvalValue, StructuralHandleMetadata};
 use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::{
     DeferredForBody, DeferredForTarget, ModuleCall, ParseContext, ParseError, ParseWarning,
@@ -18,11 +16,12 @@ use crate::parser::{
     evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
     parse_read_resource_expr, parse_resource_for_target,
 };
+use crate::parser::{
+    ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
+};
 use crate::resource::{
-    AuthoredConcreteValue as ConcreteValue, AuthoredDataSource as DataSource,
-    AuthoredDeferredValue as DeferredValue, AuthoredResource as Resource,
-    AuthoredUnknownReason as UnknownReason, AuthoredValue as Value, ForLoopElement,
-    LegacyLoopAddress, LoopElementOrigin, LoopKind, LoopSource, UnboundLoopTemplate,
+    ConcreteValue, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin, LoopKind,
+    LoopSlot, LoopSource, ParserPlaceholder, RelativeBindingName, UnboundLoopTemplate,
 };
 
 /// Binding pattern for a for expression
@@ -101,36 +100,23 @@ fn parse_deferred_for_body_template(
     source_file: &std::path::Path,
 ) -> Result<DeferredForBodyTemplateParse, ParseError> {
     let mut template_ctx = ctx.child_scope();
-    let bind = |ctx: &mut ParseContext, name: &str, value: Value| {
-        if name != "_" {
-            ctx.set_variable(name.to_string(), value);
-        }
-    };
-    let bind_value = |ctx: &mut ParseContext, name: &str| {
+    let bind_value = |ctx: &mut ParseContext, name: &str, slot: LoopSlot| {
         if name != "_" {
             ctx.set_variable(
                 name.to_string(),
-                EvalValue::deferred_for_value(name.to_string()),
+                EvalValue::deferred_for_value(name.to_string(), slot),
             );
         }
     };
     match binding {
-        ForBinding::Simple(value) => bind_value(&mut template_ctx, value),
+        ForBinding::Simple(value) => bind_value(&mut template_ctx, value, LoopSlot::Value),
         ForBinding::Indexed(index, value) => {
-            bind(
-                &mut template_ctx,
-                index,
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
-            );
-            bind_value(&mut template_ctx, value);
+            bind_value(&mut template_ctx, index, LoopSlot::Index);
+            bind_value(&mut template_ctx, value, LoopSlot::Value);
         }
         ForBinding::Map(key, value) => {
-            bind(
-                &mut template_ctx,
-                key,
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
-            );
-            bind_value(&mut template_ctx, value);
+            bind_value(&mut template_ctx, key, LoopSlot::Key);
+            bind_value(&mut template_ctx, value, LoopSlot::Value);
         }
     }
 
@@ -292,10 +278,10 @@ impl LoopParseTarget {
         }
     }
 
-    fn deferred_target(&self) -> DeferredForTarget {
+    fn deferred_target(&self) -> DeferredForTarget<RelativeBindingName> {
         match self {
             Self::Bound { binding } => DeferredForTarget::Bound {
-                binding: crate::resource::RelativeBindingName::new(binding.clone()),
+                binding: RelativeBindingName::new(binding.clone()),
             },
             Self::Unbound(template) => DeferredForTarget::Unbound {
                 template: template.clone(),
@@ -558,7 +544,7 @@ pub(crate) fn parse_for_expr(
         (_, Value::Deferred(_)) => {
             let iterable_surface = match &iterable {
                 Value::Deferred(
-                    DeferredValue::Unknown(UnknownReason::ModuleArgument { .. })
+                    DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
                     | DeferredValue::ModuleIf(_),
                 ) => iterable_surface.clone(),
                 _ => crate::value::format_value(&iterable),
@@ -605,7 +591,7 @@ pub(crate) fn parse_for_expr(
                     for_span,
                     header,
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: s.clone().into(),
+                        binding: RelativeBindingName::new(s.clone()),
                     }),
                     iterable_state,
                 )?;
@@ -829,15 +815,12 @@ pub(crate) fn parse_for_body(
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = match (target, element.as_ref()) {
-                    (LoopParseTarget::Bound { .. }, Some(element)) => Some(
-                        crate::resource::RelativeBindingName::new(target.element_address(element)),
-                    ),
-                    (LoopParseTarget::Bound { .. }, None) => {
-                        Some(crate::resource::RelativeBindingName::new(format!(
-                            "{}[?]",
-                            target.scheduler_key()
-                        )))
+                    (LoopParseTarget::Bound { .. }, Some(element)) => {
+                        Some(RelativeBindingName::new(target.element_address(element)))
                     }
+                    (LoopParseTarget::Bound { .. }, None) => Some(RelativeBindingName::new(
+                        format!("{}[?]", target.scheduler_key()),
+                    )),
                     (LoopParseTarget::Unbound(_), _) => None,
                 };
                 if let Some(element) = element {

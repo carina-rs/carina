@@ -201,9 +201,7 @@ fn module_child_prefix() -> String {
 }
 
 /// Check if a resource has a `let` binding (i.e., is not anonymous).
-fn has_binding<S, B: carina_core::resource::BindingAddress>(
-    resource: carina_core::parser::ResourceRef<'_, S, B>,
-) -> bool {
+fn has_binding<S>(resource: carina_core::parser::ResourceRef<'_, S>) -> bool {
     resource.binding().is_some()
 }
 
@@ -213,8 +211,8 @@ fn has_binding<S, B: carina_core::resource::BindingAddress>(
 /// `name` is the display name of the resource (typically `id.name`).
 /// `parent_binding` is the binding name of the parent in the tree, used to skip
 /// redundant ResourceRef hints.
-fn format_compact_name<S, B: carina_core::resource::BindingAddress>(
-    resource: carina_core::parser::ResourceRef<'_, S, B>,
+fn format_compact_name<S>(
+    resource: carina_core::parser::ResourceRef<'_, S>,
     name: &str,
     parent_binding: Option<&str>,
 ) -> String {

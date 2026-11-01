@@ -822,11 +822,9 @@ mod tests {
 
     #[test]
     fn test_backend_config_resolves_parser_context() {
-        use carina_core::resource::{
-            AuthoredConcreteValue as ConcreteValue, AuthoredValue as Value, RelativeBindingName,
-        };
+        use carina_core::resource::{ConcreteValue, Value};
 
-        let provider_context: carina_core::parser::BackendConfig<RelativeBindingName> =
+        let provider_context: carina_core::parser::BackendConfig =
             carina_core::parser::BackendConfig {
                 backend_type: "s3".to_string(),
                 attributes: [

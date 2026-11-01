@@ -1,6 +1,6 @@
 //! `split(separator, string)` built-in function
 
-use crate::resource::{BindingAddress, ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -15,7 +15,9 @@ use super::value_type_name;
 /// split("-", "a-b-c")  // => ["a", "b", "c"]
 /// "a-b-c" |> split("-") // => ["a", "b", "c"] (pipe form)
 /// ```
-pub(crate) fn builtin_split<B: BindingAddress>(args: &[Value<B>]) -> Result<Value<B>, String> {
+pub(crate) fn builtin_split<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!(
             "split() expects 2 arguments (separator, string), got {}",
@@ -43,7 +45,7 @@ pub(crate) fn builtin_split<B: BindingAddress>(args: &[Value<B>]) -> Result<Valu
         }
     };
 
-    let parts: Vec<Value<B>> = input
+    let parts: Vec<Value<NoPlaceholder, B>> = input
         .expose_plaintext()
         .split(separator.expose_plaintext())
         .map(|part| {

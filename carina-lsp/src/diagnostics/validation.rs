@@ -11,12 +11,14 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::resource::AuthoredValue as Value;
+use carina_core::resource::{ParserPlaceholder, RelativeBindingName, Value as GenericValue};
 use carina_core::schema::{
     EffectiveType, FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema,
 };
 
 use super::{DiagnosticEngine, build_enum_diagnostic_from_error, carina_diagnostic};
+
+type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
 impl DiagnosticEngine {
     /// Run [`carina_core::schema::EffectiveType::validate_collect`] against
@@ -36,7 +38,7 @@ impl DiagnosticEngine {
         effective_type: &EffectiveType<'_>,
         value_range: Option<Range>,
     ) -> Vec<Diagnostic> {
-        let errors = effective_type.validate_collect_in_phase(value);
+        let errors = effective_type.validate_collect(value);
         let mut diagnostics = Vec::new();
         for (path, err) in errors {
             if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {
@@ -348,7 +350,7 @@ fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::resource::{ConcreteValue, NoPlaceholder, Value};
     use carina_core::schema::{
         AttributeType, RootlessType, TypeIdentity, ValidatedConfigSchema, validator,
     };
@@ -375,7 +377,9 @@ mod tests {
             rejecting(first),
             rejecting(second),
         ]))
-        .validate(&Value::Concrete(ConcreteValue::String("invalid".into())))
+        .validate(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
+            "invalid".into(),
+        )))
         .expect_err("both Union arms must reject the value")
     }
 

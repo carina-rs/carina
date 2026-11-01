@@ -23,8 +23,8 @@ mod upper_lower;
 use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
 use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, Value, ValueString,
-    peel_secrets,
+    BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, NoPlaceholder, Value,
+    ValueString, peel_secrets,
 };
 
 /// Mark every string exposed from a `Secret` argument as diagnostic-only.
@@ -33,7 +33,9 @@ use crate::resource::{
 /// any handler-owned diagnostic can only render these strings through the
 /// safe [`ValueString`] diagnostic API. Runtime equality, hashing, and
 /// serialization remain byte-for-byte identical to an ordinary string.
-fn mark_secret_input_strings<B: BindingAddress>(value: Value<B>) -> Value<B> {
+fn mark_secret_input_strings<B: BindingAddress>(
+    value: Value<NoPlaceholder, B>,
+) -> Value<NoPlaceholder, B> {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => Value::Concrete(ConcreteValue::String(
             ValueString::diagnostic_sensitive(value.into_plaintext()),
@@ -155,7 +157,9 @@ fn mark_secret_input_strings<B: BindingAddress>(value: Value<B>) -> Value<B> {
 /// the result remains secret. This keeps the sensitivity tag attached across
 /// every transformation instead of making each handler remember to preserve
 /// it. Nested wrappers are normalized to one wrapper.
-fn peel_secret_arguments<B: BindingAddress>(args: Vec<Value<B>>) -> (Vec<Value<B>>, bool) {
+fn peel_secret_arguments<B: BindingAddress>(
+    args: Vec<Value<NoPlaceholder, B>>,
+) -> (Vec<Value<NoPlaceholder, B>>, bool) {
     let mut contained_secret = false;
     let args = args
         .into_iter()
@@ -172,7 +176,10 @@ fn peel_secret_arguments<B: BindingAddress>(args: Vec<Value<B>>) -> (Vec<Value<B
     (args, contained_secret)
 }
 
-fn propagate_secret<B: BindingAddress>(value: Value<B>, contained_secret: bool) -> Value<B> {
+fn propagate_secret<B: BindingAddress>(
+    value: Value<NoPlaceholder, B>,
+    contained_secret: bool,
+) -> Value<NoPlaceholder, B> {
     if !contained_secret || matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
         value
     } else {
@@ -349,17 +356,21 @@ macro_rules! register_builtins {
                         // so a closure here is a usage error: the caller
                         // tried to pass a partially-applied function as a
                         // data argument.
-                        let lowered: Result<Vec<Value<B>>, String> = args
+                        let lowered: Result<Vec<Value<NoPlaceholder, B>>, String> = args
                             .iter()
                             .cloned()
                             .map(|arg| {
-                                arg.into_value().map_err(|error| format!("{name}: {error}"))
+                                arg.into_expanded_value()
+                                    .map_err(|error| format!("{name}: {error}"))
                             })
                             .collect();
                         let (lowered, contained_secret) = peel_secret_arguments(lowered?);
                         $handler(&lowered)
                             .map(|value| {
-                                EvalValue::from_value(propagate_secret(value, contained_secret))
+                                EvalValue::from_expanded_value(propagate_secret(
+                                    value,
+                                    contained_secret,
+                                ))
                             })
                     }
                 )*
@@ -373,11 +384,15 @@ macro_rules! register_builtins {
         /// produce"). Returns `Err` if the call would produce a closure.
         pub fn evaluate_builtin_to_value<B: BindingAddress>(
             name: &str,
-            args: &[Value<B>],
-        ) -> Result<Value<B>, String> {
-            let eval_args: Vec<EvalValue<B>> = args.iter().cloned().map(EvalValue::from_value).collect();
+            args: &[Value<NoPlaceholder, B>],
+        ) -> Result<Value<NoPlaceholder, B>, String> {
+            let eval_args: Vec<EvalValue<B>> = args
+                .iter()
+                .cloned()
+                .map(EvalValue::from_expanded_value)
+                .collect();
             let result = evaluate_builtin(name, &eval_args)?;
-            result.into_value().map_err(|error| error.to_string())
+            result.into_expanded_value()
         }
     };
 }
@@ -562,17 +577,18 @@ pub(crate) fn evaluate_builtin_with_config<B: BindingAddress>(
         "decrypt" => {
             // `decrypt` is the only handler that needs the parser config.
             // It still operates on `&[Value]` so we lower the arguments.
-            let lowered: Result<Vec<Value<B>>, String> = args
+            let lowered: Result<Vec<Value<NoPlaceholder, B>>, String> = args
                 .iter()
                 .cloned()
                 .map(|arg| {
-                    arg.into_value()
+                    arg.into_expanded_value()
                         .map_err(|error| format!("decrypt: {error}"))
                 })
                 .collect();
             let (lowered, contained_secret) = peel_secret_arguments(lowered?);
-            decrypt::builtin_decrypt_with_config(&lowered, config)
-                .map(|value| EvalValue::from_value(propagate_secret(value, contained_secret)))
+            decrypt::builtin_decrypt_with_config(&lowered, config).map(|value| {
+                EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
+            })
         }
         _ => evaluate_builtin(name, args),
     }
@@ -589,8 +605,15 @@ pub fn is_known_builtin(name: &str) -> bool {
 /// `result.is_closure()` keep working without forcing each test to
 /// allocate `EvalValue` arguments by hand.
 #[cfg(test)]
-pub(crate) fn evaluate_builtin_for_tests(name: &str, args: &[Value]) -> Result<EvalValue, String> {
-    let eval_args: Vec<EvalValue> = args.iter().cloned().map(EvalValue::from_value).collect();
+pub(crate) fn evaluate_builtin_for_tests<B: BindingAddress>(
+    name: &str,
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<EvalValue<B>, String> {
+    let eval_args: Vec<EvalValue<B>> = args
+        .iter()
+        .cloned()
+        .map(EvalValue::from_expanded_value)
+        .collect();
     evaluate_builtin(name, &eval_args)
 }
 
@@ -601,16 +624,20 @@ pub(crate) fn evaluate_builtin_for_tests(name: &str, args: &[Value]) -> Result<E
 #[cfg(test)]
 pub(crate) fn evaluate_builtin_with_config_to_value<B: BindingAddress>(
     name: &str,
-    args: &[Value<B>],
+    args: &[Value<NoPlaceholder, B>],
     config: &ProviderContext,
-) -> Result<Value<B>, String> {
-    let eval_args: Vec<EvalValue<B>> = args.iter().cloned().map(EvalValue::from_value).collect();
+) -> Result<Value<NoPlaceholder, B>, String> {
+    let eval_args: Vec<EvalValue<B>> = args
+        .iter()
+        .cloned()
+        .map(EvalValue::from_expanded_value)
+        .collect();
     let result = evaluate_builtin_with_config(name, &eval_args, config)?;
-    result.into_value().map_err(|error| error.to_string())
+    result.into_expanded_value()
 }
 
 /// Return a human-readable type name for a Value
-fn value_type_name<B: BindingAddress>(value: &Value<B>) -> &'static str {
+fn value_type_name<B: BindingAddress>(value: &Value<NoPlaceholder, B>) -> &'static str {
     match value {
         Value::Concrete(ConcreteValue::String(_)) => "String",
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier",
@@ -636,6 +663,7 @@ fn value_type_name<B: BindingAddress>(value: &Value<B>) -> &'static str {
         Value::Deferred(DeferredValue::Secret(_)) => "Secret",
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret",
         Value::Deferred(DeferredValue::Unknown(_)) => "Unknown",
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 

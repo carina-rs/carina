@@ -235,7 +235,8 @@ mod tests {
     use carina_core::executor::ProgressInfo;
     use carina_core::resource::ResolvedResourceId;
     use carina_core::resource::{
-        ConcreteValue, DeferredValue, ResolvedResource, Resource, ResourceId, UnknownReason, Value,
+        AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, ResolvedResource, Resource,
+        ResourceId, Value,
     };
     use carina_core::wait::predicate::{AttrPath, WaitPredicate};
     use indexmap::IndexMap;
@@ -440,14 +441,17 @@ mod tests {
         let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let attrs = HashMap::from([(
             "status".to_string(),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
+                path: AccessPath::with_fields("bootstrap", "network", vec!["status".into()])
+                    .resolve_root_for_test(),
+            })),
         )]);
         let predicate = equals_predicate(AttrPath::single("missing"), "present");
         let observation = wait_observation(&target_id, &predicate, &attrs);
 
         assert_eq!(
             format_wait_observed_attr(&observation),
-            "status=(known after upstream apply)"
+            "status=(known after upstream apply: bootstrap.network.status)"
         );
     }
 

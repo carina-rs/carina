@@ -320,6 +320,9 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
         &SchemaRegistry::new(),
     )
     .expect("module expansion should succeed");
+    let parsed = parsed
+        .into_expanded()
+        .expect("module expansion must substitute every parser placeholder");
 
     // Sanity: module expansion produced both the RolePolicy resource
     // and the `_virtual.bs.bootstrap` row.

@@ -866,9 +866,9 @@ async fn run_destroy_locked_owned(
                 .binding_address()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| {
-                let id = effect.resource_id();
-                format!("{}:{}", id.resource_type, id.identity_display())
-            });
+                    let id = effect.resource_id();
+                    format!("{}:{}", id.resource_type, id.identity_display())
+                });
             (binding, effect.clone())
         })
         .collect();
@@ -1564,7 +1564,7 @@ fn observe_destroy_success_for_tests(
 }
 
 fn build_destroy_wait_aliases(
-    wait_bindings: &[WaitBinding<carina_core::resource::AbsoluteBindingAddress>],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
     delete_effects: &[Effect],
 ) -> Vec<DestroyWaitAlias> {
     let delete_dependencies: Vec<(
@@ -2078,8 +2078,8 @@ mod tests {
     use carina_core::provider::ProviderError;
     use std::sync::{Arc, Mutex};
 
-    fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
-        carina_core::resource::absolute_binding_address_for_test(name)
+    fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+        crate::absolute_binding_for_test(name)
     }
 
     #[path = "cancellation_fixture.rs"]
@@ -2227,7 +2227,9 @@ mod tests {
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
-        .expect("test fixture crosses module resolution");
+        .expect("test fixture crosses module resolution")
+        .into_expanded()
+        .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(

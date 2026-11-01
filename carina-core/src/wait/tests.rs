@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::resource::{
-    DataSource, ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value, ResolvedResource,
-    Resource,
+    DataSource, ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value,
+    RelativeBindingName, ResolvedResource, Resource, RootScope,
 };
 use crate::wait::predicate::{AttrPath, WaitPredicate};
 use crate::wait::{BindingPattern, WaitTargetLookup, resolve_wait_target};
@@ -17,9 +17,12 @@ fn managed(identity: &'static str, binding: Option<&'static str>) -> ResolvedRes
 }
 
 fn data_source(identity: &'static str, binding: Option<&'static str>) -> DataSource {
-    let resource: DataSource = DataSource::with_provider("aws", "test.Lookup", identity, None);
+    let mut resource: DataSource = DataSource::with_provider("aws", "test.Lookup", identity, None);
     match binding {
-        Some(binding) => resource.with_root_binding(binding),
+        Some(binding) => {
+            resource.binding = Some(RootScope::new().resolve(RelativeBindingName::new(binding)));
+            resource
+        }
         None => resource,
     }
 }

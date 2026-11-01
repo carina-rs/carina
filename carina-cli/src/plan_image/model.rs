@@ -1183,8 +1183,11 @@ mod tests {
     }
 
     fn root_resource_ref(binding: &str, attribute: &str) -> Value {
-        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
-            .resolve_root_for_test()
+        carina_core::resource::Value::<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::RelativeBindingName,
+        >::resource_ref(binding, attribute, Vec::new())
+        .resolve_root_for_test()
     }
 
     fn input<'a>(
@@ -1381,7 +1384,6 @@ mod tests {
             line: 1,
             header: "for item in literal".to_string(),
             resource_type: "test.Widget".to_string(),
-            attributes: Vec::new(),
             target: carina_core::parser::DeferredForTarget::Bound {
                 binding: absolute_binding("widgets"),
             },
@@ -1418,7 +1420,9 @@ mod tests {
         .expect("parse deferred loop fixture");
         let mut parsed =
             carina_core::module_resolver::resolve_modules_providerless(parsed, fixture.path())
-                .expect("cross the deferred-body resolution seam");
+                .expect("cross the deferred-body resolution seam")
+                .into_expanded()
+                .expect("deferred loop fixture must contain no parser placeholders");
         let template = parsed
             .deferred_for_expressions_mut()
             .pop()
@@ -1441,22 +1445,27 @@ mod tests {
             line,
             header,
             resource_type,
-            attributes,
             target,
             iterable,
             binding,
-            template_resource: _,
+            template_resource,
         } = saved;
+        let mut live_template_resource = Resource::pending_with_provider(
+            template_resource.id.provider.clone(),
+            template_resource.id.resource_type.clone(),
+            template_resource.id.provider_instance.clone(),
+        );
+        live_template_resource.attributes = template_resource.attributes;
+        live_template_resource.binding = template_resource.binding;
         let round_tripped = DeferredForExpression {
             file,
             line,
             header,
             resource_type,
-            attributes,
             target,
             iterable,
             binding,
-            template_resource: Resource::pending_with_provider("mock", "test.Child", None),
+            template_resource: live_template_resource,
         };
 
         let mut plan = Plan::new();

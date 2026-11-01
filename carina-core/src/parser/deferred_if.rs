@@ -5,42 +5,47 @@
 //! They must never survive into the expanded root graph, a saved plan, or
 //! state.
 
-use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, DataSource, ModuleSource, RelativeBindingName,
-    Resource, Value,
-};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::ModuleCall;
+use crate::resource::{
+    AbsoluteBindingAddress, BindingAddress, DataSource, ModuleSource, ParserPlaceholder,
+    PlaceholderKind, RelativeBindingName, Resource, Value,
+};
+
+use super::{File, ModuleCall, ParsedDeferredForPhase, ParsedExportParam};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeferredIfCondition<B: BindingAddress = RelativeBindingName> {
-    pub(crate) value: Value<B>,
+pub struct DeferredIfCondition<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    pub(crate) value: Value<P, B>,
     pub(crate) source_file: PathBuf,
     pub(crate) source_line: usize,
     pub(crate) source_expression: String,
 }
 
-impl<B: BindingAddress> DeferredIfCondition<B> {
+impl DeferredIfCondition<ParserPlaceholder, RelativeBindingName> {
     #[cfg(test)]
-    pub(crate) fn new(value: Value<B>, source_file: PathBuf, source_line: usize) -> Self {
-        let source_expression = if let Value::Deferred(crate::resource::DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument {
-                name,
-                source_line: _,
-                diagnostic_name,
-            },
-        )) = &value
-        {
-            diagnostic_name.as_deref().unwrap_or(name).to_string()
-        } else {
-            crate::value::format_value(&value)
+    pub(crate) fn new(
+        value: Value<ParserPlaceholder, RelativeBindingName>,
+        source_file: PathBuf,
+        source_line: usize,
+    ) -> Self {
+        let source_expression = match &value {
+            Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                ParserPlaceholder::ModuleArgument { name, diagnostic },
+            )) => diagnostic.diagnostic_name().unwrap_or(name).to_string(),
+            _ => crate::value::format_value(&value),
         };
         Self::new_with_source_expression(value, source_file, source_line, source_expression)
     }
+}
 
+impl<P: PlaceholderKind, B: BindingAddress> DeferredIfCondition<P, B> {
     pub(crate) fn new_with_source_expression(
-        value: Value<B>,
+        value: Value<P, B>,
         source_file: PathBuf,
         source_line: usize,
         source_expression: String,
@@ -53,7 +58,7 @@ impl<B: BindingAddress> DeferredIfCondition<B> {
         }
     }
 
-    pub fn value(&self) -> &Value<B> {
+    pub fn value(&self) -> &Value<P, B> {
         &self.value
     }
 
@@ -71,17 +76,20 @@ impl<B: BindingAddress> DeferredIfCondition<B> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeferredValueIf<B: BindingAddress = RelativeBindingName> {
-    pub(crate) condition: DeferredIfCondition<B>,
-    pub(crate) then_value: Value<B>,
-    pub(crate) else_value: Value<B>,
+pub struct DeferredValueIf<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    pub(crate) condition: DeferredIfCondition<P, B>,
+    pub(crate) then_value: Value<P, B>,
+    pub(crate) else_value: Value<P, B>,
 }
 
-impl<B: BindingAddress> DeferredValueIf<B> {
+impl<P: PlaceholderKind, B: BindingAddress> DeferredValueIf<P, B> {
     pub(crate) fn new(
-        condition: DeferredIfCondition<B>,
-        then_value: Value<B>,
-        else_value: Value<B>,
+        condition: DeferredIfCondition<P, B>,
+        then_value: Value<P, B>,
+        else_value: Value<P, B>,
     ) -> Self {
         Self {
             condition,
@@ -90,35 +98,32 @@ impl<B: BindingAddress> DeferredValueIf<B> {
         }
     }
 
-    pub fn condition(&self) -> &DeferredIfCondition<B> {
+    pub fn condition(&self) -> &DeferredIfCondition<P, B> {
         &self.condition
     }
 
-    pub fn then_value(&self) -> &Value<B> {
+    pub fn then_value(&self) -> &Value<P, B> {
         &self.then_value
     }
 
-    pub fn else_value(&self) -> &Value<B> {
+    pub fn else_value(&self) -> &Value<P, B> {
         &self.else_value
     }
 
-    pub fn values(&self) -> [&Value<B>; 3] {
+    pub fn values(&self) -> [&Value<P, B>; 3] {
         [self.condition.value(), &self.then_value, &self.else_value]
     }
 
-    pub(crate) fn map<C: BindingAddress>(
-        &self,
-        mut map: impl FnMut(&Value<B>) -> Value<C>,
-    ) -> DeferredValueIf<C> {
-        self.try_map::<C, std::convert::Infallible>(|value| Ok(map(value)))
+    pub(crate) fn map(&self, mut map: impl FnMut(&Value<P, B>) -> Value<P, B>) -> Self {
+        self.try_map::<std::convert::Infallible>(|value| Ok(map(value)))
             .expect("an infallible deferred-if map cannot fail")
     }
 
-    pub(crate) fn try_map<C: BindingAddress, E>(
+    pub(crate) fn try_map<E>(
         &self,
-        mut map: impl FnMut(&Value<B>) -> Result<Value<C>, E>,
-    ) -> Result<DeferredValueIf<C>, E> {
-        Ok(DeferredValueIf::new(
+        mut map: impl FnMut(&Value<P, B>) -> Result<Value<P, B>, E>,
+    ) -> Result<Self, E> {
+        Ok(Self::new(
             DeferredIfCondition::new_with_source_expression(
                 map(self.condition.value())?,
                 self.condition.source_file.clone(),
@@ -129,20 +134,55 @@ impl<B: BindingAddress> DeferredValueIf<B> {
             map(&self.else_value)?,
         ))
     }
+
+    pub(crate) fn try_map_stage<Q: PlaceholderKind, E>(
+        self,
+        mut map: impl FnMut(Value<P, B>) -> Result<Value<Q, B>, E>,
+    ) -> Result<DeferredValueIf<Q, B>, E> {
+        Ok(DeferredValueIf::new(
+            DeferredIfCondition::new_with_source_expression(
+                map(self.condition.value)?,
+                self.condition.source_file,
+                self.condition.source_line,
+                self.condition.source_expression,
+            ),
+            map(self.then_value)?,
+            map(self.else_value)?,
+        ))
+    }
+
+    pub(crate) fn map_bindings<T: BindingAddress>(
+        self,
+        map: &mut impl FnMut(B) -> T,
+    ) -> DeferredValueIf<P, T> {
+        DeferredValueIf::new(
+            DeferredIfCondition::new_with_source_expression(
+                self.condition.value.map_bindings(map),
+                self.condition.source_file,
+                self.condition.source_line,
+                self.condition.source_expression,
+            ),
+            self.then_value.map_bindings(map),
+            self.else_value.map_bindings(map),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct DeferredStructuralIf<B: BindingAddress = RelativeBindingName> {
-    pub(crate) condition: DeferredIfCondition<B>,
-    pub(crate) then_branch: DeferredIfBody<B>,
-    pub(crate) else_branch: Option<DeferredIfBody<B>>,
+pub struct DeferredStructuralIf<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    pub(crate) condition: DeferredIfCondition<P, B>,
+    pub(crate) then_branch: DeferredIfBody<P, B>,
+    pub(crate) else_branch: Option<DeferredIfBody<P, B>>,
 }
 
-impl<B: BindingAddress> DeferredStructuralIf<B> {
+impl<P: PlaceholderKind, B: BindingAddress> DeferredStructuralIf<P, B> {
     pub(crate) fn new(
-        condition: DeferredIfCondition<B>,
-        then_branch: DeferredIfBody<B>,
-        else_branch: Option<DeferredIfBody<B>>,
+        condition: DeferredIfCondition<P, B>,
+        then_branch: DeferredIfBody<P, B>,
+        else_branch: Option<DeferredIfBody<P, B>>,
     ) -> Self {
         Self {
             condition,
@@ -151,40 +191,54 @@ impl<B: BindingAddress> DeferredStructuralIf<B> {
         }
     }
 
-    pub fn condition(&self) -> &DeferredIfCondition<B> {
+    pub fn condition(&self) -> &DeferredIfCondition<P, B> {
         &self.condition
     }
 
-    pub fn then_branch(&self) -> &DeferredIfBody<B> {
+    pub fn then_branch(&self) -> &DeferredIfBody<P, B> {
         &self.then_branch
     }
 
-    pub fn else_branch(&self) -> Option<&DeferredIfBody<B>> {
+    pub fn else_branch(&self) -> Option<&DeferredIfBody<P, B>> {
         self.else_branch.as_ref()
     }
 
-    pub(crate) fn branches(&self) -> impl Iterator<Item = &DeferredIfBody<B>> {
+    pub(crate) fn branches(&self) -> impl Iterator<Item = &DeferredIfBody<P, B>> {
         std::iter::once(&self.then_branch).chain(self.else_branch.iter())
     }
 
-    pub(crate) fn branches_mut(&mut self) -> impl Iterator<Item = &mut DeferredIfBody<B>> {
+    pub(crate) fn branches_mut(&mut self) -> impl Iterator<Item = &mut DeferredIfBody<P, B>> {
         std::iter::once(&mut self.then_branch).chain(self.else_branch.iter_mut())
     }
 }
 
+type ExpandedModuleCallFile<P, B> =
+    File<ParsedExportParam<P, B>, P, P, ParsedDeferredForPhase<P, B>, B>;
+
 #[derive(Debug, Clone)]
-pub enum DeferredIfBody<B: BindingAddress = RelativeBindingName> {
-    Resource(Box<Resource<ModuleSource, B>>),
-    DataSource(Box<DataSource<ModuleSource, B>>),
-    ModuleCall(ModuleCall<B>),
+pub enum DeferredIfBody<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    Resource(Box<Resource<ModuleSource, P, B>>),
+    DataSource(Box<DataSource<ModuleSource, P, B>>),
+    ModuleCall(ModuleCall<P, B>),
+    /// Resolver-prepared nested call contribution. Parsing only constructs
+    /// `ModuleCall`; nested-module resolution replaces it with this form
+    /// while the callee's binding/type scope is still available.
+    ExpandedModuleCall(Arc<ExpandedModuleCallFile<P, B>>),
 }
 
-impl<B: BindingAddress> DeferredIfBody<B> {
+impl<P: PlaceholderKind, B: BindingAddress> DeferredIfBody<P, B> {
     pub(crate) fn binding_address(&self) -> Option<&B> {
         match self {
             Self::Resource(resource) => resource.binding.as_ref(),
             Self::DataSource(data_source) => data_source.binding.as_ref(),
             Self::ModuleCall(call) => call.binding_name.as_ref(),
+            Self::ExpandedModuleCall(contribution) => contribution
+                .compositions
+                .iter()
+                .find_map(|composition| composition.binding.as_ref()),
         }
     }
 
@@ -193,11 +247,11 @@ impl<B: BindingAddress> DeferredIfBody<B> {
     }
 }
 
-impl DeferredIfCondition<RelativeBindingName> {
+impl<P: PlaceholderKind> DeferredIfCondition<P, RelativeBindingName> {
     pub(crate) fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> DeferredIfCondition<AbsoluteBindingAddress> {
+    ) -> DeferredIfCondition<P, AbsoluteBindingAddress> {
         DeferredIfCondition::new_with_source_expression(
             self.value.resolve_bindings(resolve),
             self.source_file,
@@ -207,11 +261,11 @@ impl DeferredIfCondition<RelativeBindingName> {
     }
 }
 
-impl DeferredStructuralIf<RelativeBindingName> {
+impl<P: PlaceholderKind> DeferredStructuralIf<P, RelativeBindingName> {
     pub(crate) fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> DeferredStructuralIf<AbsoluteBindingAddress> {
+    ) -> DeferredStructuralIf<P, AbsoluteBindingAddress> {
         DeferredStructuralIf::new(
             self.condition.resolve_bindings(resolve),
             self.then_branch.resolve_bindings(resolve),
@@ -221,11 +275,11 @@ impl DeferredStructuralIf<RelativeBindingName> {
     }
 }
 
-impl DeferredIfBody<RelativeBindingName> {
+impl<P: PlaceholderKind> DeferredIfBody<P, RelativeBindingName> {
     fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> DeferredIfBody<AbsoluteBindingAddress> {
+    ) -> DeferredIfBody<P, AbsoluteBindingAddress> {
         match self {
             Self::Resource(resource) => {
                 DeferredIfBody::Resource(Box::new(resource.resolve_bindings(resolve)))
@@ -234,11 +288,16 @@ impl DeferredIfBody<RelativeBindingName> {
                 DeferredIfBody::DataSource(Box::new(data_source.resolve_bindings(resolve)))
             }
             Self::ModuleCall(call) => DeferredIfBody::ModuleCall(call.resolve_bindings(resolve)),
+            Self::ExpandedModuleCall(contribution) => {
+                let contribution = Arc::try_unwrap(contribution)
+                    .unwrap_or_else(|contribution| (*contribution).clone());
+                DeferredIfBody::ExpandedModuleCall(Arc::new(contribution.resolve_bindings(resolve)))
+            }
         }
     }
 }
 
-impl DeferredStructuralIf<AbsoluteBindingAddress> {
+impl<P: PlaceholderKind> DeferredStructuralIf<P, AbsoluteBindingAddress> {
     pub(crate) fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
@@ -251,7 +310,7 @@ impl DeferredStructuralIf<AbsoluteBindingAddress> {
     }
 }
 
-impl DeferredIfBody<AbsoluteBindingAddress> {
+impl<P: PlaceholderKind> DeferredIfBody<P, AbsoluteBindingAddress> {
     fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
@@ -260,6 +319,9 @@ impl DeferredIfBody<AbsoluteBindingAddress> {
             Self::Resource(resource) => resource.map_absolute_bindings(map),
             Self::DataSource(data_source) => data_source.map_absolute_bindings(map),
             Self::ModuleCall(call) => call.map_absolute_bindings(map),
+            Self::ExpandedModuleCall(contribution) => {
+                Arc::make_mut(contribution).map_absolute_bindings(map);
+            }
         }
     }
 }

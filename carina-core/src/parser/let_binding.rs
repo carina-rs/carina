@@ -31,11 +31,8 @@ use super::expressions::wait_expr::parse_wait_expr;
 use super::grammar::PreprocessedFile;
 use super::parse_expression_eval;
 use super::util::descend_expression;
-use crate::eval_value::{
-    AuthoredEvalValue as EvalValue, AuthoredStructuralHandle as StructuralHandle,
-    StructuralHandleKind,
-};
-use crate::resource::{AuthoredDataSource as DataSource, AuthoredResource as Resource};
+use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
+use crate::parser::{ParsedDataSource as DataSource, ParsedResource as Resource};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
 /// rather than `Value` so partial applications (closures) can survive

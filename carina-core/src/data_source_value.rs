@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::resource::{
-    AbsoluteBindingAddress, AccessPath, DataSource, ModuleSource, ResourceId, State, UnknownReason,
+    AbsoluteBindingAddress, AccessPath, ApplyTimeUnknown, DataSource, ModuleSource, ResourceId,
+    State,
 };
 
 /// A data-source input attribute whose unresolved value shapes make the read
@@ -15,7 +16,7 @@ pub struct UnresolvedDataSourceInput {
     pub attribute: String,
     pub paths: Vec<AccessPath>,
     pub bindings: Vec<AbsoluteBindingAddress>,
-    pub unknowns: Vec<UnknownReason>,
+    pub unknowns: Vec<ApplyTimeUnknown>,
 }
 
 /// The value status of one configured data source after the pre-apply read
@@ -279,8 +280,8 @@ pub enum DataSourceReadStateMergeError {
 mod tests {
     use super::*;
     use crate::resource::{
-        ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value, RelativeBindingName,
-        RootScope,
+        AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value,
+        RelativeBindingName, RootScope,
     };
 
     fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {

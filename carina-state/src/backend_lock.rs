@@ -15,6 +15,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
+use carina_core::resource::{
+    AbsoluteBindingAddress, BindingAddress, NoPlaceholder, PlaceholderKind,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendError, BackendResult, LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
@@ -111,8 +114,8 @@ impl BackendLock {
     /// configuration name"; lock creation, drift inspection, `init`'s
     /// warning path, and the migration path all go through it so they
     /// cannot disagree.
-    pub fn for_config(
-        backend_config: Option<&carina_core::parser::BackendConfig>,
+    pub fn for_config<P: PlaceholderKind, B: BindingAddress>(
+        backend_config: Option<&carina_core::parser::BackendConfig<P, B>>,
     ) -> BackendResult<Self> {
         match backend_config {
             Some(cfg) => BackendConfig::try_from(cfg)
@@ -203,7 +206,7 @@ impl BackendLock {
             .attributes
             .iter()
             .map(|(key, value)| {
-                let value = match value {
+                let value: Value = match value {
                     serde_json::Value::String(s) => {
                         Value::Concrete(ConcreteValue::String(s.clone().into()))
                     }
@@ -217,7 +220,7 @@ impl BackendLock {
                 Ok((key.clone(), value))
             })
             .collect::<BackendResult<_>>()?;
-        let raw: carina_core::parser::BackendConfig<carina_core::resource::RelativeBindingName> =
+        let raw: carina_core::parser::BackendConfig<NoPlaceholder, AbsoluteBindingAddress> =
             carina_core::parser::BackendConfig {
                 backend_type: self.backend_type.clone(),
                 attributes,

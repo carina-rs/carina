@@ -1,9 +1,8 @@
 use super::*;
-use carina_core::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
+use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::resource::{
-    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
-    ExpandedDirectives as Directives, ExpandedResource as Resource, ExpandedValue as Value,
-    ResolvedResource, ResourceId, State,
+    AbsoluteBindingAddress, ConcreteValue, Directives, LoopSlot, ModuleSource, NoPlaceholder,
+    ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use carina_core::value::format_value;
@@ -23,6 +22,8 @@ fn absolute(binding: &str) -> AbsoluteBindingAddress {
 fn root_ref(binding: &str, attribute: &str) -> Value {
     carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
         .resolve_root_for_test()
+        .into_expanded()
+        .expect("TUI fixture contains no parser placeholder")
 }
 
 #[test]
@@ -116,14 +117,14 @@ fn removed_plan_shows_each_abandoned_deposed_generation() {
 
 #[test]
 fn deferred_create_uses_create_symbol_and_kind() {
-    let template_resource = Resource::new("route53.Record", "validation_records")
-        .with_absolute_binding(absolute("validation_records"));
+    let template_resource: Resource<ModuleSource, LoopSlot, AbsoluteBindingAddress> =
+        Resource::new("route53.Record", "validation_records")
+            .with_absolute_binding(absolute("validation_records"));
     let deferred = DeferredForExpression {
         file: None,
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: Vec::new(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: absolute("validation_records"),
         },
@@ -324,19 +325,26 @@ fn host_metadata_fields_are_not_rendered_as_attributes() {
 #[test]
 fn format_value_display() {
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String("hello".into()))),
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
+            "hello".into(),
+        ))),
         "'hello'"
     );
-    assert_eq!(format_value(&Value::Concrete(ConcreteValue::Int(42))), "42");
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::Bool(true))),
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(42))),
+        "42"
+    );
+    assert_eq!(
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::Bool(true))),
         "true"
     );
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::Int(2))
-        ]))),
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::List(
+            vec![
+                Value::Concrete(ConcreteValue::Int(1)),
+                Value::Concrete(ConcreteValue::Int(2))
+            ]
+        ))),
         "[1, 2]"
     );
 }
@@ -740,7 +748,7 @@ fn tab_complete_with_provider_prefix() {
 #[test]
 fn format_value_preserves_strings_that_resemble_enum_identifiers() {
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String(
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
             "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface"
                 .to_string()
                 .into()
@@ -749,14 +757,14 @@ fn format_value_preserves_strings_that_resemble_enum_identifiers() {
     );
 
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String(
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
             "aws.s3.VersioningStatus.Enabled".into()
         ))),
         "'aws.s3.VersioningStatus.Enabled'"
     );
 
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String(
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
             "aws.Region.ap_northeast_1".into()
         ))),
         "'aws.Region.ap_northeast_1'"
@@ -764,7 +772,9 @@ fn format_value_preserves_strings_that_resemble_enum_identifiers() {
 
     // Regular string should be quoted as-is
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String("my-bucket".into()))),
+        format_value(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
+            "my-bucket".into(),
+        ))),
         "'my-bucket'"
     );
 

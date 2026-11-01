@@ -23,10 +23,13 @@ use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
     CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, UpdateRequest,
 };
+#[cfg(test)]
+use crate::resource::NoPlaceholder;
 use crate::resource::{
-    BindingAddress, ConcreteValue, DataSource, DeferredValue, LiveComposition, ProviderDataSource,
-    ProviderModuleSource, ProviderResource, RelativeBindingName, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
+    BindingAddress, ConcreteValue, DataSource, DeferredValue, LiveComposition, ParserPlaceholder,
+    PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
+    RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
+    SavedComposition, Value,
 };
 use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
@@ -146,7 +149,10 @@ impl ProviderReadyConfig {
 pub struct ProviderPreparationContext<'a> {
     bindings: &'a ResolvedBindings,
     module_gate: &'a ModuleConstraintGate,
-    provider_configs: &'a [ProviderConfig<crate::resource::AbsoluteBindingAddress>],
+    provider_configs: &'a [ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
     normalizer: &'a dyn ProviderNormalizer,
     custom_type_resolver:
         crate::provider::FactoryCustomTypeResolver<&'a [Box<dyn ProviderFactory>]>,
@@ -157,7 +163,10 @@ impl<'a> ProviderPreparationContext<'a> {
     pub fn new(
         bindings: &'a ResolvedBindings,
         module_gate: &'a ModuleConstraintGate,
-        provider_configs: &'a [ProviderConfig<crate::resource::AbsoluteBindingAddress>],
+        provider_configs: &'a [ProviderConfig<
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+        >],
         normalizer: &'a dyn ProviderNormalizer,
         factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
@@ -397,7 +406,7 @@ impl ProviderReadyDataSource {
 /// Failure while preparing a provider-facing resource.
 #[derive(Debug, Error)]
 pub enum ProviderPreparationError {
-    /// A deferred placeholder survived apply-time reference resolution.
+    /// An unresolved deferred value survived apply-time reference resolution.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
     /// A known value violates its resource schema or provider validator.
@@ -489,11 +498,11 @@ impl ProviderConfigPreparationError {
     }
 }
 
-fn canonicalize_provider_config_attributes<B: BindingAddress>(
+fn canonicalize_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
     provider_name: &str,
-    attributes: &IndexMap<String, Value<B>>,
+    attributes: &IndexMap<String, Value<P, B>>,
     attr_types: &crate::schema::ValidatedConfigSchema,
-) -> Result<IndexMap<String, Value<B>>, ProviderConfigPreparationError> {
+) -> Result<IndexMap<String, Value<P, B>>, ProviderConfigPreparationError> {
     let attributes = crate::value::canonicalize_provider_config_attributes_with_types(
         provider_name,
         attributes,
@@ -560,28 +569,26 @@ pub fn validate_and_canonicalize_provider_config(
     validate_canonical_provider_config(factory, provider_name, serializable)
 }
 
-/// Validate authored provider configuration without assigning root addresses
-/// to unresolved references. Provider-specific validation receives only the
-/// address-free attributes that can cross its serialization boundary.
-pub fn validate_authored_provider_config(
+pub fn validate_parser_provider_config(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &IndexMap<String, Value<RelativeBindingName>>,
-) -> Result<(), ProviderConfigPreparationError> {
+    attributes: &IndexMap<String, Value<ParserPlaceholder, RelativeBindingName>>,
+) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
     let config_schema = factory.provider_config_attribute_types();
     let canonical =
         canonicalize_provider_config_attributes(provider_name, attributes, &config_schema)?;
     validate_provider_config_attributes(factory, provider_name, &canonical, &config_schema)?;
 
     let serializable = canonical
-        .into_iter()
+        .iter()
         .filter_map(|(name, value)| {
             value
+                .to_expanded()?
                 .try_into_address_free_absolute()
-                .map(|value| (name, value))
+                .map(|value| (name.clone(), value))
         })
         .collect();
-    validate_canonical_provider_config(factory, provider_name, serializable).map(drop)
+    validate_canonical_provider_config(factory, provider_name, serializable)
 }
 
 /// Prepare provider configuration for construction and normalization.
@@ -623,17 +630,17 @@ pub fn prepare_provider_ready_config(
 /// The static validation phase calls this directly because unresolved values
 /// are intentionally allowed there. Provider construction calls it only after
 /// proving the complete map resolved.
-fn validate_provider_config_attributes<B: BindingAddress>(
+fn validate_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &IndexMap<String, Value<B>>,
+    attributes: &IndexMap<String, Value<P, B>>,
     attr_types: &crate::schema::ValidatedConfigSchema,
 ) -> Result<(), ProviderConfigPreparationError> {
     let lookup = crate::parser::custom_type_lookup_for_factory(factory);
     for (attribute, value) in attributes {
         if let Some(attr_type) = attr_types.rootless_type(attribute) {
             attr_type
-                .validate_with_lookup_in_phase(value, &lookup)
+                .validate_with_lookup(value, &lookup)
                 .map_err(|errors| ProviderConfigPreparationError::InvalidAttribute {
                     provider: provider_name.to_string(),
                     attribute: attribute.clone(),
@@ -684,7 +691,7 @@ impl std::error::Error for ProviderValueConstraintErrors {}
 /// This is the sole constructor for [`ProviderReadyResource`]. It unwraps
 /// secrets for the provider, validates every newly known schema value
 /// (including provider custom types), re-runs the complete desired-side
-/// normalization pipeline, and finally proves no deferred placeholder remains.
+/// normalization pipeline, and finally proves no provider-ineligible deferred value remains.
 pub async fn prepare_provider_ready_resource(
     resource: Resource,
     context: &ProviderPreparationContext<'_>,
@@ -1814,7 +1821,7 @@ mod provider_config_tests {
 
         RootlessType::new(decoded)
             .validate_with_lookup(
-                &Value::Concrete(ConcreteValue::String("value".into())),
+                &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("value".into())),
                 &lookup,
             )
             .expect("the owning bridge validator must accept the value");
@@ -1869,7 +1876,7 @@ mod provider_config_tests {
 
         RootlessType::new(native_type)
             .validate_with_lookup(
-                &Value::Concrete(ConcreteValue::String("value".into())),
+                &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("value".into())),
                 &lookup,
             )
             .expect("the native callback must accept the value");
@@ -2098,6 +2105,31 @@ mod provider_config_tests {
             .expect("valid provider config must be prepared");
 
         assert_eq!(ready.attributes(), &attributes);
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn parser_provider_config_skips_unexpandable_placeholder_without_panicking() {
+        let factory = ConfigFactory::successful();
+        let attributes = IndexMap::from([(
+            "region".to_string(),
+            Value::Deferred(DeferredValue::Placeholder(
+                ParserPlaceholder::EmptyInterpolation {
+                    source: crate::resource::DiagnosticSourceSpan::authored(
+                        "test.crn".into(),
+                        1,
+                        1,
+                        1,
+                        4,
+                    ),
+                },
+            )),
+        )]);
+
+        let canonical = validate_parser_provider_config(&factory, "test", &attributes)
+            .expect("placeholder leaves are unknown during parser-stage validation");
+
+        assert!(canonical.attributes().is_empty());
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
     }
 
