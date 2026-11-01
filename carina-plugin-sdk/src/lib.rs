@@ -6,6 +6,8 @@ pub use carina_core as core;
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
 
+pub mod aws_credentials;
+
 /// The "Schemas" page of the provider guide on carina-rs.dev. Its Rust
 /// examples run as doctests of this crate so they cannot drift from the SDK.
 #[cfg(doctest)]
