@@ -99,18 +99,20 @@ impl std::error::Error for AwsCredentialError {}
 #[cfg(target_arch = "wasm32")]
 mod bindings {
     crate::__carina_wit_bindgen!({
-        world: "carina-provider-aws",
-        // LLD concatenates same-named sections; the consumer's export bindings
-        // use the default name, so the SDK bindings need their own suffix.
-        type_section_suffix: "carina-plugin-sdk-aws-credentials",
+        // SDK consumers may link these bindings without exporting a provider.
+        inline: r#"
+            package carina:plugin-sdk;
+            world aws-credentials-client {
+                import carina:provider/aws-credentials@0.1.0;
+            }
+        "#,
+        world: "carina:plugin-sdk/aws-credentials-client",
         with: {
-            "wasi:io/poll@0.2.6": ::wasi::io::poll,
-            "wasi:io/error@0.2.6": ::wasi::io::error,
-            "wasi:io/streams@0.2.6": ::wasi::io::streams,
-            "wasi:clocks/monotonic-clock@0.2.6": ::wasi::clocks::monotonic_clock,
-            "wasi:http/types@0.2.6": ::wasi::http::types,
-            "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
+            "carina:provider/aws-credentials@0.1.0": generate,
         },
+        // Keep this imports-only section separate from the provider's default
+        // section: LLD concatenates custom sections with the same name.
+        type_section_suffix: "carina-plugin-sdk-aws-credentials",
     });
 }
 
