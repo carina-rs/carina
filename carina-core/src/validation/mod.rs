@@ -5013,9 +5013,27 @@ pub(crate) fn type_resolution_parser_error_is_covered<'a>(
 pub struct FileTypeResolutionReport {
     diagnostics: Vec<TypeResolutionDiagnostic>,
     covered_parser_error: bool,
+    resolved_argument_types: Option<ResolvedArgumentTypes>,
+}
+
+/// Argument classifications minted only by successful declaration resolution.
+/// Dependency validation consumes these rather than ambiguous parser types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArgumentTypes {
+    types: IndexMap<String, ResolvedDependencyArgumentType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedDependencyArgumentType {
+    ManagedHandle,
+    Value(String),
 }
 
 impl FileTypeResolutionReport {
+    pub fn resolved_argument_types(&self) -> Option<&ResolvedArgumentTypes> {
+        self.resolved_argument_types.as_ref()
+    }
+
     pub fn diagnostics(&self) -> &[TypeResolutionDiagnostic] {
         &self.diagnostics
     }
@@ -5089,7 +5107,7 @@ fn resolve_declaration_type(
 fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike, D>(
     parsed: &mut crate::parser::File<E, D>,
     config: &ProviderContext,
-) -> Vec<TypeResolutionDiagnostic> {
+) -> (Vec<TypeResolutionDiagnostic>, Option<ResolvedArgumentTypes>) {
     let mut errors = Vec::new();
     let argument_sources = parsed
         .arguments
@@ -5106,8 +5124,20 @@ fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike, D>(
                 })
         })
         .collect::<IndexMap<_, _>>();
+    let mut argument_types = IndexMap::new();
+    let mut arguments_resolved = true;
     for arg in &mut parsed.arguments {
-        for error in resolve_declaration_type(&mut arg.static_type, config) {
+        let argument_errors = resolve_declaration_type(&mut arg.static_type, config);
+        if argument_errors.is_empty() {
+            let classification = match &arg.static_type {
+                TypeExpr::Ref(_) => ResolvedDependencyArgumentType::ManagedHandle,
+                value => ResolvedDependencyArgumentType::Value(value.to_string()),
+            };
+            argument_types.insert(arg.name.clone(), classification);
+        } else {
+            arguments_resolved = false;
+        }
+        for error in argument_errors {
             errors.push(TypeResolutionDiagnostic::declaration(
                 TypeResolutionDeclarationKind::Argument,
                 arg.name.clone(),
@@ -5169,7 +5199,12 @@ fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike, D>(
             }
         }
     }
-    errors
+    (
+        errors,
+        arguments_resolved.then_some(ResolvedArgumentTypes {
+            types: argument_types,
+        }),
+    )
 }
 
 /// Resolve a signature snapshot when the consumer's provider catalog may be
@@ -5199,13 +5234,14 @@ pub fn resolve_file_type_exprs_report<E: crate::parser::ExportParamLike, D>(
     config: &ProviderContext,
     parser_error: Option<TypeResolutionParserError<'_>>,
 ) -> FileTypeResolutionReport {
-    let diagnostics = resolve_file_type_exprs_impl(parsed, config);
+    let (diagnostics, resolved_argument_types) = resolve_file_type_exprs_impl(parsed, config);
     let covered_parser_error = parser_error.is_some_and(|parser_error| {
         type_resolution_parser_error_is_covered(config, &diagnostics, parser_error)
     });
     FileTypeResolutionReport {
         diagnostics,
         covered_parser_error,
+        resolved_argument_types,
     }
 }
 

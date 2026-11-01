@@ -1072,10 +1072,10 @@ pub(crate) fn parse_directory_files_located_from_root(
         merge_parsed_file(&mut pass1_union, parsed);
     }
     let structural = pass1_union.structural_binding_names();
-    let module_parameters: HashSet<&str> = pass1_union
+    let module_parameters: HashMap<&str, &parser::TypeExpr> = pass1_union
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
     parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
         .map_err(LocatedParseError::directory_wide)?;

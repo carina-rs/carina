@@ -905,10 +905,10 @@ pub fn collect_known_bindings_merged<E>(parsed: &File<E>) -> std::collections::H
 #[cfg(test)]
 pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSeed<'_>> {
     let structural = parsed.structural_binding_names();
-    let module_parameters: HashSet<&str> = parsed
+    let module_parameters: HashMap<&str, &super::TypeExpr> = parsed
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
 
     collect_seed_bindings_from_parts(
@@ -921,7 +921,7 @@ pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSe
 
 pub(crate) fn collect_seed_bindings_from_parts<'a>(
     structural: &HashSet<&'a str>,
-    module_parameters: &HashSet<&'a str>,
+    module_parameters: &HashMap<&'a str, &'a super::TypeExpr>,
     variables: &'a IndexMap<String, Value>,
     metadata: &'a super::ast::ParserBindingMetadata,
 ) -> Vec<BindingSeed<'a>> {
@@ -934,10 +934,10 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
     names
         .into_iter()
         .map(|name| {
-            if module_parameters.contains(name) {
+            if let Some(declared_type) = module_parameters.get(name) {
                 match metadata.structural_handles().get(name) {
                     Some(handle) => BindingSeed::typed_structural(name, handle),
-                    None => BindingSeed::module_parameter(name),
+                    None => BindingSeed::module_parameter(name, declared_type),
                 }
             } else if let Some(handle) = metadata.structural_aliases().get(name) {
                 BindingSeed::structural_alias(name, handle)
@@ -2150,7 +2150,7 @@ mod seed_precedence_tests {
             SeedKind::TypedStructural(_)
             | SeedKind::Provisional
             | SeedKind::StructuralAlias(_)
-            | SeedKind::ModuleParameter => {}
+            | SeedKind::ModuleParameter(_) => {}
             SeedKind::Value { value, .. } => {
                 panic!("structural binding `cluster` must seed as Structural, not Value({value:?})")
             }
@@ -2184,7 +2184,7 @@ mod seed_precedence_tests {
             SeedKind::TypedStructural(_)
             | SeedKind::Provisional
             | SeedKind::StructuralAlias(_)
-            | SeedKind::ModuleParameter => {
+            | SeedKind::ModuleParameter(_) => {
                 panic!("plain value let must seed as Value, not a non-value seed")
             }
         }

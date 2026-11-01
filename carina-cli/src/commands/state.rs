@@ -36,8 +36,8 @@ use carina_core::shutdown::{
 use carina_core::value::format_value;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
-    DeposedKey, LoadedOrphans, LockInfo, ResourceState, RowBasis, StateBackend, StateFile,
-    StateUrl, load_state_from_url,
+    DeposedKey, LoadedOrphans, LocalStateFile, LockInfo, ResourceState, RowBasis, StateBackend,
+    StateFile, StateUrl, load_local_state_file, load_state_from_url,
 };
 
 use super::{
@@ -229,9 +229,9 @@ pub enum StateCommands {
         #[arg(long, value_name = "DIR")]
         check: PathBuf,
 
-        /// Copied state file to classify (file://path or a bare local path)
-        #[arg(long)]
-        state_url: String,
+        /// Copied local state file (file:///<absolute-path> or a bare path; no remote URLs)
+        #[arg(long, value_parser = LocalStateFile::parse)]
+        state_url: LocalStateFile,
 
         /// Trusted local provider schema artifact (repeatable KIND=PATH)
         #[arg(long = "provider-schema", value_name = "KIND=PATH")]
@@ -351,16 +351,7 @@ pub async fn run_state_command(
             check,
             state_url,
             provider_schemas,
-        } => {
-            run_state_migration_check(
-                user_dirs,
-                &check,
-                &state_url,
-                &provider_schemas,
-                provider_context,
-            )
-            .await
-        }
+        } => run_state_migration_check(user_dirs, &check, &state_url, &provider_schemas).await,
         StateCommands::Forget {
             resource_type,
             identity,
@@ -418,20 +409,9 @@ pub async fn run_state_command(
 async fn run_state_migration_check(
     user_dirs: &carina_core::UserDirs,
     config_dir: &Path,
-    state_url: &str,
+    state_file: &LocalStateFile,
     provider_schema_args: &[String],
-    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state =
-        require_state_file(load_state_file(None, Some(state_url), provider_context).await?)?;
-    if !state.requires_legacy_dependency_migration() {
-        println!(
-            "State dependency migration check passed: state is already version {}.",
-            StateFile::CURRENT_VERSION
-        );
-        return Ok(());
-    }
-
     let mut provider_schema_overrides = HashMap::new();
     for argument in provider_schema_args {
         let (name, path) = argument.split_once('=').ok_or_else(|| {
@@ -470,6 +450,14 @@ async fn run_state_migration_check(
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
+    let state = load_local_state_file(state_file).await?;
+    if !state.requires_legacy_dependency_migration() {
+        println!(
+            "State dependency migration check passed: state is already version {}.",
+            StateFile::CURRENT_VERSION
+        );
+        return Ok(());
+    }
     let base_dir = get_base_dir(config_dir);
     let providers = MigrationCheckProviderLoad::load(
         user_dirs,

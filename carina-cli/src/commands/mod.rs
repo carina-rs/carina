@@ -597,6 +597,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         enriched_context,
         None,
     );
+    let resolved_argument_types = type_resolution.resolved_argument_types().cloned();
     for diagnostic in type_resolution.into_diagnostics() {
         match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
             Ok(finding) => root_type_resolution_findings.push(finding),
@@ -856,7 +857,9 @@ pub(crate) fn validate_and_resolve_errors_inner(
         errors.extend(validate_no_empty_interpolations(parsed));
 
         errors.extend(validate_resources_with_ctx(ctx, parsed, enriched_context));
-        errors.extend(validate_depends_on_with_ctx(parsed));
+        if let Some(argument_types) = &resolved_argument_types {
+            errors.extend(validate_depends_on_with_ctx(parsed, argument_types));
+        }
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
         errors.extend(

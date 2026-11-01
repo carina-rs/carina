@@ -14,9 +14,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
-use crate::parser::{
-    File, ResourceRef, TypeExpr, UnexpandedDependencies, UnexpandedDependencyOperand,
-};
+use crate::parser::{File, ResourceRef, UnexpandedDependencies, UnexpandedDependencyOperand};
+
+use super::{ResolvedArgumentTypes, ResolvedDependencyArgumentType};
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +88,17 @@ fn depends_on_of<'a, D: crate::parser::DeferredForPhaseTraversal>(
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
+///
+/// Raw parses cannot be checked without the argument-type resolution witness:
+///
+/// ```compile_fail,E0061
+/// use carina_core::{parser::ParsedFile, validation::depends_on::validate_depends_on};
+/// let unresolved = ParsedFile::default();
+/// validate_depends_on(&unresolved);
+/// ```
 pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
     parsed: &File<E, D>,
+    argument_types: &ResolvedArgumentTypes,
 ) -> Vec<DependsOnDiagnostic> {
     // Common-case fast path: the vast majority of resources will have
     // no `depends_on` set, and the checks below allocate per-resource.
@@ -119,11 +128,7 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
     // it from the module signature instead of reconstructing validity from
     // `bindings_by_name`. Expansion performs the corresponding value-vs-handle
     // check and rewrites the dependency to the caller's canonical binding.
-    let module_parameters: HashMap<&str, &TypeExpr> = parsed
-        .arguments
-        .iter()
-        .map(|argument| (argument.name.as_str(), &argument.static_type))
-        .collect();
+    let module_parameters = &argument_types.types;
     let mut managed_group_names = parsed
         .parser_binding_metadata
         .structural_handles()
@@ -215,19 +220,8 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                 }
                 if let Some(parameter_type) = module_parameters.get(dep_name.as_str()) {
                     match parameter_type {
-                        TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) => continue,
-                        TypeExpr::String
-                        | TypeExpr::Bool
-                        | TypeExpr::Int
-                        | TypeExpr::Float
-                        | TypeExpr::Duration
-                        | TypeExpr::Simple(_)
-                        | TypeExpr::List(_)
-                        | TypeExpr::Map(_)
-                        | TypeExpr::SchemaType { .. }
-                        | TypeExpr::Struct { .. }
-                        | TypeExpr::StringLiteral(_)
-                        | TypeExpr::Union(_) => {
+                        ResolvedDependencyArgumentType::ManagedHandle => continue,
+                        ResolvedDependencyArgumentType::Value(parameter_type) => {
                             diags.push(
                                 DependsOnDiagnostic::error(format!(
                                     "directives.depends_on: expected a managed resource handle; got {parameter_type}",
@@ -307,6 +301,26 @@ mod tests {
     use super::*;
     use crate::parser::{ProviderContext, parse, parse_and_resolve};
 
+    fn check<
+        E: crate::parser::ExportParamLike + Clone,
+        D: crate::parser::DeferredForPhaseTraversal + Clone,
+    >(
+        parsed: &File<E, D>,
+    ) -> Vec<DependsOnDiagnostic> {
+        let mut parsed = parsed.clone();
+        let report = super::super::resolve_file_type_exprs_report(
+            &mut parsed,
+            &ProviderContext::default(),
+            None,
+        );
+        assert!(
+            report.diagnostics().is_empty(),
+            "{:?}",
+            report.diagnostics()
+        );
+        validate_depends_on(&parsed, report.resolved_argument_types().unwrap())
+    }
+
     fn diag_messages(diags: &[DependsOnDiagnostic], sev: Severity) -> Vec<String> {
         diags
             .iter()
@@ -324,7 +338,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -352,7 +366,7 @@ mod tests {
         .expect("fixture must parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
 
-        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        let errors = diag_messages(&check(&parsed), Severity::Error);
         assert!(
             errors
                 .iter()
@@ -370,7 +384,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -394,7 +408,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -418,7 +432,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         let role_warnings: Vec<_> = warnings
             .iter()
@@ -444,7 +458,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        let errors = diag_messages(&check(&parsed), Severity::Error);
         assert!(
             errors.is_empty(),
             "expanded managed groups are valid dependency targets: {errors:?}",
@@ -464,7 +478,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -488,7 +502,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -530,7 +544,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -557,7 +571,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -581,7 +595,7 @@ mod tests {
             }
         "#;
         let parsed = parse(src, &ProviderContext::default()).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -613,7 +627,7 @@ mod tests {
             }
         "#;
         let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -637,7 +651,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         assert!(
             diags.is_empty(),
             "expected zero diagnostics for valid depends_on, got {:?}",

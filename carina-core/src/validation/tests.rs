@@ -8376,3 +8376,52 @@ fn module_type_resolution_dedup_uses_typed_identity_not_display_text() {
         "deduplication must retain distinct typed type-resolution failures",
     );
 }
+#[test]
+fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
+    let context = ProviderContext {
+        resource_types: HashSet::from([("mock".to_string(), "test.resource".to_string())]),
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "aws",
+                TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn"),
+            )]),
+            Box::new(|_target, _value| Ok(())),
+        ),
+        ..ProviderContext::default()
+    };
+    let mut parsed = crate::parser::parse(
+        "arguments { rec: aws.iam.Policy.Arn r: mock.test.resource }\nlet consumer = mock.test.resource { directives { depends_on = [rec, r] } }\n",
+        &ProviderContext::default(),
+    ).unwrap();
+    assert!(matches!(
+        parsed.arguments[0].static_type,
+        TypeExpr::DottedUnresolved(_)
+    ));
+    let report = resolve_file_type_exprs_report(&mut parsed, &context, None);
+    assert!(
+        report.diagnostics().is_empty(),
+        "{:?}",
+        report.diagnostics()
+    );
+    let diagnostics =
+        depends_on::validate_depends_on(&parsed, report.resolved_argument_types().unwrap());
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].severity, depends_on::Severity::Error);
+    assert_eq!(
+        diagnostics[0].message,
+        "directives.depends_on: expected a managed resource handle; got aws.iam.Policy.Arn"
+    );
+}
+
+#[test]
+fn file_type_resolution_failure_cannot_mint_dependency_argument_types() {
+    let mut parsed = crate::parser::parse(
+        "arguments { rec: list(aws.route53.Missing.Id) }\n",
+        &ProviderContext::default(),
+    )
+    .unwrap();
+    let report =
+        resolve_file_type_exprs_report(&mut parsed, &enriched_context_with_iam_policy_arn(), None);
+    assert!(!report.diagnostics().is_empty());
+    assert!(report.resolved_argument_types().is_none());
+}

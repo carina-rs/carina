@@ -599,29 +599,25 @@ impl DiagnosticEngine {
         // Gate on the custom-type load state so the orphaned-file fallback
         // does not report unresolved declarations in files outside any known
         // project root, where no provider catalog is authoritative.
+        let mut type_resolved_parsed = merged.or(current_parsed).cloned();
+        let type_resolution = type_resolved_parsed.as_mut().map(|parsed| {
+            carina_core::validation::resolve_file_type_exprs_report(
+                parsed,
+                &self.provider_context,
+                None,
+            )
+        });
         if self.provider_context.custom_types_loaded() {
             let custom_type_findings = match merged {
-                Some(m) => {
-                    let mut parsed = m.clone();
-                    carina_core::validation::resolve_file_type_exprs_report(
-                        &mut parsed,
-                        &self.provider_context,
-                        None,
-                    )
-                    .into_diagnostics()
-                }
+                Some(_) => type_resolution
+                    .as_ref()
+                    .map(|report| report.diagnostics().to_vec())
+                    .unwrap_or_default(),
                 None => match failed_directory_type_resolution.take() {
                     Some(report) => report.into_diagnostics(),
-                    None => current_parsed
-                        .map(|p| {
-                            let mut parsed = p.clone();
-                            carina_core::validation::resolve_file_type_exprs_report(
-                                &mut parsed,
-                                &self.provider_context,
-                                None,
-                            )
-                            .into_diagnostics()
-                        })
+                    None => type_resolution
+                        .as_ref()
+                        .map(|report| report.diagnostics().to_vec())
                         .unwrap_or_default(),
                 },
             };
@@ -646,12 +642,17 @@ impl DiagnosticEngine {
 
         // Prefer the directory-merged parse so cross-file binding refs
         // resolve; fall back to the buffer-only parse otherwise.
+        if let Some(parsed) = &type_resolved_parsed
+            && let Some(argument_types) = type_resolution
+                .as_ref()
+                .and_then(|report| report.resolved_argument_types())
+        {
+            diagnostics.extend(self.check_depends_on(doc, parsed, argument_types));
+        }
         if let Some(parsed) = merged {
-            diagnostics.extend(self.check_depends_on(doc, parsed));
             diagnostics.extend(self.check_wait_bindings(doc, parsed));
             diagnostics.extend(self.check_deferred_populate_refs(doc, parsed));
         } else if let Some(parsed) = current_parsed {
-            diagnostics.extend(self.check_depends_on(doc, parsed));
             diagnostics.extend(self.check_wait_bindings(doc, parsed));
             diagnostics.extend(self.check_deferred_populate_refs(doc, parsed));
         }

@@ -288,8 +288,11 @@ unresolved legacy name is printed as a warning.
 | Flag | Description |
 |------|-------------|
 | `--check <DIR>` | Directory containing the current multi-file `.crn` configuration |
-| `--state-url <URL>` | Copied legacy state to inspect (`file://path` or a bare local path) |
+| `--state-url <URL>` | Copied state to inspect (`file:///<absolute-path>` or a bare local path); remote URLs such as `s3://` are rejected before backend construction |
 | `--provider-schema <KIND=PATH>` | Use an absolute local provider artifact for schema metadata; repeat for each declared kind that needs an override |
+
+The configuration directory and flag syntax are validated even when the copied
+state is already current and requires no dependency migration.
 
 ### `forget`
 

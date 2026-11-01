@@ -14224,3 +14224,82 @@ fn validation_subscript_uses_the_regular_expression_parser_in_lsp() {
         "a validation subscript must accept a regular constant expression: {diagnostics:#?}",
     );
 }
+fn custom_value_depends_on_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("route53.RecordSet")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "id",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::new(
+                            Some("aws"),
+                            ["route53", "RecordSet"],
+                            "Id",
+                        )),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    custom_engine(schemas)
+}
+
+#[test]
+fn depends_on_resolves_dotted_argument_type_before_validation() {
+    let source = "arguments { rec: aws.route53.RecordSet.Id }\nlet consumer = aws.route53.RecordSet { name = 'consumer' directives { depends_on = [rec] } }\n";
+    let document = create_document(source);
+    assert!(matches!(
+        document.parsed().unwrap().arguments[0].static_type,
+        TypeExpr::DottedUnresolved(_)
+    ));
+    let diagnostics = custom_value_depends_on_engine().analyze(&document, None);
+    let expected =
+        "directives.depends_on: expected a managed resource handle; got aws.route53.RecordSet.Id";
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == expected)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        matching[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn depends_on_rejects_custom_value_argument_from_sibling_file() {
+    let module = tempfile::tempdir().unwrap();
+    let main = "let consumer = aws.route53.RecordSet {\n  name = 'consumer'\n  directives { depends_on = [rec] }\n}\n";
+    std::fs::write(module.path().join("main.crn"), main).unwrap();
+    std::fs::write(
+        module.path().join("arguments.crn"),
+        "arguments { rec: aws.route53.RecordSet.Id }\n",
+    )
+    .unwrap();
+    let diagnostics = analyze_with_buffer(
+        &custom_value_depends_on_engine(),
+        module.path(),
+        "main.crn",
+        main,
+    );
+    let expected =
+        "directives.depends_on: expected a managed resource handle; got aws.route53.RecordSet.Id";
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == expected)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        matching[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}

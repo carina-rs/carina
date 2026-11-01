@@ -87,8 +87,8 @@ pub use backend_selection::{
 #[cfg(any(test, feature = "test-utils"))]
 pub use backends::local_backend_for_test;
 pub use backends::{
-    LocalBackend, StateUrl, anchored_local_path, load_published_exports_from_url,
-    load_state_from_url,
+    LocalBackend, LocalStateFile, StateUrl, anchored_local_path, load_local_state_file,
+    load_published_exports_from_url, load_state_from_url,
 };
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;

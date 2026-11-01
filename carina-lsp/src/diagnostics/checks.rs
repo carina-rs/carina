@@ -3064,9 +3064,14 @@ impl DiagnosticEngine {
     /// `dep_name` hints carried by `DependsOnDiagnostic` (#2874) to
     /// resolve a precise span. Falls back to whole-buffer scan only
     /// for diagnostics that have no hints (e.g. cycle errors).
-    pub(super) fn check_depends_on(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
+    pub(super) fn check_depends_on(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        argument_types: &carina_core::validation::ResolvedArgumentTypes,
+    ) -> Vec<Diagnostic> {
         use carina_core::validation::depends_on::{Severity, validate_depends_on};
-        let diags = validate_depends_on(parsed);
+        let diags = validate_depends_on(parsed, argument_types);
         if diags.is_empty() {
             return Vec::new();
         }

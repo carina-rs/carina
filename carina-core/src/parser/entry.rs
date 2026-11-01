@@ -49,7 +49,7 @@ pub(crate) enum SeedKind<'a> {
         value: &'a Value,
         structural_handles: Option<&'a UnexpandedStructuralHandleMetadata>,
     },
-    ModuleParameter,
+    ModuleParameter(&'a super::TypeExpr),
     TypedStructural(&'a UnexpandedStructuralHandle),
     Provisional,
     StructuralAlias(&'a UnexpandedStructuralHandle),
@@ -117,10 +117,10 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn module_parameter(name: &'a str) -> Self {
+    pub(crate) fn module_parameter(name: &'a str, declared_type: &'a super::TypeExpr) -> Self {
         Self {
             name,
-            kind: SeedKind::ModuleParameter,
+            kind: SeedKind::ModuleParameter(declared_type),
         }
     }
 
@@ -1206,8 +1206,8 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                     EvalValue::computed(value.clone(), structural_handles.cloned()),
                 );
             }
-            SeedKind::ModuleParameter => {
-                ctx.set_variable(
+            SeedKind::ModuleParameter(declared_type) => {
+                ctx.set_argument_variable(
                     seed.name().to_string(),
                     Value::Deferred(crate::resource::DeferredValue::Unknown(
                         crate::resource::UnknownReason::ModuleArgument {
@@ -1216,6 +1216,7 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                             diagnostic_name: None,
                         },
                     )),
+                    Some(declared_type.clone()),
                 );
             }
             SeedKind::TypedStructural(handle) => {

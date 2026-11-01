@@ -2,6 +2,106 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use clap::Parser;
+
+#[derive(Parser)]
+struct StateCli {
+    #[command(subcommand)]
+    command: carina_cli::commands::state::StateCommands,
+}
+
+#[test]
+fn migration_check_rejects_s3_before_backend_construction() {
+    let error = StateCli::try_parse_from([
+        "carina-state",
+        "migrate",
+        "--check",
+        ".",
+        "--state-url",
+        "s3://copied-state/legacy.json",
+    ])
+    .err()
+    .expect("offline migration checks must reject S3 during argument parsing");
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    let message = error.to_string();
+    assert!(message.contains("local state file"), "{message}");
+    assert!(message.contains("s3://"), "{message}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .args([
+            "state",
+            "migrate",
+            "--check",
+            ".",
+            "--state-url",
+            "s3://copied-state/legacy.json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("local state file"));
+}
+
+fn write_current_state(project: &Path) -> PathBuf {
+    fs::write(project.join("main.crn"), "provider mock {}\n").unwrap();
+    let state = project.join("current-state.json");
+    fs::write(
+        &state,
+        serde_json::to_vec_pretty(&carina_state::StateFile::new()).unwrap(),
+    )
+    .unwrap();
+    state
+}
+
+#[test]
+fn migration_check_accepts_file_url_and_bare_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = write_current_state(temp.path());
+    for url in [
+        state.display().to_string(),
+        format!("file://{}", state.display()),
+        "current-state.json".to_string(),
+    ] {
+        let output = run_builtin_check(temp.path(), Path::new(&url));
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("already version"));
+    }
+}
+
+#[test]
+fn migration_check_current_state_still_validates_config_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = write_current_state(temp.path());
+    let missing = temp.path().join("missing-config");
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(temp.path())
+        .args(["state", "migrate", "--check"])
+        .arg(&missing)
+        .arg("--state-url")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "invalid DIR passed: {output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing-config"));
+}
+
+#[test]
+fn migration_check_current_state_still_validates_provider_schema_flags() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = write_current_state(temp.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(temp.path())
+        .args(["state", "migrate", "--check"])
+        .arg(temp.path())
+        .arg("--state-url")
+        .arg(state)
+        .args(["--provider-schema", "malformed"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "bad flag passed: {output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected KIND=PATH"));
+}
+
 fn wasm_mock_path() -> Option<PathBuf> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
     ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]

@@ -17596,3 +17596,13 @@ fn deferred_user_calls_share_the_root_lexical_scope() {
         "deferred calls must share one lexical scope allocation",
     );
 }
+#[test]
+fn wait_depends_on_accepts_bare_and_dotted_dependency_operands() {
+    let parsed = parse("let ready = wait cert { until = cert.status == \"issued\" depends_on = [r, producer.validation_record] }\n", &ProviderContext::default()).unwrap();
+    let operands = parsed.wait_bindings[0]
+        .depends_on
+        .iter()
+        .map(|operand| operand.diagnostic_reference())
+        .collect::<Vec<_>>();
+    assert_eq!(operands, ["r", "producer.validation_record"]);
+}

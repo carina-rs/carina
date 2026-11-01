@@ -126,6 +126,22 @@ impl ProviderFactory for AwsccTestFactory {
             }
 
             vec![
+                ResourceSchema::new("route53.RecordSet").attribute(
+                    AttributeSchema::optional(
+                        "id",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::new(
+                                Some("aws"),
+                                ["route53", "RecordSet"],
+                                "Id",
+                            )),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                ),
                 ResourceSchema::new("ec2.Vpc")
                     .attribute(
                         AttributeSchema::optional("cidr_block", AttributeType::string()).build(),
@@ -234,6 +250,53 @@ fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
     carina_cli::wiring::LoadedProviderFactory::for_test(vec![Box::new(AwsccTestFactory {
         include_generic_arn: false,
     }) as Box<dyn ProviderFactory>])
+}
+
+#[test]
+fn validate_and_lsp_reject_custom_value_depends_on_with_same_error() {
+    let module = tempfile::tempdir().unwrap();
+    let main = "let consumer = awscc.ec2.Vpc {\n  directives { depends_on = [rec] }\n}\n";
+    std::fs::write(module.path().join("main.crn"), main).unwrap();
+    std::fs::write(
+        module.path().join("arguments.crn"),
+        "arguments { rec: aws.route53.RecordSet.Id }\n",
+    )
+    .unwrap();
+    let expected =
+        "directives.depends_on: expected a managed resource handle; got aws.route53.RecordSet.Id";
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(module.path(), factories());
+    assert!(
+        errors.iter().any(|error| error.contains(expected)),
+        "{errors:#?}"
+    );
+
+    let providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(vec![Box::new(AwsccTestFactory {
+            include_generic_arn: false,
+        }) as Box<dyn ProviderFactory>]),
+        carina_core::schema::SchemaRegistry::new(),
+    );
+    let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
+        std::sync::Arc::new(providers),
+        vec!["awscc".to_string()],
+    );
+    let path = module.path().join("main.crn");
+    let document = carina_lsp::document::Document::new_with_path(
+        main.to_string(),
+        path.clone(),
+        std::sync::Arc::new(Default::default()),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == expected)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        matching[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
 }
 
 fn factories_with_generic_arn() -> Vec<carina_cli::wiring::LoadedProviderFactory> {

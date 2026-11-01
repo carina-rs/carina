@@ -2753,10 +2753,11 @@ pub fn validate_resources_with_ctx<E>(
 /// command but remain visible.
 pub fn validate_depends_on_with_ctx<E>(
     parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    argument_types: &carina_core::validation::ResolvedArgumentTypes,
 ) -> Vec<AppError> {
     use carina_core::validation::depends_on::{Severity, validate_depends_on};
     let mut errors = Vec::new();
-    for diag in validate_depends_on(parsed) {
+    for diag in validate_depends_on(parsed, argument_types) {
         match diag.severity {
             Severity::Error => errors.push(AppError::Validation(diag.message)),
             Severity::Warning => eprintln!("warning: {}", diag.message),
