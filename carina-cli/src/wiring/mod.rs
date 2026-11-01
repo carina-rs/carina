@@ -10261,7 +10261,8 @@ impl<E> ValidatedConfig<ExpandedFile<E>> {
 impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
     /// Materialize the migration configuration using the same phase-2 reads,
     /// deferred-loop expansion, and child settlement as live planning. Destroy
-    /// and state refresh both preserve persisted addresses through this owner.
+    /// needs these reads only to classify legacy rows owned by residual loops;
+    /// its ordinary delete plan consumes persisted managed state directly.
     pub(crate) async fn materialize_legacy_configuration(
         mut self,
         inputs: LegacyConfigurationReadInputs<'_, '_, '_>,
@@ -10275,6 +10276,25 @@ impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
             remote_bindings,
             cancel,
         } = inputs;
+        if cancel.phase() != carina_core::shutdown::ShutdownPhase::Running {
+            return Err(AppError::Interrupted);
+        }
+        if state_file
+            .as_ref()
+            .is_none_or(|state| !state.requires_legacy_dependency_migration())
+            || self.resources.deferred_for_expressions().is_empty()
+        {
+            let sorted_resources = prelude.sorted_resources().to_vec();
+            let parts = prelude
+                .preserve_addresses(state)
+                .seal(DataSourceValues::empty())
+                .into_parts();
+            return Ok(MaterializedLegacyConfiguration {
+                config: self.into_offline_legacy_configuration(),
+                sorted_resources,
+                parts,
+            });
+        }
         let (ctx, parsed) = self.context_and_resources();
         hydrate_prior_managed_states(
             &mut state.managed_current,

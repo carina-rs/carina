@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use carina_core::effect::ResolvedMovePairs;
 use carina_core::parser::ExpandedFile;
 use carina_core::resolved_graph::{
-    LegacyClassificationGraph, ResolvedExpandedGraph, loop_group_bindings,
+    ConfiguredGraphInput, LegacyClassificationGraph, ResolvedExpandedGraph, loop_group_bindings,
     resolve_expanded_graph_for_legacy_classification,
 };
 use carina_state::{
@@ -183,7 +183,17 @@ pub(crate) fn classify_legacy_state<E>(
         ConfigurationMaterialization::Planned(_complete) => BTreeSet::new(),
         ConfigurationMaterialization::Offline(residual_loops) => residual_loops.bindings,
     };
-    let graph = resolve_expanded_graph_for_legacy_classification(parsed.into())?;
+    let desired_ids = parsed
+        .resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
+    let prior_orphans = state
+        .map(|state| state.build_orphans(&desired_ids).into_plan_orphans())
+        .unwrap_or_default();
+    let graph = resolve_expanded_graph_for_legacy_classification(
+        ConfiguredGraphInput::from(parsed).with_prior_orphans(prior_orphans),
+    )?;
     if let Some(state) = state.filter(|state| state.requires_legacy_dependency_migration()) {
         let outcome = state
             .clone()

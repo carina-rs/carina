@@ -111,6 +111,7 @@ impl ExpandedTarget {
 struct ExpandedTargets {
     bindings: HashMap<AbsoluteBindingAddress, ExpandedTarget>,
     identities: HashMap<AbsoluteBindingAddress, Vec<ExpandedTarget>>,
+    prior_bindings: HashMap<AbsoluteBindingAddress, Vec<ExpandedTarget>>,
 }
 
 impl ExpandedTargets {
@@ -187,12 +188,24 @@ impl ExpandedTargets {
         Ok(())
     }
 
-    fn get(&self, reference: &AbsoluteBindingAddress) -> Option<&ExpandedTarget> {
-        self.bindings.get(reference)
+    fn get(
+        &self,
+        reference: &AbsoluteBindingAddress,
+    ) -> Result<Option<&ExpandedTarget>, ExpandedGraphResolutionError> {
+        if let Some(target) = self.bindings.get(reference) {
+            return Ok(Some(target));
+        }
+        match self.prior_bindings.get(reference).map(Vec::as_slice) {
+            Some([target]) => Ok(Some(target)),
+            Some([_, _, ..]) => Err(ExpandedGraphResolutionError::AmbiguousBinding {
+                binding: reference.to_string(),
+            }),
+            Some([]) | None => Ok(None),
+        }
     }
 
     fn contains_key(&self, reference: &AbsoluteBindingAddress) -> bool {
-        self.bindings.contains_key(reference)
+        self.bindings.contains_key(reference) || self.prior_bindings.contains_key(reference)
     }
 
     fn managed(
@@ -200,7 +213,7 @@ impl ExpandedTargets {
         reference: &AbsoluteBindingAddress,
         owner: &str,
     ) -> Result<ResolvedHandleTarget, ExpandedGraphResolutionError> {
-        match self.get(reference) {
+        match self.get(reference)? {
             Some(ExpandedTarget::Managed { id, value_binding }) => Ok(ResolvedHandleTarget {
                 id: id.clone(),
                 value_binding: value_binding.clone(),
@@ -492,7 +505,7 @@ impl ExpandedBindingIndex {
         if let Some(target) = self.handle_outputs.get(binding) {
             return Ok(std::iter::once(target.id.clone()).collect());
         }
-        if let Some(target) = self.targets.get(binding) {
+        if let Some(target) = self.targets.get(binding)? {
             return Ok(std::iter::once(target.id().clone()).collect());
         }
         if let Some(dependencies) = self.composition_dependencies.get(binding) {
@@ -547,6 +560,7 @@ impl ExpandedBindingIndex {
             .targets
             .bindings
             .keys()
+            .chain(self.targets.prior_bindings.keys())
             .chain(self.targets.identities.keys())
             .chain(self.handle_outputs.keys())
             .chain(self.managed_groups.keys())
@@ -558,7 +572,8 @@ impl ExpandedBindingIndex {
                 owner: owner.to_owned(),
                 reference: reference.to_owned(),
             })?;
-        let legacy_target = if self.targets.get(reference).is_none() {
+        let direct_target = self.targets.get(reference)?;
+        let legacy_target = if direct_target.is_none() {
             match self.targets.identities.get(reference).map(Vec::as_slice) {
                 Some([target]) => Some(target),
                 Some([_, _, ..]) => {
@@ -576,8 +591,7 @@ impl ExpandedBindingIndex {
             .get(reference)
             .map(|target| std::iter::once(target.id.clone()).collect())
             .or_else(|| {
-                self.targets
-                    .get(reference)
+                direct_target
                     .or(legacy_target)
                     .map(|target| std::iter::once(target.id().clone()).collect())
             })
@@ -985,7 +999,7 @@ fn resolve_composition_dependencies(
     for dependency in raw.get(binding).into_iter().flatten() {
         if let Some(target) = outputs.get(dependency) {
             dependencies.insert(target.id.clone());
-        } else if let Some(target) = targets.get(dependency) {
+        } else if let Some(target) = targets.get(dependency)? {
             dependencies.insert(target.id().clone());
         } else if raw.contains_key(dependency) {
             dependencies.extend(resolve_composition_dependencies(
@@ -1198,15 +1212,29 @@ impl<E, D> Deref for ResolvedExpandedGraph<E, D> {
     }
 }
 
-/// Configuration-only resources for graph construction. State rows participate
-/// in legacy classification separately and cannot be supplied as target slices.
-pub struct ConfiguredGraphInput<E, D>(File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>);
+/// Configuration and persisted-only binding targets remain separate: orphan
+/// references are addressable without making those rows configured resources.
+pub struct ConfiguredGraphInput<E, D> {
+    configuration: File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
+    prior_orphans: crate::differ::Orphans,
+}
+
+impl<E, D> ConfiguredGraphInput<E, D> {
+    /// Add persisted managed aliases without granting configured membership.
+    pub fn with_prior_orphans(mut self, prior_orphans: crate::differ::Orphans) -> Self {
+        self.prior_orphans = prior_orphans;
+        self
+    }
+}
 
 impl<E, D> From<File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>>
     for ConfiguredGraphInput<E, D>
 {
     fn from(configuration: File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>) -> Self {
-        Self(configuration)
+        Self {
+            configuration,
+            prior_orphans: crate::differ::Orphans::new(),
+        }
     }
 }
 
@@ -1232,7 +1260,10 @@ pub fn resolve_expanded_graph<E, D>(
 pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
     configuration: ConfiguredGraphInput<E, D>,
 ) -> Result<LegacyClassificationGraph<E, D>, ExpandedGraphResolutionError> {
-    let ConfiguredGraphInput(mut parsed) = configuration;
+    let ConfiguredGraphInput {
+        configuration: mut parsed,
+        prior_orphans,
+    } = configuration;
     let configured = ConfiguredResources::from_configuration(&parsed);
     let upstream_bindings = parsed
         .upstream_states
@@ -1281,6 +1312,43 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
                 id: wait_scheduler_id(&wait.binding),
             },
         )?;
+    }
+    // Value resolution already exposes persisted orphan bindings during
+    // refresh. Carry the same managed targets into dependency resolution,
+    // with configured bindings taking precedence. Ambiguous orphan aliases
+    // fail only when used, rather than invalidating unrelated graph nodes.
+    let configured_non_row_bindings = parsed
+        .compositions
+        .iter()
+        .map(|composition| {
+            composition
+                .binding
+                .clone()
+                .unwrap_or_else(|| composition.id.binding_address())
+        })
+        .chain(upstream_bindings.iter().cloned())
+        .chain(managed_groups.keys().cloned())
+        .collect::<HashSet<_>>();
+    for (id, orphan) in &prior_orphans {
+        let id = require_resolved_id(id)?;
+        managed_ids.insert(id.clone());
+        let value_binding = orphan
+            .binding_address()
+            .cloned()
+            .unwrap_or_else(|| id.binding_address());
+        let target = ExpandedTarget::Managed {
+            id: id.clone(),
+            value_binding: value_binding.clone(),
+        };
+        for binding in [value_binding, id.binding_address()] {
+            if configured_non_row_bindings.contains(&binding) {
+                continue;
+            }
+            let candidates = targets.prior_bindings.entry(binding).or_default();
+            if !candidates.contains(&target) {
+                candidates.push(target.clone());
+            }
+        }
     }
 
     let pending = parsed

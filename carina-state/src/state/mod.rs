@@ -1237,6 +1237,22 @@ impl StateFile {
         self.version < Self::CURRENT_VERSION
     }
 
+    /// Complete the pending transition when no current or deposed rows remain.
+    /// Nonempty state still requires graph-aware classification, even when its
+    /// legacy dependency arrays are empty. Mutating commands call this before
+    /// deciding whether they can persist a loaded migration under their lock.
+    pub fn finish_rowless_dependency_migration(&mut self) {
+        if self.resources.is_empty()
+            && self.legacy_dependencies.is_empty()
+            && self.requires_legacy_dependency_migration()
+        {
+            // With no current or deposed rows there are no dependency names
+            // to classify. Lock-held no-op commands can persist this state.
+            self.version = Self::CURRENT_VERSION;
+            self.dependency_encoding = DependencyEncoding::Current;
+        }
+    }
+
     /// Whether graph projection is needed to classify any pre-v21 names.
     pub fn has_legacy_dependency_names(&self) -> bool {
         !self.legacy_dependencies.is_empty()
@@ -1815,6 +1831,7 @@ impl StateFile {
                 .collect::<HashSet<_>>();
             self.legacy_dependencies
                 .retain(|id, _dependencies| surviving_ids.contains(id));
+            self.finish_rowless_dependency_migration();
         }
         original_len - self.resources.len()
     }

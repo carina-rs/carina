@@ -310,6 +310,7 @@ pub struct BindingReferenceTypeError {
     actual: String,
     declared: Option<String>,
     path: ModuleCallDiagnosticPath,
+    declared_constraint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -755,10 +756,23 @@ fn declared_value_assignable_to_sink(
     if source.is_assignable_to(target) {
         return Ok(());
     }
-    Err(BindingResolutionError::Existing(format!(
-        "Type mismatch: expected {}, got {} (from {name})",
-        target.resolved_type_name(),
-        source.resolved_type_name(),
+    // A declared source is still a reference mismatch. Retain its typed
+    // identity so module-call diagnostics can own it and cover the resolver's
+    // backstop, just as they do for inferred reference types. The spelling is
+    // lexical provenance, even after the caller's value has been substituted.
+    Err(BindingResolutionError::ReferenceType(Box::new(
+        BindingReferenceTypeError {
+            expected: target.resolved_type_name(),
+            actual: source.resolved_type_name(),
+            declared: None,
+            path: ModuleCallDiagnosticPath::Authored(ReferencePath::Binding(
+                RelativeBindingName::new(name),
+            )),
+            declared_constraint: matches!(
+                sink,
+                RefSink::TypeExpr(TypeExpr::Union(_) | TypeExpr::StringLiteral(_))
+            ),
+        },
     )))
 }
 
@@ -775,6 +789,7 @@ fn reference_value_mismatch<B: BindingAddress>(
                 actual: mismatch.actual_type_name().to_string(),
                 declared: mismatch.declared_type_name().map(str::to_string),
                 path: diagnostic_path(reference),
+                declared_constraint: false,
             }))
         }),
         RefType::Unchecked => None,
@@ -863,6 +878,7 @@ fn deferred_value_mismatch<B: BindingAddress>(
                         path: ModuleCallDiagnosticPath::Authored(ReferencePath::Binding(
                             RelativeBindingName::new(authored_binding.to_string()),
                         )),
+                        declared_constraint: false,
                     }))
                 }
                 DeferredAccessTypeError::InvalidAccess { error } => {
@@ -6048,10 +6064,27 @@ pub struct ModuleCallReferenceDiagnostic {
     call_label: String,
     identity: ModuleCallReferenceIdentity,
     display_path: ModuleCallDiagnosticPath,
+    declared_constraint: bool,
 }
 
 impl std::fmt::Display for ModuleCallReferenceDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the established declaration-constraint wording for literal
+        // sets and unions. This affects rendering only: the typed reference
+        // identity still covers the resolver's assignment backstop.
+        if self.declared_constraint
+            && let ModuleCallRefErrorKind::TypeMismatch {
+                expected, actual, ..
+            } = &self.identity.kind
+        {
+            return write!(
+                formatter,
+                "module call '{}': argument '{}': Type mismatch: expected {expected}, got {actual} (from {})",
+                self.call_label,
+                self.identity.argument,
+                self.display_path.to_dot_string(),
+            );
+        }
         self.display_path.format_error(
             formatter,
             &self.call_label,
@@ -6518,6 +6551,7 @@ impl ModuleCallFinding {
             display_path,
             owner,
             value_span,
+            false,
         )
     }
 
@@ -6527,6 +6561,7 @@ impl ModuleCallFinding {
         display_path: ModuleCallDiagnosticPath,
         owner: ModuleCallFindingOwner,
         value_span: SourceSpan,
+        declared_constraint: bool,
     ) -> Self {
         let call = identity.call.clone();
         Self::argument_value(
@@ -6538,6 +6573,7 @@ impl ModuleCallFinding {
                 call_label: call_label.to_string(),
                 identity: identity.clone(),
                 display_path,
+                declared_constraint,
             })),
             Some(ModuleCallFindingIdentity::ReferenceType(identity)),
         )
@@ -6561,7 +6597,7 @@ impl ModuleCallFinding {
                 },
             ),
             BindingResolutionError::ReferenceType(error) => {
-                return Self::reference_type(
+                return Self::reference_type_with_display_path(
                     call_label,
                     ModuleCallReferenceIdentity {
                         call: call.clone(),
@@ -6578,8 +6614,10 @@ impl ModuleCallFinding {
                             declared: error.declared.clone(),
                         },
                     },
+                    error.path.clone(),
                     owner,
                     value_span,
+                    error.declared_constraint,
                 );
             }
             error @ (BindingResolutionError::Type(_)
@@ -7471,6 +7509,7 @@ impl ModuleCallChecker<'_> {
                             ),
                         },
                         span,
+                        false,
                     ));
                 }
                 CompositionRefError::Attribute(error) => {

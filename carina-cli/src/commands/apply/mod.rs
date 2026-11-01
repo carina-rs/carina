@@ -1099,6 +1099,7 @@ pub(crate) async fn load_state_persist_if_migrated(
         None => Ok(None),
         Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
         Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
+            state.finish_rowless_dependency_migration();
             if state.requires_legacy_dependency_migration() {
                 // v20 dependency names are an intentionally unwritable
                 // typestate. The expanded graph later classifies them before
