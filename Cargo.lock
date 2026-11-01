@@ -1222,6 +1222,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
  "wit-bindgen 0.54.0",
 ]
 

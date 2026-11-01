@@ -23,6 +23,66 @@ fn s(s: &str) -> Value {
     Value::Concrete(ConcreteValue::String(s.into()))
 }
 
+#[test]
+fn updating_changed_iterable_defers_missing_element_output() {
+    use crate::binding_index::{LivePreApplyInputs, ManagedBindingStability};
+    use crate::parser::{ProviderContext, parse};
+
+    let mut parsed = parse(
+        r#"
+        let x = mock.test.Source {}
+        let children = for r in x.rules {
+            mock.test.Target { name = r.id }
+        }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("parse deferred loop")
+    .into_expanded()
+    .expect("expand parser placeholders");
+    let desired_rules = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([("name".into(), s("new-rule"))])),
+    )]));
+    let resource = make_managed("x", &[("rules", desired_rules)]);
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(
+            resource.id.clone(),
+            State::existing(resource.id.clone(), HashMap::new()).with_identifier("source-id"),
+        )]),
+        &crate::schema::SchemaRegistry::new(),
+        &[],
+    );
+    let stability = HashMap::from([(
+        resource.id.clone(),
+        ManagedBindingStability::Updating {
+            changed_attributes: ["rules".into()].into(),
+            refreshable_attributes: Default::default(),
+        },
+    )]);
+    let bindings = ResolvedBindings::pre_apply_live_with_stability(
+        LivePreApplyInputs {
+            managed: &[resource],
+            compositions: &[],
+            managed_current: &current,
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+        &stability,
+    );
+
+    parsed
+        .expand_deferred_for_expressions(&bindings.project_iterable_bindings())
+        .expect("provider-filled element outputs in changed authored rules must defer");
+    let name = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("children[0]"))
+        .and_then(|resource| resource.get_attr("name"))
+        .expect("expanded child");
+    assert!(matches!(name, Value::Deferred(DeferredValue::Access(_))));
+}
+
 fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
     let mut attributes = IndexMap::new();
     for (k, v) in attrs {

@@ -1233,6 +1233,7 @@ pub(super) async fn execute_effects_sequential<
                             resource.binding.as_deref(),
                             &resolved_attrs,
                             &state,
+                            crate::binding_index::BindingCompleteness::Complete,
                         );
                         result
                             .data_source_states
@@ -1275,9 +1276,12 @@ pub(super) async fn execute_effects_sequential<
                             started.succeeded(Some(&state), duration);
                             accumulated.mutate(|result| {
                                 result.success_count += 1;
-                                result
-                                    .bindings
-                                    .record_applied(Some(&binding), &attrs, &state);
+                                result.bindings.record_applied(
+                                    Some(&binding),
+                                    &attrs,
+                                    &state,
+                                    crate::binding_index::BindingCompleteness::Complete,
+                                );
                             });
                             accumulated.insert_published(
                                 synthetic,

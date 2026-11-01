@@ -233,10 +233,10 @@ impl Provider for MockProvider {
         let id = id.clone();
         let identifier = identifier.to_string();
         Box::pin(async move {
-            Ok(UpdateOutcome::Success {
-                state: AppliedState::new(id, identifier, HashMap::new())
+            Ok(UpdateOutcome::success(
+                AppliedState::new(id, identifier, HashMap::new())
                     .expect("provider input identifier is non-empty"),
-            })
+            ))
         })
     }
 

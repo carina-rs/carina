@@ -3424,9 +3424,9 @@ impl Provider for ApplyTimeReadProvider {
                 id.identity_str().expect("resolved identity").to_string(),
                 attrs.clone(),
             );
-            Ok(carina_core::provider::UpdateOutcome::Success {
-                state: AppliedState::from_identifier(id, identifier, attrs),
-            })
+            Ok(carina_core::provider::UpdateOutcome::success(
+                AppliedState::from_identifier(id, identifier, attrs),
+            ))
         })
     }
 

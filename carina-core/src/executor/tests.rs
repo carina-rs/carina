@@ -386,6 +386,7 @@ enum ClassifiedCreateFixture {
 
 enum ResumeFixture {
     Resumed,
+    Partial,
     CreatedFound,
     CreatedNotFound,
     CreatedReadFailed,
@@ -435,12 +436,11 @@ impl MockProvider {
     }
 
     fn push_update(&self, result: ProviderResult<State>) {
-        self.update_results
-            .lock()
-            .unwrap()
-            .push(result.map(|state| crate::provider::UpdateOutcome::Success {
-                state: applied_state_for_test(state),
-            }));
+        self.update_results.lock().unwrap().push(
+            result.map(|state| {
+                crate::provider::UpdateOutcome::success(applied_state_for_test(state))
+            }),
+        );
     }
 
     fn push_read(&self, result: ProviderResult<State>) {
@@ -629,6 +629,26 @@ impl Provider for MockProvider {
                         )]),
                     );
                     Ok(resumed.completed(observed))
+                }
+                ResumeFixture::Partial => {
+                    let (resume, _create_request) = request.into_parts();
+                    let crate::provider::Resume::Issued(resumed) = resume else {
+                        return Err(resume.preserve(ProviderError::internal(
+                            "partial fixture requires an issued continuation",
+                        )));
+                    };
+                    let identifier = resumed.identifier().as_str().to_string();
+                    Ok(resumed.partial(
+                        HashMap::from([(
+                            "id".to_string(),
+                            Value::Concrete(ConcreteValue::String(identifier.into())),
+                        )]),
+                        crate::provider::PartialReadDiagnostic::new(
+                            "resumed read-back is incomplete".into(),
+                            vec!["computed".into()],
+                        )
+                        .expect("fixture has a missing attribute"),
+                    ))
                 }
                 ResumeFixture::CreatedFound => {
                     let (resume, _create_request) = request.into_parts();
@@ -1438,10 +1458,10 @@ impl Provider for DelayedCountingProvider {
                 "finalized".to_string(),
                 Value::Concrete(ConcreteValue::Bool(true)),
             );
-            Ok(crate::provider::UpdateOutcome::Success {
-                state: AppliedState::new(id, "finalized-id", attrs)
+            Ok(crate::provider::UpdateOutcome::success(
+                AppliedState::new(id, "finalized-id", attrs)
                     .expect("fixture identifier is non-empty"),
-            })
+            ))
         })
     }
 
@@ -2550,6 +2570,84 @@ async fn resume_resumed_publishes_observed() {
         result.applied_states.get(&dependent_id),
         Some(Applied::Complete { .. })
     ));
+}
+
+#[tokio::test]
+async fn resumed_partial_success_reports_once_and_preserves_partial_binding() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let dependent = make_resource("dependent", &["source"]);
+    let source_id = source.id.clone();
+    let dependent_id = dependent.id.clone();
+    let pending = persisted_create_for_executor(&source_id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(resolved(source), pending.started_at().clone());
+    plan.add(create_effect(dependent));
+    provider.push_resume(ResumeFixture::Partial);
+    provider.push_create(Ok(ok_state(&dependent_id)));
+    let observer = MockObserver::new();
+
+    let result = execute_lifecycle_fixture_with_observer(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::CreateInFlight(pending))]),
+        &observer,
+    )
+    .await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.partial_count,
+            result.failure_count(),
+            result.skip_count
+        ),
+        (1, 1, 0, 0)
+    );
+    let events = observer.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event == format!("partial:{source_id}"))
+            .count(),
+        1,
+        "the resumed partial result must emit exactly one partial terminal event: {events:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event == &format!("succeeded:{source_id}")
+                || event.starts_with(&format!("failed:{source_id}:")))
+    );
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("partial resume must retain its observed create")
+    };
+    assert!(matches!(
+        created.sent(),
+        crate::provider::SentRecord::Persisted(_)
+    ));
+    assert!(created.observed_state().partial_read.is_some());
+    assert!(result.applied_states.contains_key(&dependent_id));
+    assert_eq!(
+        result.partial_diagnostics[0].1.reason(),
+        "resumed read-back is incomplete"
+    );
+    assert!(matches!(
+        result.bindings.completeness("source"),
+        Some(crate::binding_index::BindingCompleteness::PartialReadBack(
+            _
+        ))
+    ));
+    assert!(
+        result
+            .bindings
+            .attribute_value_is_definitive("source", "id")
+    );
+    assert!(
+        !result
+            .bindings
+            .attribute_value_is_definitive("source", "computed")
+    );
 }
 
 #[tokio::test]
@@ -7911,10 +8009,10 @@ impl Provider for YieldingUpdateProvider {
                     Value::Concrete(ConcreteValue::String("provider-violated-id".into())),
                 );
             }
-            Ok(crate::provider::UpdateOutcome::Success {
-                state: AppliedState::new(id, identifier, attrs)
+            Ok(crate::provider::UpdateOutcome::success(
+                AppliedState::new(id, identifier, attrs)
                     .expect("provider input identifier is non-empty"),
-            })
+            ))
         })
     }
 
@@ -8470,6 +8568,80 @@ async fn test_update_effect_binding_map_propagation() {
     let events = observer.events();
     assert!(events.iter().any(|e| e.starts_with("started:")));
     assert!(events.iter().any(|e| e.starts_with("succeeded:")));
+}
+
+#[tokio::test]
+async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
+    let provider = MockProvider::new();
+    let id = ResourceId::with_identity("test", "update-recovery");
+    let from = State::existing(id.clone(), HashMap::new()).with_identifier("stable-update-id");
+    let to = make_resource("update-recovery", &[]);
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        identifier: crate::effect::fixture_applied_identifier("stable-update-id"),
+        from: Box::new(from.clone()),
+        to: resolved(to),
+        changed_attributes: vec!["some_attr".to_string()],
+    });
+    provider.push_update(Err(ProviderError::internal(
+        "WASM provider update violated the read-back polling protocol",
+    )));
+    provider.push_read(Ok(State::existing(
+        id.clone(),
+        HashMap::from([(
+            "recovered".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )]),
+    )));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(id.clone(), Current::from_state(from))]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!((result.success_count, result.failure_count()), (0, 1));
+    assert!(matches!(
+        result.failures()[0].kind(),
+        EffectFailureKind::Provider { .. }
+    ));
+    assert!(
+        effect_failure_event(&observer.events(), &id)
+            .contains("WASM provider update violated the read-back polling protocol")
+    );
+    assert_eq!(
+        provider.calls(),
+        vec![
+            ("update".to_string(), id.to_string()),
+            ("read".to_string(), id.to_string()),
+        ]
+    );
+    let Current::Present(recovered) = result
+        .managed_current
+        .get(&id)
+        .expect("failed update must keep a recoverable current state")
+    else {
+        panic!("failed update recovery changed the current-state classification")
+    };
+    assert_eq!(recovered.identifier().as_str(), "stable-update-id");
+    assert_eq!(
+        recovered.state().attributes.get("recovered"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
 }
 
 /// Regression test for #1195: dependency analysis also respects delete dependencies.

@@ -408,10 +408,16 @@ impl AcceptedRequest {
 pub fn complete_create_for_writeback(
     outcome: CreateOutcome,
     request: AcceptedRequest,
-) -> (State, AcceptedRequest, Option<PartialReadDiagnostic>) {
+) -> (
+    State,
+    AcceptedRequest,
+    Option<PartialReadDiagnostic>,
+    crate::provider::ReadBackEnd,
+) {
     let diagnostic = outcome.diagnostic().cloned();
+    let read_back_end = outcome.read_back_end();
     let state = outcome.into_state_for_writeback();
-    (state, request, diagnostic)
+    (state, request, diagnostic, read_back_end)
 }
 
 /// Provenance-preserving result of one effect. State writeback must classify

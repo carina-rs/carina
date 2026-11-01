@@ -213,6 +213,7 @@ impl CarinaProvider for HelloProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         poll: Poll<Never>,
+        _poll_request: PollRequest,
     ) -> Result<CreateStep<Never>, PollVerdict<Never>> {
         match poll {
             Poll::Unissued(_, token) | Poll::Issued(_, token) => match token {},
@@ -247,6 +248,7 @@ impl CarinaProvider for HelloProvider {
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
         pending: Pending<Never>,
+        _poll_request: PollRequest,
     ) -> Result<UpdateOutcome<Never>, ProviderError> {
         match pending.token {}
     }

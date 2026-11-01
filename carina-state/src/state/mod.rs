@@ -3335,11 +3335,11 @@ impl ResourceState {
     }
 
     /// Build an applied row for a create whose provider reported an identifier
-    /// but whose finishing step failed. The typed observation says whether the
-    /// resource was found. Values are selected strictly as observed, then sent,
-    /// then absent. Desired state controls masking but cannot introduce an
-    /// unsent value. The create establishes the current desired resource as the
-    /// authoring baseline.
+    /// but whose finishing step failed or completed with partial read-back. The
+    /// typed observation says whether the resource was found. Values are
+    /// selected strictly as observed, then sent, then absent. Desired state
+    /// controls masking but cannot introduce an unsent value. The create
+    /// establishes the current desired resource as the authoring baseline.
     pub fn from_observation<S: Clone>(
         resource: &ResolvedResource<S>,
         created: &ObservedCreate,
@@ -3404,20 +3404,30 @@ impl ResourceState {
             preferred_hashes,
         )?;
         let (attributes, write_only_attributes) = selected.finish()?;
-        let partial_read = pending_reread.and_then(|pending| {
-            let missing_attributes = writeback_resource
-                .attributes
-                .keys()
-                .chain(
-                    schema
-                        .into_iter()
-                        .flat_map(|schema| schema.attributes().keys()),
+        let partial_read = created
+            .partial_read_diagnostic()
+            .and_then(|diagnostic| {
+                PartialReadMarker::new(
+                    PendingReRead::incomplete(diagnostic.reason().to_string()),
+                    diagnostic.missing_attributes().iter().cloned().collect(),
                 )
-                .filter(|key| !attributes.contains_key(key))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            PartialReadMarker::new(pending, missing_attributes)
-        });
+            })
+            .or_else(|| {
+                pending_reread.and_then(|pending| {
+                    let missing_attributes = writeback_resource
+                        .attributes
+                        .keys()
+                        .chain(
+                            schema
+                                .into_iter()
+                                .flat_map(|schema| schema.attributes().keys()),
+                        )
+                        .filter(|key| !attributes.contains_key(key))
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    PartialReadMarker::new(pending, missing_attributes)
+                })
+            });
         let stored_attributes = attributes.to_values();
         let mut nested_write_only = NestedWriteOnlyRecord::default();
         if let Some(schema) = schema {

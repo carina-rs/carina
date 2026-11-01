@@ -62,7 +62,7 @@ use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending, Poll,
-    PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+    PollFinality, PollRequest, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -228,7 +228,7 @@ fn create(
     let client_token = self.api.new_client_token();
     match self.api.start_create(&client_token, &name, size) {
         Ok(operation) => Ok(attempt.pending(
-            CreateToken::Operation(operation),
+            CreateToken::OperationId(operation),
             Sent::AllRequestAttributes,
             5,
         )),
@@ -263,7 +263,7 @@ pub enum CreateToken {
     /// first call started.
     Starting { client_token: String },
     /// The API accepted the request and returned an operation to follow.
-    Operation(String),
+    OperationId(String),
 }
 ```
 
@@ -277,6 +277,7 @@ fn poll_create(
     id: &ResourceId,
     request: CreateRequest,
     poll: Poll<CreateToken>,
+    poll_request: PollRequest,
 ) -> Result<CreateStep<CreateToken>, PollVerdict<CreateToken>> {
     let (attempt, token) = match poll {
         Poll::Unissued(attempt, token) => (attempt, token),
@@ -291,8 +292,23 @@ fn poll_create(
                         error(ProviderErrorKind::ApiError, "widget vanished after create"),
                     )
                     .into()),
-                // A read error: try again on the next poll.
-                Err(_) => Ok(issued.pending(token, 5)),
+                // The deadline poll must finish. Preserve the applied state
+                // and tell Carina which value still needs a later refresh.
+                Err(_) if poll_request.finality == PollFinality::FinalAttempt => {
+                    Ok(issued.partial(
+                        BTreeMap::new(),
+                        PartialReadDiagnostic {
+                            reason: "widget read-back is still pending".to_string(),
+                            missing_attributes: vec![
+                                "name".to_string(),
+                                "size".to_string(),
+                                "status".to_string(),
+                            ],
+                        },
+                    ))
+                }
+                // A read error before the deadline: try again in read-back phase.
+                Err(_) => Ok(issued.pending_read_back(token, 5)),
             };
         }
     };
@@ -309,7 +325,7 @@ fn poll_create(
                 }
             };
             match self.api.start_create(&client_token, &name, size) {
-                Ok(operation) => Ok(attempt.pending(CreateToken::Operation(operation), 5)),
+                Ok(operation) => Ok(attempt.pending(CreateToken::OperationId(operation), 5)),
                 // A rejected retry does not prove the first call created
                 // nothing: the API may refuse a reused client token, for
                 // example because the configuration changed in between.
@@ -323,18 +339,33 @@ fn poll_create(
                 Err(_) => Ok(attempt.pending(CreateToken::Starting { client_token }, 5)),
             }
         }
-        CreateToken::Operation(operation) => match self.api.create_status(&operation) {
+        CreateToken::OperationId(operation) => match self.api.create_status(&operation) {
             Ok(CreateStatus::InProgress) => {
-                Ok(attempt.pending(CreateToken::Operation(operation), 5))
+                Ok(attempt.pending(CreateToken::OperationId(operation), 5))
             }
             Ok(CreateStatus::Done { id: widget_id }) => match identifier(&widget_id) {
-                // Record the identifier now and read the widget on the
-                // next poll, through the Poll::Issued arm above.
-                Ok(identifier) => Ok(attempt
-                    .issued(identifier)
-                    .pending(CreateToken::Operation(operation), 0)),
+                Ok(identifier) => {
+                    let issued = attempt.issued(identifier);
+                    if poll_request.finality == PollFinality::FinalAttempt {
+                        // The operation completed at its deadline. Keep the
+                        // identifier and settle without starting another poll.
+                        Ok(issued.partial(
+                            BTreeMap::new(),
+                            PartialReadDiagnostic {
+                                reason: "widget read-back is still pending".to_string(),
+                                missing_attributes: vec![
+                                    "name".to_string(),
+                                    "size".to_string(),
+                                    "status".to_string(),
+                                ],
+                            },
+                        ))
+                    } else {
+                        Ok(issued.pending_read_back(CreateToken::OperationId(operation), 1))
+                    }
+                }
                 Err(err) => Err(attempt.preserve(
-                    CreateToken::Operation(operation),
+                    CreateToken::OperationId(operation),
                     5,
                     err,
                 )),
@@ -356,7 +387,7 @@ fn poll_create(
                         .into())
                 }
                 Err(err) => Err(attempt.preserve(
-                    CreateToken::Operation(operation),
+                    CreateToken::OperationId(operation),
                     5,
                     err,
                 )),
@@ -365,7 +396,7 @@ fn poll_create(
                 Err(attempt.untracked(error(ProviderErrorKind::ApiError, reason)))
             }
             // The status call failed; the operation is still there.
-            Err(_) => Ok(attempt.pending(CreateToken::Operation(operation), 5)),
+            Err(_) => Ok(attempt.pending(CreateToken::OperationId(operation), 5)),
         },
     }
 }
@@ -375,11 +406,15 @@ A `Starting` token retries the create with the same client token. Because the AP
 
 A rejected retry is `preserve`, not `untracked`. The first call may have created the widget, and the API can refuse the reused token for reasons of its own, for example because the configuration changed before a later apply resumed the create. `preserve` carries the same continuation plus the error, so Carina keeps the attempt while surfacing why this poll stopped. Any other failure keeps the attempt pending.
 
-When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending` once more. That records the identifier right away, and the next poll goes to the `Poll::Issued` arm, which reads the widget back and finishes with `succeeded`. A read that fails stays pending instead of turning a healthy widget into a failed create.
+When the operation finishes, the provider calls `attempt.issued(identifier)`. On an ordinary poll it returns `pending_read_back`, which records the identifier, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. If the operation completes on the final attempt, the example settles with `partial` immediately, preserving the identifier for the next refresh.
+
+`poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. The example also returns `partial` when the issued read-back receives the final attempt and still cannot read the widget. Neither final-attempt branch has observed attributes, so both return an empty map and mark the unread attributes as missing. `resume_create` receives the same poll request when Carina resumes a persisted continuation; on its first call, the persisted token and identifier are authoritative but the inbound phase and delay are not.
+
+On the wire, create and resume use `create-progress`: `operating(option<string>)` while the mutation is in progress, or `reading-back(string)` once it has completed. Read-back therefore always carries an identifier. Updates carry their phase in `pending-update`; their request already includes the identifier.
 
 A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict<CreateToken>`, and `.into()` turns it into the `PollVerdict<CreateToken>` that `poll_create` returns.
 
-Two outcomes after `issued` are not used here. `partial` finishes a create whose read-back was incomplete, with a `PartialReadDiagnostic` naming the missing attributes. `discarded` reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. When a provider call has a usable continuation but also needs to report an error, `preserve` returns the error-bearing in-flight verdict. Provider code does not produce `undetermined`; guest transport glue reserves that wire arm for a request or token it cannot decode, when it has no newer continuation to return.
+`discarded` is not used here. It reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. When a provider call has a usable continuation but also needs to report an error, `preserve` returns the error-bearing in-flight verdict. Provider code does not produce `undetermined`; guest transport glue reserves that wire arm for a request or token it cannot decode, when it has no newer continuation to return.
 
 ## resume_create
 
@@ -493,7 +528,7 @@ Treat "already gone" as success. Carina does not special-case a `NotFound` error
 
 ## Long-running update and delete
 
-`update` and `delete` can also return `Pending` with a token and `poll_after_secs`. The host then calls `poll_update` or `poll_delete` with the original request until the operation finishes or the resource's time budget runs out. The token rules are the same as for create. A provider that finishes every update and delete in one call sets the token types to `Never`, as this one does.
+`update` and `delete` can also return pending with a token and `poll_after_secs`. The host then calls `poll_update` or `poll_delete` with the original request until the operation finishes or the resource's time budget runs out. `poll_update` receives the same `PollRequest` finality as `poll_create`, and update read-back uses `Pending::read_back`. Delete uses the separate phase-less `PendingDelete` type, so it cannot express read-back. The token rules are the same as for create. A provider that finishes every update and delete in one call sets the token types to `Never`, as this one does.
 
 ## Secrets
 

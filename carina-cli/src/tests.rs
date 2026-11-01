@@ -379,7 +379,7 @@ impl Provider for TestProvider {
             .update_result
             .clone()
             .expect("missing update state for test provider");
-        Box::pin(async move { Ok(UpdateOutcome::Success { state }) })
+        Box::pin(async move { Ok(UpdateOutcome::success(state)) })
     }
 
     fn delete(

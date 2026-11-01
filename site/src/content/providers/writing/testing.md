@@ -19,6 +19,7 @@ mod tests {
         CreateStep as WireCreateStep, CreateVerdict as WireCreateVerdict,
         PollVerdict as WirePollVerdict,
     };
+    use carina_plugin_sdk::{PollFinality, PollRequest};
     use std::cell::RefCell;
 
     /// An in-memory API that records what the provider asked for.
@@ -98,9 +99,10 @@ mod tests {
             provider,
             &resource_id(),
             create_request("a", 1),
-            pending.identifier,
+            pending.progress.into_identifier(),
             pending.sent,
             pending.token,
+            PollRequest { finality: PollFinality::Continue },
         )
         .expect("poll should not fail")
     }
@@ -150,7 +152,7 @@ mod tests {
         let WireCreateStep::Pending(pending) = step else {
             panic!("expected pending")
         };
-        assert!(pending.identifier.is_none());
+        assert!(pending.identifier().is_none());
 
         // The retry starts the create once; no second widget appears.
         let WireCreateStep::Pending(pending) = poll(&provider, pending) else {
@@ -178,9 +180,10 @@ mod tests {
             &provider,
             &resource_id(),
             create_request("a", 1),
-            pending.identifier,
+            pending.progress.into_identifier(),
             pending.sent,
             pending.token,
+            PollRequest { finality: PollFinality::Continue },
         )
         .expect_err("a rejected retry must not succeed");
         let WirePollVerdict::InFlight(in_flight) = *verdict else {
@@ -212,7 +215,7 @@ mod tests {
             panic!("expected pending")
         };
         assert_eq!(
-            pending.identifier.as_ref().map(|id| id.as_str()),
+            pending.identifier().map(|id| id.as_str()),
             Some("w-a")
         );
 
