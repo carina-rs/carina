@@ -329,6 +329,10 @@ impl SchemaDecodeError {
         Self::new("identity requires create_only")
     }
 
+    fn identity_requires_scalar_or_enum() -> Self {
+        Self::new("identity value must have a scalar or enum type")
+    }
+
     fn empty_custom_enum_namespace(name: &str) -> Self {
         Self::InvalidSchema {
             detail: "custom enum namespace is invalid".to_string(),
@@ -1001,6 +1005,9 @@ pub fn protocol_to_attribute_schema(
     if *identity && !*create_only {
         return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
     }
+    if *identity && !protocol_identity_leaf_is_scalar_or_enum(&attr_type) {
+        return Err(SchemaDecodeError::identity_requires_scalar_or_enum().prepend_attribute(name));
+    }
 
     match input_mode {
         InputMode::Optional => {
@@ -1561,6 +1568,9 @@ pub fn protocol_to_struct_field(
     }
     let field_type =
         protocol_to_attribute_type(field_type).map_err(|error| error.prepend_attribute(name))?;
+    if *identity && !protocol_identity_leaf_is_scalar_or_enum(&field_type) {
+        return Err(SchemaDecodeError::identity_requires_scalar_or_enum().prepend_attribute(name));
+    }
 
     match input_mode {
         InputMode::Optional => {
@@ -1634,6 +1644,19 @@ pub fn protocol_to_struct_field(
             Ok(builder.build())
         }
     }
+}
+
+fn protocol_identity_leaf_is_scalar_or_enum(attribute_type: &AttributeType) -> bool {
+    matches!(
+        attribute_type.raw_shape(),
+        RawShape::String { .. }
+            | RawShape::Int { .. }
+            | RawShape::Float { .. }
+            | RawShape::Bool
+            | RawShape::Duration
+            | RawShape::Enum { .. }
+            | RawShape::Ref(_)
+    )
 }
 
 fn protocol_to_input_mode(required: bool, read_only: bool) -> Result<InputMode, SchemaDecodeError> {
@@ -3390,6 +3413,117 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "attribute 'budget_name': identity requires create_only"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_non_scalar_identity_leaves_directly() {
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional("names", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        let attribute = wire.attributes.get_mut("names").unwrap();
+        attribute.attr_type = protocol::AttributeType::List {
+            element_type: Box::new(protocol::AttributeType::String {
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: None,
+            }),
+            ordered: true,
+            length: None,
+            validate: None,
+        };
+
+        let attribute_error = protocol_to_attribute_schema(attribute)
+            .expect_err("protocol attribute identity must be scalar or enum");
+        assert_eq!(
+            attribute_error.to_string(),
+            "attribute 'names': identity value must have a scalar or enum type"
+        );
+
+        let field = StructField::optional("names", AttributeType::string())
+            .create_only()
+            .identity()
+            .build();
+        let mut wire = struct_field_to_protocol(&field).unwrap();
+        wire.field_type = protocol::AttributeType::List {
+            element_type: Box::new(protocol::AttributeType::String {
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: None,
+            }),
+            ordered: true,
+            length: None,
+            validate: None,
+        };
+
+        let field_error = protocol_to_struct_field(&wire)
+            .expect_err("protocol struct-field identity must be scalar or enum");
+        assert_eq!(
+            field_error.to_string(),
+            "attribute 'names': identity value must have a scalar or enum type"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_create_only_below_union_members() {
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("config", AttributeType::string()).build())
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        wire.attributes.get_mut("config").unwrap().attr_type = protocol::AttributeType::Union {
+            members: vec![protocol::AttributeType::Struct {
+                name: "Config".to_string(),
+                fields: vec![protocol::StructField {
+                    name: "immutable".to_string(),
+                    field_type: protocol::AttributeType::String {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    },
+                    required: false,
+                    description: None,
+                    block_name: None,
+                    provider_name: None,
+                    read_only: false,
+                    write_only: false,
+                    create_only: true,
+                    identity: false,
+                    deferred_populate: false,
+                }],
+                field_groups: vec![],
+            }],
+        };
+
+        let error = protocol_to_resource_schema(&wire)
+            .expect_err("create-only fields below a union must fail wire admission");
+        assert!(matches!(
+            &error,
+            SchemaDecodeError::InvalidSchema {
+                schema_issue_location: Some(_),
+                source: Some(_),
+                ..
+            }
+        ));
+        let source = std::error::Error::source(&error)
+            .expect("schema admission error must retain its typed source")
+            .to_string();
+        assert!(
+            source.contains("union members cannot be create-only-bearing"),
+            "{error}; source: {source}"
         );
     }
 

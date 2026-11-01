@@ -2666,11 +2666,12 @@ impl AnonymousReconciliationStateView {
                 projected_id.resource_type(),
                 carina_core::schema::SchemaKind::Resource,
             ) {
-                AnonymousIdStateInfo::try_from_state_attributes(
+                AnonymousIdStateInfo::try_from_state_row(
                     state_row_id.clone(),
                     projected_target.cloned(),
                     schema.schema(),
                     &attribute_values,
+                    &state_resource.name_overrides,
                 )
             } else {
                 AnonymousIdStateInfo::try_without_comparable_attributes(

@@ -91,11 +91,12 @@ configured top-level create-only values as the compatibility fallback.
 
 Two anonymous resources of the same type and provider route cannot have equal
 declared identity values; use `let` to name at least one of them. Every declared
-identity value must also be present and have stable plan-time material. Carina
-canonicalizes a written value and hashes a resource reference by its authored
-expression, so `zone.id` has a stable address before the zone exists. An omitted
-value or a value with no plan-time expression cannot produce an anonymous
-address; write the value or give the resource a name with `let`.
+identity value must be available as written material or an authored expression
+at plan time. Carina canonicalizes a written value and hashes references and
+composite expressions over references and literals by their authored spelling,
+so `"/zones/${zone.id}"` has a stable address before the zone exists. An absent
+value or an expression containing an unknown or unavailable leaf cannot produce
+an anonymous address; write the value or give the resource a name with `let`.
 
 When a provider first adds identity declarations, an existing state row may
 still have the address produced by the older create-only rule, including one

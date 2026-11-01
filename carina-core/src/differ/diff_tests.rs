@@ -820,6 +820,128 @@ fn update_when_only_mutable_sibling_of_nested_create_only_field_changes() {
     );
 }
 
+fn unordered_nested_create_only_plan(desired_items: Vec<Value>) -> (Plan, ResourceId) {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let id = ResourceId::with_identity("test.UnorderedNestedReplacement", "example");
+    let desired = Resource::new("test.UnorderedNestedReplacement", "example")
+        .with_attribute("items", Value::Concrete(ConcreteValue::List(desired_items)));
+    let current = existing_state(
+        id.clone(),
+        HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                item("a", "old"),
+                item("b", "stable"),
+            ])),
+        )]),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.UnorderedNestedReplacement")
+            .attribute(
+                AttributeSchema::required(
+                    "items",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Item",
+                        vec![
+                            StructField::required("key", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("description", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            HashMap::from([(id.clone(), current)]),
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    (plan, id)
+}
+
+#[test]
+fn unordered_nested_create_only_reorder_with_mutable_change_is_update() {
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let (plan, id) = unordered_nested_create_only_plan(vec![item("b", "stable"), item("a", "new")]);
+
+    assert!(
+        plan.replace_display.is_empty(),
+        "unexpected replacement for {id}"
+    );
+    assert!(matches!(
+        plan.effects(),
+        [Effect::Update {
+            changed_attributes,
+            ..
+        }] if changed_attributes == &["items".to_string()]
+    ));
+}
+
+#[test]
+fn unordered_nested_create_only_addition_is_replace() {
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let (plan, id) = unordered_nested_create_only_plan(vec![
+        item("b", "stable"),
+        item("a", "old"),
+        item("c", "new"),
+    ]);
+
+    let metadata = replacement_metadata(&plan, &id);
+    assert_eq!(&metadata.changed_create_only[..], &["items".to_string()]);
+}
+
 #[test]
 fn update_when_optional_nested_create_only_field_is_omitted_but_present_in_state() {
     let (desired, current, schemas) = omitted_optional_nested_create_only_fixture();

@@ -18,8 +18,8 @@ use crate::resource::{
     ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
 };
 use crate::schema::{
-    ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
-    WAIT_DEFAULT_TIMEOUT,
+    AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec,
+    WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
@@ -57,6 +57,269 @@ struct RefAttr {
     hint: String,
 }
 
+fn contains_authored_create_only_value<'schema>(
+    attr_type: &'schema AttributeType,
+    value: &Value,
+    schema: &'schema ResourceSchema,
+    ref_chain: &mut Vec<&'schema str>,
+) -> bool {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return false;
+            }
+            let Some(definition) = schema.defs.get(name) else {
+                return false;
+            };
+            ref_chain.push(name);
+            let contains =
+                contains_authored_create_only_value(definition, value, schema, ref_chain);
+            ref_chain.pop();
+            contains
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return false;
+            };
+            items.iter().any(|item| {
+                contains_authored_create_only_value(element_type, item, schema, ref_chain)
+            })
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return false;
+            };
+            entries.values().any(|entry| {
+                contains_authored_create_only_value(value_type, entry, schema, ref_chain)
+            })
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return false;
+            };
+            fields.iter().any(|field| {
+                entries.get(&field.name).is_some_and(|field_value| {
+                    field.create_only
+                        || contains_authored_create_only_value(
+                            &field.field_type,
+                            field_value,
+                            schema,
+                            ref_chain,
+                        )
+                })
+            })
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => false,
+    }
+}
+
+struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
+    desired_items: &'items [&'items Value],
+    current_items: &'items [Value],
+    element_type: &'schema AttributeType,
+    schema: &'schema ResourceSchema,
+    context: &'context ComparisonContext<'comparison>,
+    current_matches: &'items mut [Option<usize>],
+}
+
+impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
+    fn matches(&mut self, desired_index: usize, seen_current: &mut [bool]) -> bool {
+        for current_index in 0..self.current_items.len() {
+            if seen_current[current_index]
+                || !create_only_values_compatible(
+                    self.element_type,
+                    &self.current_items[current_index],
+                    self.desired_items[desired_index],
+                    self.schema,
+                    self.context,
+                    &mut Vec::new(),
+                )
+            {
+                continue;
+            }
+            seen_current[current_index] = true;
+            if self.current_matches[current_index]
+                .is_none_or(|previous_desired| self.matches(previous_desired, seen_current))
+            {
+                self.current_matches[current_index] = Some(desired_index);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn create_only_values_compatible<'schema>(
+    attr_type: &'schema AttributeType,
+    current: &Value,
+    desired: &Value,
+    schema: &'schema ResourceSchema,
+    context: &ComparisonContext<'_>,
+    ref_chain: &mut Vec<&'schema str>,
+) -> bool {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return true;
+            }
+            let Some(definition) = schema.defs.get(name) else {
+                return true;
+            };
+            ref_chain.push(name);
+            let compatible = create_only_values_compatible(
+                definition, current, desired, schema, context, ref_chain,
+            );
+            ref_chain.pop();
+            compatible
+        }
+        AttrTypeKind::List {
+            element_type,
+            ordered,
+            ..
+        } => {
+            let Value::Concrete(ConcreteValue::List(desired_items)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::List(current_items)) = current else {
+                return !desired_items.iter().any(|item| {
+                    contains_authored_create_only_value(element_type, item, schema, &mut Vec::new())
+                });
+            };
+            if *ordered {
+                desired_items.iter().enumerate().all(|(index, desired)| {
+                    !contains_authored_create_only_value(
+                        element_type,
+                        desired,
+                        schema,
+                        &mut Vec::new(),
+                    ) || current_items.get(index).is_some_and(|current| {
+                        create_only_values_compatible(
+                            element_type,
+                            current,
+                            desired,
+                            schema,
+                            context,
+                            &mut Vec::new(),
+                        )
+                    })
+                })
+            } else {
+                let desired_items = desired_items
+                    .iter()
+                    .filter(|item| {
+                        contains_authored_create_only_value(
+                            element_type,
+                            item,
+                            schema,
+                            &mut Vec::new(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut current_matches = vec![None; current_items.len()];
+                let mut matcher = UnorderedCreateOnlyMatcher {
+                    desired_items: &desired_items,
+                    current_items,
+                    element_type,
+                    schema,
+                    context,
+                    current_matches: &mut current_matches,
+                };
+                (0..desired_items.len()).all(|desired_index| {
+                    matcher.matches(desired_index, &mut vec![false; current_items.len()])
+                })
+            }
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(desired_entries)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::Map(current_entries)) = current else {
+                return !desired_entries.values().any(|entry| {
+                    contains_authored_create_only_value(value_type, entry, schema, &mut Vec::new())
+                });
+            };
+            desired_entries.iter().all(|(key, desired)| {
+                !contains_authored_create_only_value(value_type, desired, schema, &mut Vec::new())
+                    || current_entries.get(key).is_some_and(|current| {
+                        create_only_values_compatible(
+                            value_type,
+                            current,
+                            desired,
+                            schema,
+                            context,
+                            &mut Vec::new(),
+                        )
+                    })
+            })
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(desired_fields)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::Map(current_fields)) = current else {
+                return !contains_authored_create_only_value(
+                    attr_type,
+                    desired,
+                    schema,
+                    &mut Vec::new(),
+                );
+            };
+            fields.iter().all(|field| {
+                let Some(desired) = desired_fields.get(&field.name) else {
+                    return true;
+                };
+                if field.create_only {
+                    return current_fields.get(&field.name).is_some_and(|current| {
+                        type_aware_equal(
+                            current,
+                            desired,
+                            Some(&field.field_type),
+                            &schema.defs,
+                            context,
+                        )
+                    });
+                }
+                !contains_authored_create_only_value(
+                    &field.field_type,
+                    desired,
+                    schema,
+                    &mut Vec::new(),
+                ) || current_fields.get(&field.name).is_some_and(|current| {
+                    create_only_values_compatible(
+                        &field.field_type,
+                        current,
+                        desired,
+                        schema,
+                        context,
+                        &mut Vec::new(),
+                    )
+                })
+            })
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => true,
+    }
+}
+
 pub(super) fn find_changed_create_only(
     changed_attributes: &[String],
     from: &State,
@@ -72,30 +335,28 @@ pub(super) fn find_changed_create_only(
                 return true;
             }
 
-            let from_leaves = from
-                .attributes
-                .get(attribute.as_str())
-                .map(|value| schema.create_only_leaf_projection(attribute, value))
-                .unwrap_or_default();
-            let to_leaves = to
-                .attributes
-                .get(attribute.as_str())
-                .map(|value| schema.create_only_leaf_projection(attribute, value))
-                .unwrap_or_default();
-            to_leaves.iter().any(|(to_path, to_value, field_type)| {
-                from_leaves
-                    .iter()
-                    .find(|(from_path, _, _)| from_path == to_path)
-                    .is_none_or(|(_, from_value, _)| {
-                        !type_aware_equal(
-                            from_value,
-                            to_value,
-                            Some(field_type),
-                            &schema.defs,
-                            context,
-                        )
-                    })
-            })
+            let Some(desired) = to.attributes.get(attribute.as_str()) else {
+                return false;
+            };
+            let Some(attribute_schema) = schema.attributes().get(attribute.as_str()) else {
+                return false;
+            };
+            let Some(current) = from.attributes.get(attribute.as_str()) else {
+                return contains_authored_create_only_value(
+                    attribute_schema.attr_type(),
+                    desired,
+                    schema,
+                    &mut Vec::new(),
+                );
+            };
+            !create_only_values_compatible(
+                attribute_schema.attr_type(),
+                current,
+                desired,
+                schema,
+                context,
+                &mut Vec::new(),
+            )
         })
         .cloned()
         .collect()

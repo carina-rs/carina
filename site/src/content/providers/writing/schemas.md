@@ -116,7 +116,7 @@ equal to a bare name.
 What the attributes declare:
 
 - `create_only` means the API cannot change the value in place, so a change replaces the resource.
-- `identity` marks an immutable value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Every value must be present with stable plan-time material: written values are schema-canonicalized and resource references are hashed by their authored expressions. A missing value or one with no plan-time expression requires the user to write it or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
+- `identity` marks an immutable scalar or enum value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Written values are schema-canonicalized; references and composite expressions over references and literals are hashed by their deterministic authored expressions; generated names hash a separately typed prefix value. An absent value or an expression containing an unknown or unavailable leaf requires the user to write it or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
 - `with_default` gives the value the host assumes when the configuration leaves the attribute out.
 - `with_description` shows up in the editor and in the generated docs.
 
@@ -241,21 +241,25 @@ assert_eq!(
 );
 ```
 
-An identity path may cross structs and schema references, but not a list or
-map element or a union member: those shapes do not select one singular value.
-Schema admission rejects such a declaration, including one received through
-WASM schema JSON. A provider-populated `StructField` exposes neither
-`create_only` nor `identity`.
+An identity path may cross structs and schema references, but its leaf must be
+a scalar or enum. Lists, maps, structs, and unions cannot themselves be
+identity leaves, and a path cannot descend through a collection or union: those
+shapes do not select one singular value. Schema admission rejects such a
+declaration, including one received through WASM schema JSON. A
+provider-populated `StructField` exposes neither `create_only` nor `identity`.
 
 Every identity component must be declared. For example, a DNS record key needs
 the hosted zone, record name, and record type; marking only the name can make
 two different real-world records collide. Two anonymous resources on the same
 provider route with equal complete identity values are rejected. Give one a
 stable name with `let` when both objects are intentional. Identity declarations
-should select user inputs that can be concrete during planning: omitted values,
-unknowns, deferred expressions, generated prefixes, and references to
-provider-populated attributes cannot address an anonymous resource. A concrete
-module argument can.
+may be written values, generated-name prefixes, references (including
+references to provider-populated attributes), or composite expressions whose
+leaves are authored references and literals. Carina hashes references and
+expressions by their deterministic authored spelling, not by a value that may
+resolve later. Only an absent identity value, an unknown or unavailable value,
+or an expression containing such a leaf cannot address an anonymous resource.
+A concrete module argument can.
 
 Enum values in the DSL follow the snake_case convention. When the API spells a value differently, map it with `dsl_aliases` (pairs of API value and DSL spelling) or with a `DslTransform` in `to_dsl`, such as `DslTransform::HyphenToUnderscore` for values like `us-east-1`.
 
@@ -298,7 +302,13 @@ assert!(schema.as_schema().write_only_bearing("webhook"));
 
 Write-only describes what the read API returns, not whether a value is secret. The host compares a write-only value against the value it recorded in state when the provider accepted it, because the read result never contains it. An unchanged write-only value therefore never causes an update on its own, and a changed one does. When an update happens for any reason, the host also re-sends every write-only value of the resource as a `Reassert` patch operation, because many APIs drop values a request leaves out. See [Implementing Operations](/providers/writing/implementing-operations/) for how a provider handles `Reassert`.
 
-`validate()` rejects write-only on any path below a provider-populated value and inside a union, where the host could not track which member the value belongs to.
+`validate()` rejects write-only on any path below a provider-populated value and inside a union, where the host could not track which member the value belongs to. For the same projection reason, it rejects create-only fields below union members.
+
+Nested create-only fields inside an unordered list are compared as a multiset.
+Element order and changes to mutable sibling fields do not affect that
+comparison, so reordering alone never replaces a resource. Adding an element
+that has an authored create-only field is a create-only change and does replace
+the resource.
 
 ## Validators and type identities
 
@@ -431,7 +441,7 @@ assert!(messages.iter().any(|message| message.contains("`missing`")));
 assert!(messages.iter().any(|message| message.contains("`also_missing`")));
 ```
 
-Among other things, `validate()` rejects duplicate attribute names, field groups that name unknown, provider-populated, required, or defaulted members at their own resource/struct level, duplicate field-group declarations, missing unique-name attributes, defaults that cannot be sent over the wire, enum shapes the protocol cannot carry, and the write-only placements described above. Struct fields do not have a default API, so the defaulted-member rule currently applies only to resource attributes. Validating the schema while building it means a mistake shows up in the provider's own tests, not when a user loads the provider.
+Among other things, `validate()` rejects duplicate attribute names, field groups that name unknown, provider-populated, required, or defaulted members at their own resource/struct level, duplicate field-group declarations, missing unique-name attributes, identity without create-only, non-scalar identity leaves, create-only fields below union members, defaults that cannot be sent over the wire, enum shapes the protocol cannot carry, and the write-only placements described above. Struct fields do not have a default API, so the defaulted-member rule currently applies only to resource attributes. Validating the schema while building it means a mistake shows up in the provider's own tests, not when a user loads the provider.
 
 When a `Struct` is reached below a provider-populated attribute, that inherited output-only status does not invalidate field groups declared on the `Struct`. This lets one definition be reused at writable and output-only sites. Admission still rejects malformed groups, unknown members, duplicate groups, and members whose own declared mode is provider-populated or required; the host does not enforce the groups against user input on an output-only path because users cannot set that value.
 

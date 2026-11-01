@@ -45,22 +45,43 @@ against an older JSON record fails to load instead of silently changing
 replacement or anonymous-address semantics. The host rebuilds decoded fields
 through the same input-mode and create-only builders used by native schemas.
 It rejects `identity: true` unless `create_only` is also true, rejects both
-flags on provider-populated fields, and rejects identity below a list, map, or
-union because that location does not identify one singular value. Both flags
-participate in semantic schema fingerprint encoding v6, so a saved plan is
-invalidated when either declaration changes.
+flags on provider-populated fields, and admits identity only on scalar or enum
+leaves reached through attributes, structs, and schema references. Lists, maps,
+struct values, and unions cannot themselves be identity leaves. Create-only
+fields below a union member are also rejected because the active member cannot
+be projected safely. Both flags participate in semantic schema fingerprint
+encoding v6, so a saved plan is invalidated when either declaration changes.
 
 This is a schema-JSON-only extension. The WIT world and protocol version remain
 13. For anonymous resources, one or more declared identity paths select the
 identity-only address encoding; when no identity path is declared, the host
 retains the create-only fallback. Nested paths are represented as typed
 attribute/struct-field segments in the host and are never transported as a
-dotted string. Every declared identity value must be present and have stable
-plan-time material before the host can encode an anonymous address. A written
-value is schema-canonicalized; a resource reference is hashed by its authored
-reference expression, so its address stays stable when the target later
-resolves. Missing values and values with no plan-time expression are rejected;
-a `let` binding remains available when no stable identity material exists.
+dotted string. Every declared identity value must be available as either a
+written value or an authored expression at plan time. Written values are
+schema-canonicalized. References and composite expressions whose leaves are
+references or literals are hashed by their deterministic authored expression,
+so their address stays stable when a target later resolves. Generated names
+hash their authored prefix as a separate typed value. An absent value,
+`Unknown`, `Unavailable`, or an expression containing one of those leaves is
+rejected; a `let` binding remains available when no stable identity material
+exists.
+
+The declared-identity hash encoding is deliberately typed and
+length-prefixed. It contains the length-prefixed domain
+`carina-anonymous-identity-v1`; the sorted provider-identity entry count and
+each length-prefixed key and value; then the identity-path count. Each path has
+its segment count followed by segments tagged `0` for an attribute or `1` for
+a struct field and a length-prefixed name. The path value then has a kind tag:
+`0` for `Written`, `1` for `ReferenceExpression`, or `2` for `Prefix`, followed
+by its length-prefixed deterministic spelling. Counts and lengths are unsigned
+64-bit little-endian integers. The address suffix is the first 32 bits of the
+SHA-256 digest, interpreted in big-endian byte order.
+
+Nested create-only leaves in an unordered list are compared as a multiset,
+independent of element order and mutable sibling fields. Reordering alone is
+not a create-only change. Adding an element with an authored create-only leaf
+is a create-only change and therefore replaces the resource.
 
 Every resource schema JSON record also carries the required boolean
 `default_prevent_destroy`. Providers use it for resource kinds whose deletion

@@ -564,6 +564,25 @@ impl CarinaProvider for MockProcessProvider {
                 )
                 .validate()
                 .expect("nested identity mock schema must be valid"),
+            CoreResourceSchema::new("test.unique_identity")
+                .attribute(
+                    CoreAttributeSchema::required("name", CoreAttributeType::string())
+                        .create_only()
+                        .identity()
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::required("replacement_key", CoreAttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional("description", CoreAttributeType::string())
+                        .build(),
+                )
+                .with_unique_name_attribute("name")
+                .validate()
+                .expect("unique-name identity mock schema must be valid"),
             CoreResourceSchema::new("budgets.Budget")
                 .attribute(
                     CoreAttributeSchema::required(

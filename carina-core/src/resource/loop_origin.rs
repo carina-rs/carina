@@ -315,6 +315,12 @@ impl LoopElementOrigin {
         self.source.line()
     }
 
+    /// Authored span of the loop or conditional that produced this element.
+    /// Deserialized historical provenance may not retain an authored span.
+    pub fn source_span(&self) -> Option<SourceSpan> {
+        self.source.source_span()
+    }
+
     pub fn display_suffix(&self) -> String {
         let mut suffix = String::new();
         self.append_display_suffix(&mut suffix);

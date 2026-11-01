@@ -8,8 +8,8 @@ use tempfile::TempDir;
 
 const INCOMPLETE_BUDGET_IDENTITY_ERROR: &str = "Anonymous resource of type \
     'mock.budgets.Budget' cannot derive an address because identity value \
-    'budget.budget_name' is missing or not known at plan time. Write the identity value or give \
-    the resource a name with `let`.";
+    'budget.budget_name' is not available as a written value or authored expression at plan \
+    time. Write the identity value or give the resource a name with `let`.";
 
 struct Scenario {
     _temp: TempDir,

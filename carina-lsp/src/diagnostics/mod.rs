@@ -511,6 +511,14 @@ impl DiagnosticEngine {
             .as_ref()
             .map(|result| &result.directory.parsed);
         if let Some(current_file) = current_parsed {
+            let expanded_identity_graph =
+                merged_result
+                    .as_ref()
+                    .and_then(|result| match &result.module_resolution {
+                        checks::MergedModuleResolution::Expanded { graph } => Some(graph.as_ref()),
+                        checks::MergedModuleResolution::ConstraintFailed { .. }
+                        | checks::MergedModuleResolution::Unowned { .. } => None,
+                    });
             diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(
                 doc,
                 current_file,
@@ -520,6 +528,7 @@ impl DiagnosticEngine {
                 doc,
                 current_file,
                 merged.unwrap_or(current_file),
+                expanded_identity_graph,
                 base_path,
             ));
         }

@@ -1147,14 +1147,14 @@ mock.test.Thing {
             matching[0].message,
             "Anonymous resources of type 'mock.budgets.Budget' on the same provider route have \
              equal declared identity values and produce address \
-             'mock_budgets_budget_1f99b02d'. Give one of them a name with `let`."
+             'mock_budgets_budget_d96fb606'. Give one of them a name with `let`."
         );
     }
 
     const INCOMPLETE_BUDGET_IDENTITY_ERROR: &str = "Anonymous resource of type \
         'mock.budgets.Budget' cannot derive an address because identity value \
-        'budget.budget_name' is missing or not known at plan time. Write the identity value or \
-        give the resource a name with `let`.";
+        'budget.budget_name' is not available as a written value or authored expression at plan \
+        time. Write the identity value or give the resource a name with `let`.";
 
     fn incomplete_budget_diagnostics(
         sibling_files: &[(&str, &str)],

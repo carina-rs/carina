@@ -1480,7 +1480,7 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     );
 
     let claims = crate::identifier::StateBlockClaims::empty();
-    let state_entry = crate::identifier::AnonymousIdStateInfo::try_from_state_attributes(
+    let state_entry = crate::identifier::AnonymousIdStateInfo::try_from_state_row(
         crate::resource::ResolvedResourceId::with_provider_identity(
             "mock",
             "test.resource",
@@ -1496,6 +1496,7 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("inner".into())),
         )]),
+        &HashMap::new(),
     )
     .expect("state fixture has a valid resolved address");
     let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(

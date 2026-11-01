@@ -328,6 +328,20 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .build(),
             )
             .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+        ResourceSchema::new("test.unique_identity")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("replacement_key", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .with_unique_name_attribute("name"),
         ResourceSchema::new("budgets.Budget")
             .attribute(
                 AttributeSchema::required(
@@ -427,6 +441,7 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
             .attribute(
                 AttributeSchema::optional("role_name", AttributeType::string())
                     .create_only()
+                    .identity()
                     .build(),
             )
             .attribute(
@@ -439,7 +454,16 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     .create_only()
                     .build(),
             )
-            .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .with_unique_name_attribute("role_name"),
+        ResourceSchema::new("logs.LogGroup")
+            .attribute(
+                AttributeSchema::optional("log_group_name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .with_unique_name_attribute("log_group_name"),
         ResourceSchema::new("iam.Roles").attribute(
             AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
                 .build(),

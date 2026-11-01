@@ -1598,6 +1598,100 @@ fn schema_admission_rejects_write_only_fields_inside_union_members() {
 }
 
 #[test]
+fn schema_admission_rejects_create_only_fields_inside_union_members() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::union(vec![AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("immutable", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    ],
+                )]),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("config"), "{error}");
+    assert!(
+        error.contains("union members cannot be create-only-bearing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_identity_without_create_only_witness() {
+    let mut attribute = AttributeSchema::optional("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    attribute.create_only = false;
+    let attribute_error = admission_error(ResourceSchema::new("test.Widget").attribute(attribute));
+    assert!(
+        attribute_error.contains("identity requires create-only"),
+        "{attribute_error}"
+    );
+
+    let mut field = StructField::optional("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    field.create_only = false;
+    let field_error = admission_error(ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field])).build(),
+    ));
+    assert!(
+        field_error.contains("identity requires create-only"),
+        "{field_error}"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_non_scalar_identity_leaves() {
+    let top_level = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                .create_only()
+                .identity()
+                .build(),
+        ),
+    );
+    assert!(
+        top_level.contains("identity value must have a scalar or enum type"),
+        "{top_level}"
+    );
+
+    let nested = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional(
+                            "names",
+                            AttributeType::list(AttributeType::string()),
+                        )
+                        .create_only()
+                        .identity()
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        nested.contains("identity value must have a scalar or enum type"),
+        "{nested}"
+    );
+}
+
+#[test]
 fn schema_admission_rejects_provider_populated_fields_marked_write_only() {
     let mut field = StructField::provider_populated("secret", AttributeType::string()).build();
     field.write_only = true;

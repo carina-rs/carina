@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::differ::ComparisonContext;
 use crate::effect::ResolvedMove;
+use crate::name_override::NameOverride;
 use crate::parser::ProviderConfig;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
 use crate::provider::{ComparisonResolutionError, ProviderFactory, ProviderRouter};
@@ -165,21 +166,14 @@ pub enum AnonymousIdentityBasis {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum CompleteIdentityValue {
-    /// A user-written value in its schema-canonical spelling. Prefixes use
-    /// the same `Prefix(...)` spelling as the legacy create-only hash.
+    /// A user-written value in its schema-canonical spelling.
     Written(String),
-    /// An authored resource-reference expression. The spelling is exactly
-    /// the one used by the legacy create-only hash, so resolving the target
-    /// later cannot change this identity input.
+    /// An authored expression whose leaves are references or literals. The
+    /// deterministic spelling is hashed, so resolving its references later
+    /// cannot change this identity input.
     ReferenceExpression(String),
-}
-
-impl CompleteIdentityValue {
-    fn hash_spelling(&self) -> &str {
-        match self {
-            Self::Written(value) | Self::ReferenceExpression(value) => value,
-        }
-    }
+    /// A generated-name prefix written through `<attribute>_prefix`.
+    Prefix(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -274,13 +268,13 @@ fn value_at_identity_path_root<'a>(
     Some(value)
 }
 
-fn value_is_known_at_plan_time(value: &Value) -> bool {
+fn value_has_authored_plan_time_expression(value: &Value) -> bool {
     match value {
         Value::Concrete(ConcreteValue::List(values)) => {
-            values.iter().all(value_is_known_at_plan_time)
+            values.iter().all(value_has_authored_plan_time_expression)
         }
         Value::Concrete(ConcreteValue::Map(values)) => {
-            values.values().all(value_is_known_at_plan_time)
+            values.values().all(value_has_authored_plan_time_expression)
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -292,7 +286,44 @@ fn value_is_known_at_plan_time(value: &Value) -> bool {
             | ConcreteValue::CanonicalEnum(_)
             | ConcreteValue::Duration(_),
         ) => true,
-        Value::Deferred(_) => false,
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .all(value_has_authored_plan_time_expression),
+        Value::Deferred(DeferredValue::ResourceRef { .. } | DeferredValue::BindingRef { .. }) => {
+            true
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            value_has_authored_plan_time_expression(value)
+                && value_has_authored_plan_time_expression(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_has_authored_plan_time_expression(expression.lhs())
+                && value_has_authored_plan_time_expression(expression.rhs())
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            parts.iter().all(|part| match part {
+                crate::resource::InterpolationPart::Literal(_) => true,
+                crate::resource::InterpolationPart::Expr(value) => {
+                    value_has_authored_plan_time_expression(value)
+                }
+            })
+        }
+        Value::Deferred(DeferredValue::FunctionCall { args, .. })
+        | Value::Deferred(DeferredValue::ResolvedFunctionCall { args, .. }) => args
+            .iter()
+            .all(|argument| value_has_authored_plan_time_expression(argument.walker_value())),
+        Value::Deferred(DeferredValue::Access(access)) => {
+            value_has_authored_plan_time_expression(access.base())
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            value_has_authored_plan_time_expression(inner)
+        }
+        Value::Deferred(
+            DeferredValue::Unavailable { .. }
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => false,
     }
 }
 
@@ -331,15 +362,17 @@ fn complete_identity_value<S>(
     path: &IdentityPath,
 ) -> Option<CompleteIdentityValue> {
     match identity_path_input(resource, path)? {
-        IdentityPathInput::Prefix(prefix) => Some(CompleteIdentityValue::Written(format!(
-            "Prefix({prefix:?})"
-        ))),
-        IdentityPathInput::Value(value @ Value::Deferred(DeferredValue::ResourceRef { .. })) => {
+        IdentityPathInput::Prefix(prefix) => {
+            Some(CompleteIdentityValue::Prefix(format!("Prefix({prefix:?})")))
+        }
+        IdentityPathInput::Value(value @ Value::Deferred(_))
+            if value_has_authored_plan_time_expression(value) =>
+        {
             Some(CompleteIdentityValue::ReferenceExpression(
                 deterministic_value_string(value),
             ))
         }
-        IdentityPathInput::Value(value) if value_is_known_at_plan_time(value) => {
+        IdentityPathInput::Value(value) if value_has_authored_plan_time_expression(value) => {
             let names = identity_path_field_names(path);
             let node = schema.effective_node_at_path(&names)?;
             schema_canonical_value_string(value, Some(node.field_type()), schema.as_schema().defs())
@@ -422,9 +455,10 @@ fn encode_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
 /// Encoding `v1` is: domain string; provider-entry count followed by sorted
 /// `key,value` UTF-8 strings; identity-path count followed by each path's
 /// segment count, a segment tag (`0` attribute, `1` struct field), its UTF-8
-/// name, and the deterministic value spelling. Counts and every string's byte
-/// length are unsigned 64-bit little-endian integers. SHA-256 is truncated to
-/// its first 32 bits for the existing eight-hex-character address suffix.
+/// name, a value-kind tag (`0` written, `1` reference expression, `2` prefix),
+/// and the deterministic value spelling. Counts and every string's byte length
+/// are unsigned 64-bit little-endian integers. SHA-256 is truncated to its
+/// first 32 bits for the existing eight-hex-character address suffix.
 fn hash_declared_identity_inputs(
     provider_identity: &BTreeMap<String, String>,
     identity: &CompleteIdentityValues,
@@ -451,7 +485,13 @@ fn hash_declared_identity_inputs(
                 }
             }
         }
-        encode_length_prefixed(&mut hasher, value.hash_spelling().as_bytes());
+        let (kind, spelling) = match value {
+            CompleteIdentityValue::Written(value) => (0, value),
+            CompleteIdentityValue::ReferenceExpression(value) => (1, value),
+            CompleteIdentityValue::Prefix(value) => (2, value),
+        };
+        hasher.update([kind]);
+        encode_length_prefixed(&mut hasher, spelling.as_bytes());
     }
     let digest = hasher.finalize();
     u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 has four bytes"))
@@ -541,7 +581,7 @@ impl AnonymousResourceKind {
 }
 
 /// An anonymous resource whose schema-declared identity cannot produce an
-/// address because one or more values are absent or unknown at plan time.
+/// address because one or more values have no authored plan-time material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncompleteDeclaredIdentity {
     kind: AnonymousResourceKind,
@@ -574,7 +614,7 @@ impl IncompleteDeclaredIdentity {
         )
     }
 
-    /// Identity paths whose values were absent or not known at plan time.
+    /// Identity paths whose values have no authored plan-time material.
     pub fn missing_paths(&self) -> &[IdentityPath] {
         &self.missing_paths
     }
@@ -588,7 +628,7 @@ impl std::fmt::Display for IncompleteDeclaredIdentity {
             .map(|path| format!("'{path}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        let (value_noun, missing_verb, repair_noun) = if self.missing_paths.len() == 1 {
+        let (value_noun, unavailable_verb, repair_noun) = if self.missing_paths.len() == 1 {
             ("identity value", "is", "the identity value")
         } else {
             ("identity values", "are", "each identity value")
@@ -596,8 +636,8 @@ impl std::fmt::Display for IncompleteDeclaredIdentity {
         write!(
             formatter,
             "Anonymous resource of type '{}' cannot derive an address because {value_noun} \
-             {paths} {missing_verb} missing or not known at plan time. Write {repair_noun} or \
-             give the resource a name with `let`.",
+             {paths} {unavailable_verb} not available as a written value or authored expression \
+             at plan time. Write {repair_noun} or give the resource a name with `let`.",
             self.kind.display_type(),
         )
     }
@@ -709,6 +749,10 @@ pub struct LoopAnonymousIdentityConflict {
 }
 
 impl LoopAnonymousIdentityConflict {
+    pub fn origin(&self) -> &LoopElementOrigin {
+        &self.origin
+    }
+
     pub fn file(&self) -> &str {
         self.origin.file()
     }
@@ -777,6 +821,7 @@ pub struct AnonymousResourceIdentifierCollision {
     identifier: String,
     equal_declared_identity: bool,
     same_identifier: bool,
+    origins: Vec<LoopElementOrigin>,
 }
 
 impl AnonymousResourceIdentifierCollision {
@@ -784,6 +829,12 @@ impl AnonymousResourceIdentifierCollision {
     /// natural keys occur below different module prefixes.
     pub fn identifier(&self) -> &str {
         &self.identifier
+    }
+
+    /// Authored loop/module-call origins for generated members of this
+    /// collision. Plain top-level declarations have no loop origin.
+    pub fn origins(&self) -> &[LoopElementOrigin] {
+        &self.origins
     }
 }
 
@@ -2005,6 +2056,22 @@ fn module_name_from_instance_prefix(prefix: &str) -> String {
         .unwrap_or_else(|| "module".to_string())
 }
 
+fn collision_loop_origins<S>(
+    resources: &[Resource<S>],
+    resource_indices: &[usize],
+) -> Vec<LoopElementOrigin> {
+    let mut origins = Vec::new();
+    for origin in resource_indices
+        .iter()
+        .filter_map(|&index| resources[index].loop_provenance.display_origin().cloned())
+    {
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    origins
+}
+
 fn discover_loop_module_prefix_collisions<S>(
     resources: &[Resource<S>],
 ) -> LoopModuleCollisionDiscovery {
@@ -2069,6 +2136,13 @@ fn discover_loop_module_prefix_collisions<S>(
                     identifier: current_prefix.clone(),
                     equal_declared_identity: false,
                     same_identifier: true,
+                    origins: collision_loop_origins(
+                        resources,
+                        &distinct_origins
+                            .iter()
+                            .map(|(resource_index, _)| *resource_index)
+                            .collect::<Vec<_>>(),
+                    ),
                 }
                 .into(),
             );
@@ -2402,27 +2476,21 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
                 identifier: first_identifier.clone(),
                 equal_declared_identity: true,
                 same_identifier,
+                origins: collision_loop_origins(resources, &resource_indices),
             }
             .into(),
         );
     }
 
     // Detect collisions among identities generated in this pass.
-    let mut collisions: BTreeMap<(String, String, Option<String>, String), Vec<usize>> =
-        BTreeMap::new();
+    let mut collisions: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (computed_index, (_, identifier, _)) in computed.iter().enumerate() {
-        let resource = &resources[computed[computed_index].0];
         collisions
-            .entry((
-                resource.id.provider.clone(),
-                resource.id.resource_type.clone(),
-                resource.id.provider_instance.clone(),
-                identifier.clone(),
-            ))
+            .entry(identifier.clone())
             .or_default()
             .push(computed_index);
     }
-    for ((_, _, _, identifier), collision_members) in collisions {
+    for (identifier, collision_members) in collisions {
         if collision_members.len() < 2 {
             continue;
         }
@@ -2478,6 +2546,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
                 identifier,
                 equal_declared_identity,
                 same_identifier: true,
+                origins: collision_loop_origins(resources, &resource_indices),
             }
             .into(),
         );
@@ -2519,6 +2588,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
                 identifier: identity,
                 equal_declared_identity: false,
                 same_identifier: true,
+                origins: collision_loop_origins(resources, &resource_indices),
             }
             .into(),
         );
@@ -2586,7 +2656,7 @@ pub struct AnonymousIdStateInfo {
     projected_id: ResolvedResourceId,
     origin_id: ResolvedResourceId,
     create_only_values: StateCreateOnlyValues,
-    identity_values: StateIdentityValues,
+    identity_values: StateRowIdentityValues,
 }
 
 impl AnonymousIdStateInfo {
@@ -2596,18 +2666,21 @@ impl AnonymousIdStateInfo {
     /// The full typed ids keep the effective name, persisted origin, and
     /// provider route together. A projection across provider or resource type
     /// is rejected instead of allowing callers to assemble inconsistent
-    /// identity fields.
-    pub fn try_from_state_attributes(
+    /// identity fields. Schema-declared identity values use each name
+    /// override's original value, so callers do not need to distinguish a
+    /// temporary unique name from the resource's authored identity.
+    pub fn try_from_state_row(
         origin_id: ResolvedResourceId,
         projected_id: Option<ResolvedResourceId>,
         schema: &ValidatedResourceSchema,
         attributes: &HashMap<String, Value>,
+        name_overrides: &HashMap<String, NameOverride>,
     ) -> Option<Self> {
         Self::try_from_comparable_values(
             origin_id,
             projected_id,
             StateCreateOnlyValues::from_state_attributes(schema, attributes),
-            StateIdentityValues::from_state_attributes(schema, attributes),
+            StateRowIdentityValues::from_state_row(schema, attributes, name_overrides),
         )
     }
 
@@ -2624,7 +2697,7 @@ impl AnonymousIdStateInfo {
             origin_id,
             projected_id,
             StateCreateOnlyValues::default(),
-            StateIdentityValues::default(),
+            StateRowIdentityValues::default(),
         )
     }
 
@@ -2632,7 +2705,7 @@ impl AnonymousIdStateInfo {
         origin_id: ResolvedResourceId,
         projected_id: Option<ResolvedResourceId>,
         create_only_values: StateCreateOnlyValues,
-        identity_values: StateIdentityValues,
+        identity_values: StateRowIdentityValues,
     ) -> Option<Self> {
         let projected_id = projected_id.unwrap_or_else(|| origin_id.clone());
         if origin_id.provider() != projected_id.provider()
@@ -2679,18 +2752,30 @@ impl AnonymousIdStateInfo {
 /// Identity is necessarily create-only, but this projection remains separate
 /// from top-level create-only reconciliation: identity-declared address
 /// migrations must match the real-world key and must not be redirected by a
-/// different mutable create-only collection from the legacy hash rule.
+/// different mutable create-only collection from the legacy hash rule. Values
+/// are built only from a complete state row plus its name overrides, which
+/// substitute authored original names for temporary replacement names.
 #[derive(Clone, Default)]
-struct StateIdentityValues {
+pub struct StateRowIdentityValues {
     values: BTreeMap<IdentityPath, ResolvedCreateOnlyValue>,
 }
 
-impl StateIdentityValues {
-    fn from_state_attributes(
+impl StateRowIdentityValues {
+    fn from_state_row(
         schema: &ValidatedResourceSchema,
         observed_attributes: &HashMap<String, Value>,
+        name_overrides: &HashMap<String, NameOverride>,
     ) -> Self {
         let mut canonical = observed_attributes.clone();
+        for (attribute, override_) in name_overrides {
+            let Some(original_value) = &override_.original_value else {
+                continue;
+            };
+            canonical.insert(
+                attribute.clone(),
+                Value::Concrete(ConcreteValue::String(original_value.clone().into())),
+            );
+        }
         crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
         let values = schema
             .identity_paths()
@@ -2764,7 +2849,7 @@ impl DesiredIdentityValues {
 
     fn all_match(
         &self,
-        state_values: &StateIdentityValues,
+        state_values: &StateRowIdentityValues,
         schema: &ValidatedResourceSchema,
         context: &ComparisonContext<'_>,
     ) -> bool {

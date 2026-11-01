@@ -83,6 +83,32 @@ fn top_level_anonymous_resources_with_spans<'a>(
         .collect()
 }
 
+fn diagnostic_for_loop_origin(
+    doc: &Document,
+    current_name: &str,
+    origin: &carina_core::resource::LoopElementOrigin,
+    message: String,
+) -> Option<Diagnostic> {
+    if current_name != origin.file() {
+        return None;
+    }
+    let range = parser_span_range(doc, origin.source_span()?)?;
+    Some(carina_diagnostic_range(
+        range,
+        DiagnosticSeverity::ERROR,
+        message,
+    ))
+}
+
+fn push_unique_diagnostic(diagnostics: &mut Vec<Diagnostic>, diagnostic: Diagnostic) {
+    if diagnostics.iter().any(|existing| {
+        existing.range == diagnostic.range && existing.message == diagnostic.message
+    }) {
+        return;
+    }
+    diagnostics.push(diagnostic);
+}
+
 fn module_call_position(call: &ModuleCall) -> (u32, u32) {
     source_span_position(call.source_span())
 }
@@ -691,9 +717,15 @@ impl DiagnosticEngine {
         doc: &Document,
         current_file: &ParsedFile,
         directory: &ParsedFile,
+        expanded: Option<&carina_core::parser::ModuleResolvedParsedFile>,
         configuration_root: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
-        let mut resources = directory.resources.clone();
+        let mut resources = expanded
+            .map(|expanded| expanded.resources.clone())
+            .unwrap_or_else(|| directory.resources.clone());
+        let providers = expanded
+            .map(|expanded| expanded.providers.as_slice())
+            .unwrap_or_else(|| directory.providers.as_slice());
         let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
             &mut resources,
             &self.schemas,
@@ -703,7 +735,7 @@ impl DiagnosticEngine {
         };
         let identity_result = carina_core::identifier::compute_anonymous_identifiers_with_factories(
             canonical_resources,
-            &directory.providers,
+            providers,
             &self.factories,
             &self.schemas,
             carina_core::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
@@ -738,32 +770,52 @@ impl DiagnosticEngine {
                                 message.clone(),
                             ));
                         }
+                        for resource in &resources {
+                            if resource.loop_provenance.is_empty()
+                                || !incomplete.includes(resource, &self.schemas)
+                            {
+                                continue;
+                            }
+                            let Some(origin) = resource.loop_provenance.display_origin() else {
+                                continue;
+                            };
+                            if let Some(diagnostic) = diagnostic_for_loop_origin(
+                                doc,
+                                &current_name,
+                                origin,
+                                message.clone(),
+                            ) {
+                                push_unique_diagnostic(&mut diagnostics, diagnostic);
+                            }
+                        }
                     }
                     carina_core::identifier::AnonymousIdentityError::Loop(conflict) => {
-                        if current_name != conflict.file() {
-                            continue;
-                        }
-                        let Some(span) = conflict.source_span() else {
-                            continue;
-                        };
-                        let Some(range) = parser_span_range(doc, span) else {
-                            continue;
-                        };
-                        diagnostics.push(carina_diagnostic_range(
-                            range,
-                            DiagnosticSeverity::ERROR,
+                        if let Some(diagnostic) = diagnostic_for_loop_origin(
+                            doc,
+                            &current_name,
+                            conflict.origin(),
                             conflict.to_string(),
-                        ));
+                        ) {
+                            push_unique_diagnostic(&mut diagnostics, diagnostic);
+                        }
                     }
                     carina_core::identifier::AnonymousIdentityError::Collision(collision) => {
                         let message = collision.to_string();
+                        for origin in collision.origins() {
+                            if let Some(diagnostic) = diagnostic_for_loop_origin(
+                                doc,
+                                &current_name,
+                                origin,
+                                message.clone(),
+                            ) {
+                                push_unique_diagnostic(&mut diagnostics, diagnostic);
+                            }
+                        }
                         for (resource, span) in
                             top_level_anonymous_resources_with_spans(doc, current_file)
                         {
-                            if self.generated_identity_for_plain_resource(
-                                resource,
-                                &directory.providers,
-                            ) != Some(collision.identifier().to_string())
+                            if self.generated_identity_for_plain_resource(resource, providers)
+                                != Some(collision.identifier().to_string())
                             {
                                 continue;
                             }

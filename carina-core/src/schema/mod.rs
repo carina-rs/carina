@@ -9530,6 +9530,10 @@ fn validate_attribute_mode(
     location: &SchemaValidationIssueLocation,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
+    if attribute.identity && !attribute.create_only {
+        push_schema_issue(issues, location, "identity requires create-only");
+    }
+
     match attribute.input_mode {
         InputMode::Optional => {
             if attribute.deferred_populate {
@@ -9623,6 +9627,10 @@ fn validate_struct_field_mode(
     provider_populated_ancestor: Option<bool>,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
+    if field.identity && !field.create_only {
+        push_schema_issue(issues, location, "identity requires create-only");
+    }
+
     if provider_populated_ancestor == Some(true) && field.write_only {
         push_schema_issue(
             issues,
@@ -9822,6 +9830,16 @@ fn validate_type_definition(
                     provider_populated_ancestor,
                     issues,
                 );
+                if field.identity
+                    && identity_leaf_is_scalar_or_enum(&field.field_type, defs, &mut Vec::new())
+                        == Some(false)
+                {
+                    push_schema_issue(
+                        issues,
+                        &field_location,
+                        "identity value must have a scalar or enum type",
+                    );
+                }
                 validate_type_definition(
                     &field.field_type,
                     defs,
@@ -9971,6 +9989,37 @@ fn collect_identity_paths_in_type(
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration
         | AttrTypeKind::Enum { .. } => {}
+    }
+}
+
+fn identity_leaf_is_scalar_or_enum(
+    attr_type: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    ref_chain: &mut Vec<String>,
+) -> Option<bool> {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(name) {
+                return None;
+            }
+            let definition = defs.get(name)?;
+            ref_chain.push(name.clone());
+            let result = identity_leaf_is_scalar_or_enum(definition, defs, ref_chain);
+            ref_chain.pop();
+            result
+        }
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => Some(true),
+        AttrTypeKind::List { .. }
+        | AttrTypeKind::Map { .. }
+        | AttrTypeKind::Struct { .. }
+        | AttrTypeKind::Union(_) => Some(false),
     }
 }
 
@@ -10202,6 +10251,104 @@ fn first_write_only_conflict_in(
     })
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CreateOnlyTypeAnalysis {
+    contains_create_only: bool,
+    union_conflict: bool,
+}
+
+fn type_create_only_analysis<'schema>(
+    attr_type: &'schema AttributeType,
+    defs: &'schema BTreeMap<String, AttributeType>,
+    ref_chain: &mut Vec<&'schema str>,
+) -> CreateOnlyTypeAnalysis {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return CreateOnlyTypeAnalysis::default();
+            }
+            let Some(definition) = defs.get(name) else {
+                return CreateOnlyTypeAnalysis::default();
+            };
+            ref_chain.push(name);
+            let analysis = type_create_only_analysis(definition, defs, ref_chain);
+            ref_chain.pop();
+            analysis
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            type_create_only_analysis(element_type, defs, ref_chain)
+        }
+        AttrTypeKind::Map { value, .. } => type_create_only_analysis(value, defs, ref_chain),
+        AttrTypeKind::Struct { fields, .. } => {
+            fields
+                .iter()
+                .fold(CreateOnlyTypeAnalysis::default(), |analysis, field| {
+                    let nested = type_create_only_analysis(&field.field_type, defs, ref_chain);
+                    CreateOnlyTypeAnalysis {
+                        contains_create_only: analysis.contains_create_only
+                            || field.create_only
+                            || nested.contains_create_only,
+                        union_conflict: analysis.union_conflict || nested.union_conflict,
+                    }
+                })
+        }
+        AttrTypeKind::Union(members) => {
+            let nested = members.as_raw_slice().iter().fold(
+                CreateOnlyTypeAnalysis::default(),
+                |analysis, member| {
+                    let member = type_create_only_analysis(member, defs, ref_chain);
+                    CreateOnlyTypeAnalysis {
+                        contains_create_only: analysis.contains_create_only
+                            || member.contains_create_only,
+                        union_conflict: analysis.union_conflict || member.union_conflict,
+                    }
+                },
+            );
+            CreateOnlyTypeAnalysis {
+                union_conflict: nested.contains_create_only || nested.union_conflict,
+                ..nested
+            }
+        }
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => CreateOnlyTypeAnalysis::default(),
+    }
+}
+
+/// A schema shape that cannot safely project nested create-only leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateOnlySchemaConflict {
+    attribute: String,
+}
+
+impl CreateOnlySchemaConflict {
+    pub fn attribute(&self) -> &str {
+        &self.attribute
+    }
+
+    pub fn message(&self) -> &'static str {
+        "union members cannot be create-only-bearing"
+    }
+}
+
+fn first_create_only_conflict_in(
+    attributes: &BTreeMap<String, AttributeSchema>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Option<CreateOnlySchemaConflict> {
+    attributes.iter().find_map(|(name, attribute)| {
+        type_create_only_analysis(&attribute.attr_type, defs, &mut Vec::new())
+            .union_conflict
+            .then(|| CreateOnlySchemaConflict {
+                attribute: name.clone(),
+            })
+    })
+}
+
 fn validate_keyed_partial_update(
     attribute: &AttributeSchema,
     defs: &BTreeMap<String, AttributeType>,
@@ -10356,88 +10503,6 @@ fn project_write_only_leaves<'schema>(
                         path,
                         &mut Vec::new(),
                         inherited_secret,
-                        leaves,
-                    );
-                }
-                path.pop();
-            }
-        }
-        AttrTypeKind::Union(_)
-        | AttrTypeKind::String { .. }
-        | AttrTypeKind::ResourceHandle { .. }
-        | AttrTypeKind::StringLiteralSet { .. }
-        | AttrTypeKind::Int { .. }
-        | AttrTypeKind::Float { .. }
-        | AttrTypeKind::Bool
-        | AttrTypeKind::Duration
-        | AttrTypeKind::Enum { .. } => {}
-    }
-}
-
-fn project_create_only_leaves<'schema>(
-    attr_type: &'schema AttributeType,
-    value: &Value,
-    defs: &'schema BTreeMap<String, AttributeType>,
-    path: &mut Vec<LeafPathSegment>,
-    ref_chain: &mut Vec<&'schema str>,
-    leaves: &mut Vec<(LeafPath, Value, &'schema AttributeType)>,
-) {
-    match &attr_type.kind {
-        AttrTypeKind::Ref(name) => {
-            if ref_chain.contains(&name.as_str()) {
-                return;
-            }
-            let Some(definition) = defs.get(name) else {
-                return;
-            };
-            ref_chain.push(name);
-            project_create_only_leaves(definition, value, defs, path, ref_chain, leaves);
-            ref_chain.pop();
-        }
-        AttrTypeKind::List { element_type, .. } => {
-            let Value::Concrete(ConcreteValue::List(items)) = value else {
-                return;
-            };
-            for (index, item) in items.iter().enumerate() {
-                path.push(LeafPathSegment::ListIndex(index));
-                project_create_only_leaves(element_type, item, defs, path, &mut Vec::new(), leaves);
-                path.pop();
-            }
-        }
-        AttrTypeKind::Map {
-            value: value_type, ..
-        } => {
-            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
-                return;
-            };
-            for (key, entry) in entries {
-                path.push(LeafPathSegment::MapKey(key.clone()));
-                project_create_only_leaves(value_type, entry, defs, path, &mut Vec::new(), leaves);
-                path.pop();
-            }
-        }
-        AttrTypeKind::Struct { fields, .. } => {
-            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
-                return;
-            };
-            for field in fields {
-                let Some(field_value) = entries.get(&field.name) else {
-                    continue;
-                };
-                path.push(LeafPathSegment::StructField(field.name.clone()));
-                if field.create_only {
-                    leaves.push((
-                        LeafPath::from_segments(path.iter().cloned()),
-                        field_value.clone(),
-                        &field.field_type,
-                    ));
-                } else {
-                    project_create_only_leaves(
-                        &field.field_type,
-                        field_value,
-                        defs,
-                        path,
-                        &mut Vec::new(),
                         leaves,
                     );
                 }
@@ -10657,6 +10722,19 @@ impl ResourceSchema {
         for (name, attribute) in &self.attributes {
             let location = SchemaValidationIssueLocation::Attribute(name.clone());
             validate_attribute_mode(attribute, &location, &mut issues);
+            if attribute.identity
+                && identity_leaf_is_scalar_or_enum(
+                    &attribute.attr_type,
+                    &self.defs,
+                    &mut Vec::new(),
+                ) == Some(false)
+            {
+                push_schema_issue(
+                    &mut issues,
+                    &location,
+                    "identity value must have a scalar or enum type",
+                );
+            }
             validate_keyed_partial_update(attribute, &self.defs, &location, &mut issues);
             if let Some(default) = &attribute.default {
                 validate_portable_default(default, location.clone(), &mut issues);
@@ -10741,6 +10819,12 @@ impl ResourceSchema {
         }
 
         if let Some(conflict) = self.first_write_only_conflict() {
+            let location =
+                SchemaValidationIssueLocation::Attribute(conflict.attribute().to_string());
+            push_schema_issue(&mut issues, &location, conflict.message());
+        }
+
+        if let Some(conflict) = self.first_create_only_conflict() {
             let location =
                 SchemaValidationIssueLocation::Attribute(conflict.attribute().to_string());
             push_schema_issue(&mut issues, &location, conflict.message());
@@ -10868,6 +10952,12 @@ impl ResourceSchema {
         first_write_only_conflict_in(&self.attributes, &self.defs)
     }
 
+    /// Return the first schema shape that cannot safely project nested
+    /// create-only provenance.
+    pub fn first_create_only_conflict(&self) -> Option<CreateOnlySchemaConflict> {
+        first_create_only_conflict_in(&self.attributes, &self.defs)
+    }
+
     /// Return whether a top-level attribute contains a nested write-only field.
     pub fn write_only_bearing(&self, key: &str) -> bool {
         self.attributes.get(key).is_some_and(|attribute| {
@@ -10897,32 +10987,6 @@ impl ResourceSchema {
             &mut Vec::new(),
             &mut Vec::new(),
             false,
-            &mut leaves,
-        );
-        leaves.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
-        leaves
-    }
-
-    /// Project nested create-only fields from one concrete attribute value.
-    ///
-    /// Runtime list indices and map keys remain typed path segments so the
-    /// differ can compare only immutable leaves without treating a mutable
-    /// sibling change as a replacement.
-    pub(crate) fn create_only_leaf_projection<'schema>(
-        &'schema self,
-        key: &str,
-        value: &Value,
-    ) -> Vec<(LeafPath, Value, &'schema AttributeType)> {
-        let Some(attribute) = self.attributes.get(key) else {
-            return Vec::new();
-        };
-        let mut leaves = Vec::new();
-        project_create_only_leaves(
-            &attribute.attr_type,
-            value,
-            &self.defs,
-            &mut Vec::new(),
-            &mut Vec::new(),
             &mut leaves,
         );
         leaves.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
