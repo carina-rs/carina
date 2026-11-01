@@ -2436,14 +2436,22 @@ fn resolve_module_binding_uses<P: TypeResolutionPolicy>(
                 // type. Re-inferring that use from the substituted value would
                 // blame the module body before the expanded call boundary can
                 // diagnose an unannotated composition output in the caller.
-                let declared_type = declared_type.clone().or_else(|| {
-                    let name = parameter_name?;
-                    let parameter = module.arguments.iter().find(|arg| &arg.name == name)?;
-                    P::resolve_static_type(&parameter.static_type, resolver.arguments.config)
-                        .known()
-                        .cloned()
-                        .map(std::sync::Arc::new)
-                });
+                let declared_type = declared_type
+                    .as_deref()
+                    .or_else(|| {
+                        let name = parameter_name?;
+                        let parameter = module.arguments.iter().find(|arg| &arg.name == name)?;
+                        Some(&parameter.static_type)
+                    })
+                    // Parser provenance may already carry a declaration, but
+                    // dotted types still need consumer-side resolution before
+                    // they can describe the module body's lexical source.
+                    .and_then(|declaration| {
+                        P::resolve_static_type(declaration, resolver.arguments.config)
+                            .known()
+                            .cloned()
+                            .map(std::sync::Arc::new)
+                    });
                 let parameter =
                     parameter_name.and_then(|name| resolver.arguments.arguments.get(name));
                 match parameter.map(|argument| argument.value_ref()) {

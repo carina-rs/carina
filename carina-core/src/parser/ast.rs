@@ -551,6 +551,26 @@ pub struct DeferredForExpression<
     deferred_effect_id: ResolvedResourceId,
 }
 
+impl<S, P: PlaceholderKind, T: PlaceholderKind, D>
+    DeferredForExpression<S, P, T, AbsoluteBindingAddress, D>
+{
+    /// Whether a resolved address is a managed member this bound template can
+    /// emit. Anonymous members must instead be identified by their concrete
+    /// managed rows because their identities depend on provider schemas.
+    pub fn contains_managed_member(&self, id: &ResolvedResourceId) -> bool {
+        let resource = self.template_resource_id();
+        crate::resource::PersistedDestroyDependencies::is_managed_row_address(id)
+            && resource.provider == id.provider()
+            && resource.resource_type == id.resource_type()
+            && resource.provider_instance.as_deref() == id.provider_instance()
+            && self.target().bound_binding_address().is_some()
+            && crate::differ::binding_matches_deferred_template(
+                &id.binding_address(),
+                self.target(),
+            )
+    }
+}
+
 impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress, D>
     DeferredForExpression<S, P, T, B, D>
 {

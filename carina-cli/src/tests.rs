@@ -4065,6 +4065,67 @@ fn plan_file_validation_accepts_matching_bound_deferred_template_identity() {
 }
 
 #[test]
+fn plan_file_managed_row_predicate_accepts_deferred_members() {
+    let plan = plan_file_with_bound_deferred_template();
+    for identity in [
+        "children[0]",
+        "children[12]",
+        "children.prod",
+        "children['prod-east']",
+    ] {
+        let id = carina_core::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            identity,
+            None,
+        );
+        assert!(plan.is_managed_row(&id), "deferred member {id} is managed");
+    }
+    for (provider, resource_type, identity, instance) in [
+        ("mock", "__wait", "children[0]", None),
+        ("mock", "__composition", "children[0]", None),
+        ("other", "test.resource", "children[0]", None),
+        ("mock", "test.lookup", "children[0]", None),
+        (
+            "mock",
+            "test.resource",
+            "children[0]",
+            Some("other".to_string()),
+        ),
+        ("mock", "test.resource", "children[?]", None),
+        ("mock", "test.resource", "children", None),
+        ("mock", "test.resource", "children_suffix[0]", None),
+        ("mock", "test.resource", "children[0].nested", None),
+    ] {
+        let id = carina_core::resource::ResolvedResourceId::with_provider_identity(
+            provider,
+            resource_type,
+            identity,
+            instance,
+        );
+        assert!(!plan.is_managed_row(&id), "{id} is not a managed member");
+    }
+}
+
+#[test]
+fn plan_file_managed_row_predicate_rejects_data_source_with_legacy_state_entry() {
+    let source = DataSource::with_provider("mock", "test.lookup", "lookup", None);
+    let id = carina_core::resource::ResolvedResourceId::new(source.id.clone());
+    let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
+    contents.current_states.push(CurrentStateEntry::managed(
+        source.id.clone(),
+        State::not_found(source.id.clone()),
+    ));
+    contents.data_sources.push(source.into_value_snapshot());
+    let plan = record_test_plan(contents, &["mock"]);
+
+    assert!(
+        !plan.is_managed_row(&id),
+        "a legacy data-source state entry cannot mint managed dependency ownership",
+    );
+}
+
+#[test]
 fn plan_file_load_rejects_deferred_top_level_resource_type_mismatch() {
     let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
         .expect("serialize bound deferred template");

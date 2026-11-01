@@ -2368,6 +2368,61 @@ impl PlanFile {
             })
     }
 
+    /// Managed ownership includes rows that a retained deferred template can
+    /// materialize during apply, before they exist in `sorted_resources`.
+    /// Keep this predicate shared by projection and classification validation.
+    pub(crate) fn is_managed_row(&self, id: &ResolvedResourceId) -> bool {
+        if !PersistedDestroyDependencies::is_managed_row_address(id) {
+            return false;
+        }
+        if self
+            .sorted_resources
+            .iter()
+            .any(|resource| &resource.id == id.as_inner())
+        {
+            return true;
+        }
+        for effect in self.plan.effects() {
+            let template = match effect {
+                UnresolvedSavedEffect::DeferredCreate(payload) => &payload.template,
+                UnresolvedSavedEffect::DeferredReplace(payload) => &payload.template,
+                UnresolvedSavedEffect::Read { .. }
+                | UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::ResumeCreate { .. }
+                | UnresolvedSavedEffect::Update { .. }
+                | UnresolvedSavedEffect::Delete { .. }
+                | UnresolvedSavedEffect::Import { .. }
+                | UnresolvedSavedEffect::Remove { .. }
+                | UnresolvedSavedEffect::Move { .. }
+                | UnresolvedSavedEffect::ReleaseListKeys { .. }
+                | UnresolvedSavedEffect::Wait { .. } => continue,
+            };
+            if template.contains_managed_member(id) {
+                return true;
+            }
+        }
+        // Classification also carries prior managed rows which may have left
+        // the configuration. Known plan-only nodes cannot acquire that status.
+        !self
+            .data_sources
+            .iter()
+            .any(|source| &source.id == id.as_inner())
+            && !self
+                .data_source_origins
+                .iter()
+                .any(|source| &source.id == id.as_inner())
+            && !self
+                .compositions
+                .iter()
+                .any(|composition| &composition.id == id.as_inner())
+            && self
+                .legacy_dependency_classification
+                .as_ref()
+                .is_some_and(|classification| {
+                    classification.source_row_ids().any(|source| source == id)
+                })
+    }
+
     pub(crate) fn validate_resource_identities(&self) -> Result<(), String> {
         fn require_identity(id: &ResourceId, location: &str) -> Result<(), String> {
             if id.identity_str().is_none() {
@@ -2389,11 +2444,6 @@ impl PlanFile {
                 self.sorted_resources.len()
             ));
         }
-        let configured_managed_ids = self
-            .sorted_resources
-            .iter()
-            .map(|resource| &resource.id)
-            .collect::<HashSet<_>>();
         for (kind, projections) in [
             (
                 "sorted_value_destroy_dependencies",
@@ -2406,7 +2456,7 @@ impl PlanFile {
         ] {
             for (index, dependencies) in projections.iter().enumerate() {
                 for dependency in dependencies.iter() {
-                    if !configured_managed_ids.contains(dependency.as_inner()) {
+                    if !self.is_managed_row(dependency) {
                         return Err(format!(
                             "Invalid saved plan: {kind}[{index}] contains non-managed dependency `{dependency}`"
                         ));
@@ -2415,10 +2465,8 @@ impl PlanFile {
             }
         }
         if let Some(classification) = &self.legacy_dependency_classification {
-            let source_row_ids = classification.source_row_ids().collect::<HashSet<_>>();
             for row in classification.row_ids() {
-                if !configured_managed_ids.contains(row.as_inner()) && !source_row_ids.contains(row)
-                {
+                if !self.is_managed_row(row) {
                     return Err(format!(
                         "Invalid saved plan: legacy dependency classification contains unknown row `{row}`"
                     ));

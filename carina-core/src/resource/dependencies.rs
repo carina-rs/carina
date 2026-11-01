@@ -150,6 +150,16 @@ impl PersistedDestroyDependencies {
         Self(dependencies.into_iter().collect())
     }
 
+    /// Whether an address can belong to a managed state row. Configuration
+    /// ownership (including data-source exclusion) needs the caller's graph.
+    /// Indexed and keyed deferred members have the same shape as other rows.
+    pub fn is_managed_row_address(dependency: &ResolvedResourceId) -> bool {
+        !dependency.provider().is_empty()
+            && !dependency
+                .resource_type()
+                .starts_with(SYNTHETIC_TYPE_PREFIX)
+    }
+
     /// Decode the persisted set after proving every address has managed-row
     /// shape. Data-source exclusion remains a writer-side graph invariant;
     /// unlike scheduler nodes, a dangling data-source address is not
@@ -157,12 +167,10 @@ impl PersistedDestroyDependencies {
     pub fn decode_persisted(
         dependencies: BTreeSet<ResolvedResourceId>,
     ) -> Result<Self, NotAManagedRow> {
-        if let Some(dependency) = dependencies.iter().find(|dependency| {
-            dependency.provider().is_empty()
-                || dependency
-                    .resource_type()
-                    .starts_with(SYNTHETIC_TYPE_PREFIX)
-        }) {
+        if let Some(dependency) = dependencies
+            .iter()
+            .find(|dependency| !Self::is_managed_row_address(dependency))
+        {
             return Err(NotAManagedRow(dependency.clone()));
         }
         Ok(Self(dependencies))
@@ -447,5 +455,28 @@ impl DeferredDependencyTemplate {
             Default::default(),
             Default::default(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_destroy_dependency_predicate_accepts_deferred_members() {
+        for identity in ["records[0]", "records.prod", "records['prod-east']"] {
+            let id = ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.resource",
+                identity,
+                Some("west".to_string()),
+            );
+            assert!(PersistedDestroyDependencies::is_managed_row_address(&id));
+            let decoded = PersistedDestroyDependencies::decode_persisted(
+                std::iter::once(id.clone()).collect(),
+            )
+            .expect("materialized deferred members are managed state rows");
+            assert!(decoded.contains(&id));
+        }
     }
 }
