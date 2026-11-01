@@ -140,7 +140,7 @@ Each method consumes its handle. The `u32` is the poll delay in seconds.
 
 A provider runs with no filesystem access. It sees only these environment variables:
 
-- `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's headers to stderr, including authorization headers, so do not use it with real credentials or in shared logs.
+- `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's header names to stderr, shows values only for a fixed allowlist of non-credential headers (`host`, `content-type`, `content-length`, `transfer-encoding`, `expect`, `user-agent`, `x-amz-date`), redacts all other header values, and removes userinfo, fragments and query values from URIs.
 - `AWS_REGION`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL`, only for an AWS-kind provider. AWS credential variables are never passed; the AWS world receives credentials through its typed import.
 - `GITHUB_TOKEN`, only when the same user-owned record exists for the exact `carina-rs/github` artifact (including its official GitHub source), or for a matching local build explicitly granted the `github` kind.
 
