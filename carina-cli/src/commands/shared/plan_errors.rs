@@ -37,6 +37,12 @@ impl<R> crate::wiring::PostExpansionDiagnostics<R> {
     }
 }
 
+impl crate::wiring::DiagnosticPlan {
+    pub(crate) fn render_and_abort(&self, project_dir: &Path) -> AppError {
+        render_plan_errors(self.errors.as_slice(), project_dir)
+    }
+}
+
 fn plan_error_summary(errors: &[PlanError]) -> String {
     let mut prevent_destroy_count = 0;
     let mut other_count = 0;

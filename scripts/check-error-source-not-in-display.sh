@@ -13,6 +13,9 @@
 # attributes, named and tuple fields, same-line field attributes, implicit
 # sources, positional `.field`/`.N` arguments, and tuple indices >= 1. It does
 # not expand macros, evaluate cfgs, or inspect hand-written Display/Error impls.
+# Context-only errors may opt into caller-owned chain rendering with the
+# inline marker `error-chain: caller-renders-sources` on #[error]. Such errors
+# must omit their source from Display; duplication is still rejected.
 # Keep the awk POSIX-compatible: CI uses mawk and developers use macOS awk.
 set -euo pipefail
 
@@ -60,6 +63,11 @@ for file in "${files[@]}"; do
     }
 
     function report_source(field, embedded, kind) {
+      # Explicit context-only errors retain typed sources for a caller-owned
+      # chain renderer. The opt-in never permits embedding that source too.
+      if (!embedded && error_attr ~ /error-chain: caller-renders-sources/) {
+        return
+      }
       if (embedded) {
         kind = "duplicates source in Display"
       } else {

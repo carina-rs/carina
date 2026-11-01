@@ -588,6 +588,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         &crate::empty_lifted_saved_attrs(),
         &HashMap::new(),
         &[],
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("create-only behavior change must plan a replacement");
     assert!(
@@ -3738,6 +3739,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("module data-source plan should build");
@@ -5814,6 +5816,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("post-apply plan should succeed");
@@ -5930,6 +5933,7 @@ let nat = mock.ec2.NatGateway {{
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after create should succeed");
@@ -5989,6 +5993,7 @@ let nat = mock.ec2.NatGateway {{
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after sibling update should succeed");
@@ -6116,6 +6121,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("retry plan should succeed");
@@ -6257,6 +6263,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("the removal plan should succeed");
@@ -6338,6 +6345,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("retry plan should succeed");
@@ -6413,6 +6421,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after the successful retry should succeed");
@@ -7876,7 +7885,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     //
     // This tests the scenario from issue #1499 where plan-verify fails
     // because the block_name attribute shows as an addition.
-    use carina_core::differ::diff;
+    use carina_core::differ::diff_for_test as diff;
     use carina_core::schema::StructField;
 
     let schema = ResourceSchema::new("awscc.iam.role")
@@ -7981,8 +7990,10 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
         &saved,
         Some(&prev_explicit),
         Some(schema.as_schema()),
-        &carina_core::differ::exact_comparison_context_for_tests(),
-    );
+        &carina_core::differ::exact_comparison_schema_for_tests(),
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
 
     assert!(
         matches!(d, carina_core::differ::Diff::NoChange(_)),

@@ -2,7 +2,7 @@
 
 use carina_core::binding_index::SecretPreservingAttributes;
 use carina_core::deps::get_resource_dependencies;
-use carina_core::differ::{ComparisonContext, Orphan};
+use carina_core::differ::{ComparisonContext, Orphan, ReferenceEquality};
 use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect};
 use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
@@ -3323,14 +3323,14 @@ impl ResourceState {
         recorded_write_only_keys(schema, attributes, &[])
     }
 
-    fn populate_desired_metadata<S>(
+    fn populate_desired_metadata<S, R: ReferenceEquality>(
         &mut self,
         resource: &ResolvedResource<S>,
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
         authoring_basis: DesiredAuthoringBasis<'_>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ComparisonContext<'_, R>,
     ) {
         if let Some(existing) = existing {
             self.protected = existing.protected;
@@ -3381,12 +3381,12 @@ impl ResourceState {
         }
     }
 
-    fn carried_explicit_for_stored_values<S>(
+    fn carried_explicit_for_stored_values<S, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
         existing: Option<&ResourceState>,
         stored_attributes: &HashMap<String, Value>,
         schema: Option<&ResourceSchema>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ComparisonContext<'_, R>,
     ) -> ExplicitFields {
         let Some(existing) = existing else {
             return explicit::build_from_read_resource_for_stored_values(
@@ -3416,13 +3416,13 @@ impl ResourceState {
     /// selected strictly as observed, then sent, then absent. Desired state
     /// controls masking but cannot introduce an unsent value. The create
     /// establishes the current desired resource as the authoring baseline.
-    pub fn from_observation<S: Clone>(
+    pub fn from_observation<S: Clone, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
         created: &ObservedCreate,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let applied_desired = created
             .resolved_desired_attributes()
@@ -3546,13 +3546,13 @@ impl ResourceState {
     /// known authoring record. A legacy `Unrecorded` authoring record is seeded
     /// from desired keys. A freshly sent create encodes sent write-only and
     /// secret values and establishes the current desired authoring baseline.
-    pub fn from_in_flight<S>(
+    pub fn from_in_flight<S, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
         pending: &InFlightCreate,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
         let (persisted, sent_desired) = match pending.persistence() {
             InFlightPersistence::Persisted => {
@@ -3638,12 +3638,12 @@ impl ResourceState {
 
     /// Build the token-less protected row for a create whose cloud outcome is
     /// unknown. Existing host metadata and deposed generations are retained.
-    pub fn from_unknown_create_outcome<S>(
+    pub fn from_unknown_create_outcome<S, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
         unknown: &UnknownCreateOutcome,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ComparisonContext<'_, R>,
     ) -> Self {
         let mut row = existing.cloned().unwrap_or_else(|| {
             Self::new(
@@ -3682,14 +3682,14 @@ impl ResourceState {
     ///
     /// Returns an error if any provider attribute value cannot be converted to
     /// JSON, such as non-finite float values.
-    pub fn from_provider_state_for_resource_and_schema<S: Clone>(
+    pub fn from_provider_state_for_resource_and_schema<S: Clone, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
         state: &State,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         row_basis: RowBasis<'_>,
         preferred_hashes: Option<&PersistedAttributes>,
-        comparison: &ComparisonContext<'_>,
+        comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
         // The resource carried by a saved plan still contains deferred expressions.
         // Once an operation has run, secret protection must follow the provider-ready
