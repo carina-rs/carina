@@ -7,8 +7,10 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 use crate::PERSISTED_SECRET_KEY;
+pub use crate::{PendingPhase, PollFinality, PollRequest};
 
 fn default_true() -> bool {
     true
@@ -38,7 +40,7 @@ pub struct TypeIdentity {
 
 /// A validated long-form reference template.
 ///
-/// The only placeholders accepted by protocol v14 are `{partition}`,
+/// The only placeholders accepted by protocol v16 are `{partition}`,
 /// `{region}`, `{account}`, and `{name}`. The `{name}` placeholder appears
 /// exactly once and denotes the short form of the reference.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -942,11 +944,46 @@ pub enum Observation<R, E> {
     ReadFailed(E),
 }
 
+/// Progress of an initial or resumed create. Read-back always has an identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum CreateProgress {
+    Operating {
+        identifier: Option<AppliedIdentifier>,
+    },
+    ReadingBack {
+        identifier: AppliedIdentifier,
+    },
+}
+
+impl CreateProgress {
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        match self {
+            Self::Operating { identifier } => identifier.as_ref(),
+            Self::ReadingBack { identifier } => Some(identifier),
+        }
+    }
+
+    pub fn phase(&self) -> crate::PendingPhase {
+        match self {
+            Self::Operating { .. } => crate::PendingPhase::Operation,
+            Self::ReadingBack { .. } => crate::PendingPhase::ReadBack,
+        }
+    }
+
+    pub fn into_identifier(self) -> Option<AppliedIdentifier> {
+        match self {
+            Self::Operating { identifier } => identifier,
+            Self::ReadingBack { identifier } => Some(identifier),
+        }
+    }
+}
+
 /// An unfinished initial create, including the immutable `sent` declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCreate<T> {
     pub token: T,
-    pub identifier: Option<AppliedIdentifier>,
+    pub progress: CreateProgress,
     pub sent: Sent,
     pub poll_after_secs: u32,
 }
@@ -955,21 +992,20 @@ impl<T> PendingCreate<T> {
     pub fn token(&self) -> &T {
         &self.token
     }
-
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
-
     pub fn sent(&self) -> &Sent {
         &self.sent
     }
-
     pub fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
-
-    pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, Sent, u32) {
-        (self.token, self.identifier, self.sent, self.poll_after_secs)
+    pub fn phase(&self) -> crate::PendingPhase {
+        self.progress.phase()
+    }
+    pub fn into_parts(self) -> (T, CreateProgress, Sent, u32) {
+        (self.token, self.progress, self.sent, self.poll_after_secs)
     }
 }
 
@@ -984,7 +1020,7 @@ pub struct CreateInFlight<T, E> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumePending<T> {
     pub token: T,
-    pub identifier: Option<AppliedIdentifier>,
+    pub progress: CreateProgress,
     pub poll_after_secs: u32,
 }
 
@@ -992,17 +1028,33 @@ impl<T> ResumePending<T> {
     pub fn token(&self) -> &T {
         &self.token
     }
-
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
-
     pub fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
+    pub fn phase(&self) -> crate::PendingPhase {
+        self.progress.phase()
+    }
+    pub fn into_parts(self) -> (T, CreateProgress, u32) {
+        (self.token, self.progress, self.poll_after_secs)
+    }
+}
 
-    pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, u32) {
-        (self.token, self.identifier, self.poll_after_secs)
+/// An unfinished delete operation. Delete has no post-apply read-back phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDelete<T> {
+    pub token: T,
+    pub poll_after_secs: u32,
+}
+
+impl<T> PendingDelete<T> {
+    pub fn new(token: T, poll_after_secs: u32) -> Self {
+        Self {
+            token,
+            poll_after_secs,
+        }
     }
 }
 
@@ -1101,6 +1153,11 @@ pub enum ResumeStep<A, D, T> {
     Completed {
         identifier: AppliedIdentifier,
         attributes: A,
+    },
+    PartialSuccess {
+        identifier: AppliedIdentifier,
+        attributes: A,
+        diagnostic: D,
     },
     Pending(ResumePending<T>),
     Resent(CreateStep<A, D, T>),
@@ -1552,7 +1609,7 @@ pub struct ResourceSchema {
     pub operation_config: Option<OperationConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validators: Vec<ValidatorType>,
-    /// Protocol-v14 cardinality constraints over sibling attributes.
+    /// Protocol-v16 cardinality constraints over sibling attributes.
     /// Required even when empty so version skew fails during JSON loading.
     pub field_groups: Vec<FieldGroup>,
     /// Whether the resource type is protected from destruction unless the
@@ -1582,6 +1639,33 @@ pub struct OperationConfig {
     pub create_max_retries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_back: Option<ReadBackBudget>,
+}
+
+/// Non-zero host-owned budget for a post-create or post-update read-back.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct ReadBackBudget {
+    timeout_secs: NonZeroU64,
+}
+
+impl ReadBackBudget {
+    pub const fn new(timeout_secs: NonZeroU64) -> Self {
+        Self { timeout_secs }
+    }
+
+    pub fn from_secs(timeout_secs: u64) -> Option<Self> {
+        NonZeroU64::new(timeout_secs).map(Self::new)
+    }
+
+    pub const fn timeout_secs(self) -> NonZeroU64 {
+        self.timeout_secs
+    }
+
+    pub fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.get())
+    }
 }
 
 impl OperationConfig {
@@ -1596,11 +1680,18 @@ impl OperationConfig {
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::DEFAULT_OPERATION_BUDGET)
     }
+
+    /// Return the configured read-back budget, or the host fallback.
+    pub fn read_back_budget(&self) -> std::time::Duration {
+        self.read_back
+            .map(ReadBackBudget::duration)
+            .unwrap_or(crate::DEFAULT_READ_BACK_BUDGET)
+    }
 }
 
 /// How a create-only schema value contributes to anonymous identity.
 ///
-/// This is a closed protocol-v14 enum. The field carrying it is required on
+/// This is a closed protocol-v16 enum. The field carrying it is required on
 /// every attribute and struct-field record so host/provider skew fails before
 /// schema semantics can be misinterpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -1647,7 +1738,7 @@ pub struct AttributeSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removable: Option<bool>,
     /// How this attribute contributes to anonymous resource identity hashing.
-    /// Required in protocol v14 so older providers fail the version check
+    /// Required in protocol v16 so older providers fail the version check
     /// before this changed meaning can be decoded.
     pub identity: IdentityMode,
     /// Whether this attribute is populated asynchronously after Create returns.
@@ -1747,7 +1838,7 @@ pub enum AttributeType {
     Struct {
         name: String,
         fields: Vec<StructField>,
-        /// Required in protocol v14, including when empty.
+        /// Required in protocol v16, including when empty.
         field_groups: Vec<FieldGroup>,
     },
     #[serde(rename = "union")]
@@ -1903,13 +1994,13 @@ pub struct StructField {
     #[serde(default)]
     pub read_only: bool,
     /// Whether this nested field is accepted on write but omitted from reads.
-    /// Required in protocol v14 so host/provider skew fails loudly.
+    /// Required in protocol v16 so host/provider skew fails loudly.
     pub write_only: bool,
     /// Whether changing this nested user-input field requires replacement.
-    /// Required in protocol v14 so host/provider skew fails loudly.
+    /// Required in protocol v16 so host/provider skew fails loudly.
     pub create_only: bool,
     /// How this immutable nested field contributes to anonymous identity.
-    /// Required in protocol v14 so host/provider skew fails loudly.
+    /// Required in protocol v16 so host/provider skew fails loudly.
     pub identity: IdentityMode,
     /// Whether this nested field is populated asynchronously after Create returns.
     #[serde(default)]
@@ -1921,13 +2012,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_v14_requires_field_groups_on_resources_and_structs() {
+    fn protocol_v16_requires_field_groups_on_resources_and_structs() {
         let resource_error = serde_json::from_value::<ResourceSchema>(serde_json::json!({
             "resource_type": "test.Widget",
             "attributes": {},
             "default_prevent_destroy": false
         }))
-        .expect_err("protocol v14 resource field_groups must not default")
+        .expect_err("protocol v16 resource field_groups must not default")
         .to_string();
         assert!(resource_error.contains("field_groups"), "{resource_error}");
 
@@ -1936,19 +2027,19 @@ mod tests {
             "name": "Choice",
             "fields": []
         }))
-        .expect_err("protocol v14 struct field_groups must not default")
+        .expect_err("protocol v16 struct field_groups must not default")
         .to_string();
         assert!(struct_error.contains("field_groups"), "{struct_error}");
     }
 
     #[test]
-    fn protocol_v14_requires_default_prevent_destroy_on_resources() {
+    fn protocol_v16_requires_default_prevent_destroy_on_resources() {
         let error = serde_json::from_value::<ResourceSchema>(serde_json::json!({
             "resource_type": "test.Resource",
             "attributes": {},
             "field_groups": []
         }))
-        .expect_err("protocol v14 default_prevent_destroy must not default")
+        .expect_err("protocol v16 default_prevent_destroy must not default")
         .to_string();
 
         assert!(error.contains("default_prevent_destroy"), "{error}");
@@ -2123,7 +2214,9 @@ mod tests {
     fn in_flight_verdict_conversions_preserve_the_continuation() {
         let pending = PendingCreate {
             token: "next-token".to_string(),
-            identifier: Some(AppliedIdentifier::new("resource-123").unwrap()),
+            progress: CreateProgress::ReadingBack {
+                identifier: AppliedIdentifier::new("resource-123").unwrap(),
+            },
             sent: Sent::only(["name"]),
             poll_after_secs: 7,
         };
@@ -2157,7 +2250,9 @@ mod tests {
         let in_flight = ResumeInFlight {
             pending: ResumePending {
                 token: "resume-token".to_string(),
-                identifier: Some(AppliedIdentifier::new("resource-456").unwrap()),
+                progress: CreateProgress::Operating {
+                    identifier: Some(AppliedIdentifier::new("resource-456").unwrap()),
+                },
                 poll_after_secs: 11,
             },
             error: "resume interrupted".to_string(),
@@ -2191,8 +2286,8 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v14_state_json_bytes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 14);
+    fn ordered_maps_preserve_v16_state_json_bytes() {
+        assert_eq!(crate::PROTOCOL_VERSION, 16);
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),
@@ -2566,13 +2661,13 @@ mod tests {
                 "required":false
             }"#,
         )
-        .expect_err("protocol v14 requires write_only on every struct field");
+        .expect_err("protocol v16 requires write_only on every struct field");
 
         assert!(error.to_string().contains("missing field `write_only`"));
     }
 
     #[test]
-    fn protocol_v14_requires_nested_create_only_and_identity_mode() {
+    fn protocol_v16_requires_nested_create_only_and_identity_mode() {
         let missing_create_only = serde_json::from_str::<StructField>(
             r#"{
                 "name":"budget_name",
@@ -2582,7 +2677,7 @@ mod tests {
                 "identity":"required"
             }"#,
         )
-        .expect_err("protocol v14 requires create_only on every struct field");
+        .expect_err("protocol v16 requires create_only on every struct field");
         assert!(
             missing_create_only
                 .to_string()
@@ -2598,7 +2693,7 @@ mod tests {
                 "create_only":true
             }"#,
         )
-        .expect_err("protocol v14 requires identity on every struct field");
+        .expect_err("protocol v16 requires identity on every struct field");
         assert!(
             missing_identity
                 .to_string()
@@ -2622,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v14_identity_mode_is_closed_and_required_on_every_schema_record() {
+    fn protocol_v16_identity_mode_is_closed_and_required_on_every_schema_record() {
         for mode in [
             IdentityMode::None,
             IdentityMode::Required,
@@ -2642,7 +2737,7 @@ mod tests {
                 "required": false,
                 "keyed_partial_update": null
             }))
-            .expect_err("protocol v14 requires identity on every attribute");
+            .expect_err("protocol v16 requires identity on every attribute");
         assert!(
             missing_attribute_identity
                 .to_string()
@@ -2656,7 +2751,7 @@ mod tests {
             "write_only": false,
             "create_only": false
         }))
-        .expect_err("protocol v14 requires identity on every struct field");
+        .expect_err("protocol v16 requires identity on every struct field");
         assert!(
             missing_field_identity
                 .to_string()
@@ -3179,16 +3274,25 @@ mod tests {
             create_timeout_secs: None,
             create_max_retries: None,
             update_timeout_secs: Some(900),
+            read_back: ReadBackBudget::from_secs(120),
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"delete_timeout_secs\":1800"));
         assert!(json.contains("\"update_timeout_secs\":900"));
+        assert!(json.contains("\"read_back\":{\"timeout_secs\":120}"));
         assert!(!json.contains("create_timeout_secs"));
 
         let back: OperationConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.delete_timeout_secs, Some(1800));
         assert_eq!(back.create_timeout_secs, None);
         assert_eq!(back.update_timeout_secs, Some(900));
+        assert_eq!(
+            back.read_back
+                .expect("read-back budget")
+                .timeout_secs()
+                .get(),
+            120
+        );
     }
 
     #[test]
@@ -3215,6 +3319,19 @@ mod tests {
         assert_eq!(
             OperationConfig::default().budget(crate::OperationKind::Create),
             crate::DEFAULT_OPERATION_BUDGET
+        );
+        assert_eq!(
+            OperationConfig::default().read_back_budget(),
+            crate::DEFAULT_READ_BACK_BUDGET
+        );
+    }
+
+    #[test]
+    fn read_back_budget_rejects_zero_seconds() {
+        assert!(ReadBackBudget::from_secs(0).is_none());
+        assert!(
+            serde_json::from_str::<ReadBackBudget>(r#"{"timeout_secs":0}"#).is_err(),
+            "deserialization must not bypass the non-zero budget type",
         );
     }
 

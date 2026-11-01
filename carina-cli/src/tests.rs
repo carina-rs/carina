@@ -379,7 +379,7 @@ impl Provider for TestProvider {
             .update_result
             .clone()
             .expect("missing update state for test provider");
-        Box::pin(async move { Ok(UpdateOutcome::Success { state }) })
+        Box::pin(async move { Ok(UpdateOutcome::success(state)) })
     }
 
     fn delete(
@@ -1868,6 +1868,108 @@ async fn detect_drift_returns_none_when_no_drift() {
     .expect("drift check succeeds");
 
     assert!(result.drift_messages().is_none(), "Should detect no drift");
+}
+
+#[tokio::test]
+async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
+    let resource = Resource::with_provider("mock", "test.Resource", "main", None);
+    let id = resource.id.clone();
+    let identifier = "provider-id";
+    let empty_config = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        (ResourceSchema::new("test.Resource").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![StructField::optional("label", AttributeType::string()).build()],
+                ),
+            )
+            .build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
+    );
+
+    for (planned_attributes, actual_attributes) in [
+        (
+            HashMap::from([("config".to_string(), empty_config.clone())]),
+            HashMap::new(),
+        ),
+        (
+            HashMap::new(),
+            HashMap::from([("config".to_string(), empty_config.clone())]),
+        ),
+    ] {
+        let planned = State::existing(id.clone(), planned_attributes).with_identifier(identifier);
+        let actual = State::existing(id.clone(), actual_attributes).with_identifier(identifier);
+        let provider = TestProvider::with_read_state(&id, identifier, actual);
+        let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
+
+        let result = detect_drift_for_test(
+            std::slice::from_ref(&resource),
+            &planned_states,
+            &MovedOrigins::from_plan(&Plan::new()),
+            &provider,
+            None,
+            &schemas,
+            ApplyTarget::Project(std::path::Path::new(".")),
+        )
+        .await
+        .expect("drift check succeeds");
+
+        assert_eq!(result.drift_messages(), None);
+    }
+}
+
+#[tokio::test]
+async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
+    let ignored_comment: ParsedIgnorePath = serde_json::from_value(serde_json::json!({
+        "segments": [{ "kind": "attribute", "value": "comment" }]
+    }))
+    .expect("valid ignored comment path");
+    let mut resource = Resource::with_provider("mock", "test.Resource", "main", None)
+        .with_attribute(
+            "comment",
+            Value::Concrete(ConcreteValue::String("configured".into())),
+        );
+    resource.directives.ignore_changes = vec![ignored_comment];
+    let id = resource.id.clone();
+    let identifier = "provider-id";
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Resource")
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .validate()
+            .expect("ignore_changes fixture schema must be valid"),
+    );
+    let planned = State::existing(id.clone(), HashMap::new()).with_identifier(identifier);
+    let actual = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "comment".to_string(),
+            Value::Concrete(ConcreteValue::String("added-after-plan".into())),
+        )]),
+    )
+    .with_identifier(identifier);
+    let provider = TestProvider::with_read_state(&id, identifier, actual);
+
+    let result = detect_drift_for_test(
+        &[resource],
+        &[ReloadedCurrentStateEntry::managed(id, planned)],
+        &MovedOrigins::from_plan(&Plan::new()),
+        &provider,
+        None,
+        &schemas,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await
+    .expect("ignored added attribute drift check succeeds");
+
+    assert_eq!(result.drift_messages(), None);
 }
 
 #[tokio::test]

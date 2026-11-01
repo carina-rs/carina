@@ -1685,6 +1685,63 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_credential_load_error_maps_to_typed_startup_error() {
+    let user_dirs = carina_core::TestUserDirs::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let source_path = tmp.path().join("aws-provider.wasm");
+    let installed_path = tmp
+        .path()
+        .join(".carina/providers/file/aws-provider/aws-provider.wasm");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&source_path, b"AWS fixture").unwrap();
+    std::fs::write(&installed_path, b"AWS fixture").unwrap();
+    let config = ProviderConfig {
+        name: "aws".into(),
+        source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let grants = TrustedLocalGrantInputs::new(vec![format!("{}=aws", source_path.display())], None);
+    let result = build_factories_from_providers_impl_using(
+        &user_dirs,
+        &[config],
+        tmp.path(),
+        true,
+        &grants,
+        |verified| {
+            assert_eq!(
+                verified.identity().trust().class(),
+                carina_provider_resolver::ProviderTrustClass::Aws
+            );
+            async move {
+                Err(carina_plugin_host::WasmProviderLoadError::AwsCredentials(
+                    carina_plugin_host::AwsCredentialError::NotFound(
+                        "CLI credential preflight sentinel".to_string(),
+                    ),
+                ))
+            }
+        },
+    );
+
+    let Err(AppError::AwsCredentials(error)) = result else {
+        panic!("AWS preflight must retain its typed AppError")
+    };
+    assert!(matches!(
+        error.credential_error(),
+        carina_plugin_host::AwsCredentialError::NotFound(_)
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains("CLI credential preflight sentinel"));
+    assert!(rendered.contains("AWS_PROFILE"));
+    assert!(rendered.contains("aws sso login"));
+    assert!(rendered.contains("AWS_ACCESS_KEY_ID"));
+}
+
 #[test]
 fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
@@ -3701,10 +3758,10 @@ impl Provider for ReadWithRetryProvider {
         let id = id.clone();
         let identifier = identifier.to_string();
         Box::pin(async move {
-            Ok(UpdateOutcome::Success {
-                state: AppliedState::new(id, identifier, HashMap::new())
+            Ok(UpdateOutcome::success(
+                AppliedState::new(id, identifier, HashMap::new())
                     .expect("provider input identifier is non-empty"),
-            })
+            ))
         })
     }
 
@@ -10396,10 +10453,10 @@ mod read_with_retry_identifier_tests {
             let id = id.clone();
             let identifier = identifier.to_string();
             Box::pin(async move {
-                Ok(carina_core::provider::UpdateOutcome::Success {
-                    state: AppliedState::new(id, identifier, HashMap::new())
+                Ok(carina_core::provider::UpdateOutcome::success(
+                    AppliedState::new(id, identifier, HashMap::new())
                         .expect("provider input identifier is non-empty"),
-                })
+                ))
             })
         }
 

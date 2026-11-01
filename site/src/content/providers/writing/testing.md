@@ -19,6 +19,7 @@ mod tests {
         CreateStep as WireCreateStep, CreateVerdict as WireCreateVerdict,
         PollVerdict as WirePollVerdict,
     };
+    use carina_plugin_sdk::{PollFinality, PollRequest};
     use std::cell::RefCell;
 
     /// An in-memory API that records what the provider asked for.
@@ -98,9 +99,10 @@ mod tests {
             provider,
             &resource_id(),
             create_request("a", 1),
-            pending.identifier,
+            pending.progress.into_identifier(),
             pending.sent,
             pending.token,
+            PollRequest { finality: PollFinality::Continue },
         )
         .expect("poll should not fail")
     }
@@ -150,7 +152,7 @@ mod tests {
         let WireCreateStep::Pending(pending) = step else {
             panic!("expected pending")
         };
-        assert!(pending.identifier.is_none());
+        assert!(pending.identifier().is_none());
 
         // The retry starts the create once; no second widget appears.
         let WireCreateStep::Pending(pending) = poll(&provider, pending) else {
@@ -178,9 +180,10 @@ mod tests {
             &provider,
             &resource_id(),
             create_request("a", 1),
-            pending.identifier,
+            pending.progress.into_identifier(),
             pending.sent,
             pending.token,
+            PollRequest { finality: PollFinality::Continue },
         )
         .expect_err("a rejected retry must not succeed");
         let WirePollVerdict::InFlight(in_flight) = *verdict else {
@@ -212,7 +215,7 @@ mod tests {
             panic!("expected pending")
         };
         assert_eq!(
-            pending.identifier.as_ref().map(|id| id.as_str()),
+            pending.identifier().map(|id| id.as_str()),
             Some("w-a")
         );
 
@@ -288,7 +291,7 @@ Updates, attribute removal and replacement need more than one configuration. Kee
 
 Run acceptance tests in an account that holds nothing else, and make the script destroy what it created even when a step fails or the run is interrupted. A test that leaves resources behind costs money and can break the next run. Point `source` at the build under test with a `file://` URL, which step 1 installs, and use a release build of `carina`: loading a component in a debug build is slow.
 
-A local build receives no AWS credentials or metadata access by default. For an AWS or AWSCC acceptance run, set `CARINA_TRUST_LOCAL_PROVIDER=/absolute/path/to/provider.wasm=aws` for every `apply`, `plan` and `destroy` command, or pass the equivalent repeatable `--trust-local-provider` flag to each command. The environment variable separates multiple entries with `:` on Unix and `;` on Windows. Re-run `carina init` after rebuilding so the installed bytes still match the granted source file.
+A local build cannot link the host AWS credential import by default, and metadata is unavailable to every guest. For an AWS or AWSCC acceptance run, set `CARINA_TRUST_LOCAL_PROVIDER=/absolute/path/to/provider.wasm=aws` for every `apply`, `plan` and `destroy` command, or pass the equivalent repeatable `--trust-local-provider` flag to each command. The environment variable separates multiple entries with `:` on Unix and `;` on Windows. Re-run `carina init` after rebuilding so the installed bytes still match the granted source file.
 
 ## Next steps
 

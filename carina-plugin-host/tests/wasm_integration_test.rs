@@ -1,10 +1,11 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
@@ -24,7 +25,10 @@ use carina_core::resource::{
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
-use carina_plugin_host::{GuestCallBudget, WasmProviderFactory};
+use carina_plugin_host::{
+    AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
+    GuestCallBudget, WasmProviderFactory, WasmProviderLoadError,
+};
 use carina_provider_resolver::{
     LockFile, ProviderLoadIdentity, ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
 };
@@ -45,8 +49,19 @@ fn mock_http_load_with_class(bytes: &[u8], class: ProviderTrustClass) -> Verifie
     VerifiedLoad::for_test(bytes, ProviderLoadIdentity::for_test("mock_http", class))
 }
 
+fn mock_http_aws_load_with_class(bytes: &[u8], class: ProviderTrustClass) -> VerifiedLoad {
+    VerifiedLoad::for_test(bytes, ProviderLoadIdentity::for_test("aws", class))
+}
+
 fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
+}
+
+fn assert_minted_mock_identifier(identifier: &str) {
+    assert!(
+        identifier.starts_with("mock-v1:"),
+        "expected a uniquely minted mock identifier, got {identifier}"
+    );
 }
 
 fn delete_request_without_schema() -> DeleteRequest {
@@ -222,6 +237,34 @@ fn http_wasm_path() -> Option<PathBuf> {
     None
 }
 
+fn aws_http_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in &[
+        "carina_provider_mock_http_aws.wasm",
+        "carina-provider-mock-http-aws.wasm",
+    ] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn aws_http_unused_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in &[
+        "carina_provider_mock_http_aws_unused.wasm",
+        "carina-provider-mock-http-aws-unused.wasm",
+    ] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 macro_rules! skip_if_no_wasm {
     () => {
         match wasm_path() {
@@ -252,6 +295,109 @@ macro_rules! skip_if_no_http_wasm {
     };
 }
 
+macro_rules! skip_if_no_aws_http_wasm {
+    () => {
+        match aws_http_wasm_path() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: AWS HTTP probe WASM binary not found. Build with: \
+                     cargo build -p carina-provider-mock-http --target wasm32-wasip2"
+                );
+                return;
+            }
+        }
+    };
+}
+
+macro_rules! skip_if_no_aws_http_unused_wasm {
+    () => {
+        match aws_http_unused_wasm_path() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: unused-credentials AWS HTTP probe WASM binary not found. Build with: \
+                     cargo build -p carina-provider-mock-http --bin \
+                     carina-provider-mock-http-aws-unused --target wasm32-wasip2"
+                );
+                return;
+            }
+        }
+    };
+}
+
+struct FixedAwsCredentialSource(Result<AwsCredentials, AwsCredentialError>);
+
+impl AwsCredentialSource for FixedAwsCredentialSource {
+    fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>> {
+        let result = self.0.clone();
+        Box::pin(async move { result })
+    }
+}
+
+struct SequenceAwsCredentialSource {
+    results: Mutex<VecDeque<Result<AwsCredentials, AwsCredentialError>>>,
+}
+
+impl SequenceAwsCredentialSource {
+    fn new(results: impl IntoIterator<Item = Result<AwsCredentials, AwsCredentialError>>) -> Self {
+        Self {
+            results: Mutex::new(results.into_iter().collect()),
+        }
+    }
+}
+
+impl AwsCredentialSource for SequenceAwsCredentialSource {
+    fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>> {
+        let result = self
+            .results
+            .lock()
+            .expect("credential response queue must not be poisoned")
+            .pop_front()
+            .expect("credential response queue must contain one result per guest call");
+        Box::pin(async move { result })
+    }
+}
+
+struct FixedAwsCredentialProvisioner(Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>);
+
+impl AwsCredentialProvisioner for FixedAwsCredentialProvisioner {
+    fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+        let result = self.0.clone();
+        Box::pin(async move { result })
+    }
+}
+
+struct CountingAwsCredentialProvisioner {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AwsCredentialProvisioner for CountingAwsCredentialProvisioner {
+    fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(AwsCredentialError::ProviderFailed(
+                "non-AWS loads must not provision credentials".to_string(),
+            ))
+        })
+    }
+}
+
+fn test_aws_credentials(access_key_id: &str) -> AwsCredentials {
+    AwsCredentials::new(
+        access_key_id,
+        "host-secret-sentinel",
+        Some("host-session-sentinel".to_string()),
+        None,
+    )
+}
+
+fn default_aws_provisioner() -> FixedAwsCredentialProvisioner {
+    FixedAwsCredentialProvisioner(Ok(Arc::new(FixedAwsCredentialSource(Ok(
+        test_aws_credentials("AKIADEFAULT"),
+    )))))
+}
+
 /// Build a `WasmProviderFactory` using a per-test temporary cache directory.
 ///
 /// Tests in this binary run in parallel; if they all shared
@@ -264,13 +410,35 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read WASM provider");
     let load = mock_load(&wasm_bytes);
     let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = default_aws_provisioner();
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
         cache.path(),
         locked_egress.as_ref(),
+        &aws,
     )
     .await
     .expect("Failed to load WASM provider");
+    (factory, cache)
+}
+
+async fn load_aws_http_factory(
+    wasm: &std::path::Path,
+    credentials: Arc<dyn AwsCredentialSource>,
+) -> (WasmProviderFactory, tempfile::TempDir) {
+    let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
+    let wasm_bytes = std::fs::read(wasm).expect("Failed to read AWS HTTP probe WASM provider");
+    let load = mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = FixedAwsCredentialProvisioner(Ok(credentials));
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await
+    .expect("Failed to load AWS HTTP probe WASM provider");
     (factory, cache)
 }
 
@@ -282,14 +450,24 @@ async fn load_http_factory_with_class(
     wasm: &std::path::Path,
     class: ProviderTrustClass,
 ) -> (WasmProviderFactory, tempfile::TempDir) {
+    load_http_factory_with_name_and_class(wasm, "mock_http", class).await
+}
+
+async fn load_http_factory_with_name_and_class(
+    wasm: &std::path::Path,
+    name: &str,
+    class: ProviderTrustClass,
+) -> (WasmProviderFactory, tempfile::TempDir) {
     let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read HTTP probe WASM provider");
-    let load = mock_http_load_with_class(&wasm_bytes, class);
+    let load = VerifiedLoad::for_test(&wasm_bytes, ProviderLoadIdentity::for_test(name, class));
     let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = default_aws_provisioner();
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
         cache.path(),
         locked_egress.as_ref(),
+        &aws,
     )
     .await
     .expect("Failed to load HTTP probe WASM provider");
@@ -343,6 +521,23 @@ async fn load_schema_http_factory(
     (factory, cache)
 }
 
+fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDataSource {
+    let resource = DataSource::with_provider("aws", "test.aws_credentials", "credentials", None);
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    carina_core::executor::prepare_provider_ready_data_source(resource, &preparation)
+        .expect("credential probe data source should pass the checked host boundary")
+}
+
 fn resource_with_int_attribute(
     resource_type: &str,
     identity: &str,
@@ -385,13 +580,18 @@ fn resource_with_provider_string_attribute(
 }
 
 fn http_send_phase_resource(identity: &str, url: &str, method: &str, body: &str) -> Resource {
-    let mut resource = resource_with_provider_string_attribute(
-        "mock_http",
-        "test.send_phase",
-        identity,
-        "url",
-        url,
-    );
+    http_send_phase_resource_with_provider("mock_http", identity, url, method, body)
+}
+
+fn http_send_phase_resource_with_provider(
+    provider: &str,
+    identity: &str,
+    url: &str,
+    method: &str,
+    body: &str,
+) -> Resource {
+    let mut resource =
+        resource_with_provider_string_attribute(provider, "test.send_phase", identity, "url", url);
     resource.attributes.insert(
         "method".to_string(),
         Value::Concrete(ConcreteValue::String(method.to_string().into())),
@@ -746,6 +946,250 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn schema_only_loads_an_aws_world_without_a_credential_source() {
+    let path = skip_if_no_aws_http_wasm!();
+    let cache = tempfile::tempdir().expect("create schema-only cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
+        mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws),
+        cache.path(),
+    )
+    .await
+    .expect("schema-only loading must link the failing credential import");
+
+    assert_eq!(factory.name(), "aws");
+    assert!(
+        factory
+            .schemas()
+            .iter()
+            .any(|schema| schema.parts().resource_type == "test.aws_credentials")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_kind_runtime_rejects_an_http_world_before_provisioning_credentials() {
+    let path = skip_if_no_http_wasm!();
+    let cache = tempfile::tempdir().expect("create AWS-kind cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read HTTP-world WASM provider");
+    let load = mock_http_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let aws = CountingAwsCredentialProvisioner {
+        calls: Arc::clone(&calls),
+    };
+
+    let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("an AWS-kind runtime must reject a component built with the HTTP world"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        WasmProviderLoadError::AwsCredentialsImportMissing
+    ));
+    assert_eq!(
+        error.to_string(),
+        "an AWS-kind provider must be built with the `aws` world (`export_provider!(T, aws, egress: [..])`)"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_world_without_credential_calls_loads_as_aws_kind_at_runtime() {
+    let path = skip_if_no_aws_http_unused_wasm!();
+    let cache = tempfile::tempdir().expect("create unused-credentials AWS-world cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read unused-credentials AWS-world WASM provider");
+    let load = VerifiedLoad::for_test(
+        &wasm_bytes,
+        ProviderLoadIdentity::for_test("mock_http_aws_unused", ProviderTrustClass::Aws),
+    );
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = default_aws_provisioner();
+
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await
+    .expect("the AWS world must retain its credential import even when guest code never calls it");
+
+    assert_eq!(factory.name(), "mock_http_aws_unused");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_world_provision_failure_remains_a_typed_load_error() {
+    let path = skip_if_no_aws_http_wasm!();
+    let cache = tempfile::tempdir().expect("create AWS-world cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read AWS-world WASM provider");
+    let load = mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = FixedAwsCredentialProvisioner(Err(AwsCredentialError::NotFound(
+        "host provisioning failure sentinel".to_string(),
+    )));
+
+    let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(WasmProviderLoadError::AwsCredentials(
+            AwsCredentialError::NotFound(ref message)
+        )) if message == "host provisioning failure sentinel"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_aws_kinds_never_provision_and_cannot_instantiate_an_aws_world() {
+    let path = skip_if_no_aws_http_wasm!();
+    let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let aws = CountingAwsCredentialProvisioner {
+        calls: Arc::clone(&calls),
+    };
+
+    for class in [ProviderTrustClass::GitHub, ProviderTrustClass::Untrusted] {
+        let cache = tempfile::tempdir().expect("create non-AWS cache tempdir");
+        let load = mock_http_aws_load_with_class(&wasm_bytes, class);
+        let locked_egress = explicit_test_egress(&load, cache.path());
+        let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            load,
+            cache.path(),
+            locked_egress.as_ref(),
+            &aws,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a non-AWS runtime must reject the AWS credential import"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            WasmProviderLoadError::AwsCredentialsRequired
+        ));
+        assert_eq!(
+            error.to_string(),
+            "this provider requires AWS credentials, which only an AWS-kind provider can receive"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_credential_import_returns_the_sources_credentials() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(FixedAwsCredentialSource(Ok(AwsCredentials::new(
+        "AKIAFROMHOST",
+        "host-secret-sentinel",
+        Some("host-session-sentinel".to_string()),
+        None,
+    ))));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let state = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("the guest should receive host credentials");
+
+    assert_eq!(
+        state.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "AKIAFROMHOST".into()
+        )))
+    );
+    assert_eq!(
+        state.attributes.get("has_session_token"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_credential_source_error_reaches_the_guest_as_a_wit_error() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(FixedAwsCredentialSource(Err(AwsCredentialError::NotFound(
+        "credential-source-not-found-sentinel".to_string(),
+    ))));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let error = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect_err("the guest should surface the typed source failure");
+
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("credential-source-not-found-sentinel"),
+        "unexpected guest error: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_guest_call_asks_the_host_source() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(SequenceAwsCredentialSource::new([
+        Ok(AwsCredentials::new("AKIAFIRST", "first-secret", None, None)),
+        Ok(AwsCredentials::new(
+            "AKIASECOND",
+            "second-secret",
+            None,
+            None,
+        )),
+    ]));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let first = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("first guest credential request should succeed");
+    let second = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("second guest credential request should succeed");
+
+    assert_eq!(
+        first.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String("AKIAFIRST".into())))
+    );
+    assert_eq!(
+        second.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String("AKIASECOND".into())))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn initialized_reference_scope_is_kept_per_provider_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -902,11 +1346,16 @@ async fn schema_only_instance_denies_even_a_declared_host() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn provider_kinds_do_not_inherit_amazonaws_egress() {
-    let path = skip_if_no_http_wasm!();
-    for class in [
-        ProviderTrustClass::Aws,
-        ProviderTrustClass::GitHub,
-        ProviderTrustClass::Untrusted,
+    let http_path = skip_if_no_http_wasm!();
+    let aws_path = skip_if_no_aws_http_wasm!();
+    for (class, path, provider_name) in [
+        (ProviderTrustClass::Aws, aws_path.as_path(), "aws"),
+        (ProviderTrustClass::GitHub, http_path.as_path(), "mock_http"),
+        (
+            ProviderTrustClass::Untrusted,
+            http_path.as_path(),
+            "mock_http",
+        ),
     ] {
         let socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
             socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
@@ -919,19 +1368,21 @@ async fn provider_kinds_do_not_inherit_amazonaws_egress() {
             }
         };
         let address = socket.local_addr().expect("reserved socket has an address");
-        let (factory, _cache) = load_http_factory_with_class(&path, class).await;
+        let (factory, _cache) =
+            load_http_factory_with_name_and_class(path, provider_name, class).await;
         let factory = factory.with_http_test_route("sts.amazonaws.com", address);
         let provider = factory
             .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
             .await
             .expect("provider should initialize");
         let id = ResourceId::with_provider_identity(
-            "mock_http",
+            provider_name,
             "test.send_phase",
             "amazonaws-denied",
             None,
         );
-        let resource = http_send_phase_resource(
+        let resource = http_send_phase_resource_with_provider(
+            provider_name,
             "amazonaws-denied",
             &format!("http://sts.amazonaws.com:{}/", address.port()),
             "POST",
@@ -1043,16 +1494,16 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
     );
     assert!(
         rendered.contains("mock_http")
-            && rendered.contains("untrusted")
             && rendered.contains("169.254.169.254")
-            && rendered.contains("--trust-local-provider")
-            && rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
+            && rendered.contains("instance-metadata address")
             && rendered.contains("create call"),
         "unexpected metadata denial: {rendered}"
     );
     assert!(
         !rendered.contains("WASM guest trapped")
             && !rendered.contains("timed out")
+            && !rendered.contains("--trust-local-provider")
+            && !rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
             && !rendered.contains('\n'),
         "the denial must retain its dedicated non-timeout diagnostic: {rendered}"
     );
@@ -1125,17 +1576,18 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
             && rendered.contains("create call:")
             && rendered.contains("provider 'mock_http'")
             && rendered.contains("file:///test-providers/mock_http.wasm")
-            && rendered.contains(
-                "is untrusted, so it gets no credentials and no instance-metadata access"
-            )
             && rendered.contains("request to resolved-metadata.invalid was denied")
-            && rendered.contains("--trust-local-provider"),
+            && rendered.contains(
+                "instance-metadata address 169.254.169.254 is withheld from every provider"
+            ),
         "unexpected post-resolution metadata denial: {rendered}"
     );
     assert!(
         !rendered.contains("not_sent")
             && !rendered.contains("WASM guest trapped")
             && !rendered.contains("timed out")
+            && !rendered.contains("--trust-local-provider")
+            && !rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
             && !rendered.contains('\n'),
         "the post-resolution denial must remain an outer typed trap: {rendered}"
     );
@@ -1413,13 +1865,338 @@ async fn test_wasm_pending_create_polls_until_success() {
             .expect("pending create should settle"),
     );
 
-    assert_eq!(state.identifier.as_deref(), Some("mock-id"));
+    assert_minted_mock_identifier(
+        state
+            .identifier
+            .as_deref()
+            .expect("a completed create has an identifier"),
+    );
     assert!(state.exists);
     assert_eq!(
         state.attributes.get("__mock_create_polls_served__"),
         Some(&Value::Concrete(ConcreteValue::Int(i64::from(
             PENDING_POLLS
         ))))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_completes_within_budget() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "read-back-create", None);
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        "read-back-create",
+        "create_read_back_pending_polls",
+        1,
+    );
+
+    let state = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("read-back should settle within the default budget"),
+    );
+
+    assert_eq!(
+        state.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
+    );
+    assert!(state.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_budget_returns_partial_then_refresh_completes() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-create-partial",
+        None,
+    );
+    let resource = resource_with_int_attribute(
+        "test.short_budget",
+        "read-back-create-partial",
+        "create_read_back_pending_polls",
+        100,
+    );
+
+    let outcome = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect("the final attempt should return a partial success");
+    let diagnostic = outcome
+        .diagnostic()
+        .expect("budget exhaustion must keep the partial-read diagnostic");
+    assert_eq!(diagnostic.missing_attributes(), &["computed".to_string()]);
+    let partial = create_state_for_writeback(outcome);
+    assert!(partial.partial_read.is_some());
+    let partial_identifier = AppliedIdentifier::new(
+        partial
+            .identifier
+            .clone()
+            .expect("a partial create retains its identifier"),
+    )
+    .expect("the retained identifier is non-empty");
+    assert_minted_mock_identifier(partial_identifier.as_str());
+
+    let refreshed = provider
+        .provider()
+        .read(&id, &partial_identifier, ReadRequest)
+        .await
+        .expect("the next refresh should re-read the created resource")
+        .into_state();
+    assert_eq!(
+        refreshed.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
+    );
+    assert!(refreshed.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_pending_after_final_preserves_identifier() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-create-violation",
+        None,
+    );
+    let mut resource = resource_with_int_attribute(
+        "test.short_budget",
+        "read-back-create-violation",
+        "create_read_back_pending_polls",
+        100,
+    );
+    resource.set_attr(
+        "create_read_back_pending_after_final",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("pending/read-back after final-attempt is a protocol violation")
+        .into_kind();
+    let CreateFailureKind::InFlight { pending, error } = failure else {
+        panic!("an issued read-back violation must remain recoverable")
+    };
+    assert_minted_mock_identifier(
+        pending
+            .identifier()
+            .expect("the violation retains its identifier")
+            .as_str(),
+    );
+    assert!(error.to_string().contains("final-attempt"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_cannot_regress_to_operation_phase() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-create-phase-regression",
+        None,
+    );
+    let mut resource = resource_with_int_attribute(
+        "test.short_budget",
+        "read-back-create-phase-regression",
+        "create_read_back_pending_polls",
+        100,
+    );
+    resource.set_attr(
+        "create_read_back_operation_after_final",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("read-back must not regress to operation pending")
+        .into_kind();
+    let CreateFailureKind::InFlight { pending, error } = failure else {
+        panic!("a phase regression must retain the issued create")
+    };
+    assert_minted_mock_identifier(
+        pending
+            .identifier()
+            .expect("the phase regression retains its identifier")
+            .as_str(),
+    );
+    assert!(error.to_string().contains("polling protocol"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_resumed_create_read_back_final_attempt_returns_partial_success() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "resumed-read-back-partial",
+        None,
+    );
+    let token = serde_json::json!({ "phase": "read_back" }).to_string();
+    let pending = persisted_create_for_resume(&id, &token, Some("mock-id"));
+    let resource = resource_with_int_attribute(
+        "test.short_budget",
+        "resumed-read-back-partial",
+        "create_read_back_pending_polls",
+        100,
+    );
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+
+    let result = provider
+        .provider()
+        .resume_create(request)
+        .await
+        .map(ResumeOutcome::into_kind)
+        .map_err(ResumeFailure::into_kind);
+
+    let Ok(ResumeOutcomeKind::PartialSuccess(partial)) = result else {
+        panic!("final read-back attempt must return a partial success, got {result:?}")
+    };
+    assert_eq!(partial.identifier().as_str(), "mock-id");
+    assert_eq!(
+        partial.diagnostic().missing_attributes(),
+        &["computed".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_fresh_delete_recovers_pending_controls_from_identifier() {
+    let path = wasm_path().expect("build the WASM mock before running this test");
+    let (factory, _cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let provider = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let resource = resource_with_int_attribute(
+        "test.short_budget",
+        "fresh-delete",
+        "delete_pending_polls",
+        100,
+    );
+    let id = resource.id.clone();
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("create resource with asynchronous delete"),
+    );
+    drop(provider);
+    let (factory, _fresh_cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let fresh = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let identifier = AppliedIdentifier::new(created.identifier.unwrap()).unwrap();
+    let error = fresh
+        .provider()
+        .delete(&id, &identifier, delete_request_without_schema())
+        .await
+        .expect_err("a fresh instance must honor the pending delete and exhaust its budget");
+    assert!(error.to_string().contains("budget"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_fresh_read_uses_updated_read_back_controls() {
+    let path = wasm_path().expect("build the WASM mock before running this test");
+    let (factory, _cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let provider = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let mut resource = resource_with_int_attribute("test.resource", "fresh-update", "value", 1);
+    let id = resource.id.clone();
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .unwrap(),
+    );
+    drop(provider);
+    let (factory, _update_cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let updater = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_read_back_pending_polls",
+        Value::Concrete(ConcreteValue::Int(1)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &["value".into(), "update_read_back_pending_polls".into()],
+    )
+    .await;
+    let updated = updater
+        .provider()
+        .update(&id, &identifier, request)
+        .await
+        .unwrap()
+        .into_state_for_writeback();
+    drop(updater);
+    let (factory, _read_cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let reader = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let identifier = AppliedIdentifier::new(updated.identifier.unwrap()).unwrap();
+    let state = reader
+        .provider()
+        .read(&id, &identifier, ReadRequest)
+        .await
+        .unwrap()
+        .into_state();
+    assert_eq!(
+        state.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into()))),
+        "a new instance must read the updated payload, not the create-time payload",
+    );
+    assert_ne!(
+        state.attributes.get("value"),
+        Some(&Value::Concrete(ConcreteValue::Int(1)))
     );
 }
 
@@ -1442,6 +2219,7 @@ async fn test_wasm_pending_update_polls_until_success() {
             .await
             .expect("setup create should succeed"),
     );
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_pending_polls",
@@ -1456,7 +2234,7 @@ async fn test_wasm_pending_update_polls_until_success() {
 
     let state = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("pending update should settle")
         .into_state_for_writeback();
@@ -1470,6 +2248,184 @@ async fn test_wasm_pending_update_polls_until_success() {
         Some(&Value::Concrete(ConcreteValue::Int(i64::from(
             PENDING_POLLS
         ))))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_read_back_completes_within_budget() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "read-back-update", None);
+    let mut resource = resource_with_int_attribute("test.resource", "read-back-update", "value", 1);
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("setup create should succeed"),
+    );
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_read_back_pending_polls",
+        Value::Concrete(ConcreteValue::Int(1)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &[
+            "value".to_string(),
+            "update_read_back_pending_polls".to_string(),
+        ],
+    )
+    .await;
+
+    let state = provider
+        .provider()
+        .update(&id, &created_identifier, request)
+        .await
+        .expect("update read-back should settle within the default budget")
+        .into_state_for_writeback();
+    assert_eq!(
+        state.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
+    );
+    assert!(state.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_completes() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-update-partial",
+        None,
+    );
+    let mut resource =
+        resource_with_int_attribute("test.short_budget", "read-back-update-partial", "value", 1);
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("setup create should succeed"),
+    );
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_read_back_pending_polls",
+        Value::Concrete(ConcreteValue::Int(100)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &[
+            "value".to_string(),
+            "update_read_back_pending_polls".to_string(),
+        ],
+    )
+    .await;
+
+    let outcome = provider
+        .provider()
+        .update(&id, &created_identifier, request)
+        .await
+        .expect("the final update attempt should return a partial success");
+    let diagnostic = outcome
+        .diagnostic()
+        .expect("budget exhaustion must keep the partial-read diagnostic");
+    assert_eq!(diagnostic.missing_attributes(), &["computed".to_string()]);
+    let partial = outcome.into_state_for_writeback();
+    assert!(partial.partial_read.is_some());
+
+    let partial_identifier = AppliedIdentifier::new(partial.identifier.clone().unwrap()).unwrap();
+    let refreshed = provider
+        .provider()
+        .read(&id, &partial_identifier, ReadRequest)
+        .await
+        .expect("the next refresh should re-read the updated resource")
+        .into_state();
+    assert_eq!(
+        refreshed.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
+    );
+    assert!(refreshed.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_recoverable() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-update-phase-regression",
+        None,
+    );
+    let mut resource = resource_with_int_attribute(
+        "test.short_budget",
+        "read-back-update-phase-regression",
+        "value",
+        1,
+    );
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("setup create should succeed"),
+    );
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_read_back_pending_polls",
+        Value::Concrete(ConcreteValue::Int(100)),
+    );
+    resource.set_attr(
+        "update_read_back_operation_after_final",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &[
+            "value".to_string(),
+            "update_read_back_pending_polls".to_string(),
+            "update_read_back_operation_after_final".to_string(),
+        ],
+    )
+    .await;
+
+    let error = provider
+        .provider()
+        .update(&id, &created_identifier, request)
+        .await
+        .expect_err("read-back must not regress to operation pending");
+    assert!(error.to_string().contains("polling protocol"), "{error}");
+
+    let recovered = provider
+        .provider()
+        .read(&id, &created_identifier, ReadRequest)
+        .await
+        .expect("the retained update identifier must remain usable for recovery")
+        .into_state();
+    assert_eq!(
+        recovered.attributes.get("value"),
+        Some(&Value::Concrete(ConcreteValue::Int(2)))
     );
 }
 
@@ -1490,16 +2446,17 @@ async fn test_wasm_pending_delete_polls_until_success() {
         "delete_pending_polls",
         i64::from(PENDING_POLLS),
     );
-    provider
+    let created = provider
         .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("setup create should succeed");
+    let identifier = created.identifier().clone();
 
     let delete_started = Instant::now();
     provider
         .provider()
-        .delete(&id, &mock_identifier(), delete_request_without_schema())
+        .delete(&id, &identifier, delete_request_without_schema())
         .await
         .expect("pending delete should settle");
     assert!(
@@ -1509,7 +2466,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
 
     let state = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &identifier, ReadRequest)
         .await
         .expect("provider should remain usable")
         .into_state();
@@ -1688,7 +2645,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         panic!("created mode returned the wrong failure variant");
     };
     drop(error);
-    assert_eq!(created.identifier().as_str(), "mock-id");
+    assert_minted_mock_identifier(created.identifier().as_str());
     match created.sent() {
         SentRecord::Request(Sent::Only(attributes)) => {
             assert_eq!(
@@ -1762,7 +2719,7 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
         .into_kind();
     match failure {
         CreateFailureKind::Created { created, error } => {
-            assert_eq!(created.identifier().as_str(), "mock-id");
+            assert_minted_mock_identifier(created.identifier().as_str());
             assert!(!error.to_string().is_empty());
         }
         CreateFailureKind::Untracked(error) => {
@@ -1852,7 +2809,7 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
         .into_kind()
     {
         CreateFailureKind::Created { created, error } => {
-            assert_eq!(created.identifier().as_str(), "mock-id");
+            assert_minted_mock_identifier(created.identifier().as_str());
             let read_error = match created.observation() {
                 CreateObservation::Observed(state) => {
                     panic!("token encoding failure became an observed create: {state:?}")
@@ -1962,9 +2919,11 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
                 serde_json::from_str(pending.token().expose_for_provider_call())
                     .expect("the previous continuation must remain decodable");
             assert_eq!(token["polls_served"], 0);
-            assert_eq!(
-                pending.identifier().map(AppliedIdentifier::as_str),
-                Some("mock-id")
+            assert_minted_mock_identifier(
+                pending
+                    .identifier()
+                    .expect("the previous issued continuation retains its identifier")
+                    .as_str(),
             );
             assert!(error.to_string().contains("poll_create pending token"));
         }
@@ -1997,6 +2956,7 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
         None,
     );
     let previous_token = serde_json::json!({
+        "phase": "operation",
         "remaining": 100,
         "polls_served": 0,
         "mode": "pending",
@@ -2041,6 +3001,9 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
         Ok(ResumeOutcomeKind::Resumed(created)) => {
             panic!("token encoding failure unexpectedly resumed {created:?}")
         }
+        Ok(ResumeOutcomeKind::PartialSuccess(outcome)) => {
+            panic!("token encoding failure unexpectedly completed partially {outcome:?}")
+        }
         Ok(ResumeOutcomeKind::Resent(outcome)) => {
             panic!("token encoding failure unexpectedly resent {outcome:?}")
         }
@@ -2072,6 +3035,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             None,
         );
         let token = serde_json::json!({
+            "phase": "operation",
             "remaining": 100,
             "polls_served": 0,
             "mode": mode,
@@ -2096,7 +3060,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             }
             ("resent", Ok(ResumeOutcomeKind::Resent(outcome))) => match outcome.into_kind() {
                 CreateOutcomeKind::Success { state } => {
-                    assert_eq!(state.identifier().as_str(), "mock-id");
+                    assert_minted_mock_identifier(state.identifier().as_str());
                 }
                 CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
                     panic!(
@@ -2111,6 +3075,9 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             }
             (expected, Ok(ResumeOutcomeKind::Resumed(created))) => {
                 panic!("expected {expected}, got resumed {created:?}")
+            }
+            (expected, Ok(ResumeOutcomeKind::PartialSuccess(outcome))) => {
+                panic!("expected {expected}, got partial {outcome:?}")
             }
             (expected, Ok(ResumeOutcomeKind::Resent(outcome))) => {
                 panic!("expected {expected}, got resent {outcome:?}")
@@ -2161,6 +3128,9 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             "undecodable resume token unexpectedly resumed {}",
             created.identifier()
         ),
+        Ok(ResumeOutcomeKind::PartialSuccess(outcome)) => {
+            panic!("undecodable resume token unexpectedly completed partially: {outcome:?}")
+        }
         Ok(ResumeOutcomeKind::Resent(outcome)) => {
             panic!("undecodable resume token unexpectedly resent: {outcome:?}")
         }
@@ -2203,6 +3173,7 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
     let resumed_id =
         ResourceId::with_provider_identity("mock", "test.short_budget", "canonical-resumed", None);
     let token = serde_json::json!({
+        "phase": "operation",
         "remaining": 100,
         "polls_served": 0,
         "mode": "resumed",
@@ -2226,6 +3197,9 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
     {
         Ok(ResumeOutcomeKind::Resumed(created)) => {
             assert_eq!(created.identifier().as_str(), canonical);
+        }
+        Ok(ResumeOutcomeKind::PartialSuccess(outcome)) => {
+            panic!("expected resumed canonical identifier, got partial {outcome:?}")
         }
         Ok(ResumeOutcomeKind::Resent(outcome)) => {
             panic!("expected resumed canonical identifier, got resent {outcome:?}")
@@ -2258,7 +3232,10 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
     );
     resource.set_attr(
         "create_pending_polls",
-        Value::Concrete(ConcreteValue::Int(1)),
+        // The slow initial call reaches the operation deadline. Protocol v15
+        // still grants exactly one final poll, so keep the mock pending after
+        // that poll to verify that the initial call consumed the budget.
+        Value::Concrete(ConcreteValue::Int(2)),
     );
 
     let error = provider
@@ -3067,7 +4044,14 @@ async fn test_wasm_mock_provider_create_and_read() {
             .await
             .expect("create should succeed"),
     );
-    assert_eq!(created.identifier, Some("mock-id".into()));
+    let created_identifier = AppliedIdentifier::new(
+        created
+            .identifier
+            .clone()
+            .expect("a successful create has an identifier"),
+    )
+    .expect("the created identifier is non-empty");
+    assert_minted_mock_identifier(created_identifier.as_str());
     assert_eq!(
         created.attributes.get("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -3086,11 +4070,14 @@ async fn test_wasm_mock_provider_create_and_read() {
     // Read back - should return the created state
     let read_state = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &created_identifier, ReadRequest)
         .await
         .expect("read should not error")
         .into_state();
-    assert_eq!(read_state.identifier, Some("mock-id".into()));
+    assert_eq!(
+        read_state.identifier.as_deref(),
+        Some(created_identifier.as_str())
+    );
     assert_eq!(
         read_state.attributes.get("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -3115,16 +4102,13 @@ async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error(
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
-    let id = ResourceId::with_provider_identity(
-        "mock",
-        "test.resource",
-        "__mock_non_finite_read__",
-        None,
-    );
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "non-finite-read", None);
+    let identifier = AppliedIdentifier::new("__mock_non_finite_read__")
+        .expect("the non-finite read fixture identifier is non-empty");
 
     let error = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &identifier, ReadRequest)
         .await
         .expect_err("guest output containing nested NaN must be a provider error");
 
@@ -3175,6 +4159,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     );
 
     // Prepare all four patch variants through the checked core seam.
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr(
         "color",
         Value::Concrete(ConcreteValue::String("blue".into())),
@@ -3194,7 +4179,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     let updated = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("update should succeed")
         .into_state_for_writeback();
@@ -3239,10 +4224,11 @@ async fn test_wasm_mock_provider_update_and_delete() {
         Value::Concrete(ConcreteValue::String("reassert:reassert_token".into()))
     );
 
+    let updated_identifier = AppliedIdentifier::new(updated.identifier.clone().unwrap()).unwrap();
     // Read to verify update persisted in memory
     let read_state = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &updated_identifier, ReadRequest)
         .await
         .expect("read should not error")
         .into_state();
@@ -3254,14 +4240,14 @@ async fn test_wasm_mock_provider_update_and_delete() {
     // Delete
     provider
         .provider()
-        .delete(&id, &mock_identifier(), delete_request_without_schema())
+        .delete(&id, &updated_identifier, delete_request_without_schema())
         .await
         .expect("delete should succeed");
 
     // Read after delete - should return empty state (no identifier, no attributes)
     let deleted_state = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &updated_identifier, ReadRequest)
         .await
         .expect("read should not error")
         .into_state();
@@ -3386,11 +4372,12 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
         ),
         ("payload".into(), cloud_payload.clone()),
     ]);
-    provider
+    let created = provider
         .provider()
         .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should seed the mock cloud store");
+    let created_identifier = created.identifier().clone();
 
     let (persisted_secret, _) = redacted_secret_and_legacy_marker("cloud-secret");
     let from = State::existing(
@@ -3409,21 +4396,23 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
             ),
         ]),
     )
-    .with_identifier("mock-id");
+    .with_identifier(created_identifier.as_str());
     resource.set_attr(
         "color",
         Value::Concrete(ConcreteValue::String("blue".into())),
     );
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
-    provider
+    let updated = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
-        .expect("update should preserve the unchanged persisted attribute");
+        .expect("update should preserve the unchanged persisted attribute")
+        .into_state_for_writeback();
+    let updated_identifier = AppliedIdentifier::new(updated.identifier.unwrap()).unwrap();
 
     let read = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &updated_identifier, ReadRequest)
         .await
         .expect("read after update should succeed")
         .into_state();
@@ -4416,12 +5405,13 @@ async fn test_wasm_provider_returned_wit_error_does_not_poison_fail_fast_instanc
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
-    let error_id =
-        ResourceId::with_provider_identity("mock", "test.resource", "__mock_read_error__", None);
+    let error_id = ResourceId::with_provider_identity("mock", "test.resource", "read-error", None);
+    let error_identifier = AppliedIdentifier::new("__mock_read_error__")
+        .expect("the read-error fixture identifier is non-empty");
 
     let error = provider
         .provider()
-        .read(&error_id, &mock_identifier(), ReadRequest)
+        .read(&error_id, &error_identifier, ReadRequest)
         .await
         .expect_err("the mock read hook must return a WIT provider-error");
     assert_eq!(error.variant_name(), "internal");

@@ -12,18 +12,20 @@ The host and the provider talk through a versioned protocol. `carina-provider-pr
 Every time Carina starts a provider, for `validate`, `plan`, `apply` or any other command that uses it, it checks that version first and refuses to go further if it is out of range. `carina init` only downloads and records the provider without starting it, so a mismatch shows up at the first command after `init`:
 
 ```text
-provider 'hello' was built against protocol version 13 but this host requires at least version 14; rebuild the provider against the current carina protocol
+provider 'hello' was built against protocol version 15 but this host requires at least version 16; rebuild the provider against the current carina protocol
 ```
 
 ```text
-provider 'hello' was built against protocol version 15 but this host supports up to version 14; upgrade carina to load this provider
+provider 'hello' was built against protocol version 17 but this host supports up to version 16; upgrade carina to load this provider
 ```
 
 Since v0.5.0, the first release that checks the version, every release has set the minimum equal to the protocol version it speaks, so a provider has to be built for exactly the protocol version of the Carina that loads it:
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Next release after v0.9.0 (unreleased) | 14 | 14 |
+| Next release after v0.9.0 (unreleased) | 16 | 16 |
+| Development snapshot after v0.9.0 (unreleased) | 15 | 15 |
+| Development snapshot after v0.9.0 (unreleased) | 14 | 14 |
 | v0.9.0 | 12 | 12 |
 | v0.8.0 | 12 | 12 |
 | v0.7.1 | 12 | 12 |
@@ -31,7 +33,15 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Rejecting an older provider is deliberate. A protocol bump changes what crosses the boundary, and accepting a provider from the other side of the change would lose information without any error. Protocol 14, for example, replaces the schema's identity boolean with a required closed mode and changes identity from an extra create-only hash input to the complete set of hash inputs. Released version-13 providers could set the boolean on mutable attributes, so a version-14 host rejects them before schema decoding and asks for a rebuild. Protocol 12 similarly added a required `write_only` flag to nested struct fields. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) lists what each version changed.
+Only protocol 16 is current. Protocols 14 and 15 were development snapshots, and their changes remain part of protocol 16:
+
+| Development protocol | Change |
+|----------------------|--------|
+| 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
+| 15 | Create-progress variants, poll finality, and separate read-back budgets. |
+| 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+Rejecting an older provider is deliberate. A protocol bump changes what crosses the boundary, and accepting a provider from the other side of the change would lose information without any error. Protocol 16, for example, replaces the schema's identity boolean with a required closed mode and changes identity from an extra create-only hash input to the complete set of hash inputs. Version-15 providers could set the boolean on mutable attributes, so a version-16 host rejects them before schema decoding and asks for a rebuild. Protocol 12 similarly added a required `write_only` flag to nested struct fields. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) lists what each version changed.
 
 ## When the protocol changes
 

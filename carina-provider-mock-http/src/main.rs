@@ -3,20 +3,17 @@
 use std::collections::BTreeMap;
 
 use carina_plugin_sdk::core::schema::{
-    AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
-    ResourceSchema as CoreResourceSchema, ValidatedConfigSchema as CoreValidatedConfigSchema,
+    AttributeType as CoreAttributeType, ValidatedConfigSchema as CoreValidatedConfigSchema,
     ValidatedResourceSchema as CoreValidatedResourceSchema,
 };
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
-    PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+    PendingDelete, PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, UpdateOutcome,
 };
 
-const URL_ATTRIBUTE: &str = "url";
-const METHOD_ATTRIBUTE: &str = "method";
-const BODY_ATTRIBUTE: &str = "body";
-const SEND_PHASE_ATTRIBUTE: &str = "send_phase";
+use carina_provider_mock_http::send_phase::{self, PreparedCreate, ProbeKind};
+
 const CREATE_BEHAVIOR_ATTRIBUTE: &str = "create_behavior";
 const VALIDATE_EGRESS_URL_ATTRIBUTE: &str = "validate_egress_url";
 
@@ -58,90 +55,6 @@ impl MockHttpProvider {
             request_id: None,
         }
     }
-
-    fn wasi_http_send_phase(url: &str, method: &str, body: &str) -> String {
-        #[cfg(target_arch = "wasm32")]
-        {
-            use std::error::Error as _;
-            use std::time::Duration;
-
-            use aws_smithy_runtime_api::client::http::{
-                HttpClient, HttpConnector, HttpConnectorSettings,
-            };
-            use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
-            use aws_smithy_runtime_api::client::result::SdkError;
-            use aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder;
-            use carina_plugin_sdk::wasi_http::{SendPhase, TransportFailure, WasiHttpClient};
-
-            let components = RuntimeComponentsBuilder::for_tests()
-                .build()
-                .expect("HTTP probe runtime components must be valid");
-            let settings = HttpConnectorSettings::builder()
-                .connect_timeout(Duration::from_secs(1))
-                // Keep the first-byte timeout short for the silent-server
-                // host/guest contract test.
-                .read_timeout(Duration::from_secs(1))
-                .build();
-            let connector = WasiHttpClient::new().http_connector(&settings, &components);
-            let mut request = HttpRequest::get(url).expect("HTTP probe URL must be valid");
-            request
-                .set_method(method)
-                .expect("HTTP probe method must be valid");
-            *request.body_mut() = body.as_bytes().to_vec().into();
-
-            match futures::executor::block_on(connector.call(request)) {
-                Ok(_) => "success".to_string(),
-                Err(error) => {
-                    let sdk_error: SdkError<(), ()> = SdkError::dispatch_failure(error);
-                    let SdkError::DispatchFailure(dispatch) = &sdk_error else {
-                        unreachable!("the probe wraps a connector error as a dispatch failure")
-                    };
-                    let connector_error = dispatch
-                        .as_connector_error()
-                        .expect("dispatch failure must retain its connector error");
-                    let Some(source) = connector_error.source() else {
-                        return "missing_transport_failure_source".to_string();
-                    };
-                    let Some(failure) = source.downcast_ref::<TransportFailure>() else {
-                        return format!("unexpected_transport_failure_source:{source}");
-                    };
-
-                    let phase = match failure.phase() {
-                        SendPhase::NotSent => {
-                            assert!(connector_error.is_io());
-                            "not_sent"
-                        }
-                        SendPhase::MaybeSent => {
-                            assert!(!connector_error.is_timeout());
-                            assert!(!connector_error.is_io());
-                            assert!(connector_error.is_other());
-                            "maybe_sent"
-                        }
-                    };
-                    let code = failure.code().map_or_else(
-                        || "none".to_string(),
-                        |code| {
-                            let debug = format!("{code:?}");
-                            debug
-                                .strip_prefix("ErrorCode::")
-                                .unwrap_or(&debug)
-                                .split('(')
-                                .next()
-                                .expect("an error-code debug name is non-empty")
-                                .to_string()
-                        },
-                    );
-                    format!("{phase}:{code}")
-                }
-            }
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = (url, method, body);
-            "unsupported".to_string()
-        }
-    }
 }
 
 impl CarinaProvider for MockHttpProvider {
@@ -159,38 +72,10 @@ impl CarinaProvider for MockHttpProvider {
     }
 
     fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
-        vec![
-            CoreResourceSchema::new("test.send_phase")
-                .attribute(
-                    CoreAttributeSchema::required(URL_ATTRIBUTE, CoreAttributeType::string())
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::required(METHOD_ATTRIBUTE, CoreAttributeType::string())
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::required(BODY_ATTRIBUTE, CoreAttributeType::string())
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::provider_populated(
-                        SEND_PHASE_ATTRIBUTE,
-                        CoreAttributeType::string(),
-                    )
-                    .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::optional(
-                        CREATE_BEHAVIOR_ATTRIBUTE,
-                        CoreAttributeType::string(),
-                    )
-                    .build(),
-                )
-                .with_description("WASI HTTP send-phase probe")
-                .validate()
-                .expect("mock HTTP probe schema must be valid"),
-        ]
+        vec![send_phase::schema(
+            ProbeKind::HttpWorld,
+            Some(CREATE_BEHAVIOR_ATTRIBUTE),
+        )]
     }
 
     fn reference_forms(&self) -> carina_plugin_sdk::core::schema::ReferenceForms {
@@ -207,7 +92,7 @@ impl CarinaProvider for MockHttpProvider {
 
     fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
         if let Some(Value::String(url)) = attrs.get(VALIDATE_EGRESS_URL_ATTRIBUTE) {
-            let _outcome = Self::wasi_http_send_phase(url, "GET", "");
+            let _outcome = send_phase::wasi_http_send_phase(url, "GET", "", ProbeKind::HttpWorld);
         }
         Ok(())
     }
@@ -239,30 +124,12 @@ impl CarinaProvider for MockHttpProvider {
         request: CreateRequest,
         attempt: CreateAttempt,
     ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
-        let Some(Value::String(url)) = request.resource.attributes.get(URL_ATTRIBUTE) else {
-            return Err(attempt.untracked(Self::error(
-                id,
-                ProviderErrorKind::InvalidInput,
-                "the HTTP probe requires a string url attribute",
-            )));
-        };
-        let Some(Value::String(method)) = request.resource.attributes.get(METHOD_ATTRIBUTE) else {
-            return Err(attempt.untracked(Self::error(
-                id,
-                ProviderErrorKind::InvalidInput,
-                "the HTTP probe requires a string method attribute",
-            )));
-        };
-        let Some(Value::String(body)) = request.resource.attributes.get(BODY_ATTRIBUTE) else {
-            return Err(attempt.untracked(Self::error(
-                id,
-                ProviderErrorKind::InvalidInput,
-                "the HTTP probe requires a string body attribute",
-            )));
-        };
-        let behavior = request
-            .resource
-            .attributes
+        let probe =
+            PreparedCreate::prepare(request, attempt, ProbeKind::HttpWorld).map_err(|error| {
+                error.untracked(|message| Self::error(id, ProviderErrorKind::InvalidInput, message))
+            })?;
+        let behavior = probe
+            .attributes()
             .get(CREATE_BEHAVIOR_ATTRIBUTE)
             .and_then(|value| match value {
                 Value::String(value) => Some(value.clone()),
@@ -276,14 +143,14 @@ impl CarinaProvider for MockHttpProvider {
         if behavior.as_deref() == Some("trap_before_send") {
             panic!("intentional mock HTTP trap before send");
         }
-        let phase = Self::wasi_http_send_phase(url, method, body);
+        let probe = probe.send();
         match behavior.as_deref() {
             Some("trap_after_send") => panic!("intentional mock HTTP trap after send"),
             Some("pending_nan_after_send") => {
-                return Ok(attempt.pending(CreateToken(f64::NAN), Sent::AllRequestAttributes, 1));
+                return Ok(probe.pending(CreateToken(f64::NAN), 1));
             }
             Some("untracked_after_send") => {
-                return Err(attempt.untracked(Self::error(
+                return Err(probe.untracked(Self::error(
                     id,
                     ProviderErrorKind::ApiError,
                     "provider declared untracked after send",
@@ -291,21 +158,14 @@ impl CarinaProvider for MockHttpProvider {
             }
             None | Some("normal") => {}
             Some(unsupported) => {
-                return Err(attempt.untracked(Self::error(
+                return Err(probe.untracked(Self::error(
                     id,
                     ProviderErrorKind::InvalidInput,
                     format!("unsupported create behavior {unsupported}"),
                 )));
             }
         }
-        let mut attributes = request.resource.attributes;
-        attributes.insert(SEND_PHASE_ATTRIBUTE.to_string(), Value::String(phase));
-        let identifier =
-            AppliedIdentifier::new("send-phase-probe").expect("the probe identifier is non-empty");
-
-        Ok(attempt
-            .issued(identifier, Sent::AllRequestAttributes)
-            .succeeded(attributes))
+        Ok(probe.succeeded())
     }
 
     fn poll_create(
@@ -313,6 +173,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         _poll: Poll<Self::CreateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         unreachable!("the NaN fixture token cannot cross the guest boundary")
     }
@@ -322,6 +183,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         _resume: Resume<Self::CreateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         unreachable!("the NaN fixture token cannot cross the guest boundary")
     }
@@ -345,6 +207,7 @@ impl CarinaProvider for MockHttpProvider {
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
         match pending.token {}
     }
@@ -363,7 +226,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: DeleteRequest,
-        pending: Pending<Self::DeleteToken>,
+        pending: PendingDelete<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
         match pending.token {}
     }

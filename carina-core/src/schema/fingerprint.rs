@@ -457,12 +457,17 @@ fn encode_operation_config(
         create_timeout_secs,
         create_max_retries,
         update_timeout_secs,
+        read_back,
     } = config;
     encoder.option(*delete_timeout_secs, CanonicalEncoder::u64);
     encoder.option(*delete_max_retries, CanonicalEncoder::u32);
     encoder.option(*create_timeout_secs, CanonicalEncoder::u64);
     encoder.option(*create_max_retries, CanonicalEncoder::u32);
     encoder.option(*update_timeout_secs, CanonicalEncoder::u64);
+    encoder.option(
+        read_back.map(|budget| budget.timeout_secs().get()),
+        CanonicalEncoder::u64,
+    );
 }
 
 fn encode_type_identity(encoder: &mut CanonicalEncoder, identity: &TypeIdentity) {

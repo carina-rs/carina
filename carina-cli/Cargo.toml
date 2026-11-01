@@ -21,6 +21,7 @@ test-utils = ["carina-core/test-utils", "carina-provider-resolver/test-utils"]
 
 [dependencies]
 carina-core = { path = "../carina-core" }
+carina-credentials-aws = { path = "../carina-credentials-aws" }
 carina-plugin-host = { path = "../carina-plugin-host" }
 carina-provider-mock = { path = "../carina-provider-mock" }
 carina-provider-resolver = { path = "../carina-provider-resolver" }

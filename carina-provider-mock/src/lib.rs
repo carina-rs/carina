@@ -1773,7 +1773,7 @@ impl Provider for MockProvider {
                 ));
             }
 
-            Ok(UpdateOutcome::Success { state })
+            Ok(UpdateOutcome::success(state))
         })
     }
 
@@ -2180,6 +2180,9 @@ mod tests {
                 }
                 (expected, Ok(ResumeOutcomeKind::Resumed(created))) => {
                     panic!("expected {expected}, got resumed {created:?}")
+                }
+                (expected, Ok(ResumeOutcomeKind::PartialSuccess(outcome))) => {
+                    panic!("expected {expected}, got partial {outcome:?}")
                 }
                 (expected, Ok(ResumeOutcomeKind::Resent(outcome))) => {
                     panic!("expected {expected}, got resent {outcome:?}")

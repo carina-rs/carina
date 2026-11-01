@@ -194,7 +194,7 @@ impl GuestStore {
         budget: GuestCallBudget,
         http_test_route: Option<HttpTestRoute>,
     ) -> Self {
-        let wasi_ctx = build_sandboxed_wasi_ctx(network.kind());
+        let wasi_ctx = build_sandboxed_wasi_ctx(network.runtime_capabilities());
         let http_hooks = AllowListHttpHooks::with_test_route(label, network, http_test_route);
         let host_state = HostState {
             wasi_ctx,
@@ -291,6 +291,12 @@ impl GuestStore {
     #[cfg(test)]
     pub(super) fn set_epoch_deadline_for_test(&mut self, ticks: u64) {
         self.store.set_epoch_deadline(ticks);
+    }
+}
+
+impl HostState {
+    pub(super) fn network(&self) -> &GuestNetwork {
+        &self.http_hooks.network
     }
 }
 

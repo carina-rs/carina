@@ -6,6 +6,8 @@ pub use carina_core as core;
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
 
+pub mod aws_credentials;
+
 /// The "Schemas" page of the provider guide on carina-rs.dev. Its Rust
 /// examples run as doctests of this crate so they cannot drift from the SDK.
 #[cfg(doctest)]
@@ -211,9 +213,9 @@ pub enum BindingPattern {
 
 /// Provider-owned continuation for an operation that has not settled yet.
 ///
-/// A create, update, delete, or poll call is one short step that must finish
-/// well under the host's per-call hard timeout; providers must never run an
-/// in-call waiter. A poll may return another `Pending`. The host supplies the
+/// A create or update call, including each poll, is one short step that must
+/// finish well under the host's per-call hard timeout; providers must never
+/// run an in-call waiter. A poll may return another `Pending`. The host supplies the
 /// original request on every poll, so `token` must contain only opaque
 /// continuation metadata and must never contain request or secret data. A
 /// token must also serialize as finite JSON. If an initial create has already
@@ -224,9 +226,29 @@ pub enum BindingPattern {
 pub struct Pending<T> {
     pub token: T,
     pub poll_after_secs: u32,
+    pub phase: carina_provider_protocol::PendingPhase,
 }
 
-pub use carina_provider_protocol::types::{PendingToken, Sent};
+pub use carina_provider_protocol::types::{CreateProgress, PendingDelete, PendingToken, Sent};
+pub use carina_provider_protocol::{PendingPhase, PollFinality, PollRequest};
+
+impl<T> Pending<T> {
+    pub fn operation(token: T, poll_after_secs: u32) -> Self {
+        Self {
+            token,
+            poll_after_secs,
+            phase: PendingPhase::Operation,
+        }
+    }
+
+    pub fn read_back(token: T, poll_after_secs: u32) -> Self {
+        Self {
+            token,
+            poll_after_secs,
+            phase: PendingPhase::ReadBack,
+        }
+    }
+}
 
 /// Initial-create typestate minted only by the guest transport.
 ///
@@ -267,7 +289,7 @@ impl CreateAttempt {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
                 token,
-                identifier: None,
+                progress: CreateProgress::Operating { identifier: None },
                 sent,
                 poll_after_secs,
             },
@@ -285,7 +307,7 @@ impl CreateAttempt {
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
                     token,
-                    identifier: None,
+                    progress: CreateProgress::Operating { identifier: None },
                     sent,
                     poll_after_secs,
                 },
@@ -340,7 +362,7 @@ impl PollAttempt {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
                 token,
-                identifier: None,
+                progress: CreateProgress::Operating { identifier: None },
                 sent: self.sent,
                 poll_after_secs,
             },
@@ -357,7 +379,7 @@ impl PollAttempt {
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
                     token,
-                    identifier: None,
+                    progress: CreateProgress::Operating { identifier: None },
                     sent: self.sent,
                     poll_after_secs,
                 },
@@ -391,10 +413,31 @@ impl IssuedCreate {
     }
 
     pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+        self.pending_in_phase(token, poll_after_secs, PendingPhase::Operation)
+    }
+
+    /// Continue polling the post-create read after the identifier is known.
+    pub fn pending_read_back<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+        self.pending_in_phase(token, poll_after_secs, PendingPhase::ReadBack)
+    }
+
+    fn pending_in_phase<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        phase: PendingPhase,
+    ) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
                 token,
-                identifier: Some(self.identifier),
+                progress: match phase {
+                    PendingPhase::Operation => CreateProgress::Operating {
+                        identifier: Some(self.identifier),
+                    },
+                    PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                        identifier: self.identifier,
+                    },
+                },
                 sent: self.sent,
                 poll_after_secs,
             },
@@ -411,7 +454,9 @@ impl IssuedCreate {
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
                     token,
-                    identifier: Some(self.identifier),
+                    progress: CreateProgress::Operating {
+                        identifier: Some(self.identifier),
+                    },
                     sent: self.sent,
                     poll_after_secs,
                 },
@@ -544,7 +589,7 @@ impl ResumeAttempt {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
             carina_provider_protocol::types::ResumePending {
                 token,
-                identifier: None,
+                progress: CreateProgress::Operating { identifier: None },
                 poll_after_secs,
             },
         ))
@@ -560,7 +605,7 @@ impl ResumeAttempt {
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
                     token,
-                    identifier: None,
+                    progress: CreateProgress::Operating { identifier: None },
                     poll_after_secs,
                 },
                 error,
@@ -627,10 +672,30 @@ impl ResumedCreate {
     }
 
     pub fn pending<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
+        self.pending_in_phase(token, poll_after_secs, PendingPhase::Operation)
+    }
+
+    pub fn pending_read_back<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
+        self.pending_in_phase(token, poll_after_secs, PendingPhase::ReadBack)
+    }
+
+    fn pending_in_phase<T>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+        phase: PendingPhase,
+    ) -> ResumeStep<T> {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
             carina_provider_protocol::types::ResumePending {
                 token,
-                identifier: Some(self.identifier),
+                progress: match phase {
+                    PendingPhase::Operation => CreateProgress::Operating {
+                        identifier: Some(self.identifier),
+                    },
+                    PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                        identifier: self.identifier,
+                    },
+                },
                 poll_after_secs,
             },
         ))
@@ -646,7 +711,9 @@ impl ResumedCreate {
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
                     token,
-                    identifier: Some(self.identifier),
+                    progress: CreateProgress::Operating {
+                        identifier: Some(self.identifier),
+                    },
                     poll_after_secs,
                 },
                 error,
@@ -659,6 +726,20 @@ impl ResumedCreate {
             identifier: self.identifier,
             attributes: read.attributes,
         })
+    }
+
+    pub fn partial<T>(
+        self,
+        attributes: BTreeMap<String, Value>,
+        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+    ) -> ResumeStep<T> {
+        ResumeStep(
+            carina_provider_protocol::types::ResumeStep::PartialSuccess {
+                identifier: self.identifier,
+                attributes,
+                diagnostic,
+            },
+        )
     }
 
     pub fn failed<T>(
@@ -694,6 +775,20 @@ impl FinishingResume {
             identifier: self.identifier,
             attributes: read.attributes,
         })
+    }
+
+    pub fn partial<T>(
+        self,
+        attributes: BTreeMap<String, Value>,
+        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+    ) -> ResumeStep<T> {
+        ResumeStep(
+            carina_provider_protocol::types::ResumeStep::PartialSuccess {
+                identifier: self.identifier,
+                attributes,
+                diagnostic,
+            },
+        )
     }
 
     pub fn failed<T>(
@@ -898,7 +993,7 @@ pub enum UpdateOutcome<T> {
 #[derive(Debug)]
 pub enum DeleteOutcome<T> {
     Deleted,
-    Pending(Pending<T>),
+    Pending(PendingDelete<T>),
 }
 
 /// Token type for an operation kind that this provider can never defer.
@@ -1213,20 +1308,34 @@ pub trait CarinaProvider {
     /// Perform one short poll step for a pending create operation.
     ///
     /// The host passes the original request on every poll. This method may
-    /// return [`CreateOutcome::Pending`] again and must not wait in-call.
+    /// return a pending step again and must not wait in-call. A
+    /// [`PollFinality::FinalAttempt`] sent to a read-back continuation must
+    /// finish with success, partial success, or an error; pending in either
+    /// phase is a protocol violation. Pending after a final attempt sent to an
+    /// operation continuation is instead reported as over budget, even if the
+    /// response moves to read-back. A read-back continuation must never regress
+    /// to operation phase.
     fn poll_create(
         &self,
         id: &ResourceId,
         request: CreateRequest,
         poll: Poll<Self::CreateToken>,
+        poll_request: PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>>;
 
-    /// Continue a create operation loaded from state.
+    /// Continue a create operation loaded from state. `poll_request` has the
+    /// same host-owned finality and monotonic read-back semantics as
+    /// [`CarinaProvider::poll_create`]. On the first call after loading state,
+    /// the WIT transport's inbound phase and delay are non-authoritative because
+    /// state retains only the token and optional identifier; the SDK does not
+    /// expose those scheduling fields here. Recover the actual phase from the
+    /// token or cloud operation and set it on any pending result returned.
     fn resume_create(
         &self,
         id: &ResourceId,
         request: CreateRequest,
         resume: Resume<Self::CreateToken>,
+        poll_request: PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>>;
 
     /// Perform one short update step.
@@ -1249,13 +1358,18 @@ pub trait CarinaProvider {
     ///
     /// The host passes the original request and identifier on every poll. This
     /// method may return [`UpdateOutcome::Pending`] again and must not wait
-    /// in-call.
+    /// in-call. A [`PollFinality::FinalAttempt`] sent to a read-back
+    /// continuation must not return pending in either phase. Pending after a
+    /// final attempt sent to an operation continuation is instead reported as
+    /// over budget, even if the response moves to read-back. Read-back must
+    /// never regress to operation phase.
     fn poll_update(
         &self,
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
+        poll_request: PollRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError>;
 
     /// Perform one short delete step.
@@ -1274,13 +1388,14 @@ pub trait CarinaProvider {
     ///
     /// The host passes the original request and identifier on every poll. This
     /// method may return [`DeleteOutcome::Pending`] again and must not wait
-    /// in-call.
+    /// in-call. [`PendingDelete`] deliberately has no phase because delete has
+    /// no post-apply read-back step.
     fn poll_delete(
         &self,
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: DeleteRequest,
-        pending: Pending<Self::DeleteToken>,
+        pending: PendingDelete<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError>;
 
     /// Permissions this provider needs to perform `op` on `id`.
@@ -1368,13 +1483,14 @@ pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
     identifier: Option<AppliedIdentifier>,
     sent: Sent,
     token: P::CreateToken,
+    poll_request: PollRequest,
 ) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict<P::CreateToken>>> {
     let poll = match identifier {
         Some(identifier) => Poll::Issued(IssuedCreate::from_parts(identifier, sent), token),
         None => Poll::Unissued(PollAttempt::from_sent(sent), token),
     };
     provider
-        .poll_create(id, request, poll)
+        .poll_create(id, request, poll, poll_request)
         .map(CreateStep::into_protocol)
         .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
@@ -1386,13 +1502,14 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
     request: CreateRequest,
     identifier: Option<AppliedIdentifier>,
     token: P::CreateToken,
+    poll_request: PollRequest,
 ) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict<P::CreateToken>>> {
     let resume = match identifier {
         Some(identifier) => Resume::Issued(ResumedCreate::new(identifier), token),
         None => Resume::Unissued(ResumeAttempt::new(), token),
     };
     provider
-        .resume_create(id, request, resume)
+        .resume_create(id, request, resume, poll_request)
         .map(ResumeStep::into_protocol)
         .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
@@ -1474,6 +1591,7 @@ mod tests {
             _id: &ResourceId,
             _request: CreateRequest,
             _poll: Poll<Self::CreateToken>,
+            _poll_request: PollRequest,
         ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
             unimplemented!("schema-only provider")
         }
@@ -1483,6 +1601,7 @@ mod tests {
             _id: &ResourceId,
             _request: CreateRequest,
             _resume: Resume<Self::CreateToken>,
+            _poll_request: PollRequest,
         ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
             unimplemented!("schema-only provider")
         }
@@ -1502,6 +1621,7 @@ mod tests {
             _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
             _pending: Pending<Self::UpdateToken>,
+            _poll_request: PollRequest,
         ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
             unimplemented!("schema-only provider")
         }
@@ -1520,7 +1640,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &AppliedIdentifier,
             _request: DeleteRequest,
-            _pending: Pending<Self::DeleteToken>,
+            _pending: PendingDelete<Self::DeleteToken>,
         ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
             unimplemented!("schema-only provider")
         }
@@ -1674,6 +1794,33 @@ mod tests {
             .expect_err("a validated schema must always be projectable to protocol v14");
 
         assert!(error.to_string().contains("protocol v14"), "{error}");
+    }
+
+    #[test]
+    fn read_back_create_and_resume_progress_keep_the_issued_identifier() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let create = CreateAttempt::new()
+            .issued(identifier.clone(), Sent::only(["name"]))
+            .pending_read_back("create-token", 7)
+            .into_protocol();
+        let carina_provider_protocol::types::CreateStep::Pending(create) = create else {
+            panic!("issued create must remain pending")
+        };
+        assert_eq!(
+            create.progress,
+            CreateProgress::ReadingBack {
+                identifier: identifier.clone()
+            }
+        );
+        assert_eq!(create.sent, Sent::only(["name"]));
+        let resume = ResumeAttempt::new()
+            .issued(identifier.clone())
+            .pending_read_back("resume-token", 9)
+            .into_protocol();
+        let carina_provider_protocol::types::ResumeStep::Pending(resume) = resume else {
+            panic!("issued resume must remain pending")
+        };
+        assert_eq!(resume.progress, CreateProgress::ReadingBack { identifier });
     }
 
     #[test]

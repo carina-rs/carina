@@ -39,6 +39,22 @@ use crate::wiring::{
     resolve_config_block_names_for_test,
 };
 
+struct UnusedAwsCredentialProvisioner;
+
+impl carina_plugin_host::AwsCredentialProvisioner for UnusedAwsCredentialProvisioner {
+    fn provision(
+        &self,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            Arc<dyn carina_plugin_host::AwsCredentialSource>,
+            carina_plugin_host::AwsCredentialError,
+        >,
+    > {
+        Box::pin(async { panic!("an untrusted test provider must not provision AWS credentials") })
+    }
+}
+
 fn validate_with_test_factories(
     parsed: &carina_core::parser::InferredFile,
     base_dir: &Path,
@@ -435,6 +451,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             fresh_verified,
             cache.path(),
             Some(&locked_egress),
+            &UnusedAwsCredentialProvisioner,
         )
         .await
         .expect("load mock HTTP WASM provider")
@@ -510,6 +527,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             replacement_verified,
             cache.path(),
             Some(&locked_egress),
+            &UnusedAwsCredentialProvisioner,
         )
         .await
         .expect("load replacement mock HTTP WASM provider")
@@ -3406,9 +3424,9 @@ impl Provider for ApplyTimeReadProvider {
                 id.identity_str().expect("resolved identity").to_string(),
                 attrs.clone(),
             );
-            Ok(carina_core::provider::UpdateOutcome::Success {
-                state: AppliedState::from_identifier(id, identifier, attrs),
-            })
+            Ok(carina_core::provider::UpdateOutcome::success(
+                AppliedState::from_identifier(id, identifier, attrs),
+            ))
         })
     }
 

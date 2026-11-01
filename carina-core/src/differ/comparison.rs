@@ -8,8 +8,9 @@ use indexmap::IndexMap;
 use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::resource::{
-    ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, ResolvedIgnoreChanges,
-    SavedValueViews, Value, merge_with_saved, value_at_leaf,
+    ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
+    InterpolationPart, ResolvedIgnoreChanges, SavedValueViews, Value, merge_with_saved,
+    value_at_leaf,
 };
 use crate::schema::{
     AttributeType, DslTransform, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
@@ -514,8 +515,7 @@ fn type_aware_struct_equal(
 /// - Float: `0.0`
 /// - String / Enum: `""`
 /// - List: empty list
-/// - Map / Struct: empty map
-/// - Custom: delegates to the base type
+/// - Map: empty map
 fn is_type_default(
     value: &Value,
     attr_type: Option<&AttributeType>,
@@ -526,7 +526,7 @@ fn is_type_default(
     // `Shape` enum has no `Ref` variant by construction, so the type
     // system rather than convention enforces that every default-value
     // classification has seen its target shape.
-    let shape = attr_type.map(|t| t.shape_with_defs(defs));
+    let shape = attr_type.map(|attr_type| attr_type.shape_with_defs(defs));
     match (value, shape) {
         (Value::Concrete(ConcreteValue::Bool(false)), Some(crate::schema::Shape::Bool) | None) => {
             true
@@ -561,10 +561,11 @@ fn is_type_default(
         {
             true
         }
-        (
-            Value::Concrete(ConcreteValue::Map(m)),
-            Some(crate::schema::Shape::Map { .. } | crate::schema::Shape::Struct { .. }),
-        ) if m.is_empty() => true,
+        (Value::Concrete(ConcreteValue::Map(m)), Some(crate::schema::Shape::Map { .. }))
+            if m.is_empty() =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -988,15 +989,15 @@ pub(super) struct AttributeChanges {
 }
 
 pub(super) struct AttributeValueViews<'a> {
-    desired: &'a HashMap<String, Value>,
-    current: &'a HashMap<String, Value>,
-    saved: Option<&'a HashMap<String, Value>>,
+    desired: &'a CanonicalComparisonAttributes,
+    current: &'a CanonicalComparisonAttributes,
+    saved: Option<&'a CanonicalComparisonAttributes>,
     nested_write_only: &'a NestedWriteOnlyRecord,
 }
 
 pub(super) struct AuthoredAttributeViews {
-    current: HashMap<String, Value>,
-    saved: Option<HashMap<String, Value>>,
+    current: CanonicalComparisonAttributes,
+    saved: Option<CanonicalComparisonAttributes>,
     removal_evidence: AuthoredRemovalEvidence,
     previously_authored_top_level_attributes: Vec<String>,
 }
@@ -1008,11 +1009,11 @@ pub(super) enum AuthoredRemovalEvidence {
 }
 
 impl AuthoredAttributeViews {
-    pub(super) fn current(&self) -> &HashMap<String, Value> {
+    pub(super) fn current(&self) -> &CanonicalComparisonAttributes {
         &self.current
     }
 
-    fn saved(&self) -> Option<&HashMap<String, Value>> {
+    fn saved(&self) -> Option<&CanonicalComparisonAttributes> {
         self.saved.as_ref()
     }
 
@@ -1032,9 +1033,9 @@ impl AuthoredAttributeViews {
 /// never authored is absent from both projected views, while a previously
 /// authored value remains visible when desired omits it.
 pub(super) fn project_authored_attribute_views(
-    desired: &HashMap<String, Value>,
-    current: &HashMap<String, Value>,
-    saved: Option<&HashMap<String, Value>>,
+    desired: &CanonicalComparisonAttributes,
+    current: &CanonicalComparisonAttributes,
+    saved: Option<&CanonicalComparisonAttributes>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
@@ -1053,7 +1054,7 @@ pub(super) fn project_authored_attribute_views(
         )
         | None => (AuthoredRemovalEvidence::Unrecorded, Vec::new()),
     };
-    let empty_stored = HashMap::new();
+    let empty_stored = CanonicalComparisonAttributes::default();
     let projection = prev_explicit.map(|explicit| {
         ExplicitProjection::for_desired(
             saved.unwrap_or(&empty_stored),
@@ -1092,9 +1093,9 @@ pub(super) fn project_authored_attribute_views(
 
 impl<'a> AttributeValueViews<'a> {
     pub(super) fn new(
-        desired: &'a HashMap<String, Value>,
-        current: &'a HashMap<String, Value>,
-        saved: Option<&'a HashMap<String, Value>>,
+        desired: &'a CanonicalComparisonAttributes,
+        current: &'a CanonicalComparisonAttributes,
+        saved: Option<&'a CanonicalComparisonAttributes>,
         nested_write_only: &'a NestedWriteOnlyRecord,
     ) -> Self {
         Self {
@@ -1150,6 +1151,18 @@ pub(super) fn find_changed_attributes_with_ignores(
     let projected_current = projected.current();
     let projected_saved = projected.saved();
 
+    let observed_for_ignored = raw_saved.map_or_else(
+        || projected_current.clone(),
+        |saved| {
+            projected_current.with_missing_values_from(saved, |key, value| {
+                desired.get(key).is_some_and(contains_secret)
+                    && crate::value::contains_redacted_secret(value)
+            })
+        },
+    );
+    let effective_desired =
+        ignore_changes.mask_comparison_readable_leaves(desired, &observed_for_ignored, schema);
+
     let mut differing_ignored_paths = std::collections::HashSet::new();
     for path in ignore_changes.iter().filter(|path| !path.is_write_only()) {
         let Some(desired_value) = desired.get(path.attribute()) else {
@@ -1182,7 +1195,7 @@ pub(super) fn find_changed_attributes_with_ignores(
         }
     }
 
-    for (key, desired_value) in desired {
+    for (key, desired_value) in &effective_desired {
         if ignore_changes.ignores_whole_attribute(key) {
             continue;
         }
@@ -1199,7 +1212,7 @@ pub(super) fn find_changed_attributes_with_ignores(
         // a provider default into desired state, and verification proves
         // whether the newly-authored plaintext is the value already stored.
         let current_value = projected_current.get(key).or_else(|| {
-            if !contains_secret(desired_value) {
+            if !desired.get(key).is_some_and(contains_secret) {
                 return None;
             }
             raw_saved?
@@ -1207,11 +1220,9 @@ pub(super) fn find_changed_attributes_with_ignores(
                 .filter(|value| crate::value::contains_redacted_secret(value))
         });
 
-        let effective_desired =
-            ignore_changes.with_observed_readable_leaves(key, desired_value, current_value);
         let comparison = AttrComparison {
             from: current_value,
-            to: &effective_desired,
+            to: desired_value,
             saved: projected_saved.and_then(|projected_saved| {
                 projected_saved.get(key).map(|projected_value| SavedAttr {
                     views: raw_saved
@@ -1282,8 +1293,17 @@ pub(super) fn find_changed_attributes(
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
 ) -> Vec<String> {
+    let canonicalize = |attributes| match schema {
+        Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(attributes),
+        ),
+    };
+    let desired = canonicalize(desired.clone());
+    let current = canonicalize(current.clone());
+    let saved = saved.cloned().map(canonicalize);
     find_changed_attributes_with_ignores(
-        AttributeValueViews::new(desired, current, saved, nested_write_only),
+        AttributeValueViews::new(&desired, &current, saved.as_ref(), nested_write_only),
         prev_explicit,
         schema,
         &ResolvedIgnoreChanges::default(),

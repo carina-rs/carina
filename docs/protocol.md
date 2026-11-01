@@ -1,15 +1,23 @@
 # Provider protocol versions
 
-## Version 14
+The current protocol and minimum supported provider protocol are both **16**.
 
-Protocol v14 makes declared anonymous identity a closed schema mode and changes
+| Protocol version | Minimum provider protocol | Change |
+|------------------|---------------------------|--------|
+| 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
+| 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
+| 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 16
+
+Protocol v16 makes declared anonymous identity a closed schema mode and changes
 its address semantics. `PROTOCOL_VERSION` and
-`MIN_SUPPORTED_PROTOCOL_VERSION` are both 14. A v14 host therefore rejects a
-v13 provider through the existing version check before attempting to decode
-its schemas. This is required because the v13 top-level `identity` boolean
-meant “add this value to the configured create-only hash inputs” and released
+`MIN_SUPPORTED_PROTOCOL_VERSION` are both 16. A v16 host therefore rejects a
+v15 provider through the existing version check before attempting to decode
+its schemas. This is required because the v15 top-level `identity` boolean
+meant “add this value to the configured create-only hash inputs” and earlier
 providers could set it on mutable attributes. Interpreting that boolean with
-v14 semantics would silently change addresses or produce a misleading schema
+v16 semantics would silently change addresses or produce a misleading schema
 decode error.
 
 Every top-level `AttributeSchema` and nested `StructField` schema JSON record
@@ -64,8 +72,93 @@ independent of element order and mutable sibling fields. Reordering alone is
 not a create-only change. Adding an element with an authored create-only leaf
 is a create-only change and therefore replaces the resource.
 
-The WIT world is unchanged in v14; the incompatible representation is in the
-schema JSON records. Hosts and providers must both use protocol v14.
+The WIT world is unchanged in v16; the incompatible representation is in the
+schema JSON records. Hosts and providers must both use protocol v16.
+
+## Version 15
+
+Protocol v15 separates an asynchronous mutation from its post-mutation
+read-back. Create and resume continuations carry a single `create-progress`
+variant: `operating(option<string>)` while the mutation is in progress, or
+`reading-back(string)` once the mutation completed and its identifier is
+required. `pending-create` and `resume-pending` have no separate identifier or
+phase, so read-back without an identifier cannot be represented on the wire.
+Update uses `pending-update` with a `pending-phase` of `operation` or
+`read-back`; its request always supplies the identifier. These continuations
+share the phase-less `pending-operation` record for the token and poll interval.
+`poll-create`, `resume-create`, and `poll-update` receive a `poll-request`
+whose `finality` is `continue` or `final-attempt`.
+
+The host starts the operation's existing deadline before the initial call.
+The read-back deadline starts only when the first `read-back` pending result
+arrives and is the earlier of that time plus the resource's read-back budget
+and the operation deadline. The schema may set a typed, non-zero
+`operation_config.read_back.timeout_secs`; otherwise the host uses two
+minutes. The read-back budget is clipped to the operation budget in effect,
+including any resource-specific override; it never extends that budget.
+Poll delays remain clamped to 1–300 seconds against the
+active deadline.
+
+At the active deadline the host sends exactly one `final-attempt`. The phase of
+the continuation that receives that request determines the result of another
+pending response. A final attempt sent to an `operation` continuation may
+return pending in either phase; the host reports that the operation exceeded
+its budget. For create, the host preserves the returned continuation and any
+known identifier. For update, it preserves the pre-update state row, which the
+next plan refreshes from the cloud. A final attempt sent to a `read-back`
+continuation must finish with success, partial success, or an error; pending in
+either phase is a protocol violation.
+Returning from `read-back` to `operation` at any point is also a protocol
+violation. Providers should return partial success when the mutation is known
+to have completed but the final read still lacks attributes. Core records the
+partial-read marker, publishes returned attributes while keeping only the
+reported missing attributes unknown, and retries the read on the next apply or
+refresh.
+
+`resume-create` receives the same `poll-request` finality as `poll-create`; the
+host never fabricates the `sent` values that are absent from a persisted
+`resume-pending`. Persisted state retains the resume token and identifier, but
+not scheduling metadata, so the first resume call's inbound phase and delay are
+non-authoritative: the host sends `operating` with the persisted optional
+identifier. The provider recovers the operation from its token and any
+pending result it returns establishes the phase used by later polls. Delete
+continuations use the phase-less `pending-delete` record because delete has no
+post-apply read-back phase.
+
+`OperationConfig.read_back` participates in semantic schema fingerprint
+encoding v6. Provider protocol and minimum supported protocol are both 15;
+v14 providers are rejected because they cannot receive poll finality or
+distinguish operation pending from read-back pending.
+
+## Version 14
+
+Protocol v14 adds the `carina-provider-aws` world for AWS-kind providers. It
+imports both `wasi:http/outgoing-handler` and the new `aws-credentials`
+interface, then exports the same provider interface as the existing worlds.
+
+The `aws-credentials` interface defines an `aws-credentials` record containing
+`access-key-id`, `secret-access-key`, an optional `session-token`, and an
+optional `expires-at` Unix timestamp in seconds. Its `aws-credential-error`
+variant distinguishes `not-found(string)` from `provider-failed(string)`, and
+`current-credentials` returns either the current record or one of those typed,
+host-rendered errors. The host owns default-chain lookup, caching, and refresh;
+credential secrets do not cross the component boundary except through this
+typed call.
+
+An AWS-kind runtime load must import `aws-credentials`. GitHub-kind and
+untrusted runtime loads must not import it, so changing only the trust kind
+cannot give a non-AWS component access to credentials. Schema-only loading
+links the interface without resolving credentials, while an attempted call
+during schema loading fails with `provider-failed`.
+
+AWS credential environment variables are no longer passed to AWS guests.
+Cloud metadata addresses are also withheld from guest networking, preventing
+guest access to ECS or EC2 metadata credentials. The host may still use those
+environment variables, profiles, SSO, ECS, or EC2 metadata as part of its own
+AWS SDK credential chain.
+
+Hosts and providers must both use protocol v14. The minimum supported protocol
+version is 14.
 
 ## Version 13
 

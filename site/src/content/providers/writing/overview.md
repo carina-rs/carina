@@ -9,12 +9,13 @@ This section covers writing a provider, building it, and using it from a local f
 
 ## What a provider is
 
-A provider is a [WebAssembly component](https://component-model.bytecodealliance.org/) built for the `wasm32-wasip2` target. Carina (the host) loads it into a sandbox and calls it through the interface defined in [carina-plugin-wit](https://github.com/carina-rs/carina-plugin-wit). It exports one of two WIT worlds:
+A provider is a [WebAssembly component](https://component-model.bytecodealliance.org/) built for the `wasm32-wasip2` target. Carina (the host) loads it into a sandbox and calls it through the interface defined in [carina-plugin-wit](https://github.com/carina-rs/carina-plugin-wit). It exports one of three WIT worlds:
 
 | World | Use it when |
 |-------|-------------|
 | `carina-provider` | The provider needs no network access. |
 | `carina-provider-with-http` | The provider calls an HTTP API through `wasi:http` and declares the hosts it may reach. |
+| `carina-provider-aws` | An AWS-kind provider needs `wasi:http` plus host-resolved AWS base credentials. |
 
 You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `CarinaProvider` trait, and its `export_provider!` macro generates the bindings and connects them to your implementation. The SDK re-exports the request and schema types from `carina-provider-protocol`.
 
@@ -36,7 +37,19 @@ The HTTP form embeds a versioned `carina:egress` custom section in the component
 - `*.example.com` matches one label, such as `api.example.com`, but not `v1.api.example.com`.
 - `**.example.com` matches one or more labels at any depth below `example.com`. It does not match `example.com` itself.
 
-Wildcards are allowed only as the complete leftmost label and cannot sit directly above a public suffix. IP literals, localhost, metadata and link-local names, non-ASCII labels, empty labels, and labels longer than 63 bytes are rejected. DNS resolution is checked separately: loopback, unspecified, and link-local addresses are always denied; metadata is withheld except for a provider kind's own endpoints (currently AWS IMDS and ECS endpoints for AWS-kind providers); and Alibaba or Azure metadata is always withheld. Private IPv4, IPv6, and CGNAT addresses are denied except for AWS-kind providers, which need them for VPC interface endpoints and PrivateLink.
+Wildcards are allowed only as the complete leftmost label and cannot sit directly above a public suffix. IP literals, localhost, metadata and link-local names, non-ASCII labels, empty labels, and labels longer than 63 bytes are rejected. DNS resolution is checked separately: loopback, unspecified, link-local, and cloud metadata addresses are always denied. Private IPv4, IPv6, and CGNAT addresses are denied except for AWS-kind providers, which need them for VPC interface endpoints and PrivateLink.
+
+An AWS provider uses the same egress declaration but selects the AWS world:
+
+```rust
+carina_plugin_sdk::export_provider!(
+    MyAwsProvider,
+    aws,
+    egress: ["**.amazonaws.com", "**.amazonaws.com.cn"],
+);
+```
+
+Call `carina_plugin_sdk::aws_credentials::current()` to obtain the current base credentials. The SDK-side type exposes accessors but redacts secret fields from `Debug`. Native builds return a typed error so provider unit tests still compile. At runtime, only a component loaded with the AWS trust kind can link this import. Schema-only loading links the import without resolving credentials and returns `ProviderFailed` if the provider calls it while schemas are loading. See [AWS Credentials](/guides/aws-credentials/) for the user-facing chain and refresh behavior.
 
 In native provider tests, validate declaration patterns with `carina_plugin_sdk::protocol::HostPattern::parse`.
 
@@ -96,15 +109,17 @@ A write-only attribute (one the API accepts but never returns, such as a passwor
 
 ## Short calls; the host waits
 
-Every call must return quickly. The host stops a call whose WebAssembly code has computed for more than 30 seconds in total (time spent waiting in host I/O, such as an HTTP request or a clock sleep, does not count), stops any call that is still running 60 minutes after it began, and limits each HTTP request's connect, first-byte and between-bytes waits to 30 seconds each. A stopped call also breaks that provider instance, so its later calls in the same run fail. A provider never sleeps or polls inside a call. When an operation has not finished, the provider returns a pending result that carries a token it defines and a hint for when to ask again. The host then calls `poll_create`, `poll_update` or `poll_delete` with the original request and that token, until the operation finishes or the resource's time budget (15 minutes by default) runs out.
+Every call must return quickly. The host stops a call whose WebAssembly code has computed for more than 30 seconds in total (time spent waiting in host I/O, such as an HTTP request or a clock sleep, does not count), stops any call that is still running 60 minutes after it began, and limits each HTTP request's connect, first-byte and between-bytes waits to 30 seconds each. A stopped call also breaks that provider instance, so its later calls in the same run fail. A provider never sleeps or polls inside a call. When a create or update has not finished, the provider returns a pending result that carries a token it defines, an `operation` or `read-back` phase, and a hint for when to ask again. Delete pending is phase-less because delete has no post-apply read-back. The host then calls `poll_create`, `poll_update` or `poll_delete` with the original request and that token, until the operation finishes or the resource's time budget (15 minutes by default) runs out.
 
-A pending create is also saved in state. If Carina is interrupted, the next apply calls `resume_create` with the saved token instead of creating the resource again. The token is stored and passed around, so it must hold only what the provider needs to find the operation again, never request values or secrets.
+Post-create and post-update reads have a separate host-owned budget. It starts at the first `read-back` pending result, defaults to two minutes, and is clipped to the operation's original deadline, so it never extends the operation. A resource schema can set a non-zero `operation_config.read_back.timeout_secs`. The host marks the one poll at the active deadline as `final-attempt` in `poll_create`, `resume_create`, and `poll_update`. The phase of the continuation sent that request controls the result: pending after a final attempt sent to an `operation` continuation is over budget, even if the response moves to `read-back`; pending in either phase after a final attempt sent to a `read-back` continuation is a protocol violation. Returning from `read-back` to `operation` at any time is also a violation. Do not put attempt counters in a read-back token—the host owns the deadline and finality.
+
+A pending create is also saved in state. If Carina is interrupted, the next apply calls `resume_create` with the saved token instead of creating the resource again. The token is stored and passed around, so it must hold only what the provider needs to find the operation again, never request values or secrets. State retains the token and identifier but not poll scheduling metadata, so the first resumed call's inbound phase and delay are non-authoritative; recover the real phase from the token or cloud operation, and set it on any pending result you return.
 
 Create results go through a typestate in the SDK, so a provider must say what it knows. There is no conversion from a plain error into a create result; every failure has to be classified:
 
 - `untracked` means nothing was created. Use it only when you know the API never accepted the request, for example when local validation failed or the API rejected it outright. Carina keeps no record of the resource.
 - If the request may have reached the API but you have no identifier (a timeout, or a server error with no ID), return `CreateAttempt::pending(token, sent, poll_after_secs)`, which carries no identifier, and settle it in `poll_create`. If a call has a usable continuation but stops with an error, preserve it with the signature for that handle: `CreateAttempt::preserve(token, sent, poll_after_secs, error)`, or `PollAttempt::preserve(token, poll_after_secs, error)`, `ResumeAttempt::preserve(token, poll_after_secs, error)`, `IssuedCreate::preserve(token, poll_after_secs, error)`, or `ResumedCreate::preserve(token, poll_after_secs, error)`. Carina then keeps the attempt and the error instead of forgetting a resource that may exist.
-- Call `issued` as soon as you see the resource's identifier. An `IssuedCreate` can then end or transition through `succeeded`, `partial`, `failed`, `discarded`, `pending`, `preserve`, or `canonicalize`; only an explicit `discarded` leaves no record. `canonicalize` replaces the provisional identifier and returns a finishing handle that cannot go back to pending.
+- Call `issued` as soon as you see the resource's identifier. An `IssuedCreate` can then end or transition through `succeeded`, `partial`, `failed`, `discarded`, `pending`, `pending_read_back`, `preserve`, or `canonicalize`; only an explicit `discarded` leaves no record. `canonicalize` replaces the provisional identifier and returns a finishing handle that cannot go back to pending.
 - `discarded` means the provider removed the resource it had created, so Carina keeps no record of it. If the resource may still exist, report it with `failed` instead.
 
 ## The sandbox
@@ -112,18 +127,18 @@ Create results go through a typestate in the SDK, so a provider must say what it
 A provider runs with no filesystem access. It sees only these environment variables:
 
 - `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's headers to stderr, including authorization headers, so do not use it with real credentials or in shared logs.
-- AWS credential and region variables, only when this user's `carina init` downloaded the exact artifact from the origin for `carina-rs/aws` or `carina-rs/awscc` (including their official GitHub sources) and recorded its source and SHA-256 in the user's trust directory, or for a matching local build explicitly granted the `aws` kind.
+- `AWS_REGION`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL`, only for an AWS-kind provider. AWS credential variables are never passed; the AWS world receives credentials through its typed import.
 - `GITHUB_TOKEN`, only when the same user-owned record exists for the exact `carina-rs/github` artifact (including its official GitHub source), or for a matching local build explicitly granted the `github` kind.
 
 For a remote provider, the host hashes the bytes being loaded and looks for that SHA-256 and canonical source in a user-owned record under `~/.carina/trust/`. It then applies the fixed official-source allow-list. Registry records are written only after the registry signature verifies, and a signer recorded for the source must belong to `carina-rs`. A `carina-providers.lock` file or `.carina/` directory shipped in a repository cannot create this record and does not grant credentials. This also applies in CI: restoring `.carina/` without the trust directory makes official providers fail before their WebAssembly code runs, so the job must run `carina init` or persist the trust directory (`CARINA_TRUST_RECORD_DIR` can relocate it). An absent, unreadable, malformed, or non-`carina-rs` record produces an error that tells the user to run `carina init`.
 
 A local `file://` build receives no credential partition unless its canonical source path is granted with `--trust-local-provider <PATH=KIND>` or `CARINA_TRUST_LOCAL_PROVIDER`; Carina checks that the bytes being loaded still match that source file. A stale entry in `CARINA_TRUST_LOCAL_PROVIDER` makes provider-loading commands fail until it is fixed or removed. Declare other settings as attributes of the `provider` block, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` keeps it out of plan output and saved plan files.
 
-The same user trust record controls metadata access. Only a recorded artifact from an allow-listed AWS source can reach the EC2 or ECS metadata addresses and read role credentials from them.
+Cloud metadata addresses are withheld from every provider kind. The host may use ECS or EC2 metadata as part of its own AWS SDK credential chain, but those endpoints and credentials are never exposed through guest networking or environment variables.
 
 ## Protocol version
 
-The provider protocol is versioned. The current development version is 14, and the host also requires at least 14. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0 and v0.7.1 all speak version 12; the next release after v0.9.0 will speak version 14. Providers built for the intermediate version 13 must be rebuilt because version 14 changes the schema identity field and its meaning.
+The provider protocol is versioned. The current development version is 16, and the host also requires at least 16. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release. Protocol 16 changes the schema identity field to a required mode and uses declared identity hashing, so providers built for versions 14 or 15 must be rebuilt.
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 

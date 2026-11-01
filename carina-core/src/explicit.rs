@@ -11,8 +11,8 @@ use crate::diff_helpers::{list_element_type, map_entry_subtype};
 use crate::differ::ComparisonContext;
 use crate::provider::SentDesiredAttributes;
 use crate::resource::{
-    ConcreteValue, ListElementPairing, Resource, Value, pair_list_elements,
-    pair_list_elements_with_uniqueness,
+    CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, Resource, Value,
+    pair_list_elements, pair_list_elements_with_uniqueness,
 };
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 use indexmap::IndexMap;
@@ -1222,7 +1222,7 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// stored lists use the legacy union projection. Schema-aware list pairing
 /// uses the same equality as state writeback.
 pub struct ExplicitProjection<'a> {
-    stored_attributes: &'a HashMap<String, Value>,
+    stored_attributes: &'a CanonicalComparisonAttributes,
     desired: ProjectionDesired<'a>,
     explicit: &'a ExplicitFields,
     schema: Option<&'a ResourceSchema>,
@@ -1257,16 +1257,13 @@ impl ProjectionDesiredValue<'_> {
 impl<'a> ExplicitProjection<'a> {
     /// Build a projection whose server-added classification is checked against
     /// the resource's desired attributes.
-    pub fn for_desired<I>(
-        stored_attributes: &'a HashMap<String, Value>,
-        desired_attributes: I,
+    pub fn for_desired(
+        stored_attributes: &'a CanonicalComparisonAttributes,
+        desired_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
         comparison: &ComparisonContext<'a>,
-    ) -> Self
-    where
-        I: IntoIterator<Item = (&'a String, &'a Value)>,
-    {
+    ) -> Self {
         Self {
             stored_attributes,
             desired: ProjectionDesired::Attributes(
@@ -1286,7 +1283,7 @@ impl<'a> ExplicitProjection<'a> {
     /// This mode never treats an `Unrecorded`-paired list element as a proven
     /// server addition, so uncertain elements remain visible.
     pub fn conservative(
-        stored_attributes: &'a HashMap<String, Value>,
+        stored_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
         comparison: &ComparisonContext<'a>,
@@ -1307,16 +1304,16 @@ impl<'a> ExplicitProjection<'a> {
     /// after applying the legacy union projection. Lists whose stored
     /// alignment is unavailable use that same fallback, so uncertainty remains
     /// visible without resurfacing unauthored fields inside retained elements.
-    pub fn project_attributes(&self, attributes: HashMap<String, Value>) -> ProjectedAttributes {
+    pub fn project_attributes(
+        &self,
+        attributes: CanonicalComparisonAttributes,
+    ) -> ProjectedAttributes {
         let defs = self
             .schema
             .map(|schema| &schema.defs)
             .unwrap_or(empty_defs_for_schema_walks());
         let ExplicitFields::Struct { children } = self.explicit else {
-            return ProjectedAttributes {
-                attributes,
-                authoring: ProjectedAuthoring::from_unprojected(self.explicit),
-            };
+            return ProjectedAttributes::unprojected(attributes, Some(self.explicit));
         };
 
         let mut projected_attributes = HashMap::new();
@@ -1350,24 +1347,42 @@ impl<'a> ExplicitProjection<'a> {
             projected_attributes.insert(key.clone(), projected.value);
             projected_children.insert(key, projected.authoring);
         }
-        ProjectedAttributes {
-            attributes: projected_attributes,
-            authoring: ProjectedAuthoring::Struct {
+        ProjectedAttributes::canonicalized(
+            projected_attributes,
+            ProjectedAuthoring::Struct {
                 children: projected_children,
             },
-        }
+            self.schema,
+        )
     }
 }
 
 /// Values produced by an [`ExplicitProjection`].
 pub struct ProjectedAttributes {
-    attributes: HashMap<String, Value>,
+    attributes: CanonicalComparisonAttributes,
     pub(crate) authoring: ProjectedAuthoring,
 }
 
 impl ProjectedAttributes {
-    pub(crate) fn unprojected(
+    fn canonicalized(
         attributes: HashMap<String, Value>,
+        authoring: ProjectedAuthoring,
+        schema: Option<&ResourceSchema>,
+    ) -> Self {
+        let attributes = match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                crate::resource::UnschematizedComparisonAttributes::new(attributes),
+            ),
+        };
+        Self {
+            attributes,
+            authoring,
+        }
+    }
+
+    pub(crate) fn unprojected(
+        attributes: CanonicalComparisonAttributes,
         explicit: Option<&ExplicitFields>,
     ) -> Self {
         Self {
@@ -1378,11 +1393,11 @@ impl ProjectedAttributes {
         }
     }
 
-    pub fn attributes(&self) -> &HashMap<String, Value> {
+    pub fn attributes(&self) -> &CanonicalComparisonAttributes {
         &self.attributes
     }
 
-    pub fn into_attributes(self) -> HashMap<String, Value> {
+    pub fn into_attributes(self) -> CanonicalComparisonAttributes {
         self.attributes
     }
 }
@@ -1736,6 +1751,15 @@ mod tests {
         let current_attributes = HashMap::from([(key.clone(), value)]);
         let stored_attributes = HashMap::from([(key.clone(), stored)]);
         let desired_attributes = HashMap::from([(key.clone(), desired)]);
+        let current_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(current_attributes),
+        );
+        let stored_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(stored_attributes),
+        );
+        let desired_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(desired_attributes),
+        );
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
@@ -1748,6 +1772,8 @@ mod tests {
         )
         .project_attributes(current_attributes)
         .into_attributes()
+        .into_iter()
+        .collect::<HashMap<_, _>>()
         .remove(&key)
         .expect("projected test value")
     }
@@ -1764,6 +1790,12 @@ mod tests {
         let key = "value".to_string();
         let current_attributes = HashMap::from([(key.clone(), value)]);
         let stored_attributes = HashMap::from([(key.clone(), stored)]);
+        let current_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(current_attributes),
+        );
+        let stored_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(stored_attributes),
+        );
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
@@ -1775,6 +1807,8 @@ mod tests {
         )
         .project_attributes(current_attributes)
         .into_attributes()
+        .into_iter()
+        .collect::<HashMap<_, _>>()
         .remove(&key)
         .expect("projected test value")
     }
@@ -1783,6 +1817,9 @@ mod tests {
         attributes: HashMap<String, Value>,
         explicit: &ExplicitFields,
     ) -> HashMap<String, Value> {
+        let attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(attributes),
+        );
         ExplicitProjection::for_desired(
             &attributes,
             &attributes,
@@ -1792,6 +1829,8 @@ mod tests {
         )
         .project_attributes(attributes.clone())
         .into_attributes()
+        .into_iter()
+        .collect()
     }
 
     fn rule(port: i64, description: Option<&str>) -> Value {

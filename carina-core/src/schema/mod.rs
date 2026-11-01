@@ -207,7 +207,9 @@ use crate::resource::{
     Value, ValueString,
 };
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
-use crate::value::{CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value};
+use crate::value::{
+    CanonicalState, CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value,
+};
 
 mod fingerprint;
 mod resolved_attr_type;
@@ -218,7 +220,7 @@ pub use carina_provider_protocol::types::{
     DslTransform, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };
 /// Per-resource operational configuration for provider timeouts and retries.
-pub use carina_provider_protocol::{OperationConfig, ValidatorType};
+pub use carina_provider_protocol::{OperationConfig, ReadBackBudget, ValidatorType};
 pub use resolved_attr_type::ResolvedAttrType;
 use resolved_union_members::UnionMemberTypes;
 pub use resolved_union_members::{ResolvedUnionMember, UnionMembers};
@@ -1924,7 +1926,7 @@ impl RootlessType {
     }
 
     /// Canonicalize provider or persisted state for this rootless type.
-    pub fn canonicalize_state(&self, value: Value) -> Value {
+    pub fn canonicalize_state(&self, value: Value) -> CanonicalState {
         self.schema.canonicalize_state(value)
     }
 
@@ -2093,7 +2095,7 @@ impl Schema {
     }
 
     /// Canonicalize provider or persisted state against this schema's root.
-    pub(crate) fn canonicalize_state(&self, value: Value) -> Value {
+    pub(crate) fn canonicalize_state(&self, value: Value) -> CanonicalState {
         crate::value::canonicalize_state_with_type_and_ancestry(
             value,
             &self.root,
@@ -2913,6 +2915,22 @@ pub(crate) fn empty_defs_for_schema_walks()
     use std::sync::OnceLock;
     static EMPTY: OnceLock<std::collections::BTreeMap<String, AttributeType>> = OnceLock::new();
     EMPTY.get_or_init(std::collections::BTreeMap::new)
+}
+
+/// Whether this provider or persisted-state value represents absence.
+///
+/// The decision is made only from the value and its fully Ref-resolved type: an
+/// empty map means absence for a struct that declares at least one field.
+/// Zero-field structs remain real marker values.
+pub(crate) fn reads_as_absent<H: PlaceholderKind>(
+    value: &Value<H>,
+    resolved_type: ResolvedAttrType<'_>,
+) -> bool {
+    matches!(value, Value::Concrete(ConcreteValue::Map(map)) if map.is_empty())
+        && matches!(
+            &resolved_type.as_attr().kind,
+            AttrTypeKind::Struct { fields, .. } if !fields.is_empty()
+        )
 }
 
 impl AttributeType {
@@ -4681,7 +4699,7 @@ impl Ord for FitExactness {
 /// validation or enum resolution a second time.
 pub(crate) struct Fit<'a> {
     exactness: FitExactness,
-    pub(crate) attr: &'a AttributeType,
+    pub(crate) attr: ResolvedAttrType<'a>,
     pub(crate) kind: FitKind<'a>,
 }
 
@@ -4735,7 +4753,7 @@ impl Fit<'_> {
     ) -> Fit<'a> {
         Fit {
             exactness,
-            attr,
+            attr: ResolvedAttrType::new_after_peel(attr),
             kind,
         }
     }
@@ -8282,7 +8300,7 @@ impl<'a> EffectiveAttribute<'a> {
 
     /// Canonicalize provider or persisted state with this attribute's
     /// effective ancestry.
-    pub fn canonicalize_state(&self, value: Value) -> Value {
+    pub fn canonicalize_state(&self, value: Value) -> CanonicalState {
         self.value_type().canonicalize_state(value)
     }
 
@@ -8448,7 +8466,7 @@ impl<'a> EffectiveType<'a> {
 
     /// Canonicalize provider or persisted state without discarding the
     /// reference path that determines nested field modes.
-    pub fn canonicalize_state(&self, value: Value) -> Value {
+    pub fn canonicalize_state(&self, value: Value) -> CanonicalState {
         crate::value::canonicalize_state_with_type_and_ancestry(
             value,
             self.attr_type,
