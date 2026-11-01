@@ -6182,24 +6182,42 @@ fn v20_dependency_migration_preserves_matchable_resolution_cause() {
     );
 }
 
-#[test]
-fn v20_dependency_migration_classifies_moved_row_as_configured() {
+fn assert_moved_legacy_row_scope(
+    destination: &'static str,
+    expected_target: &'static str,
+    configured: bool,
+) {
     let mut target = persisted_resource("mock", "test.Target", "module_instance.target");
     target["binding"] = serde_json::json!("module_instance.target");
+    let mut root_target = persisted_resource("mock", "test.Target", "target");
+    root_target["binding"] = serde_json::json!("target");
     let mut consumer = persisted_resource("mock", "test.Consumer", "module_instance.old_consumer");
     consumer["binding"] = serde_json::json!("module_instance.old_consumer");
     consumer["dependency_bindings"] = serde_json::json!(["target"]);
-    let json = state_json_with_resources(20, vec![target, consumer]);
+    consumer["directives"] = serde_json::json!({"depends_on": ["target"]});
+    consumer["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "consumer-old",
+        "attributes": {},
+        "dependency_bindings": ["target"]
+    }]);
+    let json = state_json_with_resources(20, vec![target, root_target, consumer]);
     let state = check_and_migrate(&json)
         .expect("moved-row fixture must load as pending migration")
         .into_state();
 
-    let graph_resources: Vec<Resource> = vec![
+    let mut graph_resources: Vec<Resource> = vec![
         Resource::with_provider("mock", "test.Target", "module_instance.target", None)
             .with_binding("module_instance.target"),
-        Resource::with_provider("mock", "test.Consumer", "other_instance.consumer", None)
-            .with_binding("other_instance.consumer"),
+        Resource::with_provider("mock", "test.Target", expected_target, None)
+            .with_binding(expected_target),
     ];
+    if configured {
+        graph_resources.push(
+            Resource::with_provider("mock", "test.Consumer", destination, None)
+                .with_binding(destination),
+        );
+    }
     let parsed: carina_core::parser::ParsedFile = Default::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
         let mut configuration = parsed;
@@ -6214,7 +6232,7 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
         "module_instance.old_consumer",
         None,
     );
-    let to = resolved_dependency("mock", "test.Consumer", "other_instance.consumer", None);
+    let to = resolved_dependency("mock", "test.Consumer", destination, None);
 
     let mut move_plan: carina_core::plan::Plan<SavedModuleSource> =
         carina_core::plan::Plan::default();
@@ -6228,7 +6246,7 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
     let migration = expect_classified(
         state
             .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
-            .expect("the moved row must classify with its persisted source scope"),
+            .expect("the moved row must classify with its resolved destination scope"),
     );
     assert!(migration.warnings().is_empty());
     let state = migration
@@ -6238,14 +6256,38 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
     let row = state
         .find_resource("mock", "test.Consumer", "module_instance.old_consumer")
         .expect("migration classifies but does not itself move the row");
-    assert_eq!(
-        row.dependency_bindings,
-        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
-            "mock",
-            "test.Target",
-            "module_instance.target",
-            None,
-        )])
+    let expected = PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
+        "mock",
+        "test.Target",
+        expected_target,
+        None,
+    )]);
+    assert_eq!(row.dependency_bindings, expected);
+    assert_eq!(row.directives.depends_on, expected);
+    assert_eq!(row.deposed[0].dependency_bindings, expected);
+}
+
+#[test]
+fn v20_dependency_migration_classifies_moved_row_as_configured() {
+    assert_moved_legacy_row_scope("other_instance.consumer", "other_instance.target", true);
+}
+
+#[test]
+fn v20_dependency_migration_uses_destination_scope_for_moved_orphan_and_deposed_rows() {
+    assert_moved_legacy_row_scope("other_instance.consumer", "other_instance.target", false);
+}
+
+#[test]
+fn v20_dependency_migration_uses_root_scope_for_row_moved_out_of_module() {
+    assert_moved_legacy_row_scope("consumer", "target", true);
+}
+
+#[test]
+fn v20_dependency_migration_uses_destination_ancestors_without_splitting_quoted_map_keys() {
+    assert_moved_legacy_row_scope(
+        "other_instance[\"west.example\"].inner.consumer",
+        "other_instance[\"west.example\"].target",
+        true,
     );
 }
 

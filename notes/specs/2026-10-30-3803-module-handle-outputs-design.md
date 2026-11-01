@@ -344,12 +344,20 @@ graph. Graph construction consumes `ConfiguredGraphInput`, which owns the expand
 classification and live plan/apply, destroy, refresh, and offline checks retain that same graph. Its target maps
 contain configuration resources only. Orphan rows participate only as state-row candidates during classification,
 so a configured resource may reuse an orphan's binding after changing resource type. Configuration-only membership
-is captured in `ConfiguredResources`; it determines strictness, never the historical row's scope.
-Every row derives its enclosing instance scopes from its persisted binding address (or identity when no binding
-was recorded), including configured, moved, orphan, and deposed rows. Resolution probes those scopes from inside
-out before root, preserving quoted map-key segments. Removing a module or moving a row to another instance must
-not redirect its historical module-local edges to root or destination-instance resources. Old releases stored
-module-local dependency and argument spellings inconsistently. A configured row fails with a typed
+is captured in `ConfiguredResources`; it determines strictness. Every row uses the same scope rule, including
+configured, orphan, and deposed rows: when the resolved move pairs map it to a destination (`classified_id`), derive
+its enclosing instance scopes from that destination identity. Otherwise use its persisted binding address (or
+identity when no binding was recorded). Resolution probes those scopes from inside out before root, preserving
+quoted map-key segments; at each spelling, state rows take precedence over the current graph. Removing a module
+retains its historical scope. An explicit move adopts the destination scope, including root for a move out of a
+module, even when migration is persisted before the move executes. For example, moving `vpc` to `net.vpc` makes
+its legacy dependency `igw` resolve to `net.igw` before root `igw`.
+
+V20 merged dependency strings from references, dependency snapshots, and directives without storing a per-edge
+scope. Old releases stored both module-local and prefixed spellings, so the strings alone cannot establish a
+source-versus-destination rule for a moved row. This design chooses the destination because classification already
+treats the row as `classified_id`; its unqualified names use that same module instance. Source row IDs remain the
+classification keys and fingerprints until the move executes. A configured row fails with a typed
 `LegacyDependencyMigrationError` when a name is missing or ambiguous. A saved plan persists the complete
 classification, including its source fingerprints and warnings, so `apply --plan` validates it against the loaded
 state and cannot fall back to the old kind-blind strings. Move scope is an opaque `ResolvedMovePairs` value with no

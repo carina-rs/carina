@@ -1198,10 +1198,11 @@ impl StateFile {
 
     /// Classify pre-v21 dependency names without mutating the loaded state.
     ///
-    /// State rows win over current graph names. Every row's persisted binding
-    /// supplies its instance scope, including orphan and deposed rows. Configured
-    /// rows fail closed on missing/ambiguous names; orphan and deposed deletes
-    /// retain known edges and return explicit display warnings for the rest.
+    /// State rows win over current graph names. Resolved move destinations supply
+    /// instance scopes; unmoved rows retain their persisted binding's scopes,
+    /// including orphan and deposed rows. Configured rows fail closed on missing
+    /// or ambiguous names; orphan and deposed deletes retain known edges and
+    /// return explicit display warnings for the rest.
     fn classify_legacy_dependencies(
         &self,
         input: &LegacyMigrationInput<'_>,
@@ -1299,13 +1300,13 @@ impl StateFile {
             let Some(legacy) = self.legacy_dependencies.get(&row_id) else {
                 continue;
             };
-            let classified_id = input
+            let move_destination = input
                 .moved_pairs
                 .iter()
-                .find_map(|(from, to)| (from == &row_id).then_some(to))
-                .unwrap_or(&row_id);
+                .find_map(|(from, to)| (from == &row_id).then_some(to));
+            let classified_id = move_destination.unwrap_or(&row_id);
             let configured = input.configured.contains(classified_id);
-            let scopes = legacy_row_scopes(row);
+            let scopes = legacy_row_scopes(row, move_destination);
             let row_description = format!(
                 "resources[{row_index}] ({}.{} {:?})",
                 row.provider,
@@ -2709,11 +2710,17 @@ struct LegacyNameClassificationContext<'a> {
     location: String,
 }
 
-/// Persisted bindings retain module ancestry after the module has disappeared
-/// from configuration. Probe enclosing address scopes from inside out; dots
-/// within a quoted map key belong to that key, never to module ancestry.
-fn legacy_row_scopes(row: &ResourceState) -> Vec<&str> {
-    let address = row.binding.as_deref().unwrap_or(row.identity.as_str());
+/// A resolved move classifies every generation in its destination's scope, even
+/// before the move executes. Otherwise persisted bindings retain module ancestry
+/// after the module has disappeared from configuration. Probe enclosing address
+/// scopes from inside out; dots within a quoted map key belong to that key.
+fn legacy_row_scopes<'a>(
+    row: &'a ResourceState,
+    move_destination: Option<&'a ResolvedResourceId>,
+) -> Vec<&'a str> {
+    let address = move_destination
+        .map(ResolvedResourceId::identity_str)
+        .unwrap_or_else(|| row.binding.as_deref().unwrap_or(row.identity.as_str()));
     let mut brackets = 0usize;
     let mut quote = None;
     let mut escaped = false;
