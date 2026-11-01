@@ -78,9 +78,8 @@ fn module_arguments(
 fn parsed_deferred_resource(
     expression: DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>,
 ) -> ParsedDeferredForExpression {
-    ParsedDeferredForExpression::new(
-        expression.file.clone(),
-        expression.line,
+    ParsedDeferredForExpression::from_location(
+        expression.location().clone(),
         SourceSpan::dummy(),
         expression.header.clone(),
         expression.target().clone(),

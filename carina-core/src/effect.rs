@@ -2236,6 +2236,15 @@ pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
     }
 }
 
+/// An import identifier that remained unresolved at the provider boundary.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "import identifier did not resolve to a concrete string at apply time (got {got}). A referenced upstream value has not been published yet — apply the upstream stack first, then re-run apply here."
+)]
+pub struct ImportIdentifierError {
+    got: String,
+}
+
 /// Resolve an [`Effect::Import`] identifier to the concrete string the
 /// provider's `read()` needs, or return a structured error describing
 /// which deferred segment prevented resolution.
@@ -2249,18 +2258,17 @@ pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
 /// deferred upstream-state ref renders as
 /// `(known after upstream apply: …)` rather than being silently
 /// substituted to empty — see carina#3329.
-pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<&str, String> {
+pub fn resolve_import_identifier(
+    identifier: &crate::resource::Value,
+) -> Result<&str, ImportIdentifierError> {
     use crate::resource::{ConcreteValue, DeferredValue, Value};
     match identifier {
         Value::Concrete(ConcreteValue::String(s)) => Ok(s.expose_plaintext()),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Ok(s.as_str()),
         Value::Deferred(DeferredValue::Secret(inner)) => resolve_import_identifier(inner),
-        other => Err(format!(
-            "import identifier did not resolve to a concrete string at apply time \
-             (got {}). A referenced upstream value has not been published yet — \
-             apply the upstream stack first, then re-run apply here.",
-            crate::value::format_value_with_key(other, Some("id"))
-        )),
+        other => Err(ImportIdentifierError {
+            got: crate::value::format_value_with_key(other, Some("id")),
+        }),
     }
 }
 
@@ -2329,9 +2337,16 @@ mod tests {
     }
 
     fn deferred_for_template() -> crate::parser::DeferredForExpression {
+        deferred_for_template_at(Some("main.crn".to_string()), 12)
+    }
+
+    fn deferred_for_template_at(
+        file: Option<String>,
+        line: usize,
+    ) -> crate::parser::DeferredForExpression {
         crate::parser::DeferredForExpression::new(
-            Some("main.crn".to_string()),
-            12,
+            file,
+            line,
             "for opt in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound("validation_records")
                 .expect("fixture binding is valid"),
@@ -2348,9 +2363,7 @@ mod tests {
     }
 
     fn deferred_replace_effect() -> Effect {
-        let mut template = deferred_for_template();
-        template.file = None;
-        template.line = 0;
+        let template = deferred_for_template_at(None, 0);
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -2607,7 +2620,8 @@ mod tests {
         ]));
         let err = resolve_import_identifier(&v).unwrap_err();
         assert!(
-            err.contains("did not resolve to a concrete string"),
+            err.to_string()
+                .contains("did not resolve to a concrete string"),
             "unexpected error message: {err}"
         );
         // Sanity: still passes for a concrete String/EnumIdentifier.
@@ -2638,9 +2652,7 @@ mod tests {
 
     #[test]
     fn deferred_replace_blocking_bindings_includes_upstream_and_delete_deps() {
-        let mut template = deferred_for_template();
-        template.file = None;
-        template.line = 0;
+        let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -2666,9 +2678,7 @@ mod tests {
 
     #[test]
     fn deferred_replace_explicit_dependencies_unions_delete_explicit_deps() {
-        let mut template = deferred_for_template();
-        template.file = None;
-        template.line = 0;
+        let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -2715,8 +2725,8 @@ mod tests {
         match decoded {
             Effect::DeferredCreate(payload) => {
                 let template = payload.template;
-                assert_eq!(template.file, None);
-                assert_eq!(template.line, 0);
+                assert_eq!(template.file(), Some("main.crn"));
+                assert_eq!(template.line(), 12);
                 assert_eq!(template.header, "for opt in cert.domain_validation_options");
                 assert_eq!(template.resource_type(), "route53.Record");
                 assert_eq!(

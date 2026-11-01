@@ -3475,9 +3475,9 @@ impl Provider for ApplyTimeReadProvider {
                 id.identity_str().expect("resolved identity").to_string(),
                 attrs.clone(),
             );
-            Ok(carina_core::provider::UpdateOutcome::Success {
-                state: AppliedState::from_identifier(id, identifier, attrs),
-            })
+            Ok(carina_core::provider::UpdateOutcome::success(
+                AppliedState::from_identifier(id, identifier, attrs),
+            ))
         })
     }
 
@@ -9687,7 +9687,8 @@ mod apply_deferred_for_parity {
 mod saved_plan_version_tests {
 
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 36 adds typed
+    //! `carina plan` is the supported migration. Version 37 requires deferred
+    //! diagnostic locations. Version 36 adds typed
     //! deferred-for templates and stage-specific placeholder types. Version 35
     //! stores tri-state prevent-destroy directives and the approved state-only
     //! directive change set. Version 34 adds Int-only integer arithmetic.
@@ -9800,12 +9801,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            36,
-            "carina#4094 uses saved-plan format 36 after carina#4150 format 35",
+            37,
+            "carina#4174 requires saved-plan format 37 for diagnostic locations",
         );
-        let previous = 35;
+        let previous = 36;
 
-        for older_version in [previous, 34, 33, 32] {
+        for older_version in [previous, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
@@ -10963,21 +10964,10 @@ fn apply_exit_code_prioritizes_failure_over_partial() {
 
 #[test]
 fn skipped_export_does_not_downgrade_partial_success() {
-    let result: ExecutionResult = ExecutionResult {
-        success_count: 0,
-        failure_count: 0,
-        partial_count: 1,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::new(),
-        runtime_synthesized_resources: Vec::new(),
-        successfully_deleted: HashSet::new(),
-        permanent_name_overrides: HashMap::new(),
-        managed_current: HashMap::new(),
-        data_source_states: HashMap::new(),
-        bindings: Default::default(),
-        failed_refreshes: HashSet::new(),
+    let result = {
+        let mut result: ExecutionResult = ExecutionResult::empty();
+        result.partial_count = 1;
+        result
     };
 
     let err = finish_apply(
@@ -10998,28 +10988,57 @@ fn skipped_export_does_not_downgrade_partial_success() {
 
 #[test]
 fn interrupted_apply_summary_counts_unknown_outcome() {
-    let result: ExecutionResult = ExecutionResult {
-        success_count: 1,
-        failure_count: 0,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 1,
-        applied_states: HashMap::new(),
-        runtime_synthesized_resources: Vec::new(),
-        successfully_deleted: HashSet::new(),
-        permanent_name_overrides: HashMap::new(),
-        managed_current: HashMap::new(),
-        data_source_states: HashMap::new(),
-        bindings: Default::default(),
-        failed_refreshes: HashSet::new(),
+    let result = {
+        let mut result: ExecutionResult = ExecutionResult::empty();
+        result.success_count = 1;
+        result.interrupted_count = 1;
+        result
     };
 
     let err = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
 
-    assert!(matches!(&err, AppError::Config(_)));
+    assert!(matches!(&err, AppError::ExecutionFailed(_)));
     assert_eq!(
         err.to_string(),
         "Apply failed. 1 succeeded, 1 outcome unknown."
     );
+}
+
+#[test]
+fn failed_apply_final_error_names_endpoint_and_typed_cause() {
+    let effect = Effect::Create(carina_core::resource::ResolvedResource::new(Resource::new(
+        "test.resource",
+        "failed",
+    )));
+    let mut result: ExecutionResult = ExecutionResult::empty();
+    result.failure_sink().record(
+        &carina_core::executor::NoopExecutionObserver,
+        carina_core::executor::FailureReport::Effect {
+            effect: &effect,
+            kind: carina_core::executor::EffectFailureKind::execution_with_context(
+                "apply context",
+                std::io::Error::other("root detail"),
+            ),
+            context: carina_core::executor::FailureEventContext {
+                recovery: None,
+                duration: Duration::ZERO,
+                progress: carina_core::executor::ProgressInfo {
+                    completed: 1,
+                    total: 1,
+                },
+            },
+        },
+    );
+    let error = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("create test.resource.failed: execution error")
+            && !rendered.contains("root detail"),
+        "final error lost retained failures: {rendered}"
+    );
+    let AppError::ExecutionFailed(report) = error else {
+        panic!("failure summaries must be typed");
+    };
+    assert_eq!(report.failures().len(), 1);
+    assert!(report.failures()[0].to_string().contains("root detail"));
 }

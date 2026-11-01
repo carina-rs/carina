@@ -9,7 +9,7 @@ use carina_plugin_sdk::core::schema::{
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
-    PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, UpdateOutcome,
+    PendingDelete, PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, UpdateOutcome,
 };
 
 use carina_provider_mock_http::send_phase::{self, PreparedCreate, ProbeKind};
@@ -173,6 +173,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         _poll: Poll<Self::CreateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         unreachable!("the NaN fixture token cannot cross the guest boundary")
     }
@@ -182,6 +183,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         _resume: Resume<Self::CreateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         unreachable!("the NaN fixture token cannot cross the guest boundary")
     }
@@ -205,6 +207,7 @@ impl CarinaProvider for MockHttpProvider {
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
         match pending.token {}
     }
@@ -223,7 +226,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: DeleteRequest,
-        pending: Pending<Self::DeleteToken>,
+        pending: PendingDelete<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
         match pending.token {}
     }

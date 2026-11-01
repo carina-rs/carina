@@ -2265,9 +2265,8 @@ pub(super) fn prefix_parsed_deferred_for_expression(
         arguments,
     )?;
     let rebuild = |body| {
-        ParsedDeferredForExpression::new(
-            deferred.file.clone(),
-            deferred.line,
+        ParsedDeferredForExpression::from_location(
+            deferred.location().clone(),
             deferred.span,
             deferred.header.clone(),
             target.clone(),

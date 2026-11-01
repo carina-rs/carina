@@ -132,7 +132,7 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
     template_resource.set_attr("value", for_value_access(&["resource_record", "value"]));
 
     crate::parser::DeferredForExpression::new(
-        None,
+        Some("main.crn".to_string()),
         1,
         "for opt in cert.domain_validation_options".to_string(),
         crate::parser::DeferredForTarget::bound("validation_records")
@@ -386,6 +386,7 @@ enum ClassifiedCreateFixture {
 
 enum ResumeFixture {
     Resumed,
+    Partial,
     CreatedFound,
     CreatedNotFound,
     CreatedReadFailed,
@@ -435,12 +436,11 @@ impl MockProvider {
     }
 
     fn push_update(&self, result: ProviderResult<State>) {
-        self.update_results
-            .lock()
-            .unwrap()
-            .push(result.map(|state| crate::provider::UpdateOutcome::Success {
-                state: applied_state_for_test(state),
-            }));
+        self.update_results.lock().unwrap().push(
+            result.map(|state| {
+                crate::provider::UpdateOutcome::success(applied_state_for_test(state))
+            }),
+        );
     }
 
     fn push_read(&self, result: ProviderResult<State>) {
@@ -630,6 +630,26 @@ impl Provider for MockProvider {
                     );
                     Ok(resumed.completed(observed))
                 }
+                ResumeFixture::Partial => {
+                    let (resume, _create_request) = request.into_parts();
+                    let crate::provider::Resume::Issued(resumed) = resume else {
+                        return Err(resume.preserve(ProviderError::internal(
+                            "partial fixture requires an issued continuation",
+                        )));
+                    };
+                    let identifier = resumed.identifier().as_str().to_string();
+                    Ok(resumed.partial(
+                        HashMap::from([(
+                            "id".to_string(),
+                            Value::Concrete(ConcreteValue::String(identifier.into())),
+                        )]),
+                        crate::provider::PartialReadDiagnostic::new(
+                            "resumed read-back is incomplete".into(),
+                            vec!["computed".into()],
+                        )
+                        .expect("fixture has a missing attribute"),
+                    ))
+                }
                 ResumeFixture::CreatedFound => {
                     let (resume, _create_request) = request.into_parts();
                     let crate::provider::Resume::Issued(resumed) = resume else {
@@ -788,8 +808,10 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
         ExecutionEvent::EffectPartiallySucceeded { effect, .. } => {
             format!("partial:{}", effect.resource_id())
         }
-        ExecutionEvent::EffectFailed { effect, error, .. } => {
-            format!("failed:{}:{}", effect.resource_id(), error)
+        ExecutionEvent::EffectFailed {
+            effect, failure, ..
+        } => {
+            format!("failed:{}:{}", effect.resource_id(), failure)
         }
         ExecutionEvent::EffectSkipped { effect, reason, .. } => {
             format!("skipped:{}:{}", effect.resource_id(), reason)
@@ -824,8 +846,8 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
         ExecutionEvent::RefreshFailed { id, error } => {
             format!("refresh_fail:{}:{}", id, error)
         }
-        ExecutionEvent::ModuleConstraintFailed { error } => {
-            format!("module_constraint_failed:{error}")
+        ExecutionEvent::ModuleConstraintFailed { failure } => {
+            format!("module_constraint_failed:{failure}")
         }
     }
 }
@@ -864,7 +886,9 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
         ExecutionOutcome::Completed(result) => result,
         ExecutionOutcome::Cancelled(result) => panic!(
             "uncancelled execution returned Cancelled: success={}, failure={}, skip={}",
-            result.success_count, result.failure_count, result.skip_count
+            result.success_count,
+            result.failure_count(),
+            result.skip_count
         ),
     }
 }
@@ -1288,7 +1312,7 @@ fn ok_state(id: &ResourceId) -> State {
 fn empty_execution_result() -> ExecutionResult {
     ExecutionResult {
         success_count: 0,
-        failure_count: 0,
+        failures: FailureSink::default(),
         partial_count: 0,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
@@ -1444,10 +1468,10 @@ impl Provider for DelayedCountingProvider {
                 "finalized".to_string(),
                 Value::Concrete(ConcreteValue::Bool(true)),
             );
-            Ok(crate::provider::UpdateOutcome::Success {
-                state: AppliedState::new(id, "finalized-id", attrs)
+            Ok(crate::provider::UpdateOutcome::success(
+                AppliedState::new(id, "finalized-id", attrs)
                     .expect("fixture identifier is non-empty"),
-            })
+            ))
         })
     }
 
@@ -2004,7 +2028,7 @@ fn execution_outcome_completed_and_cancelled_are_matchable() {
 
     match cancelled {
         ExecutionOutcome::Cancelled(result) => {
-            assert_eq!(result.failure_count, 0);
+            assert_eq!(result.failure_count(), 0);
             assert!(result.successfully_deleted.is_empty());
         }
         ExecutionOutcome::Completed(_) => panic!("cancelled outcome changed variant"),
@@ -2045,7 +2069,7 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
 
     match outcome {
         ExecutionOutcome::Completed(result) => {
-            assert_eq!(result.failure_count, 0);
+            assert_eq!(result.failure_count(), 0);
             assert_eq!(result.success_count, 1);
         }
         ExecutionOutcome::Cancelled(_) => panic!("uncancelled execution returned Cancelled"),
@@ -2241,7 +2265,7 @@ async fn create_success_publishes_complete() {
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (2, 0, 0)
@@ -2254,6 +2278,265 @@ async fn create_success_publishes_complete() {
         result.applied_states.get(&dependent_id),
         Some(Applied::Complete { .. })
     ));
+}
+
+#[tokio::test]
+async fn dependency_cycle_records_members_and_emits_failure_events() {
+    let provider = MockProvider::new();
+    let first = make_resource("cycle_first", &["cycle_second"]);
+    let second = make_resource("cycle_second", &["cycle_first"]);
+    let first_id = first.id.clone();
+    let second_id = second.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(first));
+    plan.add(create_effect(second));
+    let observer = MockObserver::new();
+
+    let result =
+        execute_lifecycle_fixture_with_observer(&provider, &plan, HashMap::new(), &observer).await;
+
+    assert_eq!(result.failure_count(), 2);
+    assert_eq!(
+        result
+            .failures()
+            .iter()
+            .filter(|failure| matches!(failure.kind(), EffectFailureKind::DependencyCycle { .. }))
+            .count(),
+        1,
+    );
+    assert!(result.failures().iter().all(|failure| {
+        let cycle = match failure.kind() {
+            EffectFailureKind::DependencyCycle { cycle }
+            | EffectFailureKind::BlockedByDependencyCycle { cycle } => cycle,
+            _ => return false,
+        };
+        let members = cycle
+            .members()
+            .iter()
+            .map(|member| member.resource_id())
+            .collect::<HashSet<_>>();
+        members == HashSet::from([&first_id, &second_id])
+    }));
+    let events = observer.events();
+    let cycle = effect_failure_event(&events, &first_id);
+    assert!(cycle.contains("dependency cycle"), "event: {cycle}");
+    assert!(cycle.contains(&first_id.to_string()), "event: {cycle}");
+    assert!(cycle.contains(&second_id.to_string()), "event: {cycle}");
+    let blocked = effect_failure_event(&events, &second_id);
+    assert!(
+        blocked.contains(&format!(
+            "blocked by the dependency cycle containing create {first_id}"
+        )),
+        "event: {blocked}"
+    );
+    assert!(
+        !blocked.contains('{'),
+        "blocked events must not repeat the cycle: {blocked}"
+    );
+}
+
+#[test]
+fn independent_dependency_cycles_have_unambiguous_blocked_references() {
+    let effects = [
+        create_effect(make_resource("a", &["b"])),
+        create_effect(make_resource("b", &["a"])),
+        create_effect(make_resource("c", &["d"])),
+        create_effect(make_resource("d", &["c"])),
+        create_effect(make_resource("e", &["c"])),
+    ];
+    let deps = HashMap::from([
+        (0, HashSet::from([1])),
+        (1, HashSet::from([0])),
+        (2, HashSet::from([3])),
+        (3, HashSet::from([2])),
+        (4, HashSet::from([2])),
+    ]);
+    let failures = classify_stalled_effects(
+        &effects,
+        &deps,
+        &HashSet::from([0, 1, 2, 3, 4]),
+        &HashSet::new(),
+    );
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|(_, kind)| matches!(kind, EffectFailureKind::DependencyCycle { .. }))
+            .count(),
+        2
+    );
+    for (idx, first) in [(1, 0), (3, 2), (4, 2)] {
+        let kind = &failures.iter().find(|(index, _)| *index == idx).unwrap().1;
+        let message = kind.to_string();
+        assert_eq!(
+            message,
+            format!(
+                "blocked by the dependency cycle containing {}",
+                EffectEndpoint::from_effect(&effects[first])
+            )
+        );
+        assert!(
+            !message.contains('{'),
+            "blocked references must not repeat members: {message}"
+        );
+    }
+}
+
+#[test]
+fn stalled_acyclic_graph_reports_unsatisfied_dependencies_without_inventing_cycle() {
+    let effects = [
+        create_effect(make_resource("stuck", &[])),
+        create_effect(make_resource("not_completed", &[])),
+    ];
+    let failures = classify_stalled_effects(
+        &effects,
+        &HashMap::from([(0, HashSet::from([1]))]),
+        &HashSet::from([0]),
+        &HashSet::new(),
+    );
+    assert_eq!(failures.len(), 1);
+    let rendered = failures[0].1.to_string();
+    assert!(!rendered.contains("cycle"), "acyclic graph: {rendered}");
+    assert!(
+        rendered.contains("no progress") && rendered.contains("not_completed"),
+        "unsatisfied dependency must be named: {rendered}"
+    );
+}
+
+#[test]
+fn completed_dependency_does_not_attribute_an_unrelated_cycle_to_stuck_effect() {
+    let effects = ["cycle_a", "cycle_b", "stuck", "external", "completed"]
+        .map(|name| create_effect(make_resource(name, &[])));
+    let failures = classify_stalled_effects(
+        &effects,
+        &HashMap::from([
+            (0, HashSet::from([1])),
+            (1, HashSet::from([0])),
+            (2, HashSet::from([3, 4])),
+            (4, HashSet::from([0])),
+        ]),
+        &HashSet::from([0, 1, 2]),
+        &HashSet::from([4]),
+    );
+    let failure = &failures.iter().find(|(idx, _)| *idx == 2).unwrap().1;
+    assert!(
+        matches!(failure, EffectFailureKind::NoProgress { .. }),
+        "completed dependencies cannot block: {failure:?}"
+    );
+    let reason = failure.to_string();
+    assert!(
+        reason.contains("external") && !reason.contains("completed") && !reason.contains("cycle_a"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn dependency_cycle_display_does_not_claim_index_order_is_an_edge_path() {
+    let effects = [
+        create_effect(make_resource("first", &[])),
+        create_effect(make_resource("second", &[])),
+        create_effect(make_resource("third", &[])),
+    ];
+    let failures = classify_stalled_effects(
+        &effects,
+        &HashMap::from([
+            (0, HashSet::from([2])),
+            (2, HashSet::from([1])),
+            (1, HashSet::from([0])),
+        ]),
+        &HashSet::from([0, 1, 2]),
+        &HashSet::new(),
+    );
+    let rendered = failures[0].1.to_string();
+    assert!(
+        !rendered.contains("first -> create test.second"),
+        "index order is not a path: {rendered}"
+    );
+    assert!(
+        rendered.contains("first") && rendered.contains("second") && rendered.contains("third")
+    );
+}
+
+#[test]
+fn effect_failure_display_includes_the_complete_typed_source_chain() {
+    let effect = create_effect(make_resource("failed", &[]));
+    let failure = EffectFailure::new(
+        &effect,
+        EffectFailureKind::execution_with_context(
+            "outer context",
+            std::io::Error::other("root detail"),
+        ),
+    );
+    let rendered = failure.to_string();
+    assert!(
+        rendered.contains("outer context") && rendered.contains("root detail"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn preparation_provider_failure_preserves_the_original_source_chain() {
+    let effect = create_effect(make_resource("preparation", &[]));
+    let error = ProviderPreparationError::from(ProviderError::internal_caused_by(
+        "normalization failed",
+        std::io::Error::other("normalizer root detail"),
+    ));
+    let failure = EffectFailure::new(&effect, EffectFailureKind::execution(error));
+    assert!(
+        failure.to_string().contains("normalizer root detail"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn recording_failure_reports_the_retained_typed_reason() {
+    let effect = create_effect(make_resource("reported", &[]));
+    let observer = MockObserver::new();
+    let mut result = empty_execution_result();
+    result.failure_sink().record(
+        &observer,
+        FailureReport::Effect {
+            effect: &effect,
+            kind: EffectFailureKind::execution_with_context(
+                "context",
+                std::io::Error::other("root detail"),
+            ),
+            context: FailureEventContext {
+                recovery: None,
+                duration: Duration::ZERO,
+                progress: ProgressInfo {
+                    completed: 1,
+                    total: 1,
+                },
+            },
+        },
+    );
+    assert_eq!(result.failure_count(), 1);
+    let events = observer.events();
+    assert!(effect_failure_event(&events, effect.resource_id()).contains("root detail"));
+}
+
+#[tokio::test]
+async fn unresolved_serialization_failure_keeps_its_typed_error() {
+    let mut resource = make_resource("unknown", &[]);
+    resource.set_attr(
+        "value",
+        Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "upstream".into(),
+            },
+        )),
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    let provider = MockProvider::new();
+    let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
+    let EffectFailureKind::Execution { error } = result.failures()[0].kind() else {
+        panic!("expected a resolution failure");
+    };
+    assert!(
+        error.as_error().is::<crate::value::SerializationError>(),
+        "typed serialization error was flattened: {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -2281,7 +2564,7 @@ async fn resume_resumed_publishes_observed() {
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (2, 0, 0)
@@ -2297,6 +2580,84 @@ async fn resume_resumed_publishes_observed() {
         result.applied_states.get(&dependent_id),
         Some(Applied::Complete { .. })
     ));
+}
+
+#[tokio::test]
+async fn resumed_partial_success_reports_once_and_preserves_partial_binding() {
+    let provider = MockProvider::new();
+    let source = make_resource("source", &[]);
+    let dependent = make_resource("dependent", &["source"]);
+    let source_id = source.id.clone();
+    let dependent_id = dependent.id.clone();
+    let pending = persisted_create_for_executor(&source_id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(resolved(source), pending.started_at().clone());
+    plan.add(create_effect(dependent));
+    provider.push_resume(ResumeFixture::Partial);
+    provider.push_create(Ok(ok_state(&dependent_id)));
+    let observer = MockObserver::new();
+
+    let result = execute_lifecycle_fixture_with_observer(
+        &provider,
+        &plan,
+        HashMap::from([(source_id.clone(), Current::CreateInFlight(pending))]),
+        &observer,
+    )
+    .await;
+
+    assert_eq!(
+        (
+            result.success_count,
+            result.partial_count,
+            result.failure_count(),
+            result.skip_count
+        ),
+        (1, 1, 0, 0)
+    );
+    let events = observer.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event == format!("partial:{source_id}"))
+            .count(),
+        1,
+        "the resumed partial result must emit exactly one partial terminal event: {events:?}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event == &format!("succeeded:{source_id}")
+                || event.starts_with(&format!("failed:{source_id}:")))
+    );
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
+        panic!("partial resume must retain its observed create")
+    };
+    assert!(matches!(
+        created.sent(),
+        crate::provider::SentRecord::Persisted(_)
+    ));
+    assert!(created.observed_state().partial_read.is_some());
+    assert!(result.applied_states.contains_key(&dependent_id));
+    assert_eq!(
+        result.partial_diagnostics[0].1.reason(),
+        "resumed read-back is incomplete"
+    );
+    assert!(matches!(
+        result.bindings.completeness("source"),
+        Some(crate::binding_index::BindingCompleteness::PartialReadBack(
+            _
+        ))
+    ));
+    assert!(
+        result
+            .bindings
+            .attribute_value_is_definitive("source", "id")
+    );
+    assert!(
+        !result
+            .bindings
+            .attribute_value_is_definitive("source", "computed")
+    );
 }
 
 #[tokio::test]
@@ -2364,7 +2725,7 @@ async fn create_untracked_skips_dependents_and_writes_nothing() {
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (0, 1, 1)
@@ -2404,7 +2765,7 @@ async fn create_before_destroy_outcome_unknown_records_replacement_create_state(
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (0, 1, 1)
@@ -2444,7 +2805,7 @@ async fn resume_ended_skips_dependents_and_marks_create_ended() {
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (0, 1, 1)
@@ -2475,7 +2836,7 @@ async fn created_failure_records_observation() {
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (0, 1, 1)
@@ -2671,7 +3032,7 @@ async fn in_flight_failure_records_pending() {
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (0, 1, 1)
@@ -2706,7 +3067,7 @@ async fn resume_resolution_failure_has_no_applied_entry() {
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (0, 1, 0)
@@ -2737,7 +3098,7 @@ async fn skipped_or_cancelled_resume_has_no_applied_entry() {
     assert_eq!(
         (
             result.success_count,
-            result.failure_count,
+            result.failure_count(),
             result.skip_count
         ),
         (0, 1, 1)
@@ -2874,7 +3235,7 @@ async fn invalid_resolved_create_value_never_reaches_provider() {
     );
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(provider.calls().is_empty());
 }
 
@@ -2934,7 +3295,7 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
     let events = observer.events().join("\n");
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(provider.calls().is_empty());
     assert!(events.contains("(secret)"), "events: {events}");
     assert!(
@@ -3007,7 +3368,7 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
     );
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(provider.calls().is_empty());
 }
 
@@ -3095,7 +3456,7 @@ async fn runtime_integer_arithmetic_failures_abort_before_dependent_provider_cal
             execute_plan(&provider, input, &observer, uncancelled_shutdown()).await,
         );
         assert_eq!(result.success_count, 0, "{name}: {:?}", observer.events());
-        assert_eq!(result.failure_count, 1, "{name}: {:?}", observer.events());
+        assert_eq!(result.failure_count(), 1, "{name}: {:?}", observer.events());
         assert!(
             provider.calls().is_empty(),
             "{name}: arithmetic failure crossed the provider boundary"
@@ -3166,7 +3527,7 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
     );
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(provider.calls().is_empty());
 }
 
@@ -3228,7 +3589,7 @@ async fn execute_plan_missing_update_schema_fails_before_provider_update() {
     );
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     let events = observer.events();
     assert!(
         events.iter().any(|event| {
@@ -3342,7 +3703,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     );
 
     assert_eq!(result.success_count, 2);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert_eq!(
         provider.captured_create_resources()[0].get_attr("target"),
         Some(&create_value)
@@ -3481,7 +3842,7 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
         .await,
     );
 
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     let requests = provider.captured_update_requests();
     assert!(
         requests[0].patch().ops.iter().any(
@@ -3567,7 +3928,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
     );
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(
         provider.calls(),
         vec![("create".to_string(), producer_id.to_string())]
@@ -3672,7 +4033,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     );
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(
         provider.calls(),
         vec![("create".to_string(), producer_id.to_string())]
@@ -3741,7 +4102,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
     );
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(
         provider.calls(),
         vec![("create".to_string(), cert_id.to_string())]
@@ -3813,7 +4174,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(provider.captured_data_source_reads().is_empty());
     assert_eq!(
         provider.calls(),
@@ -3911,7 +4272,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
         "schema-invalid apply-resolved data source reached the provider"
     );
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(
         provider.calls(),
         vec![("create".to_string(), upstream_id.to_string())]
@@ -4091,7 +4452,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
         "module-invalid apply-resolved data source reached the provider"
     );
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(
         provider.calls(),
         vec![("create".to_string(), upstream_id.to_string())]
@@ -4188,7 +4549,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(
         provider.calls(),
         vec![("create".to_string(), producer_id.to_string())]
@@ -4254,7 +4615,7 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(provider.calls().is_empty());
     let events = observer.events().join("\n");
     assert!(events.contains("root.outer.inner"), "events: {events}");
@@ -4330,7 +4691,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
         provider.captured_create_resources()
     );
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
 }
 
 #[tokio::test]
@@ -4402,7 +4763,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
         provider.captured_create_resources()
     );
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
 }
 
 #[tokio::test]
@@ -4445,7 +4806,7 @@ async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
 
     assert!(provider.calls().is_empty());
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 2);
+    assert_eq!(result.failure_count(), 2);
     let events = observer.events().join("\n");
     assert_eq!(
         events.matches("value must not be bad").count(),
@@ -4526,7 +4887,7 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
     );
 
     assert_eq!(result.success_count, 2);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(
         provider.calls(),
         vec![
@@ -4574,7 +4935,7 @@ async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(
         provider.calls(),
         vec![("create".to_string(), resource_id.to_string())]
@@ -4637,7 +4998,7 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 2);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert_eq!(
         provider.calls(),
         vec![
@@ -4693,7 +5054,7 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     let events = observer.events().join("\n");
     for expected in [
         "checked_module",
@@ -4734,7 +5095,7 @@ async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     let events = observer.events().join("\n");
     for expected in [
         "checked_module",
@@ -4783,7 +5144,7 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     let events = observer.events().join("\n");
 
-    assert_eq!(result.failure_count, 1, "events: {events}");
+    assert_eq!(result.failure_count(), 1, "events: {events}");
     assert_eq!(result.skip_count, 1, "events: {events}");
     assert!(
         events.contains("upstream create failed"),
@@ -4832,7 +5193,7 @@ async fn terminal_pending_constraint_is_silent_after_failure_without_skips() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     let events = observer.events().join("\n");
 
-    assert_eq!(result.failure_count, 1, "events: {events}");
+    assert_eq!(result.failure_count(), 1, "events: {events}");
     assert_eq!(result.skip_count, 0, "events: {events}");
     assert!(
         events.contains("standalone create failed"),
@@ -4906,7 +5267,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     let events = observer.events().join("\n");
 
-    assert_eq!(result.failure_count, 0, "events: {events}");
+    assert_eq!(result.failure_count(), 0, "events: {events}");
     assert_eq!(result.skip_count, 1, "events: {events}");
     assert!(events.contains("no mutator remaining"), "events: {events}");
     assert!(
@@ -5235,7 +5596,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         "cancelled Wait must not mark its binding failed; events: {events:?}"
     );
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert_eq!(result.skip_count, 2);
 }
 
@@ -5498,7 +5859,7 @@ async fn test_simple_create() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert!(
         observer
             .events()
@@ -5548,7 +5909,7 @@ async fn partial_create_records_state_and_diagnostic() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert_eq!(result.partial_count, 1);
     assert!(result.applied_states.contains_key(&rid));
     assert_eq!(result.partial_diagnostics, vec![(rid, diagnostic)]);
@@ -5705,7 +6066,8 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
         "apply revalidated the plan-normalized literal instead of only the runtime value: {events}"
     );
     assert_eq!(
-        result.failure_count, 0,
+        result.failure_count(),
+        0,
         "normalized literals were checked in authored form during planning"
     );
     assert_eq!(result.success_count, 1);
@@ -5779,7 +6141,7 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     let events = observer.events().join("\n");
 
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(
         events.contains("missing authored value origin for plan-normalized resource"),
         "expected an executor invariant error, got: {events}"
@@ -5899,7 +6261,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     let events = observer.events().join("\n");
 
-    assert_eq!(result.failure_count, 0, "{events}");
+    assert_eq!(result.failure_count(), 0, "{events}");
     assert_eq!(result.success_count, 2, "{events}");
     assert_eq!(provider.captured_data_source_reads().len(), 1);
 }
@@ -6788,7 +7150,7 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         .await,
     );
     assert_eq!(result.success_count, 2);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     let created = provider.captured_create_resources();
     let applied_consumer = created
         .iter()
@@ -7021,7 +7383,7 @@ async fn test_failed_effect_propagates_to_dependent() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(result.skip_count, 1);
     assert!(observer.events().iter().any(|e| e.contains("failed:")));
     assert!(
@@ -7100,7 +7462,7 @@ async fn test_read_effect_is_no_op() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert!(provider.calls().is_empty());
 }
 
@@ -7173,7 +7535,7 @@ async fn release_list_keys_never_reaches_provider_executor() {
     );
 
     assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert!(provider.calls().is_empty());
 }
 
@@ -7220,7 +7582,7 @@ async fn test_independent_effects_run_in_parallel() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 3);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
 
     // vpc should be created first (level 0), before either subnet
     let calls = provider.calls();
@@ -7278,7 +7640,7 @@ async fn test_parallel_failure_skips_dependents() {
 
     // vpc + subnet_b succeed, subnet_a fails, subnet_c skipped
     assert_eq!(result.success_count, 2);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(result.skip_count, 1);
 
     // Verify subnet_c was skipped due to subnet_a failure
@@ -7582,7 +7944,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 3);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
 
     // Verify C completed before B.
     // With fine-grained scheduling, C starts right after A completes
@@ -7687,10 +8049,10 @@ impl Provider for YieldingUpdateProvider {
                     Value::Concrete(ConcreteValue::String("provider-violated-id".into())),
                 );
             }
-            Ok(crate::provider::UpdateOutcome::Success {
-                state: AppliedState::new(id, identifier, attrs)
+            Ok(crate::provider::UpdateOutcome::success(
+                AppliedState::new(id, identifier, attrs)
                     .expect("provider input identifier is non-empty"),
-            })
+            ))
         })
     }
 
@@ -7816,7 +8178,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 13);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     provider.max_active()
 }
 
@@ -7894,7 +8256,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 2);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     provider.max_active()
 }
 
@@ -8240,12 +8602,86 @@ async fn test_update_effect_binding_map_propagation() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert!(result.applied_states.contains_key(&ra_id));
 
     let events = observer.events();
     assert!(events.iter().any(|e| e.starts_with("started:")));
     assert!(events.iter().any(|e| e.starts_with("succeeded:")));
+}
+
+#[tokio::test]
+async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
+    let provider = MockProvider::new();
+    let id = ResourceId::with_identity("test", "update-recovery");
+    let from = State::existing(id.clone(), HashMap::new()).with_identifier("stable-update-id");
+    let to = make_resource("update-recovery", &[]);
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        identifier: crate::effect::fixture_applied_identifier("stable-update-id"),
+        from: Box::new(from.clone()),
+        to: resolved(to),
+        changed_attributes: vec!["some_attr".to_string()],
+    });
+    provider.push_update(Err(ProviderError::internal(
+        "WASM provider update violated the read-back polling protocol",
+    )));
+    provider.push_read(Ok(State::existing(
+        id.clone(),
+        HashMap::from([(
+            "recovered".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )]),
+    )));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(id.clone(), Current::from_state(from))]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!((result.success_count, result.failure_count()), (0, 1));
+    assert!(matches!(
+        result.failures()[0].kind(),
+        EffectFailureKind::Provider { .. }
+    ));
+    assert!(
+        effect_failure_event(&observer.events(), &id)
+            .contains("WASM provider update violated the read-back polling protocol")
+    );
+    assert_eq!(
+        provider.calls(),
+        vec![
+            ("update".to_string(), id.to_string()),
+            ("read".to_string(), id.to_string()),
+        ]
+    );
+    let Current::Present(recovered) = result
+        .managed_current
+        .get(&id)
+        .expect("failed update must keep a recoverable current state")
+    else {
+        panic!("failed update recovery changed the current-state classification")
+    };
+    assert_eq!(recovered.identifier().as_str(), "stable-update-id");
+    assert_eq!(
+        recovered.state().attributes.get("recovered"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
 }
 
 /// Regression test for #1195: dependency analysis also respects delete dependencies.
@@ -8375,7 +8811,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 2, "Both resources should succeed");
-    assert_eq!(result.failure_count, 0, "No failures expected");
+    assert_eq!(result.failure_count(), 0, "No failures expected");
 
     // Check that the subnet received vpc_id = "vpc-12345" (resolved from state)
     let create_calls = provider.create_calls();
@@ -8620,7 +9056,10 @@ impl Provider for CascadeReplaceProvider {
 #[tokio::test]
 async fn cascading_replacement_child_create_uses_new_parent_binding() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
-    use crate::differ::create_plan_with_cascades;
+    use crate::differ::{
+        CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice,
+        create_plan_with_cascades,
+    };
     use crate::schema::SchemaRegistry;
 
     fn string(value: &str) -> Value {
@@ -8761,7 +9200,14 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     let desired = crate::resource::plan_input_desired_resources(&managed, &schemas);
     let plan = create_plan_with_cascades(
         &desired,
-        &unresolved,
+        CascadeDependents::new(
+            &unresolved,
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
         &[],
         &comparison_provider,
         crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
@@ -8772,7 +9218,8 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &[],
         &std::collections::HashSet::new(),
     )
-    .expect("test provider hints should succeed");
+    .expect("test provider hints should succeed")
+    .finish(|_| {});
     assert_eq!(plan.replace_display_info().count(), 2);
 
     let deps = build_dependency_analysis(
@@ -8829,7 +9276,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
 
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
-    assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
 
     let calls = provider.create_calls();
     let subnet_create = calls
@@ -8944,7 +9391,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         result.success_count,
         observer.events()
     );
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
 
     let calls = provider.calls();
     assert_eq!(calls[0], ("create".to_string(), cert_id.to_string()));
@@ -9094,7 +9541,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
-        result.failure_count,
+        result.failure_count(),
         0,
         "no effect should fail; events: {:?}",
         observer.events()
@@ -9305,7 +9752,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     // *before* reaching the provider — no `create` call for the
     // record should be recorded.
     assert_eq!(result.success_count, 1, "events: {:?}", observer.events());
-    assert_eq!(result.failure_count, 1, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
 
     let captured = provider.captured_create_resources();
     assert!(
@@ -9402,7 +9849,7 @@ async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 0, "events: {:?}", observer.events());
-    assert_eq!(result.failure_count, 1, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
     assert!(
         provider
             .captured_create_resources()
@@ -9569,7 +10016,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
-        result.failure_count,
+        result.failure_count(),
         0,
         "no failures expected; events: {:?}",
         observer.events()
@@ -9797,7 +10244,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
-        result.failure_count,
+        result.failure_count(),
         0,
         "wait must not fail; the just-created identifier should reach \
          provider.read. read identifiers seen: {:?}",
@@ -9816,7 +10263,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
 }
 
 #[tokio::test]
-async fn deferred_create_reports_iterable_reference_when_binding_missing() {
+async fn deferred_materialization_failure_retains_reason_in_result_and_event() {
     let provider = MockProvider::new();
     let mut plan = Plan::new();
     plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
@@ -9842,11 +10289,34 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
+    let [failure] = result.failures() else {
+        panic!(
+            "expected one retained deferred failure: {:?}",
+            result.failures()
+        );
+    };
+    let EffectFailureKind::DeferredMaterialization { failure } = failure.kind() else {
+        panic!("expected typed deferred materialization failure: {failure:?}");
+    };
+    assert!(matches!(
+        failure.as_ref(),
+        DeferredCreateFailure::IterableUnknown {
+            file: Some(file),
+            line: 1,
+            binding,
+            expression,
+            ..
+        } if file == "main.crn"
+            && binding == "validation_records"
+            && expression == "cert.domain_validation_options"
+    ));
     assert!(
         observer.events().iter().any(|event| {
             event.contains("failed:test.validation_records")
                 && event.contains("cert.domain_validation_options")
+                && event.contains("binding `validation_records`")
+                && event.contains("main.crn:1")
         }),
         "events: {:?}",
         observer.events(),
@@ -9889,7 +10359,7 @@ async fn apply_time_unbound_child_collision_with_another_desired_id_is_typed_err
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
     assert!(
         observer.events().iter().any(|event| {
             event.contains("anonymous")
@@ -9936,7 +10406,7 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
     assert!(
         observer.events().iter().any(|event| {
             event.contains("anonymous")
@@ -10002,7 +10472,7 @@ async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows()
 
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
-    assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
 
     let calls = provider.calls();
     assert!(
@@ -10042,7 +10512,7 @@ async fn unbound_deferred_replace_keeps_legacy_rows_when_gate_fails() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
     assert_eq!(result.skip_count, 1, "events: {:?}", observer.events());
     assert!(provider.calls().is_empty(), "calls: {:?}", provider.calls());
     assert!(
@@ -10105,7 +10575,7 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
     assert_eq!(result.success_count, 2, "events: {:?}", observer.events());
     let calls = provider.calls();
     assert!(
@@ -10151,7 +10621,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(observer.events().iter().any(|event| {
         event.contains("failed:test.validation_records")
             && event.contains("domain_validation_options")
@@ -10200,7 +10670,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(observer.events().iter().any(|event| {
         event.contains("failed:test.validation_records")
             && event.contains("expected list")
@@ -10297,7 +10767,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(
-        result.failure_count,
+        result.failure_count(),
         0,
         "events: {:?}; calls: {:?}",
         observer.events(),
@@ -10388,7 +10858,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert!(
         provider
             .calls()
@@ -10656,7 +11126,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     .expect("expanded DeferredReplace deletes must stay in in_flight");
     let result = completed_result(outcome);
 
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert!(
         result
             .runtime_synthesized_resources
@@ -10845,7 +11315,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
-        result.failure_count,
+        result.failure_count(),
         0,
         "data-source ref must resolve; pre-fix this errored with \
          'has not been published yet' (carina#3252). events: {:?}",
@@ -10988,7 +11458,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
-        result.failure_count,
+        result.failure_count(),
         0,
         "apply-time read must publish before the consumer runs; events: {:?}",
         observer.events(),
@@ -11125,7 +11595,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
-    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.failure_count(), 1);
     assert_eq!(result.skip_count, 1);
     let events = observer.events();
     assert!(
@@ -11211,7 +11681,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
     assert_eq!(result.success_count, 1);
     assert_eq!(
         provider.captured_data_source_reads().len(),
@@ -11311,7 +11781,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
-    assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
     assert_eq!(result.success_count, 1);
     assert_eq!(
         provider.captured_data_source_reads().len(),

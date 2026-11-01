@@ -1510,7 +1510,12 @@ mod tests {
         let mut bindings = ResolvedBindings::default();
         let empty = HashMap::new();
         let resolved = SecretPreservingAttributes::from_provider_values(&empty, &empty);
-        bindings.record_applied(Some("producer"), &resolved, &state);
+        bindings.record_applied(
+            Some("producer"),
+            &resolved,
+            &state,
+            crate::binding_index::BindingCompleteness::Complete,
+        );
         let default = Value::Concrete(ConcreteValue::String("fallback".into()));
         let expression = coalesce(
             Value::resource_ref("producer", "optional", vec![]),

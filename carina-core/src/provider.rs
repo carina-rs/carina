@@ -17,10 +17,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use tokio::sync::Notify;
 
+use carina_provider_protocol::CompletedOperation;
+pub use carina_provider_protocol::ReadBackEnd;
 use carina_provider_protocol::types as protocol_types;
 pub use carina_provider_protocol::types::{
-    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, ReferenceScope, ReferenceScopeError,
-    ReferenceScopeField, ReferenceScopeValues, Sent,
+    AppliedIdentifier, CreateProgress, EmptyAppliedIdentifier, PendingToken, ReferenceScope,
+    ReferenceScopeError, ReferenceScopeField, ReferenceScopeValues, Sent,
 };
 use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
@@ -2071,8 +2073,11 @@ pub(crate) fn fixture_read_outcome_for_identifier(
 ///     CreateOutcome::Success { state }
 /// }
 /// ```
-#[derive(Debug, PartialEq, Serialize)]
-pub struct CreateOutcome(CreateOutcomeKind);
+#[derive(Debug)]
+pub struct CreateOutcome {
+    kind: CreateOutcomeKind,
+    read_back_end: ReadBackEnd,
+}
 
 /// Read-only classification exposed by an opaque [`CreateOutcome`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -2087,8 +2092,15 @@ pub enum CreateOutcomeKind {
 }
 
 /// Result of a provider update operation.
+#[derive(Debug, Clone)]
+pub struct UpdateOutcome {
+    kind: UpdateOutcomeKind,
+    read_back_end: ReadBackEnd,
+}
+
+/// Read-only classification exposed by an opaque [`UpdateOutcome`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdateOutcome {
+pub enum UpdateOutcomeKind {
     /// Update completed and the returned state is complete.
     Success { state: AppliedState },
     /// Update completed but the provider could not fully observe state.
@@ -2179,7 +2191,7 @@ fn validate_utc_rfc3339(value: &str) -> Result<(), InvalidTimestamp> {
 pub struct PendingCreate {
     id: ResourceId,
     token: PendingToken,
-    identifier: Option<AppliedIdentifier>,
+    progress: CreateProgress,
     sent: Sent,
     poll_after_secs: u32,
     /// Time the current create request first returned a pending step. A
@@ -2193,7 +2205,7 @@ pub struct PendingCreate {
 pub struct FreshPendingCreate {
     id: ResourceId,
     token: PendingToken,
-    identifier: Option<AppliedIdentifier>,
+    progress: CreateProgress,
     sent: Sent,
     poll_after_secs: u32,
     started_at: Timestamp,
@@ -2204,7 +2216,7 @@ impl From<PendingCreate> for FreshPendingCreate {
         Self {
             id: pending.id,
             token: pending.token,
-            identifier: pending.identifier,
+            progress: pending.progress,
             sent: pending.sent,
             poll_after_secs: pending.poll_after_secs,
             started_at: pending.started_at,
@@ -2218,7 +2230,7 @@ impl FreshPendingCreate {
     }
 
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
 
     pub fn sent(&self) -> &Sent {
@@ -2240,6 +2252,14 @@ impl FreshPendingCreate {
         self.poll_after_secs
     }
 
+    pub fn progress(&self) -> &CreateProgress {
+        &self.progress
+    }
+
+    pub fn phase(&self) -> carina_provider_protocol::PendingPhase {
+        self.progress.phase()
+    }
+
     pub fn started_at(&self) -> &Timestamp {
         &self.started_at
     }
@@ -2253,7 +2273,7 @@ impl FreshPendingCreate {
             id: self.id.clone(),
             pending: PendingRecord::Persisted(PendingEnvelope::new(
                 self.token.clone(),
-                self.identifier.clone(),
+                self.identifier().cloned(),
                 write_only,
                 secrets,
             )),
@@ -2266,7 +2286,7 @@ impl FreshPendingCreate {
         PendingCreate {
             id: self.id,
             token: self.token,
-            identifier: self.identifier,
+            progress: self.progress,
             sent: self.sent,
             poll_after_secs: self.poll_after_secs,
             started_at: self.started_at,
@@ -2278,7 +2298,7 @@ impl PendingCreate {
     fn new(
         id: ResourceId,
         token: PendingToken,
-        identifier: Option<AppliedIdentifier>,
+        progress: CreateProgress,
         sent: Sent,
         poll_after_secs: u32,
         started_at: Timestamp,
@@ -2286,7 +2306,7 @@ impl PendingCreate {
         Self {
             id,
             token,
-            identifier,
+            progress,
             sent,
             poll_after_secs,
             started_at,
@@ -2298,7 +2318,7 @@ impl PendingCreate {
     }
 
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
 
     pub fn sent(&self) -> &Sent {
@@ -2309,6 +2329,14 @@ impl PendingCreate {
         self.poll_after_secs
     }
 
+    pub fn progress(&self) -> &CreateProgress {
+        &self.progress
+    }
+
+    pub fn phase(&self) -> carina_provider_protocol::PendingPhase {
+        self.progress.phase()
+    }
+
     pub fn started_at(&self) -> &Timestamp {
         &self.started_at
     }
@@ -2317,7 +2345,7 @@ impl PendingCreate {
     /// create when the provider reports that it can no longer track it.
     /// Consuming the witness makes the two outcomes mutually exclusive.
     pub fn untracked(self, error: ProviderError) -> CreateFailure {
-        if self.identifier.is_some() {
+        if self.identifier().is_some() {
             InFlightCreate::from_pending(self).into_create_failure(error)
         } else {
             CreateFailure::from_kind(CreateFailureKind::Untracked(error))
@@ -2339,7 +2367,7 @@ impl PendingCreate {
             id: self.id.clone(),
             pending: PendingRecord::Persisted(PendingEnvelope::new(
                 self.token.clone(),
-                self.identifier.clone(),
+                self.identifier().cloned(),
                 write_only,
                 secrets,
             )),
@@ -2350,7 +2378,7 @@ impl PendingCreate {
     /// Consume the continuation and recover the only poll witness valid for
     /// its identifier state.
     pub fn into_poll(self) -> Poll {
-        match self.identifier {
+        match self.progress.into_identifier() {
             Some(identifier) => Poll::Issued(IssuedCreate {
                 id: self.id,
                 identifier,
@@ -2405,7 +2433,7 @@ impl PollAttempt {
         PendingCreate::new(
             self.id,
             token,
-            None,
+            CreateProgress::Operating { identifier: None },
             self.sent,
             poll_after_secs,
             self.started_at,
@@ -2573,6 +2601,7 @@ pub struct ObservedCreate {
     identifier: AppliedIdentifier,
     observation: CreateObservation,
     sent: SentRecord,
+    partial_read: Option<Box<PartialReadDiagnostic>>,
     resolved_desired_attributes: Option<SecretPreservingAttributes>,
 }
 
@@ -2606,6 +2635,7 @@ impl ObservedCreate {
             identifier,
             observation,
             sent,
+            partial_read: None,
             resolved_desired_attributes: None,
         }
     }
@@ -2638,6 +2668,10 @@ impl ObservedCreate {
         &self.sent
     }
 
+    pub fn partial_read_diagnostic(&self) -> Option<&PartialReadDiagnostic> {
+        self.partial_read.as_deref()
+    }
+
     /// Resolved desired values and send evidence retained by the accepted
     /// create observation.
     pub fn sent_desired_attributes_for<'a, S>(
@@ -2657,6 +2691,18 @@ impl ObservedCreate {
     ) -> Self {
         self.resolved_desired_attributes = Some(attributes);
         self
+    }
+
+    fn with_partial_read(mut self, diagnostic: PartialReadDiagnostic) -> Self {
+        self.partial_read = Some(Box::new(diagnostic));
+        self
+    }
+
+    /// Attach a partial read-back diagnostic in cross-crate tests.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn with_partial_read_for_test(self, diagnostic: PartialReadDiagnostic) -> Self {
+        self.with_partial_read(diagnostic)
     }
 
     pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
@@ -2700,8 +2746,12 @@ impl ObservedCreate {
             CreateObservation::Observed(state) => state.attributes().clone(),
             CreateObservation::Unobserved(_reason) => HashMap::new(),
         };
-        State::existing(self.id.clone(), attributes)
-            .with_identifier(self.identifier.as_str().to_string())
+        let state = State::existing(self.id.clone(), attributes)
+            .with_identifier(self.identifier.as_str().to_string());
+        match &self.partial_read {
+            Some(diagnostic) => diagnostic.as_ref().clone().into_state_for_writeback(state),
+            None => state,
+        }
     }
 }
 
@@ -2942,14 +2992,14 @@ impl InFlightCreate {
             PendingRecord::Fresh(FreshPendingCreate {
                 id,
                 token: _old_token,
-                identifier,
+                progress,
                 sent,
                 poll_after_secs,
                 started_at,
             }) => PendingRecord::Fresh(FreshPendingCreate {
                 id,
                 token,
-                identifier,
+                progress,
                 sent,
                 poll_after_secs,
                 started_at,
@@ -2971,14 +3021,21 @@ impl InFlightCreate {
             PendingRecord::Fresh(FreshPendingCreate {
                 id,
                 token,
-                identifier: _old_identifier,
+                progress,
                 sent,
                 poll_after_secs,
                 started_at,
             }) => PendingRecord::Fresh(FreshPendingCreate {
                 id,
                 token,
-                identifier: Some(identifier),
+                progress: match progress {
+                    CreateProgress::Operating { .. } => CreateProgress::Operating {
+                        identifier: Some(identifier),
+                    },
+                    CreateProgress::ReadingBack { .. } => {
+                        CreateProgress::ReadingBack { identifier }
+                    }
+                },
                 sent,
                 poll_after_secs,
                 started_at,
@@ -3537,7 +3594,9 @@ impl CreateFailure {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ResumeOutcome(ResumeOutcomeKind);
+pub struct ResumeOutcome {
+    kind: ResumeOutcomeKind,
+}
 
 /// A resumed create that completed with an applied state.
 ///
@@ -3590,33 +3649,133 @@ impl CompletedResume {
     }
 }
 
+/// A resumed create whose resource is known but whose read-back is partial.
+///
+/// The completed observation retains the persisted continuation's sent-value
+/// authority; unlike a resent create, this type never invents a new `Sent`.
+#[derive(Debug)]
+pub struct PartialResume {
+    completed: CompletedResume,
+    diagnostic: PartialReadDiagnostic,
+    read_back_end: ReadBackEnd,
+}
+
+impl PartialResume {
+    fn new(
+        pending: InFlightCreate,
+        identifier: AppliedIdentifier,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> Self {
+        let state =
+            AppliedState::from_identifier(pending.id().clone(), identifier.clone(), attributes);
+        Self {
+            completed: CompletedResume::new(pending, identifier, state),
+            diagnostic,
+            read_back_end: ReadBackEnd::ProviderReported,
+        }
+    }
+
+    fn id(&self) -> &ResourceId {
+        self.completed.id()
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        self.completed.identifier()
+    }
+
+    pub fn diagnostic(&self) -> &PartialReadDiagnostic {
+        &self.diagnostic
+    }
+
+    pub fn observed_state(&self) -> State {
+        self.diagnostic
+            .clone()
+            .into_state_for_writeback(self.completed.observed_state())
+    }
+
+    pub(crate) fn with_resolved_desired_attributes(
+        self,
+        attributes: SecretPreservingAttributes,
+    ) -> Self {
+        Self {
+            completed: self.completed.with_resolved_desired_attributes(attributes),
+            diagnostic: self.diagnostic,
+            read_back_end: self.read_back_end,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (ObservedCreate, State, PartialReadDiagnostic, ReadBackEnd) {
+        let Self {
+            completed,
+            diagnostic,
+            read_back_end,
+        } = self;
+        let created = completed
+            .into_observed_create()
+            .with_partial_read(diagnostic.clone());
+        let state = created.observed_state();
+        (created, state, diagnostic, read_back_end)
+    }
+}
+
 /// Read-only classification exposed by an opaque [`ResumeOutcome`].
 #[derive(Debug)]
 pub enum ResumeOutcomeKind {
     Resumed(Box<CompletedResume>),
+    /// The persisted create completed, but its read-back remains incomplete.
+    /// This is distinct from `Resent`: no new create request or `sent` value
+    /// was fabricated to finish the resumed continuation.
+    PartialSuccess(Box<PartialResume>),
     Resent(Box<CreateOutcome>),
 }
 
 impl ResumeOutcome {
     fn resumed(completed: CompletedResume) -> Self {
-        Self(ResumeOutcomeKind::Resumed(Box::new(completed)))
+        Self {
+            kind: ResumeOutcomeKind::Resumed(Box::new(completed)),
+        }
     }
 
     fn resent(outcome: CreateOutcome) -> Self {
-        Self(ResumeOutcomeKind::Resent(Box::new(outcome)))
+        Self {
+            kind: ResumeOutcomeKind::Resent(Box::new(outcome)),
+        }
+    }
+
+    fn partial(outcome: PartialResume) -> Self {
+        Self {
+            kind: ResumeOutcomeKind::PartialSuccess(Box::new(outcome)),
+        }
+    }
+
+    /// Attach host-owned polling provenance from the pending driver.
+    pub fn from_host_completion(completed: CompletedOperation<Self>) -> Self {
+        let (mut outcome, read_back_end) = completed.into_parts();
+        match &mut outcome.kind {
+            ResumeOutcomeKind::Resumed(_) => {}
+            ResumeOutcomeKind::PartialSuccess(partial) => {
+                partial.read_back_end = read_back_end;
+            }
+            ResumeOutcomeKind::Resent(resent) => {
+                resent.read_back_end = read_back_end;
+            }
+        }
+        outcome
     }
 
     pub fn kind(&self) -> &ResumeOutcomeKind {
-        &self.0
+        &self.kind
     }
 
     pub fn into_kind(self) -> ResumeOutcomeKind {
-        self.0
+        self.kind
     }
 
     pub fn id(&self) -> &ResourceId {
-        match &self.0 {
+        match &self.kind {
             ResumeOutcomeKind::Resumed(completed) => completed.id(),
+            ResumeOutcomeKind::PartialSuccess(outcome) => outcome.id(),
             ResumeOutcomeKind::Resent(outcome) => outcome.id(),
         }
     }
@@ -3801,7 +3960,14 @@ impl CreateAttempt {
     }
 
     pub fn pending(self, token: PendingToken, sent: Sent, poll_after_secs: u32) -> PendingCreate {
-        PendingCreate::new(self.id, token, None, sent, poll_after_secs, self.started_at)
+        PendingCreate::new(
+            self.id,
+            token,
+            CreateProgress::Operating { identifier: None },
+            sent,
+            poll_after_secs,
+            self.started_at,
+        )
     }
 }
 
@@ -3828,10 +3994,38 @@ impl IssuedCreate {
     }
 
     pub fn pending(self, token: PendingToken, poll_after_secs: u32) -> PendingCreate {
+        self.pending_in_phase(
+            token,
+            poll_after_secs,
+            carina_provider_protocol::PendingPhase::Operation,
+        )
+    }
+
+    pub fn pending_read_back(self, token: PendingToken, poll_after_secs: u32) -> PendingCreate {
+        self.pending_in_phase(
+            token,
+            poll_after_secs,
+            carina_provider_protocol::PendingPhase::ReadBack,
+        )
+    }
+
+    fn pending_in_phase(
+        self,
+        token: PendingToken,
+        poll_after_secs: u32,
+        phase: carina_provider_protocol::PendingPhase,
+    ) -> PendingCreate {
         PendingCreate::new(
             self.id,
             token,
-            Some(self.identifier),
+            match phase {
+                carina_provider_protocol::PendingPhase::Operation => CreateProgress::Operating {
+                    identifier: Some(self.identifier),
+                },
+                carina_provider_protocol::PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                    identifier: self.identifier,
+                },
+            },
             self.sent,
             poll_after_secs,
             self.started_at.unwrap_or_else(Timestamp::now),
@@ -3839,7 +4033,7 @@ impl IssuedCreate {
     }
 
     pub fn succeeded(self, attributes: HashMap<String, Value>) -> CreateOutcome {
-        CreateOutcome(CreateOutcomeKind::Success {
+        CreateOutcome::provider_reported(CreateOutcomeKind::Success {
             state: AppliedState::from_identifier(self.id, self.identifier, attributes),
         })
     }
@@ -3849,7 +4043,7 @@ impl IssuedCreate {
         attributes: HashMap<String, Value>,
         diagnostic: PartialReadDiagnostic,
     ) -> CreateOutcome {
-        CreateOutcome(CreateOutcomeKind::PartialSuccess {
+        CreateOutcome::provider_reported(CreateOutcomeKind::PartialSuccess {
             state: AppliedState::from_identifier(self.id, self.identifier, attributes),
             diagnostic,
         })
@@ -3882,7 +4076,7 @@ pub struct FinishingCreate {
 
 impl FinishingCreate {
     pub fn succeeded(self, attributes: HashMap<String, Value>) -> CreateOutcome {
-        CreateOutcome(CreateOutcomeKind::Success {
+        CreateOutcome::provider_reported(CreateOutcomeKind::Success {
             state: AppliedState::from_identifier(self.id, self.identifier, attributes),
         })
     }
@@ -3892,7 +4086,7 @@ impl FinishingCreate {
         attributes: HashMap<String, Value>,
         diagnostic: PartialReadDiagnostic,
     ) -> CreateOutcome {
-        CreateOutcome(CreateOutcomeKind::PartialSuccess {
+        CreateOutcome::provider_reported(CreateOutcomeKind::PartialSuccess {
             state: AppliedState::from_identifier(self.id, self.identifier, attributes),
             diagnostic,
         })
@@ -4100,6 +4294,19 @@ impl ResumedCreate {
         ResumeOutcome::resumed(CompletedResume::new(self.pending, self.identifier, state))
     }
 
+    pub fn partial(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> ResumeOutcome {
+        ResumeOutcome::partial(PartialResume::new(
+            self.pending,
+            self.identifier,
+            attributes,
+            diagnostic,
+        ))
+    }
+
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
         let sent = self.pending.sent();
         let created = ObservedCreate::new(self.pending.id, self.identifier, observation, sent);
@@ -4129,6 +4336,19 @@ pub struct FinishingResume {
 impl FinishingResume {
     pub fn completed(self, state: AppliedState) -> ResumeOutcome {
         ResumeOutcome::resumed(CompletedResume::new(self.pending, self.identifier, state))
+    }
+
+    pub fn partial(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> ResumeOutcome {
+        ResumeOutcome::partial(PartialResume::new(
+            self.pending,
+            self.identifier,
+            attributes,
+            diagnostic,
+        ))
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
@@ -4245,7 +4465,7 @@ impl ResentCreateAttempt {
         ResentPendingCreate(PendingCreate::new(
             self.previous.id().clone(),
             token,
-            None,
+            CreateProgress::Operating { identifier: None },
             sent,
             poll_after_secs,
             Timestamp::now(),
@@ -4267,6 +4487,14 @@ impl ResentIssuedCreate {
 
     pub fn pending(self, token: PendingToken, poll_after_secs: u32) -> ResentPendingCreate {
         ResentPendingCreate(self.0.pending(token, poll_after_secs))
+    }
+
+    pub fn pending_read_back(
+        self,
+        token: PendingToken,
+        poll_after_secs: u32,
+    ) -> ResentPendingCreate {
+        ResentPendingCreate(self.0.pending_read_back(token, poll_after_secs))
     }
 
     pub fn succeeded(self, attributes: HashMap<String, Value>) -> ResumeOutcome {
@@ -4356,6 +4584,14 @@ impl ResentPendingCreate {
         self.0.poll_after_secs()
     }
 
+    pub fn progress(&self) -> &CreateProgress {
+        self.0.progress()
+    }
+
+    pub fn phase(&self) -> carina_provider_protocol::PendingPhase {
+        self.0.phase()
+    }
+
     pub fn into_poll(self) -> ResentPoll {
         match self.0.into_poll() {
             Poll::Unissued(attempt) => ResentPoll::Unissued(ResentPollAttempt(attempt)),
@@ -4401,9 +4637,23 @@ impl ResentPollAttempt {
 }
 
 impl CreateOutcome {
+    fn provider_reported(kind: CreateOutcomeKind) -> Self {
+        Self {
+            kind,
+            read_back_end: ReadBackEnd::ProviderReported,
+        }
+    }
+
+    /// Attach host-owned polling provenance from the pending driver.
+    pub fn from_host_completion(completed: CompletedOperation<Self>) -> Self {
+        let (mut outcome, read_back_end) = completed.into_parts();
+        outcome.read_back_end = read_back_end;
+        outcome
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture_success(state: AppliedState) -> Self {
-        Self(CreateOutcomeKind::Success { state })
+        Self::provider_reported(CreateOutcomeKind::Success { state })
     }
 
     #[cfg(test)]
@@ -4413,21 +4663,27 @@ impl CreateOutcome {
         missing_attributes: Vec<String>,
     ) -> Self {
         match PartialReadDiagnostic::new(reason, missing_attributes) {
-            Some(diagnostic) => Self(CreateOutcomeKind::PartialSuccess { state, diagnostic }),
-            None => Self(CreateOutcomeKind::Success { state }),
+            Some(diagnostic) => {
+                Self::provider_reported(CreateOutcomeKind::PartialSuccess { state, diagnostic })
+            }
+            None => Self::provider_reported(CreateOutcomeKind::Success { state }),
         }
     }
 
     pub fn kind(&self) -> &CreateOutcomeKind {
-        &self.0
+        &self.kind
     }
 
     pub fn into_kind(self) -> CreateOutcomeKind {
-        self.0
+        self.kind
+    }
+
+    pub fn read_back_end(&self) -> ReadBackEnd {
+        self.read_back_end
     }
 
     pub fn id(&self) -> &ResourceId {
-        match &self.0 {
+        match &self.kind {
             CreateOutcomeKind::Success { state }
             | CreateOutcomeKind::PartialSuccess {
                 state,
@@ -4438,7 +4694,7 @@ impl CreateOutcome {
 
     /// Provider-assigned identifier carried by every successful create.
     pub fn identifier(&self) -> &AppliedIdentifier {
-        match &self.0 {
+        match &self.kind {
             CreateOutcomeKind::Success { state }
             | CreateOutcomeKind::PartialSuccess {
                 state,
@@ -4449,7 +4705,7 @@ impl CreateOutcome {
 
     /// Consume the outcome and produce a State ready for writeback.
     pub(crate) fn into_state_for_writeback(self) -> State {
-        match self.0 {
+        match self.kind {
             CreateOutcomeKind::Success { state } => state.into_state_for_writeback(),
             CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
                 diagnostic.into_state_for_writeback(state.into_state_for_writeback())
@@ -4458,7 +4714,7 @@ impl CreateOutcome {
     }
 
     pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
-        match &self.0 {
+        match &self.kind {
             CreateOutcomeKind::Success { .. } => None,
             CreateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
         }
@@ -4466,31 +4722,63 @@ impl CreateOutcome {
 }
 
 impl UpdateOutcome {
+    pub fn success(state: AppliedState) -> Self {
+        Self::provider_reported(UpdateOutcomeKind::Success { state })
+    }
+
     pub fn partial_success(
         state: AppliedState,
         reason: String,
         missing_attributes: Vec<String>,
     ) -> Self {
         match PartialReadDiagnostic::new(reason, missing_attributes) {
-            Some(diagnostic) => UpdateOutcome::PartialSuccess { state, diagnostic },
-            None => UpdateOutcome::Success { state },
+            Some(diagnostic) => {
+                Self::provider_reported(UpdateOutcomeKind::PartialSuccess { state, diagnostic })
+            }
+            None => Self::success(state),
         }
+    }
+
+    fn provider_reported(kind: UpdateOutcomeKind) -> Self {
+        Self {
+            kind,
+            read_back_end: ReadBackEnd::ProviderReported,
+        }
+    }
+
+    /// Attach host-owned polling provenance from the pending driver.
+    pub fn from_host_completion(completed: CompletedOperation<Self>) -> Self {
+        let (mut outcome, read_back_end) = completed.into_parts();
+        outcome.read_back_end = read_back_end;
+        outcome
+    }
+
+    pub fn kind(&self) -> &UpdateOutcomeKind {
+        &self.kind
+    }
+
+    pub fn into_kind(self) -> UpdateOutcomeKind {
+        self.kind
+    }
+
+    pub fn read_back_end(&self) -> ReadBackEnd {
+        self.read_back_end
     }
 
     /// Consume the outcome and produce a State ready for writeback.
     pub fn into_state_for_writeback(self) -> State {
-        match self {
-            UpdateOutcome::Success { state } => state.into_state_for_writeback(),
-            UpdateOutcome::PartialSuccess { state, diagnostic } => {
+        match self.kind {
+            UpdateOutcomeKind::Success { state } => state.into_state_for_writeback(),
+            UpdateOutcomeKind::PartialSuccess { state, diagnostic } => {
                 diagnostic.into_state_for_writeback(state.into_state_for_writeback())
             }
         }
     }
 
     pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
-        match self {
-            UpdateOutcome::Success { .. } => None,
-            UpdateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
+        match &self.kind {
+            UpdateOutcomeKind::Success { .. } => None,
+            UpdateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
         }
     }
 }
@@ -8003,7 +8291,7 @@ mod tests {
         let first = PendingCreate::new(
             id,
             PendingToken::new("first-token"),
-            None,
+            CreateProgress::Operating { identifier: None },
             Sent::AllRequestAttributes,
             1,
             started_at.clone(),
@@ -8029,7 +8317,9 @@ mod tests {
         let pending = PendingCreate::new(
             id,
             PendingToken::new("first-token"),
-            Some(original.clone()),
+            CreateProgress::Operating {
+                identifier: Some(original.clone()),
+            },
             Sent::AllRequestAttributes,
             1,
             started_at,
@@ -8046,6 +8336,72 @@ mod tests {
             repended.pending.identifier(),
             Some(&original),
             "an issued continuation must keep the identifier it was issued with"
+        );
+    }
+
+    #[test]
+    fn resumed_partial_success_preserves_persisted_sent_authority() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let started_at =
+            Timestamp::try_from("2026-10-23T08:00:00Z").expect("fixture timestamp is valid");
+        let identifier = AppliedIdentifier::new("persisted-id").expect("valid identifier");
+        let pending = PendingCreate::new(
+            id,
+            PendingToken::new("persisted-token"),
+            CreateProgress::ReadingBack {
+                identifier: identifier.clone(),
+            },
+            Sent::AllRequestAttributes,
+            1,
+            started_at,
+        )
+        .persist(
+            PersistedAttributes::default(),
+            PersistedAttributes::default(),
+        );
+        let diagnostic = PartialReadDiagnostic::new(
+            "read-back remained incomplete".to_string(),
+            vec!["computed".to_string()],
+        )
+        .expect("fixture has one missing attribute");
+
+        let outcome = ResumedCreate {
+            pending,
+            identifier: identifier.clone(),
+        }
+        .partial(
+            HashMap::from([(
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("known-arn".into())),
+            )]),
+            diagnostic.clone(),
+        );
+        let ResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
+            panic!("resumed partial read-back must remain distinct from a resent create")
+        };
+        let (created, state, actual_diagnostic, read_back_end) = partial.into_parts();
+
+        let SentRecord::Persisted(envelope) = created.sent() else {
+            panic!("resumed partial read-back fabricated request sent authority")
+        };
+        assert_eq!(
+            envelope.token().expose_for_provider_call(),
+            "persisted-token"
+        );
+        assert_eq!(envelope.identifier(), Some(&identifier));
+        assert_eq!(actual_diagnostic, diagnostic);
+        assert_eq!(read_back_end, ReadBackEnd::ProviderReported);
+        assert_eq!(
+            state
+                .partial_read
+                .as_ref()
+                .expect("partial result retains a state marker")
+                .missing_attributes(),
+            &BTreeSet::from(["computed".to_string()])
+        );
+        assert_eq!(
+            state.attributes.get("arn"),
+            Some(&Value::Concrete(ConcreteValue::String("known-arn".into())))
         );
     }
 
@@ -9134,10 +9490,10 @@ mod tests {
                 }
             }
             Box::pin(async move {
-                Ok(UpdateOutcome::Success {
-                    state: AppliedState::new(id, identifier, attrs)
+                Ok(UpdateOutcome::success(
+                    AppliedState::new(id, identifier, attrs)
                         .expect("provider input identifier is non-empty"),
-                })
+                ))
             })
         }
 
@@ -9336,6 +9692,86 @@ mod tests {
                 "shared".to_string(),
                 "create_attr".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn host_deadline_provenance_is_not_provider_diagnostic_identity() {
+        let provider_reported = PartialReadDiagnostic::new(
+            "read-back remained incomplete".to_string(),
+            vec!["computed".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+        let encoded = serde_json::to_value(&provider_reported).unwrap();
+        let round_tripped: PartialReadDiagnostic = serde_json::from_value(encoded.clone()).unwrap();
+
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "reason": "read-back remained incomplete",
+                "missing_attributes": ["computed"],
+            }),
+            "provider diagnostic formats must not carry host provenance",
+        );
+        assert_eq!(
+            provider_reported, round_tripped,
+            "a persisted diagnostic retains only provider-reported data",
+        );
+
+        let id = ResourceId::with_identity("test", "deadline-roundtrip");
+        let state = AppliedState::new(id, "provider-id", HashMap::new())
+            .expect("the fixture identifier is non-empty");
+        let mut provider_outcome = Some(UpdateOutcome::partial_success(
+            state,
+            "read-back remained incomplete".to_string(),
+            vec!["computed".to_string()],
+        ));
+        let provider_kind = provider_outcome.as_ref().unwrap().kind().clone();
+        let driven =
+            futures::executor::block_on(carina_provider_protocol::drive_pending_infallible(
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(30),
+                std::future::ready(carina_provider_protocol::OperationStep::<
+                    UpdateOutcome,
+                    (),
+                    (),
+                >::Pending {
+                    pending: (),
+                    poll_after_secs: 1,
+                    phase: carina_provider_protocol::PendingPhase::ReadBack,
+                }),
+                |(), finality| {
+                    assert_eq!(
+                        finality,
+                        carina_provider_protocol::PollFinality::FinalAttempt
+                    );
+                    std::future::ready(carina_provider_protocol::OperationStep::Done(
+                        provider_outcome
+                            .take()
+                            .expect("the final attempt runs exactly once"),
+                    ))
+                },
+                |_| std::future::ready(()),
+            ));
+        let carina_provider_protocol::DriveOutcome::Done(completed) = driven else {
+            panic!("the final attempt must complete with a partial update")
+        };
+        let host_outcome = UpdateOutcome::from_host_completion(completed);
+        assert_eq!(host_outcome.read_back_end(), ReadBackEnd::HostDeadline);
+
+        assert_eq!(
+            host_outcome.kind(),
+            &provider_kind,
+            "host provenance does not change the provider-reported outcome kind",
+        );
+
+        let writeback = host_outcome.into_state_for_writeback();
+        let encoded_state = serde_json::to_string(&writeback).unwrap();
+        assert!(!encoded_state.contains("HostDeadline"));
+        let round_tripped_state: State = serde_json::from_str(&encoded_state).unwrap();
+        assert!(
+            round_tripped_state.partial_read.is_some(),
+            "the partial-read marker survives without same-run budget provenance",
         );
     }
 
@@ -11559,10 +11995,10 @@ mod tests {
                 let id = id.clone();
                 let identifier = identifier.to_string();
                 Box::pin(async move {
-                    Ok(UpdateOutcome::Success {
-                        state: AppliedState::new(id, identifier, HashMap::new())
+                    Ok(UpdateOutcome::success(
+                        AppliedState::new(id, identifier, HashMap::new())
                             .expect("provider input identifier is non-empty"),
-                    })
+                    ))
                 })
             }
 

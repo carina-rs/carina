@@ -76,7 +76,9 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
         ExecutionOutcome::Completed(result) => result,
         ExecutionOutcome::Cancelled(result) => panic!(
             "uncancelled execution returned Cancelled: success={}, failure={}, skip={}",
-            result.success_count, result.failure_count, result.skip_count
+            result.success_count,
+            result.failure_count(),
+            result.skip_count
         ),
     }
 }
@@ -231,10 +233,10 @@ impl Provider for MockProvider {
         let id = id.clone();
         let identifier = identifier.to_string();
         Box::pin(async move {
-            Ok(UpdateOutcome::Success {
-                state: AppliedState::new(id, identifier, HashMap::new())
+            Ok(UpdateOutcome::success(
+                AppliedState::new(id, identifier, HashMap::new())
                     .expect("provider input identifier is non-empty"),
-            })
+            ))
         })
     }
 
@@ -269,8 +271,8 @@ impl ExecutionObserver for CollectingObserver {
                 .push(format!("effect interrupted: {}", effect.resource_id()));
             return;
         }
-        if let carina_core::executor::ExecutionEvent::EffectFailed { error, .. } = event {
-            self.failures.lock().unwrap().push(error.to_string());
+        if let carina_core::executor::ExecutionEvent::EffectFailed { failure, .. } = event {
+            self.failures.lock().unwrap().push(failure.to_string());
         }
     }
 }
@@ -451,7 +453,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
 
     let failures = observer.failures.lock().unwrap().clone();
     assert_eq!(
-        result.failure_count, 0,
+        result.failure_count(),
+        0,
         "no effect should fail: the Distribution's \
          `cert_issued.certificate_arn` must resolve after the wait, \
          not fail immediately at dispatch. Failures: {failures:?}"
@@ -627,7 +630,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     );
     let failures = observer.failures.lock().unwrap().clone();
     assert_eq!(
-        result.failure_count, 0,
+        result.failure_count(),
+        0,
         "nested-module wait must synchronize the Distribution. Failures: {failures:?}"
     );
     assert_eq!(

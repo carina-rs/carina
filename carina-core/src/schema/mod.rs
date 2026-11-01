@@ -216,7 +216,7 @@ pub use carina_provider_protocol::types::{
     DslTransform, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };
 /// Per-resource operational configuration for provider timeouts and retries.
-pub use carina_provider_protocol::{OperationConfig, ValidatorType};
+pub use carina_provider_protocol::{OperationConfig, ReadBackBudget, ValidatorType};
 pub use resolved_attr_type::ResolvedAttrType;
 use resolved_union_members::UnionMemberTypes;
 pub use resolved_union_members::{ResolvedUnionMember, UnionMembers};

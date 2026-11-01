@@ -7417,6 +7417,78 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 }
 
 #[test]
+fn resumed_partial_create_records_exact_missing_attributes() {
+    use carina_core::provider::{
+        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, ObservedCreate,
+        PartialReadDiagnostic, PendingToken, PersistedAttributes, Sent, SentRecord,
+    };
+
+    let resource = Resource::with_provider("mock", "test.Widget", "example", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("example".into())),
+    );
+    let identifier = AppliedIdentifier::new("persisted-id").unwrap();
+    let pending = CreateAttempt::for_test(resource.id.clone())
+        .issued(identifier.clone(), Sent::AllRequestAttributes)
+        .pending(PendingToken::new("persisted-token"), 1)
+        .persist(
+            PersistedAttributes::default(),
+            PersistedAttributes::default(),
+        );
+    let observed_state = AppliedState::new(
+        resource.id.clone(),
+        identifier.as_str(),
+        HashMap::from([(
+            "arn".to_string(),
+            Value::Concrete(ConcreteValue::String("known-arn".into())),
+        )]),
+    )
+    .unwrap();
+    let diagnostic = PartialReadDiagnostic::new(
+        "read-back remained incomplete".to_string(),
+        vec!["computed".to_string()],
+    )
+    .unwrap();
+    let created = ObservedCreate::from_in_flight_for_test(
+        pending,
+        identifier.clone(),
+        CreateObservation::Observed(observed_state),
+    )
+    .with_partial_read_for_test(diagnostic);
+
+    let SentRecord::Persisted(envelope) = created.sent() else {
+        panic!("resumed partial create must retain its persisted sent envelope")
+    };
+    assert_eq!(
+        envelope.token().expose_for_provider_call(),
+        "persisted-token"
+    );
+    let row =
+        resource_state_from_observation_for_test(&resolved(&resource), &created, None, None, None)
+            .expect("resumed partial create must be persistable");
+
+    assert_eq!(
+        row.identifier().map(AppliedIdentifier::as_str),
+        Some("persisted-id")
+    );
+    assert_eq!(
+        row.partial_read(),
+        PartialReadMarker::new(
+            PendingReRead::incomplete("read-back remained incomplete"),
+            BTreeSet::from(["computed".to_string()]),
+        )
+        .as_ref()
+    );
+    assert_eq!(
+        row.persisted_attributes()
+            .expect("observed values are persisted")
+            .to_values()
+            .get("arn"),
+        Some(&Value::Concrete(ConcreteValue::String("known-arn".into())))
+    );
+}
+
+#[test]
 fn unobserved_not_found_create_records_identifier_and_partial_read() {
     use carina_core::provider::{
         AppliedIdentifier, CreateAttempt, CreateFailureKind, CreateObservation, Observation,
