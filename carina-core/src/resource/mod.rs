@@ -8061,7 +8061,11 @@ fn append_schema_pairing_hashes(
                 ));
             }
         }
-        Shape::List { ordered, .. } => {
+        Shape::List {
+            ordered,
+            element_type: _element_type,
+            constraints: _constraints,
+        } => {
             if let Value::Concrete(ConcreteValue::List(items)) = value {
                 hashes.push(pairing_component_hash(0x03, &(ordered, items.len())));
             }
