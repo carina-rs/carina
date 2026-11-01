@@ -1335,7 +1335,7 @@ fn accumulate_deferred_iterable_errors(
             if known.contains(root.as_str()) {
                 continue;
             }
-            errors.push(undefined_identifier_error(known, root, deferred.line));
+            errors.push(undefined_identifier_error(known, root, deferred.line()));
         }
     }
 }

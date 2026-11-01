@@ -90,15 +90,18 @@ use carina_core::deps::{
     get_composition_dependencies, get_data_source_dependencies, get_resource_dependencies,
     sort_resources_by_dependencies,
 };
+pub use carina_core::differ::DeferredForExpansionChoice;
 use carina_core::differ::{
-    Orphan, Orphans, PlanPriorStates, binding_matches_deferred_template, into_all_prior_states,
-    lift_prior_state_enum_leaves, provider_states_for, rekey_current_for_move,
-    transform_prior_managed_provider_states, transform_prior_provider_states,
+    CascadeDependents, DeferredCreateTargets, block_deletes_on_prior_consumer_updates,
+    create_plan_with_cascades,
 };
-use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
+use carina_core::differ::{
+    Orphan, Orphans, PlanPriorStates, into_all_prior_states, lift_prior_state_enum_leaves,
+    provider_states_for, rekey_current_for_move, transform_prior_managed_provider_states,
+    transform_prior_provider_states,
+};
 use carina_core::effect::{
-    DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration,
-    MoveAuthority, NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedMove,
+    Effect, EffectGeneration, MoveAuthority, OutcomeUnknownImportReplacement, ResolvedMove,
 };
 use carina_core::executor::normalized::{
     apply_desired_normalization_slice, is_value_fully_concrete_for_expansion,
@@ -159,9 +162,8 @@ mod override_aware;
 
 pub(crate) use override_aware::ParserCanonicalResourcePair;
 pub use override_aware::{
-    CanonicalResourceIdentityError, CanonicalResourcePair, DeferredForExpansionChoice,
-    DuplicateResolvedResourceIdError, OverrideAwareBuildMode, OverrideAwareResources,
-    RebuildBindingsInputs,
+    CanonicalResourceIdentityError, CanonicalResourcePair, DuplicateResolvedResourceIdError,
+    OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
 };
 
 static TRUSTED_LOCAL_GRANT_INPUTS: OnceLock<TrustedLocalGrantInputs> = OnceLock::new();
@@ -4260,40 +4262,6 @@ impl RefreshableChildIds {
     }
 }
 
-/// A deferred-for expression whose iterable is not plan-time concrete,
-/// but has enough upstream identity for the apply executor to re-expand it.
-///
-/// This target emits `DeferredCreate` when no matching orphan delete exists,
-/// or `DeferredReplace` when `add_deferred_create_effects` absorbs matching
-/// delete effects for prior indexed iterations.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DeferredCreateTarget {
-    pub template: carina_core::parser::DeferredForExpression,
-}
-
-impl DeferredCreateTarget {
-    fn from_deferred(deferred: &carina_core::parser::DeferredForExpression) -> Self {
-        Self {
-            template: deferred.clone(),
-        }
-    }
-
-    pub fn id(&self) -> &ResolvedResourceId {
-        self.template.deferred_effect_id()
-    }
-
-    fn to_effect(&self) -> Effect {
-        Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(self.template.clone())))
-    }
-
-    fn to_deferred_replace_effect(&self, deletes: Vec<DeferredReplaceDelete>) -> Effect {
-        Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-            deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
-            template: Box::new(self.template.clone()),
-        }))
-    }
-}
-
 /// State and metadata maps that have crossed the shared address-reconciliation
 /// boundary.
 #[derive(Clone)]
@@ -5299,7 +5267,7 @@ pub struct DeferredForExpansion {
     post_expansion_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
     /// Loops whose iterable is deferred until apply and should become
     /// state-only `Effect::DeferredCreate` entries in the plan.
-    pub deferred_create_targets: Vec<DeferredCreateTarget>,
+    pub deferred_create_targets: DeferredCreateTargets,
     /// Ids of the resources materialized by this expansion (empty when
     /// no loop resolved).
     pub new_child_ids: HashSet<ResourceId>,
@@ -5474,7 +5442,7 @@ struct PostExpansionPlanData<E> {
     data_source_values: DataSourceValues,
     wait_aliases: Vec<WaitAliasSpec>,
     residual_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
-    deferred_create_targets: Vec<DeferredCreateTarget>,
+    deferred_create_targets: DeferredCreateTargets,
 }
 
 pub(crate) struct PostExpansionPlanView<E, C> {
@@ -6085,9 +6053,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     );
     let plan_input_desired =
         carina_core::resource::plan_input_desired_resources(&resolved_resources, context.schemas());
-    let mut plan = create_plan_with_cascades(
+    let plan = create_plan_with_cascades(
         &plan_input_desired,
-        &resolved_unresolved_resources,
+        CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets),
         &data_sources_for_plan,
         provider,
         PlanPriorStates::new(&plan_input_current, &addressed.orphans),
@@ -6098,22 +6066,23 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         &wait_bindings,
         &outcome_unknown_import_replacements,
     )?;
-    add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
-    block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
-    override_aware_resources.apply_plan_stability(&plan_input_current, &plan, context.schemas());
+    let plan = plan.finish(|plan| {
+        add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
+        block_deletes_on_prior_consumer_updates(plan, &directives_map);
+        override_aware_resources.apply_plan_stability(&plan_input_current, plan, context.schemas());
 
-    // State blocks run after differ/deposed identifier errors so `removed`
-    // remains the explicit recovery that can suppress those diagnostics.
-    add_state_block_effects(
-        &mut plan,
-        &parsed.state_blocks,
-        state_file,
-        &addressed.moved_pairs,
-        override_aware_resources.resources(),
-        override_aware_resources.bindings(),
-        state_block_upstream_bindings,
-    );
-    add_deferred_create_effects(&mut plan, &deferred_create_targets);
+        // State blocks run after differ/deposed identifier errors so `removed`
+        // remains the explicit recovery that can suppress those diagnostics.
+        add_state_block_effects(
+            plan,
+            &parsed.state_blocks,
+            state_file,
+            &addressed.moved_pairs,
+            override_aware_resources.resources(),
+            override_aware_resources.bindings(),
+            state_block_upstream_bindings,
+        );
+    });
 
     let moved_origins = addressed
         .moved_pairs
@@ -6154,17 +6123,26 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
         managed_bindings: &HashSet<String>,
         non_managed: carina_core::parser::ResolvedDeferredForExpressions,
     ) {
-        self.resources
-            .inner
-            .data
-            .deferred_create_targets
-            .retain(|target| {
-                target
-                    .template
+        let (_, retained) = DeferredCreateTargets::partition_for_expansion(
+            self.resources
+                .inner
+                .data
+                .deferred_create_targets
+                .templates()
+                .clone(),
+            |template| {
+                if template
                     .root_bindings()
                     .iter()
                     .any(|binding| managed_bindings.contains(binding))
-            });
+                {
+                    DeferredForExpansionChoice::Retain
+                } else {
+                    DeferredForExpansionChoice::Expand
+                }
+            },
+        );
+        self.resources.inner.data.deferred_create_targets = retained;
         self.resources
             .inner
             .data
@@ -6425,7 +6403,10 @@ pub(crate) trait DeferredExpansionTarget<E> {
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         classify: F,
     ) -> Result<
-        carina_core::parser::ResolvedDeferredForExpressions,
+        (
+            carina_core::parser::ResolvedDeferredForExpressions,
+            DeferredCreateTargets,
+        ),
         carina_core::parser::DeferredForExpansionError,
     >
     where
@@ -6455,7 +6436,10 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         classify: F,
     ) -> Result<
-        carina_core::parser::ResolvedDeferredForExpressions,
+        (
+            carina_core::parser::ResolvedDeferredForExpressions,
+            DeferredCreateTargets,
+        ),
         carina_core::parser::DeferredForExpansionError,
     >
     where
@@ -6490,29 +6474,34 @@ impl<E> DeferredExpansionTarget<E> for ExpandedFile<E> {
     fn expand_partitioned<F>(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
-        mut classify: F,
+        classify: F,
     ) -> Result<
-        carina_core::parser::ResolvedDeferredForExpressions,
+        (
+            carina_core::parser::ResolvedDeferredForExpressions,
+            DeferredCreateTargets,
+        ),
         carina_core::parser::DeferredForExpansionError,
     >
     where
         F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
     {
-        let (selected, retained) = self
-            .take_deferred_for_expressions()
-            .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
+        let (selected, retained) = DeferredCreateTargets::partition_for_expansion(
+            self.take_deferred_for_expressions(),
+            classify,
+        );
         self.warnings.retain(|warning| {
             warning.kind != WarningKind::DeferredFor
                 || !retained
+                    .templates()
                     .iter()
-                    .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
+                    .any(|deferred| deferred.location().matches_deferred_warning(warning))
         });
         self.replace_deferred_for_expressions(selected);
         self.expand_deferred_for_expressions(bindings)?;
         let residual = self.deferred_for_expressions().clone();
         self.deferred_for_expressions_mut()
-            .append_finalized(retained);
-        Ok(residual)
+            .append_finalized(retained.templates().clone());
+        Ok((residual, retained))
     }
 }
 
@@ -6549,7 +6538,11 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
             residual_warnings: parsed.warnings.clone(),
             #[cfg(test)]
             post_expansion_deferred_for: parsed.deferred_for_expressions().clone(),
-            deferred_create_targets: Vec::new(),
+            deferred_create_targets: DeferredCreateTargets::partition_for_expansion(
+                parsed.deferred_for_expressions().clone(),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
             new_child_ids: HashSet::new(),
             refreshable_child_ids: RefreshableChildIds::default(),
             printed_warnings,
@@ -6587,8 +6580,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     );
     let iterable_bindings = resolved_bindings.project_iterable_bindings();
 
-    let mut deferred_create_targets = Vec::new();
-    let residual_deferred_for = target
+    let (residual_deferred_for, deferred_create_targets) = target
         .expand_partitioned(&iterable_bindings, |deferred| {
             match iterable_bindings.resolve_value(&deferred.iterable) {
                 Ok(carina_core::resolver::ValueResolution::Present(value))
@@ -6600,10 +6592,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
                     carina_core::resolver::ValueResolution::Present(_)
                     | carina_core::resolver::ValueResolution::Absent
                     | carina_core::resolver::ValueResolution::Unknown(_),
-                ) => {
-                    deferred_create_targets.push(DeferredCreateTarget::from_deferred(deferred));
-                    DeferredForExpansionChoice::Retain
-                }
+                ) => DeferredForExpansionChoice::Retain,
                 // Let the shared expansion path render the path-aware error.
                 Err(_) => DeferredForExpansionChoice::Expand,
             }
@@ -8056,28 +8045,12 @@ pub fn add_state_block_effects(
 
     // Remove Delete effects for resources covered by removed blocks,
     // and Create effects for import targets (they will be imported, not created)
-    if !suppress_delete.is_empty() || !suppress_create.is_empty() {
-        plan.retain(|effect| match effect {
-            Effect::Delete {
-                id,
-                generation: EffectGeneration::Current,
-                ..
-            } => !suppress_delete.contains(id),
-            Effect::Delete {
-                generation: EffectGeneration::Deposed(_),
-                ..
-            } => true,
-            Effect::Create(resource) => !suppress_create.contains(&resource.id),
-            Effect::Read { .. }
-            | Effect::ResumeCreate { .. }
-            | Effect::Update { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::ReleaseListKeys { .. }
-            | Effect::Wait { .. }
-            | Effect::DeferredCreate(_)
-            | Effect::DeferredReplace(_) => true,
+    plan.suppress_current_deletes(&suppress_delete);
+    if !suppress_create.is_empty() {
+        plan.retain(|effect| {
+            !matches!(effect,
+                Effect::Create(resource) if suppress_create.contains(&resource.id)
+            )
         });
     }
 
@@ -8107,94 +8080,6 @@ pub fn add_state_block_effects(
 
     // Add the new state block effects
     for effect in new_effects {
-        plan.add(effect);
-    }
-}
-
-/// Add apply-time deferred-for re-expansion effects to the plan.
-///
-/// Matching orphan `Delete` effects are absorbed into `DeferredReplace`; targets
-/// with no matching deletes remain plain `DeferredCreate` effects.
-pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTarget]) {
-    let mut deletes_to_absorb: HashSet<ResourceId> = HashSet::new();
-    let mut deferred_effects = Vec::new();
-
-    for target in targets {
-        let deletes: Vec<DeferredReplaceDelete> = plan
-            .effects()
-            .iter()
-            .filter_map(|effect| {
-                let Effect::Delete {
-                    id,
-                    identifier,
-                    generation: EffectGeneration::Current,
-                    directives,
-                    binding,
-                    dependencies,
-                    explicit_dependencies,
-                    blocked_by_updates,
-                } = effect
-                else {
-                    return None;
-                };
-
-                if deletes_to_absorb.contains(id.as_inner())
-                    || id.provider != target.template.template_resource_id().provider
-                    || id.resource_type != target.template.template_resource_id().resource_type
-                    || id.provider_instance
-                        != target.template.template_resource_id().provider_instance
-                {
-                    return None;
-                }
-                let matches = binding.as_deref().is_some_and(|binding| {
-                    binding_matches_deferred_template(binding, target.template.target())
-                });
-                matches.then(|| DeferredReplaceDelete {
-                    id: id.clone(),
-                    identifier: identifier.clone(),
-                    directives: directives.clone(),
-                    binding: binding.clone(),
-                    dependencies: dependencies.clone(),
-                    explicit_dependencies: explicit_dependencies.clone(),
-                    blocked_by_updates: blocked_by_updates.clone(),
-                })
-            })
-            .collect();
-
-        if deletes.is_empty() {
-            deferred_effects.push(target.to_effect());
-        } else {
-            deletes_to_absorb.extend(deletes.iter().map(|delete| delete.id.clone().into_inner()));
-            deferred_effects.push(target.to_deferred_replace_effect(deletes));
-        }
-    }
-
-    if !deletes_to_absorb.is_empty() {
-        plan.retain(|effect| match effect {
-            Effect::Delete {
-                id,
-                generation: EffectGeneration::Current,
-                ..
-            } => !deletes_to_absorb.contains(id),
-            Effect::Delete {
-                generation: EffectGeneration::Deposed(_),
-                ..
-            }
-            | Effect::Read { .. }
-            | Effect::Create(_)
-            | Effect::ResumeCreate { .. }
-            | Effect::Update { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::ReleaseListKeys { .. }
-            | Effect::Wait { .. }
-            | Effect::DeferredCreate(_)
-            | Effect::DeferredReplace(_) => true,
-        });
-    }
-
-    for effect in deferred_effects {
         plan.add(effect);
     }
 }

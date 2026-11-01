@@ -29,6 +29,61 @@ fn comparison_provider_for_resources(
     .1
 }
 
+#[test]
+fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("main.crn");
+    std::fs::write(&source, "let orgs = upstream_state { source = '../orgs' }\nlet rows = for item in orgs.ids { mock.test.resource { name = item } }\n").unwrap();
+    let loaded = carina_core::config_loader::load_configuration(project.path()).unwrap();
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        loaded.parsed,
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let mut parsed = parsed.into_expanded().unwrap();
+    parsed.warnings = vec![
+        carina_core::parser::ParseWarning {
+            file: Some(source.display().to_string()),
+            line: 2,
+            kind: WarningKind::DeferredFor,
+            span: None,
+            message: "owned deferred warning".into(),
+        },
+        carina_core::parser::ParseWarning {
+            file: Some(project.path().join("other.crn").display().to_string()),
+            line: 2,
+            kind: WarningKind::DeferredFor,
+            span: None,
+            message: "other file warning".into(),
+        },
+        carina_core::parser::ParseWarning {
+            file: Some(source.display().to_string()),
+            line: 2,
+            kind: WarningKind::SingleQuotedInterpolation,
+            span: None,
+            message: "unrelated same-line warning".into(),
+        },
+    ];
+    let bindings = carina_core::binding_index::IterableBindings::from_upstream_only(HashMap::new());
+    let mut pair = CanonicalResourcePair::for_test(parsed.clone(), Vec::new());
+    parsed
+        .expand_partitioned(&bindings, |_| DeferredForExpansionChoice::Retain)
+        .unwrap();
+    pair.expand_deferred_for_expressions(&bindings, |_| DeferredForExpansionChoice::Retain)
+        .unwrap();
+    for warnings in [&parsed.warnings, &pair.parsed().warnings] {
+        assert_eq!(
+            warnings
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>(),
+            ["other file warning", "unrelated same-line warning"]
+        );
+    }
+}
+
 fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
     resources: &[Resource],
@@ -181,7 +236,11 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
             data_source_values: DataSourceValues::empty(),
             wait_aliases: Vec::new(),
             residual_deferred_for,
-            deferred_create_targets: Vec::new(),
+            deferred_create_targets: DeferredCreateTargets::partition_for_expansion(
+                carina_core::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
         },
         children: AbsentChildrenSettled,
     }
@@ -8355,7 +8414,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         ExecutionOutcome::Completed(result) => result,
         ExecutionOutcome::Cancelled(_) => panic!("test plan should not be cancelled"),
     };
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
 
     let create_calls = provider.create_calls();
     let subnet_call = create_calls
@@ -10511,6 +10570,7 @@ mod read_with_retry_identifier_tests {
 // ---------------------------------------------------------------------
 #[test]
 fn deferred_template_binding_match_requires_single_numeric_index() {
+    use carina_core::differ::binding_matches_deferred_template;
     let target = carina_core::parser::DeferredForTarget::bound("validation_records")
         .expect("fixture binding is valid");
     assert!(binding_matches_deferred_template(
@@ -10535,323 +10595,165 @@ fn deferred_template_binding_match_requires_single_numeric_index() {
     ));
 }
 
-fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpression {
-    let template_resource =
-        Resource::with_provider("aws", "route53.Record", "validation_records", None)
-            .with_binding("validation_records");
+async fn plan_deferred_for_with_state_block(state_block: &str, keep_other_child: bool) -> Plan {
+    use carina_core::parser::ProviderContext;
 
-    carina_core::parser::DeferredForExpression::new(
-        Some("main.crn".to_string()),
-        12,
-        "for opt in cert.domain_validation_options".to_string(),
-        carina_core::parser::DeferredForTarget::bound("validation_records")
-            .expect("fixture binding is valid"),
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        carina_core::parser::ForBinding::Simple("opt".to_string()),
-        template_resource,
-    )
-}
+    let source = format!(
+        r#"
+provider aws {{}}
 
-fn deferred_replace_test_target() -> DeferredCreateTarget {
-    DeferredCreateTarget {
-        template: deferred_replace_test_template(),
-    }
-}
+let cert = aws.acm.Certificate {{
+    domain_name = "r.example.com"
+    validation_method = "DNS"
+}}
 
-fn delete_effect_for_binding(binding: &str) -> Effect {
-    Effect::Delete {
-        id: ResolvedResourceId::with_provider_identity(
+let records = for (_, opt) in cert.domain_validation_options {{
+    aws.route53.RecordSet {{
+        name = opt.resource_record.name
+        type = "CNAME"
+        resource_records = [opt.resource_record.value]
+    }}
+}}
+
+{state_block}
+"#,
+    );
+    let parsed = parse(&source, &ProviderContext::default()).expect("parse state-block fixture");
+    let expanded = parsed.clone().into_expanded().unwrap();
+    assert_eq!(expanded.deferred_for_expressions().len(), 1);
+
+    let mut state_file = StateFile::new();
+    for index in 0..=usize::from(keep_other_child) {
+        let child = format!("records[{index}]");
+        let mut row = carina_state::ResourceState::try_applied(
+            "route53.RecordSet",
+            test_identity(child.clone()),
             "aws",
-            "route53.Record",
-            test_identity(binding),
-            None,
-        ),
-        identifier: crate::fixture_applied_identifier(format!("{binding}-old-id")),
-        generation: carina_core::effect::EffectGeneration::Current,
-        directives: Directives::default(),
-        binding: Some(binding.to_string()),
-        dependencies: std::collections::HashSet::from(["cert".to_string()]),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: std::collections::HashSet::new(),
+            format!("old-record-{index}"),
+        )
+        .unwrap();
+        row.binding = Some(child);
+        state_file.upsert_resource(row).unwrap();
     }
-}
+    let state_file = Some(state_file);
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        vec![Box::new(DeferredForCollisionFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let StateBlockResolution { claims, targets } = resolve_state_blocks(
+        &expanded.state_blocks,
+        &state_file,
+        &expanded.resources,
+        wiring.context().schemas(),
+    );
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
 
-#[test]
-fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace() {
-    let target = deferred_replace_test_target();
-    let mut plan = Plan::new();
-    plan.add(delete_effect_for_binding("validation_records[0]"));
-
-    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
-
-    let mut deferred_replaces = plan.effects().iter().filter_map(|effect| match effect {
-        Effect::DeferredReplace(payload) => {
-            Some((&payload.deletes, payload.id(), &payload.template))
-        }
-        _ => None,
-    });
-    let (deletes, id, template) = deferred_replaces
-        .next()
-        .expect("matching delete + deferred target must produce DeferredReplace");
-    assert!(
-        deferred_replaces.next().is_none(),
-        "plan must contain exactly one DeferredReplace"
-    );
-    assert_eq!(id, target.id());
-    assert_eq!(
-        template.root_bindings(),
-        std::collections::BTreeSet::from(["cert".to_string()])
-    );
-    assert_eq!(
-        template.target().bound_binding(),
-        Some("validation_records")
-    );
-    assert_eq!(deletes.len(), 1);
-    assert_eq!(
-        deletes[0].id,
-        ResourceId::with_provider_identity("aws", "route53.Record", "validation_records[0]", None)
-    );
-    assert_eq!(deletes[0].binding.as_deref(), Some("validation_records[0]"));
-
-    assert!(
-        !plan.effects().iter().any(|effect| {
-            matches!(
-                effect,
-                Effect::Delete {
-                    binding: Some(binding),
-                    ..
-                } if binding == "validation_records[0]"
-            )
-        }),
-        "absorbed delete must not remain as a standalone Delete"
-    );
-    assert!(
-        !plan
-            .effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate(_))),
-        "absorbed target must not also remain as DeferredCreate"
-    );
-}
-
-fn unbound_deferred_test_target() -> DeferredCreateTarget {
-    let parsed = parse(
-        "let upstream = upstream_state { source = '../upstream' }\n\
-         for value in upstream.accounts {\n\
-           mock.test.Child { identity_input = value }\n\
-         }\n",
-        &carina_core::parser::ProviderContext::default(),
+    // Use the production post-expansion path: create_plan_with_cascades,
+    // then finish's state-block callback, then deferred-effect emission.
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &claims,
+        &targets,
     )
-    .expect("unbound deferred loop parses")
-    .into_expanded()
-    .expect("unbound deferred-loop fixture has no parser placeholders");
-    DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions()[0])
-}
-
-fn delete_effect_for_unbound_child(
-    identity: &str,
-    binding: Option<&str>,
-) -> (carina_core::resource::ResolvedResourceId, Effect) {
-    let id = ResolvedResourceId::with_provider_identity(
-        "mock",
-        "test.Child",
-        carina_core::resource::ResourceIdentity::try_from(identity.to_string())
-            .expect("test identity is non-empty"),
-        None,
-    );
-    let effect = Effect::Delete {
-        id: id.clone(),
-        identifier: crate::fixture_applied_identifier("old-child"),
-        generation: carina_core::effect::EffectGeneration::Current,
-        directives: Directives::default(),
-        binding: binding.map(str::to_string),
-        dependencies: std::collections::HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: std::collections::HashSet::new(),
-    };
-    (id, effect)
-}
-
-#[test]
-fn unbound_deferred_create_absorbs_exact_legacy_current_delete() {
-    let target = unbound_deferred_test_target();
-    let (legacy_id, legacy_delete) =
-        delete_effect_for_unbound_child("_accounts.alpha", Some("_accounts.alpha"));
-    let mut plan = Plan::new();
-    plan.add(legacy_delete);
-
-    add_deferred_create_effects(&mut plan, &[target]);
-
-    let payload = plan
-        .effects()
-        .iter()
-        .find_map(|effect| match effect {
-            Effect::DeferredReplace(payload) => Some(payload),
-            _ => None,
-        })
-        .expect("the exact legacy row must be owned by DeferredReplace");
-    assert_eq!(payload.deletes.len(), 1);
-    assert_eq!(payload.deletes[0].id, legacy_id);
-    assert_eq!(
-        payload.deletes[0].binding.as_deref(),
-        Some("_accounts.alpha")
-    );
+    .await
+    .expect("state blocks and the retained loop must plan together");
+    let plan = planned.into_context_for_test().plan;
+    assert!(plan.errors().is_empty(), "{:#?}", plan.errors());
+    assert_eq!(plan.effects().len(), 3, "{:#?}", plan.effects());
     assert!(
-        plan.effects()
-            .iter()
-            .all(|effect| !matches!(effect, Effect::Delete { .. })),
-        "the legacy delete must not race the runtime recreate",
+        matches!(&plan.effects()[0], Effect::Create(resource) if resource.binding.as_deref() == Some("cert"))
     );
-}
-
-#[test]
-fn unbound_deferred_create_keeps_unrelated_anonymous_delete_plain() {
-    let target = unbound_deferred_test_target();
-    let anonymous_id = ResolvedResourceId::with_provider_identity(
-        "mock",
-        "test.Child",
-        "mock_test_child_deadbeef",
-        None,
-    );
-    let (_, anonymous_delete) = delete_effect_for_unbound_child("mock_test_child_deadbeef", None);
-    let mut plan = Plan::new();
-    plan.add(anonymous_delete);
-
-    add_deferred_create_effects(&mut plan, &[target]);
-
-    assert!(
-        plan.effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate(_))),
-        "an unrelated anonymous row does not belong to this loop",
-    );
-    assert!(
-        plan
-        .effects()
-        .iter()
-            .any(|effect| matches!(effect, Effect::Delete { id, binding: None, .. } if id == &anonymous_id)),
-        "the unrelated anonymous row must remain a standalone Delete",
-    );
-    assert!(
-        plan.effects()
-            .iter()
-            .all(|effect| !matches!(effect, Effect::DeferredReplace(_))),
-        "an unrelated anonymous row must not be absorbed",
-    );
-}
-
-#[test]
-fn deferred_create_targets_absorb_matching_map_key_orphan_deletes() {
-    let target = deferred_replace_test_target();
-    let mut plan = Plan::new();
-    plan.add(delete_effect_for_binding("validation_records.alpha"));
-    plan.add(delete_effect_for_binding(
-        "validation_records['key with space']",
-    ));
-    plan.add(delete_effect_for_binding("validation_records['']"));
-
-    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
-
-    let payload = plan
-        .effects()
-        .iter()
-        .find_map(|effect| match effect {
-            Effect::DeferredReplace(payload) => Some(payload),
-            _ => None,
-        })
-        .expect("map-key deletes must be paired with their deferred create");
-    assert_eq!(payload.deletes.len(), 3);
     assert!(
         !plan
             .effects()
             .iter()
             .any(|effect| matches!(effect, Effect::Delete { .. })),
-        "stable map-key children must not remain standalone cleanups beside runtime upserts",
+        "state-block deletes must be suppressed and any other child delete absorbed: {:#?}",
+        plan.effects(),
     );
-}
 
-#[test]
-fn deferred_create_targets_do_not_absorb_deposed_deletes() {
-    let target = deferred_replace_test_target();
-    let deposed_key = carina_state::DeposedKey::new_unique();
-    let mut deposed_delete = delete_effect_for_binding("validation_records[0]");
-    if let Effect::Delete {
-        generation,
-        identifier,
-        ..
-    } = &mut deposed_delete
-    {
-        *generation = carina_core::effect::EffectGeneration::Deposed(deposed_key.clone());
-        *identifier = crate::fixture_applied_identifier("deposed-old-id");
+    let deferred = plan
+        .effects()
+        .iter()
+        .find(|effect| {
+            matches!(
+                effect,
+                Effect::DeferredCreate(_) | Effect::DeferredReplace(_)
+            )
+        })
+        .expect("retained loop must emit a deferred effect");
+    let template = if keep_other_child {
+        let Effect::DeferredReplace(payload) = deferred else {
+            panic!(
+                "the remaining child needs a deferred replacement: {:#?}",
+                plan.effects()
+            )
+        };
+        assert_eq!(payload.deletes.len(), 1);
+        assert_eq!(payload.deletes[0].id.identity().as_str(), "records[1]");
+        assert_eq!(payload.deletes[0].identifier.as_str(), "old-record-1");
+        assert_eq!(payload.deletes[0].binding.as_deref(), Some("records[1]"));
+        &payload.template
     } else {
-        unreachable!("helper builds Delete");
-    }
-    let mut plan = Plan::new();
-    plan.add(deposed_delete);
-
-    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
-
-    assert!(
-        plan.effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate(_))),
-        "deposed delete must not turn the deferred create into DeferredReplace"
-    );
-    assert!(
-        !plan
-            .effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredReplace(_))),
-        "deposed delete must not be absorbed into DeferredReplace"
-    );
-    assert!(
-        plan.effects().iter().any(|effect| {
-            matches!(
-                effect,
-                Effect::Delete {
-                    binding: Some(binding),
-                    generation: carina_core::effect::EffectGeneration::Deposed(key),
-                    ..
-                } if binding == "validation_records[0]" && key == &deposed_key
+        let Effect::DeferredCreate(payload) = deferred else {
+            panic!(
+                "suppressing the only prior child leaves a deferred create: {:#?}",
+                plan.effects()
             )
-        }),
-        "deposed delete must remain top-level so remove-deposed writeback can observe it"
+        };
+        &payload.template
+    };
+    assert_eq!(template.target().bound_binding(), Some("records"));
+    assert!(
+        matches!(
+            plan.effects().last(),
+            Some(Effect::DeferredCreate(_) | Effect::DeferredReplace(_))
+        ),
+        "deferred effects must follow state-block effects: {:#?}",
+        plan.effects()
     );
+    plan
 }
 
-#[test]
-fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
-    let target = deferred_replace_test_target();
-    let mut plan = Plan::new();
-    plan.add(delete_effect_for_binding("some_other_resource[0]"));
+#[tokio::test]
+async fn removed_block_suppresses_child_delete_before_deferred_emission() {
+    for keep_other_child in [false, true] {
+        let plan = plan_deferred_for_with_state_block(
+            r#"removed { from = aws.route53.RecordSet "records[0]" }"#,
+            keep_other_child,
+        )
+        .await;
+        assert!(
+            matches!(&plan.effects()[1], Effect::Remove { id } if id.identity().as_str() == "records[0]")
+        );
+    }
+}
 
-    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
-
-    assert!(
-        plan.effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate(_))),
-        "unmatched target must stay a plain DeferredCreate"
-    );
-    assert!(
-        plan.effects().iter().any(|effect| {
-            matches!(
-                effect,
-                Effect::Delete {
-                    binding: Some(binding),
-                    ..
-                } if binding == "some_other_resource[0]"
-            )
-        }),
-        "unrelated orphan delete must stay a plain Delete"
-    );
-    assert!(
-        !plan
-            .effects()
-            .iter()
-            .any(|effect| matches!(effect, Effect::DeferredReplace(_))),
-        "unrelated delete must not be falsely absorbed"
-    );
+#[tokio::test]
+async fn moved_block_suppresses_child_delete_before_deferred_emission() {
+    for keep_other_child in [false, true] {
+        let plan = plan_deferred_for_with_state_block(
+            r#"moved {
+                from = aws.route53.RecordSet "records[0]"
+                to = aws.route53.RecordSet "retired"
+            }"#,
+            keep_other_child,
+        )
+        .await;
+        assert!(matches!(&plan.effects()[1], Effect::Move { from, to, .. }
+            if from.identity().as_str() == "records[0]" && to.identity().as_str() == "retired"));
+    }
 }
 
 mod expand_same_config_deferred_for_tests {
@@ -11224,7 +11126,7 @@ mod expand_same_config_deferred_for_tests {
             "one deferred-for expression should be carried for apply-time re-expansion"
         );
         assert_eq!(
-            out.deferred_create_targets[0].template.root_bindings(),
+            out.deferred_create_targets.templates()[0].root_bindings(),
             std::collections::BTreeSet::from(["cert".to_string()])
         );
         assert!(
