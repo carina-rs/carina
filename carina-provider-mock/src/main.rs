@@ -11,9 +11,8 @@ use carina_core::schema::{
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, DesiredAttribute,
-    DesiredResource, FoundRead, NormalizedResource, OperationToken, Pending, PendingDelete,
-    PendingPhase, PhasedToken, Poll, PollRequest, PollVerdict, Resume, ResumeStep, ResumeVerdict,
-    Sent, UpdateOutcome,
+    DesiredResource, FoundRead, NormalizedResource, Pending, PendingDelete, PhasedToken, Poll,
+    PollRequest, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -37,23 +36,39 @@ enum CreateMode {
 const UNENCODABLE_CREATE_TOKEN_POLLS: u32 = u32::MAX;
 
 #[derive(Debug, Serialize, Deserialize)]
+struct CreateOperation {
+    remaining: u32,
+    #[serde(serialize_with = "encode_create_poll_count")]
+    polls_served: u32,
+    #[serde(default, deserialize_with = "decode_create_mode")]
+    mode: CreateMode,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 enum CreateToken {
-    Operation {
-        remaining: u32,
-        #[serde(serialize_with = "encode_create_poll_count")]
-        polls_served: u32,
-        #[serde(default, deserialize_with = "decode_create_mode")]
-        mode: CreateMode,
-    },
+    Operation(CreateOperation),
     ReadBack,
 }
 
 impl PhasedToken for CreateToken {
-    fn phase(&self) -> PendingPhase {
+    type Operation = CreateOperation;
+
+    fn from_operation(operation: CreateOperation) -> Self {
+        Self::Operation(operation)
+    }
+
+    fn into_operation(self) -> Result<CreateOperation, Self> {
         match self {
-            Self::Operation { .. } => PendingPhase::Operation,
-            Self::ReadBack => PendingPhase::ReadBack,
+            Self::Operation(operation) => Ok(operation),
+            Self::ReadBack => Err(self),
+        }
+    }
+
+    fn operation(&self) -> Option<&CreateOperation> {
+        match self {
+            Self::Operation(operation) => Some(operation),
+            Self::ReadBack => None,
         }
     }
 }
@@ -82,17 +97,36 @@ fn decode_create_mode<'de, D: serde::Deserializer<'de>>(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct UpdateOperation {
+    remaining: u32,
+    polls_served: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum UpdateToken {
-    Operation { remaining: u32, polls_served: u32 },
+    Operation(UpdateOperation),
     ReadBack,
 }
 
 impl PhasedToken for UpdateToken {
-    fn phase(&self) -> PendingPhase {
+    type Operation = UpdateOperation;
+
+    fn from_operation(operation: UpdateOperation) -> Self {
+        Self::Operation(operation)
+    }
+
+    fn into_operation(self) -> Result<UpdateOperation, Self> {
         match self {
-            Self::Operation { .. } => PendingPhase::Operation,
-            Self::ReadBack => PendingPhase::ReadBack,
+            Self::Operation(operation) => Ok(operation),
+            Self::ReadBack => Err(self),
+        }
+    }
+
+    fn operation(&self) -> Option<&UpdateOperation> {
+        match self {
+            Self::Operation(operation) => Some(operation),
+            Self::ReadBack => None,
         }
     }
 }
@@ -965,7 +999,7 @@ impl CarinaProvider for MockProcessProvider {
             return Ok(attempt.issued(identifier, sent).succeeded(attributes));
         }
         if unencodable_pending || unencodable_pending_issued {
-            let token = CreateToken::Operation {
+            let token = CreateOperation {
                 remaining: 100,
                 polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
                 mode: CreateMode::Pending,
@@ -973,16 +1007,14 @@ impl CarinaProvider for MockProcessProvider {
             if unencodable_pending_issued {
                 let identifier = Self::mint_identifier(&request.resource.attributes);
                 self.remember_state(&identifier, &request.resource.attributes);
-                return Ok(attempt.issued(identifier, sent).pending(token, 1));
+                return Ok(attempt
+                    .issued(identifier, sent)
+                    .pending(CreateToken::Operation(token), 1));
             }
-            return Ok(attempt.pending(
-                OperationToken::new(token).expect("operation token"),
-                sent,
-                1,
-            ));
+            return Ok(attempt.pending(token, sent, 1));
         }
         if unencodable_poll || unencodable_poll_issued {
-            let token = CreateToken::Operation {
+            let token = CreateOperation {
                 remaining: 100,
                 polls_served: 0,
                 mode: CreateMode::Pending,
@@ -990,13 +1022,11 @@ impl CarinaProvider for MockProcessProvider {
             if unencodable_poll_issued {
                 let identifier = Self::mint_identifier(&request.resource.attributes);
                 self.remember_state(&identifier, &request.resource.attributes);
-                return Ok(attempt.issued(identifier, sent).pending(token, 1));
+                return Ok(attempt
+                    .issued(identifier, sent)
+                    .pending(CreateToken::Operation(token), 1));
             }
-            return Ok(attempt.pending(
-                OperationToken::new(token).expect("operation token"),
-                sent,
-                1,
-            ));
+            return Ok(attempt.pending(token, sent, 1));
         }
         if matches!(
             request.resource.attributes.get("call_spin_forever"),
@@ -1067,12 +1097,11 @@ impl CarinaProvider for MockProcessProvider {
                 })
             }
             CreateMode::Normal => Ok(attempt.pending(
-                OperationToken::new(CreateToken::Operation {
+                CreateOperation {
                     remaining: pending_polls - 1,
                     polls_served: 0,
                     mode,
-                })
-                .expect("operation token"),
+                },
                 sent,
                 1,
             )),
@@ -1080,11 +1109,11 @@ impl CarinaProvider for MockProcessProvider {
                 let identifier = Self::mint_identifier(&request.resource.attributes);
                 self.remember_state(&identifier, &request.resource.attributes);
                 Ok(attempt.issued(identifier, sent).pending(
-                    CreateToken::Operation {
+                    CreateToken::Operation(CreateOperation {
                         remaining: 100,
                         polls_served: 0,
                         mode,
-                    },
+                    }),
                     1,
                 ))
             }
@@ -1092,12 +1121,11 @@ impl CarinaProvider for MockProcessProvider {
             | CreateMode::Undetermined
             | CreateMode::MalformedPending
             | CreateMode::Resend => Ok(attempt.pending(
-                OperationToken::new(CreateToken::Operation {
+                CreateOperation {
                     remaining: 100,
                     polls_served: 0,
                     mode,
-                })
-                .expect("operation token"),
+                },
                 sent,
                 1,
             )),
@@ -1117,39 +1145,33 @@ impl CarinaProvider for MockProcessProvider {
                 if mode == "unencodable_poll" || mode == "unencodable_poll_issued"
         );
         if unencodable_poll {
-            let token = CreateToken::Operation {
+            let token = CreateOperation {
                 remaining: 100,
                 polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
                 mode: CreateMode::Pending,
             };
             return Ok(match poll {
-                Poll::Unissued(attempt, _previous) => {
-                    attempt.pending(OperationToken::new(token).expect("operation token"), 1)
-                }
-                Poll::Issued(issued, _previous) => issued.pending(token, 1),
+                Poll::Unissued(attempt, _previous) => attempt.pending(token, 1),
+                Poll::Issued(issued, _previous) => issued.pending(CreateToken::Operation(token), 1),
             });
         }
         let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
         match poll {
             Poll::Unissued(attempt, token) => {
-                let CreateToken::Operation {
+                let CreateOperation {
                     remaining,
                     polls_served,
                     mode,
-                } = token.into_inner()
-                else {
-                    unreachable!("the SDK excludes read-back tokens without an identifier");
-                };
+                } = token;
                 match mode {
                     CreateMode::Normal => {
                         if remaining > 0 {
                             return Ok(attempt.pending(
-                                OperationToken::new(CreateToken::Operation {
+                                CreateOperation {
                                     remaining: remaining - 1,
                                     polls_served: polls_served + 1,
                                     mode,
-                                })
-                                .expect("operation token"),
+                                },
                                 1,
                             ));
                         }
@@ -1175,21 +1197,19 @@ impl CarinaProvider for MockProcessProvider {
                     | CreateMode::Discarded
                     | CreateMode::Undetermined
                     | CreateMode::Resend) => Ok(attempt.pending(
-                        OperationToken::new(CreateToken::Operation {
+                        CreateOperation {
                             remaining,
                             polls_served: polls_served + 1,
                             mode,
-                        })
-                        .expect("operation token"),
+                        },
                         1,
                     )),
                     CreateMode::MalformedPending => Err(attempt.preserve(
-                        OperationToken::new(CreateToken::Operation {
+                        CreateOperation {
                             remaining,
                             polls_served,
                             mode,
-                        })
-                        .expect("operation token"),
+                        },
                         1,
                         Self::create_mode_error(id, CreateMode::MalformedPending),
                     )),
@@ -1222,20 +1242,20 @@ impl CarinaProvider for MockProcessProvider {
             }
             Poll::Issued(
                 issued,
-                CreateToken::Operation {
+                CreateToken::Operation(CreateOperation {
                     remaining,
                     polls_served,
                     mode,
-                },
+                }),
             ) => match mode {
                 CreateMode::Normal => {
                     if remaining > 0 {
                         return Ok(issued.pending(
-                            CreateToken::Operation {
+                            CreateToken::Operation(CreateOperation {
                                 remaining: remaining - 1,
                                 polls_served: polls_served + 1,
                                 mode,
-                            },
+                            }),
                             1,
                         ));
                     }
@@ -1262,11 +1282,11 @@ impl CarinaProvider for MockProcessProvider {
                 | CreateMode::Discarded
                 | CreateMode::Undetermined
                 | CreateMode::Resend) => Ok(issued.pending(
-                    CreateToken::Operation {
+                    CreateToken::Operation(CreateOperation {
                         remaining,
                         polls_served: polls_served + 1,
                         mode,
-                    },
+                    }),
                     1,
                 )),
                 CreateMode::MalformedPending | CreateMode::Untracked => {
@@ -1307,11 +1327,11 @@ impl CarinaProvider for MockProcessProvider {
                         "create_read_back_operation_after_final",
                     ) {
                         return Ok(issued.pending(
-                            CreateToken::Operation {
+                            CreateToken::Operation(CreateOperation {
                                 remaining: 0,
                                 polls_served: 0,
                                 mode: CreateMode::Normal,
-                            },
+                            }),
                             1,
                         ));
                     }
@@ -1350,39 +1370,35 @@ impl CarinaProvider for MockProcessProvider {
             Some(Value::String(mode)) if mode == "unencodable_repending"
         );
         if unencodable_repending {
-            let token = CreateToken::Operation {
+            let token = CreateOperation {
                 remaining: 100,
                 polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
                 mode: CreateMode::Pending,
             };
             return Ok(match resume {
-                Resume::Unissued(attempt, _previous) => {
-                    attempt.pending(OperationToken::new(token).expect("operation token"), 1)
+                Resume::Unissued(attempt, _previous) => attempt.pending(token, 1),
+                Resume::Issued(resumed, _previous) => {
+                    resumed.pending(CreateToken::Operation(token), 1)
                 }
-                Resume::Issued(resumed, _previous) => resumed.pending(token, 1),
             });
         }
         let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
         match resume {
             Resume::Unissued(attempt, token) => {
-                let CreateToken::Operation {
+                let CreateOperation {
                     remaining,
                     polls_served,
                     mode,
-                } = token.into_inner()
-                else {
-                    unreachable!("the SDK excludes read-back tokens without an identifier");
-                };
+                } = token;
                 match mode {
                     CreateMode::Normal => {
                         if remaining > 0 {
                             return Ok(attempt.pending(
-                                OperationToken::new(CreateToken::Operation {
+                                CreateOperation {
                                     remaining: remaining - 1,
                                     polls_served: polls_served + 1,
                                     mode,
-                                })
-                                .expect("operation token"),
+                                },
                                 1,
                             ));
                         }
@@ -1396,12 +1412,11 @@ impl CarinaProvider for MockProcessProvider {
                         })
                     }
                     CreateMode::Pending => Ok(attempt.pending(
-                        OperationToken::new(CreateToken::Operation {
+                        CreateOperation {
                             remaining,
                             polls_served: polls_served + 1,
                             mode,
-                        })
-                        .expect("operation token"),
+                        },
                         1,
                     )),
                     CreateMode::Resumed => {
@@ -1418,22 +1433,20 @@ impl CarinaProvider for MockProcessProvider {
                         Err(attempt.untracked(Self::create_mode_error(id, mode)))
                     }
                     CreateMode::Undetermined => Err(attempt.preserve(
-                        OperationToken::new(CreateToken::Operation {
+                        CreateOperation {
                             remaining,
                             polls_served,
                             mode,
-                        })
-                        .expect("operation token"),
+                        },
                         1,
                         Self::create_mode_error(id, CreateMode::Undetermined),
                     )),
                     CreateMode::MalformedPending => Err(attempt.preserve(
-                        OperationToken::new(CreateToken::Operation {
+                        CreateOperation {
                             remaining,
                             polls_served,
                             mode,
-                        })
-                        .expect("operation token"),
+                        },
                         1,
                         Self::create_mode_error(id, CreateMode::MalformedPending),
                     )),
@@ -1471,29 +1484,36 @@ impl CarinaProvider for MockProcessProvider {
             }
             Resume::Issued(
                 resumed,
-                CreateToken::Operation {
+                CreateToken::Operation(CreateOperation {
                     remaining,
                     polls_served,
                     mode,
-                },
+                }),
             ) => match mode {
                 CreateMode::Normal => {
                     if remaining > 0 {
                         return Ok(resumed.pending(
-                            CreateToken::Operation {
+                            CreateToken::Operation(CreateOperation {
                                 remaining: remaining - 1,
                                 polls_served: polls_served + 1,
                                 mode,
-                            },
+                            }),
                             1,
                         ));
                     }
                     let identifier = resumed.identifier().clone();
+                    let read_back_pending_polls = Self::exact_pending_polls(
+                        &request.resource.attributes,
+                        "create_read_back_pending_polls",
+                    );
                     let attributes = self.create_done_with_identifier(
                         &identifier,
                         request,
                         Some(polls_served + 1),
                     );
+                    if read_back_pending_polls > 0 {
+                        return Ok(resumed.pending(CreateToken::ReadBack, 1));
+                    }
                     let found = Self::found_read(id, resumed.identifier(), attributes);
                     Ok(match canonical_identifier {
                         Some(identifier) => resumed.canonicalize(identifier).completed(found),
@@ -1501,11 +1521,11 @@ impl CarinaProvider for MockProcessProvider {
                     })
                 }
                 CreateMode::Pending => Ok(resumed.pending(
-                    CreateToken::Operation {
+                    CreateToken::Operation(CreateOperation {
                         remaining,
                         polls_served: polls_served + 1,
                         mode,
-                    },
+                    }),
                     1,
                 )),
                 CreateMode::Resumed | CreateMode::Resend => {
@@ -1552,7 +1572,22 @@ impl CarinaProvider for MockProcessProvider {
                     let attributes = self.read_back_attributes(resumed.identifier());
                     return Ok(resumed.partial(attributes, Self::partial_read_diagnostic()));
                 }
-                Ok(resumed.pending(CreateToken::ReadBack, 1))
+                let target = Self::exact_pending_polls(
+                    &request.resource.attributes,
+                    "create_read_back_pending_polls",
+                );
+                if self.read_back_poll_number(resumed.identifier(), "create") < target {
+                    return Ok(resumed.pending(CreateToken::ReadBack, 1));
+                }
+                match self.read(id, resumed.identifier(), ReadRequest) {
+                    Ok(ReadOutcome::Found { state }) => {
+                        Ok(resumed.completed(FoundRead::from_applied_state(state)))
+                    }
+                    Ok(ReadOutcome::NotFound { .. }) => {
+                        Ok(resumed.pending(CreateToken::ReadBack, 1))
+                    }
+                    Err(error) => Err(resumed.preserve(CreateToken::ReadBack, 1, error)),
+                }
             }
         }
     }
@@ -1566,10 +1601,10 @@ impl CarinaProvider for MockProcessProvider {
         let pending_polls = Self::update_pending_polls(&request);
         if pending_polls > 0 {
             return Ok(UpdateOutcome::Pending(Pending::new(
-                UpdateToken::Operation {
+                UpdateToken::Operation(UpdateOperation {
                     remaining: pending_polls - 1,
                     polls_served: 0,
-                },
+                }),
                 1,
             )));
         }
@@ -1594,20 +1629,20 @@ impl CarinaProvider for MockProcessProvider {
         poll_request: PollRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
         match pending.token {
-            UpdateToken::Operation {
+            UpdateToken::Operation(UpdateOperation {
                 remaining,
                 polls_served,
-            } if remaining > 0 => Ok(UpdateOutcome::Pending(Pending::new(
-                UpdateToken::Operation {
+            }) if remaining > 0 => Ok(UpdateOutcome::Pending(Pending::new(
+                UpdateToken::Operation(UpdateOperation {
                     remaining: remaining - 1,
                     polls_served: polls_served + 1,
-                },
+                }),
                 1,
             ))),
-            UpdateToken::Operation {
+            UpdateToken::Operation(UpdateOperation {
                 remaining: _,
                 polls_served,
-            } => {
+            }) => {
                 if Self::update_exact_pending_polls(&request, "update_read_back_pending_polls") > 0
                 {
                     let _outcome =
@@ -1629,10 +1664,10 @@ impl CarinaProvider for MockProcessProvider {
             {
                 if Self::update_bool_attribute(&request, "update_read_back_operation_after_final") {
                     return Ok(UpdateOutcome::Pending(Pending::new(
-                        UpdateToken::Operation {
+                        UpdateToken::Operation(UpdateOperation {
                             remaining: 0,
                             polls_served: 0,
-                        },
+                        }),
                         1,
                     )));
                 }

@@ -61,8 +61,8 @@ use std::collections::{BTreeMap, HashMap};
 use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
-    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, OperationToken,
-    Pending, PendingPhase, PhasedToken, Poll, PollFinality, PollRequest, PollVerdict, Resume,
+    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never,
+    Pending, PhasedToken, Poll, PollFinality, PollRequest, PollVerdict, Resume,
     ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
@@ -229,7 +229,7 @@ fn create(
     let client_token = self.api.new_client_token();
     match self.api.start_create(&client_token, &name, size) {
         Ok(operation) => Ok(attempt.pending(
-            CreateToken::OperationId(operation).operation(),
+            CreateOperation::OperationId(operation),
             Sent::AllRequestAttributes,
             5,
         )),
@@ -240,7 +240,7 @@ fn create(
         // The request may have been accepted. Keep the attempt and
         // retry it with the same client token in poll_create.
         Err(_) => Ok(attempt.pending(
-            CreateToken::Starting { client_token }.operation(),
+            CreateOperation::Starting { client_token },
             Sent::AllRequestAttributes,
             5,
         )),
@@ -255,37 +255,53 @@ The three outcomes follow the rules from the Overview. Bad input is found before
 The token is stored in state while the create is unfinished:
 
 ```rust
-/// What the provider needs to find an unfinished create again. The host
-/// stores it in state, so it holds no request values or secrets.
+/// Operation continuations cannot contain a read-back marker.
 #[derive(Debug, Serialize, Deserialize)]
-pub enum CreateToken {
-    /// The create call has not been confirmed. Retrying it with the same
-    /// client token either starts the create or returns the operation the
-    /// first call started.
+pub enum CreateOperation {
+    /// Retrying the same client token finds or starts the original create.
     Starting { client_token: String },
     /// The API accepted the request and returned an operation to follow.
     OperationId(String),
+}
+
+/// The host stores this token, so it holds no request values or secrets.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CreateToken {
     /// The mutation finished; only reading the widget back remains.
     ReadBack,
+    /// Keep the existing Starting / OperationId JSON representation.
+    #[serde(untagged)]
+    Operation(CreateOperation),
 }
 
 impl PhasedToken for CreateToken {
-    fn phase(&self) -> PendingPhase {
+    type Operation = CreateOperation;
+
+    fn from_operation(operation: CreateOperation) -> Self {
+        Self::Operation(operation)
+    }
+
+    fn into_operation(self) -> Result<CreateOperation, Self> {
         match self {
-            Self::Starting { .. } | Self::OperationId(_) => PendingPhase::Operation,
-            Self::ReadBack => PendingPhase::ReadBack,
+            Self::Operation(operation) => Ok(operation),
+            Self::ReadBack => Err(self),
         }
     }
-}
 
-impl CreateToken {
-    fn operation(self) -> OperationToken<Self> {
-        OperationToken::new(self).expect("an operation continuation")
+    fn operation(&self) -> Option<&CreateOperation> {
+        match self {
+            Self::Operation(operation) => Some(operation),
+            Self::ReadBack => None,
+        }
     }
 }
 ```
 
-It holds a client token, an operation ID, or the read-back marker, never request values. `PhasedToken` reports the phase from the variant. Before an identifier is known, `pending` and `preserve` require `OperationToken<CreateToken>`; the example's `operation()` helper narrows its operation variants through `OperationToken::new`. That constructor rejects `ReadBack`. Once an identifier is known, both methods take the token directly and derive the phase from it, so there is no separate phase-selection method. Deriving `Serialize` and `Deserialize` needs `serde` with the `derive` feature: `serde = { version = "1", features = ["derive"] }`. Within one apply, every poll receives the original request again, so the token does not need to repeat it. A create resumed by a later apply receives the request built from the configuration as it is then, which may have changed.
+`CreateOperation` holds only a client token or an operation ID. Before an identifier is known, `pending` and `preserve` take that payload directly, so provider code never checks a phase or unwraps a conversion. `Poll::Unissued` and `Resume::Unissued` also carry `CreateOperation`. Only SDK dispatch calls `into_operation` when decoding a full host token; a read-back token without an identifier ends polling with `READ_BACK_WITHOUT_IDENTIFIER`.
+
+`PhasedToken::phase()` derives the phase from the borrowed `operation()` view: `Some` means operation, `None` means read-back. The borrowed and consuming views must agree, and `from_operation` must invert `into_operation`. Identifier-bearing handles accept the full token and derive their pending or preserved phase from it. The untagged operation variant retains the earlier token JSON form. Deriving `Serialize` and `Deserialize` needs `serde` with the `derive` feature: `serde = { version = "1", features = ["derive"] }`.
+
+Within one apply, every poll receives the original request again, so the token does not need to repeat it. A create resumed by a later apply receives the request built from the configuration as it is then, which may have changed.
 
 ## poll_create
 
@@ -330,36 +346,36 @@ fn poll_create(
             };
         }
     };
-    match token.into_inner() {
-        CreateToken::Starting { client_token } => {
+    match token {
+        CreateOperation::Starting { client_token } => {
             let (name, size) = match desired(&request.resource) {
                 Ok(values) => values,
                 Err(err) => {
                     return Err(attempt.preserve(
-                        CreateToken::Starting { client_token }.operation(),
+                        CreateOperation::Starting { client_token },
                         5,
                         err,
                     ));
                 }
             };
             match self.api.start_create(&client_token, &name, size) {
-                Ok(operation) => Ok(attempt.pending(CreateToken::OperationId(operation).operation(), 5)),
+                Ok(operation) => Ok(attempt.pending(CreateOperation::OperationId(operation), 5)),
                 // A rejected retry does not prove the first call created
                 // nothing: the API may refuse a reused client token, for
                 // example because the configuration changed in between.
                 Err(err @ ApiError::Rejected(_)) => {
                     Err(attempt.preserve(
-                        CreateToken::Starting { client_token }.operation(),
+                        CreateOperation::Starting { client_token },
                         5,
                         api_error("widget.Create", err),
                     ))
                 }
-                Err(_) => Ok(attempt.pending(CreateToken::Starting { client_token }.operation(), 5)),
+                Err(_) => Ok(attempt.pending(CreateOperation::Starting { client_token }, 5)),
             }
         }
-        CreateToken::OperationId(operation) => match self.api.create_status(&operation) {
+        CreateOperation::OperationId(operation) => match self.api.create_status(&operation) {
             Ok(CreateStatus::InProgress) => {
-                Ok(attempt.pending(CreateToken::OperationId(operation).operation(), 5))
+                Ok(attempt.pending(CreateOperation::OperationId(operation), 5))
             }
             Ok(CreateStatus::Done { id: widget_id }) => match identifier(&widget_id) {
                 Ok(identifier) => {
@@ -383,7 +399,7 @@ fn poll_create(
                     }
                 }
                 Err(err) => Err(attempt.preserve(
-                    CreateToken::OperationId(operation).operation(),
+                    CreateOperation::OperationId(operation),
                     5,
                     err,
                 )),
@@ -405,7 +421,7 @@ fn poll_create(
                         .into())
                 }
                 Err(err) => Err(attempt.preserve(
-                    CreateToken::OperationId(operation).operation(),
+                    CreateOperation::OperationId(operation),
                     5,
                     err,
                 )),
@@ -414,9 +430,8 @@ fn poll_create(
                 Err(attempt.untracked(error(ProviderErrorKind::ApiError, reason)))
             }
             // The status call failed; the operation is still there.
-            Err(_) => Ok(attempt.pending(CreateToken::OperationId(operation).operation(), 5)),
+            Err(_) => Ok(attempt.pending(CreateOperation::OperationId(operation), 5)),
         },
-        CreateToken::ReadBack => unreachable!("unissued tokens are checked by the SDK"),
     }
 }
 ```
@@ -427,7 +442,9 @@ A rejected retry is `preserve`, not `untracked`. The first call may have created
 
 When the operation finishes, the provider calls `attempt.issued(identifier)`. On an ordinary poll it returns `pending(CreateToken::ReadBack, ..)`, which records the identifier, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. If the operation completes on the final attempt, the example settles with `partial` immediately, preserving the identifier for the next refresh.
 
-`poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. The example also returns `partial` when the issued read-back receives the final attempt and still cannot read the widget. Neither final-attempt branch has observed attributes, so both return an empty map and mark the unread attributes as missing. `resume_create` receives the same poll request when Carina resumes a persisted continuation; on its first call, the persisted token and identifier are authoritative but the inbound phase and delay are not.
+`poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. The example also returns `partial` when the issued read-back receives the final attempt and still cannot read the widget. Neither final-attempt branch has observed attributes, so both return an empty map and mark the unread attributes as missing.
+
+`resume_create` receives the same poll request when Carina resumes a persisted continuation. SDK dispatch rejects only the backward phase pairing: host progress is read-back while the token is operation-phase. For create poll and resume this returns `Undetermined` and keeps the previous continuation; update decoding rejects the same backward pairing. Operation progress with a read-back token is accepted when an identifier is available. This includes the first resume call: the host supplies `operating` because state has no phase metadata, and a saved read-back token can use the identifier-bearing handle to read from a fresh provider instance. Its next pending or preserved result reports read-back progress. A read-back token without an identifier ends create polling with `READ_BACK_WITHOUT_IDENTIFIER`.
 
 On the wire, create and resume use `create-progress`: `operating(option<string>)` while the mutation is in progress, or `reading-back(string)` once it has completed. Read-back therefore always carries an identifier. Updates carry their phase in `pending-update`; their request already includes the identifier.
 

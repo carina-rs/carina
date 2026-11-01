@@ -8,9 +8,9 @@ use carina_plugin_sdk::core::schema::{
 };
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
-    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, OperationToken,
-    Pending, PendingDelete, PendingPhase, PhasedToken, PlanOp, Poll, PollVerdict, Resume,
-    ResumeStep, ResumeVerdict, UpdateOutcome,
+    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
+    PendingDelete, PhasedToken, PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict,
+    UpdateOutcome,
 };
 
 use carina_provider_mock_http::send_phase::{self, PreparedCreate, ProbeKind};
@@ -25,8 +25,18 @@ struct MockHttpProvider;
 struct CreateToken(f64);
 
 impl PhasedToken for CreateToken {
-    fn phase(&self) -> PendingPhase {
-        PendingPhase::Operation
+    type Operation = f64;
+
+    fn from_operation(operation: f64) -> Self {
+        Self(operation)
+    }
+
+    fn into_operation(self) -> Result<f64, Self> {
+        Ok(self.0)
+    }
+
+    fn operation(&self) -> Option<&f64> {
+        Some(&self.0)
     }
 }
 
@@ -154,7 +164,7 @@ impl CarinaProvider for MockHttpProvider {
         match behavior.as_deref() {
             Some("trap_after_send") => panic!("intentional mock HTTP trap after send"),
             Some("pending_nan_after_send") => {
-                return Ok(probe.pending(OperationToken::new(CreateToken(f64::NAN)).unwrap(), 1));
+                return Ok(probe.pending(f64::NAN, 1));
             }
             Some("untracked_after_send") => {
                 return Err(probe.untracked(Self::error(

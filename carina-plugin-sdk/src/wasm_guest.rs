@@ -7,6 +7,22 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+/// Decode and validate a host-owned update continuation before dispatch.
+#[doc(hidden)]
+pub fn decode_pending_update<T: serde::de::DeserializeOwned + crate::PhasedToken>(
+    token: &str,
+    poll_after_secs: u32,
+    host_phase: crate::PendingPhase,
+) -> Result<crate::Pending<T>, serde_json::Error> {
+    let pending = crate::Pending::new(serde_json::from_str::<T>(token)?, poll_after_secs);
+    if crate::continuation_phase_regresses(host_phase, pending.phase()) {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "update continuation phase does not match its token",
+        ));
+    }
+    Ok(pending)
+}
+
 /// Structural failures that can be diagnosed in a provider's const context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressPatternStructureError {
@@ -1136,16 +1152,11 @@ macro_rules! export_provider {
             fn wit_to_sdk_pending<T: serde::de::DeserializeOwned + $crate::PhasedToken>(
                 pending: wit_types::PendingUpdate,
             ) -> Result<$crate::Pending<T>, serde_json::Error> {
-                let decoded = $crate::Pending::new(
-                    serde_json::from_str::<T>(&pending.operation.token)?,
+                helpers::decode_pending_update(
+                    &pending.operation.token,
                     pending.operation.poll_after_secs,
-                );
-                if decoded.phase() != wit_to_proto_pending_phase(pending.phase) {
-                    return Err(<serde_json::Error as serde::de::Error>::custom(
-                        "update continuation phase does not match its token",
-                    ));
-                }
-                Ok(decoded)
+                    wit_to_proto_pending_phase(pending.phase),
+                )
             }
 
             fn sdk_to_wit_pending_delete<T: serde::Serialize>(
@@ -1756,22 +1767,33 @@ macro_rules! export_provider {
                 }
             }
 
-            fn decode_create_identifier(
+            fn decode_create_progress(
                 operation: &'static str,
-                identifier: Option<String>,
-            ) -> Result<Option<proto::AppliedIdentifier>, wit_types::ProviderError> {
-                identifier
-                    .map(proto::AppliedIdentifier::new)
-                    .transpose()
-                    .map_err(|error| {
+                progress: wit_types::CreateProgress,
+            ) -> Result<proto::CreateProgress, wit_types::ProviderError> {
+                let decode_identifier = |identifier| {
+                    proto::AppliedIdentifier::new(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error(operation, error)
                     })
+                };
+                Ok(match progress {
+                    wit_types::CreateProgress::Operating(identifier) => {
+                        proto::CreateProgress::Operating {
+                            identifier: identifier.map(decode_identifier).transpose()?,
+                        }
+                    }
+                    wit_types::CreateProgress::ReadingBack(identifier) => {
+                        proto::CreateProgress::ReadingBack {
+                            identifier: decode_identifier(identifier)?,
+                        }
+                    }
+                })
             }
 
             fn wit_to_sdk_poll<T: serde::de::DeserializeOwned>(
                 pending: wit_types::PendingCreate,
                 request: &proto::CreateRequest,
-            ) -> Result<(Option<proto::AppliedIdentifier>, proto::Sent, T), wit_types::ProviderError> {
+            ) -> Result<(proto::CreateProgress, proto::Sent, T), wit_types::ProviderError> {
                 let wit_types::PendingCreate {
                     operation,
                     progress,
@@ -1803,13 +1825,13 @@ macro_rules! export_provider {
                 let token = serde_json::from_str(&token).map_err(|error| {
                     boundary_token_decode_to_provider_error("poll_create", error)
                 })?;
-                let identifier = decode_create_identifier("poll_create", wit_create_identifier(progress))?;
-                Ok((identifier, sent, token))
+                let progress = decode_create_progress("poll_create", progress)?;
+                Ok((progress, sent, token))
             }
 
             fn wit_to_sdk_resume<T: serde::de::DeserializeOwned>(
                 pending: wit_types::ResumePending,
-            ) -> Result<(Option<proto::AppliedIdentifier>, T), wit_types::ProviderError> {
+            ) -> Result<(proto::CreateProgress, T), wit_types::ProviderError> {
                 let wit_types::ResumePending {
                     operation,
                     progress,
@@ -1821,8 +1843,8 @@ macro_rules! export_provider {
                 let token = serde_json::from_str(&token).map_err(|error| {
                     boundary_token_decode_to_provider_error("resume_create", error)
                 })?;
-                let identifier = decode_create_identifier("resume_create", wit_create_identifier(progress))?;
-                Ok((identifier, token))
+                let progress = decode_create_progress("resume_create", progress)?;
+                Ok((progress, token))
             }
 
             fn sdk_to_wit_update_outcome<T: serde::Serialize + $crate::PhasedToken>(
@@ -2324,7 +2346,7 @@ macro_rules! export_provider {
                             ));
                         }
                     };
-                    let (identifier, sent, token) = match wit_to_sdk_poll::<
+                    let (progress, sent, token) = match wit_to_sdk_poll::<
                         <$provider_type as $crate::CarinaProvider>::CreateToken,
                     >(pending, &proto_request) {
                         Ok(poll) => poll,
@@ -2338,7 +2360,7 @@ macro_rules! export_provider {
                         &*provider,
                         &proto_id,
                         proto_request,
-                        identifier,
+                        progress,
                         sent,
                         token,
                         poll_request,
@@ -2372,7 +2394,7 @@ macro_rules! export_provider {
                             ));
                         }
                     };
-                    let (identifier, token) = match wit_to_sdk_resume::<
+                    let (progress, token) = match wit_to_sdk_resume::<
                         <$provider_type as $crate::CarinaProvider>::CreateToken,
                     >(pending) {
                         Ok(resume) => resume,
@@ -2386,7 +2408,7 @@ macro_rules! export_provider {
                         &*provider,
                         &proto_id,
                         proto_request,
-                        identifier,
+                        progress,
                         token,
                         poll_request,
                     ) {
