@@ -67,12 +67,11 @@ attribute, nested path and conversion reason exactly once, without the value.
 `ProviderWireError::conversion_error()` retains the typed conversion reason.
 
 Native create validators use the infallible
-`DesiredInputs::from_provider_ready(request.resource())`; native update validators
-use `DesiredInputs::from_update(&request)`. Update requests retain the checked
-desired resource privately and expose only a read-only validation view, without
-its core attributes or resource. The WIT update request carries current state
-and the checked patch. Normalization callers query `DesiredView::inputs()` or
-`NativeDesiredNormalization::inputs()`. All views use protocol map key order;
+`DesiredInputs::from_provider_ready(request.resource())`. Update receives current
+state, directives and the checked patch, with no desired resource or validation
+view, per #2559. Both routes expose desired update values only through that patch.
+Normalization callers query `DesiredView::inputs()` or
+`NativeDesiredNormalization::inputs()`. These views use protocol map key order;
 there is no public raw-resource `DesiredInputs` constructor.
 
 The host validates and decodes the entire result before writing any changes.

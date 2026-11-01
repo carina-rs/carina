@@ -220,7 +220,10 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
         let carina_core::executor::ProviderPreparationError::Wire(error) = error else {
             panic!("expected a shared wire error: {error}")
         };
-        assert_eq!(error.resource(), Some(&resource.id));
+        assert_eq!(
+            error.target(),
+            &carina_core::provider::ProviderWireTarget::Resource(resource.id.clone())
+        );
         assert_eq!(error.attribute(), "tags");
         assert_eq!(
             error.path(),

@@ -577,9 +577,9 @@ A struct type represents a nested object with typed fields.
   host rewrites, including default tags and observed ignored patch leaves.
   Native and WASM dispatch share this proof; WASM only adapts the cached wire
   values to WIT. Native create validators use infallible
-  `DesiredInputs::from_provider_ready`; update validators use
-  `DesiredInputs::from_update` without access to the retained desired resource
-  or core attributes. Validation and normalization maps use protocol key order.
+  `DesiredInputs::from_provider_ready`. Updates expose desired values only
+  through the checked patch, with no desired resource or validation view
+  (#2559). Create validation and normalization maps use protocol key order.
   Raw normalization queries belong to `DesiredView` or
   `NativeDesiredNormalization`. Keep `ProviderWireError`
   terminal: render its typed conversion reason once, without input values,

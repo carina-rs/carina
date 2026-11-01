@@ -42,7 +42,6 @@ pub mod plan_tree;
 pub mod protocol_convert;
 pub mod provider;
 pub mod provider_source;
-pub mod provider_validation;
 pub mod provider_wire;
 pub mod references;
 pub mod resolver;

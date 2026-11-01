@@ -1093,10 +1093,9 @@ async fn native_and_wasm_normalization_views_iterate_maps_in_the_same_order() {
 }
 
 #[tokio::test]
-async fn provider_ready_and_update_inputs_use_protocol_map_order() {
+async fn provider_ready_inputs_use_protocol_map_order() {
     use carina_core::executor::{
         ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
-        prepare_update_request,
     };
     let mut resource = Resource::with_provider("test", "test.Resource", "ordered", None)
         .with_attribute("z", map([("z", string("last")), ("a", string("first"))]))
@@ -1127,16 +1126,8 @@ async fn provider_ready_and_update_inputs_use_protocol_map_order() {
         .await
         .unwrap();
     let ready = DesiredInputs::from_provider_ready(request.resource());
-    let from = carina_core::resource::State::existing(
-        resource.id.clone(),
-        resource.attributes.clone().into_iter().collect(),
-    );
-    let update = prepare_update_request(resource.clone(), from, &["a".into()], &context)
-        .await
-        .unwrap();
-    let update = DesiredInputs::from_update(&update);
     let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
-    for inputs in [ready, update, owner.inputs()] {
+    for inputs in [ready, owner.inputs()] {
         let tree = match &inputs.tree {
             InputsTree::Owned(tree) => tree,
             InputsTree::Borrowed(tree) => tree,
@@ -1151,88 +1142,6 @@ async fn provider_ready_and_update_inputs_use_protocol_map_order() {
         assert_eq!(
             map.entries.keys().map(String::as_str).collect::<Vec<_>>(),
             ["a", "z"]
-        );
-    }
-}
-
-#[tokio::test]
-async fn update_validators_read_complete_checked_validation_inputs() {
-    use carina_core::executor::{
-        ModuleConstraintGate, ProviderPreparationContext, prepare_update_request,
-    };
-    use carina_core::schema::{
-        PatternResourceSchema, SchemaRegistry, ValidatedConfigSchema,
-        ValidatedProviderSchemaWitness,
-    };
-    let witness = ValidatedProviderSchemaWitness::new(
-        ["ec2.NatGateway", "sqs.Queue"]
-            .into_iter()
-            .map(|name| PatternResourceSchema::new(name).validate().unwrap())
-            .collect(),
-        ValidatedConfigSchema::validate(Default::default()).unwrap(),
-        Default::default(),
-    )
-    .unwrap();
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert_provider_witness("aws", &witness).unwrap();
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let context = ProviderPreparationContext::new(
-        &bindings,
-        &gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
-    );
-    let cases = [
-        (
-            Resource::with_provider("aws", "ec2.NatGateway", "nat", None)
-                .with_attribute("availability_mode", string("regional"))
-                .with_attribute("subnet_id", string("subnet-unchanged")),
-            "availability_mode",
-            "subnet_id",
-        ),
-        (
-            Resource::with_provider("aws", "sqs.Queue", "queue", None)
-                .with_attribute("fifo_queue", Value::Concrete(ConcreteValue::Bool(false)))
-                .with_attribute(
-                    "content_based_deduplication",
-                    Value::Concrete(ConcreteValue::Bool(true)),
-                ),
-            "fifo_queue",
-            "content_based_deduplication",
-        ),
-    ];
-    for (resource, changed, unchanged) in cases {
-        let desired = resource.attributes.clone();
-        let from = carina_core::resource::State::existing(
-            resource.id.clone(),
-            desired.clone().into_iter().collect(),
-        );
-        let request = prepare_update_request(resource, from, &[changed.into()], &context)
-            .await
-            .unwrap();
-        assert!(request.patch().ops.iter().all(|op| op.key() != unchanged));
-        let inputs = DesiredInputs::from_update(&request);
-        assert_eq!(inputs.id(), &request.from().id);
-        for (name, expected) in &desired {
-            match (expected, inputs.attribute(name)) {
-                (
-                    Value::Concrete(ConcreteValue::String(expected)),
-                    Some(DesiredValue::Known(DesiredScalar::String(actual))),
-                ) => assert_eq!(actual, expected),
-                (
-                    Value::Concrete(ConcreteValue::Bool(expected)),
-                    Some(DesiredValue::Known(DesiredScalar::Bool(actual))),
-                ) => assert_eq!(actual, expected),
-                _ => panic!("the validation view must retain each desired input"),
-            }
-        }
-        assert!(inputs.attribute(unchanged).is_some());
-        assert!(
-            !validate(inputs),
-            "the validator needs desired values outside the update patch"
         );
     }
 }

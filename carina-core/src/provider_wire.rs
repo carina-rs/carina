@@ -48,18 +48,12 @@ impl ProviderWireError {
             target: Box::new(target.clone()),
             attribute: attribute.into(),
             path,
-            error: Box::new(error),
+            error: Box::new(error.into_leaf_error()),
         }
     }
 
     pub fn target(&self) -> &ProviderWireTarget {
         &self.target
-    }
-    pub fn resource(&self) -> Option<&ResourceId> {
-        match self.target.as_ref() {
-            ProviderWireTarget::Resource(id) => Some(id),
-            ProviderWireTarget::Configuration { .. } => None,
-        }
     }
     pub fn attribute(&self) -> &str {
         &self.attribute
@@ -68,7 +62,7 @@ impl ProviderWireError {
         &self.path
     }
     pub fn conversion_error(&self) -> &ProtocolConvertError {
-        self.error.leaf_error()
+        self.error.as_ref()
     }
 
     pub fn attribute_path(&self) -> String {
@@ -217,22 +211,22 @@ pub trait ResourceWirePayload: ProviderWirePayload<Projection = WireAttributes> 
 /// The only constructor runs the complete wire projection. There is no mutable
 /// access, unchecked conversion, default, or deserialization path.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::provider::{WireReady, UpdatePatch};
 /// fn bypass(raw: UpdatePatch) -> WireReady<UpdatePatch> { raw.into() }
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_core::provider::{WireReady, UpdatePatch};
 /// fn forge(raw: UpdatePatch) -> WireReady<UpdatePatch> {
 ///     WireReady { value: raw, wire: Vec::new() }
 /// }
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0594
 /// use carina_core::provider::{WireReady, UpdatePatch};
-/// fn mutate(ready: &mut WireReady<UpdatePatch>) {
-///     ready.as_inner().ops.clear();
+/// fn mutate(ready: &mut WireReady<UpdatePatch>, replacement: UpdatePatch) {
+///     *ready.as_inner() = replacement;
 /// }
 /// ```
 #[derive(Clone)]
@@ -423,6 +417,34 @@ impl ProviderWirePayload for UpdatePatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_error_debug_contains_one_path_and_stores_the_leaf_reason() {
+        let error = WireReady::try_new(
+            IndexMap::from([(
+                "input".into(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "only_once_in_debug".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                )]))),
+            )]),
+            ProviderWireTarget::Configuration {
+                provider: "test".into(),
+            },
+        )
+        .unwrap_err();
+        let debug = format!("{error:?}");
+        assert_eq!(debug.matches("only_once_in_debug").count(), 1, "{debug}");
+        assert_eq!(
+            error.path(),
+            &[WirePathSegment::Key("only_once_in_debug".into())]
+        );
+        assert!(matches!(
+            error.error.as_ref(),
+            ProtocolConvertError::NonFiniteFloat
+        ));
+        assert!(error.error.value_path().is_empty());
+    }
 
     #[test]
     fn wire_errors_do_not_reveal_paths_inside_secrets() {
