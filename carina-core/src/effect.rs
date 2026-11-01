@@ -907,8 +907,20 @@ impl ResolvedMovePairs {
     /// Address-preserving refresh obtains its empty scope from the resolver:
     ///
     /// ```
-    /// use carina_core::{effect::{AddressedMoves, ResolvedMovePairs}, parser::ParsedFile};
-    /// let configuration = ParsedFile::default();
+    /// use carina_core::{
+    ///     config_loader::parse_directory,
+    ///     effect::{AddressedMoves, ResolvedMovePairs},
+    ///     module_resolver::resolve_modules_providerless,
+    ///     parser::ProviderContext,
+    ///     schema::SchemaRegistry,
+    /// };
+    /// let project = tempfile::tempdir().unwrap();
+    /// std::fs::write(project.path().join("main.crn"), "").unwrap();
+    /// let parsed = parse_directory(project.path(), &ProviderContext::default()).unwrap();
+    /// let configuration = resolve_modules_providerless(parsed, project.path())
+    ///     .unwrap()
+    ///     .into_expanded(&SchemaRegistry::new())
+    ///     .unwrap();
     /// let addressed = AddressedMoves::preserve_addresses(&configuration.state_blocks);
     /// let pairs = ResolvedMovePairs::from_addressed_moves(addressed);
     /// assert!(pairs.is_empty());
