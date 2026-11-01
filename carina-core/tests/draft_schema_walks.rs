@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use carina_core::resource::{ConcreteValue, EnumValueResolver, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, LeafPath, LeafPathSegment, ResourceSchema, Shape,
+    AttributeSchema, AttributeType, LeafPath, LeafPathSegment, ListElements, ResourceSchema, Shape,
     ShapeWalkBudget, StructField, TypeInSchema, enum_identity, schema_write_only_keys, types,
 };
 use indexmap::IndexMap;
@@ -155,9 +155,17 @@ fn draft_schema_walks_resolve_definitions() {
         }
     ));
     let children = struct_field_type(&schema, &reference, "children").unwrap();
-    let Shape::List { element_type, .. } = schema.shape_of(children) else {
+    let Shape::List {
+        element_type,
+        ordered,
+        constraints,
+    } = schema.shape_of(children)
+    else {
         panic!("children must remain a list");
     };
+    assert!(ordered);
+    assert_eq!(constraints.length(), None);
+    assert_eq!(constraints.elements(), ListElements::AllowDuplicates);
     assert!(matches!(
         schema.shape_of(element_type),
         Shape::Struct { .. }

@@ -75,13 +75,13 @@ impl PatternAttributeType<Draft> {
             AttrTypeKind::List {
                 element_type,
                 ordered,
-                length,
+                constraints,
             } => AttrTypeKind::List {
                 element_type: Box::new(
                     element_type.compile_patterns(location.with_suffix("[]"), issues)?,
                 ),
                 ordered,
-                length,
+                constraints,
             },
             AttrTypeKind::Map { key, value } => {
                 let key = key.compile_patterns(location.with_suffix(".<key>"), issues);

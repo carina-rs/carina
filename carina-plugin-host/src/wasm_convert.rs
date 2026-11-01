@@ -2904,6 +2904,7 @@ mod tests {
         let mut writable = proto_attr(
             "tags",
             proto::AttributeType::List {
+                elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                 element_type: Box::new(proto::AttributeType::Ref {
                     name: "Tag".to_string(),
                 }),
@@ -2916,6 +2917,7 @@ mod tests {
         let mut output = proto_attr(
             "effective_tags",
             proto::AttributeType::List {
+                elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                 element_type: Box::new(proto::AttributeType::Ref {
                     name: "Tag".to_string(),
                 }),
@@ -4816,22 +4818,22 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v16_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 16);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 16);
+    fn test_protocol_version_range_is_v17_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 17);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 17);
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_pre_v16_provider() {
-        for version in [13, 14, 15] {
+    fn test_check_protocol_version_rejects_pre_v17_provider() {
+        for version in [13, 14, 15, 16] {
             let error = check_protocol_version(
             &format!(r#"{{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":{version}}}"#),
         )
-        .expect_err("a v16 host must reject an older provider before schema decoding");
+        .expect_err("a v17 host must reject an older provider before schema decoding");
 
             assert!(error.contains("provider 'old'"));
             assert!(error.contains(&format!("protocol version {version}")));
-            assert!(error.contains("requires at least version 16"));
+            assert!(error.contains("requires at least version 17"));
         }
     }
 
@@ -4936,6 +4938,12 @@ mod tests {
                             serde_json::Value::String("none".to_string()),
                         );
                     }
+                    if object.get("type").and_then(serde_json::Value::as_str) == Some("list") {
+                        object.insert(
+                            "elements".to_string(),
+                            serde_json::json!("allow_duplicates"),
+                        );
+                    }
                     if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
                         object.insert(
                             "field_groups".to_string(),
@@ -4980,6 +4988,7 @@ mod tests {
                     || rendered.contains("missing field `field_groups`")
                     || rendered.contains("missing field `create_only`")
                     || rendered.contains("missing field `identity`")
+                    || rendered.contains("missing field `elements`")
                     || rejected_legacy_identity_bool,
                 "released fixture {expected_resource_type} crossed the required-field gate: {rendered}",
             );
@@ -5043,7 +5052,7 @@ mod tests {
                     "domain_validation_options":{
                         "name":"domain_validation_options",
                         "attr_type":{
-                            "type":"list",
+                            "type":"list", "elements": "allow_duplicates",
                             "element_type":{
                                 "type":"struct",
                                 "name":"DomainValidation",
@@ -5157,7 +5166,7 @@ mod tests {
                                 },{
                                     "name":"validation_emails",
                                     "field_type":{
-                                        "type":"list",
+                                        "type":"list", "elements": "allow_duplicates",
                                         "element_type":{"type":"String","identity":"Email"},
                                         "ordered":true
                                     },
@@ -5397,7 +5406,7 @@ mod tests {
               "ingress": {
                 "name": "ingress",
                 "attr_type": {
-                  "type": "list",
+                  "type": "list", "elements": "allow_duplicates",
                   "inner": {
                     "type": "union",
                     "members": [
@@ -5565,7 +5574,7 @@ mod tests {
             carina_core::schema::Shape::List {
                 element_type: inner,
                 ordered,
-                ..
+                constraints: _constraints,
             } => {
                 assert!(!ordered, "list should be unordered");
 
@@ -6506,7 +6515,7 @@ mod tests {
                 "validate":true
             }"#,
             r#"{
-                "type":"list",
+                "type":"list", "elements": "allow_duplicates",
                 "element_type":{"type":"String"},
                 "ordered":true,
                 "validate":{"legacy":"callback"}
@@ -6577,7 +6586,7 @@ mod tests {
             "type":"custom",
             "name":"awscc.wafv2.StatementList",
             "base":{
-                "type":"list",
+                "type":"list", "elements": "allow_duplicates",
                 "inner":{"type":"String"},
                 "ordered":false
             },
@@ -6611,7 +6620,7 @@ mod tests {
             r#"{"type":"Int","identity":"aws.ec2.Port","range":[-1,65535]}"#,
             r#"{"type":"Float","identity":"awscc.wafv2.Size","range":[0.0,1.0]}"#,
             r#"{
-                "type":"list",
+                "type":"list", "elements": "allow_duplicates",
                 "element_type":{"type":"String"},
                 "ordered":true,
                 "length":[1,3]
@@ -6647,10 +6656,12 @@ mod tests {
                     assert_eq!(range, Some((Some(0.0), Some(1.0))));
                 }
                 carina_core::schema::Shape::List {
-                    ordered, length, ..
+                    ordered,
+                    constraints,
+                    element_type: _element_type,
                 } => {
                     assert!(ordered);
-                    assert_eq!(length, Some((Some(1), Some(3))));
+                    assert_eq!(constraints.length(), Some((Some(1), Some(3))));
                 }
                 other => panic!("unexpected lifted shape: {other:?}"),
             }
