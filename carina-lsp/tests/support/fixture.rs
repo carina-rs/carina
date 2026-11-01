@@ -62,7 +62,7 @@ impl ProviderFactory for SchemaFixtureFactory {
     }
 }
 
-fn factories_for(schemas: &SchemaRegistry) -> Vec<Box<dyn ProviderFactory>> {
+pub(super) fn factories_for(schemas: &SchemaRegistry) -> Vec<Box<dyn ProviderFactory>> {
     let mut by_provider = std::collections::HashMap::<String, Vec<ValidatedResourceSchema>>::new();
     for (provider, _resource_type, _kind, schema) in schemas.iter() {
         by_provider

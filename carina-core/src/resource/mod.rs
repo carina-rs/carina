@@ -7082,6 +7082,7 @@ impl<B: BindingAddress> Value<NoPlaceholder, B> {
     /// for single-element List([Map]) vs Map, treats them as equivalent (bare struct);
     /// for all other variants, falls back to PartialEq.
     pub fn semantically_equal(&self, other: &Value<NoPlaceholder, B>) -> bool {
+        comparison_work::visit();
         match (self, other) {
             (Value::Concrete(ConcreteValue::List(a)), Value::Concrete(ConcreteValue::List(b))) => {
                 lists_equal(a, b)
@@ -7103,6 +7104,7 @@ impl<B: BindingAddress> Value<NoPlaceholder, B> {
 
     /// Feed a deterministic representation of this Value into a Hasher.
     fn hash_into(&self, hasher: &mut impl Hasher) {
+        comparison_work::visit();
         std::mem::discriminant(self).hash(hasher);
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
@@ -7260,6 +7262,33 @@ fn maps_semantically_equal<B: BindingAddress>(
         .all(|(k, v)| b.get(k).map(|bv| v.semantically_equal(bv)).unwrap_or(false))
 }
 
+// Counts actual value visits and candidate examinations, rather than input size.
+// Thread-local storage keeps unrelated parallel tests out of each measurement.
+#[cfg(test)]
+mod comparison_work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static UNITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn visit() {
+        UNITS.with(|units| units.set(units.get() + 1));
+    }
+
+    pub(super) fn measure<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        UNITS.with(|units| units.set(0));
+        let result = f();
+        (result, UNITS.with(Cell::get))
+    }
+}
+
+#[cfg(not(test))]
+mod comparison_work {
+    #[inline(always)]
+    pub(super) fn visit() {}
+}
+
 /// Threshold below which we use the simple O(n^2) algorithm.
 /// For small lists, the overhead of hashing is not worth it.
 const HASH_THRESHOLD: usize = 20;
@@ -7292,6 +7321,7 @@ fn lists_equal_quadratic<B: BindingAddress>(
     for item_a in a {
         let mut found = false;
         for (j, item_b) in b.iter().enumerate() {
+            comparison_work::visit();
             if !matched[j] && item_a.semantically_equal(item_b) {
                 matched[j] = true;
                 found = true;
@@ -7324,6 +7354,7 @@ fn lists_equal_hashed<B: BindingAddress>(
         let mut found = false;
         if let Some(bucket) = b_buckets.get(&hash) {
             for &j in bucket {
+                comparison_work::visit();
                 if !matched[j] && item_a.semantically_equal(&b[j]) {
                     matched[j] = true;
                     found = true;
@@ -8451,6 +8482,7 @@ fn similarity_score<R: ReferenceEquality>(
     defs: &BTreeMap<String, AttributeType>,
     context: &ComparisonContext<'_, R>,
 ) -> usize {
+    comparison_work::visit();
     match (a, b) {
         (Value::Concrete(ConcreteValue::Map(am)), Value::Concrete(ConcreteValue::Map(bm))) => am
             .iter()

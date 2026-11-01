@@ -17,9 +17,11 @@ pub(crate) static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
 /// Delegates state I/O to a local backend but simulates another process taking
-/// the lock as soon as the heartbeat attempts its first renewal.
+/// the lock after the test confirms its provider call is blocked.
 pub(crate) struct LockLossBackend {
     inner: Arc<dyn StateBackend>,
+    fail_renewal: tokio::sync::Notify,
+    renewal_failed: tokio::sync::Notify,
     locked_writes: AtomicUsize,
     releases: AtomicUsize,
 }
@@ -28,9 +30,25 @@ impl LockLossBackend {
     fn new(inner: Arc<dyn StateBackend>) -> Self {
         Self {
             inner,
+            fail_renewal: tokio::sync::Notify::new(),
+            renewal_failed: tokio::sync::Notify::new(),
             locked_writes: AtomicUsize::new(0),
             releases: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn provider_is_blocked(&self) {
+        self.fail_renewal.notify_one();
+    }
+
+    pub(crate) async fn wait_for_renewal_failure(&self) {
+        // wall-clock-ok: hang guard for the heartbeat reaching the injected LockNotHeld after provider readiness.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.renewal_failed.notified(),
+        )
+        .await
+        .expect("heartbeat did not report the injected renewal failure");
     }
 
     pub(crate) fn locked_writes(&self) -> usize {
@@ -66,6 +84,8 @@ impl StateBackend for LockLossBackend {
     }
 
     async fn renew_lock(&self, _lock: &LockInfo) -> BackendResult<LockInfo> {
+        self.fail_renewal.notified().await;
+        self.renewal_failed.notify_one();
         Err(BackendError::LockNotHeld(
             "test heartbeat lock was replaced".to_string(),
         ))

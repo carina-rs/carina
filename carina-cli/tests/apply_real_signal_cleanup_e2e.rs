@@ -237,6 +237,7 @@ fn abandoned_destroy_reports_unknown_outcome_separately_from_skipped() {
 fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
+        // wall-clock-ok: hang guard for a real child-process readiness file.
         assert!(
             Instant::now() < deadline,
             "provider readiness handshake was not written: {}",
@@ -250,6 +251,7 @@ fn wait_for_stderr(lines: &Receiver<String>, needle: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        // wall-clock-ok: hang guard for stderr from a real child process.
         let line = lines
             .recv_timeout(remaining)
             .unwrap_or_else(|_| panic!("child stderr never contained {needle:?}"));
@@ -292,6 +294,7 @@ impl KillOnDrop {
                 self.child.take();
                 return Some(status);
             }
+            // wall-clock-ok: hang guard: terminate a stuck child process, not a speed assertion.
             if Instant::now() >= deadline {
                 return None;
             }

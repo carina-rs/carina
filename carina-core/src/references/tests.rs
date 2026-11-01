@@ -2548,9 +2548,6 @@ impl ProviderFactory for ReferenceValidationFactory {
     fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
         Ok(())
     }
-    fn extract_region(&self, _: &indexmap::IndexMap<String, Value>) -> String {
-        "test".into()
-    }
     fn create_provider(
         &self,
         _: Option<&str>,
@@ -2617,7 +2614,7 @@ fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
     assert!(attribute.value_type().validate(&string("bad")).is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn round2_provider_instance_batches_run_concurrently() {
     let mut fixture = Fixture::new(string("alias/live"), string("key/a"), HashMap::new(), false);
     let barrier = Arc::new(tokio::sync::Barrier::new(2));

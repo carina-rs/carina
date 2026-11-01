@@ -8,6 +8,7 @@ use tower_lsp::{LspService, Server};
 
 use carina_core::parser::ProviderContext;
 use carina_lsp::Backend;
+use carina_lsp::backend::FactoryBuilder;
 
 use super::byte_helpers::find_subsequence;
 
@@ -22,6 +23,34 @@ pub struct TestClient {
 #[allow(dead_code)]
 impl TestClient {
     pub async fn new() -> Self {
+        Self::with_factory_builder(None).await
+    }
+
+    pub async fn with_schemas(
+        root: &std::path::Path,
+        schemas: carina_core::schema::SchemaRegistry,
+    ) -> Self {
+        let builder: FactoryBuilder = std::sync::Arc::new(move |_| {
+            (
+                super::fixture::factories_for(&schemas),
+                Default::default(),
+                Vec::new(),
+            )
+        });
+        let mut client = Self::with_factory_builder(Some(builder)).await;
+        let root_uri = tower_lsp::lsp_types::Url::from_directory_path(root).unwrap();
+        client.initialize_with_root(Some(root_uri.as_str())).await;
+        client
+            .wait_for_server_notification("window/logMessage", |params| {
+                params["message"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Loaded providers for "))
+            })
+            .await;
+        client
+    }
+
+    async fn with_factory_builder(factory_builder: Option<FactoryBuilder>) -> Self {
         let (client_writer, server_reader) = tokio::io::duplex(1024 * 1024);
         let (server_writer, client_reader) = tokio::io::duplex(1024 * 1024);
 
@@ -31,7 +60,7 @@ impl TestClient {
                 resource_types: Default::default(),
                 ..ProviderContext::default()
             };
-            Backend::new(client, provider_context, None)
+            Backend::new(client, provider_context, factory_builder.clone())
         });
 
         tokio::spawn(async move {
@@ -65,6 +94,11 @@ impl TestClient {
     async fn read_message(&mut self) -> Value {
         loop {
             if let Some(msg) = self.try_parse_message() {
+                if msg["method"] == "client/registerCapability" && msg.get("id").is_some() {
+                    self.send_message(&json!({"jsonrpc": "2.0", "id": msg["id"], "result": null}))
+                        .await;
+                    continue;
+                }
                 return msg;
             }
             let mut tmp = [0u8; 4096];
@@ -102,6 +136,10 @@ impl TestClient {
     }
 
     pub async fn initialize(&mut self) -> Value {
+        self.initialize_with_root(None).await
+    }
+
+    async fn initialize_with_root(&mut self, root_uri: Option<&str>) -> Value {
         let id = self.next_id();
         let init_request = json!({
             "jsonrpc": "2.0",
@@ -110,7 +148,7 @@ impl TestClient {
             "params": {
                 "processId": null,
                 "capabilities": {},
-                "rootUri": null
+                "rootUri": root_uri
             }
         });
 
@@ -156,6 +194,31 @@ impl TestClient {
         self.send_message(&notification).await;
     }
 
+    pub async fn wait_for_diagnostics(&mut self, uri: &str) -> Value {
+        self.wait_for_server_notification("textDocument/publishDiagnostics", |params| {
+            params["uri"] == uri
+        })
+        .await
+    }
+
+    async fn wait_for_server_notification(
+        &mut self,
+        method: &str,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Value {
+        // wall-clock-ok: bounds a hung in-process LSP server; matching notification parameters determine readiness.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = self.read_message().await;
+                if message["method"] == method && matches(&message["params"]) {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("server did not publish the readiness notification")
+    }
+
     pub async fn _request_completion(&mut self, uri: &str, line: u32, character: u32) -> Value {
         let id = self.next_id();
         let request = json!({
@@ -194,6 +257,7 @@ impl TestClient {
             }
 
             let mut tmp = [0u8; 4096];
+            // wall-clock-ok: hang guard for asynchronous LSP notifications over duplex I/O.
             match tokio::time::timeout(remaining, self.reader.read(&mut tmp)).await {
                 Ok(Ok(0)) => return None, // Connection closed
                 Ok(Ok(n)) => {

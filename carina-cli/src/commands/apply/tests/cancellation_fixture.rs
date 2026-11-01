@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::parser::ProviderContext;
@@ -43,6 +42,7 @@ pub(super) struct ApplyCancellationFixture {
     cancel_after_successes: Option<usize>,
     success_count: Arc<AtomicUsize>,
     provider_ready_path: Option<std::path::PathBuf>,
+    provider_release_path: Option<std::path::PathBuf>,
     _provider_env: Vec<ScopedEnv>,
 }
 
@@ -54,6 +54,7 @@ impl ApplyCancellationFixture {
             cancel_after_successes: None,
             success_count: Arc::new(AtomicUsize::new(0)),
             provider_ready_path: None,
+            provider_release_path: None,
             _provider_env: Vec::new(),
         }
     }
@@ -110,6 +111,7 @@ impl ApplyCancellationFixture {
 
     pub(super) fn with_blocked_create(mut self, name: &str) -> Self {
         let ready_path = self.base.readiness_path("mock-create-ready");
+        let release_path = self.base.readiness_path("mock-create-release");
         self._provider_env = vec![
             ScopedEnv::set(
                 "CARINA_MOCK_CREATE_DELAY_MS_FOR",
@@ -117,20 +119,21 @@ impl ApplyCancellationFixture {
             ),
             ScopedEnv::set("CARINA_MOCK_CREATE_DELAY_MS", "60000"),
             ScopedEnv::set("CARINA_MOCK_CREATE_READY_PATH", &ready_path),
+            ScopedEnv::set("CARINA_MOCK_CREATE_RELEASE_PATH", &release_path),
         ];
         self.provider_ready_path = Some(ready_path);
+        self.provider_release_path = Some(release_path);
         self
     }
 
-    pub(super) fn with_delayed_create(mut self, name: &str, delay: Duration) -> Self {
-        self._provider_env = vec![
-            ScopedEnv::set(
-                "CARINA_MOCK_CREATE_DELAY_MS_FOR",
-                format!("test.resource.{name}"),
-            ),
-            ScopedEnv::set("CARINA_MOCK_CREATE_DELAY_MS", delay.as_millis().to_string()),
-        ];
-        self
+    pub(super) fn release_blocked_create(&self) {
+        std::fs::write(
+            self.provider_release_path
+                .as_ref()
+                .expect("blocked create must be configured"),
+            b"",
+        )
+        .expect("write the mock create release handshake");
     }
 
     pub(super) async fn wait_for_blocked_create(&self) {
@@ -138,6 +141,7 @@ impl ApplyCancellationFixture {
             .provider_ready_path
             .as_ref()
             .expect("blocked create must be configured");
+        // wall-clock-ok: hang guard waiting for the mock provider readiness file on disk.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !ready_path.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;

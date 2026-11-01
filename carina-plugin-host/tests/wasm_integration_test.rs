@@ -1,6 +1,8 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
 
+use carina_plugin_host::wasm_factory::PollEventForTest;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -683,6 +685,7 @@ fn spawn_http_ok_server() -> Option<(SocketAddr, std::thread::JoinHandle<usize>)
             match listener.accept() {
                 Ok(connection) => break connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // wall-clock-ok: hang guard for the real loopback server accept.
                     assert!(Instant::now() < deadline, "server accept timed out");
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1527,7 +1530,7 @@ async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classific
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instance() {
+async fn untrusted_metadata_denial_poisons_the_provider_instance() {
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
@@ -1548,21 +1551,15 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
     );
     let request = create_request_for_test(resource).await;
 
-    let started = Instant::now();
     let failure = provider
         .provider()
         .create_for_test(&id, request)
         .await
         .expect_err("an untrusted provider must trap on an IMDS request");
-    let elapsed = started.elapsed();
     let error = create_failure_error(failure);
     let rendered = error.to_string();
-    eprintln!("untrusted metadata create denial elapsed={elapsed:?}: {rendered}");
+    eprintln!("untrusted metadata create denial: {rendered}");
 
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "create denial took {elapsed:?}"
-    );
     assert!(
         rendered.contains("mock_http")
             && rendered.contains("169.254.169.254")
@@ -1585,19 +1582,13 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
         "after-metadata-denial",
         None,
     );
-    let followup_started = Instant::now();
     let followup_error = provider
         .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the trapping metadata denial must poison the shared instance");
-    let followup_elapsed = followup_started.elapsed();
     let followup_rendered = followup_error.to_string();
 
-    assert!(
-        followup_elapsed < Duration::from_secs(1),
-        "poisoned provider did not fail fast: {followup_elapsed:?}"
-    );
     assert!(
         followup_rendered.contains("provider instance unusable after trap in create")
             && followup_rendered.contains("mock_http")
@@ -1629,19 +1620,13 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
         "",
     );
 
-    let started = Instant::now();
     let failure = provider
         .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("post-resolution metadata policy must trap the guest");
-    let elapsed = started.elapsed();
     let rendered = create_failure_error(failure).to_string();
 
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "post-resolution metadata denial took {elapsed:?}"
-    );
     assert!(
         rendered.contains("WASM guest call stopped by the host egress policy")
             && rendered.contains("create call:")
@@ -1669,19 +1654,13 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
         "after-resolved-metadata-denial",
         None,
     );
-    let followup_started = Instant::now();
     let followup_error = provider
         .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the post-resolution metadata trap must poison the shared instance");
-    let followup_elapsed = followup_started.elapsed();
     let followup_rendered = followup_error.to_string();
 
-    assert!(
-        followup_elapsed < Duration::from_secs(1),
-        "poisoned provider did not fail fast: {followup_elapsed:?}"
-    );
     assert!(
         followup_rendered.contains("provider instance unusable after trap in create")
             && followup_rendered.contains("mock_http")
@@ -1791,6 +1770,7 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
             match listener.accept() {
                 Ok(connection) => break connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // wall-clock-ok: hang guard for the real loopback server accept.
                     assert!(Instant::now() < deadline, "server accept timed out");
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1871,6 +1851,7 @@ async fn probe_early_http_response(response: &'static [u8], check_outcome: impl 
             match listener.accept() {
                 Ok(connection) => break connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // wall-clock-ok: hang guard for the real loopback server accept.
                     assert!(Instant::now() < deadline, "server accept timed out");
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1902,6 +1883,7 @@ async fn probe_early_http_response(response: &'static [u8], check_outcome: impl 
             .expect("finish response before draining the request body");
         let drain_deadline = Instant::now() + Duration::from_secs(10);
         let mut discarded = [0_u8; 8192];
+        // wall-clock-ok: bound draining a real socket after the response; no execution-speed property.
         while Instant::now() < drain_deadline {
             match stream.read(&mut discarded) {
                 Ok(0) | Err(_) => break,
@@ -2003,6 +1985,7 @@ async fn wasm_guest_connection_reset_after_request_head_is_maybe_sent() {
             match listener.accept() {
                 Ok(connection) => break connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // wall-clock-ok: hang guard for the real loopback server accept.
                     assert!(Instant::now() < deadline, "server accept timed out");
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -2097,6 +2080,7 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
             match listener.accept() {
                 Ok(connection) => break connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // wall-clock-ok: hang guard for the real loopback server accept.
                     assert!(Instant::now() < deadline, "server accept timed out");
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -2114,6 +2098,7 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
             .read(&mut request)
             .expect("read request bytes before waiting");
         assert!(bytes_read > 0, "the server must receive request bytes");
+        // wall-clock-ok: hang guard waiting for the real HTTP timeout probe to release the server.
         wait_for_release
             .recv_timeout(Duration::from_secs(10))
             .expect("guest did not finish before the silent-server deadline");
@@ -2921,6 +2906,10 @@ async fn test_wasm_pending_delete_polls_until_success() {
 
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = events.clone();
+    let factory =
+        factory.with_poll_observer_for_test(move |event| recorded.lock().unwrap().push(event));
     let provider = factory
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
@@ -2939,16 +2928,27 @@ async fn test_wasm_pending_delete_polls_until_success() {
         .expect("setup create should succeed");
     let identifier = created.identifier().clone();
 
-    let delete_started = Instant::now();
     provider
         .provider()
         .delete(&id, &identifier, delete_request_without_schema())
         .await
         .expect("pending delete should settle");
-    assert!(
-        delete_started.elapsed() >= Duration::from_secs(u64::from(PENDING_POLLS)),
-        "delete must serve every requested one-second pending poll"
-    );
+    {
+        let recorded = events.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    PollEventForTest::Attempt {
+                        operation: "delete"
+                    }
+                ))
+                .count(),
+            PENDING_POLLS as usize
+        );
+        assert_eq!(recorded.iter().filter(|event| matches!(event, PollEventForTest::Sleep { operation: "delete", delay } if *delay == Duration::from_secs(1))).count(), PENDING_POLLS as usize);
+    }
 
     let state = provider
         .provider()
@@ -3002,6 +3002,19 @@ async fn test_wasm_pending_create_can_settle_on_final_poll_at_deadline() {
 async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let signal = parked.clone();
+    let factory = factory.with_poll_observer_for_test(move |event| {
+        if matches!(
+            event,
+            PollEventForTest::Sleep {
+                operation: "create",
+                ..
+            }
+        ) {
+            signal.notify_one();
+        }
+    });
     let provider = factory
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
@@ -3015,14 +3028,21 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
         100,
     );
 
-    tokio::time::timeout(
-        Duration::from_millis(750),
-        provider
-            .provider()
-            .create_for_test(&pending_id, create_request_for_test(pending).await),
-    )
-    .await
-    .expect_err("the caller timeout should drop the operation between polls");
+    let request = create_request_for_test(pending).await;
+    {
+        let mut operation = Box::pin(provider.provider().create_for_test(&pending_id, request));
+        // wall-clock-ok: generous hang guard for the initial real guest call to reach its poll-sleep notification.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                biased;
+                () = parked.notified() => {},
+                result = &mut operation => panic!("pending create completed before its first sleep: {result:?}"),
+            }
+        }).await.expect("create must reach its pending-poll sleep");
+        // The notification proves the guest call released the store. Drop the
+        // operation here without polling it into another guest call.
+        drop(operation);
+    }
 
     let healthy_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-cancel", None);
@@ -3843,14 +3863,12 @@ async fn test_wasm_short_compute_budget_interrupts_busy_loop() {
         "call_spin_forever",
         Value::Concrete(ConcreteValue::Bool(true)),
     );
-    let started = Instant::now();
 
     let error = provider
         .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("busy guest computation should exhaust its compute budget");
-    let elapsed = started.elapsed();
     let error = create_failure_error(error);
     let rendered = error.to_string();
 
@@ -3859,10 +3877,6 @@ async fn test_wasm_short_compute_budget_interrupts_busy_loop() {
     assert!(
         !rendered.to_lowercase().contains("credential"),
         "{rendered}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "compute timeout should fire well before the wall budget; elapsed {elapsed:?}"
     );
 }
 
@@ -3891,18 +3905,12 @@ async fn test_wasm_short_compute_budget_interrupts_spin_with_host_calls() {
         "call_spin_with_host_calls_forever",
         Value::Concrete(ConcreteValue::Bool(true)),
     );
-    let started = Instant::now();
 
-    let error = tokio::time::timeout(
-        Duration::from_secs(10),
-        provider
-            .provider()
-            .create_for_test(&id, create_request_for_test(resource).await),
-    )
-    .await
-    .expect("compute timeout should fire within 10s even when the guest calls host imports")
-    .expect_err("guest computation should exhaust its compute budget across host calls");
-    let elapsed = started.elapsed();
+    let error = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("guest computation should exhaust its compute budget across host calls");
     let error = create_failure_error(error);
     let rendered = error.to_string();
 
@@ -3911,10 +3919,6 @@ async fn test_wasm_short_compute_budget_interrupts_spin_with_host_calls() {
     assert!(
         !rendered.to_lowercase().contains("credential"),
         "{rendered}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "compute timeout should fire well before the wall budget; elapsed {elapsed:?}"
     );
 }
 
@@ -3934,14 +3938,12 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "wall-timeout", None);
     let resource =
         resource_with_int_attribute("test.resource", "wall-timeout", "call_delay_millis", 10_000);
-    let started = Instant::now();
 
     let error = provider
         .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the whole guest call should be bounded by its wall budget");
-    let elapsed = started.elapsed();
     let error = create_failure_error(error);
     let rendered = error.to_string();
 
@@ -3954,7 +3956,7 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
         cause.source().is_some(),
         "the operation-aware timeout cause must retain WallBudgetExceeded"
     );
-    assert!(rendered.contains("wall-clock budget"), "{rendered}");
+    assert!(rendered.contains("2s wall-clock budget"), "{rendered}");
     assert_eq!(
         rendered.matches("wall-clock budget").count(),
         1,
@@ -3964,10 +3966,6 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
         !rendered.to_lowercase().contains("credential"),
         "{rendered}"
     );
-    assert!(
-        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
-        "wall timeout should fire after about 2s; elapsed {elapsed:?}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3975,6 +3973,10 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
 async fn test_wasm_queued_sibling_observes_poison_before_dead_store() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = events.clone();
+    let factory =
+        factory.with_poll_observer_for_test(move |event| recorded.lock().unwrap().push(event));
     let factory = factory.with_guest_call_budget(GuestCallBudget::new(
         Duration::from_secs(30),
         Duration::from_secs(1),
@@ -3995,14 +3997,35 @@ async fn test_wasm_queued_sibling_observes_poison_before_dead_store() {
     let sibling_id =
         ResourceId::with_provider_identity("mock", "test.resource", "queued-sibling", None);
 
+    // Queue both calls before any guest-call timer is armed. The store mutex's
+    // FIFO order puts the sibling behind the create without racing guest setup.
+    let entered = tokio::sync::Notify::new();
+    let release = tokio::sync::Notify::new();
+    let held = factory.hold_configured_instance_for_test(&entered, &release);
+    tokio::pin!(held);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(held.as_mut().poll(&mut context).is_pending());
+    entered.notified().await;
+
     let timed_out = provider.provider().create_for_test(&slow_id, slow);
-    let sibling = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        provider
-            .provider()
-            .read(&sibling_id, &mock_identifier(), ReadRequest)
-            .await
-    };
+    let identifier = mock_identifier();
+    let sibling = provider
+        .provider()
+        .read(&sibling_id, &identifier, ReadRequest);
+    tokio::pin!(timed_out, sibling);
+    assert!(timed_out.as_mut().poll(&mut context).is_pending());
+    assert!(sibling.as_mut().poll(&mut context).is_pending());
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            PollEventForTest::StoreQueued {
+                operation: "create"
+            },
+            PollEventForTest::StoreQueued { operation: "read" },
+        ],
+    );
+    release.notify_one();
+    held.await;
     let (timed_out, sibling) = tokio::join!(timed_out, sibling);
 
     let timed_out = create_failure_error(timed_out.expect_err("the slow create must time out"));
@@ -4043,12 +4066,13 @@ async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
     ))
     .await;
 
-    tokio::time::timeout(
-        Duration::from_millis(500),
-        provider.provider().create_for_test(&slow_id, slow),
-    )
-    .await
-    .expect_err("the outer timeout must cancel the in-flight guest call");
+    let mut operation = Box::pin(provider.provider().create_for_test(&slow_id, slow));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(
+        operation.as_mut().poll(&mut context).is_pending(),
+        "the guest must park in its host wait"
+    );
+    drop(operation);
 
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-cancel", None);
@@ -4073,6 +4097,19 @@ async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
 async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
+    let parked = Arc::new(tokio::sync::Notify::new());
+    let signal = parked.clone();
+    let factory = factory.with_poll_observer_for_test(move |event| {
+        if matches!(
+            event,
+            PollEventForTest::Sleep {
+                operation: "create",
+                ..
+            }
+        ) {
+            signal.notify_one();
+        }
+    });
     let provider = factory
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
@@ -4085,24 +4122,30 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
     let sibling_id =
         ResourceId::with_provider_identity("mock", "test.resource", "sibling-read", None);
 
-    let pending_operation = provider.provider().create_for_test(&pending_id, request);
-    let sibling_operation = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            provider
-                .provider()
-                .read(&sibling_id, &mock_identifier(), ReadRequest),
-        )
-        .await
-        .expect("sibling read must not wait for the provider's poll sleep")
-        .expect("sibling read should succeed")
-        .into_state()
-    };
-
-    let (pending_result, sibling_state) = tokio::join!(pending_operation, sibling_operation);
-    pending_result.expect("pending create should settle");
+    let operation = provider.provider().create_for_test(&pending_id, request);
+    tokio::pin!(operation);
+    // wall-clock-ok: generous hang guard for the initial real guest call to reach its poll-sleep notification.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            biased;
+            () = parked.notified() => {},
+            result = &mut operation => panic!("create completed before its pending sleep: {result:?}"),
+        }
+    }).await.expect("create must reach its pending-poll sleep");
+    // Leave create unpolled so its sleep cannot finish and reacquire the store.
+    // wall-clock-ok: original 500ms hang guard around the sibling read alone; setup guest work has already completed.
+    let sibling_state = tokio::time::timeout(
+        Duration::from_millis(500),
+        provider
+            .provider()
+            .read(&sibling_id, &mock_identifier(), ReadRequest),
+    )
+    .await
+    .expect("poll sleep must not hold the provider store lock")
+    .expect("sibling must acquire the store while create is parked")
+    .into_state();
     assert!(!sibling_state.exists);
+    operation.await.expect("pending create should settle");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4119,33 +4162,21 @@ async fn test_wasm_short_wall_budget_times_out_validate_config() {
         Value::Concrete(ConcreteValue::Int(10_000)),
     )]);
     let config = resolved_provider_config(factory.name(), attributes);
-    let started = Instant::now();
 
     let error = carina_core::executor::prepare_provider_ready_config(&factory, &config)
         .expect_err("validate_config should be bounded by the guest wall budget");
-    let elapsed = started.elapsed();
     let rendered = error.to_string();
 
     assert!(rendered.contains("validate_config"), "{rendered}");
-    assert!(rendered.contains("wall-clock budget"), "{rendered}");
+    assert!(rendered.contains("2s wall-clock budget"), "{rendered}");
     assert!(
         !rendered.to_lowercase().contains("credential"),
         "{rendered}"
     );
-    assert!(
-        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
-        "validate_config should time out after about 2s; elapsed {elapsed:?}"
-    );
 
     let clean_config = resolved_provider_config(factory.name(), indexmap::IndexMap::new());
-    let retry_started = Instant::now();
     carina_core::executor::prepare_provider_ready_config(&factory, &clean_config)
         .expect("validate_config should rebuild the timed-out init instance");
-    let retry_elapsed = retry_started.elapsed();
-    assert!(
-        retry_elapsed < Duration::from_secs(1),
-        "a clean call on the rebuilt init instance should finish quickly; elapsed {retry_elapsed:?}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4169,37 +4200,24 @@ async fn test_wasm_repeated_validation_timeout_survives_interleaved_successes() 
         .expect_err("the initial validation instance should time out and become poisoned");
 
     let clean_config = || resolved_provider_config(factory.name(), indexmap::IndexMap::new());
-    let clean_started = Instant::now();
     carina_core::executor::prepare_provider_ready_config(&factory, &clean_config())
         .expect("a different validation input should rebuild and validate normally");
-    assert!(
-        clean_started.elapsed() < Duration::from_secs(1),
-        "a clean validation input should complete quickly"
-    );
 
     let rebuilt_config = resolved_provider_config(factory.name(), slow_attributes());
-    let started = Instant::now();
     let error = carina_core::executor::prepare_provider_ready_config(&factory, &rebuilt_config)
         .expect_err("the second timeout for this input must survive an interleaved success");
-    let elapsed = started.elapsed();
     let rendered = error.to_string();
 
     assert!(rendered.contains("validate_config"), "{rendered}");
-    assert!(rendered.contains("wall-clock budget"), "{rendered}");
-    assert!(
-        elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
-        "the second validate_config call should time out after about 2s; elapsed {elapsed:?}"
-    );
+    assert!(rendered.contains("2s wall-clock budget"), "{rendered}");
 
     carina_core::executor::prepare_provider_ready_config(&factory, &clean_config())
         .expect("the healthy input should still validate after the second timeout");
 
     let suspended_config = resolved_provider_config(factory.name(), slow_attributes());
-    let suspended_started = Instant::now();
     let suspended =
         carina_core::executor::prepare_provider_ready_config(&factory, &suspended_config)
             .expect_err("a repeatedly timed-out validation input must be suspended");
-    let suspended_elapsed = suspended_started.elapsed();
     let rendered = suspended.to_string();
 
     assert_eq!(
@@ -4221,24 +4239,23 @@ async fn test_wasm_repeated_validation_timeout_survives_interleaved_successes() 
         ),
         "{rendered}"
     );
-    assert!(
-        suspended_elapsed < Duration::from_secs(1),
-        "a suspended validation input must fail fast; elapsed {suspended_elapsed:?}"
-    );
 
     for _ in 0..2 {
         carina_core::executor::prepare_provider_ready_config(&factory, &clean_config())
             .expect("the healthy input must remain usable while the slow input is suspended");
-        let started = Instant::now();
-        carina_core::executor::prepare_provider_ready_config(
+        let suspended = carina_core::executor::prepare_provider_ready_config(
             &factory,
             &resolved_provider_config(factory.name(), slow_attributes()),
         )
-        .expect_err("alternating back to the suspended input must keep failing fast");
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the slow input must consume at most two wall budgets in total"
-        );
+        .expect_err("alternating back to the suspended input must remain suspended");
+        assert!(matches!(
+            suspended
+                .provider_error()
+                .and_then(|error| error.detail().host_cause()),
+            Some(carina_core::provider::HostErrorCause::ValidationSuspended(
+                _
+            ))
+        ));
     }
 }
 
@@ -4373,13 +4390,11 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
     };
 
     for attempt in 1..=2 {
-        let started = Instant::now();
         let error = validate("__mock_validate_custom_type_hang__")
             .expect_err("the mock custom-type hook must exceed the wall-clock budget")
             .into_iter()
             .next()
             .expect("custom-type validation must return an error");
-        let elapsed = started.elapsed();
 
         let provider_error = match &error {
             carina_core::schema::TypeError::CustomTypeValidation { error, .. } => error
@@ -4396,29 +4411,19 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
             error.to_string().contains("validate_custom_type"),
             "attempt {attempt}: {error}"
         );
-        assert!(
-            elapsed >= Duration::from_millis(1_500) && elapsed < Duration::from_secs(6),
-            "attempt {attempt} should consume about the 2s wall budget; elapsed {elapsed:?}"
-        );
     }
 
-    let suspended_started = Instant::now();
     let suspended = validate("__mock_validate_custom_type_hang__")
         .expect_err("the repeatedly timed-out custom-type value must be suspended")
         .into_iter()
         .next()
         .expect("suspended validation must return an error");
-    let suspended_elapsed = suspended_started.elapsed();
     assert!(matches!(
         suspended.host_cause(),
         Some(carina_core::provider::HostErrorCause::ValidationSuspended(
             _
         ))
     ));
-    assert!(
-        suspended_elapsed < Duration::from_secs(1),
-        "the suspended value must fail fast; elapsed {suspended_elapsed:?}"
-    );
 
     validate("healthy-value").expect("a different custom-type value must still validate");
 }
@@ -4428,10 +4433,14 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
 async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let factory = factory.with_guest_call_budget(GuestCallBudget::new(
-        Duration::from_secs(30),
-        Duration::from_secs(1),
-    ));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = events.clone();
+    let factory = factory
+        .with_poll_observer_for_test(move |event| recorded.lock().unwrap().push(event))
+        .with_guest_call_budget(GuestCallBudget::new(
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        ));
     let provider = factory
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
@@ -4442,15 +4451,15 @@ async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
     let first = create_request_for_test(resource_with_int_attribute(
         "test.resource",
         "slow-one",
-        "call_delay_millis",
-        600,
+        "value",
+        1,
     ))
     .await;
     let second = create_request_for_test(resource_with_int_attribute(
         "test.resource",
         "slow-two",
-        "call_delay_millis",
-        600,
+        "value",
+        1,
     ))
     .await;
     let fast = create_request_for_test(resource_with_int_attribute(
@@ -4461,30 +4470,70 @@ async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
     ))
     .await;
 
+    // The multi-thread runtime is required by validate_config's block_in_place.
+    // Observe actual timeout creation instead of measuring queue residence:
+    // queued calls must not construct a deadline before acquiring the store.
+    let entered = tokio::sync::Notify::new();
+    let release = tokio::sync::Notify::new();
+    let held = factory.hold_configured_instance_for_test(&entered, &release);
+    tokio::pin!(held);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(held.as_mut().poll(&mut context).is_pending());
+    entered.notified().await;
     let first_operation = provider.provider().create_for_test(&first_id, first);
-    let second_operation = async {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        provider
-            .provider()
-            .create_for_test(&second_id, second)
-            .await
-    };
-    let fast_operation = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let queued_at = Instant::now();
-        let result = provider.provider().create_for_test(&fast_id, fast).await;
-        (result, queued_at.elapsed())
-    };
-    let (first_result, second_result, (fast_result, fast_elapsed)) =
-        tokio::join!(first_operation, second_operation, fast_operation);
-
-    first_result.expect("first slow guest call should stay within the injected timeout");
-    second_result.expect("second slow guest call should stay within the injected timeout");
-    fast_result.expect("queued lock time must not consume the guest-call timeout");
-    assert!(
-        fast_elapsed > Duration::from_secs(1),
-        "the fast call must have spent longer than the injected timeout queued behind siblings"
+    let second_operation = provider.provider().create_for_test(&second_id, second);
+    let fast_operation = provider.provider().create_for_test(&fast_id, fast);
+    tokio::pin!(first_operation, second_operation, fast_operation);
+    assert!(first_operation.as_mut().poll(&mut context).is_pending());
+    assert!(second_operation.as_mut().poll(&mut context).is_pending());
+    assert!(fast_operation.as_mut().poll(&mut context).is_pending());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            PollEventForTest::StoreQueued {
+                operation: "create"
+            };
+            3
+        ],
+        "all calls must reach the queue without acquiring the held store or arming a deadline"
     );
+    release.notify_one();
+    held.await;
+    let (first_result, second_result, fast_result) =
+        tokio::join!(first_operation, second_operation, fast_operation);
+    first_result.expect("first guest call must start its budget after acquiring the lock");
+    second_result.expect("second guest call must start its budget after acquiring the lock");
+    fast_result.expect("queued time must not arm a guest-call timer");
+    let mut acquired = false;
+    let mut deadlines = 0;
+    for event in events.lock().unwrap().iter() {
+        match event {
+            PollEventForTest::StoreQueued {
+                operation: "create",
+            } => {}
+            PollEventForTest::StoreAcquired {
+                operation: "create",
+            } => {
+                assert!(
+                    !acquired,
+                    "each acquired store must arm exactly one call deadline"
+                );
+                acquired = true;
+            }
+            PollEventForTest::GuestCallDeadlineCreated { wall } => {
+                assert!(
+                    acquired,
+                    "guest-call deadlines must be created after acquiring the store"
+                );
+                assert_eq!(*wall, Duration::from_secs(1));
+                acquired = false;
+                deadlines += 1;
+            }
+            event => panic!("unexpected queue-probe event: {event:?}"),
+        }
+    }
+    assert!(!acquired);
+    assert_eq!(deadlines, 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]

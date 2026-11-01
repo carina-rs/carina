@@ -251,6 +251,7 @@ pub(crate) fn wait_for_output_contains(output: &Mutex<Vec<u8>>, needle: &str) {
         if rendered.contains(needle) {
             return;
         }
+        // wall-clock-ok: hang guard for output from the real heartbeat thread.
         assert!(
             Instant::now() < deadline,
             "expected output was not emitted before the deadline; needle: {needle:?}; output: {rendered:?}",
@@ -1221,10 +1222,21 @@ mod tests {
 
         let first = backend.start_indexed(1, "Create r.a");
         let second = backend.start_indexed(2, "Create r.b");
-        let now = std::time::Instant::now() + Duration::from_secs(90);
         let ProgressBackendInner::Plain { state, .. } = &backend.inner else {
             panic!("expected plain progress backend");
         };
+        // Both fixture entries start at the same injected instant. Reading a
+        // fresh wall clock here would include scheduler delays between starts.
+        let origin = {
+            let mut active = state.active.lock().unwrap();
+            let origin = active.entries.get(&1).unwrap().started;
+            for entry in active.entries.values_mut() {
+                entry.started = origin;
+                entry.last_reported = origin;
+            }
+            origin
+        };
+        let now = origin + Duration::from_secs(90);
 
         emit_heartbeats(state, now);
         let first_tick_len = output.0.lock().unwrap().len();

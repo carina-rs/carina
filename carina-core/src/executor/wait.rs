@@ -875,7 +875,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::{oneshot, watch};
+    use tokio::sync::watch;
 
     const CLEANUP_TEST_BOUND: Duration = Duration::from_secs(1);
 
@@ -930,6 +930,7 @@ mod tests {
     struct ReadSequenceProvider {
         responses: Mutex<Vec<State>>,
         reads: Mutex<usize>,
+        read_started: tokio::sync::Notify,
         pending: bool,
     }
 
@@ -938,6 +939,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 reads: Mutex::new(0),
+                read_started: tokio::sync::Notify::new(),
                 pending: false,
             }
         }
@@ -946,6 +948,7 @@ mod tests {
             Self {
                 responses: Mutex::new(Vec::new()),
                 reads: Mutex::new(0),
+                read_started: tokio::sync::Notify::new(),
                 pending: true,
             }
         }
@@ -972,6 +975,7 @@ mod tests {
                     let mut reads = self.reads.lock().unwrap();
                     *reads += 1;
                 }
+                self.read_started.notify_one();
                 if self.pending {
                     return std::future::pending().await;
                 }
@@ -1206,7 +1210,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_abandons_in_flight_provider_read_when_cleanup_is_prioritized() {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::pending();
@@ -1308,7 +1312,7 @@ mod tests {
         .expect("sleep-parked cleanup regression test exceeded its one-second bound");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_abandons_before_read_when_cleanup_is_already_prioritized() {
         let provider = Arc::new(ReadSequenceProvider::new(vec![state_with_status("ISSUED")]));
         let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -1319,39 +1323,23 @@ mod tests {
             "the test trigger and shutdown token must share cleanup-priority state"
         );
 
-        let worker_provider = Arc::clone(&provider);
-        let (result_tx, result_rx) = oneshot::channel();
-        let worker = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("failed to build wait-test runtime");
-            let result = runtime.block_on(async move {
-                let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(60));
-                let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
-                let observer = NoopWaitObserver;
-                let cleanup_loop = shutdown.cleanup_aware_loop();
-
-                execute_wait_effect(
-                    &cleanup_loop,
-                    worker_provider.as_ref(),
-                    WaitEffectRef::from_effect(&effect).unwrap(),
-                    &provider_identifier,
-                    cancel_rx,
-                    &observer,
-                )
-                .await
-            });
-            let _ = result_tx.send(result);
-        });
-
-        let result = tokio::time::timeout(CLEANUP_TEST_BOUND, result_rx)
-            .await
-            .expect("already-active cleanup wait did not return within one second")
-            .expect("already-active cleanup wait worker exited without an outcome");
-        worker
-            .join()
-            .expect("already-active cleanup wait worker panicked");
+        let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(60));
+        let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
+        let observer = NoopWaitObserver;
+        let cleanup_loop = shutdown.cleanup_aware_loop();
+        let result = tokio::time::timeout(
+            CLEANUP_TEST_BOUND,
+            execute_wait_effect(
+                &cleanup_loop,
+                provider.as_ref(),
+                WaitEffectRef::from_effect(&effect).unwrap(),
+                &provider_identifier,
+                cancel_rx,
+                &observer,
+            ),
+        )
+        .await
+        .expect("already-active cleanup must abandon before starting a read");
 
         assert!(
             matches!(result, WaitOutcome::Abandoned),
@@ -1364,7 +1352,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_reaches_satisfied_during_graceful_shutdown() {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
@@ -1459,7 +1447,7 @@ mod tests {
         assert_eq!(provider.read_count(), 3);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_returns_timeout_when_predicate_stays_false() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let effect = wait_effect(Duration::from_millis(10), Duration::from_millis(2));
@@ -1483,10 +1471,8 @@ mod tests {
         else {
             panic!("expected Timeout, got {result:?}");
         };
-        assert!(
-            elapsed >= Duration::from_millis(10),
-            "timeout should report elapsed time, got {elapsed:?}"
-        );
+        assert_eq!(elapsed, Duration::from_millis(10));
+        assert_eq!(provider.read_count(), 6);
         assert_eq!(
             last_attrs.get("status"),
             Some(&Value::Concrete(ConcreteValue::String(
@@ -1597,7 +1583,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_returns_unsatisfiable_when_cancelled() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let effect = wait_effect(Duration::from_secs(60), Duration::from_millis(1));
@@ -1615,7 +1601,7 @@ mod tests {
                         let _ = cancel_tx.send(WaitSignal::NoMutatorRemaining);
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    provider.read_started.notified().await;
                 }
             },
             execute_wait_effect(

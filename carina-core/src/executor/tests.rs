@@ -39,7 +39,6 @@ use parallel::build_dependency_levels;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::shutdown::ShutdownToken;
@@ -5455,7 +5454,7 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_pending() {
     let provider = DelayedCountingProvider::new(std::time::Duration::from_millis(1));
     let observer = CancelsAfterSuccesses::new(3);
@@ -5641,7 +5640,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     assert_eq!(result.skip_count, 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
     let provider = DelayedCountingProvider::new(std::time::Duration::ZERO)
         .with_delay("r2", std::time::Duration::from_millis(10));
@@ -5678,7 +5677,7 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
     assert_eq!(provider.started_names(), vec!["r1", "r2"]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_effects() {
     let provider = DelayedCountingProvider::new(std::time::Duration::ZERO)
         .with_delay("r2", std::time::Duration::from_secs(60))
@@ -5740,7 +5739,7 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cleanup_abandonment_checkpoints_unknown_outcome_after_guest_egress() {
     let provider = DelayedCountingProvider::new(std::time::Duration::from_secs(60))
         .with_guest_egress("unknown");
@@ -5822,7 +5821,7 @@ async fn execute_plan_harvests_ready_effect_before_cleanup_priority() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
     let provider = PendingRefreshProvider;
     let mut desired = make_resource("target", &[]);
@@ -7864,25 +7863,20 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
 /// Setup:
 ///   A (no deps, fast), B (no deps, slow), C (depends on A, fast)
 ///
-/// With level-based execution:
-///   Level 0: A and B run concurrently, wait for both.
-///   Level 1: C starts after B finishes (~100ms total).
-///
-/// With fine-grained scheduling:
-///   A and B start concurrently. A finishes quickly (~5ms).
-///   C starts immediately (A is done), while B is still running.
-///   C should start (and finish) before B completes.
-#[tokio::test]
+/// B remains pending until C completes. A level-based scheduler would wait
+/// for B before dispatching C; a fine-grained scheduler can dispatch C as
+/// soon as A completes, then let B finish.
+#[tokio::test(start_paused = true)]
 async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_completes() {
     use std::time::Duration;
 
-    // A provider that delays certain resources
-    struct DelayedProvider {
-        delays: HashMap<String, Duration>,
-        call_log: Arc<Mutex<Vec<(String, String, Instant)>>>,
+    // Keep B pending until C completes, without a sleep or scheduler race.
+    struct GatedProvider {
+        complete_c: Arc<tokio::sync::Notify>,
+        call_log: Arc<Mutex<Vec<String>>>,
     }
 
-    impl Provider for DelayedProvider {
+    impl Provider for GatedProvider {
         fn name(&self) -> &str {
             "delayed"
         }
@@ -7912,13 +7906,16 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         {
             let id_clone = id.clone();
             let name = id.identity_str().expect("resolved identity").to_string();
-            let delay = self.delays.get(&name).copied().unwrap_or(Duration::ZERO);
+            let complete_c = self.complete_c.clone();
             let log = self.call_log.clone();
             Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                log.lock()
-                    .unwrap()
-                    .push(("create".to_string(), name, Instant::now()));
+                if name == "b" {
+                    complete_c.notified().await;
+                }
+                log.lock().unwrap().push(name.clone());
+                if name == "c" {
+                    complete_c.notify_one();
+                }
                 // Publish `id` so dependents created via
                 // `make_resource(name, &["dep"])` resolve their
                 // `ResourceRef(parent, "id")` (post-#3032 the executor
@@ -7964,14 +7961,9 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         }
     }
 
-    let mut delays = HashMap::new();
-    delays.insert("a".to_string(), Duration::from_millis(5));
-    delays.insert("b".to_string(), Duration::from_millis(200));
-    delays.insert("c".to_string(), Duration::from_millis(5));
-
     let call_log = Arc::new(Mutex::new(Vec::new()));
-    let provider = DelayedProvider {
-        delays,
+    let provider = GatedProvider {
+        complete_c: Arc::new(tokio::sync::Notify::new()),
         call_log: call_log.clone(),
     };
 
@@ -8001,24 +7993,24 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     };
 
     let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    // With a paused clock this bounds a dependency deadlock, not execution speed.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        execute_plan(&provider, input, &observer, uncancelled_shutdown()),
+    )
+    .await
+    .expect("C must be dispatched while B is waiting for C");
+    let result = completed_result(outcome);
 
     assert_eq!(result.success_count, 3);
     assert_eq!(result.failure_count(), 0);
 
-    // Verify C completed before B.
-    // With fine-grained scheduling, C starts right after A completes
-    // (while B is still sleeping), so C should finish before B.
     let log = call_log.lock().unwrap();
-    let c_time = log.iter().find(|(_, name, _)| name == "c").unwrap().2;
-    let b_time = log.iter().find(|(_, name, _)| name == "b").unwrap().2;
+    let c_index = log.iter().position(|name| name == "c").unwrap();
+    let b_index = log.iter().position(|name| name == "b").unwrap();
     assert!(
-        c_time < b_time,
-        "C should complete before B with fine-grained scheduling. \
-         C completed at {:?}, B completed at {:?}",
-        c_time,
-        b_time,
+        c_index < b_index,
+        "C must complete before its gated peer B: {log:?}"
     );
 }
 
@@ -9115,7 +9107,7 @@ impl Provider for CascadeReplaceProvider {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cascading_replacement_child_create_uses_new_parent_binding() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::differ::{
@@ -10943,7 +10935,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_normalizer() {
     #[derive(Clone)]
     struct LockOrderScenario {

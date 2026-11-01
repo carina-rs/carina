@@ -1303,7 +1303,16 @@ impl MockProvider {
             if let Err(error) = Self::signal_ready("CARINA_MOCK_CREATE_READY_PATH") {
                 return Err(attempt.untracked(error));
             }
-            tokio::time::sleep(delay).await;
+            if let Some(release) = env::var_os("CARINA_MOCK_CREATE_RELEASE_PATH").map(PathBuf::from)
+            {
+                // Tests release a parked create after observing shutdown or
+                // lock loss instead of relying on a finite delay to order them.
+                while !release.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
         }
 
         let _state_guard = match Self::lock_state_file() {
@@ -1967,7 +1976,17 @@ impl Provider for MockProvider {
 
             if let Some(delay) = Self::delete_delay_for(&id) {
                 Self::signal_ready("CARINA_MOCK_DELETE_READY_PATH")?;
-                tokio::time::sleep(delay).await;
+                if let Some(release) =
+                    env::var_os("CARINA_MOCK_DELETE_RELEASE_PATH").map(PathBuf::from)
+                {
+                    // Subprocess tests can hold the delete until they observe
+                    // shutdown, independently of how long either process runs.
+                    while !release.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
             }
 
             if let Some(path) = env::var_os("CARINA_MOCK_DELETE_LOG").map(PathBuf::from) {
@@ -1999,7 +2018,6 @@ mod tests {
     use carina_core::resource::NoPlaceholder;
     use std::ffi::{OsStr, OsString};
     use std::sync::Mutex;
-    use std::time::Instant;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -3029,6 +3047,168 @@ mod tests {
     }
 
     #[test]
+    fn create_release_handshake_keeps_create_pending_until_released() {
+        let guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ready = tmp.path().join("create-ready");
+        let release = tmp.path().join("create-release");
+        let provider = MockProvider {
+            reference_table: None,
+            state_file: tmp.path().join("mock-state.json"),
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
+        let resource = Resource::with_provider("mock", "test.resource", "slow", None)
+            .with_attribute("name", string_value("slow"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let (initially_pending, ready_seen, still_pending, released, outcome) = {
+            let _target = EnvGuard::set("CARINA_MOCK_CREATE_DELAY_MS_FOR", "test.resource.slow");
+            let _delay = EnvGuard::set("CARINA_MOCK_CREATE_DELAY_MS", "25");
+            let _ready = EnvGuard::set("CARINA_MOCK_CREATE_READY_PATH", &ready);
+            let _release = EnvGuard::set("CARINA_MOCK_CREATE_RELEASE_PATH", &release);
+            runtime.block_on(async {
+                let create = dispatch_mock_create(&provider, id, resource);
+                tokio::pin!(create);
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                let first = create.as_mut().poll(&mut context);
+                let initially_pending = first.is_pending();
+                let ready_seen = ready.exists();
+                tokio::time::advance(Duration::from_secs(60)).await;
+                let after_wait = if initially_pending {
+                    create.as_mut().poll(&mut context)
+                } else {
+                    first
+                };
+                let still_pending = after_wait.is_pending();
+                let released = fs::write(&release, b"");
+                let outcome = match after_wait {
+                    std::task::Poll::Ready(result) => Some(result),
+                    std::task::Poll::Pending if released.is_ok() => Some(create.await),
+                    std::task::Poll::Pending => None,
+                };
+                (
+                    initially_pending,
+                    ready_seen,
+                    still_pending,
+                    released,
+                    outcome,
+                )
+            })
+        };
+        drop(guard);
+
+        assert!(initially_pending);
+        assert!(ready_seen, "the mock must report when its create is parked");
+        assert!(still_pending, "elapsed time must not release the create");
+        released.unwrap();
+        outcome.unwrap().unwrap();
+    }
+
+    #[test]
+    fn create_delay_env_var_delays_matching_resource_create() {
+        let guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            reference_table: None,
+            state_file: tmp.path().join("mock-state.json"),
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
+        let resource = Resource::with_provider("mock", "test.resource", "slow", None)
+            .with_attribute("name", string_value("slow"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let (outcome, elapsed) = {
+            let _target = EnvGuard::set("CARINA_MOCK_CREATE_DELAY_MS_FOR", "test.resource.slow");
+            let _delay = EnvGuard::set("CARINA_MOCK_CREATE_DELAY_MS", "25");
+            let _release = EnvGuard::unset("CARINA_MOCK_CREATE_RELEASE_PATH");
+            runtime.block_on(async {
+                let started = tokio::time::Instant::now();
+                let outcome = dispatch_mock_create(&provider, id, resource).await;
+                (outcome, started.elapsed())
+            })
+        };
+        drop(guard);
+
+        outcome.unwrap();
+        assert_eq!(elapsed, Duration::from_millis(25));
+    }
+
+    #[test]
+    fn delete_release_handshake_keeps_delete_pending_until_released() {
+        let guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ready = tmp.path().join("delete-ready");
+        let release = tmp.path().join("delete-release");
+        let provider = MockProvider {
+            reference_table: None,
+            state_file: tmp.path().join("mock-state.json"),
+            partial_create: None,
+            partial_update: None,
+        };
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
+        let identifier = AppliedIdentifier::new("mock-id").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let (initially_pending, ready_seen, still_pending, released, outcome) = {
+            let _target = EnvGuard::set("CARINA_MOCK_DELETE_DELAY_MS_FOR", "test.resource.slow");
+            let _delay = EnvGuard::set("CARINA_MOCK_DELETE_DELAY_MS", "25");
+            let _ready = EnvGuard::set("CARINA_MOCK_DELETE_READY_PATH", &ready);
+            let _release = EnvGuard::set("CARINA_MOCK_DELETE_RELEASE_PATH", &release);
+            runtime.block_on(async {
+                let delete = provider.delete(&id, &identifier, delete_request_without_schema());
+                tokio::pin!(delete);
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                let first = delete.as_mut().poll(&mut context);
+                let initially_pending = first.is_pending();
+                let ready_seen = ready.exists();
+                tokio::time::advance(Duration::from_secs(60)).await;
+                let after_wait = if initially_pending {
+                    delete.as_mut().poll(&mut context)
+                } else {
+                    first
+                };
+                let still_pending = after_wait.is_pending();
+                let released = fs::write(&release, b"");
+                let outcome = match after_wait {
+                    std::task::Poll::Ready(result) => Some(result),
+                    std::task::Poll::Pending if released.is_ok() => Some(delete.await),
+                    std::task::Poll::Pending => None,
+                };
+                (
+                    initially_pending,
+                    ready_seen,
+                    still_pending,
+                    released,
+                    outcome,
+                )
+            })
+        };
+        drop(guard);
+
+        assert!(initially_pending);
+        assert!(ready_seen, "the mock must report when its delete is parked");
+        assert!(still_pending, "elapsed time must not release the delete");
+        released.unwrap();
+        outcome.unwrap().unwrap();
+    }
+
+    #[test]
     fn delete_delay_env_var_delays_matching_resource_delete() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -3042,6 +3222,7 @@ mod tests {
         let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .start_paused(true)
             .build()
             .unwrap();
 
@@ -3052,23 +3233,23 @@ mod tests {
             env::set_var("CARINA_MOCK_DELETE_DELAY_MS", "25");
         }
 
-        let started = Instant::now();
         let identifier =
             AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
-        runtime
-            .block_on(provider.delete(&id, &identifier, delete_request_without_schema()))
-            .unwrap();
-        let elapsed = started.elapsed();
+        let (outcome, elapsed) = runtime.block_on(async {
+            let started = tokio::time::Instant::now();
+            let outcome = provider
+                .delete(&id, &identifier, delete_request_without_schema())
+                .await;
+            (outcome, tokio::time::Instant::now() - started)
+        });
 
         // SAFETY: See the set_var safety note above; ENV_LOCK is still held.
         unsafe {
             env::remove_var("CARINA_MOCK_DELETE_DELAY_MS_FOR");
             env::remove_var("CARINA_MOCK_DELETE_DELAY_MS");
         }
-
-        assert!(
-            elapsed >= Duration::from_millis(25),
-            "matching delete should be delayed by at least 25ms, elapsed {elapsed:?}"
-        );
+        drop(_guard);
+        outcome.unwrap();
+        assert_eq!(elapsed, Duration::from_millis(25));
     }
 }

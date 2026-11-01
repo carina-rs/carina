@@ -2647,33 +2647,27 @@ fn lists_equal_large_list_of_maps() {
 }
 
 #[test]
-fn lists_equal_performance_large_list() {
-    // Benchmark: 1000-element list comparison should complete quickly
-    // With O(n^2), 1000 elements = 1M comparisons; with hashing, ~1000.
-    let n = 1000;
-    let a: Vec<Value> = (0..n)
-        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
-        .collect();
-    let b: Vec<Value> = (0..n)
-        .rev()
-        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
-        .collect();
-
-    let start = std::time::Instant::now();
-    for _ in 0..100 {
-        assert!(lists_equal(&a, &b));
-    }
-    let elapsed = start.elapsed();
-    // Should complete well under 1 second for 100 iterations
+fn lists_equal_work_grows_linearly() {
+    let measure = |n: i64| {
+        let a: Vec<Value> = (0..n)
+            .map(|i| Value::Concrete(ConcreteValue::Int(i)))
+            .collect();
+        let b: Vec<Value> = a.iter().rev().cloned().collect();
+        let (equal, units) = super::comparison_work::measure(|| lists_equal(&a, &b));
+        assert!(equal);
+        assert!(units > 0, "the algorithm must report its work");
+        units
+    };
+    let small = measure(500);
+    let large = measure(1500);
     assert!(
-        elapsed.as_secs() < 5,
-        "lists_equal with 1000 elements took {:?} for 100 iterations, expected < 5s",
-        elapsed
+        large <= small * 4,
+        "list comparison work: 500={small}, 1500={large}"
     );
 }
 
 #[test]
-fn pair_list_elements_performance_large_list() {
+fn pair_list_elements_work_grows_at_most_n_log_n() {
     #[derive(Clone, Copy)]
     enum Fixture {
         AllDistinct,
@@ -2715,40 +2709,27 @@ fn pair_list_elements_performance_large_list() {
         let desired = build(n, fixture);
         let mut saved = desired.clone();
         saved.reverse();
-        let start = std::time::Instant::now();
-        let pairs = pair_list_elements(
-            &desired,
-            &saved,
-            None,
-            crate::schema::empty_defs_for_schema_walks(),
-        );
-        let elapsed = start.elapsed();
-        assert_eq!(pairs[0], Some(n - 1));
-        assert_eq!(pairs[n - 1], Some(0));
-        elapsed
+        let (pairs, units) = super::comparison_work::measure(|| {
+            pair_list_elements(
+                &desired,
+                &saved,
+                None,
+                crate::schema::empty_defs_for_schema_walks(),
+            )
+        });
+        assert_eq!(pairs, (0..n).rev().map(Some).collect::<Vec<_>>());
+        assert!(units > 0, "the algorithm must report its work");
+        units
     };
 
     for fixture in [Fixture::AllDistinct, Fixture::SharedEffect] {
-        let name = match fixture {
-            Fixture::AllDistinct => "all-distinct",
-            Fixture::SharedEffect => "shared-effect",
-        };
-        for n in [100, 400, 800] {
-            eprintln!("pair_list_elements {name} n={n}: {:?}", measure(n, fixture));
-        }
-    }
-
-    // The known quadratic implementation takes about one second at n=800,
-    // projecting to well over 30 seconds at n=5000. Two seconds leaves ample
-    // headroom for slow debug CI while still reliably catching that regression.
-    for (name, fixture) in [
-        ("all-distinct", Fixture::AllDistinct),
-        ("shared-effect", Fixture::SharedEffect),
-    ] {
-        let large_elapsed = measure(5_000, fixture);
+        let small = measure(500, fixture);
+        let large = measure(1500, fixture);
+        // n*log2(n) grows by < 3.6x here. Allow 4.5x for bookkeeping,
+        // still below the 9x growth of all-pairs scoring.
         assert!(
-            large_elapsed < std::time::Duration::from_secs(2),
-            "pair_list_elements with 5000 {name} maps took {large_elapsed:?}, expected < 2s"
+            large * 2 <= small * 9,
+            "pairing work: 500={small}, 1500={large}"
         );
     }
 }

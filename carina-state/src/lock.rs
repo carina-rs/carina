@@ -131,7 +131,10 @@ impl LockInfo {
     /// The lock ID, operation, and owner remain the same; only the `created`
     /// and `expires` fields are refreshed.
     pub(crate) fn renewed(&self) -> Self {
-        let now = Utc::now();
+        self.renewed_at(Utc::now())
+    }
+
+    fn renewed_at(&self, now: DateTime<Utc>) -> Self {
         let renewal_ttl = Duration::from_std(self.renewal_ttl)
             .expect("state lock renewal TTL must fit in chrono::Duration");
         Self {
@@ -166,6 +169,12 @@ impl LockInfo {
                 .to_std()
                 .expect("positive test state lock TTL must convert to std::time::Duration"),
         }
+    }
+
+    /// Stamp a fake renewal without consulting the real clock.
+    #[cfg(test)]
+    pub(crate) fn renewed_at_for_test(&self, now: DateTime<Utc>) -> Self {
+        self.renewed_at(now)
     }
 
     /// Produce the value a test backend would return from `renew_lock`.

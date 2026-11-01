@@ -201,7 +201,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn lock_not_held_cancels_before_another_dispatch() {
         let backend = Arc::new(LostLockBackend::new());
         let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(30));
@@ -256,7 +256,7 @@ mod tests {
         assert!(matches!(lost.into_error(), BackendError::LockNotHeld(_)));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cleanup_priority_uses_bounded_stop_for_a_hung_renewal() {
         let backend = Arc::new(LostLockBackend::with_never_completing_renewal());
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(30));
