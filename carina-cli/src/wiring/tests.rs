@@ -53,7 +53,7 @@ fn non_mock_validation_does_not_resolve_invalid_mock_storage() {
             builtin_mock: BuiltinMockInputs::deferred(|| {
                 let path = Path::new("/").to_path_buf();
                 let scope = MockScope::file(path.clone())
-                    .map_err(|source| CommandInputError::MockStorage { path, source })?;
+                    .map_err(|error| CommandInputError::MockStorage { path, error })?;
                 Ok(ConfiguredBuiltinMock::new(MockBehavior::default(), scope))
             }),
             trusted_local_grants: TrustedLocalGrantInputs::new(Vec::new(), None),

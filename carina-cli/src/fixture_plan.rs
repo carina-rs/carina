@@ -1552,7 +1552,7 @@ mod tests {
                 builtin_mock: BuiltinMockInputs::deferred(|| {
                     let path = PathBuf::from("/");
                     let scope = MockScope::file(path.clone())
-                        .map_err(|source| CommandInputError::MockStorage { path, source })?;
+                        .map_err(|error| CommandInputError::MockStorage { path, error })?;
                     Ok(ConfiguredBuiltinMock::new(MockBehavior::default(), scope))
                 }),
                 trusted_local_grants: TrustedLocalGrantInputs::new(Vec::new(), None),
@@ -1579,12 +1579,16 @@ mod tests {
             let AppError::CommandInput(error) = error else {
                 panic!("expected a typed command input error, got {error:?}");
             };
-            let CommandInputError::MockStorage { path, source } = error.as_ref() else {
+            let CommandInputError::MockStorage {
+                path,
+                error: io_error,
+            } = error.as_ref()
+            else {
                 panic!("expected a typed mock storage error, got {error:?}");
             };
             assert_eq!(path, Path::new("/"));
-            assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
-            assert_eq!(source.to_string(), "mock state path has no file name");
+            assert_eq!(io_error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(io_error.to_string(), "mock state path has no file name");
         }
     }
 

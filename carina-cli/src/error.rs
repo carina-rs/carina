@@ -14,16 +14,12 @@ use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 /// Filesystem failures when a command resolves its invocation inputs.
 #[derive(Debug, thiserror::Error)]
 pub enum CommandInputError {
-    #[error("Failed to resolve the command startup directory")]
-    StartupDirectory {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("Invalid mock state storage path {}", path.display())]
+    #[error("Failed to resolve the command startup directory: {error}")]
+    StartupDirectory { error: std::io::Error },
+    #[error("Invalid mock state storage path {}: {error}", path.display())]
     MockStorage {
         path: PathBuf,
-        #[source]
-        source: std::io::Error,
+        error: std::io::Error,
     },
 }
 

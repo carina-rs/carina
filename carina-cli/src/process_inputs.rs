@@ -114,13 +114,13 @@ impl ProcessInputs {
                 state_file
             } else {
                 cwd()
-                    .map_err(|source| CommandInputError::StartupDirectory { source })?
+                    .map_err(|error| CommandInputError::StartupDirectory { error })?
                     .join(state_file)
             };
-            let scope = MockScope::file(state_file.clone()).map_err(|source| {
+            let scope = MockScope::file(state_file.clone()).map_err(|error| {
                 CommandInputError::MockStorage {
                     path: state_file,
-                    source,
+                    error,
                 }
             })?;
             Ok(ConfiguredBuiltinMock::new(behavior, scope))
@@ -240,13 +240,9 @@ mod tests {
         assert!(matches!(error, AppError::CommandInput(_)), "{error:?}");
         assert_eq!(
             error.to_string(),
-            "Failed to resolve the command startup directory"
+            "Failed to resolve the command startup directory: startup directory removed"
         );
-        assert!(
-            std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<std::io::Error>())
-                .is_some_and(|source| source.kind() == std::io::ErrorKind::NotFound)
-        );
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
@@ -307,16 +303,11 @@ mod tests {
             )
             .expect_err("selecting either builtin mock route must reject invalid storage");
             assert!(matches!(error, AppError::CommandInput(_)), "{error:?}");
-            assert!(
-                error
-                    .to_string()
-                    .contains("Invalid mock state storage path /")
+            assert_eq!(
+                error.to_string(),
+                "Invalid mock state storage path /: mock state path has no file name"
             );
-            assert!(
-                std::error::Error::source(&error)
-                    .and_then(|source| source.downcast_ref::<std::io::Error>())
-                    .is_some_and(|source| source.kind() == std::io::ErrorKind::InvalidInput)
-            );
+            assert!(std::error::Error::source(&error).is_none());
         }
     }
 
