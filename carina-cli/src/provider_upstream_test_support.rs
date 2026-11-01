@@ -33,10 +33,6 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "local".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
