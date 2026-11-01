@@ -340,12 +340,19 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
     /// Resolve root-owned type declarations while preserving this witness.
     pub fn resolve_type_exprs_report(
         &mut self,
-        config: &ProviderContext,
+        config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> crate::validation::FileTypeResolutionReport {
         crate::validation::resolve_file_type_exprs_report(&mut self.parsed, config, None)
     }
 
     /// Resolve root-relative resource references while preserving this witness.
+    pub fn resolve_resource_refs_in_session(
+        &mut self,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<(), parser::ParseError> {
+        parser::resolve_resource_refs_in_session(&mut self.parsed, session)
+    }
+
     pub fn resolve_resource_refs_with_config(
         &mut self,
         config: &ProviderContext,
@@ -2241,13 +2248,18 @@ for account_id in orgs.accounts {
         .unwrap();
 
         let config = load_configuration(&dir).expect("directory fixture loads");
-        let mut parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-            config.parsed,
-            &dir,
+        let mut parsed = crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
-            &SchemaRegistry::new(),
-        )
-        .expect("directory fixture crosses the module-resolution seam");
+            |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    config.parsed,
+                    &dir,
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .expect("directory fixture crosses the module-resolution seam")
+            },
+        );
         assert_eq!(parsed.deferred_for_expressions().len(), 1);
         let deferred_line = parsed.deferred_for_expressions()[0].line();
         parsed.warnings.push(crate::parser::ParseWarning {
@@ -2406,12 +2418,19 @@ let orgs = upstream_state {
         let parsed = load_configuration(fixture.path())
             .expect("the parser-side deferred body must survive directory loading")
             .parsed;
-        crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
-            fixture.path(),
+        crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
-            &SchemaRegistry::new(),
+            |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    parsed,
+                    fixture.path(),
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .map_err(Box::new)
+            },
         )
+        .map_err(|error| *error)
     }
 
     #[test]

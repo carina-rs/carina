@@ -1685,6 +1685,7 @@ pub(crate) async fn run_state_refresh_locked(
     let empty_remote_bindings = HashMap::new();
     let data_source_values = addressed_expansion
         .read_data_sources_phase2(AddressedDataSourceReadInputs {
+            provider_context: ctx.provider_context(),
             provider: &provider,
             refresh_phase: Some(&refresh_phase),
             compositions: &parsed.compositions,
@@ -1735,6 +1736,7 @@ pub(crate) async fn run_state_refresh_locked(
     data_source_values = crate::wiring::read_expanded_data_sources_phase2(
         data_source_values,
         crate::wiring::ExpandedDataSourceReadInputs {
+            provider_context: ctx.provider_context(),
             provider: &provider,
             refresh_phase: Some(&refresh_phase),
             managed: &sorted_resources,
@@ -1908,12 +1910,21 @@ pub(crate) async fn run_state_refresh_locked(
                 wait_aliases: &wait_aliases,
             },
         );
-        let checked_exports = carina_core::validation::check_export_values_pre_apply(
-            &parsed.export_params,
-            &export_bindings,
-            ctx.provider_context(),
-        )
-        .map_err(AppError::Validation)?;
+
+        let checked_exports = crate::wiring::settle_type_checks(
+            carina_core::validation::deferred_types::TypeCheckSession::run(
+                ctx.provider_context(),
+                |session| {
+                    carina_core::validation::check_export_values_pre_apply(
+                        &parsed.export_params,
+                        &export_bindings,
+                        session,
+                    )
+                    .map_err(AppError::Validation)
+                },
+            ),
+            AppError::Validation,
+        )?;
         let values = crate::commands::shared::state_writeback::resolve_export_values_post_apply(
             crate::commands::shared::state_writeback::ResolveExportValuesPostApplyInput {
                 export_params: &checked_exports,
@@ -2773,13 +2784,18 @@ mod tests {
                 carina_core::resource::AbsoluteBindingAddress,
             >,
     {
-        carina_core::module_resolver::resolve_modules_with_providerless_config(
-            carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-            base_dir,
+        carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
-            &SchemaRegistry::new(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_with_providerless_config(
+                    carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                    base_dir,
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .expect("test fixture crosses module resolution")
+            },
         )
-        .expect("test fixture crosses module resolution")
         .into_expanded()
         .expect("test fixture contains no leftover parser placeholders")
     }

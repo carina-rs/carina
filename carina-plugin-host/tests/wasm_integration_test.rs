@@ -24,6 +24,7 @@ use carina_core::resource::{
     ResourceId, State, Value, absolute_binding_address_for_test,
 };
 use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
+
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{
     AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
@@ -145,17 +146,28 @@ async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(Vec::new()),
+        schemas.clone(),
     );
-    carina_core::executor::prepare_create_request(resource, &preparation)
-        .await
-        .expect("test resource should pass checked create preparation")
+    carina_core::validation::deferred_types::with_session_for_test_async(
+        provider_types.provider_context(),
+        async |type_checks| {
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
+                &bindings,
+                &module_gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request =
+                carina_core::executor::prepare_create_request(resource, &preparation).await;
+            request.expect("test resource should pass checked create preparation")
+        },
+    )
+    .await
 }
 
 trait DispatchCreateForTest {
@@ -205,17 +217,33 @@ async fn update_request_for_test(
             .validate()
             .expect("test schema must be valid"),
     );
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(Vec::new()),
+        schemas.clone(),
     );
-    carina_core::executor::prepare_update_request(resource, from, changed_attributes, &preparation)
-        .await
-        .expect("test resource should pass checked update preparation")
+    carina_core::validation::deferred_types::with_session_for_test_async(
+        provider_types.provider_context(),
+        async |type_checks| {
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
+                &bindings,
+                &module_gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = carina_core::executor::prepare_update_request(
+                resource,
+                from,
+                changed_attributes,
+                &preparation,
+            )
+            .await;
+            request.expect("test resource should pass checked update preparation")
+        },
+    )
+    .await
 }
 
 fn wasm_path() -> Option<PathBuf> {
@@ -533,16 +561,27 @@ fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDat
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(Vec::new()),
+        schemas.clone(),
     );
-    carina_core::executor::prepare_provider_ready_data_source(resource, &preparation)
-        .expect("credential probe data source should pass the checked host boundary")
+    carina_core::validation::deferred_types::with_session_for_test(
+        provider_types.provider_context(),
+        |type_checks| {
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
+                &bindings,
+                &module_gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let resource =
+                carina_core::executor::prepare_provider_ready_data_source(resource, &preparation);
+            resource.expect("credential probe data source should pass the checked host boundary")
+        },
+    )
 }
 
 fn resource_with_int_attribute(
@@ -954,10 +993,15 @@ fn resolved_provider_config(
         unresolved_attributes: indexmap::IndexMap::new(),
         binding: None,
     }];
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider config must be fully resolved")
     .iter()
@@ -6041,43 +6085,55 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(Vec::new()),
+        schemas.clone(),
     );
-    let resource =
-        carina_core::executor::prepare_provider_ready_data_source(resource, &preparation)
-            .expect("data-source request should pass the checked host boundary");
+    carina_core::validation::deferred_types::with_session_for_test_async(
+        provider_types.provider_context(),
+        async |type_checks| {
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
+                &bindings,
+                &module_gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let resource =
+                carina_core::executor::prepare_provider_ready_data_source(resource, &preparation);
+            let resource =
+                resource.expect("data-source request should pass the checked host boundary");
 
-    let state = provider
-        .provider()
-        .read_data_source(&resource)
-        .await
-        .expect("read_data_source should dispatch to the plugin override");
+            let state = provider
+                .provider()
+                .read_data_source(&resource)
+                .await
+                .expect("read_data_source should dispatch to the plugin override");
 
-    assert!(state.exists, "state should be marked as existing");
-    assert_eq!(
-        state.attributes.get("__mock_read_data_source__"),
-        Some(&Value::Concrete(ConcreteValue::Bool(true))),
-        "sentinel attribute must be present — proves the plugin override ran"
-    );
-    assert_eq!(
-        state.attributes.get("identity_store_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "d-1234567890".into()
-        ))),
-        "input attributes must cross the WASM boundary unchanged"
-    );
-    assert_eq!(
-        state.attributes.get("user_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "alice@example.com".into()
-        ))),
-    );
+            assert!(state.exists, "state should be marked as existing");
+            assert_eq!(
+                state.attributes.get("__mock_read_data_source__"),
+                Some(&Value::Concrete(ConcreteValue::Bool(true))),
+                "sentinel attribute must be present — proves the plugin override ran"
+            );
+            assert_eq!(
+                state.attributes.get("identity_store_id"),
+                Some(&Value::Concrete(ConcreteValue::String(
+                    "d-1234567890".into()
+                ))),
+                "input attributes must cross the WASM boundary unchanged"
+            );
+            assert_eq!(
+                state.attributes.get("user_name"),
+                Some(&Value::Concrete(ConcreteValue::String(
+                    "alice@example.com".into()
+                ))),
+            );
+        },
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]

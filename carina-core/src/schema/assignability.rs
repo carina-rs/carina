@@ -6,25 +6,34 @@ use crate::parser::CustomTypeValidationError;
 /// Missing provider evidence is distinct from a proven type mismatch.
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
-pub enum TypeAssignability {
+pub enum TypeAssignability<'s> {
     Assignable,
     Mismatch,
-    Unchecked(TypeAssignmentDeferral),
+    Unchecked(TypeAssignmentDeferral<'s>),
 }
 
 /// The actual annotation identities whose scalar evidence is missing.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypeAssignmentDeferral {
+pub struct TypeAssignmentDeferral<'s> {
     first: crate::parser::TypeExpr,
     additional: Vec<crate::parser::TypeExpr>,
+    brand: std::marker::PhantomData<fn(&'s ()) -> &'s ()>,
 }
 
-impl TypeAssignmentDeferral {
+impl<'s> TypeAssignmentDeferral<'s> {
     pub(crate) fn new(expected: crate::parser::TypeExpr) -> Self {
         Self {
             first: expected,
             additional: Vec::new(),
+            brand: std::marker::PhantomData,
         }
+    }
+    pub(crate) fn with_additional(
+        mut self,
+        types: impl IntoIterator<Item = crate::parser::TypeExpr>,
+    ) -> Self {
+        self.additional.extend(types);
+        self
     }
     fn merge(mut self, other: Self) -> Self {
         self.additional.push(other.first);
@@ -34,14 +43,14 @@ impl TypeAssignmentDeferral {
     pub(crate) fn into_types(self) -> impl Iterator<Item = crate::parser::TypeExpr> {
         std::iter::once(self.first).chain(self.additional)
     }
-    fn record(self, sink: &crate::validation::deferred_types::ProviderTypeCheckRecorder) {
+    fn record(self, sink: &dyn crate::validation::deferred_types::ProviderTypeCheckContext) {
         for expected in self.into_types() {
             sink.record_type(&expected, "assignment");
         }
     }
 }
 
-impl TypeAssignability {
+impl<'s> TypeAssignability<'s> {
     /// Loaded validation must prove assignment using the provider schemas.
     pub fn require_loaded(self) -> Result<bool, CustomTypeValidationError> {
         match self {
@@ -54,7 +63,7 @@ impl TypeAssignability {
     /// Record missing evidence before permitting a provisional assignment.
     pub fn record_unchecked(
         self,
-        sink: &crate::validation::deferred_types::ProviderTypeCheckRecorder,
+        sink: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> bool {
         match self {
             Self::Assignable => true,
@@ -126,8 +135,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// identity relation, including provider and segments, even when a schema
     /// is unloaded. A source without identity cannot satisfy a nominal sink.
     /// Only comparisons that require the unavailable scalar kind are unchecked.
-    pub fn assignment_to(self, sink: TypeInSchema<'_, R>) -> TypeAssignability {
-        self.assignment_on_paths(sink, &mut Vec::new(), &mut Vec::new())
+    pub fn assignment_to<'query>(self, sink: TypeInSchema<'query, R>) -> TypeAssignability<'query>
+    where
+        'source: 'query,
+    {
+        let source: TypeInSchema<'query, R> = self;
+        source.assignment_on_paths(sink, &mut Vec::new(), &mut Vec::new())
     }
 
     fn assignment_on_paths<'sink>(
@@ -135,7 +148,10 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         sink: TypeInSchema<'sink, R>,
         source_refs: &mut Vec<&'source str>,
         sink_refs: &mut Vec<&'sink str>,
-    ) -> TypeAssignability {
+    ) -> TypeAssignability<'source>
+    where
+        'sink: 'source,
+    {
         let Ok(source) = resolve_refs_on_path(self.attr, self.defs, source_refs) else {
             return TypeAssignability::Mismatch;
         };
@@ -253,7 +269,13 @@ mod tests {
             (TypeAssignability::Mismatch, false),
         ] {
             assert_eq!(assignment.clone().require_loaded(), Ok(expected));
-            assert_eq!(assignment.record_unchecked(&Default::default()), expected);
+            assert_eq!(
+                crate::validation::deferred_types::with_session_for_test(
+                    &crate::parser::ProviderContext::default(),
+                    |session| assignment.record_unchecked(session)
+                ),
+                expected
+            );
         }
         let unchecked = TypeAssignability::Unchecked(TypeAssignmentDeferral::new(
             crate::parser::parse_type_expr_str("Arn", &crate::parser::ProviderContext::default())
@@ -263,6 +285,9 @@ mod tests {
             unchecked.clone().require_loaded(),
             Err(CustomTypeValidationError::ProvidersNotLoaded)
         );
-        assert!(unchecked.record_unchecked(&Default::default()));
+        assert!(crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| unchecked.record_unchecked(session)
+        ));
     }
 }

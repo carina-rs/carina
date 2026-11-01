@@ -216,7 +216,10 @@ fn pre_apply_composition_is_complete_for_coalesce_absence() {
     });
 
     assert_eq!(
-        resolve_ref_value_status(&expression, &bindings),
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value_status(&expression, &bindings, session)
+        ),
         Ok(ValueResolution::Present(fallback)),
         "a composition is fully authored, so a missing attribute is definitive absence",
     );

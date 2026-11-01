@@ -7571,6 +7571,7 @@ mod tests {
         ApplyTimeUnknown, AuthoredAccessPath as AccessPath, ConcreteValue, Current, DeferredValue,
         InterpolationPart, ModuleSource, absolute_binding_address_for_test,
     };
+
     use std::borrow::Cow;
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -8079,49 +8080,60 @@ mod tests {
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
-        let preparation = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &carina_core::provider::NoopNormalizer,
-            &[],
-            &schemas,
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(Vec::new()),
+            schemas.clone(),
         );
-        let request = carina_core::executor::prepare_create_request(resource, &preparation)
-            .await
-            .expect("fixture resource passes provider preparation");
-        let (create, _cancellation) =
-            carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request);
-        let failure = create.await.expect_err("fixture create remains pending");
-        let pending = match failure.into_kind() {
-            CreateFailureKind::InFlight {
-                pending,
-                error: _error,
-            } => pending
-                .into_fresh()
-                .unwrap_or_else(|_| panic!("fixture provider returned a persisted continuation")),
-            CreateFailureKind::Created {
-                created: _created,
-                error,
-            } => {
-                panic!("fixture create was created: {error}")
-            }
-            CreateFailureKind::Untracked(error) => {
-                panic!("fixture create was not pending: {error}")
-            }
-            CreateFailureKind::OutcomeUnknown { unknown, error } => {
-                panic!(
-                    "fixture create outcome was unknown for {}: {error}",
-                    unknown.id()
-                )
-            }
-        };
-        PendingCreate {
-            id,
-            wit_id,
-            wit_request,
-            pending,
-        }
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let request =
+                    carina_core::executor::prepare_create_request(resource, &preparation).await;
+                let request = request.expect("fixture resource passes provider preparation");
+                let (create, _cancellation) =
+                    carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request);
+                let failure = create.await.expect_err("fixture create remains pending");
+                let pending = match failure.into_kind() {
+                    CreateFailureKind::InFlight {
+                        pending,
+                        error: _error,
+                    } => pending.into_fresh().unwrap_or_else(|_| {
+                        panic!("fixture provider returned a persisted continuation")
+                    }),
+                    CreateFailureKind::Created {
+                        created: _created,
+                        error,
+                    } => {
+                        panic!("fixture create was created: {error}")
+                    }
+                    CreateFailureKind::Untracked(error) => {
+                        panic!("fixture create was not pending: {error}")
+                    }
+                    CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                        panic!(
+                            "fixture create outcome was unknown for {}: {error}",
+                            unknown.id()
+                        )
+                    }
+                };
+                PendingCreate {
+                    id,
+                    wit_id,
+                    wit_request,
+                    pending,
+                }
+            },
+        )
+        .await
     }
 
     fn pending_create_without_identifier() -> PendingCreate {
@@ -8197,21 +8209,33 @@ mod tests {
         let normalizer = carina_core::provider::NoopNormalizer;
         let factories = [];
         let schemas = carina_core::schema::SchemaRegistry::new();
-        let context = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &provider_configs,
-            &normalizer,
-            &factories,
-            &schemas,
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(Vec::new()),
+            schemas.clone(),
         );
-        let request = carina_core::executor::prepare_create_request(resource, &context)
-            .await
-            .expect("resume fixture request must pass provider preparation");
-        let (resume, _request) = ResumeCreateRequest::for_test(pending, request)
-            .expect("resume fixture route must match")
-            .into_parts();
-        resume
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let context = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &provider_configs,
+                    &normalizer,
+                    &factories,
+                    &schemas,
+                    type_checks,
+                );
+                let request =
+                    carina_core::executor::prepare_create_request(resource, &context).await;
+                let request =
+                    request.expect("resume fixture request must pass provider preparation");
+                let (resume, _request) = ResumeCreateRequest::for_test(pending, request)
+                    .expect("resume fixture route must match")
+                    .into_parts();
+                resume
+            },
+        )
+        .await
     }
 
     fn assert_original_polled_record(

@@ -428,7 +428,7 @@ impl CompletionProvider {
         arg_name: &str,
         text: &str,
         base_path: Option<&Path>,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let Some(parsed) = self.load_called_module(module_name, text, base_path) else {
             return Vec::new();
@@ -446,10 +446,11 @@ impl CompletionProvider {
         // that identity through the same owner index used by validation so
         // an enum parameter retains its member declaration instead of being
         // flattened into a generic refined string.
-        let resolved_type = carina_core::validation::resolve_type_expr(arg_type, provider_ctx)
-            .unwrap_or_else(|_| arg_type.clone());
+        let resolved_type =
+            carina_core::validation::resolve_type_expr(arg_type, provider_ctx.catalog())
+                .unwrap_or_else(|_| arg_type.clone());
         if let parser::TypeExpr::SchemaType { owned } = &resolved_type
-            && let Ok(Some(declaration)) = provider_ctx.enum_declaration(owned)
+            && let Ok(Some(declaration)) = provider_ctx.catalog().enum_declaration(owned)
         {
             return self.value_completions_for_attribute_type(
                 &declaration,

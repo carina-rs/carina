@@ -198,8 +198,8 @@ pub(super) async fn resolve_resource<S: Clone>(
         CheckInput::Authored(source) => {
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
-                let resolved_value =
-                    resolve_ref_value(expr, bindings).map_err(EffectFailureKind::message)?;
+                let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
+                    .map_err(EffectFailureKind::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 resolved.attributes.insert(key.clone(), resolved_value);
@@ -219,8 +219,8 @@ pub(super) async fn resolve_resource<S: Clone>(
                 let expr = source_expr
                     .filter(|source_expr| needs_apply_resolution(source_expr))
                     .unwrap_or(target_expr);
-                let resolved_value =
-                    resolve_ref_value(expr, bindings).map_err(EffectFailureKind::message)?;
+                let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
+                    .map_err(EffectFailureKind::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 if resolves_at_apply {
@@ -234,7 +234,8 @@ pub(super) async fn resolve_resource<S: Clone>(
                     continue;
                 }
                 let resolved_value =
-                    resolve_ref_value(source_expr, bindings).map_err(EffectFailureKind::message)?;
+                    resolve_ref_value(source_expr, bindings, context.type_checks())
+                        .map_err(EffectFailureKind::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 if needs_apply_resolution(source_expr) {
@@ -295,14 +296,15 @@ fn needs_apply_resolution(value: &Value) -> bool {
 
 pub(super) fn resolve_data_source<S: Clone>(
     input: Result<CheckInput<DataSource<S>>, String>,
-    bindings: &ResolvedBindings,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<ResolvedCheckInput<DataSource<S>>, ReportedError> {
+    let bindings = context.bindings();
     let checked = match input.map_err(ReportedError::message)? {
         CheckInput::Authored(source) => {
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
-                let resolved_value =
-                    resolve_ref_value(expr, bindings).map_err(ReportedError::message)?;
+                let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
+                    .map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
@@ -321,8 +323,8 @@ pub(super) fn resolve_data_source<S: Clone>(
                 let expr = source_expr
                     .filter(|source_expr| needs_apply_resolution(source_expr))
                     .unwrap_or(target_expr);
-                let resolved_value =
-                    resolve_ref_value(expr, bindings).map_err(ReportedError::message)?;
+                let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
+                    .map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 if resolves_at_apply {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -335,7 +337,8 @@ pub(super) fn resolve_data_source<S: Clone>(
                     continue;
                 }
                 let resolved_value =
-                    resolve_ref_value(source_expr, bindings).map_err(ReportedError::message)?;
+                    resolve_ref_value(source_expr, bindings, context.type_checks())
+                        .map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 if needs_apply_resolution(source_expr) {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -1623,7 +1626,10 @@ mod process_basic_result_tests {
             default: Box::new(fallback.clone()),
         });
         assert_eq!(
-            crate::resolver::resolve_ref_value_status(&expression, bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| crate::resolver::resolve_ref_value_status(&expression, bindings, session)
+            ),
             Ok(crate::resolver::ValueResolution::Present(fallback)),
             "an absent attribute not listed as missing is definitively absent",
         );
@@ -2003,10 +2009,13 @@ mod assert_fully_resolved_tests {
         )
         .unwrap();
 
-        let error = resolve_ref_value(&value, &bindings)
-            .map_err(ReportedError::message)
-            .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
-            .expect_err("the apply path must reject the final computed list access");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&value, &bindings, session),
+        )
+        .map_err(ReportedError::message)
+        .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
+        .expect_err("the apply path must reject the final computed list access");
 
         assert!(
             error

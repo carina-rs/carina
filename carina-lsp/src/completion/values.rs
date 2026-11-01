@@ -19,7 +19,7 @@ use carina_core::static_type::{
 };
 use carina_core::upstream_exports::{UpstreamExportEntry, UpstreamExportType};
 
-use super::{AttributeValueTarget, CompletionProvider, DslSource};
+use super::{AttributeValueTarget, CompletionProvider, DslSource, UpstreamDepth2Match};
 
 /// How far up the directory tree to walk when suggesting upstream_state sources.
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
@@ -67,7 +67,7 @@ impl StructuralTypeForCompletion<TypeExpr> {
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         schemas: &SchemaRegistry,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> bool {
         match self {
             Self::Known(type_expr) => type_expr_source_is_assignable_to(
@@ -128,7 +128,7 @@ impl<'a> UpstreamCompletionStaticType<'a> {
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         schemas: &SchemaRegistry,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> bool {
         match self {
             Self::Known(type_expr) => type_expr_source_is_assignable_to(
@@ -215,23 +215,25 @@ fn type_expr_source_is_assignable_to(
     sink: &AttributeType,
     sink_defs: &std::collections::BTreeMap<String, AttributeType>,
     schemas: &SchemaRegistry,
-    provider_ctx: &carina_core::parser::ProviderContext,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> bool {
-    let Ok(source) =
-        carina_core::parser::resolve_type_expr_from_schemas(source, schemas, provider_ctx)
-    else {
+    let Ok(source) = carina_core::parser::resolve_type_expr_from_schemas(
+        source,
+        schemas,
+        provider_ctx.catalog(),
+    ) else {
         return true;
     };
     let Some(source) = carina_core::validation::lift_type_expr(&source) else {
         return true;
     };
     let assignment = TypeInSchema::schemaless(&source).assignment_to(sink.in_schema(sink_defs));
-    if provider_ctx.custom_types_loaded() {
+    if provider_ctx.catalog().custom_types_loaded() {
         // Completion has no diagnostic channel; missing loaded evidence must
         // exclude the candidate rather than suggest an unproven assignment.
         assignment.require_loaded().unwrap_or(false)
     } else {
-        assignment.record_unchecked(provider_ctx.type_checks())
+        assignment.record_unchecked(provider_ctx)
     }
 }
 
@@ -346,7 +348,7 @@ impl CompletionProvider {
         current_binding: Option<&str>,
         position: Position,
         base_path: Option<&Path>,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
@@ -472,6 +474,7 @@ impl CompletionProvider {
                     base_path,
                     &self.schemas,
                     &mut exports_cache,
+                    provider_ctx,
                 );
                 for (export_name, entry) in exports {
                     let completion_type = structural_type_for_completion(entry);
@@ -533,9 +536,13 @@ impl CompletionProvider {
                     .extract_argument_parameters(src)
                     .into_iter()
                     .filter_map(|(name, type_hint)| {
-                        carina_core::parser::parse_type_expr_str(&type_hint, provider_ctx)
+                        carina_core::parser::parse_type_expr_str(&type_hint, provider_ctx.catalog())
                             .and_then(|ty| {
-                                carina_core::validation::resolve_type_expr(&ty, provider_ctx).ok()
+                                carina_core::validation::resolve_type_expr(
+                                    &ty,
+                                    provider_ctx.catalog(),
+                                )
+                                .ok()
                             })
                             .map(|ty| (name, ty))
                     })
@@ -586,6 +593,7 @@ impl CompletionProvider {
                     base_path,
                     &self.schemas,
                     &mut exports_cache,
+                    provider_ctx,
                 )
                 && !element_type.is_candidate_for_target(
                     attr_type,
@@ -1118,7 +1126,7 @@ impl CompletionProvider {
     /// not surfaced — omitting `directives.provider` routes there.
     pub(super) fn directives_provider_completions(
         &self,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
         base_path: Option<&std::path::Path>,
     ) -> Vec<CompletionItem> {
         let bindings = collect_named_provider_instance_bindings(provider_ctx, base_path);
@@ -1377,8 +1385,10 @@ impl CompletionProvider {
         source: &str,
         position: Position,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
-        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path, &self.schemas)
+        let Some(keys) =
+            resolve_upstream_export_keys(binding, source, base_path, &self.schemas, provider_ctx)
         else {
             return Vec::new();
         };
@@ -1429,14 +1439,19 @@ impl CompletionProvider {
     /// depth and produce an empty list.
     pub(super) fn upstream_state_depth2_dot_completions(
         &self,
-        binding: &str,
-        key: &str,
-        partial: &str,
-        source: &str,
+        upstream: &UpstreamDepth2Match,
         position: Position,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
-        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path, &self.schemas)
+        let UpstreamDepth2Match {
+            binding,
+            key,
+            partial,
+            source,
+        } = upstream;
+        let Some(keys) =
+            resolve_upstream_export_keys(binding, source, base_path, &self.schemas, provider_ctx)
         else {
             return Vec::new();
         };
@@ -1649,7 +1664,7 @@ impl CompletionProvider {
     /// since an unknown type offers no basis for suggestion.
     pub(super) fn exports_value_completions(
         &self,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
         type_expr_text: &str,
         in_nested: bool,
         text: &str,
@@ -1718,7 +1733,7 @@ impl CompletionProvider {
         attr_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
@@ -1758,7 +1773,7 @@ impl CompletionProvider {
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -1775,6 +1790,7 @@ impl CompletionProvider {
                 base_path,
                 &self.schemas,
                 &mut exports_cache,
+                provider_ctx,
             );
             for (export_name, entry) in exports {
                 let completion_type = structural_type_for_completion(entry);
@@ -1861,7 +1877,7 @@ impl CompletionProvider {
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -2260,6 +2276,7 @@ fn resolve_upstream_export_keys(
     source: &str,
     base_path: Option<&Path>,
     schemas: &carina_core::schema::SchemaRegistry,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Option<carina_core::upstream_exports::UpstreamExportEntries> {
     let base = base_path?;
     let upstream = carina_core::parser::UpstreamState {
@@ -2270,7 +2287,7 @@ fn resolve_upstream_export_keys(
         carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
             base,
             &[upstream],
-            &Default::default(),
+            provider_ctx,
             Some(schemas),
         );
     exports.remove(binding)
@@ -2298,9 +2315,11 @@ fn resolve_upstream_exports_cached<'a>(
         String,
         carina_core::upstream_exports::UpstreamExportEntries,
     >,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> &'a carina_core::upstream_exports::UpstreamExportEntries {
     cache.entry(binding.to_string()).or_insert_with(|| {
-        resolve_upstream_export_keys(binding, source, base_path, schemas).unwrap_or_default()
+        resolve_upstream_export_keys(binding, source, base_path, schemas, provider_ctx)
+            .unwrap_or_default()
     })
 }
 
@@ -2327,6 +2346,7 @@ fn infer_for_binding_type(
         String,
         carina_core::upstream_exports::UpstreamExportEntries,
     >,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Option<StructuralTypeForCompletion<carina_core::parser::TypeExpr>> {
     use super::top_level::ForBindingSlot;
     use carina_core::parser::TypeExpr;
@@ -2347,7 +2367,7 @@ fn infer_for_binding_type(
                 carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
                     base,
                     &[upstream],
-                    &Default::default(),
+                    provider_ctx,
                     Some(schemas),
                 );
             // Move the entry out of `resolved` rather than cloning so we
@@ -2472,10 +2492,11 @@ fn return_type_fits(
 /// than guessing a scalar kind from the spelling of a custom name.
 fn parse_exports_type_text(
     text: &str,
-    provider_ctx: &carina_core::parser::ProviderContext,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Option<AttributeType> {
-    let parsed = carina_core::parser::parse_type_expr_str(text, provider_ctx)?;
-    let resolved = carina_core::validation::resolve_type_expr(&parsed, provider_ctx).ok()?;
+    let parsed = carina_core::parser::parse_type_expr_str(text, provider_ctx.catalog())?;
+    let resolved =
+        carina_core::validation::resolve_type_expr(&parsed, provider_ctx.catalog()).ok()?;
     carina_core::validation::lift_type_expr(&resolved)
 }
 
@@ -2575,7 +2596,7 @@ fn join_relative(up_depth: usize, parts: &[&str]) -> String {
 /// (input/output shape) or a root config — `load_module` returns
 /// `None` for root configs and would miss the bindings entirely.
 fn collect_named_provider_instance_bindings(
-    provider_ctx: &carina_core::parser::ProviderContext,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     base_path: Option<&Path>,
 ) -> Vec<String> {
     let Some(base) = base_path else {
@@ -2586,7 +2607,7 @@ fn collect_named_provider_instance_bindings(
     } else {
         base.to_path_buf()
     };
-    let parsed = match carina_core::config_loader::parse_directory(&dir, provider_ctx) {
+    let parsed = match carina_core::config_loader::parse_directory(&dir, provider_ctx.catalog()) {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
@@ -2616,41 +2637,66 @@ mod return_type_fits_tests {
         let source = carina_core::parser::parse_type_expr_str("KmsKeyArn", &context).unwrap();
         let defs = std::collections::BTreeMap::new();
         let schemas = SchemaRegistry::new();
-        assert!(type_expr_source_is_assignable_to(
-            &source,
-            &nominal("KmsKeyArn"),
-            &defs,
-            &schemas,
-            carina_core::parser::ProviderContext::unloaded()
-        ));
-        assert!(!type_expr_source_is_assignable_to(
-            &source,
-            &nominal("Arn"),
-            &defs,
-            &schemas,
-            carina_core::parser::ProviderContext::unloaded()
-        ));
-        assert!(type_expr_source_is_assignable_to(
-            &source,
-            &AttributeType::string(),
-            &defs,
-            &schemas,
-            carina_core::parser::ProviderContext::unloaded()
-        ));
-        assert!(!type_expr_source_is_assignable_to(
-            &source,
-            &nominal("PositiveInt"),
-            &defs,
-            &schemas,
-            carina_core::parser::ProviderContext::unloaded()
-        ));
-        assert!(!type_expr_source_is_assignable_to(
-            &TypeExpr::String,
-            &nominal("KmsKeyArn"),
-            &defs,
-            &schemas,
-            carina_core::parser::ProviderContext::unloaded()
-        ));
+        assert!(
+            carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    &nominal("KmsKeyArn"),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            !carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    &nominal("Arn"),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    &AttributeType::string(),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            !carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    &nominal("PositiveInt"),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            !carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &TypeExpr::String,
+                    &nominal("KmsKeyArn"),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
     }
 
     fn unnameable_reason() -> UnnameableInConsumer {

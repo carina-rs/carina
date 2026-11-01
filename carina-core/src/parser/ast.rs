@@ -8562,11 +8562,17 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed = crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+        let parsed = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("deferred fixture crosses the module-resolution seam")
+            },
         )
-        .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded()
         .expect("template must expand");
         let deferred = &parsed.deferred_for_expressions()[0];
@@ -9245,11 +9251,17 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed = crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
-        )
-        .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("deferred fixture crosses the module-resolution seam")
+            },
+        );
         let target = parsed.deferred_for_expressions()[0].target();
         let mut json = serde_json::to_value(target).expect("serialize deferred target");
         json["template"]["source"]

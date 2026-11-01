@@ -589,18 +589,24 @@ fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource 
     let bindings = crate::binding_index::ResolvedBindings::default();
     let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = crate::schema::SchemaRegistry::new();
-    let context = crate::executor::ProviderPreparationContext::new(
-        &bindings,
-        &gate,
-        &[],
-        &crate::provider::NoopNormalizer,
-        &[],
-        &schemas,
-    );
-    futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-        resource, &context,
-    ))
-    .expect("test resource should pass provider preparation")
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |type_checks| {
+            let context = crate::executor::ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &crate::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+                resource, &context,
+            ))
+            .expect("test resource should pass provider preparation")
+        },
+    )
 }
 
 /// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
@@ -5328,11 +5334,17 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         "#,
     )
     .expect("parsed file should be valid");
-    let parsed = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect("plan fixture crosses the module-resolution seam")
+        },
     )
-    .expect("plan fixture crosses the module-resolution seam")
     .into_expanded()
     .expect("plan fixture contains no parser placeholders");
     let provider = HintProvider {

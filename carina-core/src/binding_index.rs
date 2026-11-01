@@ -36,7 +36,7 @@
 //! binding-name table is scoped.
 //!
 //! ```ignore
-//! let index = BindingIndex::from_parsed(&parsed, &registry, crate::parser::ProviderContext::unloaded());
+//! let index = BindingIndex::from_parsed(&parsed, &registry, &crate::parser::ProviderContext::default());
 //! if let Some(entry) = index.get("vpc") {
 //!     // entry.target is the statically known validation surface
 //! }
@@ -513,7 +513,8 @@ fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
 #[derive(Debug)]
 pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     schemas: &'a SchemaRegistry,
-    provider_context: &'a crate::parser::ProviderContext,
+    provider_context: crate::parser::ProviderContext,
+    session: Option<&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     entries: HashMap<String, BindingEntry<'a, B>>,
     known_names: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
@@ -533,7 +534,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     pub fn from_parsed<E, D>(
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-        provider_context: &'a crate::parser::ProviderContext,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -549,7 +550,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
-        provider_context: &'a crate::parser::ProviderContext,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -570,7 +571,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
-        provider_context: &'a crate::parser::ProviderContext,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -590,7 +591,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
-        provider_context: &'a crate::parser::ProviderContext,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -604,12 +605,33 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         )
     }
 
+    pub fn from_parsed_with_upstream_exports_and_module_signatures_in_session<E, D>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        registry: &'a SchemaRegistry,
+        upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+        session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let mut index = Self::build(
+            parsed,
+            registry,
+            upstream_exports,
+            Some(module_signatures),
+            session.catalog(),
+        );
+        index.session = Some(session);
+        index
+    }
+
     fn build<E, D>(
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
         module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
-        provider_context: &'a crate::parser::ProviderContext,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -796,7 +818,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         }
         Self {
             schemas: registry,
-            provider_context,
+            provider_context: provider_context.clone(),
+            session: None,
             entries,
             known_names,
             resource_handles,
@@ -808,8 +831,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         self.entries.get(name)
     }
 
-    pub(crate) fn provider_context(&self) -> &'a crate::parser::ProviderContext {
-        self.provider_context
+    pub(crate) fn provider_context(&self) -> &crate::parser::ProviderContext {
+        &self.provider_context
     }
 
     /// Consume assignment with this index's provider authority. Loaded paths
@@ -823,7 +846,10 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         if self.provider_context.custom_types_loaded() {
             assignment.require_loaded()
         } else {
-            Ok(assignment.record_unchecked(self.provider_context.type_checks()))
+            match self.session {
+                Some(session) => Ok(assignment.record_unchecked(session)),
+                None => assignment.require_loaded(),
+            }
         }
     }
 
@@ -846,7 +872,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         &self,
         ty: &crate::parser::TypeExpr,
     ) -> Result<crate::parser::TypeExpr, crate::static_type::StaticTypeResolutionError> {
-        crate::parser::resolve_type_expr_from_schemas(ty, self.schemas, self.provider_context)
+        crate::parser::resolve_type_expr_from_schemas(ty, self.schemas, &self.provider_context)
     }
 
     pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction<B>> {
@@ -2882,7 +2908,7 @@ impl<'a> IterableBindings<'a> {
     /// Resolve a complete deferred iterable through the same three-state
     /// evaluator used by ordinary resource attributes.
     pub fn resolve_value(&self, value: &Value) -> Result<crate::resolver::ValueResolution, String> {
-        crate::resolver::resolve_ref_value_status(value, self.bindings.as_ref())
+        crate::resolver::project_ref_value_status(value, self.bindings.as_ref())
     }
 
     /// Missing selections may be treated as final only when every binding
@@ -2898,7 +2924,7 @@ mod tests {
     #[test]
     fn value_declaration_resolves_the_catalog_scalar_kind_before_lifting() {
         let declaration =
-            crate::parser::parse_type_expr_str("Count", crate::parser::ProviderContext::unloaded())
+            crate::parser::parse_type_expr_str("Count", &crate::parser::ProviderContext::default())
                 .unwrap();
         let parsed = crate::parser::ParsedFile::default();
         let schemas = SchemaRegistry::new();
@@ -2930,40 +2956,44 @@ mod tests {
 
     #[test]
     fn binding_assignment_requires_loaded_evidence_or_explicitly_allows_unchecked() {
-        let declaration =
-            crate::parser::parse_type_expr_str("Count", crate::parser::ProviderContext::unloaded())
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                let declaration = crate::parser::parse_type_expr_str(
+                    "Count",
+                    &crate::parser::ProviderContext::default(),
+                )
                 .unwrap();
-        let source = crate::validation::lift_type_expr(&declaration).unwrap();
-        let sink = AttributeType::int();
-        let parsed = crate::parser::ParsedFile::default();
-        let schemas = SchemaRegistry::new();
-        let loaded = crate::parser::ProviderContext {
-            custom_types: crate::parser::ProviderCustomTypes::loaded(
-                HashSet::new(),
-                Box::new(|_, _| Ok(())),
-            ),
-            ..Default::default()
-        };
-        let strict = BindingIndex::from_parsed(&parsed, &schemas, &loaded);
-        let bootstrap = BindingIndex::from_parsed(
-            &parsed,
-            &schemas,
-            crate::parser::ProviderContext::unloaded(),
-        );
-        assert_eq!(
-            strict.check_type_assignment(
-                TypeInSchema::schemaless(&source),
-                TypeInSchema::schemaless(&sink)
-            ),
-            Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
-        );
-        assert_eq!(
-            bootstrap.check_type_assignment(
-                TypeInSchema::schemaless(&source),
-                TypeInSchema::schemaless(&sink)
-            ),
-            Ok(true)
-        );
+                let source = crate::validation::lift_type_expr(&declaration).unwrap();
+                let sink = AttributeType::int();
+                let parsed = crate::parser::ParsedFile::default();
+                let schemas = SchemaRegistry::new();
+                let loaded = crate::parser::ProviderContext {
+                    custom_types: crate::parser::ProviderCustomTypes::loaded(
+                        HashSet::new(),
+                        Box::new(|_, _| Ok(())),
+                    ),
+                    ..Default::default()
+                };
+                let strict = BindingIndex::from_parsed(&parsed, &schemas, &loaded);
+                let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+                let bootstrap = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(&parsed, &schemas, None, &signatures, session);
+                assert_eq!(
+                    strict.check_type_assignment(
+                        TypeInSchema::schemaless(&source),
+                        TypeInSchema::schemaless(&sink)
+                    ),
+                    Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+                );
+                assert_eq!(
+                    bootstrap.check_type_assignment(
+                        TypeInSchema::schemaless(&source),
+                        TypeInSchema::schemaless(&sink)
+                    ),
+                    Ok(true)
+                );
+            },
+        )
     }
 
     #[test]
@@ -2975,7 +3005,7 @@ mod tests {
         let index = BindingIndex::from_parsed(
             &parsed,
             &schemas,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
         let handle = TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc"));
         for declaration in [
@@ -3106,7 +3136,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
         let entry = index.get("vpc").expect("vpc binding present");
         let BindingTarget::Schema(schema) = entry.target else {
@@ -3139,7 +3169,7 @@ let existing = read aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
         let entry = index
             .get("existing")
@@ -3160,7 +3190,7 @@ let existing = read aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let entry = index
@@ -3200,7 +3230,7 @@ let existing = read aws.ec2.Vpc {
             &parsed,
             &registry,
             &signatures,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let RefType::Typed(count) = index.ref_type(&AccessPath::new("x", "count")) else {
@@ -3256,7 +3286,7 @@ let existing = read aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let entry = index
@@ -3285,7 +3315,7 @@ aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
         assert!(index.is_empty());
     }
@@ -3308,7 +3338,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
         assert!(index.get("vpc").is_none());
         assert!(
@@ -3334,7 +3364,7 @@ let cert_issued = wait cert {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
         assert!(index.get("cert").is_none());
         assert!(index.get("cert_issued").is_none());
@@ -3370,7 +3400,7 @@ for _, n in some_iterable {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
         assert!(index.get("net").is_some(), "named let binding indexed");
         assert!(
@@ -3397,7 +3427,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let by_name = index.schemas_by_name();
@@ -3423,7 +3453,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
         assert!(index.get("missing").is_none());
     }
@@ -3453,7 +3483,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
@@ -3490,7 +3520,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
@@ -3682,7 +3712,7 @@ let vpc = aws.ec2.Vpc {
                 let index = BindingIndex::from_parsed(
                     &parsed,
                     &registry,
-                    crate::parser::ProviderContext::unloaded(),
+                    &crate::parser::ProviderContext::default(),
                 );
                 let RefType::Typed(chain) = index.ref_type(&AccessPath::new("middle", "value"))
                 else {
@@ -3745,7 +3775,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let name_binding = RelativeBindingName::new("name");
@@ -3774,7 +3804,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let vpc_binding = RelativeBindingName::new("vpc");
@@ -3828,7 +3858,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let vpc_binding = RelativeBindingName::new("vpc");
@@ -3872,7 +3902,7 @@ let vpc = aws.ec2.Vpc {
             &parsed,
             &registry,
             &exports,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         let RefType::Typed(vpc) = index.ref_type(&AccessPath::new("up", "vpc")) else {
@@ -3916,7 +3946,7 @@ let vpc = aws.ec2.Vpc {
             &parsed,
             &registry,
             &exports,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         assert!(matches!(
@@ -3938,7 +3968,7 @@ let vpc = aws.ec2.Vpc {
             &parsed,
             &registry,
             &exports,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         assert!(matches!(
@@ -3987,7 +4017,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            crate::parser::ProviderContext::unloaded(),
+            &crate::parser::ProviderContext::default(),
         );
 
         assert!(matches!(
@@ -4185,8 +4215,17 @@ mod resolved_bindings_tests {
                 if pending == &PendingReRead::incomplete("read after create did not return dns_name")
         ));
 
-        crate::resolver::resolve_refs_with_state_and_remote(&mut resources, &resolved)
-            .expect("sibling ref should resolve through the binding view");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                crate::resolver::resolve_refs_with_state_and_remote(
+                    &mut resources,
+                    &resolved,
+                    session,
+                )
+            },
+        )
+        .expect("sibling ref should resolve through the binding view");
         let target = resources[1]
             .attributes
             .get("target")
@@ -4894,7 +4933,14 @@ mod resolved_bindings_tests {
             default: Box::new(fallback.clone()),
         });
         assert_eq!(
-            crate::resolver::resolve_ref_value_status(&expression, &resolved),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| crate::resolver::resolve_ref_value_status(
+                    &expression,
+                    &resolved,
+                    session
+                )
+            ),
             Ok(crate::resolver::ValueResolution::Present(fallback)),
         );
     }

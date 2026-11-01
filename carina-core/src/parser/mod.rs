@@ -87,15 +87,16 @@ pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
     CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, LoadedProviderContext,
     NonEmptySchemaTypeOwners, OwnedTypeIdentity, ProviderContext, ProviderCustomTypes,
-    SchemaTypeOwner,
+    SchemaTypeOwner, unavailable_provider_kinds,
 };
 #[cfg(test)]
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
 pub use deferred_if::{DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, DeferredValueIf};
 pub use entry::{
     AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse_file, parse_file_and_resolve,
-    top_level_anonymous_resource_spans, top_level_backend_block_spans,
-    top_level_exports_block_spans, top_level_state_block_spans, top_level_upstream_state_spans,
+    parse_provider_factory_declarations, top_level_anonymous_resource_spans,
+    top_level_backend_block_spans, top_level_exports_block_spans, top_level_state_block_spans,
+    top_level_upstream_state_spans,
 };
 pub(crate) use entry::{
     BindingSeed, parse_with_directory_context, top_level_argument_names,
@@ -130,7 +131,7 @@ pub use resolve::{
     check_provider_instance_routing, collect_known_bindings_merged, finalize_provider_configs,
     resolve_expanded_provider_unresolved_attributes, resolve_provider_attributes_with_remote,
     resolve_provider_unresolved_attributes, resolve_resource_refs,
-    resolve_resource_refs_with_config,
+    resolve_resource_refs_in_session, resolve_resource_refs_with_config,
 };
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,

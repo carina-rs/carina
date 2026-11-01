@@ -117,7 +117,7 @@ impl ProviderState {
             .collect();
         for (_, config) in &configs {
             let provider = &config.factory_config().name;
-            if !provider_names.contains(provider) {
+            if config.factory_config().is_default() && !provider_names.contains(provider) {
                 provider_errors
                     .entry(provider.clone())
                     .or_insert_with(|| format!("Provider '{provider}' schemas are unavailable"));
@@ -560,10 +560,14 @@ impl LanguageServer for Backend {
                 .as_ref()
                 .map(|p| providers.state_for_path(p))
                 .unwrap_or(&providers.empty);
-            let completions =
-                state
-                    .completion_provider
-                    .complete(&doc, position, base_path.as_deref());
+            let completions = state.completion_provider.complete(
+                &doc,
+                position,
+                base_path.as_deref(),
+                &state
+                    .diagnostic_engine
+                    .catalog_for_document(&doc, uri.to_file_path().ok().as_deref()),
+            );
             return Ok(Some(CompletionResponse::Array(completions)));
         }
         Ok(None)

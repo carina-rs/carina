@@ -239,3 +239,39 @@ fn provider_custom_type_exports_surface_provider_rejection() {
         &scenario.carina(&["plan", "--refresh=false", "."]),
     );
 }
+
+#[test]
+fn apply_time_user_function_argument_uses_loaded_provider_type_validation() {
+    let scenario = Scenario::new();
+    scenario.replace_exports("");
+    fs::write(
+        scenario.project.join("main.crn"),
+        r#"
+fn f(a: mock.test.sdk_validator.Guarded): String { a }
+let source = mock.test.read_back { create_read_back_pending_polls = 1 }
+mock.test.read_back { present = f(source.computed) }
+"#,
+    )
+    .unwrap();
+    assert_success(
+        "deferred custom-type validation",
+        &scenario.carina(&["validate", "."]),
+    );
+    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    assert_success("deferred custom-type plan", &plan);
+    let plan_text = output_text(&plan);
+    assert!(
+        plan_text.contains("f(source.computed)"),
+        "the call must survive until apply: {plan_text}"
+    );
+    let apply = scenario.carina(&["apply", "--auto-approve", "."]);
+    let text = output_text(&apply);
+    assert_eq!(apply.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("function 'f'")
+            && text.contains("parameter 'a'")
+            && text.contains("intentional SDK schema validator rejection"),
+        "{text}"
+    );
+    assert!(!text.contains("provider schemas were not loaded"), "{text}");
+}

@@ -313,13 +313,18 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     // Drive it explicitly here so the post-expansion shape (RolePolicy
     // in `resources`, `_virtual.bs.bootstrap` in `compositions`)
     // is in place for the assertion below.
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        &caller,
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         &provider_context,
-        &SchemaRegistry::new(),
-    )
-    .expect("module expansion should succeed");
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                parsed,
+                &caller,
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("module expansion should succeed")
+        },
+    );
     let parsed = parsed
         .into_expanded()
         .expect("module expansion must substitute every parser placeholder");
@@ -373,10 +378,16 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
             wait_aliases: &[],
         },
     );
-    carina_core::resolver::resolve_refs_for_plan(
-        &mut resources,
-        &bindings,
-        &std::collections::HashSet::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            carina_core::resolver::resolve_refs_for_plan(
+                &mut resources,
+                &bindings,
+                &std::collections::HashSet::new(),
+                session,
+            )
+        },
     )
     .expect("resolve_refs_for_plan should succeed");
 

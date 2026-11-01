@@ -11,7 +11,7 @@ fn top_level_completion_replaces_prefix() {
         character: 5,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Find the aws.s3.Bucket completion
     let s3_completion = completions
@@ -52,7 +52,7 @@ fn top_level_completion_with_leading_whitespace() {
         character: 9,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Find the aws.ec2.Vpc completion
     let vpc_completion = completions
@@ -83,7 +83,7 @@ fn top_level_completion_at_line_start() {
         character: 1,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Find the aws.ec2.Vpc completion (should still be offered)
     let vpc_completion = completions.iter().find(|c| c.label == "aws.ec2.Vpc");
@@ -146,7 +146,7 @@ web_tier {
         character: 4,
     };
 
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
 
     // Should have module parameter completions
     assert!(!completions.is_empty(), "Should have completions");
@@ -229,7 +229,7 @@ let bootstrap = github {
         character: 4,
     };
 
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
 
     assert!(
         !completions.is_empty(),
@@ -306,7 +306,7 @@ let bootstrap = github {
         character: 4,
     };
 
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
 
     assert!(
         !completions.is_empty(),
@@ -351,7 +351,7 @@ instance_tenancy =
         character: 23,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Should have namespaced instance_tenancy completions
     let default_completion = completions
@@ -389,7 +389,7 @@ versioning_status =
         character: 24,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     assert!(
         completions
@@ -419,7 +419,7 @@ address_family =
         character: 21,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     assert!(
         completions
@@ -451,7 +451,7 @@ name = "my-bucket"
         character: 4,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Should have versioning_status as attribute completion
     let versioning_completion = completions.iter().find(|c| c.label == "versioning_status");
@@ -479,7 +479,7 @@ security_group_ingress {
         character: 8,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Should have struct field completions
     let ip_protocol = completions.iter().find(|c| c.label == "ip_protocol");
@@ -530,7 +530,7 @@ outer {
         character: 8,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels = completions
         .iter()
         .map(|completion| completion.label.as_str())
@@ -556,7 +556,7 @@ outer {
         character: 23,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels = completions
         .iter()
         .map(|completion| completion.label.as_str())
@@ -608,7 +608,7 @@ destination_options {
         character: 37,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     let true_completion = completions.iter().find(|c| c.label == "true");
     assert!(
@@ -647,7 +647,7 @@ security_group_ingress {
         character: 8,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Should have struct field completions in the second block too
     let ip_protocol = completions.iter().find(|c| c.label == "ip_protocol");
@@ -723,7 +723,7 @@ fn type_completion_uses_text_edit_to_replace_from_colon() {
         character: 9, // cursor after "vpc: aws."
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Find any ref type completion (e.g., aws.s3.Bucket)
     let s3_completion = completions
@@ -767,7 +767,7 @@ fn type_completion_with_empty_type() {
         character: 5, // cursor right after "vpc: "
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     let s3_completion = completions
         .iter()
@@ -806,7 +806,7 @@ fn provider_block_completion_suggests_region() {
         character: 5,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Should have "region" as a completion
     let region_completion = completions.iter().find(|c| c.label == "region");
@@ -825,7 +825,7 @@ fn provider_source_completion_advertises_registry_and_github_forms() {
     s
 }"#,
     );
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 1,
@@ -859,7 +859,7 @@ fn provider_block_region_value_completion() {
         character: 12,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Should have region value completions (like awscc.Region.ap_northeast_1)
     let has_region_value = completions
@@ -908,7 +908,7 @@ fn provider_block_region_completions_use_matching_namespace() {
         character: 12,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Should have awscc.Region completions
     let has_awscc_region = completions
@@ -947,7 +947,7 @@ fn provider_block_region_completions_use_aws_namespace() {
         character: 12,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Should have aws.Region completions
     let has_aws_region = completions
@@ -979,7 +979,7 @@ fn type_completion_includes_basic_types() {
         character: 5,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     for basic_type in &["String", "Int", "Bool", "Float"] {
@@ -1022,7 +1022,7 @@ fn completion_at_type_position_proposes_pascal_case_primitives() {
         character: 3,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(labels.contains(&"String"), "got: {:?}", labels);
@@ -1045,7 +1045,7 @@ fn type_completion_includes_generic_constructors() {
         character: 7,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1069,7 +1069,7 @@ fn type_completion_includes_custom_types() {
         character: 6,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // Custom types from provider validators should appear
@@ -1099,7 +1099,7 @@ fn type_completion_custom_types_inside_list() {
         character: 15,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1197,7 +1197,7 @@ versioning_status =
         character: 24,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
@@ -1242,7 +1242,7 @@ versioning_configuration {
         character: 14,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
@@ -1266,7 +1266,7 @@ fn type_completion_inside_list_shows_basic_types() {
         character: 13,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1290,7 +1290,7 @@ fn type_completion_inside_map_shows_basic_types() {
         character: 11,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1314,7 +1314,7 @@ fn module_binding_completion_at_top_level() {
         character: 1,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1345,7 +1345,7 @@ fn module_call_scaffolding_includes_arguments() {
         character: 1,
     };
 
-    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let completions = provider.complete_for_test(&doc, position, Some(tmp.path()));
     let web_completion = completions
         .iter()
         .find(|c| c.label == "web")
@@ -1396,7 +1396,7 @@ fn unknown_attribute_fallback_has_no_type_pollution() {
         character: 22,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1444,7 +1444,7 @@ for item in items {
         character: 25,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1482,7 +1482,7 @@ fn resource_attribute_completion_inside_let_for_expression() {
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["aws".to_string()], vec![], vec![]);
     let text = "let xs = for v in vs {\n  aws.s3.Bucket {\n    ";
-    let completions = provider.complete(&create_document(text), Position::new(2, 4), None);
+    let completions = provider.complete_for_test(&create_document(text), Position::new(2, 4), None);
     let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
 
     assert!(labels.contains(&"name"), "{labels:?}");
@@ -1510,7 +1510,7 @@ fn enum_completion_inside_nested_for_loop_body() {
         character: 27,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1536,7 +1536,7 @@ fn for_loop_binding_suggested_in_body_value_position() {
         character: 11,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1563,7 +1563,7 @@ fn for_loop_binding_not_suggested_outside_body() {
         character: 9,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1583,7 +1583,7 @@ fn for_loop_discard_not_suggested() {
         character: 11,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1621,7 +1621,7 @@ fn import_path_completion_lists_directories_only() {
         character: source.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let completions = provider.complete_for_test(&doc, position, Some(tmp.path()));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1658,7 +1658,7 @@ fn import_path_completion_offers_dot_anchors_for_partial_dot() {
         character: source.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&leaf));
+    let completions = provider.complete_for_test(&doc, position, Some(&leaf));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1692,7 +1692,7 @@ fn import_path_completion_offers_dot_anchors_for_empty_partial() {
         character: source.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&leaf));
+    let completions = provider.complete_for_test(&doc, position, Some(&leaf));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1725,7 +1725,7 @@ fn import_path_completion_offers_dot_anchors_for_partial_double_dot() {
         character: source.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&leaf));
+    let completions = provider.complete_for_test(&doc, position, Some(&leaf));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1760,7 +1760,7 @@ fn import_path_completion_does_not_offer_anchors_after_slash() {
         character: source.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&leaf));
+    let completions = provider.complete_for_test(&doc, position, Some(&leaf));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1811,7 +1811,7 @@ fn use_source_path_completion_lists_parent_at_double_dot_slash() {
         character: last_line.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&leaf));
+    let completions = provider.complete_for_test(&doc, position, Some(&leaf));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1848,7 +1848,7 @@ fn use_source_path_completion_works_multiline() {
         character: last_line.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let completions = provider.complete_for_test(&doc, position, Some(tmp.path()));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1885,7 +1885,7 @@ fn use_source_path_completion_works_multiline_with_trailing_brace() {
         character: second_line.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(tmp.path()));
+    let completions = provider.complete_for_test(&doc, position, Some(tmp.path()));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1941,7 +1941,7 @@ fn module_parameter_completion_with_sibling_use_decl() {
     let provider = test_provider();
     let doc = create_document(main_text);
     // Cursor on the empty body line at column 2.
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 1,
@@ -1984,7 +1984,7 @@ fn top_level_module_call_completion_skips_discard_binding() {
 
     let provider = test_provider();
     let doc = create_document(main_text);
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 0,
@@ -2014,7 +2014,7 @@ fn top_level_module_call_completion_with_sibling_use_decl() {
 
     let provider = test_provider();
     let doc = create_document(main_text);
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 0,
@@ -2067,7 +2067,7 @@ let rd = registry_deploy {
         line: 5,
         character: 16,
     };
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"'dev'"),
@@ -2115,7 +2115,7 @@ let rd = registry_deploy {
         line: 5,
         character: 3,
     };
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"oidc_provider_arn"),
@@ -2161,7 +2161,7 @@ fn module_call_value_completion_with_sibling_use_decl() {
         line: 1,
         character: 16,
     };
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"'dev'"),
@@ -2193,7 +2193,7 @@ inner {
 "#;
     std::fs::write(fixture.path().join("main.crn"), main).expect("write module call");
     let doc = create_enum_shadow_document(main);
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 3,
@@ -2254,7 +2254,7 @@ let rd = registry_deploy {
         line: 5,
         character: 22,
     };
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels
@@ -2298,7 +2298,7 @@ let t = toggle {
         line: 5,
         character: 12,
     };
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"true"),
@@ -2371,7 +2371,7 @@ let rd = registry_deploy {
         line: 5,
         character: 22,
     };
-    let completions = provider.complete(&doc, position, Some(consumer_dir.as_path()));
+    let completions = provider.complete_for_test(&doc, position, Some(consumer_dir.as_path()));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"bootstrap.oidc_provider_arn"),
@@ -2439,7 +2439,7 @@ let rd = registry_deploy {
         line: 12,
         character: 22,
     };
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"bs.oidc_provider_arn"),
@@ -2481,7 +2481,7 @@ let n = notes {
         line: 5,
         character: 9,
     };
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for expected in &["join", "lower", "upper", "trim"] {
         assert!(
@@ -2522,7 +2522,7 @@ let rd = registry_deploy {
 }
 "#;
     let doc = create_document(main_typo_arg);
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 5,
@@ -2550,7 +2550,7 @@ let rd = registry_deploy {
 }
 "#;
     let doc = create_document(main_string_arg);
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 5,
@@ -2570,7 +2570,7 @@ fn directives_block_completion_includes_all_six_keys() {
     let provider = test_provider_single_attr();
     let doc = create_document("test.foo.bar {\n  attr = \"x\"\n  directives {\n    \n  }\n}\n");
     // Cursor inside directives block, line 3, char 4
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 3,
@@ -2600,7 +2600,7 @@ fn directives_ignore_changes_completion_offers_writable_attribute_paths() {
     let doc = create_document(
         "test.nested.resource {\n  outer = { inner = { leaf_field = \"x\" } }\n  directives {\n    ignore_changes = []\n  }\n}\n",
     );
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 3,
@@ -2631,7 +2631,7 @@ fn directives_depends_on_completion_lists_resource_bindings() {
         "let role = test.foo.bar {\n  attr = \"r\"\n}\nlet bucket = test.foo.bar {\n  attr = \"x\"\n  directives {\n    depends_on = []\n  }\n}\n",
     );
     // Cursor between `[` and `]` on line 6, char 18
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 6,
@@ -2658,7 +2658,7 @@ fn directives_depends_on_completion_excludes_already_listed_names() {
         "let role = test.foo.bar {\n  attr = \"r\"\n}\nlet kms = test.foo.bar {\n  attr = \"k\"\n}\nlet bucket = test.foo.bar {\n  attr = \"x\"\n  directives {\n    depends_on = [role, ]\n  }\n}\n",
     );
     // Cursor right after the comma+space inside the list
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 9,
@@ -2737,7 +2737,7 @@ fn directives_provider_value_completion_lists_named_instances() {
         line: 3,
         character: 15,
     };
-    let completions = provider.complete(&doc, position, Some(base_path));
+    let completions = provider.complete_for_test(&doc, position, Some(base_path));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(

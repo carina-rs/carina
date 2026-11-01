@@ -848,23 +848,30 @@ fn render_value_type_error(
     type_expr: &TypeExpr,
     value: &Value,
 ) -> Option<String> {
-    let result = match engine.provider_context.loaded() {
-        Some(provider_context) => carina_core::validation::typecheck::check_type_expr_value(
-            type_expr,
-            value,
-            provider_context,
-            carina_core::validation::typecheck::TypecheckInference::Unavailable,
-        )
-        .require_provider_schemas(),
-        None => carina_core::validation::typecheck::check_type_expr_value_providerless(
-            type_expr,
-            value,
-            &engine.provider_context,
-            carina_core::validation::typecheck::TypecheckInference::Unavailable,
-        )
-        .record_deferred(ProviderContext::unloaded().type_checks()),
-    };
-    result.err().map(|error| error.to_string())
+    carina_core::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| {
+            let result = match engine.provider_context.loaded() {
+                Some(provider_context) => {
+                    carina_core::validation::typecheck::check_type_expr_value(
+                        type_expr,
+                        value,
+                        provider_context,
+                        carina_core::validation::typecheck::TypecheckInference::Unavailable,
+                    )
+                    .require_provider_schemas()
+                }
+                None => carina_core::validation::typecheck::check_type_expr_value_providerless(
+                    type_expr,
+                    value,
+                    &engine.provider_context,
+                    carina_core::validation::typecheck::TypecheckInference::Unavailable,
+                )
+                .record_deferred(session),
+            };
+            result.err().map(|error| error.to_string())
+        },
+    )
 }
 
 fn unused_binding_names(diagnostics: &[Diagnostic]) -> Vec<String> {
@@ -3073,7 +3080,7 @@ fn find_let_binding_position_with_multibyte_leading_whitespace() {
     // name_col should be char 1 + 4 = 5 (correct)
     // Bug produces byte 3 + 4 = 7 (wrong)
     let text = "\u{3000}let my_var = awscc.ec2.Vpc { }";
-    let result = engine.find_let_binding_position(text, "my_var");
+    let result = engine.with_run_for_test(|run| run.find_let_binding_position(text, "my_var"));
     assert_eq!(
         result,
         Some((0, 5)),
@@ -6326,7 +6333,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         let engine = module_boundary_identity_engine();
         let nominal = carina_core::parser::parse_type_expr_str(
             &format!("aws.{path}.Id"),
-            carina_core::parser::ProviderContext::unloaded(),
+            &carina_core::parser::ProviderContext::default(),
         )
         .unwrap();
         let resolved =
@@ -6418,7 +6425,7 @@ let first = unrelated { }
     let bindings = BindingIndex::from_parsed(
         &binding_input,
         &engine.schemas,
-        carina_core::parser::ProviderContext::unloaded(),
+        &carina_core::parser::ProviderContext::default(),
     );
     let findings = carina_core::validation::check_expanded_module_calls(
         carina_core::validation::ExpandedModuleCallCheckInput::References {
@@ -7215,21 +7222,31 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
     );
     let report = match &engine.provider_context {
         DiagnosticProviderContext::Loaded(provider_context) => {
-            carina_core::module_resolver::resolve_modules_with_diagnostics(
-                &resolver_input,
-                fixture.path(),
+            carina_core::validation::deferred_types::with_session_for_test(
                 provider_context,
-                &engine.schemas,
-                &[],
+                |session| {
+                    carina_core::module_resolver::resolve_modules_with_diagnostics(
+                        &resolver_input,
+                        fixture.path(),
+                        session,
+                        &engine.schemas,
+                        &[],
+                    )
+                },
             )
         }
         DiagnosticProviderContext::Unloaded(provider_context) => {
-            carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
-                &resolver_input,
-                fixture.path(),
+            carina_core::validation::deferred_types::with_session_for_test(
                 provider_context,
-                &engine.schemas,
-                &[],
+                |session| {
+                    carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
+                        &resolver_input,
+                        fixture.path(),
+                        session,
+                        &engine.schemas,
+                        &[],
+                    )
+                },
             )
         }
     };
@@ -11835,7 +11852,9 @@ provider awscc {
     let engine = test_engine();
     let doc = create_document(providers);
     let finalize_error = engine
-        .finalize_provider_diagnostic(&doc, Some("providers.crn"), root.path())
+        .with_run_for_test(|run| {
+            run.finalize_provider_diagnostic(&doc, Some("providers.crn"), root.path())
+        })
         .expect("independent provider finalization must survive a module witness failure");
     assert!(finalize_error.to_string().contains("default_tags"));
 
@@ -11872,7 +11891,11 @@ let instance = module { count = 'wrong' }
     let doc = create_document(providers);
     assert!(
         engine
-            .finalize_provider_diagnostic(&doc, Some("providers.crn"), root.path())
+            .with_run_for_test(|run| run.finalize_provider_diagnostic(
+                &doc,
+                Some("providers.crn"),
+                root.path()
+            ))
             .is_none(),
         "a provider value downstream of failed expansion cannot be finalized independently"
     );
@@ -12418,7 +12441,7 @@ exports {
     let mut engine = test_engine();
     engine
         .provider_context
-        .set_decryptor_for_test(Box::new(|_, _| Ok("decrypted-marker".to_string())));
+        .set_decryptor_for_test(Arc::new(|_, _| Ok("decrypted-marker".to_string())));
     let diagnostics = analyze_with_buffer(&engine, temp.path(), "main.crn", source);
 
     for name in [
@@ -13511,7 +13534,9 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
         std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
     );
     let merged = engine
-        .parse_merged_with_buffer(&call_doc, Some("call.crn"), root.path())
+        .with_run_for_test(|run| {
+            run.parse_merged_with_buffer(&call_doc, Some("call.crn"), root.path())
+        })
         .expect("root directory parses before module expansion");
     let errors = match &merged.module_resolution {
         crate::diagnostics::checks::MergedModuleResolution::ConstraintFailed {
@@ -13543,13 +13568,15 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
         module_path.clone(),
         std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
     );
-    let diagnostics = engine.module_resolver_error_diagnostics(
-        &module_doc,
-        merged.directory.parsed.parsed(),
-        error,
-        root.path(),
-        Some(&module_path),
-    );
+    let diagnostics = engine.with_run_for_test(|run| {
+        run.module_resolver_error_diagnostics(
+            &module_doc,
+            merged.directory.parsed.parsed(),
+            error,
+            root.path(),
+            Some(&module_path),
+        )
+    });
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| diagnostic.message.contains("unknown binding 'missing'"))
@@ -14450,8 +14477,9 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
         .expect("parsed directory retains main.crn source");
     *parsed_source = current_source.to_string();
 
-    let diagnostics =
-        test_engine().check_mixed_tag_key_styles("main.crn", temp.path(), &merged_result);
+    let diagnostics = test_engine().with_run_for_test(|run| {
+        run.check_mixed_tag_key_styles("main.crn", temp.path(), &merged_result)
+    });
 
     assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(diagnostics[0].range.start.line, 2);
@@ -14765,18 +14793,20 @@ fn providerless_orphan_reports_deferred_function_and_attribute_type_checks() {
     let source = "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes {\n  x: AwsAccountId = '123'\n}\n";
     let path = std::path::PathBuf::from("/orphan/main.crn");
     let doc = create_document_at(source, path.clone());
-    let context = ProviderContext::default();
-    let mut parsed = doc.parsed().unwrap().clone();
-    assert!(carina_core::validation::resolve_file_type_exprs(&mut parsed, &context).is_empty());
-    carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
-    let terminal = carina_core::validation::deferred_types::ProviderTypeCheckResult::settle(
-        context.type_checks().take(),
-        &context,
-        (),
+
+    let terminal = carina_core::validation::deferred_types::TypeCheckSession::run(
+        &ProviderContext::default(),
+        |context| {
+            let mut parsed = doc.parsed().unwrap().clone();
+            assert!(
+                carina_core::validation::resolve_file_type_exprs(&mut parsed, context).is_empty()
+            );
+            carina_core::parser::resolve_resource_refs_in_session(&mut parsed, context).unwrap();
+        },
     );
-    let expected = terminal
-        .into_parts()
-        .1
+    let mut provider_diagnostics = Vec::new();
+    terminal.publish(&mut provider_diagnostics);
+    let expected = provider_diagnostics
         .into_iter()
         .map(|diagnostic| match diagnostic {
             carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(
@@ -14979,6 +15009,79 @@ fn settlement_reviewer_fixtures_a_b_c_d_have_cli_parity() {
 }
 
 #[test]
+fn failed_directory_scan_rechecks_a_document_parsed_with_a_loaded_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "provider broken {}\nfn f(x: BareUnknown) { x }\n";
+    std::fs::write(&path, source).unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let =\n").unwrap();
+    let engine = custom_engine(SchemaRegistry::new()).with_provider_errors(HashMap::from([(
+        "broken".into(),
+        "Provider 'broken' failed to load".into(),
+    )]));
+    let doc = Document::new_with_path(
+        source.into(),
+        path.clone(),
+        Arc::new((*engine.provider_context).clone()),
+    );
+    let diagnostics = engine.analyze(&doc, Some(&path));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "providers_not_loaded".into(),
+                    ))
+                    && diagnostic.message.contains("BareUnknown")
+            })
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown custom type")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn failed_provider_with_a_syntax_error_sibling_keeps_non_authoritative_diagnostics() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "provider broken {}\nfn f(x: broken.Widget) { x }\n";
+    std::fs::write(&path, source).unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let =\n").unwrap();
+    let engine = custom_engine(SchemaRegistry::new()).with_provider_errors(HashMap::from([(
+        "broken".into(),
+        "Provider 'broken' failed to load".into(),
+    )]));
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "providers_not_loaded".into(),
+                    ))
+                    && diagnostic.message.contains("broken.Widget")
+            })
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown custom type")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
 fn settlement_partial_catalog_does_not_warn_for_a_loaded_owner() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
     let mut schemas = SchemaRegistry::new();
@@ -14989,7 +15092,11 @@ fn settlement_partial_catalog_does_not_warn_for_a_loaded_owner() {
                 AttributeSchema::optional(
                     "id",
                     AttributeType::refined_string(
-                        Some(TypeIdentity::bare("ReadyId")),
+                        Some(TypeIdentity::new(
+                            Some("ready"),
+                            Vec::<String>::new(),
+                            "ReadyId",
+                        )),
                         None,
                         None,
                         None,
@@ -15006,8 +15113,7 @@ fn settlement_partial_catalog_does_not_warn_for_a_loaded_owner() {
     )]));
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("main.crn");
-    let source =
-        "provider broken { source = 'file:///missing.wasm' }\nattributes { x: ReadyId = 'ok' }\n";
+    let source = "provider broken { source = 'file:///missing.wasm' }\nattributes { x: ready.ReadyId = 'ok' }\n";
     std::fs::write(&path, source).unwrap();
     let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
     assert!(
@@ -15017,4 +15123,113 @@ fn settlement_partial_catalog_does_not_warn_for_a_loaded_owner() {
                 && !diagnostic.message.contains("unknown custom type")),
         "{diagnostics:#?}"
     );
+}
+
+#[test]
+fn settlement_directory_failure_does_not_weaken_a_loaded_sibling_directory() {
+    let workspace = tempfile::tempdir().unwrap();
+    let a = workspace.path().join("a");
+    let b = workspace.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let source = "provider mock {}\nfn f(x: BareUnknown) { x }\n";
+    std::fs::write(a.join("main.crn"), source).unwrap();
+    std::fs::write(b.join("main.crn"), "provider broken {}\n").unwrap();
+    let engine = custom_engine(SchemaRegistry::new()).with_provider_errors(HashMap::from([(
+        "broken".into(),
+        "uninitialized provider in b".into(),
+    )]));
+    let path = a.join("main.crn");
+    let doc = create_document_at(source, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(
+                |diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                    && diagnostic
+                        .message
+                        .contains("unknown custom type 'BareUnknown'")
+            )
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("was deferred")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn settlement_partial_bare_match_defers_even_with_a_loaded_candidate() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let directory = tempfile::tempdir().unwrap();
+    let source = "provider ready {}\nprovider broken {}\nfn f(x: SharedId) { x }\n";
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "ready",
+        ResourceSchema::new("test.Value")
+            .attribute(
+                AttributeSchema::optional(
+                    "id",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::bare("SharedId")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas).with_provider_errors(HashMap::from([(
+        "broken".into(),
+        "broken provider failed".into(),
+    )]));
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(
+                |diagnostic| diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+                    && diagnostic
+                        .message
+                        .contains("type check for SharedId was deferred")
+            )
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown custom type")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn settlement_loaded_error_from_another_file_stays_out_of_the_current_document() {
+    use carina_core::validation::deferred_types::{ProviderTypeCheckSite, TypeCheckSession};
+    let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
+
+    let terminal = TypeCheckSession::run(&catalog, |session| {
+        let expected =
+            carina_core::parser::parse_type_expr_str("Missing", &ProviderContext::default())
+                .unwrap();
+        session.record(
+            &expected,
+            ProviderTypeCheckSite::at_line(Path::new("/project/other.crn"), 9, 3, "foreign check"),
+        );
+        Vec::new()
+    });
+    let doc = create_document_at("", "/project/current.crn".into());
+    assert!(DiagnosticEngine::publish_type_diagnostics(terminal, &doc).is_empty());
 }

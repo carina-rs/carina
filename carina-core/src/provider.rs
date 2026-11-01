@@ -9540,34 +9540,46 @@ mod tests {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &schemas,
-        );
-        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-            resource, &context,
-        ))
-        .expect("test resource should pass provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+                    resource, &context,
+                ))
+                .expect("test resource should pass provider preparation")
+            },
+        )
     }
 
     fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &schemas,
-        );
-        crate::executor::prepare_provider_ready_data_source(resource, &context)
-            .expect("test data source should pass provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                crate::executor::prepare_provider_ready_data_source(resource, &context)
+                    .expect("test data source should pass provider preparation")
+            },
+        )
     }
 
     // Mock Provider for testing
@@ -10848,18 +10860,24 @@ mod tests {
         registry.insert("", schema.clone());
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &registry,
-        );
-        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-            resource, &context,
-        ))
-        .expect("ignore_changes path must resolve during provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &registry,
+                    type_checks,
+                );
+                futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+                    resource, &context,
+                ))
+                .expect("ignore_changes path must resolve during provider preparation")
+            },
+        )
     }
 
     #[test]

@@ -1087,6 +1087,7 @@ fn schema_admission_rejects_identity_below_provider_populated_ancestor() {
 #[test]
 fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
     let registry = builtin_validator_registry();
+    assert_eq!(registry.len(), builtin_type_registry().len());
     assert_eq!(registry.len(), 15);
 
     let positive_int =

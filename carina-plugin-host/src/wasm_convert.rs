@@ -4737,6 +4737,11 @@ mod tests {
                 .validate()
                 .expect("test schema must be valid"),
         );
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            std::sync::Arc::new(Vec::new()),
+            schemas.clone(),
+        );
+        carina_core::validation::deferred_types::with_session_for_test_async(provider_types.provider_context(), async |type_checks| {
         let preparation = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
             &module_gate,
@@ -4744,6 +4749,7 @@ mod tests {
             &carina_core::provider::NoopNormalizer,
             &[],
             &schemas,
+            type_checks,
         );
         let request = carina_core::executor::prepare_update_request(
             resource,
@@ -4751,8 +4757,9 @@ mod tests {
             &["a".to_string(), "b".to_string(), "c".to_string()],
             &preparation,
         )
-        .await
-        .expect("checked request should be prepared");
+        .await;
+        let request =
+            request.expect("checked request should be prepared");
         let wit_request = core_to_wit_update_request(&request).unwrap();
         assert!(wit_request.current.attributes.iter().any(|(key, value)| {
             key == "persisted_token"
@@ -4783,6 +4790,7 @@ mod tests {
             back[3].sent_value(),
             Some(&CV::Concrete(ConcreteValue::String("unchanged".into())))
         );
+    }).await
     }
 
     #[test]

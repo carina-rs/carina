@@ -1,13 +1,13 @@
 //! Tests for #3175: typed resolver entry points.
 //!
-//! - `resolve_managed_refs_with_state_and_remote(&mut [Resource], ...)`
+//! - `crate::validation::deferred_types::with_session_for_test(&crate::parser::LoadedProviderContext::empty_for_test(), |session| resolve_managed_refs_with_state_and_remote(&mut [Resource], ..., session))`
 //!   — pre-apply path, accepts only `Resource` slices.
-//! - `resolve_live_composition_refs_post_apply(&mut [LiveComposition], &ResolvedBindings)`
+//! - `crate::validation::deferred_types::with_session_for_test(&crate::parser::LoadedProviderContext::empty_for_test(), |session| resolve_live_composition_refs_post_apply(&mut [LiveComposition], &ResolvedBindings, session))`
 //!   — post-apply path, takes a pre-built bindings view.
 //!
 //! Both are new entry points layered over the existing
 //! `resolve_refs_inner` logic; the legacy
-//! `resolve_refs_with_state_and_remote(&mut [Resource], …)` shim is
+//! `crate::validation::deferred_types::with_session_for_test(&crate::parser::LoadedProviderContext::empty_for_test(), |session| resolve_refs_with_state_and_remote(&mut [Resource], …, session))` shim is
 //! unchanged.
 
 use std::collections::{BTreeSet, HashMap};
@@ -102,7 +102,10 @@ fn resolve_managed_refs_resolves_resource_ref_against_managed_sibling() {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
-        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_managed_refs_with_state_and_remote(&mut managed, &bindings, session),
+        )
     }
     .expect("resolve managed");
 
@@ -126,7 +129,10 @@ fn resolve_managed_refs_records_dependency_bindings() {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
-        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_managed_refs_with_state_and_remote(&mut managed, &bindings, session),
+        )
     }
     .expect("resolve managed");
 
@@ -168,7 +174,10 @@ fn resolve_managed_refs_falls_through_state_attributes() {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
-        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_managed_refs_with_state_and_remote(&mut managed, &bindings, session),
+        )
     }
     .expect("resolve managed");
 
@@ -192,8 +201,11 @@ fn resolve_live_composition_refs_post_apply_uses_provided_bindings() {
     });
 
     let mut compositions = vec![make_virtual("v", &[("forwarded", ref_to("a", "value"))])];
-    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)
-        .expect("resolve compositions");
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| resolve_live_composition_refs_post_apply(&mut compositions, &bindings, session),
+    )
+    .expect("resolve compositions");
 
     let forwarded = compositions[0]
         .signature
@@ -222,8 +234,17 @@ fn resolve_live_composition_refs_post_apply_picks_post_apply_value_not_pre_apply
         });
 
     let mut compositions = vec![make_virtual("rd", &[("role_arn", ref_to("role", "arn"))])];
-    resolve_live_composition_refs_post_apply(&mut compositions, &post_apply_bindings)
-        .expect("resolve compositions");
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_live_composition_refs_post_apply(
+                &mut compositions,
+                &post_apply_bindings,
+                session,
+            )
+        },
+    )
+    .expect("resolve compositions");
 
     let role_arn = compositions[0]
         .signature
@@ -251,8 +272,11 @@ fn resolve_live_composition_refs_post_apply_leaves_non_ref_values_intact() {
     });
     let mut compositions = vec![make_virtual("v", &[("literal", s("kept"))])];
 
-    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)
-        .expect("resolve compositions");
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| resolve_live_composition_refs_post_apply(&mut compositions, &bindings, session),
+    )
+    .expect("resolve compositions");
 
     let literal = compositions[0]
         .signature
@@ -274,7 +298,10 @@ fn resolve_managed_refs_with_empty_slice_is_ok() {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
-        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_managed_refs_with_state_and_remote(&mut managed, &bindings, session),
+        )
     }
     .expect("empty managed slice resolves cleanly");
     assert!(managed.is_empty());
@@ -291,8 +318,11 @@ fn resolve_live_composition_refs_post_apply_with_empty_slice_is_ok() {
         wait_aliases: &[],
     });
     let mut compositions: Vec<LiveComposition> = Vec::new();
-    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)
-        .expect("empty composition slice resolves cleanly");
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| resolve_live_composition_refs_post_apply(&mut compositions, &bindings, session),
+    )
+    .expect("empty composition slice resolves cleanly");
     assert!(compositions.is_empty());
 }
 
@@ -314,7 +344,10 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
-        resolve_managed_refs_with_state_and_remote(&mut managed, &bindings)
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_managed_refs_with_state_and_remote(&mut managed, &bindings, session),
+        )
     }
     .expect("resolve managed");
 
@@ -328,8 +361,13 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
-        crate::resolver::resolve_refs_with_state_and_remote(&mut legacy, &bindings)
-            .expect("resolve legacy");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                crate::resolver::resolve_refs_with_state_and_remote(&mut legacy, &bindings, session)
+            },
+        )
+        .expect("resolve legacy");
     }
 
     for (m, l) in managed.iter().zip(legacy.iter()) {

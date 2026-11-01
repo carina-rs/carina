@@ -51,6 +51,26 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, ValidatedConfigSchema,
     ValidatedProviderSchemaWitness,
 };
+use carina_core::validation::deferred_types::{
+    ProviderTypeCheckDiagnostic, ProviderTypeCheckSink, TypeCheckSession,
+};
+
+fn with_type_check_session<T>(
+    catalog: &ProviderContext,
+    operation: impl FnOnce(&dyn carina_core::validation::deferred_types::ProviderTypeCheckContext) -> T,
+) -> T {
+    TypeCheckSession::run(catalog, |session| operation(session)).publish(&mut TestTypeCheckSink)
+}
+
+struct TestTypeCheckSink;
+impl ProviderTypeCheckSink for TestTypeCheckSink {
+    fn record(&mut self, diagnostic: ProviderTypeCheckDiagnostic) {
+        match diagnostic {
+            ProviderTypeCheckDiagnostic::Deferred(warning) => eprintln!("{}", warning.message),
+            ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => panic!("{}", error.message),
+        }
+    }
+}
 
 fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
     carina_core::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
@@ -285,7 +305,9 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed for the caller fixture");
 
-    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
+    let parsed = with_type_check_session(&ProviderContext::default(), |session| {
+        resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
+    });
     let parsed = parsed
         .into_expanded()
         .expect("expanded module fixture contains no parser placeholders");
@@ -360,6 +382,11 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let mut resources_for_plan = sorted_resources.clone();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(Vec::new()),
+        registry.clone(),
+    );
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
@@ -380,11 +407,12 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
                 wait_aliases: &wait_aliases,
             },
         );
-        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+        with_type_check_session(provider_types.provider_context(), |session| {
+            resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings, session)
+        })
     }
     .expect("resolve_refs should succeed");
 
-    let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
     let resolved_resources_for_plan =
         ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
@@ -430,6 +458,9 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         failures: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
+        provider_context: carina_core::parser::ProviderContext::clone(
+            provider_types.provider_context(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -487,7 +518,9 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let parsed = parse_directory(&root, &ProviderContext::default())
         .expect("parse_directory should succeed for the nested root fixture");
 
-    let parsed = resolve_modules(parsed, &root).expect("nested module resolution should succeed");
+    let parsed = with_type_check_session(&ProviderContext::default(), |session| {
+        resolve_modules(parsed, &root, session).expect("nested module resolution should succeed")
+    });
     let parsed = parsed
         .into_expanded()
         .expect("expanded nested module fixture contains no parser placeholders");
@@ -542,6 +575,11 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let mut resources_for_plan = sorted_resources.clone();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(Vec::new()),
+        registry.clone(),
+    );
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
@@ -562,11 +600,12 @@ async fn nested_module_wait_binding_survives_two_expansions() {
                 wait_aliases: &wait_aliases,
             },
         );
-        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+        with_type_check_session(provider_types.provider_context(), |session| {
+            resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings, session)
+        })
     }
     .expect("resolve_refs should succeed");
 
-    let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
     let resolved_resources_for_plan =
         ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
@@ -611,6 +650,9 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         failures: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
+        provider_context: carina_core::parser::ProviderContext::clone(
+            provider_types.provider_context(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -670,7 +712,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed");
-    let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
+    let parsed = with_type_check_session(&ProviderContext::default(), |session| {
+        resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
+    });
     let parsed = parsed
         .into_expanded()
         .expect("expanded module fixture contains no parser placeholders");
@@ -704,6 +748,11 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         .collect();
 
     let mut resources_for_plan = sorted_resources.clone();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(Vec::new()),
+        registry.clone(),
+    );
     {
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
             carina_core::binding_index::LivePreApplyInputs {
@@ -719,7 +768,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
                 wait_aliases: &wait_aliases,
             },
         );
-        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+        with_type_check_session(provider_types.provider_context(), |session| {
+            resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings, session)
+        })
     }
     .expect("resolve_refs should succeed");
 
@@ -753,7 +804,6 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     );
 
     // ---- The dependency edge is intact: Effect::Wait still emitted.
-    let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
     let resolved_resources_for_plan =
         ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();

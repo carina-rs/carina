@@ -95,6 +95,8 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     pub(super) evaluating_functions: Vec<String>,
     /// Parser configuration (decryptor, custom validators)
     pub(super) config: &'cfg ProviderContext,
+    pub(super) session:
+        Option<&'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     /// Binding names from structurally-required expressions (if/for/read)
     pub(super) structural_bindings: HashSet<String>,
     /// Upstream state bindings (binding_name -> UpstreamState)
@@ -175,11 +177,13 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
     }
 
     pub(super) fn isolated(&self) -> Self {
-        Self::with_source(
+        let mut context = Self::with_source(
             self.config,
             self.binding_scope_source_file.clone(),
             self.diagnostic_source.clone(),
-        )
+        );
+        context.session = self.session;
+        context
     }
 
     pub(super) fn set_preprocessed_file(&mut self, file: &super::PreprocessedFile) {
@@ -220,12 +224,31 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
 }
 
 impl<'cfg> ParseContext<'cfg, EvaluationOnly> {
+    pub(super) fn for_evaluation_in_session(
+        session: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self {
+        let mut context = Self::for_evaluation(session.catalog());
+        context.session = Some(session);
+        context
+    }
+
     pub(super) fn for_evaluation(config: &'cfg ProviderContext) -> Self {
         Self::with_source(config, std::path::PathBuf::new(), EvaluationOnly)
     }
 }
 
 impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
+    pub(super) fn typecheck_provider_context(
+        &self,
+    ) -> crate::validation::typecheck::TypecheckProviderContext<'cfg> {
+        match self.session {
+            Some(session) => {
+                crate::validation::typecheck::TypecheckProviderContext::for_session(session)
+            }
+            None => crate::validation::typecheck::TypecheckProviderContext::for_parser(self.config),
+        }
+    }
+
     fn with_source(
         config: &'cfg ProviderContext,
         source_file: std::path::PathBuf,
@@ -240,6 +263,7 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
             seeded_user_functions: HashSet::new(),
             evaluating_functions: Vec::new(),
             config,
+            session: None,
             structural_bindings: HashSet::new(),
             upstream_states: HashMap::new(),
             wait_bindings: HashMap::new(),

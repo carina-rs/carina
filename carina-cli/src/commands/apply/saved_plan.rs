@@ -521,6 +521,10 @@ impl TestSavedPlanSecretCandidates {
 }
 
 impl SavedPlanSecretCandidates {
+    pub(super) fn provider_context(&self) -> &carina_core::parser::LoadedProviderContext {
+        self.validated.context().provider_context()
+    }
+
     pub(super) fn from_expansion(
         validated: ValidatedConfig<
             ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
@@ -1309,10 +1313,15 @@ mod tests {
     ) -> carina_core::parser::SavedProviderConfigs {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
-        let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let resolved = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .expect("test provider configs must resolve");
         carina_core::parser::SavedProviderConfigs::from(&resolved)

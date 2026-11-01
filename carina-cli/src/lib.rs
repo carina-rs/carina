@@ -412,24 +412,31 @@ fn dispatch_fixture_create(
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
-    );
-    let request = block_on_ready(carina_core::executor::prepare_create_request(
-        resource,
-        &preparation,
-    ))
-    .expect("fixture resource passes provider preparation");
-    let provider = FixtureCreateProvider {
-        result: std::sync::Mutex::new(Some(result)),
-    };
-    let (create, _cancellation) = carina_core::executor::dispatch_create(&provider, id, request);
-    block_on_ready(create).expect_err("fixture create returns a classified failure")
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |type_checks| {
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
+                &bindings,
+                &module_gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = block_on_ready(carina_core::executor::prepare_create_request(
+                resource,
+                &preparation,
+            ))
+            .expect("fixture resource passes provider preparation");
+            let provider = FixtureCreateProvider {
+                result: std::sync::Mutex::new(Some(result)),
+            };
+            let (create, _cancellation) =
+                carina_core::executor::dispatch_create(&provider, id, request);
+            block_on_ready(create).expect_err("fixture create returns a classified failure")
+        },
+    )
 }
 
 #[cfg(test)]
@@ -474,43 +481,49 @@ pub(crate) fn fixture_repend_in_flight_create(
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
-    );
-    let request = block_on_ready(carina_core::executor::prepare_create_request(
-        carina_core::resource::Resource::from_id(id),
-        &preparation,
-    ))
-    .expect("resume fixture resource passes provider preparation");
-    let request = carina_core::provider::ResumeCreateRequest::for_test(pending, request)
-        .expect("resume fixture route agrees with its checked request");
-    let (resume, _request) = request.into_parts();
-    let token = carina_core::provider::PendingToken::new(token);
-    let repended = match resume {
-        carina_core::provider::Resume::Unissued(attempt) => attempt.repend(token),
-        carina_core::provider::Resume::Issued(resumed) => resumed.repend(token),
-    };
-    let failure = repended.preserve(carina_core::provider::ProviderError::timeout(
-        "fixture create remains in progress",
-    ));
-    match failure.into_kind() {
-        carina_core::provider::ResumeFailureKind::InFlight {
-            pending,
-            error: _error,
-        } => pending,
-        carina_core::provider::ResumeFailureKind::Created {
-            created: _created,
-            error,
-        } => panic!("re-pend fixture was classified created: {error}"),
-        carina_core::provider::ResumeFailureKind::Ended(error) => {
-            panic!("re-pend fixture was classified ended: {error}")
-        }
-    }
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |type_checks| {
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
+                &bindings,
+                &module_gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = block_on_ready(carina_core::executor::prepare_create_request(
+                carina_core::resource::Resource::from_id(id),
+                &preparation,
+            ))
+            .expect("resume fixture resource passes provider preparation");
+            let request = carina_core::provider::ResumeCreateRequest::for_test(pending, request)
+                .expect("resume fixture route agrees with its checked request");
+            let (resume, _request) = request.into_parts();
+            let token = carina_core::provider::PendingToken::new(token);
+            let repended = match resume {
+                carina_core::provider::Resume::Unissued(attempt) => attempt.repend(token),
+                carina_core::provider::Resume::Issued(resumed) => resumed.repend(token),
+            };
+            let failure = repended.preserve(carina_core::provider::ProviderError::timeout(
+                "fixture create remains in progress",
+            ));
+            match failure.into_kind() {
+                carina_core::provider::ResumeFailureKind::InFlight {
+                    pending,
+                    error: _error,
+                } => pending,
+                carina_core::provider::ResumeFailureKind::Created {
+                    created: _created,
+                    error,
+                } => panic!("re-pend fixture was classified created: {error}"),
+                carina_core::provider::ResumeFailureKind::Ended(error) => {
+                    panic!("re-pend fixture was classified ended: {error}")
+                }
+            }
+        },
+    )
 }
 
 #[cfg(test)]

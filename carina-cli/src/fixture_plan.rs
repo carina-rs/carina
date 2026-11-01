@@ -450,10 +450,15 @@ where
             .unwrap_or_default();
         remote_bindings.insert(us.binding.to_string(), bindings);
     }
-    let resolved_provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-        parsed,
-        &remote_bindings,
+    let resolved_provider_configs = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                parsed,
+                &remote_bindings,
+                session,
+            )
+        },
     )
     .expect("fixture provider configs must resolve");
     let raw_provider_configs = resolved_provider_configs.as_provider_configs();
@@ -668,12 +673,18 @@ where
                 moved_origins,
                 deferred_for_expressions: residual_deferred_for,
                 export_params,
-                resolved_export_params: carina_core::validation::check_export_values_pre_apply(
-                    &[],
-                    &carina_core::binding_index::ResolvedBindings::default(),
-                    validated_expansion.context().provider_context(),
-                )
-                .expect("empty exports are checked"),
+                resolved_export_params:
+                    carina_core::validation::deferred_types::with_session_for_test(
+                        validated_expansion.context().provider_context(),
+                        |session| {
+                            carina_core::validation::check_export_values_pre_apply(
+                                &[],
+                                &carina_core::binding_index::ResolvedBindings::default(),
+                                session,
+                            )
+                        },
+                    )
+                    .expect("empty exports are checked"),
                 prev_explicit,
                 expansion_trace,
             }

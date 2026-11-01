@@ -179,10 +179,12 @@ enum PreparedUserFunctionCall<'cfg, Source = super::context::AuthoredDiagnosticS
     Deferred(Vec<FunctionArgument>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum FunctionArgumentTypeCheck {
     Complete,
-    DeferredUntilSchemasAreLoaded,
+    AwaitingRuntimeValue,
+    RecordedProviderDeferral,
+    AwaitingProviderSession,
     /// The structural argument is already an explicit handle. Its annotation
     /// still needs provider classification, but a pure body can run while the
     /// pending check retains that handle for loaded validation.
@@ -223,8 +225,14 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
     // Build substitution map: param_name -> value, and type-check annotated params
     let mut substitutions: HashMap<String, FunctionArgument> = HashMap::new();
     let mut effective_args = Vec::with_capacity(func.params.len());
-    let mut has_deferred_type_check = false;
-    let mut defer_value_call = false;
+    let requires_session = ctx.session.is_none()
+        && !ctx.config.custom_types_loaded()
+        && func
+            .return_type
+            .as_ref()
+            .is_some_and(annotation_requires_provider_session);
+    let mut has_deferred_type_check = requires_session;
+    let mut defer_value_call = requires_session;
     for (i, param) in func.params.iter().enumerate() {
         let argument = if i < args.len() {
             args[i].clone()
@@ -252,7 +260,12 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
                 None,
             )? {
                 FunctionArgumentTypeCheck::Complete => {}
-                FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded => {
+                FunctionArgumentTypeCheck::AwaitingRuntimeValue => {
+                    has_deferred_type_check = true;
+                    defer_value_call = true;
+                }
+                FunctionArgumentTypeCheck::RecordedProviderDeferral
+                | FunctionArgumentTypeCheck::AwaitingProviderSession => {
                     has_deferred_type_check = true;
                     defer_value_call = true;
                 }
@@ -713,7 +726,27 @@ fn check_fn_arg_type<Source: Clone>(
     site: Option<crate::validation::deferred_types::ProviderTypeCheckSite>,
 ) -> Result<FunctionArgumentTypeCheck, ParseError> {
     if argument.pending_parameter().is_some() {
-        return Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded);
+        return Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue);
+    }
+    // An authored resource handle already proves its resource-type identity.
+    // A matching dotted parameter can be checked without querying provider
+    // scalar schemas, preserving pure handle calls in static expressions.
+    if ctx.session.is_none()
+        && !ctx.config.custom_types_loaded()
+        && let (TypeExpr::DottedUnresolved(path), Some(handle)) = (type_expr, argument.handle())
+        && crate::validation::check_handle_sink(
+            handle,
+            &crate::validation::ResolvedParameterType::Handle(path.clone()),
+        )
+        .is_ok()
+    {
+        return Ok(FunctionArgumentTypeCheck::Complete);
+    }
+    if ctx.session.is_none()
+        && !ctx.config.custom_types_loaded()
+        && annotation_requires_provider_session(type_expr)
+    {
+        return Ok(FunctionArgumentTypeCheck::AwaitingProviderSession);
     }
     // Function annotations are parsed before provider schemas are necessarily
     // available, so dotted types intentionally enter the AST unresolved. When
@@ -724,13 +757,19 @@ fn check_fn_arg_type<Source: Clone>(
         match crate::validation::resolve_parameter_type_for_check(type_expr, ctx.config) {
             Ok(Some(resolved)) => resolved,
             Ok(None) => {
-                if let Some(site) = site {
-                    ctx.config.type_checks().record(type_expr, site);
+                if let Some(session) = ctx.session {
+                    match site {
+                        Some(site) => session.record(type_expr, site),
+                        None => session.record_type(
+                            type_expr,
+                            &format!("function '{fn_name}' parameter '{param_name}'"),
+                        ),
+                    }
                 }
                 return Ok(if argument.handle().is_some() {
                     FunctionArgumentTypeCheck::DeferredHandleAnnotation
                 } else {
-                    FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded
+                    FunctionArgumentTypeCheck::RecordedProviderDeferral
                 });
             }
             Err(error) => return Err(ParseError::UserFunctionError(error.to_string())),
@@ -754,20 +793,72 @@ fn check_fn_arg_type<Source: Clone>(
     let value = argument.value().expect("non-handle function argument");
     let type_expr = resolved_type.as_type_expr();
 
-    let provider_context =
-        crate::validation::typecheck::TypecheckProviderContext::for_parser(ctx.config);
+    let provider_context = ctx.typecheck_provider_context();
     let check = crate::validation::typecheck::check_type_expr_value_with_context(
         &type_expr,
         value,
         provider_context,
         crate::validation::typecheck::TypecheckInference::Unavailable,
     );
-    finish_function_type_check(check, provider_context, site)
-        .map_err(|mismatch| function_argument_type_error(fn_name, param_name, mismatch))
+    let result = finish_function_type_check(check, provider_context, site)
+        .map_err(|mismatch| function_argument_type_error(fn_name, param_name, mismatch))?;
+    if result == FunctionArgumentTypeCheck::Complete
+        && !value.is_fully_resolved()
+        && requires_concrete_annotation_check(&type_expr)
+    {
+        Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue)
+    } else {
+        Ok(result)
+    }
+}
+
+/// Shape-only annotations are checked against the declared source by the
+/// binding pass. Refinements/literals also need the eventual concrete value;
+/// keep their annotated call instead of erasing that remaining obligation.
+fn requires_concrete_annotation_check(expected: &TypeExpr) -> bool {
+    match expected {
+        TypeExpr::Simple(_)
+        | TypeExpr::SchemaType { .. }
+        | TypeExpr::UnloadedSchemaType(_)
+        | TypeExpr::DottedUnresolved(_)
+        | TypeExpr::StringLiteral(_) => true,
+        TypeExpr::List(inner) | TypeExpr::Map(inner) => requires_concrete_annotation_check(inner),
+        TypeExpr::Union(members) => members.iter().any(requires_concrete_annotation_check),
+        TypeExpr::Struct { fields } => fields
+            .iter()
+            .any(|(_, field)| requires_concrete_annotation_check(field)),
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Ref(_) => false,
+    }
+}
+
+fn annotation_requires_provider_session(expected: &TypeExpr) -> bool {
+    match expected {
+        TypeExpr::UnloadedSchemaType(_)
+        | TypeExpr::SchemaType { .. }
+        | TypeExpr::DottedUnresolved(_) => true,
+        TypeExpr::List(inner) | TypeExpr::Map(inner) => annotation_requires_provider_session(inner),
+        TypeExpr::Union(members) => members.iter().any(annotation_requires_provider_session),
+        TypeExpr::Struct { fields } => fields
+            .iter()
+            .any(|(_, field)| annotation_requires_provider_session(field)),
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Simple(_)
+        | TypeExpr::Ref(_)
+        | TypeExpr::StringLiteral(_) => false,
+    }
 }
 
 fn finish_function_type_check(
-    check: crate::validation::typecheck::TypeExprValueCheck,
+    check: crate::validation::typecheck::TypeExprValueCheck<'_>,
     provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
     site: Option<crate::validation::deferred_types::ProviderTypeCheckSite>,
 ) -> Result<FunctionArgumentTypeCheck, crate::validation::typecheck::TypeExprValueError> {
@@ -782,14 +873,19 @@ fn finish_function_type_check(
                 .require_provider_schemas()
                 .map(|()| FunctionArgumentTypeCheck::Complete)
         }
-        deferred @ TypeExprValueCheck::Deferred(_) => {
-            let recorder = provider_context.as_provider_context().type_checks();
-            match site {
-                Some(site) => deferred.record_at(recorder, site)?,
-                None => deferred.record_deferred(recorder)?,
+        TypeExprValueCheck::Deferred(deferred) => match provider_context.session() {
+            Some(session) => {
+                let check = TypeExprValueCheck::Deferred(deferred);
+                match site {
+                    Some(site) => check.record_at(session, site)?,
+                    None => check.record_deferred(session)?,
+                }
+                Ok(FunctionArgumentTypeCheck::RecordedProviderDeferral)
             }
-            Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded)
-        }
+            None => TypeExprValueCheck::Deferred(deferred)
+                .require_provider_schemas()
+                .map(|()| FunctionArgumentTypeCheck::Complete),
+        },
     }
 }
 
@@ -877,11 +973,12 @@ fn function_argument_type_error(
     ))
 }
 
-pub(crate) fn validate_pending_function_type_check<Source: Clone>(
+pub(crate) fn validate_pending_function_type_check(
     check: &PendingFunctionTypeCheck,
     functions: &HashMap<String, UserFunction>,
-    ctx: &ParseContext<'_, Source>,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), ParseError> {
+    let ctx = ParseContext::for_evaluation_in_session(session);
     let Some(function) = functions.get(&check.function_name) else {
         return Ok(());
     };
@@ -897,7 +994,7 @@ pub(crate) fn validate_pending_function_type_check<Source: Clone>(
             &parameter.name,
             type_expr,
             argument,
-            ctx,
+            &ctx,
             check.source_line,
             Some(
                 crate::validation::deferred_types::ProviderTypeCheckSite::at_line(
@@ -916,8 +1013,14 @@ pub(crate) fn validate_pending_function_type_check<Source: Clone>(
         );
         match result {
             Ok(FunctionArgumentTypeCheck::Complete)
-            | Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded)
+            | Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue)
+            | Ok(FunctionArgumentTypeCheck::RecordedProviderDeferral)
             | Ok(FunctionArgumentTypeCheck::DeferredHandleAnnotation) => {}
+            Ok(FunctionArgumentTypeCheck::AwaitingProviderSession) => {
+                return Err(ParseError::UserFunctionError(
+                    "provider annotation check requires its session".into(),
+                ));
+            }
             Err(error) => {
                 let located = match error {
                     ParseError::InvalidExpression { message, .. }
@@ -950,8 +1053,16 @@ fn check_fn_return_type(
         config,
         crate::validation::typecheck::TypecheckInference::Unavailable,
     );
-    finish_function_type_check(check, config, None)
-        .map_err(|mismatch| function_return_type_error(fn_name, mismatch))
+    let result = finish_function_type_check(check, config, None)
+        .map_err(|mismatch| function_return_type_error(fn_name, mismatch))?;
+    if result == FunctionArgumentTypeCheck::Complete
+        && !value.is_fully_resolved()
+        && requires_concrete_annotation_check(type_expr)
+    {
+        Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue)
+    } else {
+        Ok(result)
+    }
 }
 
 fn function_return_type_error(
@@ -1000,32 +1111,53 @@ pub(crate) fn evaluate_user_function<Source: Clone>(
         .map_err(|error| locate_function_body_error(func, error))?
         .canonicalize();
     // Check return type if annotated
-    if let Some(ref return_type) = func.return_type
-        && matches!(
-            check_fn_return_type(
-                &func.name,
-                return_type,
-                &result,
-                crate::validation::typecheck::TypecheckProviderContext::for_parser(
-                    child_ctx.config
-                ),
-            )
-            .map_err(|error| locate_function_body_error(func, error))?,
-            FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded
+    if let Some(ref return_type) = func.return_type {
+        let return_check = check_fn_return_type(
+            &func.name,
+            return_type,
+            &result,
+            child_ctx.typecheck_provider_context(),
         )
-    {
-        return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: ctx
-                .resolved_user_function(&func.name)
-                .unwrap_or_else(|| std::sync::Arc::new(func.clone())),
-            functions: ctx.shared_user_function_scope(),
-            args: func
-                .params
-                .iter()
-                .map(|parameter| substitutions[&parameter.name].clone())
-                .collect(),
-            source_line: call_line.into(),
-        }));
+        .map_err(|error| locate_function_body_error(func, error))?;
+        let retain_check = match return_check {
+            FunctionArgumentTypeCheck::RecordedProviderDeferral
+            | FunctionArgumentTypeCheck::AwaitingRuntimeValue => true,
+            FunctionArgumentTypeCheck::Complete
+            | FunctionArgumentTypeCheck::DeferredHandleAnnotation => false,
+            FunctionArgumentTypeCheck::AwaitingProviderSession => {
+                return Err(ParseError::UserFunctionError(
+                    "provider return annotation check requires its session".into(),
+                ));
+            }
+        };
+        if retain_check {
+            ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
+                function_name: func.name.clone(),
+                arguments: func
+                    .params
+                    .iter()
+                    .filter_map(|parameter| substitutions.get(&parameter.name).cloned())
+                    .collect(),
+                source_line: func.body.source_line,
+                source_column: None,
+                source_file: func
+                    .annotation_source_file
+                    .clone()
+                    .or_else(|| func.body.source_file.clone()),
+            });
+            return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function: ctx
+                    .resolved_user_function(&func.name)
+                    .unwrap_or_else(|| std::sync::Arc::new(func.clone())),
+                functions: ctx.shared_user_function_scope(),
+                args: func
+                    .params
+                    .iter()
+                    .map(|parameter| substitutions[&parameter.name].clone())
+                    .collect(),
+                source_line: call_line.into(),
+            }));
+        }
     }
     Ok(result)
 }
@@ -1038,9 +1170,13 @@ pub(crate) fn evaluate_resolved_user_function(
     functions: &Arc<HashMap<String, UserFunction>>,
     arguments: &[FunctionArgument],
     config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     call_line: usize,
 ) -> Result<Value, ParseError> {
-    let mut context = ParseContext::for_evaluation(config);
+    let mut context = match session {
+        Some(session) => ParseContext::for_evaluation_in_session(session),
+        None => ParseContext::for_evaluation(config),
+    };
     context.replace_shared_user_functions(Arc::clone(functions));
     if !context.user_functions.contains_key(&function.name) {
         context.insert_user_function(function.name.clone(), function.clone());
@@ -1500,6 +1636,7 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
                 &functions,
                 &evaluated_args,
                 ctx.config,
+                ctx.session,
                 source_line,
             )
         }

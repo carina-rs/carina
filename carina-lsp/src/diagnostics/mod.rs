@@ -248,6 +248,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
 }
 
 impl DiagnosticProviderContext {
+    #[cfg(test)]
     fn loaded(&self) -> Option<&carina_core::parser::LoadedProviderContext> {
         match self {
             Self::Loaded(context) => Some(context),
@@ -291,7 +292,54 @@ pub struct DiagnosticEngine {
     provider_context: DiagnosticProviderContext,
 }
 
-impl DiagnosticEngine {
+struct LspTypeCheckSink<'a> {
+    doc: &'a Document,
+    diagnostics: Vec<Diagnostic>,
+}
+impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LspTypeCheckSink<'_> {
+    fn record(
+        &mut self,
+        diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
+    ) {
+        let (warning, severity, code) = match diagnostic {
+                carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => (warning, DiagnosticSeverity::WARNING, "providers_not_loaded"),
+                carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => (error, DiagnosticSeverity::ERROR, "unsettled_provider_type_check"),
+            };
+        let other_source = warning
+            .file
+            .as_deref()
+            .filter(|file| *file != "<config>")
+            .is_some_and(|file| Path::new(file) != self.doc.source_file());
+        if other_source {
+            return;
+        }
+        let span = warning.span.expect("provider check source span");
+        let mut diagnostic = carina_diagnostic_range(
+            Range::new(
+                Position::new((span.start_line - 1) as u32, (span.start_column - 1) as u32),
+                Position::new((span.end_line - 1) as u32, (span.end_column - 1) as u32),
+            ),
+            severity,
+            warning.message,
+        );
+        diagnostic.code = Some(tower_lsp::lsp_types::NumberOrString::String(code.into()));
+        self.diagnostics.push(diagnostic);
+    }
+}
+
+pub(super) struct DiagnosticRun<'a> {
+    engine: &'a DiagnosticEngine,
+    provider_context: &'a dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+}
+
+impl std::ops::Deref for DiagnosticRun<'_> {
+    type Target = DiagnosticEngine;
+    fn deref(&self) -> &Self::Target {
+        self.engine
+    }
+}
+
+impl DiagnosticRun<'_> {
     fn resolve_diagnostic_upstream_exports<B: BindingAddress>(
         &self,
         base: &Path,
@@ -300,102 +348,12 @@ impl DiagnosticEngine {
         carina_core::upstream_exports::UpstreamExports<B>,
         Vec<carina_core::upstream_exports::UpstreamResolveError>,
     ) {
-        match &self.provider_context {
-            DiagnosticProviderContext::Loaded(provider_context) => {
-                carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
-                    base,
-                    upstream_states,
-                    provider_context,
-                    Some(&self.schemas),
-                )
-            }
-            DiagnosticProviderContext::Unloaded(provider_context) => {
-                carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
-                    base,
-                    upstream_states,
-                    provider_context,
-                    Some(&self.schemas),
-                )
-            }
-        }
-    }
-
-    /// Construct diagnostics backed by one loaded-provider snapshot.
-    pub fn new(loaded_providers: Arc<LoadedProviderSnapshot>, provider_names: Vec<String>) -> Self {
-        Self::new_with_known_providers(loaded_providers, provider_names, HashSet::new())
-    }
-
-    /// Construct diagnostics for the orphaned-file fallback with no loaded
-    /// providers. This path deliberately cannot mint provider-schema inference
-    /// evidence.
-    pub fn without_loaded_provider_schemas() -> Self {
-        let schemas = Arc::new(SchemaRegistry::new());
-        Self {
-            schemas: Arc::clone(&schemas),
-            loaded_providers: None,
-            provider_names: Vec::new(),
-            known_provider_names: HashSet::new(),
-            factories: Arc::new(Vec::new()),
-            provider_errors: HashMap::new(),
-            provider_context: DiagnosticProviderContext::Unloaded(Arc::new(
-                carina_core::parser::ProviderContext {
-                    decryptor: None,
-                    custom_types: carina_core::parser::ProviderCustomTypes::default(),
-                    resource_types:
-                        carina_core::parser::ProviderContext::resource_types_from_schema_registry(
-                            &schemas,
-                        ),
-                },
-            )),
-        }
-    }
-
-    pub(crate) fn new_with_known_providers(
-        loaded_providers: Arc<LoadedProviderSnapshot>,
-        provider_names: Vec<String>,
-        known_provider_names: HashSet<String>,
-    ) -> Self {
-        let schemas = loaded_providers.schemas().schemas_arc();
-        let factories = loaded_providers.factories_arc();
-        let provider_context =
-            DiagnosticProviderContext::Loaded(loaded_providers.provider_context().clone());
-        Self {
-            schemas,
-            loaded_providers: Some(loaded_providers),
-            provider_names,
-            known_provider_names,
-            factories,
-            provider_errors: HashMap::new(),
-            provider_context,
-        }
-    }
-
-    pub fn schema_count(&self) -> usize {
-        self.schemas.len()
-    }
-
-    pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {
-        if !errors.is_empty() {
-            // A failed owner does not erase the authority of successfully loaded owners.
-            let catalog = self
-                .loaded_providers
-                .as_ref()
-                .map(|snapshot| snapshot.provider_context().custom_types.clone())
-                .unwrap_or_else(|| {
-                    carina_core::provider::provider_custom_types_from_factories(
-                        Arc::new(Vec::new()),
-                    )
-                });
-            self.provider_context = DiagnosticProviderContext::Unloaded(Arc::new(
-                carina_core::parser::ProviderContext {
-                    custom_types: catalog.with_failed_providers(errors.keys().cloned().collect()),
-                    resource_types: self.provider_context.resource_types.clone(),
-                    ..Default::default()
-                },
-            ));
-        }
-        self.provider_errors = errors;
-        self
+        carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+            base,
+            upstream_states,
+            self.provider_context,
+            Some(&self.schemas),
+        )
     }
 
     fn validation_inputs<'a, D>(
@@ -417,35 +375,23 @@ impl DiagnosticEngine {
                 RelativeBindingName,
             >,
     {
-        let binding_index = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(
+        let binding_index = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
             binding_input,
             &self.schemas,
-            upstream_exports,
+            Some(upstream_exports),
             module_signatures,
-            &self.provider_context,
+            self.provider_context,
         );
         let inference_bindings =
             carina_core::validation::inference::bindings_from_parsed(binding_input);
-        let binding_use_report = match &self.provider_context {
-            DiagnosticProviderContext::Loaded(provider_context) => {
-                let context = carina_core::validation::ValidationTypeContext::new(
-                    binding_input,
-                    &self.schemas,
-                    provider_context,
-                    module_signatures,
-                );
-                carina_core::validation::check_bare_binding_uses(binding_input, &context)
-            }
-            DiagnosticProviderContext::Unloaded(provider_context) => {
-                let context = carina_core::validation::ValidationTypeContext::new_providerless(
-                    binding_input,
-                    &self.schemas,
-                    provider_context,
-                    module_signatures,
-                );
-                carina_core::validation::check_bare_binding_uses(binding_input, &context)
-            }
-        };
+        let context = carina_core::validation::ValidationTypeContext::in_session(
+            binding_input,
+            &self.schemas,
+            self.provider_context,
+            module_signatures,
+        );
+        let binding_use_report =
+            carina_core::validation::check_bare_binding_uses(binding_input, &context);
         let export_value_bindings =
             carina_core::binding_index::ResolvedBindings::for_authored_validation(binding_input);
         DiagnosticValidationInputs {
@@ -456,144 +402,11 @@ impl DiagnosticEngine {
         }
     }
 
-    /// Analyze an open document in its directory context.
-    ///
-    /// `current_file_path` is the document's full path. It is the sole source
-    /// of file identity; the directory and basename used for merged parsing
-    /// are derived from it rather than inferred from buffer contents.
-    pub fn analyze(&self, doc: &Document, current_file_path: Option<&Path>) -> Vec<Diagnostic> {
-        let mut context = match &self.provider_context {
-            DiagnosticProviderContext::Loaded(context) => {
-                DiagnosticProviderContext::Loaded(context.type_check_session())
-            }
-            DiagnosticProviderContext::Unloaded(context) => {
-                DiagnosticProviderContext::Unloaded(Arc::new(context.type_check_session()))
-            }
-        };
-        // A resolvable directory has known declarations, including a known zero providers.
-        // Only an actual orphan retains a fully unloaded catalog.
-        if self.loaded_providers.is_none()
-            && self.provider_errors.is_empty()
-            && let Some(directory_context) = current_file_path
-                .and_then(Path::parent)
-                .and_then(|directory| Self::orphan_directory_catalog(doc, directory))
-        {
-            context = match (&self.provider_context, directory_context) {
-                (
-                    DiagnosticProviderContext::Unloaded(runtime),
-                    DiagnosticProviderContext::Loaded(catalog),
-                ) => DiagnosticProviderContext::Loaded(
-                    catalog.type_check_session_with_runtime(runtime),
-                ),
-                (
-                    DiagnosticProviderContext::Unloaded(runtime),
-                    DiagnosticProviderContext::Unloaded(catalog),
-                ) => {
-                    let mut session = runtime.type_check_session();
-                    session.custom_types = catalog.custom_types.clone();
-                    session.resource_types = catalog.resource_types.clone();
-                    DiagnosticProviderContext::Unloaded(Arc::new(session))
-                }
-                (_, catalog) => catalog,
-            };
-        }
-        let session = Self {
-            schemas: self.schemas.clone(),
-            loaded_providers: self.loaded_providers.clone(),
-            provider_names: self.provider_names.clone(),
-            known_provider_names: self.known_provider_names.clone(),
-            factories: self.factories.clone(),
-            provider_errors: self.provider_errors.clone(),
-            provider_context: context,
-        };
-        let terminal = session.analyze_result(doc, current_file_path);
-        let (mut diagnostics, provider_types) = terminal.into_parts();
-        for diagnostic in provider_types {
-            let (warning, severity, code) = match diagnostic {
-                carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => (warning, DiagnosticSeverity::WARNING, "providers_not_loaded"),
-                carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => (error, DiagnosticSeverity::ERROR, "unsettled_provider_type_check"),
-            };
-            let other_source = warning
-                .file
-                .as_deref()
-                .filter(|file| *file != "<config>")
-                .is_some_and(|file| Path::new(file) != doc.source_file());
-            if other_source && severity != DiagnosticSeverity::ERROR {
-                continue;
-            }
-            let span = warning.span.expect("provider check source span");
-            let mut diagnostic = carina_diagnostic_range(
-                Range::new(
-                    Position::new((span.start_line - 1) as u32, (span.start_column - 1) as u32),
-                    Position::new((span.end_line - 1) as u32, (span.end_column - 1) as u32),
-                ),
-                severity,
-                warning.message,
-            );
-            diagnostic.code = Some(tower_lsp::lsp_types::NumberOrString::String(code.into()));
-            diagnostics.push(diagnostic);
-        }
-        diagnostics
-    }
-
-    /// An orphan engine can establish an empty/partial catalog only after all
-    /// provider declarations in the directory are known. Failed discovery
-    /// preserves the unavailable-context fallback.
-    fn orphan_directory_catalog(
-        doc: &Document,
-        directory: &Path,
-    ) -> Option<DiagnosticProviderContext> {
-        let files = carina_core::config_loader::find_crn_files_in_dir(directory).ok()?;
-        let mut providers = Vec::new();
-        let mut has_buffer = false;
-        for file in files {
-            let source = if file == doc.source_file() {
-                has_buffer = true;
-                doc.text()
-            } else {
-                std::fs::read_to_string(&file).ok()?
-            };
-            let parsed = carina_core::parser::parse_file(
-                &source,
-                &file,
-                &carina_core::parser::ProviderContext::default(),
-            )
-            .ok()?;
-            providers.extend(parsed.providers);
-        }
-        if !has_buffer {
-            providers.extend(doc.parsed()?.providers.iter().cloned());
-        }
-        let failed = providers
-            .iter()
-            .filter(|provider| {
-                provider.name != carina_provider_mock::BUILTIN_PROVIDER_NAME
-                    || provider.source.is_some()
-            })
-            .map(|provider| provider.name.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let snapshot = carina_core::provider::loaded_provider_snapshot_from_factories(
-            Arc::new(Vec::new()),
-            SchemaRegistry::new(),
-        );
-        let loaded = snapshot.provider_context();
-        if failed.is_empty() {
-            Some(DiagnosticProviderContext::Loaded(loaded.clone()))
-        } else {
-            Some(DiagnosticProviderContext::Unloaded(Arc::new(
-                carina_core::parser::ProviderContext {
-                    custom_types: loaded.custom_types.with_failed_providers(failed),
-                    ..Default::default()
-                },
-            )))
-        }
-    }
-
-    fn analyze_result(
+    fn collect_diagnostics(
         &self,
         doc: &Document,
         current_file_path: Option<&Path>,
-    ) -> carina_core::validation::deferred_types::ProviderTypeCheckResult<Vec<Diagnostic>> {
+    ) -> Vec<Diagnostic> {
         #[cfg(test)]
         if let Some(current_file_path) = current_file_path {
             assert_eq!(
@@ -644,7 +457,7 @@ impl DiagnosticEngine {
                 let mut parsed = parsed.clone();
                 carina_core::validation::resolve_file_type_exprs_report(
                     &mut parsed,
-                    &self.provider_context,
+                    self.provider_context,
                     Some(carina_core::validation::TypeResolutionParserError::new(
                         current_file_path,
                         parse_error,
@@ -695,9 +508,9 @@ impl DiagnosticEngine {
         if let (Some(result), Some(current_file_path)) = (merged_result.as_ref(), current_file_path)
         {
             let mut strict = result.directory.parsed.parsed().clone();
-            if let Err(error) = carina_core::parser::resolve_resource_refs_with_config(
+            if let Err(error) = carina_core::parser::resolve_resource_refs_in_session(
                 &mut strict,
-                &self.provider_context,
+                self.provider_context,
             ) && error
                 .source_file()
                 .is_some_and(|source_file| source_file == current_file_path)
@@ -865,7 +678,7 @@ impl DiagnosticEngine {
                     let mut parsed = m.clone();
                     carina_core::validation::resolve_file_type_exprs_report(
                         &mut parsed,
-                        &self.provider_context,
+                        self.provider_context,
                         None,
                     )
                     .into_diagnostics()
@@ -877,15 +690,15 @@ impl DiagnosticEngine {
                             let mut parsed = p.clone();
                             let findings = carina_core::validation::resolve_file_type_exprs_report(
                                 &mut parsed,
-                                &self.provider_context,
+                                self.provider_context,
                                 None,
                             )
                             .into_diagnostics();
                             if findings.is_empty()
                                 && let Err(error) =
-                                    carina_core::parser::resolve_resource_refs_with_config(
+                                    carina_core::parser::resolve_resource_refs_in_session(
                                         &mut parsed,
-                                        &self.provider_context,
+                                        self.provider_context,
                                     )
                             {
                                 diagnostics.push(parse_error_to_diagnostic(&error));
@@ -1047,14 +860,14 @@ impl DiagnosticEngine {
                             carina_core::module_resolver::load_resolved_module_signatures(
                                 pre_expansion_input,
                                 base,
-                                &self.provider_context,
+                                self.provider_context.catalog(),
                             )
                         },
                         |graph| {
                             carina_core::module_resolver::load_resolved_module_signatures(
                                 graph,
                                 base,
-                                &self.provider_context,
+                                self.provider_context.catalog(),
                             )
                         },
                     )
@@ -1075,11 +888,8 @@ impl DiagnosticEngine {
                 expanded_graph.map(|graph| ExpandedDiagnosticValidationInputs {
                     graph,
                     binding_index:
-                        carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports(
-                            graph,
-                            &self.schemas,
-                            &expanded_upstream_exports,
-                            &self.provider_context,
+                        carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                            graph, &self.schemas, Some(&expanded_upstream_exports), &module_signatures, self.provider_context,
                         ),
                     inference_bindings: carina_core::validation::inference::bindings_from_parsed(
                         graph,
@@ -1200,40 +1010,19 @@ impl DiagnosticEngine {
                     },
                     None => &[],
                 };
-            let authored_findings = match &self.provider_context {
-                DiagnosticProviderContext::Loaded(provider_context) => {
-                    carina_core::validation::check_module_calls(
-                        carina_core::validation::ModuleCallCheckInput {
-                            authored: parsed,
-                            semantic: merged,
-                            base_dir: base_path,
-                            imported_signatures: &module_signatures,
-                            provider_context,
-                            schemas: &self.schemas,
-                            binding_use_report: &binding_use_report,
-                            bindings: &binding_index,
-                            reference_checks:
-                                carina_core::validation::ModuleCallReferenceChecks::Enabled,
-                        },
-                    )
-                }
-                DiagnosticProviderContext::Unloaded(provider_context) => {
-                    carina_core::validation::check_module_calls_providerless(
-                        carina_core::validation::ModuleCallCheckInput {
-                            authored: parsed,
-                            semantic: merged,
-                            base_dir: base_path,
-                            imported_signatures: &module_signatures,
-                            provider_context,
-                            schemas: &self.schemas,
-                            binding_use_report: &binding_use_report,
-                            bindings: &binding_index,
-                            reference_checks:
-                                carina_core::validation::ModuleCallReferenceChecks::Enabled,
-                        },
-                    )
-                }
-            };
+            let authored_findings = carina_core::validation::check_module_calls(
+                carina_core::validation::ModuleCallCheckInput {
+                    authored: parsed,
+                    semantic: merged,
+                    base_dir: base_path,
+                    imported_signatures: &module_signatures,
+                    provider_context: self.provider_context,
+                    schemas: &self.schemas,
+                    binding_use_report: &binding_use_report,
+                    bindings: &binding_index,
+                    reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+                },
+            );
             let expanded_binding_findings = match expanded_compositions {
                 Some(compositions) => carina_core::validation::check_expanded_module_calls(
                     carina_core::validation::ExpandedModuleCallCheckInput::BindingUses {
@@ -1277,9 +1066,9 @@ impl DiagnosticEngine {
             // itself carries any diagnostic-sensitivity provenance.
             let resolved_buffer = {
                 let mut resolved = parsed.clone();
-                match carina_core::parser::resolve_resource_refs_with_config(
+                match carina_core::parser::resolve_resource_refs_in_session(
                     &mut resolved,
-                    &self.provider_context,
+                    self.provider_context,
                 ) {
                     Ok(()) => Some(resolved),
                     Err(error) => {
@@ -1967,7 +1756,7 @@ impl DiagnosticEngine {
                         if let Some(evaluated) =
                             carina_core::parser::evaluate_static_value_for_validation(
                                 value,
-                                &self.provider_context,
+                                self.provider_context.catalog(),
                             )
                         {
                             *value = evaluated;
@@ -1978,7 +1767,7 @@ impl DiagnosticEngine {
                     if let Err(errors) = validated_schema.validate_with_resolver(
                         &resolved_attrs,
                         &is_string_literal,
-                        self.provider_context.custom_type_resolver(),
+                        self.provider_context.catalog().custom_type_resolver(),
                     ) {
                         for error in errors {
                             if let carina_core::schema::TypeError::MissingRequired { name } = &error
@@ -2128,7 +1917,7 @@ impl DiagnosticEngine {
                 (None, None) => carina_core::config_loader::AuthoredBindingView::parse_file_source(
                     &text,
                     current_file_path.unwrap_or_else(|| doc.source_file()),
-                    &self.provider_context,
+                    self.provider_context.catalog(),
                 )
                 .map(|view| {
                     carina_core::validation::check_unused_bindings_with_identity_requirements(
@@ -2165,11 +1954,190 @@ impl DiagnosticEngine {
         // Check for non-snake_case binding names
         diagnostics.extend(self.check_non_snake_case_bindings(doc));
 
-        carina_core::validation::deferred_types::ProviderTypeCheckResult::settle(
-            self.provider_context.type_checks().take(),
+        diagnostics
+    }
+}
+
+impl DiagnosticEngine {
+    /// Construct diagnostics backed by one loaded-provider snapshot.
+    pub fn new(loaded_providers: Arc<LoadedProviderSnapshot>, provider_names: Vec<String>) -> Self {
+        Self::new_with_known_providers(loaded_providers, provider_names, HashSet::new())
+    }
+
+    /// Construct diagnostics for the orphaned-file fallback with no loaded
+    /// providers. This path deliberately cannot mint provider-schema inference
+    /// evidence.
+    pub fn without_loaded_provider_schemas() -> Self {
+        let schemas = Arc::new(SchemaRegistry::new());
+        Self {
+            schemas: Arc::clone(&schemas),
+            loaded_providers: None,
+            provider_names: Vec::new(),
+            known_provider_names: HashSet::new(),
+            factories: Arc::new(Vec::new()),
+            provider_errors: HashMap::new(),
+            provider_context: DiagnosticProviderContext::Unloaded(Arc::new(
+                carina_core::parser::ProviderContext {
+                    decryptor: None,
+                    custom_types: carina_core::parser::ProviderCustomTypes::default(),
+                    resource_types:
+                        carina_core::parser::ProviderContext::resource_types_from_schema_registry(
+                            &schemas,
+                        ),
+                },
+            )),
+        }
+    }
+
+    pub(crate) fn new_with_known_providers(
+        loaded_providers: Arc<LoadedProviderSnapshot>,
+        provider_names: Vec<String>,
+        known_provider_names: HashSet<String>,
+    ) -> Self {
+        let schemas = loaded_providers.schemas().schemas_arc();
+        let factories = loaded_providers.factories_arc();
+        let provider_context =
+            DiagnosticProviderContext::Loaded(loaded_providers.provider_context().clone());
+        Self {
+            schemas,
+            loaded_providers: Some(loaded_providers),
+            provider_names,
+            known_provider_names,
+            factories,
+            provider_errors: HashMap::new(),
+            provider_context,
+        }
+    }
+
+    pub fn schema_count(&self) -> usize {
+        self.schemas.len()
+    }
+
+    pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {
+        self.provider_errors = errors;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_run_for_test<T>(&self, produce: impl FnOnce(&DiagnosticRun<'_>) -> T) -> T {
+        carina_core::validation::deferred_types::with_session_for_test(
             &self.provider_context,
-            diagnostics,
+            |session| {
+                produce(&DiagnosticRun {
+                    engine: self,
+                    provider_context: session,
+                })
+            },
         )
+    }
+
+    /// Analyze an open document in its directory context.
+    ///
+    /// `current_file_path` is the document's full path. It is the sole source
+    /// of file identity; the directory and basename used for merged parsing
+    /// are derived from it rather than inferred from buffer contents.
+    pub fn analyze(&self, doc: &Document, current_file_path: Option<&Path>) -> Vec<Diagnostic> {
+        let context = self.catalog_for_document(doc, current_file_path);
+        let reparsed;
+        let doc = if doc.provider_context().custom_types_loaded() && !context.custom_types_loaded()
+        {
+            reparsed = Document::new_with_path(
+                doc.text(),
+                doc.source_file().to_path_buf(),
+                Arc::new(context.clone()),
+            );
+            &reparsed
+        } else {
+            doc
+        };
+        let terminal =
+            carina_core::validation::deferred_types::TypeCheckSession::run(&context, |session| {
+                DiagnosticRun {
+                    engine: self,
+                    provider_context: session,
+                }
+                .collect_diagnostics(doc, current_file_path)
+            });
+        Self::publish_type_diagnostics(terminal, doc)
+    }
+
+    pub(crate) fn catalog_for_document(
+        &self,
+        doc: &Document,
+        current_file_path: Option<&Path>,
+    ) -> carina_core::parser::ProviderContext {
+        match current_file_path.and_then(Path::parent) {
+            Some(directory) => self.directory_catalog(doc, directory).unwrap_or_default(),
+            None => (*self.provider_context).clone(),
+        }
+    }
+
+    fn publish_type_diagnostics(
+        terminal: carina_core::validation::deferred_types::ProviderTypeCheckResult<Vec<Diagnostic>>,
+        doc: &Document,
+    ) -> Vec<Diagnostic> {
+        let mut sink = LspTypeCheckSink {
+            doc,
+            diagnostics: Vec::new(),
+        };
+        let mut diagnostics = terminal.publish(&mut sink);
+        diagnostics.extend(sink.diagnostics);
+        diagnostics
+    }
+
+    /// An orphan engine can establish an empty/partial catalog only after all
+    /// provider declarations in the directory are known. Failed discovery
+    /// preserves the unavailable-context fallback.
+    fn directory_catalog(
+        &self,
+        doc: &Document,
+        directory: &Path,
+    ) -> Option<carina_core::parser::ProviderContext> {
+        let files = carina_core::config_loader::find_crn_files_in_dir(directory).ok()?;
+        let mut providers = Vec::new();
+        let mut has_buffer = false;
+        for file in files {
+            let source = if file == doc.source_file() {
+                has_buffer = true;
+                doc.text()
+            } else {
+                std::fs::read_to_string(&file).ok()?
+            };
+            providers.extend(
+                carina_core::parser::parse_provider_factory_declarations(&source, &file).ok()?,
+            );
+        }
+        if !has_buffer {
+            providers.extend(
+                carina_core::parser::parse_provider_factory_declarations(
+                    &doc.text(),
+                    doc.source_file(),
+                )
+                .ok()?,
+            );
+        }
+        let mut loaded = self.provider_names.iter().cloned().collect::<HashSet<_>>();
+        if providers.iter().any(|provider| {
+            provider.name == carina_provider_mock::BUILTIN_PROVIDER_NAME
+                && provider.source.is_none()
+        }) {
+            loaded.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
+        }
+        let failed = carina_core::parser::unavailable_provider_kinds(
+            &providers,
+            &loaded,
+            &self.provider_errors,
+        );
+        let mut catalog = (*self.provider_context).clone();
+        let loaded_catalog = self
+            .loaded_providers
+            .as_ref()
+            .map(|snapshot| snapshot.provider_context().custom_types.clone())
+            .unwrap_or_else(|| {
+                carina_core::provider::provider_custom_types_from_factories(Arc::new(Vec::new()))
+            });
+        catalog.custom_types = loaded_catalog.with_failed_providers(failed);
+        Some(catalog)
     }
 
     /// Check for duplicate attribute keys within the same block.

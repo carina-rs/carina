@@ -43,11 +43,27 @@ impl<P: PlaceholderKind, B: BindingAddress> Clone for TypecheckInference<'_, P, 
 #[derive(Clone, Copy)]
 pub(crate) enum TypecheckProviderContext<'a> {
     Loaded(&'a LoadedProviderContext),
+    Session(&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext),
     LoadedParserCatalog(&'a ProviderContext),
     Providerless(&'a ProviderContext),
 }
 
 impl<'a> TypecheckProviderContext<'a> {
+    pub(crate) fn for_session(
+        session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self {
+        Self::Session(session)
+    }
+
+    pub(crate) fn session(
+        self,
+    ) -> Option<&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext> {
+        match self {
+            Self::Session(session) => Some(session),
+            _ => None,
+        }
+    }
+
     pub(crate) fn loaded(config: &'a LoadedProviderContext) -> Self {
         Self::Loaded(config)
     }
@@ -69,6 +85,7 @@ impl<'a> TypecheckProviderContext<'a> {
     pub(crate) fn as_provider_context(self) -> &'a ProviderContext {
         match self {
             Self::Loaded(config) => config.as_provider_context(),
+            Self::Session(session) => session.catalog(),
             Self::LoadedParserCatalog(config) | Self::Providerless(config) => config,
         }
     }
@@ -76,6 +93,7 @@ impl<'a> TypecheckProviderContext<'a> {
     pub(crate) fn loaded_context(self) -> Option<&'a LoadedProviderContext> {
         match self {
             Self::Loaded(config) => Some(config),
+            Self::Session(session) => session.loaded_context(),
             Self::LoadedParserCatalog(_) | Self::Providerless(_) => None,
         }
     }
@@ -86,19 +104,13 @@ impl<'a> TypecheckProviderContext<'a> {
         value: &Value<P, B>,
         inference: TypecheckInference<'_, P, B>,
     ) -> Result<(), TypeExprValueError> {
-        match self {
-            Self::Loaded(config) => {
-                check_type_expr_value(expected, value, config, inference).require_provider_schemas()
-            }
-            Self::Providerless(config) => {
-                check_type_expr_value_providerless(expected, value, config, inference)
-                    .record_deferred(config.type_checks())
-            }
-            Self::LoadedParserCatalog(_) => {
-                check_type_expr_value_inner(expected, value, self, inference)
-                    .require_provider_schemas()
-            }
+        let check = check_type_expr_value_inner(expected, value, self, inference);
+        if let Self::Session(session) = self
+            && !session.catalog().custom_types_loaded()
+        {
+            return check.record_deferred(session);
         }
+        check.require_provider_schemas()
     }
 
     pub(crate) fn check_at<P: PlaceholderKind, B: BindingAddress>(
@@ -112,12 +124,15 @@ impl<'a> TypecheckProviderContext<'a> {
         if self.requires_provider_schemas() {
             check.require_provider_schemas()
         } else {
-            check.record_at(self.as_provider_context().type_checks(), site)
+            match self.session() {
+                Some(session) => check.record_at(session, site),
+                None => check.require_provider_schemas(),
+            }
         }
     }
 
     pub(crate) fn requires_provider_schemas(self) -> bool {
-        matches!(self, Self::Loaded(_) | Self::LoadedParserCatalog(_))
+        self.as_provider_context().custom_types_loaded()
     }
 }
 
@@ -125,23 +140,24 @@ impl<'a> TypecheckProviderContext<'a> {
 /// recursively until a caller chooses the policy for its validation phase.
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
-pub enum TypeExprValueCheck {
+pub enum TypeExprValueCheck<'s> {
     Assignable,
     Mismatch(TypeExprValueError),
-    Deferred(TypeExprValueDeferral),
+    Deferred(TypeExprValueDeferral<'s>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypeExprValueDeferral {
+pub struct TypeExprValueDeferral<'s> {
     pub path: Vec<TypeExprValuePathSegment>,
     pub expected: Box<TypeExpr>,
     pub actual: Box<ValueDescription>,
     pub reason: crate::parser::CustomTypeValidationError,
     provider_types: Vec<TypeExpr>,
-    additional: Vec<TypeExprValueDeferral>,
+    additional: Vec<TypeExprValueDeferral<'s>>,
+    brand: std::marker::PhantomData<fn(&'s ()) -> &'s ()>,
 }
 
-impl TypeExprValueDeferral {
+impl TypeExprValueDeferral<'_> {
     fn merge(mut self, other: Self) -> Self {
         self.additional.push(other);
         self
@@ -164,13 +180,13 @@ impl TypeExprValueDeferral {
     }
 }
 
-impl TypeExprValueCheck {
+impl<'s> TypeExprValueCheck<'s> {
     /// Intermediate bootstrap/editor checks may retain unavailable evidence.
     /// A terminal providerless pipeline must settle its sites through
-    /// [`super::deferred_types::DeferredProviderTypeChecks`].
+    /// [`super::deferred_types::TypeCheckSession`].
     pub fn record_deferred(
         self,
-        sink: &super::deferred_types::ProviderTypeCheckRecorder,
+        sink: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), TypeExprValueError> {
         match self {
             Self::Assignable => Ok(()),
@@ -188,7 +204,7 @@ impl TypeExprValueCheck {
 
     pub fn record_at(
         self,
-        sink: &super::deferred_types::ProviderTypeCheckRecorder,
+        sink: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         site: super::deferred_types::ProviderTypeCheckSite,
     ) -> Result<(), TypeExprValueError> {
         match self {
@@ -395,12 +411,12 @@ impl fmt::Display for TypeExprValueError {
 ///
 /// Unresolved values defer until the binding/reference validation or
 /// evaluation phase that has their types.
-pub fn check_type_expr_value<P: PlaceholderKind, B: BindingAddress>(
+pub fn check_type_expr_value<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
-    config: &LoadedProviderContext,
+    config: &'s LoadedProviderContext,
     inference: TypecheckInference<'_, P, B>,
-) -> TypeExprValueCheck {
+) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
         value,
@@ -415,12 +431,12 @@ pub fn check_type_expr_value<P: PlaceholderKind, B: BindingAddress>(
 /// Structural checks and provider-independent leaves run normally. A
 /// provider-owned custom-type leaf defers when its owner is unavailable.
 /// Partial catalogs still invoke the resolver for successfully loaded owners.
-pub fn check_type_expr_value_providerless<P: PlaceholderKind, B: BindingAddress>(
+pub fn check_type_expr_value_providerless<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
-    config: &ProviderContext,
+    config: &'s ProviderContext,
     inference: TypecheckInference<'_, P, B>,
-) -> TypeExprValueCheck {
+) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
         value,
@@ -436,12 +452,12 @@ enum ProviderCustomTypeValidation {
     Providerless,
 }
 
-fn check_type_expr_value_inner<P: PlaceholderKind, B: BindingAddress>(
+fn check_type_expr_value_inner<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
-    config: TypecheckProviderContext<'_>,
+    config: TypecheckProviderContext<'s>,
     inference: TypecheckInference<'_, P, B>,
-) -> TypeExprValueCheck {
+) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
         value,
@@ -455,10 +471,10 @@ fn check_type_expr_value_inner<P: PlaceholderKind, B: BindingAddress>(
     )
 }
 
-fn deferred_provider_check<P: PlaceholderKind, B: BindingAddress>(
+fn deferred_provider_check<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
-) -> TypeExprValueCheck {
+) -> TypeExprValueCheck<'s> {
     TypeExprValueCheck::Deferred(TypeExprValueDeferral {
         path: Vec::new(),
         expected: Box::new(expected.clone()),
@@ -466,16 +482,17 @@ fn deferred_provider_check<P: PlaceholderKind, B: BindingAddress>(
         reason: crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
         provider_types: vec![expected.clone()],
         additional: Vec::new(),
+        brand: std::marker::PhantomData,
     })
 }
 
-fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
+fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
-    config: &ProviderContext,
+    config: &'s ProviderContext,
     inference: TypecheckInference<'_, P, B>,
     provider_custom_types: ProviderCustomTypeValidation,
-) -> TypeExprValueCheck {
+) -> TypeExprValueCheck<'s> {
     use TypeExprValueCheck::{Assignable, Mismatch};
     let check = |expected: &TypeExpr, value: &Value<P, B>| {
         check_type_expr_value_inner_with_mode(
@@ -812,11 +829,11 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn inferred_value_check<P: PlaceholderKind, B: BindingAddress>(
+fn inferred_value_check<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     actual: &TypeExpr,
     value: &Value<P, B>,
-) -> TypeExprValueCheck {
+) -> TypeExprValueCheck<'s> {
     match inferred_type_assignment(expected, actual) {
         crate::schema::TypeAssignability::Assignable => TypeExprValueCheck::Assignable,
         crate::schema::TypeAssignability::Mismatch => {
@@ -830,6 +847,7 @@ fn inferred_value_check<P: PlaceholderKind, B: BindingAddress>(
                 reason: crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
                 provider_types: evidence.into_types().collect(),
                 additional: Vec::new(),
+                brand: std::marker::PhantomData,
             })
         }
     }
@@ -838,12 +856,12 @@ fn inferred_value_check<P: PlaceholderKind, B: BindingAddress>(
 /// Internal parser seam preserving deferred provider evidence. The caller
 /// consumes the outcome using the authority carried by `config`; public
 /// validation and resolver APIs use the witness-carrying entry points above.
-pub(crate) fn check_type_expr_value_with_context<P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn check_type_expr_value_with_context<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
-    config: TypecheckProviderContext<'_>,
+    config: TypecheckProviderContext<'s>,
     inference: TypecheckInference<'_, P, B>,
-) -> TypeExprValueCheck {
+) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner(expected, value, config, inference)
 }
 
@@ -903,16 +921,35 @@ fn is_qualified_enum_identifier(identifier: &str) -> bool {
     identifier.contains('.')
 }
 
-fn inferred_type_assignment(
-    expected: &TypeExpr,
-    actual: &TypeExpr,
-) -> crate::schema::TypeAssignability {
+fn inferred_type_assignment<'s>(
+    expected: &'s TypeExpr,
+    actual: &'s TypeExpr,
+) -> crate::schema::TypeAssignability<'s> {
     match (
         super::lift_type_expr(actual),
         super::lift_type_expr(expected),
     ) {
-        (Some(actual), Some(expected)) => crate::schema::TypeInSchema::schemaless(&actual)
-            .assignment_to(crate::schema::TypeInSchema::schemaless(&expected)),
+        (Some(actual), Some(expected)) => {
+            match crate::schema::TypeInSchema::schemaless(&actual)
+                .assignment_to(crate::schema::TypeInSchema::schemaless(&expected))
+            {
+                crate::schema::TypeAssignability::Assignable => {
+                    crate::schema::TypeAssignability::Assignable
+                }
+                crate::schema::TypeAssignability::Mismatch => {
+                    crate::schema::TypeAssignability::Mismatch
+                }
+                crate::schema::TypeAssignability::Unchecked(evidence) => {
+                    let mut types = evidence.into_types();
+                    let first = types
+                        .next()
+                        .expect("an unchecked assignment retains at least one identity");
+                    crate::schema::TypeAssignability::Unchecked(
+                        crate::schema::TypeAssignmentDeferral::new(first).with_additional(types),
+                    )
+                }
+            }
+        }
         (None, _) | (_, None) => crate::schema::TypeAssignability::Unchecked(
             crate::schema::TypeAssignmentDeferral::new(actual.clone()),
         ),
@@ -1108,7 +1145,7 @@ mod tests {
     #[test]
     fn check_type_expr_value_providerless_with_loaded_catalog_rejects_unloaded_typo() {
         let expected =
-            crate::parser::parse_type_expr_str("UndeclaredAccountId", ProviderContext::unloaded())
+            crate::parser::parse_type_expr_str("UndeclaredAccountId", &ProviderContext::default())
                 .unwrap();
         let config = ProviderContext {
             custom_types: crate::parser::ProviderCustomTypes::loaded(
@@ -1386,10 +1423,15 @@ mod tests {
     }
 
     fn providerless_check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
-        TypecheckProviderContext::providerless(&ProviderContext::default()).check(
-            expected,
-            value,
-            TypecheckInference::Unavailable,
+        crate::validation::deferred_types::with_session_for_test(
+            &ProviderContext::default(),
+            |session| {
+                TypecheckProviderContext::for_session(session).check(
+                    expected,
+                    value,
+                    TypecheckInference::Unavailable,
+                )
+            },
         )
     }
 

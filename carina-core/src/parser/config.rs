@@ -720,7 +720,6 @@ where
 #[derive(Clone)]
 pub struct ProviderCustomTypes {
     state: std::sync::Arc<ProviderCustomTypeState>,
-    checks: std::sync::Arc<crate::validation::deferred_types::ProviderTypeCheckRecorder>,
 }
 
 enum ProviderCustomTypeState {
@@ -740,7 +739,6 @@ impl Default for ProviderCustomTypes {
     fn default() -> Self {
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Unloaded),
-            checks: Default::default(),
         }
     }
 }
@@ -754,7 +752,6 @@ impl ProviderCustomTypes {
         resolver: CustomTypeValidatorFn,
     ) -> Self {
         Self {
-            checks: Default::default(),
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known: known.into_iter().collect(),
                 resolver,
@@ -768,7 +765,6 @@ impl ProviderCustomTypes {
         let source = std::sync::Arc::new(source);
         let validation_source = std::sync::Arc::clone(&source);
         Self {
-            checks: Default::default(),
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known,
                 resolver: Box::new(move |target, value| validation_source.validate(target, value)),
@@ -787,7 +783,6 @@ impl ProviderCustomTypes {
                 loaded: self.clone(),
                 failed_providers,
             }),
-            checks: Default::default(),
         }
     }
 
@@ -805,17 +800,6 @@ impl ProviderCustomTypes {
             } => provider.map_or(!failed_providers.is_empty(), |owner| {
                 failed_providers.contains(owner)
             }),
-        }
-    }
-
-    pub fn type_checks(&self) -> &crate::validation::deferred_types::ProviderTypeCheckRecorder {
-        &self.checks
-    }
-
-    pub fn fresh_type_checks(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-            checks: Default::default(),
         }
     }
 
@@ -912,14 +896,15 @@ impl CustomTypeResolver for ProviderCustomTypes {
 /// Signature for a decryptor function.
 ///
 /// Takes `(ciphertext, optional_key)` and returns the decrypted plaintext or an error.
-pub type DecryptorFn = Box<dyn Fn(&str, Option<&str>) -> Result<String, String> + Send + Sync>;
+pub type DecryptorFn =
+    std::sync::Arc<dyn Fn(&str, Option<&str>) -> Result<String, String> + Send + Sync>;
 
 /// Configuration for the parser, allowing providers to inject behavior.
 ///
 /// This replaces the global `Mutex`-based decryptor registration and enables
 /// provider-specific validators (e.g., ARN, availability_zone) to be injected
 /// from provider crates while being callable during parsing.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderContext {
     /// Optional decryptor for the `decrypt()` built-in function.
     pub decryptor: Option<DecryptorFn>,
@@ -933,32 +918,6 @@ pub struct ProviderContext {
 }
 
 impl ProviderContext {
-    /// Explicit bootstrap authority for callers that have no provider catalog.
-    pub fn unloaded() -> &'static Self {
-        static CONTEXT: std::sync::LazyLock<ProviderContext> =
-            std::sync::LazyLock::new(ProviderContext::default);
-        &CONTEXT
-    }
-
-    pub fn type_checks(&self) -> &crate::validation::deferred_types::ProviderTypeCheckRecorder {
-        self.custom_types.type_checks()
-    }
-
-    /// A new validation pass shares catalog authority, but owns fresh pending evidence.
-    pub fn type_check_session(self: &std::sync::Arc<Self>) -> Self {
-        let original = self.clone();
-        let decryptor: Option<DecryptorFn> = self.decryptor.as_ref().map(|_| {
-            Box::new(move |value: &str, key: Option<&str>| {
-                original.decryptor.as_ref().expect("retained decryptor")(value, key)
-            }) as DecryptorFn
-        });
-        Self {
-            decryptor,
-            custom_types: self.custom_types.fresh_type_checks(),
-            resource_types: self.resource_types.clone(),
-        }
-    }
-
     pub fn custom_types_loaded(&self) -> bool {
         self.custom_types.is_loaded()
     }
@@ -1028,19 +987,11 @@ impl LoadedProviderContext {
         &self.0
     }
 
-    pub fn type_check_session(&self) -> Self {
-        Self::new(self.0.type_check_session())
-    }
-
-    /// Retain this catalog's authority while preserving the caller's runtime hooks.
-    pub fn type_check_session_with_runtime(
-        &self,
-        runtime: &std::sync::Arc<ProviderContext>,
-    ) -> Self {
-        let mut session = runtime.type_check_session();
-        session.custom_types = self.custom_types.fresh_type_checks();
-        session.resource_types = self.resource_types.clone();
-        Self::new(session)
+    /// Retain catalog authority with the caller's immutable runtime hooks.
+    pub fn with_runtime(&self, runtime: &ProviderContext) -> Self {
+        let mut catalog = self.as_provider_context().clone();
+        catalog.decryptor = runtime.decryptor.clone();
+        Self::new(catalog)
     }
 
     /// Test-only constructor for fixtures that deliberately inject a loaded
@@ -1060,7 +1011,6 @@ impl LoadedProviderContext {
     pub fn empty_for_test() -> Self {
         Self::new(ProviderContext {
             custom_types: ProviderCustomTypes {
-                checks: Default::default(),
                 state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                     known: BTreeSet::new(),
                     resolver: Box::new(|_target, _value| Ok(())),
@@ -1129,4 +1079,25 @@ impl std::fmt::Debug for ProviderCustomTypes {
                 .finish(),
         }
     }
+}
+
+/// Provider kinds whose declarations request unavailable factory authority.
+/// A workspace error outside these declarations cannot make this directory's
+/// otherwise complete catalog partial. Named instances do not request plugins.
+pub fn unavailable_provider_kinds<
+    P: crate::resource::PlaceholderKind,
+    B: crate::resource::BindingAddress,
+>(
+    providers: &[super::ProviderConfig<P, B>],
+    loaded: &std::collections::HashSet<String>,
+    load_errors: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeSet<String> {
+    providers
+        .iter()
+        .filter(|provider| {
+            provider.is_default()
+                && (!loaded.contains(&provider.name) || load_errors.contains_key(&provider.name))
+        })
+        .map(|provider| provider.name.clone())
+        .collect()
 }

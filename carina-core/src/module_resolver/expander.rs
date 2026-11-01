@@ -367,7 +367,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 default_line: call_line,
                 caller_source_file: call_source_file,
                 binding_index,
-                config: self.config(),
+                config: self.session,
             };
             for arg in &module.arguments {
                 // Call-site expressions are evaluated in the caller's scope,
@@ -458,7 +458,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             default_line: call_line,
             caller_source_file: call_source_file,
             binding_index,
-            config: self.config(),
+            config: self.session,
         };
         let argument_values: HashMap<String, ModuleResolvedValue> = resolved_arguments
             .iter()
@@ -521,7 +521,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .value()
                 .expect("value-shaped module argument was matched above");
             let resolved_type = resolved_parameter.as_type_expr();
-            self.provider_context
+            self.typecheck_context()
                 .check(
                     &resolved_type,
                     value,
@@ -693,7 +693,15 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .map_err(contextualize_access_error)?;
         let selected = &selected_module_ifs.contribution;
 
-        let nested_binding_index = BindingIndex::from_parsed(module, self.schemas, self.config());
+        let nested_signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let nested_binding_index =
+            BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                module,
+                self.schemas,
+                None,
+                &nested_signatures,
+                self.session,
+            );
         let mut nested_contributions = Vec::new();
         for nested_call in module.module_calls.iter().chain(&selected.module_calls) {
             let local_prefix = instance_prefix_for_call(nested_call);
@@ -793,7 +801,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     composition,
                     &expanded_call,
                     &module_scope_resolver,
-                    self.provider_context,
+                    self.typecheck_context(),
                 )
             })
             .collect::<Result<_, _>>()
@@ -1790,7 +1798,7 @@ struct ArgumentSubstitutions<'a, B: BindingAddress = AbsoluteBindingAddress> {
     default_line: usize,
     caller_source_file: &'a std::path::Path,
     binding_index: Option<&'a BindingIndex<'a>>,
-    config: &'a crate::parser::ProviderContext,
+    config: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 }
 
 impl<B: BindingAddress> Copy for ArgumentSubstitutions<'_, B> {}
@@ -2309,10 +2317,13 @@ fn resolve_module_binding_uses<P: TypeResolutionPolicy>(
                 let declared_type = declared_type.clone().or_else(|| {
                     let name = parameter_name?;
                     let parameter = module.arguments.iter().find(|arg| &arg.name == name)?;
-                    P::resolve_static_type(&parameter.static_type, resolver.arguments.config)
-                        .known()
-                        .cloned()
-                        .map(std::sync::Arc::new)
+                    P::resolve_static_type(
+                        &parameter.static_type,
+                        resolver.arguments.config.catalog(),
+                    )
+                    .known()
+                    .cloned()
+                    .map(std::sync::Arc::new)
                 });
                 let parameter =
                     parameter_name.and_then(|name| resolver.arguments.arguments.get(name));
@@ -2473,7 +2484,8 @@ fn bind_constraint_expression(
                 })?;
         }
         if let Some(bindings) = resolved_bindings
-            && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
+            && let Ok(resolved) =
+                crate::resolver::resolve_ref_value(&value, bindings, arguments.config)
         {
             value = resolved;
         }
@@ -2927,7 +2939,7 @@ fn select_expanded_module_ifs(
 
 fn evaluate_expanded_module_functions(
     value: &ModuleResolvedValue,
-    config: &crate::parser::ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
@@ -3013,20 +3025,24 @@ fn evaluate_expanded_module_functions(
                     .iter()
                     .map(crate::parser::function_argument_as_eval)
                     .collect::<Vec<_>>();
-                crate::builtins::evaluate_builtin_with_config(name.as_str(), &eval_args, config)
-                    .map_err(|message| ArgumentSubstitutionError {
-                        source_file: None,
-                        line: source_line.get().unwrap_or(0),
-                        message,
-                        parse_error: None,
-                    })?
-                    .into_value()
-                    .map_err(|error| ArgumentSubstitutionError {
-                        source_file: None,
-                        line: source_line.get().unwrap_or(0),
-                        message: error.to_string(),
-                        parse_error: None,
-                    })?
+                crate::builtins::evaluate_builtin_with_config(
+                    name.as_str(),
+                    &eval_args,
+                    config.catalog(),
+                )
+                .map_err(|message| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: source_line.get().unwrap_or(0),
+                    message,
+                    parse_error: None,
+                })?
+                .into_value()
+                .map_err(|error| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: source_line.get().unwrap_or(0),
+                    message: error.to_string(),
+                    parse_error: None,
+                })?
             } else {
                 Value::Deferred(DeferredValue::FunctionCall {
                     name: *name,
@@ -3847,52 +3863,55 @@ pub(super) fn substitute_arguments(
     value: &Value,
     arguments: &HashMap<String, Value>,
 ) -> Result<Value, ArgumentSubstitutionError> {
-    let config = crate::parser::ProviderContext::default();
-    let arguments = arguments
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.clone(),
-                ResolvedArgument {
-                    argument: ModuleArgument::new(value.clone()),
-                    origin: ArgumentOrigin::Defaulted,
-                    caller_reference: None,
-                    forwarded_from_enclosing_parameter: false,
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |config| {
+            let arguments = arguments
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        ResolvedArgument {
+                            argument: ModuleArgument::new(value.clone()),
+                            origin: ArgumentOrigin::Defaulted,
+                            caller_reference: None,
+                            forwarded_from_enclosing_parameter: false,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let substituted = substitute_arguments_with_position(
+                value,
+                ArgumentSubstitutions {
+                    arguments: &arguments,
+                    default_line: 1,
+                    caller_source_file: std::path::Path::new("test.crn"),
+                    binding_index: None,
+                    config,
                 },
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let substituted = substitute_arguments_with_position(
-        value,
-        ArgumentSubstitutions {
-            arguments: &arguments,
-            default_line: 1,
-            caller_source_file: std::path::Path::new("test.crn"),
-            binding_index: None,
-            config: &config,
+                ArgumentSubstitutionPosition::Value,
+            )?;
+            select_authored_module_ifs_for_test(&substituted, config)
         },
-        ArgumentSubstitutionPosition::Value,
-    )?;
-    select_authored_module_ifs_for_test(&substituted, &config)
+    )
 }
 
 #[cfg(test)]
 fn select_authored_module_ifs_for_test(
     value: &Value,
-    config: &crate::parser::ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Value, ArgumentSubstitutionError> {
     use crate::resource::{ConcreteValue, DeferredValue, Value};
 
     Ok(match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            match crate::parser::decide_if_condition(deferred.condition().value(), config).map_err(
-                |error| ArgumentSubstitutionError {
+            match crate::parser::decide_if_condition(deferred.condition().value(), config.catalog())
+                .map_err(|error| ArgumentSubstitutionError {
                     source_file: Some(deferred.condition().source_file().to_path_buf()),
                     line: deferred.condition().source_line(),
                     message: error.to_string(),
                     parse_error: None,
-                },
-            )? {
+                })? {
                 Some(true) => select_authored_module_ifs_for_test(deferred.then_value(), config)?,
                 Some(false) => select_authored_module_ifs_for_test(deferred.else_value(), config)?,
                 None => value.clone(),

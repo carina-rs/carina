@@ -200,6 +200,7 @@ fn format_total_apply_line(elapsed: Duration) -> String {
 }
 
 struct BootstrapCreateContext<'a> {
+    provider_context: &'a carina_core::parser::LoadedProviderContext,
     backend: &'a dyn StateBackend,
     parsed: &'a carina_core::parser::ExpandedInferredFile,
     provider_configs: &'a ResolvedProviderConfigs,
@@ -214,119 +215,133 @@ async fn create_checked_bootstrap_resource(
     resource: Resource,
     context: BootstrapCreateContext<'_>,
 ) -> Result<(), AppError> {
-    let BootstrapCreateContext {
-        backend,
-        parsed,
-        provider_configs,
-        normalizer,
-        factories,
-        schemas,
-    } = context;
-    let id = resource.id.clone();
-    let bindings = bootstrap_resolved_bindings(parsed);
-    let module_gate =
-        carina_core::executor::ModuleConstraintGate::from_live_compositions(&parsed.compositions);
-    let preparation = carina_core::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        provider_configs.as_provider_configs(),
-        normalizer,
-        factories,
-        schemas,
-    );
-    let request = carina_core::executor::prepare_create_request(resource, &preparation)
-        .await
-        .map_err(AppError::from_state_bucket_preparation)?;
-    let resolved = request.resource().as_inner().clone();
-    let resolved_comparison = comparison_provider.comparison_for(schemas, &resolved.id)?;
-    let owner_schema = resolved_comparison.owner_schema();
-    let comparison = resolved_comparison.context();
-    let schema = Some(owner_schema.schema().as_schema());
-    let accepted_request = AcceptedRequest::from_create_request(&request);
-    let (create, create_cancellation) =
-        carina_core::executor::dispatch_create(operation_provider, &id, request);
-    let outcome = create.await;
-    // Bootstrap creates are not part of the parallel executor, but they still
-    // retain the reporter until the guest call has settled.
-    drop(create_cancellation);
-    match outcome {
-        Ok(outcome) => {
-            let identifier = outcome.identifier().as_str().to_string();
-            let (state, accepted_request, diagnostic, _read_back_end) =
-                carina_core::executor::complete_create_for_writeback(outcome, accepted_request);
-            let row = carina_state::ResourceState::from_provider_state_for_resource_and_schema(
-                &resolved,
-                &state,
-                None,
-                schema,
-                RowBasis::Applied(&accepted_request),
-                None,
-                comparison,
-            )
-            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
-            seed_protected_bootstrap_resource(backend, row)
-                .await
-                .map_err(|source| {
-                    let resource_address = format!(
-                        "{} {}",
-                        resolved.id.display_type(),
-                        carina_core::parser::display_string_literal(resolved.identity_str())
-                    );
-                    AppError::StateBucketSeed(Box::new(crate::error::StateBucketSeedError::new(
-                        identifier.clone(),
-                        resource_address,
-                        source,
-                    )))
-                })?;
-            if let Some(diagnostic) = diagnostic {
-                eprintln!(
-                    "{}",
-                    format_partial_state_bucket_create_warning(&identifier, &diagnostic)
-                );
-            }
-            Ok(())
-        }
-        Err(error) => {
-            let row = match error.kind() {
-                carina_core::provider::CreateFailureKind::Untracked(_error) => Ok(None),
-                carina_core::provider::CreateFailureKind::OutcomeUnknown {
-                    unknown,
-                    error: _provider_error,
-                } => Ok(Some(
-                    carina_state::ResourceState::from_unknown_create_outcome(
-                        &resolved, unknown, None, schema, comparison,
-                    ),
-                )),
-                carina_core::provider::CreateFailureKind::Created {
-                    created,
-                    error: _provider_error,
-                } => carina_state::ResourceState::from_observation(
-                    &resolved, created, None, schema, None, comparison,
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run_async(
+            context.provider_context,
+            async |session| {
+        let BootstrapCreateContext {
+            provider_context: _provider_context,
+            backend,
+            parsed,
+            provider_configs,
+            normalizer,
+            factories,
+            schemas,
+        } = context;
+        let id = resource.id.clone();
+        let bindings = bootstrap_resolved_bindings(parsed);
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
+            &parsed.compositions,
+        );
+        let preparation = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &module_gate,
+            provider_configs.as_provider_configs(),
+            normalizer,
+            factories,
+            schemas,
+            session,
+        );
+        let request = carina_core::executor::prepare_create_request(resource, &preparation)
+            .await
+            .map_err(AppError::from_state_bucket_preparation)?;
+        let resolved = request.resource().as_inner().clone();
+        let resolved_comparison = comparison_provider.comparison_for(schemas, &resolved.id)?;
+        let owner_schema = resolved_comparison.owner_schema();
+        let comparison = resolved_comparison.context();
+        let schema = Some(owner_schema.schema().as_schema());
+        let accepted_request = AcceptedRequest::from_create_request(&request);
+        let (create, create_cancellation) =
+            carina_core::executor::dispatch_create(operation_provider, &id, request);
+        let outcome = create.await;
+        // Bootstrap creates are not part of the parallel executor, but they still
+        // retain the reporter until the guest call has settled.
+        drop(create_cancellation);
+        match outcome {
+            Ok(outcome) => {
+                let identifier = outcome.identifier().as_str().to_string();
+                let (state, accepted_request, diagnostic, _read_back_end) =
+                    carina_core::executor::complete_create_for_writeback(outcome, accepted_request);
+                let row = carina_state::ResourceState::from_provider_state_for_resource_and_schema(
+                    &resolved,
+                    &state,
+                    None,
+                    schema,
+                    RowBasis::Applied(&accepted_request),
+                    None,
+                    comparison,
                 )
-                .map(Some)
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
-                carina_core::provider::CreateFailureKind::InFlight {
-                    pending,
-                    error: _provider_error,
-                } => carina_state::ResourceState::from_in_flight(
-                    &resolved, pending, None, schema, None, comparison,
-                )
-                .map(Some)
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
-            };
-            let seed_error = match row {
-                Ok(Some(row)) => seed_protected_bootstrap_resource(backend, row)
+                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
+                seed_protected_bootstrap_resource(backend, row)
                     .await
-                    .err()
-                    .map(AppError::Backend),
-                Ok(None) => None,
-                Err(seed_error) => Some(seed_error),
-            };
-            Err(AppError::StateBucketCreate(
-                crate::error::StateBucketCreateError::new(error, seed_error),
-            ))
+                    .map_err(|source| {
+                        let resource_address = format!(
+                            "{} {}",
+                            resolved.id.display_type(),
+                            carina_core::parser::display_string_literal(resolved.identity_str())
+                        );
+                        AppError::StateBucketSeed(Box::new(
+                            crate::error::StateBucketSeedError::new(
+                                identifier.clone(),
+                                resource_address,
+                                source,
+                            ),
+                        ))
+                    })?;
+                if let Some(diagnostic) = diagnostic {
+                    eprintln!(
+                        "{}",
+                        format_partial_state_bucket_create_warning(&identifier, &diagnostic)
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let row = match error.kind() {
+                    carina_core::provider::CreateFailureKind::Untracked(_error) => Ok(None),
+                    carina_core::provider::CreateFailureKind::OutcomeUnknown {
+                        unknown,
+                        error: _provider_error,
+                    } => Ok(Some(
+                        carina_state::ResourceState::from_unknown_create_outcome(
+                            &resolved, unknown, None, schema, comparison,
+                        ),
+                    )),
+                    carina_core::provider::CreateFailureKind::Created {
+                        created,
+                        error: _provider_error,
+                    } => carina_state::ResourceState::from_observation(
+                        &resolved, created, None, schema, None, comparison,
+                    )
+                    .map(Some)
+                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
+                    carina_core::provider::CreateFailureKind::InFlight {
+                        pending,
+                        error: _provider_error,
+                    } => carina_state::ResourceState::from_in_flight(
+                        &resolved, pending, None, schema, None, comparison,
+                    )
+                    .map(Some)
+                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
+                };
+                let seed_error = match row {
+                    Ok(Some(row)) => seed_protected_bootstrap_resource(backend, row)
+                        .await
+                        .err()
+                        .map(AppError::Backend),
+                    Ok(None) => None,
+                    Err(seed_error) => Some(seed_error),
+                };
+                Err(AppError::StateBucketCreate(
+                    crate::error::StateBucketCreateError::new(error, seed_error),
+                ))
+            }
         }
-    }
+    },
+        )
+        .await,
+        AppError::Validation,
+    )
 }
 
 #[cfg(test)]
@@ -340,6 +355,7 @@ async fn create_checked_bootstrap_resource_for_test(
         std::iter::once(&resource.id),
     );
     let BootstrapCreateContext {
+        provider_context,
         backend,
         parsed,
         provider_configs,
@@ -352,6 +368,7 @@ async fn create_checked_bootstrap_resource_for_test(
         &comparison_provider,
         resource,
         BootstrapCreateContext {
+            provider_context,
             backend,
             parsed,
             provider_configs,
@@ -429,19 +446,37 @@ fn start_apply_state_saver<S: Clone + Send + Sync + 'static>(
 fn finalize_module_constraints(
     compositions: &[carina_core::resource::LiveComposition],
     bindings: &ResolvedBindings,
+    provider_context: &carina_core::parser::LoadedProviderContext,
 ) -> Result<(), AppError> {
-    carina_core::executor::ModuleConstraintGate::from_live_compositions(compositions)
-        .finish(bindings, true)
-        .map_err(AppError::from)
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run(
+            provider_context,
+            |session| {
+                carina_core::executor::ModuleConstraintGate::from_live_compositions(compositions)
+                    .finish(bindings, true, session)
+                    .map_err(AppError::from)
+            },
+        ),
+        AppError::Validation,
+    )
 }
 
 fn finalize_saved_module_constraints(
     compositions: &[carina_core::resource::SavedComposition],
     bindings: &ResolvedBindings,
+    provider_context: &carina_core::parser::LoadedProviderContext,
 ) -> Result<(), AppError> {
-    carina_core::executor::ModuleConstraintGate::from_saved_compositions(compositions)
-        .finish(bindings, true)
-        .map_err(AppError::from)
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run(
+            provider_context,
+            |session| {
+                carina_core::executor::ModuleConstraintGate::from_saved_compositions(compositions)
+                    .finish(bindings, true, session)
+                    .map_err(AppError::from)
+            },
+        ),
+        AppError::Validation,
+    )
 }
 
 fn data_source_values_from_saved_plan<S: Clone>(
@@ -621,27 +656,56 @@ fn saved_plan_replan_command(plan_path: &Path, source_path: &Path) -> String {
     .to_string()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_effects_with_observer(
-    plan: &Plan,
-    provider: &ProviderRouter,
-    normalizer: &dyn ProviderNormalizer,
-    provider_configs: &[ExpandedProviderConfig],
-    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
-    schemas: &carina_core::schema::SchemaRegistry,
-    bindings: &mut ResolvedBindings,
-    managed_current: &mut HashMap<ResourceId, Current>,
-    data_source_values: ExecutableDataSourceValues,
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    data_source_origins: &[DataSource],
-    compositions: &[carina_core::resource::LiveComposition],
-    precompleted_success_count: usize,
-    checkpoint_sink: ExecutionCheckpointSink,
+struct ApplyExecutionContext<'a, S = ModuleSource> {
+    provider: &'a ProviderRouter,
+    normalizer: &'a dyn ProviderNormalizer,
+    provider_configs: &'a [ExpandedProviderConfig],
+    factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &'a carina_core::schema::SchemaRegistry,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
-    observer: &dyn ExecutionObserver,
+    observer: &'a dyn ExecutionObserver<S>,
+    provider_context: &'a carina_core::parser::LoadedProviderContext,
+}
+
+struct ApplyExecutionState<'a, S = ModuleSource> {
+    bindings: &'a mut ResolvedBindings,
+    managed_current: &'a mut HashMap<ResourceId, Current>,
+    data_source_values: ExecutableDataSourceValues<S>,
+    unresolved_resources: &'a HashMap<ResourceId, UnresolvedResource<S>>,
+    data_source_origins: &'a [DataSource<S>],
+    precompleted_success_count: usize,
+    checkpoint_sink: ExecutionCheckpointSink<S>,
+}
+
+async fn execute_effects_with_observer(
+    plan: &Plan,
+    compositions: &[carina_core::resource::LiveComposition],
+    context: ApplyExecutionContext<'_>,
+    state: ApplyExecutionState<'_>,
 ) -> ExecutionOutcome {
+    let ApplyExecutionContext {
+        provider,
+        normalizer,
+        provider_configs,
+        factories,
+        schemas,
+        cancel,
+        parallelism,
+        observer,
+        provider_context,
+    } = context;
+    let ApplyExecutionState {
+        bindings,
+        managed_current,
+        data_source_values,
+        unresolved_resources,
+        data_source_origins,
+        precompleted_success_count,
+        checkpoint_sink,
+    } = state;
     let input = LiveExecutionInput {
+        provider_context: carina_core::parser::ProviderContext::clone(provider_context),
         plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: unresolved_resources,
@@ -675,27 +739,34 @@ async fn execute_effects_with_observer(
 /// Saved-plan executor gateway. Requiring [`ExecutablePlanFile`] here makes it
 /// impossible for the deserialized `PlanFile` path to dispatch effects before
 /// schema compatibility and all typed secret placeholders have been verified.
-#[allow(clippy::too_many_arguments)]
 async fn execute_rehydrated_saved_plan(
     plan_file: &ExecutablePlanFile,
-    provider: &ProviderRouter,
-    normalizer: &dyn ProviderNormalizer,
-    provider_configs: &[ExpandedProviderConfig],
-    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
-    schemas: &carina_core::schema::SchemaRegistry,
-    bindings: &mut ResolvedBindings,
-    managed_current: &mut HashMap<ResourceId, Current>,
-    data_source_values: ExecutableDataSourceValues<SavedModuleSource>,
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<SavedModuleSource>>,
-    data_source_origins: &[SavedDataSource],
     compositions: &[carina_core::resource::SavedComposition],
-    precompleted_success_count: usize,
-    checkpoint_sink: ExecutionCheckpointSink<SavedModuleSource>,
-    cancel: ShutdownToken,
-    parallelism: NonZeroUsize,
-    observer: &dyn ExecutionObserver<SavedModuleSource>,
+    context: ApplyExecutionContext<'_, SavedModuleSource>,
+    state: ApplyExecutionState<'_, SavedModuleSource>,
 ) -> ExecutionOutcome<SavedModuleSource> {
+    let ApplyExecutionContext {
+        provider,
+        normalizer,
+        provider_configs,
+        factories,
+        schemas,
+        cancel,
+        parallelism,
+        observer,
+        provider_context,
+    } = context;
+    let ApplyExecutionState {
+        bindings,
+        managed_current,
+        data_source_values,
+        unresolved_resources,
+        data_source_origins,
+        precompleted_success_count,
+        checkpoint_sink,
+    } = state;
     let input = SavedExecutionInput {
+        provider_context: carina_core::parser::ProviderContext::clone(provider_context),
         plan: plan_file.plan(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: unresolved_resources,
@@ -1606,6 +1677,7 @@ async fn run_apply_with_observer_factory(
                     &bucket_provider,
                     bucket_resource.clone(),
                     BootstrapCreateContext {
+                        provider_context: validated_config.context().provider_context(),
                         backend: backend.as_ref(),
                         parsed: validated_config.resources().parsed(),
                         provider_configs: bootstrap_provider_inputs.configs(),
@@ -2071,6 +2143,7 @@ async fn run_apply_locked_owned(
             // state refresh and produces one outcome per query.
             let phase2 = reconciled_expansion
                 .read_data_sources_phase2(AddressedDataSourceReadInputs {
+                    provider_context: ctx.provider_context(),
                     provider: &provider,
                     refresh_phase: Some(&refresh_phase),
                     compositions: &parsed.compositions,
@@ -2183,7 +2256,11 @@ async fn run_apply_locked_owned(
                 // mutation does) silently falls through into the
                 // resource-apply pipeline and the `Persisting N export
                 // change(s) to state.` banner never prints (carina#3270).
-                finalize_module_constraints(&pre_resolve_compositions, &bindings)?;
+                finalize_module_constraints(
+                    &pre_resolve_compositions,
+                    &bindings,
+                    ctx.provider_context(),
+                )?;
                 let checked_exports_pre_apply =
                     crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
                         export_params: &parsed.export_params,
@@ -2393,22 +2470,27 @@ async fn run_apply_locked_owned(
             let state_only_success_count = execute_state_only_effects(&plan);
             let outcome = execute_effects_with_observer(
                 &plan,
-                provider.as_ref(),
-                provider.as_ref(),
-                raw_provider_configs,
-                ctx.factories(),
-                ctx.schemas(),
-                &mut bindings,
-                &mut managed_current,
-                executable_data_source_values,
-                &unresolved_resources,
-                &data_sources,
                 &pre_resolve_compositions,
-                state_only_success_count,
-                checkpoint_sink.clone(),
-                cancel.clone(),
-                parallelism,
-                observer.as_ref(),
+                ApplyExecutionContext {
+                    provider: provider.as_ref(),
+                    normalizer: provider.as_ref(),
+                    provider_configs: raw_provider_configs,
+                    factories: ctx.factories(),
+                    schemas: ctx.schemas(),
+                    cancel: cancel.clone(),
+                    parallelism,
+                    observer: observer.as_ref(),
+                    provider_context: ctx.provider_context(),
+                },
+                ApplyExecutionState {
+                    bindings: &mut bindings,
+                    managed_current: &mut managed_current,
+                    data_source_values: executable_data_source_values,
+                    unresolved_resources: &unresolved_resources,
+                    data_source_origins: &data_sources,
+                    precompleted_success_count: state_only_success_count,
+                    checkpoint_sink: checkpoint_sink.clone(),
+                },
             )
             .await;
             let (mut result, cancelled) = split_execution_outcome(outcome);
@@ -2750,6 +2832,7 @@ where
 fn import_identifiers_from_current_config<S>(
     plan: &carina_core::plan::Plan<S>,
     parsed: &carina_core::parser::ExpandedInferredFile,
+    session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> HashMap<ResourceId, Value> {
     let mut identifiers = HashMap::new();
     let bindings = bootstrap_resolved_bindings(parsed);
@@ -2768,6 +2851,7 @@ fn import_identifiers_from_current_config<S>(
                     value,
                     &bindings,
                     &unresolved_upstream_bindings,
+                    session,
                 ))
             }
             _ => None,
@@ -2883,6 +2967,7 @@ fn rehydrate_desired_plan_file(
         candidates.parsed(),
         candidates.provider_inputs(),
         apply_target,
+        candidates.provider_context(),
     )
 }
 
@@ -2891,114 +2976,121 @@ fn rehydrate_desired_plan_file_from_parts(
     parsed: &carina_core::parser::ExpandedInferredFile,
     provider_inputs: &ResolvedProviderInputs,
     apply_target: ApplyTarget<'_>,
+    provider_context: &carina_core::parser::LoadedProviderContext,
 ) -> Result<(), AppError> {
-    let mut resource_candidates = HashMap::new();
-    for saved in plan_file.sorted_resources() {
-        if let Some(fresh) = matching_resource_like(saved, &parsed.resources) {
-            resource_candidates.insert(saved.id.clone(), fresh.clone());
-        }
-    }
-    let mut data_source_candidates = HashMap::new();
-    for saved in plan_file.data_sources() {
-        if let Some(fresh) = matching_resource_like(saved, &parsed.data_sources) {
-            data_source_candidates.insert(saved.id.clone(), fresh.clone());
-        }
-    }
-    let import_identifiers = import_identifiers_from_current_config(plan_file.plan(), parsed);
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run(
+            provider_context,
+            |session| {
+                let mut resource_candidates = HashMap::new();
+                for saved in plan_file.sorted_resources() {
+                    if let Some(fresh) = matching_resource_like(saved, &parsed.resources) {
+                        resource_candidates.insert(saved.id.clone(), fresh.clone());
+                    }
+                }
+                let mut data_source_candidates = HashMap::new();
+                for saved in plan_file.data_sources() {
+                    if let Some(fresh) = matching_resource_like(saved, &parsed.data_sources) {
+                        data_source_candidates.insert(saved.id.clone(), fresh.clone());
+                    }
+                }
+                let import_identifiers =
+                    import_identifiers_from_current_config(plan_file.plan(), parsed, session);
 
-    let rehydrated_plan = carina_core::value::rehydrate_plan_desired_secrets(
-        plan_file.plan(),
-        &resource_candidates,
-        &data_source_candidates,
-        &import_identifiers,
-        parsed.deferred_for_expressions(),
-    )
-    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-    *plan_file.plan_mut() = rehydrated_plan;
-
-    rehydrate_saved_resource_like(
-        plan_file.sorted_resources_mut(),
-        &resource_candidates,
-        apply_target,
-        carina_core::value::rehydrate_resource_secrets,
-    )?;
-    rehydrate_saved_resource_like(
-        plan_file.unresolved_resources_mut(),
-        &resource_candidates,
-        apply_target,
-        carina_core::value::rehydrate_resource_secrets,
-    )?;
-
-    let mut composition_source_identities = CompositionSourceIdentityResolver::new(
-        carina_core::config_loader::get_base_dir(apply_target.source_dir()),
-    )
-    .map_err(AppError::from)?;
-    plan_file
-        .rehydrate_composition_secrets(
-            &parsed.compositions,
-            &mut composition_source_identities,
-        )
-        .map_err(|error| match error {
-            ReloadedCompositionRehydrationError::MissingCandidate(origin_id) => {
-                let call_chain = origin_id
-                    .calls()
-                    .map(|call| {
-                        let source_file = call.source_file().to_string_lossy();
-                        format!(
-                            "{}:{}:{}",
-                            source_file.escape_debug(),
-                            call.start_line(),
-                            call.start_column(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" -> ");
-                saved_plan_secret_shape_error(
-                    format!(
-                        "composition call id chain {call_chain} disagreed with the saved plan",
-                    ),
-                    apply_target,
+                let rehydrated_plan = carina_core::value::rehydrate_plan_desired_secrets(
+                    plan_file.plan(),
+                    &resource_candidates,
+                    &data_source_candidates,
+                    &import_identifiers,
+                    parsed.deferred_for_expressions(),
                 )
-            }
-            ReloadedCompositionRehydrationError::Secret(error) => {
-                saved_plan_secret_rehydration_error(error, apply_target)
-            }
-            ReloadedCompositionRehydrationError::SourceIdentity(error) => AppError::from(error),
-        })?;
+                .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+                *plan_file.plan_mut() = rehydrated_plan;
 
-    rehydrate_saved_resource_like(
-        plan_file.data_sources_mut(),
-        &data_source_candidates,
-        apply_target,
-        carina_core::value::rehydrate_data_source_secrets,
-    )?;
-    rehydrate_saved_resource_like(
-        plan_file.data_source_origins_mut(),
-        &data_source_candidates,
-        apply_target,
-        carina_core::value::rehydrate_data_source_secrets,
-    )?;
+                rehydrate_saved_resource_like(
+                    plan_file.sorted_resources_mut(),
+                    &resource_candidates,
+                    apply_target,
+                    carina_core::value::rehydrate_resource_secrets,
+                )?;
+                rehydrate_saved_resource_like(
+                    plan_file.unresolved_resources_mut(),
+                    &resource_candidates,
+                    apply_target,
+                    carina_core::value::rehydrate_resource_secrets,
+                )?;
 
-    let fresh_provider_configs =
-        carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
-    plan_file
-        .rehydrate_provider_config_secrets(&fresh_provider_configs)
-        .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-    for (binding, attributes) in plan_file.upstream_snapshot_mut() {
-        if let Some((key, _)) = attributes
-            .iter()
-            .find(|(_, value)| carina_core::value::contains_redacted_secret(value))
-        {
-            return Err(saved_plan_secret_shape_error(
-                format!(
-                    "upstream_state {binding}.{key}: secret placeholders cannot occur in valid upstream exports"
-                ),
-                apply_target,
-            ));
-        }
-    }
+                let mut composition_source_identities = CompositionSourceIdentityResolver::new(
+                    carina_core::config_loader::get_base_dir(apply_target.source_dir()),
+                )
+                .map_err(AppError::from)?;
+                plan_file
+            .rehydrate_composition_secrets(&parsed.compositions, &mut composition_source_identities)
+            .map_err(|error| match error {
+                ReloadedCompositionRehydrationError::MissingCandidate(origin_id) => {
+                    let call_chain = origin_id
+                        .calls()
+                        .map(|call| {
+                            let source_file = call.source_file().to_string_lossy();
+                            format!(
+                                "{}:{}:{}",
+                                source_file.escape_debug(),
+                                call.start_line(),
+                                call.start_column(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" -> ");
+                    saved_plan_secret_shape_error(
+                        format!(
+                            "composition call id chain {call_chain} disagreed with the saved plan",
+                        ),
+                        apply_target,
+                    )
+                }
+                ReloadedCompositionRehydrationError::Secret(error) => {
+                    saved_plan_secret_rehydration_error(error, apply_target)
+                }
+                ReloadedCompositionRehydrationError::SourceIdentity(error) => AppError::from(error),
+            })?;
 
-    Ok(())
+                rehydrate_saved_resource_like(
+                    plan_file.data_sources_mut(),
+                    &data_source_candidates,
+                    apply_target,
+                    carina_core::value::rehydrate_data_source_secrets,
+                )?;
+                rehydrate_saved_resource_like(
+                    plan_file.data_source_origins_mut(),
+                    &data_source_candidates,
+                    apply_target,
+                    carina_core::value::rehydrate_data_source_secrets,
+                )?;
+
+                let fresh_provider_configs =
+                    carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
+                plan_file
+                    .rehydrate_provider_config_secrets(&fresh_provider_configs)
+                    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+                for (binding, attributes) in plan_file.upstream_snapshot_mut() {
+                    if let Some((key, _)) = attributes
+                        .iter()
+                        .find(|(_, value)| carina_core::value::contains_redacted_secret(value))
+                    {
+                        return Err(saved_plan_secret_shape_error(
+                            format!(
+                                "upstream_state {binding}.{key}: secret placeholders cannot occur in valid upstream exports"
+                            ),
+                            apply_target,
+                        ));
+                    }
+                }
+
+                Ok(())
+            },
+        ),
+        AppError::Validation,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3616,7 +3708,11 @@ async fn run_apply_from_plan_locked_owned(
                     remote_bindings: rehydrated_plan_file.upstream_snapshot(),
                     wait_aliases: &terminal_wait_aliases,
                 });
-                finalize_saved_module_constraints(plan_compositions, &terminal_bindings)?;
+                finalize_saved_module_constraints(
+                    plan_compositions,
+                    &terminal_bindings,
+                    wiring.provider_context(),
+                )?;
                 let directive_change_count = directive_changes.len();
                 if directive_change_count == 0 {
                     println!("{}", "No changes needed.".green());
@@ -3795,22 +3891,27 @@ async fn run_apply_from_plan_locked_owned(
             let state_only_success_count = execute_state_only_effects(plan);
             let outcome = execute_rehydrated_saved_plan(
                 &rehydrated_plan_file,
-                provider.as_ref(),
-                provider.as_ref(),
-                raw_provider_configs,
-                wiring.factories(),
-                wiring.schemas(),
-                &mut bindings,
-                &mut managed_current,
-                executable_data_source_values,
-                &unresolved_resources,
-                plan_data_source_origins,
                 plan_compositions,
-                state_only_success_count,
-                checkpoint_sink.clone(),
-                cancel.clone(),
-                parallelism,
-                observer.as_ref(),
+                ApplyExecutionContext {
+                    provider: provider.as_ref(),
+                    normalizer: provider.as_ref(),
+                    provider_configs: raw_provider_configs,
+                    factories: wiring.factories(),
+                    schemas: wiring.schemas(),
+                    cancel: cancel.clone(),
+                    parallelism,
+                    observer: observer.as_ref(),
+                    provider_context: wiring.provider_context(),
+                },
+                ApplyExecutionState {
+                    bindings: &mut bindings,
+                    managed_current: &mut managed_current,
+                    data_source_values: executable_data_source_values,
+                    unresolved_resources: &unresolved_resources,
+                    data_source_origins: plan_data_source_origins,
+                    precompleted_success_count: state_only_success_count,
+                    checkpoint_sink: checkpoint_sink.clone(),
+                },
             )
             .await;
             let (mut result, cancelled) = split_execution_outcome(outcome);

@@ -64,7 +64,7 @@ impl From<BuiltinTypeName> for String {
 
 #[cfg(test)]
 pub(crate) fn bare_type_for_test(name: String) -> TypeExpr {
-    resolve_known_bare_custom_type(&name, ProviderContext::unloaded())
+    resolve_known_bare_custom_type(&name, &ProviderContext::default())
         .expect("bootstrap resolution has no conflicting declarations")
         .expect("bootstrap resolution preserves authored names")
 }
@@ -77,18 +77,24 @@ pub(crate) fn bare_type_for_test(name: String) -> TypeExpr {
 /// relation; identity-free scalar and literal checks require the missing schema.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "TypeIdentity", into = "TypeIdentity")]
-pub struct UnloadedSchemaType(TypeIdentity);
+pub struct UnloadedSchemaType(TypeIdentity, Vec<super::OwnedTypeIdentity>);
 
 impl UnloadedSchemaType {
     pub fn identity(&self) -> &TypeIdentity {
         &self.0
+    }
+
+    /// Candidates from loaded providers, retained without claiming that the
+    /// incomplete catalog has found every owner of this bare name.
+    pub fn loaded_candidates(&self) -> &[super::OwnedTypeIdentity] {
+        &self.1
     }
 }
 
 impl TryFrom<TypeIdentity> for UnloadedSchemaType {
     type Error = String;
     fn try_from(identity: TypeIdentity) -> Result<Self, Self::Error> {
-        match resolve_custom_type_identity(&identity, ProviderContext::unloaded()) {
+        match resolve_custom_type_identity(&identity, &ProviderContext::default()) {
             Ok(Some(TypeExpr::UnloadedSchemaType(unloaded))) => Ok(unloaded),
             Ok(_) => Err(format!(
                 "built-in type `{identity}` cannot be an unloaded provider type"
@@ -122,13 +128,14 @@ pub(crate) fn resolve_custom_type_identity(
         .iter()
         .filter(|owned| owned.identity() == identity)
         .collect::<Vec<_>>();
-    if let Some(resolved) = merge_custom_type_candidates(&matches)? {
-        return Ok(Some(resolved));
-    }
     if config.custom_types.may_defer(identity.provider.as_deref()) {
         return Ok(Some(TypeExpr::UnloadedSchemaType(UnloadedSchemaType(
             identity.clone(),
+            matches.iter().map(|owned| (*owned).clone()).collect(),
         ))));
+    }
+    if let Some(resolved) = merge_custom_type_candidates(&matches)? {
+        return Ok(Some(resolved));
     }
     Ok(None)
 }

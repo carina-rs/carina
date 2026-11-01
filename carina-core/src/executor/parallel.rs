@@ -515,6 +515,7 @@ pub(super) async fn execute_effects_sequential<
     let mut pending_refreshes: HashMap<ResourceId, AppliedIdentifier> = HashMap::new();
     let mut runtime_authored_resource_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = input.compositions.module_constraint_gate();
+    let type_checks = input.type_checks;
 
     let ExpandedEffects {
         effects: expanded_effects,
@@ -738,6 +739,7 @@ pub(super) async fn execute_effects_sequential<
                     provider_configs: input.provider_configs,
                     factories: input.factories,
                     schemas: input.schemas,
+                    type_checks,
                 },
             };
             match try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx) {
@@ -889,6 +891,7 @@ pub(super) async fn execute_effects_sequential<
                     normalizer,
                     factories,
                     schemas,
+                    type_checks,
                 );
                 let result = match effect_for_future.as_basic() {
                     // `BasicEffect` is the type-level contract for
@@ -942,7 +945,7 @@ pub(super) async fn execute_effects_sequential<
                             let outcome = {
                                 let check_input =
                                     provider_check_inputs.data_source_input(resource.as_inner());
-                                match resolve_data_source(check_input, &binding_snapshot) {
+                                match resolve_data_source(check_input, &preparation) {
                                     Ok(resolved_input) => {
                                         resolved = resolved_input.value().clone();
                                         let resolved_secret_shapes =
@@ -1371,6 +1374,7 @@ pub(super) async fn execute_effects_sequential<
         && let Err(error) = module_gate.finish(
             &accumulated.result().bindings,
             report_unresolved_constraints,
+            type_checks,
         )
     {
         for failure in error.failures() {
@@ -1426,11 +1430,17 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred fixture parses");
-        let parsed = crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+        let parsed = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("deferred fixture crosses the module-resolution seam")
+            },
         )
-        .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded()
         .expect("deferred fixture crosses the placeholder boundary");
         parsed
@@ -1696,226 +1706,252 @@ mod tests {
 
     #[tokio::test]
     async fn wait_marked_unsatisfiable_when_only_waits_in_flight() {
-        let provider = TerminalWaitProvider::new();
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |session| {
+                let provider = TerminalWaitProvider::new();
 
-        let mut cert: Resource = Resource::new("test", "cert");
-        cert.binding = Some(absolute("cert"));
-        let cert_id = cert.id.clone();
+                let mut cert: Resource = Resource::new("test", "cert");
+                cert.binding = Some(absolute("cert"));
+                let cert_id = cert.id.clone();
 
-        let mut alb: Resource = Resource::new("test", "alb");
-        alb.binding = Some(absolute("alb"));
+                let mut alb: Resource = Resource::new("test", "alb");
+                alb.binding = Some(absolute("alb"));
 
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(resolved(cert.clone())));
-        plan.add(Effect::Wait {
-            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
-            target_id: managed_wait_target(cert_id.clone()),
-            until: WaitPredicate::equals(
-                AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            )
-            .unwrap(),
-            until_surface: "cert.status == ISSUED".to_string(),
-            timeout: std::time::Duration::from_secs(60),
-            interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: std::collections::HashSet::new(),
-        });
-        plan.add(Effect::Create(resolved(alb.clone())));
+                let mut plan = Plan::new();
+                plan.add(Effect::Create(resolved(cert.clone())));
+                plan.add(Effect::Wait {
+                    identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
+                    target_id: managed_wait_target(cert_id.clone()),
+                    until: WaitPredicate::equals(
+                        AttrPath::single("status"),
+                        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                    )
+                    .unwrap(),
+                    until_surface: "cert.status == ISSUED".to_string(),
+                    timeout: std::time::Duration::from_secs(60),
+                    interval: std::time::Duration::from_millis(1),
+                    explicit_dependencies: std::collections::HashSet::new(),
+                });
+                plan.add(Effect::Create(resolved(alb.clone())));
 
-        let unresolved = HashMap::from([
-            (
-                cert.id.clone(),
-                UnresolvedResource::from_pre_resolve(cert.clone()),
-            ),
-            (
-                alb.id.clone(),
-                UnresolvedResource::from_pre_resolve(alb.clone()),
-            ),
-        ]);
-        let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
-            &SchemaRegistry::new(),
-            plan.effects().iter().map(Effect::resource_id),
-        );
-        let mut input: RuntimeExecutionInput = ExecutionInput {
-            plan: &plan,
-            provider_check_inputs: ProviderCheckInputs::PlanNormalized {
-                resource_origins: &unresolved,
-                data_source_origins: &[],
+                let unresolved = HashMap::from([
+                    (
+                        cert.id.clone(),
+                        UnresolvedResource::from_pre_resolve(cert.clone()),
+                    ),
+                    (
+                        alb.id.clone(),
+                        UnresolvedResource::from_pre_resolve(alb.clone()),
+                    ),
+                ]);
+                let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+                    &SchemaRegistry::new(),
+                    plan.effects().iter().map(Effect::resource_id),
+                );
+                let mut input: RuntimeExecutionInput = ExecutionInput {
+                    provider_context: crate::parser::ProviderContext::clone(
+                        &crate::parser::LoadedProviderContext::empty_for_test(),
+                    ),
+                    plan: &plan,
+                    provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                        resource_origins: &unresolved,
+                        data_source_origins: &[],
+                    },
+                    compositions: &[],
+                    bindings: Default::default(),
+                    managed_current: HashMap::new(),
+                    data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(
+                    ),
+                    normalizer: &NoopNormalizer,
+                    provider_configs: &[],
+                    factories: &[],
+                    schemas: &schemas,
+                    parallelism: std::num::NonZeroUsize::new(2).unwrap(),
+                    precompleted_success_count: 0,
+                    checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+                }
+                .in_session(session);
+                let observer = RecordingSkipObserver::new();
+
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    execute_effects_sequential(
+                        &provider,
+                        &comparison_provider,
+                        &mut input,
+                        &observer,
+                        &ShutdownToken::running(),
+                    ),
+                )
+                .await
+                .expect("wait should be skipped as unsatisfiable instead of timing out");
+                let (result, was_cancelled) = result;
+                assert!(!was_cancelled);
+
+                assert_eq!(result.failure_count(), 1, "alb create should fail");
+                assert_eq!(
+                    result.skip_count, 1,
+                    "wait should be skipped when only waits remain in flight"
+                );
+                assert!(
+                    observer
+                        .failures()
+                        .iter()
+                        .any(|event| event.contains("alb")),
+                    "test setup should fail alb create; failures: {:?}",
+                    observer.failures()
+                );
+                assert!(
+                    observer.skipped().iter().any(|event| {
+                        event.contains("cert")
+                            && event.to_ascii_lowercase().contains("unsatisfiable")
+                    }),
+                    "wait skip reason should contain unsatisfiable, skipped: {:?}",
+                    observer.skipped()
+                );
             },
-            compositions: &[],
-            bindings: Default::default(),
-            managed_current: HashMap::new(),
-            data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(),
-            normalizer: &NoopNormalizer,
-            provider_configs: &[],
-            factories: &[],
-            schemas: &schemas,
-            parallelism: std::num::NonZeroUsize::new(2).unwrap(),
-            precompleted_success_count: 0,
-            checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
-        }
-        .into();
-        let observer = RecordingSkipObserver::new();
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            execute_effects_sequential(
-                &provider,
-                &comparison_provider,
-                &mut input,
-                &observer,
-                &ShutdownToken::running(),
-            ),
         )
         .await
-        .expect("wait should be skipped as unsatisfiable instead of timing out");
-        let (result, was_cancelled) = result;
-        assert!(!was_cancelled);
-
-        assert_eq!(result.failure_count(), 1, "alb create should fail");
-        assert_eq!(
-            result.skip_count, 1,
-            "wait should be skipped when only waits remain in flight"
-        );
-        assert!(
-            observer
-                .failures()
-                .iter()
-                .any(|event| event.contains("alb")),
-            "test setup should fail alb create; failures: {:?}",
-            observer.failures()
-        );
-        assert!(
-            observer.skipped().iter().any(|event| {
-                event.contains("cert") && event.to_ascii_lowercase().contains("unsatisfiable")
-            }),
-            "wait skip reason should contain unsatisfiable, skipped: {:?}",
-            observer.skipped()
-        );
     }
 
     #[tokio::test]
     async fn wait_marked_unsatisfiable_when_failing_sibling_blocks_consumer_inside_wait_subtree() {
-        let provider = TerminalWaitProvider::new();
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |session| {
+                let provider = TerminalWaitProvider::new();
 
-        let mut cert: Resource = Resource::new("test", "cert");
-        cert.binding = Some(absolute("cert"));
-        let cert_id = cert.id.clone();
+                let mut cert: Resource = Resource::new("test", "cert");
+                cert.binding = Some(absolute("cert"));
+                let cert_id = cert.id.clone();
 
-        let mut alb: Resource = Resource::new("test", "alb");
-        alb.binding = Some(absolute("alb"));
+                let mut alb: Resource = Resource::new("test", "alb");
+                alb.binding = Some(absolute("alb"));
 
-        let mut listener: Resource = Resource::new("test", "listener");
-        listener.binding = Some(absolute("listener"));
-        listener.set_attr(
-            "load_balancer_arn",
-            Value::root_resource_ref("alb", "load_balancer_arn", vec![]),
-        );
-        listener.set_attr(
-            "certificate_arn",
-            Value::root_resource_ref("cert_issued", "arn", vec![]),
-        );
+                let mut listener: Resource = Resource::new("test", "listener");
+                listener.binding = Some(absolute("listener"));
+                listener.set_attr(
+                    "load_balancer_arn",
+                    Value::root_resource_ref("alb", "load_balancer_arn", vec![]),
+                );
+                listener.set_attr(
+                    "certificate_arn",
+                    Value::root_resource_ref("cert_issued", "arn", vec![]),
+                );
 
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(resolved(cert.clone())));
-        plan.add(Effect::Wait {
-            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
-            target_id: managed_wait_target(cert_id.clone()),
-            until: WaitPredicate::equals(
-                AttrPath::single("status"),
-                Value::Concrete(ConcreteValue::String("ISSUED".into())),
-            )
-            .unwrap(),
-            until_surface: "cert.status == ISSUED".to_string(),
-            timeout: std::time::Duration::from_secs(60),
-            interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: std::collections::HashSet::new(),
-        });
-        plan.add(Effect::Create(resolved(alb.clone())));
-        plan.add(Effect::Create(resolved(listener.clone())));
+                let mut plan = Plan::new();
+                plan.add(Effect::Create(resolved(cert.clone())));
+                plan.add(Effect::Wait {
+                    identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
+                    target_id: managed_wait_target(cert_id.clone()),
+                    until: WaitPredicate::equals(
+                        AttrPath::single("status"),
+                        Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                    )
+                    .unwrap(),
+                    until_surface: "cert.status == ISSUED".to_string(),
+                    timeout: std::time::Duration::from_secs(60),
+                    interval: std::time::Duration::from_millis(1),
+                    explicit_dependencies: std::collections::HashSet::new(),
+                });
+                plan.add(Effect::Create(resolved(alb.clone())));
+                plan.add(Effect::Create(resolved(listener.clone())));
 
-        let unresolved = HashMap::from([
-            (
-                cert.id.clone(),
-                UnresolvedResource::from_pre_resolve(cert.clone()),
-            ),
-            (
-                alb.id.clone(),
-                UnresolvedResource::from_pre_resolve(alb.clone()),
-            ),
-            (
-                listener.id.clone(),
-                UnresolvedResource::from_pre_resolve(listener.clone()),
-            ),
-        ]);
-        let deps =
-            build_dependency_analysis(plan.effects(), &unresolved, &[], ScheduleInputs::Apply)
+                let unresolved = HashMap::from([
+                    (
+                        cert.id.clone(),
+                        UnresolvedResource::from_pre_resolve(cert.clone()),
+                    ),
+                    (
+                        alb.id.clone(),
+                        UnresolvedResource::from_pre_resolve(alb.clone()),
+                    ),
+                    (
+                        listener.id.clone(),
+                        UnresolvedResource::from_pre_resolve(listener.clone()),
+                    ),
+                ]);
+                let deps = build_dependency_analysis(
+                    plan.effects(),
+                    &unresolved,
+                    &[],
+                    ScheduleInputs::Apply,
+                )
                 .expect("dependency analysis must resolve")
                 .into_deps_of();
-        assert!(
-            deps.get(&3).is_some_and(|listener_deps| {
-                listener_deps.contains(&1) && listener_deps.contains(&2)
-            }),
-            "listener should depend on both alb and cert_issued; deps: {deps:?}"
-        );
+                assert!(
+                    deps.get(&3).is_some_and(|listener_deps| {
+                        listener_deps.contains(&1) && listener_deps.contains(&2)
+                    }),
+                    "listener should depend on both alb and cert_issued; deps: {deps:?}"
+                );
 
-        let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
-            &SchemaRegistry::new(),
-            plan.effects().iter().map(Effect::resource_id),
-        );
-        let mut input: RuntimeExecutionInput = ExecutionInput {
-            plan: &plan,
-            provider_check_inputs: ProviderCheckInputs::PlanNormalized {
-                resource_origins: &unresolved,
-                data_source_origins: &[],
+                let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+                    &SchemaRegistry::new(),
+                    plan.effects().iter().map(Effect::resource_id),
+                );
+                let mut input: RuntimeExecutionInput = ExecutionInput {
+                    provider_context: crate::parser::ProviderContext::clone(
+                        &crate::parser::LoadedProviderContext::empty_for_test(),
+                    ),
+                    plan: &plan,
+                    provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                        resource_origins: &unresolved,
+                        data_source_origins: &[],
+                    },
+                    compositions: &[],
+                    bindings: Default::default(),
+                    managed_current: HashMap::new(),
+                    data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(
+                    ),
+                    normalizer: &NoopNormalizer,
+                    provider_configs: &[],
+                    factories: &[],
+                    schemas: &schemas,
+                    parallelism: std::num::NonZeroUsize::new(2).unwrap(),
+                    precompleted_success_count: 0,
+                    checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+                }
+                .in_session(session);
+                let observer = RecordingSkipObserver::new();
+
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    execute_effects_sequential(
+                        &provider,
+                        &comparison_provider,
+                        &mut input,
+                        &observer,
+                        &ShutdownToken::running(),
+                    ),
+                )
+                .await
+                .expect("wait should be skipped as unsatisfiable instead of polling until timeout");
+                let (result, was_cancelled) = result;
+                assert!(!was_cancelled);
+
+                assert!(
+                    result.failure_count() >= 1,
+                    "alb create should fail; failure_count: {}",
+                    result.failure_count()
+                );
+                assert!(
+                    result.skip_count >= 1,
+                    "listener and cert_issued should be skipped; skip_count: {}",
+                    result.skip_count
+                );
+                assert!(
+                    observer.skipped().iter().any(|event| {
+                        event.contains("cert")
+                            && event.to_ascii_lowercase().contains("unsatisfiable")
+                    }),
+                    "wait skip reason should contain unsatisfiable, skipped: {:?}",
+                    observer.skipped()
+                );
             },
-            compositions: &[],
-            bindings: Default::default(),
-            managed_current: HashMap::new(),
-            data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(),
-            normalizer: &NoopNormalizer,
-            provider_configs: &[],
-            factories: &[],
-            schemas: &schemas,
-            parallelism: std::num::NonZeroUsize::new(2).unwrap(),
-            precompleted_success_count: 0,
-            checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
-        }
-        .into();
-        let observer = RecordingSkipObserver::new();
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            execute_effects_sequential(
-                &provider,
-                &comparison_provider,
-                &mut input,
-                &observer,
-                &ShutdownToken::running(),
-            ),
         )
         .await
-        .expect("wait should be skipped as unsatisfiable instead of polling until timeout");
-        let (result, was_cancelled) = result;
-        assert!(!was_cancelled);
-
-        assert!(
-            result.failure_count() >= 1,
-            "alb create should fail; failure_count: {}",
-            result.failure_count()
-        );
-        assert!(
-            result.skip_count >= 1,
-            "listener and cert_issued should be skipped; skip_count: {}",
-            result.skip_count
-        );
-        assert!(
-            observer.skipped().iter().any(|event| {
-                event.contains("cert") && event.to_ascii_lowercase().contains("unsatisfiable")
-            }),
-            "wait skip reason should contain unsatisfiable, skipped: {:?}",
-            observer.skipped()
-        );
     }
 
     #[test]

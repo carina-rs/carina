@@ -8676,7 +8676,14 @@ fn published_null_export_is_absent_for_coalesce_resolution() {
     });
 
     assert_eq!(
-        carina_core::resolver::resolve_ref_value_status(&expression, &bindings),
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| carina_core::resolver::resolve_ref_value_status(
+                &expression,
+                &bindings,
+                session
+            ),
+        ),
         Ok(carina_core::resolver::ValueResolution::Present(default)),
     );
 }

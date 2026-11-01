@@ -262,11 +262,19 @@ pub fn run_validate(
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let loaded = load_configuration_with_config(
+    let loaded = match load_configuration_with_config(
         path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?;
+    ) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return crate::wiring::settle_type_checks(
+                crate::wiring::failed_configuration_report(path, error.into()),
+                AppError::Validation,
+            );
+        }
+    };
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
@@ -295,9 +303,6 @@ pub fn run_validate(
         providers.validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations);
     // Publish unresolved provider checks even if another validation/load error
     // prevents a resolved file from being returned.
-    for warning in validation_report.provider_type_warnings() {
-        print_provider_type_warning(warning);
-    }
     let (validation_result, schemas) = validation_report.into_parts();
     let parsed = match validation_result {
         Ok(parsed) => {
@@ -504,7 +509,7 @@ mod tests {
         std::fs::write(fixture.path().join("main.crn"), "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes { x: AwsAccountId = '123' }\n").unwrap();
         let loaded = load_configuration_with_config(
             fixture.path(),
-            ProviderContext::unloaded(),
+            &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .unwrap();
@@ -545,11 +550,17 @@ mod tests {
     fn resolve_file_for_test(
         parsed: carina_core::parser::ParsedFile,
     ) -> carina_core::parser::ModuleResolvedParsedFile {
-        carina_core::module_resolver::resolve_modules_providerless(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_providerless(
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("test fixture crosses module resolution")
+            },
         )
-        .expect("test fixture crosses module resolution")
     }
 
     #[test]
@@ -957,11 +968,17 @@ let observed_names = roles.names
             &ProviderContext::default(),
         )
         .expect("fixture parses");
-        let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
-        )
-        .expect("cross the deferred-body resolution seam");
+        let parsed = carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_providerless(
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("cross the deferred-body resolution seam")
+            },
+        );
         // After the resolution seam the same-config provider-read loop is not
         // in `parsed.resources`; its resource-only template is ready for the
         // validate display path in `deferred_for_expressions`.

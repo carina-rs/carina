@@ -419,6 +419,23 @@ pub struct ValidationTypeContext<'a, B: BindingAddress = RelativeBindingName> {
 }
 
 impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
+    pub fn in_session<E, D>(
+        file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        schemas: &'a SchemaRegistry,
+        session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        Self::with_provider_context(
+            file,
+            schemas,
+            typecheck::TypecheckProviderContext::for_session(session),
+            module_signatures,
+        )
+    }
+
     pub fn new<E, D>(
         file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         schemas: &'a SchemaRegistry,
@@ -469,12 +486,23 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
             schemas,
             provider_context,
             module_signatures,
-            scope_bindings: BindingIndex::from_parsed_with_module_signatures(
-                file,
-                schemas,
-                module_signatures,
-                provider_context.as_provider_context(),
-            ),
+            scope_bindings: match provider_context.session() {
+                Some(session) => {
+                    BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                        file,
+                        schemas,
+                        None,
+                        module_signatures,
+                        session,
+                    )
+                }
+                None => BindingIndex::from_parsed_with_module_signatures(
+                    file,
+                    schemas,
+                    module_signatures,
+                    provider_context.as_provider_context(),
+                ),
+            },
             inference_bindings: inference::bindings_from_parsed(file),
         }
     }
@@ -740,9 +768,10 @@ fn declared_value_assignable_to_sink(
     name: &str,
     declared_type: &TypeExpr,
     sink: RefSink<'_>,
-    config: &ProviderContext,
+    provider_context: typecheck::TypecheckProviderContext<'_>,
     schemas: &SchemaRegistry,
 ) -> Result<(), BindingResolutionError> {
+    let config = provider_context.as_provider_context();
     let resolved =
         resolve_type_expr(declared_type, config).map_err(BindingResolutionError::TypeResolution)?;
     let resolved = crate::parser::resolve_type_expr_from_schemas(&resolved, schemas, config)
@@ -777,7 +806,12 @@ fn declared_value_assignable_to_sink(
             .require_loaded()
             .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))?
     } else {
-        assignment.record_unchecked(config.type_checks())
+        match provider_context.session() {
+            Some(session) => assignment.record_unchecked(session),
+            None => assignment
+                .require_loaded()
+                .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))?,
+        }
     };
     if assignable {
         return Ok(());
@@ -994,7 +1028,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
             &use_site.name,
             declared_type,
             sink,
-            context.raw_provider_context(),
+            context.provider_context,
             context.schemas,
         );
     }
@@ -1015,7 +1049,16 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
         .map_err(BindingResolutionError::Type),
         RefSink::TypeExpr(type_expr) => context
             .provider_context
-            .check(type_expr, value, typecheck::TypecheckInference::Unavailable)
+            .check_at(
+                type_expr,
+                value,
+                typecheck::TypecheckInference::Unavailable,
+                deferred_types::ProviderTypeCheckSite::new(
+                    use_site.source_file.path(),
+                    use_site.span,
+                    format!("binding '{}'", use_site.name),
+                ),
+            )
             .map_err(|error| BindingResolutionError::ValueType(Box::new(error))),
     }
 }
@@ -1474,6 +1517,32 @@ pub fn resolve_bare_binding_uses<
             ValidationTypeContext::new(&file, schemas, provider_context, module_signatures);
         check_expanded_bare_binding_uses(&file, &context)
     };
+    finish_binding_resolution(file, report)
+}
+
+/// Consume a bootstrap/recovery file using the same incomplete catalog that
+/// checked its declarations and module boundaries. Unavailable provider types
+/// remain recorded in that catalog's settlement sink.
+pub fn resolve_bare_binding_uses_in_session<
+    E: crate::parser::IntoExpandedExportParam<AbsoluteBindingAddress>,
+>(
+    file: crate::parser::ModuleResolvedFile<E>,
+    schemas: &SchemaRegistry,
+    provider_context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
+) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
+    let report = {
+        let context =
+            ValidationTypeContext::in_session(&file, schemas, provider_context, module_signatures);
+        check_expanded_bare_binding_uses(&file, &context)
+    };
+    finish_binding_resolution(file, report)
+}
+
+fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>(
+    file: crate::parser::ModuleResolvedFile<E>,
+    report: BindingUseReport,
+) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
     if !report.is_ready() {
         return Err(report.into());
     }
@@ -3158,11 +3227,14 @@ fn validate_user_function_ref_types_inner<
                     .and_then(|parameter| parameter.param_type.as_ref());
                 let argument_context = format!("function '{name}': argument {}", index + 1);
                 let awaits_module_substitution = argument.pending_parameter().is_some();
+                // Explicit handles belong to the parser's in-session argument
+                // check. This pass supplies binding authority for values only.
                 if let Some(sink) = parameter_sink
                     && !awaits_module_substitution
+                    && let Some(value) = argument.value()
                 {
                     check_refs(
-                        argument.walker_value(),
+                        value,
                         Some(RefSink::TypeExpr(sink)),
                         &argument_context,
                         bindings,
@@ -5208,9 +5280,6 @@ pub fn resolve_parameter_type_for_check(
 ) -> Result<Option<ResolvedParameterType>, StaticTypeResolutionError> {
     let resolved = resolve_type_expr(ty, config)?;
     if matches!(resolved, TypeExpr::DottedUnresolved(_)) {
-        config
-            .type_checks()
-            .record_type(&resolved, "parameter annotation");
         return Ok(None);
     }
     resolve_parameter_type(&resolved, config).map(Some)
@@ -5410,7 +5479,7 @@ impl FileTypeResolutionReport {
 
 fn resolve_declaration_type(
     ty: &mut TypeExpr,
-    config: &ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     site: &deferred_types::ProviderTypeCheckSite,
 ) -> Vec<TypeResolutionError> {
     match ty {
@@ -5425,14 +5494,14 @@ fn resolve_declaration_type(
             .iter_mut()
             .flat_map(|(_, field)| resolve_declaration_type(field, config, site))
             .collect(),
-        _ => match resolve_type_expr(ty, config) {
+        _ => match resolve_type_expr(ty, config.catalog()) {
             Ok(resolved) => {
-                config.type_checks().declaration(&resolved, site.clone());
+                config.declaration(&resolved, site.clone());
                 if matches!(
                     resolved,
                     TypeExpr::UnloadedSchemaType(_) | TypeExpr::DottedUnresolved(_)
                 ) {
-                    config.type_checks().record(&resolved, site.clone());
+                    config.record(&resolved, site.clone());
                 }
                 *ty = resolved;
                 Vec::new()
@@ -5444,7 +5513,7 @@ fn resolve_declaration_type(
 
 fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike>(
     parsed: &mut crate::parser::File<E>,
-    config: &ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Vec<TypeResolutionDiagnostic> {
     use deferred_types::ProviderTypeCheckSite;
     let mut errors = Vec::new();
@@ -5596,7 +5665,7 @@ pub fn resolve_consumer_static_type_for_signature(
 /// every frontend the same contextual error surface.
 pub fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
     parsed: &mut crate::parser::File<E>,
-    config: &ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Vec<TypeResolutionDiagnostic> {
     resolve_file_type_exprs_report(parsed, config, None).into_diagnostics()
 }
@@ -5605,7 +5674,7 @@ pub fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
 /// an optional parser backstop for the same authored type token.
 pub fn resolve_file_type_exprs_report<E: crate::parser::ExportParamLike>(
     parsed: &mut crate::parser::File<E>,
-    config: &ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     parser_error: Option<TypeResolutionParserError<'_>>,
 ) -> FileTypeResolutionReport {
     let diagnostics = resolve_file_type_exprs_impl(parsed, config);
@@ -5684,7 +5753,7 @@ pub fn resolve_attribute_static_types_for_consumer(
 /// authored syntax for declarations outside its provider catalog.
 pub fn resolve_file_type_exprs_best_effort<E: crate::parser::ExportParamLike>(
     parsed: &mut crate::parser::File<E>,
-    config: &ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) {
     let _diagnostics = resolve_file_type_exprs_impl(parsed, config);
 }
@@ -6574,7 +6643,12 @@ pub enum ModuleCallReferenceChecks {
 }
 
 /// Input to the authored module-call diagnostic phase.
-pub struct ModuleCallCheckInput<'a, 'bindings, E, C: ?Sized = LoadedProviderContext> {
+pub struct ModuleCallCheckInput<
+    'a,
+    'bindings,
+    E,
+    C: ?Sized = dyn deferred_types::ProviderTypeCheckContext + 'a,
+> {
     pub authored: &'a crate::parser::File<E>,
     pub semantic: Option<&'a crate::parser::File<E>>,
     pub base_dir: Option<&'a std::path::Path>,
@@ -6935,10 +7009,16 @@ impl ModuleCallChecker<'_> {
             } else {
                 typecheck::TypecheckInference::Unavailable
             };
-            if let Err(error) =
-                self.provider_context
-                    .check(&resolved_parameter.as_type_expr(), value, inference)
-            {
+            if let Err(error) = self.provider_context.check_at(
+                &resolved_parameter.as_type_expr(),
+                value,
+                inference,
+                deferred_types::ProviderTypeCheckSite::new(
+                    authored_call.id().source_file(),
+                    authored.value_span(),
+                    format!("{call_label} argument '{argument}'"),
+                ),
+            ) {
                 self.push_finding(ModuleCallFinding::argument_value(
                     ModuleCallFindingKind::ValueType,
                     owner.clone(),
@@ -7063,8 +7143,12 @@ impl ModuleCallChecker<'_> {
         }
 
         if let Some(mut module) = crate::module_resolver::load_module(&module_dir) {
-            let resolution_errors =
-                resolve_file_type_exprs(&mut module, self.provider_context.as_provider_context());
+            let resolution_errors = resolve_file_type_exprs(
+                &mut module,
+                self.provider_context
+                    .session()
+                    .expect("module checks borrow their run session"),
+            );
             let signatures = crate::module_resolver::load_resolved_module_signatures(
                 &module,
                 &module_dir,
@@ -7405,9 +7489,9 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
 
 /// Collect module-call findings from authored source and its imported graph.
 pub fn check_module_calls<E>(
-    input: ModuleCallCheckInput<'_, '_, E, LoadedProviderContext>,
+    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
 ) -> Vec<ModuleCallFinding> {
-    let provider_context = typecheck::TypecheckProviderContext::loaded(input.provider_context);
+    let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
     check_module_calls_with_provider_context(input, provider_context)
 }
 
@@ -7415,10 +7499,9 @@ pub fn check_module_calls<E>(
 /// contexts. Structural checks still run, while provider-owned leaves are not
 /// sent to an unloaded resolver.
 pub fn check_module_calls_providerless<E>(
-    input: ModuleCallCheckInput<'_, '_, E, ProviderContext>,
+    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
 ) -> Vec<ModuleCallFinding> {
-    let provider_context =
-        typecheck::TypecheckProviderContext::providerless(input.provider_context);
+    let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
     check_module_calls_with_provider_context(input, provider_context)
 }
 
@@ -7575,7 +7658,7 @@ impl<P> CheckedExportValues<P> {
 fn resolve_and_validate_export_values<E, P: PlaceholderKind, B: BindingAddress>(
     export_params: &[E],
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
-    config: typecheck::TypecheckProviderContext<'_>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Vec<E>, String>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
@@ -7602,11 +7685,7 @@ where
                 checked.push(resolved_param);
                 continue;
             }
-            match crate::resolver::resolve_ref_value_with_config(
-                value,
-                bindings,
-                config.as_provider_context(),
-            ) {
+            match crate::resolver::resolve_ref_value_with_config(value, bindings, config) {
                 Ok(resolved) if crate::value::contains_secret(&resolved) => {
                     errors.push(format!(
                         "export '{}' cannot hold a secret value",
@@ -7617,13 +7696,28 @@ where
                     resolved_param.set_value(Some(resolved));
                     if let (Some(type_expr), Some(value)) =
                         (resolved_param.type_expr_opt(), resolved_param.value())
-                        && let Err(error) = config.check(
-                            type_expr,
-                            value,
-                            typecheck::TypecheckInference::Unavailable,
-                        )
                     {
-                        errors.push(format!("export '{}': {error}", param.name()));
+                        let provider = typecheck::TypecheckProviderContext::for_session(config);
+                        let check = match param.source_location() {
+                            Some((source, span)) => provider.check_at(
+                                type_expr,
+                                value,
+                                typecheck::TypecheckInference::Unavailable,
+                                deferred_types::ProviderTypeCheckSite::new(
+                                    source,
+                                    span,
+                                    format!("export '{}'", param.name()),
+                                ),
+                            ),
+                            None => provider.check(
+                                type_expr,
+                                value,
+                                typecheck::TypecheckInference::Unavailable,
+                            ),
+                        };
+                        if let Err(error) = check {
+                            errors.push(format!("export '{}': {error}", param.name()));
+                        }
                     }
                 }
                 Err(error) => errors.push(format!("export '{}': {error}", param.name())),
@@ -7645,16 +7739,12 @@ where
 pub fn check_export_values_pre_apply_providerless<E, P: PlaceholderKind, B: BindingAddress>(
     export_params: &[E],
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
-    config: &ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ExportsCheckedPreApply<E>, String>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
-    let display_params = resolve_and_validate_export_values(
-        export_params,
-        bindings,
-        typecheck::TypecheckProviderContext::providerless(config),
-    )?;
+    let display_params = resolve_and_validate_export_values(export_params, bindings, config)?;
     Ok(ExportsCheckedPreApply {
         original_params: export_params.to_vec(),
         display_params,
@@ -7667,16 +7757,12 @@ where
 pub fn check_export_values_pre_apply<E, P: PlaceholderKind, B: BindingAddress>(
     export_params: &[E],
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
-    config: &LoadedProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ExportsCheckedPreApply<E>, String>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
-    let display_params = resolve_and_validate_export_values(
-        export_params,
-        bindings,
-        typecheck::TypecheckProviderContext::loaded(config),
-    )?;
+    let display_params = resolve_and_validate_export_values(export_params, bindings, config)?;
     Ok(ExportsCheckedPreApply {
         original_params: export_params.to_vec(),
         display_params,
@@ -7689,16 +7775,13 @@ where
 pub fn resolve_export_values_post_apply<E, P: PlaceholderKind, B: BindingAddress>(
     export_params: &ExportsCheckedPreApply<E>,
     bindings: &crate::binding_index::ResolvedBindings<P, B>,
-    config: &LoadedProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<CheckedExportValues<E>, String>
 where
     E: crate::parser::ExportParamLike<P, B> + Clone,
 {
-    let params = resolve_and_validate_export_values(
-        &export_params.original_params,
-        bindings,
-        typecheck::TypecheckProviderContext::loaded(config),
-    )?;
+    let params =
+        resolve_and_validate_export_values(&export_params.original_params, bindings, config)?;
     Ok(CheckedExportValues { params })
 }
 
@@ -7711,21 +7794,39 @@ pub fn validate_attribute_params<P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
     config: &LoadedProviderContext,
 ) -> Result<(), String> {
-    validate_attribute_params_with_context(attribute_params, config.as_provider_context())
+    validate_attribute_params_impl(
+        attribute_params,
+        typecheck::TypecheckProviderContext::loaded(config),
+    )
 }
 
 pub fn validate_attribute_params_with_context<P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
-    config: &ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Result<(), String> {
+    validate_attribute_params_impl(
+        attribute_params,
+        typecheck::TypecheckProviderContext::for_session(config),
+    )
+}
+
+fn validate_attribute_params_impl<P: PlaceholderKind, B: BindingAddress>(
+    attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
+    config: typecheck::TypecheckProviderContext<'_>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for param in attribute_params {
         if let (Some(type_expr), Some(value)) = (&param.static_type, &param.value)
-            && let Err(error) = typecheck::TypecheckProviderContext::for_parser(config).check(
+            && let Err(error) = config.check_at(
                 type_expr,
                 value,
                 typecheck::TypecheckInference::Unavailable,
+                deferred_types::ProviderTypeCheckSite::new(
+                    param.source_file(),
+                    param.source_span(),
+                    format!("attribute '{}'", param.name),
+                ),
             )
         {
             errors.push(format!("attribute '{}': {}", param.name, error));

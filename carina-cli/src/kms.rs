@@ -73,7 +73,7 @@ pub async fn decrypt_one(
 /// runtime. Production calls go through `#[tokio::main]` (multi-thread
 /// by default); tests must use `#[tokio::test(flavor = "multi_thread")]`.
 pub fn build_kms_decryptor(client: Client) -> DecryptorFn {
-    Box::new(move |ciphertext, key| {
+    std::sync::Arc::new(move |ciphertext, key| {
         let ciphertext = ciphertext.to_string();
         let key = key.map(|k| k.to_string());
         let client = client.clone();

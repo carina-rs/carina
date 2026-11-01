@@ -24,6 +24,32 @@ fn text(output: &Output) -> String {
 }
 
 #[test]
+fn failed_provider_with_a_syntax_error_sibling_keeps_non_authoritative_diagnostics() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        format!("{FAILED}fn f(x: broken.Widget) {{ x }}\n"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let =\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .args(["validate", directory.path().to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let text = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert_eq!(
+        text.matches("type check for broken.Widget was deferred")
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains("unknown custom type"), "{text}");
+    assert!(text.contains("Syntax error"), "{text}");
+}
+
+#[test]
 fn settlement_fixture_a_failed_provider_defers_attribute_once() {
     let output = run("validate", &format!("{FAILED}{ATTRIBUTE}"));
     let text = text(&output);
@@ -99,6 +125,16 @@ fn settlement_lint_failed_provider_is_a_finding_without_annotations() {
 }
 
 #[test]
+fn lint_deferred_provider_checks_keep_the_authored_column() {
+    let output = run("lint", &format!("{FAILED}{FUNCTIONS}{ATTRIBUTE}"));
+    let text = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("main.crn:2:9:"), "{text}");
+    assert!(text.contains("main.crn:3:9:"), "{text}");
+    assert!(text.contains("main.crn:5:3:"), "{text}");
+}
+
+#[test]
 fn settlement_lint_failed_provider_reports_all_uncalled_annotations() {
     let output = run("lint", &format!("{FAILED}{FUNCTIONS}{ATTRIBUTE}"));
     let text = text(&output);
@@ -127,4 +163,47 @@ fn settlement_factoryless_provider_is_non_authoritative() {
         );
         assert!(!text.contains("unknown custom type"), "{text}");
     }
+}
+
+#[test]
+fn settlement_partial_catalog_keeps_loaded_resource_schema_findings() {
+    let output = run(
+        "validate",
+        &format!(
+            "provider mock {{}}\n{FAILED}mock.test.resource {{ name = 'bucket' bukcet = 'typo' }}\n"
+        ),
+    );
+    let text = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert_eq!(text.matches("bukcet").count(), 1, "{text}");
+    assert!(text.contains("broken"), "{text}");
+    assert!(!text.contains("was deferred"), "{text}");
+}
+
+#[test]
+fn settlement_directory_catalog_ignores_an_uninitialized_sibling_directory() {
+    let workspace = tempfile::tempdir().unwrap();
+    let a = workspace.path().join("a");
+    let b = workspace.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::write(
+        a.join("main.crn"),
+        "provider mock {}\nfn f(x: BareUnknown) { x }\n",
+    )
+    .unwrap();
+    std::fs::write(b.join("main.crn"), FAILED).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .args(["validate", a.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let text = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert_eq!(
+        text.matches("unknown custom type 'BareUnknown'").count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains("was deferred"), "{text}");
 }

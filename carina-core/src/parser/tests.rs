@@ -644,13 +644,18 @@ fn cross_deferred_for_resolution_seam<E>(parsed: File<E>) -> ModuleResolvedFile<
 where
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 {
-    crate::module_resolver::resolve_modules_with_providerless_config(
-        crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+    crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
+        |session| {
+            crate::module_resolver::resolve_modules_with_providerless_config(
+                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect("deferred fixture crosses the module-resolution seam")
+        },
     )
-    .expect("deferred fixture crosses the module-resolution seam")
 }
 
 fn known(type_expr: TypeExpr) -> TypeExpr {
@@ -4205,9 +4210,11 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
         .clone()
         .into_expanded()
         .expect("provider config must contain no parser placeholders");
-    let resolved =
-        resolve_provider_attributes_with_remote(&expanded, &remote, &ProviderContext::default())
-            .expect("resolve must succeed");
+    let resolved = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&expanded, &remote, session),
+    )
+    .expect("resolve must succeed");
 
     let assume_role = resolved
         .iter()
@@ -4281,9 +4288,11 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
             .expect("provider config must contain no parser placeholders");
     let empty: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
-    let error =
-        resolve_provider_attributes_with_remote(&parsed, &empty, &ProviderContext::default())
-            .expect_err("resolved provider configs must reject a missing binding");
+    let error = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&parsed, &empty, session),
+    )
+    .expect_err("resolved provider configs must reject a missing binding");
 
     let message = error.to_string();
     assert!(message.contains("assume_role"), "{message}");
@@ -4310,19 +4319,23 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     )
     .unwrap();
 
-    let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-        parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
-        tmp.path(),
+    let parsed = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
+        |session| {
+            crate::module_resolver::resolve_modules_with_providerless_config(
+                parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
+                tmp.path(),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect("provider config crosses the module-resolution seam")
+        },
     )
-    .expect("provider config crosses the module-resolution seam")
     .into_expanded()
     .expect("provider config must contain no parser placeholders");
-    let resolved = resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let resolved = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
     )
     .expect("provider attributes should use the merged user-function scope");
     assert_eq!(
@@ -4353,19 +4366,23 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
     )
     .unwrap();
 
-    let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-        parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
-        tmp.path(),
+    let parsed = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
+        |session| {
+            crate::module_resolver::resolve_modules_with_providerless_config(
+                parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
+                tmp.path(),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect("provider config crosses the module-resolution seam")
+        },
     )
-    .expect("provider config crosses the module-resolution seam")
     .into_expanded()
     .expect("provider config must contain no parser placeholders");
-    let error = resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
     )
     .expect_err("invalid sibling function should fail at the authored provider call");
     let ProviderConfigResolutionError::Parse(ParseError::Located { path, error }) = error else {
@@ -4408,9 +4425,11 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
     let parsed = cross_deferred_for_resolution_seam(parsed)
         .into_expanded()
         .expect("provider config must contain no parser placeholders");
-    let resolved =
-        resolve_provider_attributes_with_remote(&parsed, &remote, &ProviderContext::default())
-            .expect("default_tags do not participate in the provider-ready invariant");
+    let resolved = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&parsed, &remote, session),
+    )
+    .expect("default_tags do not participate in the provider-ready invariant");
     let saved = SavedProviderConfigs::from(&resolved);
     assert!(matches!(
         saved.as_provider_configs()[0].default_tags.get("Owner"),
@@ -9080,7 +9099,9 @@ let result = mock.test.resource {{
 #[test]
 fn user_fn_evaluated_decrypt_result_is_redacted_at_parameter_boundary() {
     let config = ProviderContext {
-        decryptor: Some(Box::new(|_, _| Ok("hunter2plaintext".to_string()))),
+        decryptor: Some(std::sync::Arc::new(|_, _| {
+            Ok("hunter2plaintext".to_string())
+        })),
         ..ProviderContext::default()
     };
     let input = r#"
@@ -9104,7 +9125,9 @@ let result = mock.test.resource {
 #[test]
 fn user_fn_evaluated_decrypt_result_is_redacted_at_return_boundary() {
     let config = ProviderContext {
-        decryptor: Some(Box::new(|_, _| Ok("hunter2plaintext".to_string()))),
+        decryptor: Some(std::sync::Arc::new(|_, _| {
+            Ok("hunter2plaintext".to_string())
+        })),
         ..ProviderContext::default()
     };
     let input = r#"
@@ -10398,7 +10421,7 @@ fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnosti
 #[test]
 fn parse_decrypt_uses_config_decryptor() {
     let config = ProviderContext {
-        decryptor: Some(Box::new(|ciphertext, _key| {
+        decryptor: Some(std::sync::Arc::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         })),
         ..ProviderContext::default()
@@ -10440,7 +10463,7 @@ fn parse_decrypt_uses_config_decryptor() {
 #[test]
 fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
     let config = ProviderContext {
-        decryptor: Some(Box::new(|ciphertext, _key| {
+        decryptor: Some(std::sync::Arc::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         })),
         ..ProviderContext::default()
@@ -12813,7 +12836,11 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         wait_aliases: &[],
     });
     let upstream_keys: HashSet<&str> = remote_bindings.keys().map(String::as_str).collect();
-    resolve_refs_for_plan(&mut parsed.resources, &bindings, &upstream_keys).unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| resolve_refs_for_plan(&mut parsed.resources, &bindings, &upstream_keys, session),
+    )
+    .unwrap();
 
     let child = &parsed.resources[0];
     assert!(
@@ -13267,11 +13294,17 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
         errs.as_slice(),
         [ParseError::UndefinedDeferredIterable { name, .. }] if name == "org"
     ));
-    let err = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect_err("finalization must reject the bare undefined iterable");
+    let err = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect_err("finalization must reject the bare undefined iterable")
+        },
+    );
     let crate::module_resolver::ModuleError::Parse(parse_error) = err.root_cause() else {
         panic!("expected a typed parse error, got {err:?}");
     };
@@ -14329,10 +14362,14 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
 
     let parsed = parse_directory(tmp.path(), &ProviderContext::default())
         .expect("directory fixture must parse");
-    let parsed = resolve_modules(parsed, tmp.path())
-        .expect("module expansion must succeed")
-        .into_expanded()
-        .expect("module fixture contains no parser placeholders");
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| {
+            resolve_modules(parsed, tmp.path(), session).expect("module expansion must succeed")
+        },
+    )
+    .into_expanded()
+    .expect("module fixture contains no parser placeholders");
     let record = parsed
         .resources
         .iter()

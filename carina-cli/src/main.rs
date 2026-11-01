@@ -346,7 +346,7 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
         tokio::sync::OnceCell::const_new();
 
     carina_core::parser::ProviderContext {
-        decryptor: Some(Box::new(|ciphertext, key| {
+        decryptor: Some(std::sync::Arc::new(|ciphertext, key| {
             let ciphertext = ciphertext.to_string();
             let key = key.map(|k| k.to_string());
             tokio::task::block_in_place(|| {

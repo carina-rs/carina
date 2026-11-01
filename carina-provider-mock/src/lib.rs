@@ -1850,6 +1850,7 @@ impl Provider for MockProvider {
 mod tests {
     use super::*;
     use carina_core::resource::NoPlaceholder;
+
     use std::ffi::{OsStr, OsString};
     use std::sync::Mutex;
     use std::time::Instant;
@@ -1969,20 +1970,31 @@ mod tests {
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
-        let preparation = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &carina_core::provider::NoopNormalizer,
-            &[],
-            &schemas,
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            std::sync::Arc::new(Vec::new()),
+            schemas.clone(),
         );
-        let request = carina_core::executor::prepare_create_request(resource, &preparation)
-            .await
-            .expect("mock test resource should pass create preparation");
-        let (create, _cancellation) =
-            carina_core::executor::dispatch_create(provider, &id, request);
-        create.await
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let request =
+                    carina_core::executor::prepare_create_request(resource, &preparation).await;
+                let request = request.expect("mock test resource should pass create preparation");
+                let (create, _cancellation) =
+                    carina_core::executor::dispatch_create(provider, &id, request);
+                create.await
+            },
+        )
+        .await
     }
 
     fn persist_pending_for_resume(pending: &InFlightCreate) -> InFlightCreate {
@@ -2166,20 +2178,34 @@ mod tests {
                 let module_gate =
                     carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
                 let schemas = carina_core::schema::SchemaRegistry::new();
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
-                    &bindings,
-                    &module_gate,
-                    &[],
-                    &carina_core::provider::NoopNormalizer,
-                    &[],
-                    &schemas,
+                let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+                    std::sync::Arc::new(Vec::new()),
+                    schemas.clone(),
                 );
-                let create_request =
-                    carina_core::executor::prepare_create_request(resource.clone(), &preparation)
-                        .await
-                        .expect("resume fixture passes create preparation");
-                ResumeCreateRequest::for_test(pending.clone(), create_request)
-                    .expect("resume fixture route matches")
+                carina_core::validation::deferred_types::with_session_for_test_async(
+                    provider_types.provider_context(),
+                    async |type_checks| {
+                        let preparation = carina_core::executor::ProviderPreparationContext::new(
+                            &bindings,
+                            &module_gate,
+                            &[],
+                            &carina_core::provider::NoopNormalizer,
+                            &[],
+                            &schemas,
+                            type_checks,
+                        );
+                        let create_request = carina_core::executor::prepare_create_request(
+                            resource.clone(),
+                            &preparation,
+                        )
+                        .await;
+                        let create_request =
+                            create_request.expect("resume fixture passes create preparation");
+                        ResumeCreateRequest::for_test(pending.clone(), create_request)
+                            .expect("resume fixture route matches")
+                    },
+                )
+                .await
             });
             let result = runtime
                 .block_on(provider.resume_create(request))
@@ -2724,33 +2750,44 @@ mod tests {
                     .validate()
                     .expect("test schema must be valid"),
             );
-            let preparation = carina_core::executor::ProviderPreparationContext::new(
-                &bindings,
-                &module_gate,
-                &[],
-                &carina_core::provider::NoopNormalizer,
-                &[],
-                &schemas,
+            let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+                std::sync::Arc::new(Vec::new()),
+                schemas.clone(),
             );
-            let request = carina_core::executor::prepare_update_request(
-                update_resource,
-                from,
-                &["comment".to_string()],
-                &preparation,
+            carina_core::validation::deferred_types::with_session_for_test_async(
+                provider_types.provider_context(),
+                async |type_checks| {
+                    let preparation = carina_core::executor::ProviderPreparationContext::new(
+                        &bindings,
+                        &module_gate,
+                        &[],
+                        &carina_core::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        type_checks,
+                    );
+                    let request = carina_core::executor::prepare_update_request(
+                        update_resource,
+                        from,
+                        &["comment".to_string()],
+                        &preparation,
+                    )
+                    .await;
+                    let request = request.expect("update request should pass checked preparation");
+                    let identifier = AppliedIdentifier::new("mock-id")
+                        .expect("the mock identifier is non-empty");
+                    provider
+                        .update(&id, &identifier, request)
+                        .await
+                        .expect("update should succeed");
+
+                    provider
+                        .delete(&id, &identifier, delete_request_without_schema())
+                        .await
+                        .expect("delete should succeed");
+                },
             )
             .await
-            .expect("update request should pass checked preparation");
-            let identifier =
-                AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
-            provider
-                .update(&id, &identifier, request)
-                .await
-                .expect("update should succeed");
-
-            provider
-                .delete(&id, &identifier, delete_request_without_schema())
-                .await
-                .expect("delete should succeed");
         });
 
         assert_eq!(

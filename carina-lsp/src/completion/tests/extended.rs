@@ -154,7 +154,7 @@ fn completion_inside_multiline_list_of_struct_uses_shared_path() {
 "#;
     let position = Position::new(3, 0);
 
-    let completions = provider.complete(&create_document(text), position, None);
+    let completions = provider.complete_for_test(&create_document(text), position, None);
     let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
     assert!(labels.contains(&"name"), "{labels:?}");
     assert!(labels.contains(&"enabled"), "{labels:?}");
@@ -167,7 +167,7 @@ fn completion_after_same_line_resource_and_struct_openers_uses_shared_path() {
     let text = "test.nested.resource { outer = { ";
     let position = Position::new(0, text.chars().count() as u32);
 
-    let completions = provider.complete(&create_document(text), position, None);
+    let completions = provider.complete_for_test(&create_document(text), position, None);
     let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
     assert!(labels.contains(&"inner"), "{labels:?}");
     assert!(labels.contains(&"outer_field"), "{labels:?}");
@@ -193,7 +193,8 @@ fn scalar_list_values_keep_value_completion_context() {
         "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = [",
         "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = [role, ",
     ] {
-        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        let completions =
+            provider.complete_for_test(&create_document(text), position_at_end(text), None);
         let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
         assert!(
             labels.contains(&"role"),
@@ -210,7 +211,8 @@ fn function_argument_comma_stays_in_struct_value_context() {
         "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = concat([role, ",
         "let role = 'admin'\ntest.review.Resource {\n  outer {\n    outer_field = lower('a,b')",
     ] {
-        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        let completions =
+            provider.complete_for_test(&create_document(text), position_at_end(text), None);
         let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
         assert!(
             labels.contains(&"role"),
@@ -277,7 +279,7 @@ fn assignment_expressions_and_control_blocks_keep_struct_context() {
         "test.review.Resource {\n  for item in items {\n    ",
         "test.review.Resource {\n  if false {\n  } else {\n    ",
     ] {
-        let completions = provider.complete(
+        let completions = provider.complete_for_test(
             &create_document(control_text),
             position_at_end(control_text),
             None,
@@ -309,7 +311,8 @@ fn else_branches_keep_assignment_struct_context() {
     {
       "#,
     ] {
-        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        let completions =
+            provider.complete_for_test(&create_document(text), position_at_end(text), None);
         let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
         assert!(labels.contains(&"inner"), "{text:?}: {labels:?}");
         assert!(labels.contains(&"outer_field"), "{text:?}: {labels:?}");
@@ -334,7 +337,8 @@ fn quoted_map_key_does_not_fall_back_to_resource_attributes() {
     "k=v" = {
       "#,
     ] {
-        let completions = provider.complete(&create_document(text), position_at_end(text), None);
+        let completions =
+            provider.complete_for_test(&create_document(text), position_at_end(text), None);
         assert!(
             completions.is_empty(),
             "quoted map-key context must resolve to no schema fields: {:?}",
@@ -390,7 +394,8 @@ fn unresolvable_struct_path_preserves_enclosing_resource_binding() {
     .unwrap();
     std::fs::write(temp_dir.path().join("exports.crn"), "exports {\n}\n").unwrap();
 
-    let completions = provider.complete(&create_document(text), position, Some(temp_dir.path()));
+    let completions =
+        provider.complete_for_test(&create_document(text), position, Some(temp_dir.path()));
     let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
     assert!(labels.contains(&"a"), "{labels:?}");
     assert!(
@@ -691,7 +696,7 @@ awscc.ec2.route {
         character: 22,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // Should suggest rt.route_table_id (type-based match: RouteTableId)
@@ -726,7 +731,7 @@ awscc.ec2.Subnet {
         character: 14,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // Should suggest vpc.vpc_id (type-based match: VpcId)
@@ -761,7 +766,7 @@ awscc.ec2.Subnet {
         character: 14,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // Should NOT suggest rt.route_table_id (wrong type: RouteTableId != VpcId)
@@ -801,12 +806,17 @@ fn type_based_completion_resolves_ref_typed_source_attribute() {
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
     let target = PatternAttributeType::string();
     let target_defs = std::collections::BTreeMap::new();
-    let completions = provider.value_completions_for_attribute_type(
-        &target,
-        &target_defs,
-        "let source = test.source.Item {}\n",
-        None,
-        carina_core::parser::ProviderContext::unloaded(),
+    let completions = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::default(),
+        |session| {
+            provider.value_completions_for_attribute_type(
+                &target,
+                &target_defs,
+                "let source = test.source.Item {}\n",
+                None,
+                session,
+            )
+        },
     );
     let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
     assert!(
@@ -845,7 +855,7 @@ awscc.ec2.route {
         character: 22,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // Should NOT suggest boolean values
@@ -913,7 +923,7 @@ awscc.ec2.Subnet {
         character: 14,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // vpc_id on ec2.vpc is read-only, but should be suggested as a reference value
@@ -946,7 +956,7 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
         character: 27,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // Should NOT suggest igw_attachment.internet_gateway_id (self-reference)
@@ -989,7 +999,7 @@ fn builtin_function_completions_suppressed_at_value_position() {
         character: 18,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     for builtin in ["join", "upper", "cidr_subnet", "lower", "lookup", "length"] {
@@ -1079,7 +1089,7 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
         character: 30,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     // Find the igw.internet_gateway_id completion
     let igw_completion = completions
@@ -1137,7 +1147,7 @@ awscc.ec2.vpc_gateway_attachment {
         character: 30,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // Should include the binding's resource attributes
@@ -1239,7 +1249,7 @@ fn upstream_state_block_completes_source_attribute() {
         line: 1,
         character: 0,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"source"),
@@ -1266,7 +1276,7 @@ fn use_block_completes_source_attribute() {
         line: 1,
         character: 0,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"source"),
@@ -1293,7 +1303,7 @@ fn use_block_completes_source_attribute_single_line() {
         line: 0,
         character: source.chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"source"),
@@ -1338,7 +1348,7 @@ fn struct_field_completion_with_assignment_syntax() {
     );
 
     // Verify completions return struct fields, not top-level attributes
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &create_document(text),
         Position {
             line: 2,
@@ -1375,7 +1385,7 @@ outer =
         character: 8,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     // Should NOT contain built-in functions
@@ -1689,7 +1699,7 @@ fn upstream_state_source_suggests_sibling_carina_projects() {
         character: 14,
     };
 
-    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("envs/prod")));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1733,7 +1743,7 @@ fn upstream_state_source_outside_block_produces_nothing() {
         line: 0,
         character: 10,
     };
-    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("envs/prod")));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels.iter().any(|l| l == &"'../staging'"),
@@ -1763,7 +1773,7 @@ fn upstream_state_source_matches_partial_prefix() {
         character: 19,
     };
 
-    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("envs/prod")));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"'../orgs'"),
@@ -1851,7 +1861,7 @@ fn upstream_state_source_suggestions_work_with_double_quotes() {
         character: 14,
     };
 
-    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("envs/prod")));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
 
     assert!(
@@ -1884,7 +1894,7 @@ fn staging_text_edit(source: &str) -> TextEdit {
         character: last_line.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&root.join("envs/prod")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("envs/prod")));
     let staging = completions
         .iter()
         .find(|c| c.label.contains("../staging"))
@@ -1944,7 +1954,7 @@ fn for_iterable_position_suggests_let_binding() {
         character: last_line.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     assert!(
         completions.iter().any(|c| c.label == "orgs"),
@@ -1968,7 +1978,7 @@ for name, _ in i";
         character: last_line.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     assert!(
         completions.iter().any(|c| c.label == "inst"),
@@ -1992,7 +2002,7 @@ fn for_binding_declaration_position_does_not_suggest_bindings() {
         character: 4, // cursor sits right after "for "
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     assert!(
         !completions.iter().any(|c| c.label == "orgs"),
@@ -2023,7 +2033,7 @@ fn for_iterable_offers_binding_declared_in_sibling_file() {
         character: main.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(base));
+    let completions = provider.complete_for_test(&doc, position, Some(base));
 
     assert!(
         completions.iter().any(|c| c.label == "orgs"),
@@ -2047,7 +2057,7 @@ fn for_iterable_fires_immediately_after_in_without_trailing_space() {
         character: last_line.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     assert!(
         completions.iter().any(|c| c.label == "orgs"),
@@ -2070,7 +2080,7 @@ fn for_iterable_after_dot_does_not_trigger() {
         character: last_line.chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
 
     assert!(
         !completions.iter().any(|c| c.label == "orgs"),
@@ -2112,7 +2122,7 @@ fn upstream_state_dot_completion_in_for_iterable_lists_exports() {
         character: "for _, id in orgs.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
@@ -2155,7 +2165,7 @@ fn upstream_state_dot_completion_cross_file_binding() {
         character: "for _, id in orgs.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
 
     assert!(
         completions.iter().any(|c| c.label == "accounts"),
@@ -2180,7 +2190,7 @@ fn upstream_state_dot_completion_text_edit_replaces_partial() {
         character: "for _, id in orgs.acc".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let accounts = completions
         .iter()
         .find(|c| c.label == "accounts")
@@ -2211,7 +2221,7 @@ fn upstream_state_dot_completion_missing_source_does_not_crash() {
         character: "for _, id in orgs.".chars().count() as u32,
     };
 
-    let _ = provider.complete(&doc, position, Some(&base));
+    let _ = provider.complete_for_test(&doc, position, Some(&base));
     // No crash is the entire assertion here.
 }
 
@@ -2250,7 +2260,7 @@ for _, id in orgs.
         character: "for _, id in orgs.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
 
     assert!(
         !completions.iter().any(|c| c.label == "accounts"),
@@ -2276,7 +2286,7 @@ fn upstream_state_dot_completion_detail_shows_type_expr() {
         character: "for _, id in orgs.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let accounts = completions
         .iter()
         .find(|c| c.label == "accounts")
@@ -2318,7 +2328,7 @@ fn upstream_state_dot_completion_keeps_consumer_unnameable_export_discoverable()
         character: "let value = up.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&create_document(&source), position, Some(&base));
+    let completions = provider.complete_for_test(&create_document(&source), position, Some(&base));
     let export = find_completion(&completions, "vpc_id");
     let detail = export.detail.as_deref().unwrap_or_default();
     assert!(
@@ -2358,7 +2368,8 @@ fn upstream_state_dot_completion_detail_distinguishes_static_type_states() {
         character: "let value = up.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&create_document(source), position, Some(&downstream));
+    let completions =
+        provider.complete_for_test(&create_document(source), position, Some(&downstream));
     let detail = |label| {
         find_completion(&completions, label)
             .detail
@@ -2403,7 +2414,7 @@ fn upstream_state_depth2_dot_completion_lists_struct_fields() {
         character: "let x = orgs.config.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"name") && labels.contains(&"region"),
@@ -2425,7 +2436,8 @@ fn upstream_state_depth2_dot_completion_preserves_struct_with_unnameable_leaf() 
         character: "let x = up.net.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&create_document(&main_src), position, Some(&base));
+    let completions =
+        provider.complete_for_test(&create_document(&main_src), position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
 
     assert!(
@@ -2448,7 +2460,7 @@ fn upstream_state_depth2_dot_completion_detail_shows_field_type() {
         character: "let x = orgs.config.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let region = completions
         .iter()
         .find(|c| c.label == "region")
@@ -2488,7 +2500,7 @@ fn upstream_state_depth2_dot_completion_text_edit_replaces_partial() {
         character: "let x = orgs.config.na".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let name = completions
         .iter()
         .find(|c| c.label == "name")
@@ -2527,7 +2539,7 @@ fn upstream_state_depth2_dot_completion_lists_map_literal_keys() {
         character: "let x = orgs.accounts.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_prod") && labels.contains(&"registry_dev"),
@@ -2558,7 +2570,7 @@ fn upstream_state_depth2_dot_completion_lists_map_literal_keys_inside_interpolat
         character: cursor_col as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_prod") && labels.contains(&"registry_dev"),
@@ -2586,7 +2598,7 @@ fn upstream_state_depth2_dot_completion_filters_non_identifier_map_keys() {
         character: "let x = orgs.accounts.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_dev"),
@@ -2618,7 +2630,7 @@ fn upstream_state_depth2_dot_completion_unparseable_upstream_yields_nothing() {
         character: "let x = orgs.accounts.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     assert!(
         completions.is_empty(),
         "an unparseable upstream must yield no completions, not panic; got: {:?}",
@@ -2642,7 +2654,7 @@ fn upstream_state_depth2_dot_completion_empty_map_yields_nothing() {
         character: "let x = orgs.accounts.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     assert!(
         completions.is_empty(),
         "depth-2 on empty map literal must yield nothing; got: {:?}",
@@ -2668,7 +2680,7 @@ fn upstream_state_depth2_dot_completion_unknown_key_returns_empty() {
         character: "let x = orgs.unknown.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels.contains(&"name"),
@@ -2704,7 +2716,7 @@ exports {
         character: "    k = re".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels.iter().any(|l| l.contains(".Region.")),
@@ -2730,7 +2742,7 @@ exports {
         character: "  id: String = re".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels.iter().any(|l| l.contains(".Region.")),
@@ -2755,7 +2767,7 @@ fn builtin_functions_filtered_out_for_custom_semantic_value_position() {
         line: 1,
         character: 15,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for builtin in [
         "concat",
@@ -2796,7 +2808,7 @@ fn namespaced_enum_tail_tokens_do_not_leak_into_sibling_value_position() {
         line: 2,
         character: 15,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels.contains(&"GROUP"),
@@ -2827,7 +2839,7 @@ fn namespaced_enum_completions_offer_full_form_not_bare_tail() {
         line: 1,
         character: 19,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels
@@ -2858,7 +2870,7 @@ fn enum_typed_completion_excludes_shadowing_structural_binding() {
 "#;
     std::fs::write(fixture.path().join("main.crn"), main).expect("write completion buffer");
     let doc = create_document(main);
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 1,
@@ -2910,7 +2922,7 @@ fn dynamic_enum_completion_offers_namespaced_prefix() {
 "#,
     );
 
-    let completions = provider.complete(
+    let completions = provider.complete_for_test(
         &doc,
         Position {
             line: 1,
@@ -2948,7 +2960,7 @@ fn builtins_suppressed_at_plain_string_value_position() {
         line: 1,
         character: 9,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for builtin in ["join", "upper", "lower", "concat", "length", "keys"] {
         assert!(
@@ -2983,7 +2995,7 @@ for _, account_id in orgs.accounts {
         line: 3,
         character: "    principal_type = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         !labels.contains(&"account_id"),
@@ -3014,7 +3026,7 @@ for _, account_id in orgs.accounts {
         line: 3,
         character: "    target_id = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"account_id"),
@@ -3043,7 +3055,7 @@ fn for_loop_binding_without_resolvable_iterable_falls_back_to_unconditional() {
     };
     // No base path → no upstream resolution possible. The binding still
     // shows (permissive fallback).
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"account_id"),
@@ -3068,7 +3080,7 @@ fn exports_top_level_string_position_offers_string_builtins() {
         line: 1,
         character: "  region: String = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for expected in ["join", "lower", "upper", "trim"] {
         assert!(
@@ -3095,7 +3107,7 @@ fn exports_top_level_string_position_excludes_non_string_builtins() {
         line: 1,
         character: "  region: String = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for banned in ["flatten", "keys"] {
         assert!(
@@ -3127,7 +3139,7 @@ fn exports_map_value_position_filters_by_element_type() {
         line: 2,
         character: "    registry_prod = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     // `replace` returns `string`; `aws_account_id` is a Custom
     // semantic subtype — no built-in produces it, so `replace` must
@@ -3160,7 +3172,7 @@ fn exports_value_without_type_annotation_returns_empty() {
         line: 1,
         character: "  mystery = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     // Empty is acceptable; what's NOT acceptable is dumping every
     // built-in.
     assert!(
@@ -3190,7 +3202,7 @@ exports {
         line: 3,
         character: "  registry_dev  = re".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for banned in ["replace", "join", "lower", "upper", "trim", "env", "lookup"] {
         assert!(
@@ -3246,7 +3258,7 @@ exports {
         line: 6,
         character: "    registry_prod = re".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_prod.account_id"),
@@ -3273,7 +3285,7 @@ fn exports_list_value_position_filters_by_element_type() {
         line: 2,
         character: "    re".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     // The list-element case is harder to detect from text alone
     // (square brackets don't change brace_depth). The conservative
@@ -3338,7 +3350,7 @@ exports {
         line: 11,
         character: "    registry_dev = r".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_dev.account_id"),
@@ -3396,7 +3408,7 @@ exports {
         line: 2,
         character: "    registry_prod = r".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(base));
+    let completions = provider.complete_for_test(&doc, position, Some(base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_prod.account_id"),
@@ -3410,6 +3422,117 @@ exports {
 /// `account_id = ▉` in `other.crn` and `registry_prod` is declared in
 /// `main.crn`, the completion list must include
 /// `registry_prod.account_id`.
+#[test]
+fn completion_uses_the_directory_partial_catalog_instead_of_the_document_catalog() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Counter")
+            .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
+            .validate()
+            .unwrap(),
+    );
+    let provider = CompletionProvider::new(Arc::new(schemas), vec!["test".into()], vec![], vec![]);
+    struct StringCatalogFactory;
+    impl carina_core::provider::ProviderFactory for StringCatalogFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn display_name(&self) -> &str {
+            "completion catalog fixture"
+        }
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
+        }
+        fn validate_config(
+            &self,
+            _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> carina_core::provider::ProviderResult<()> {
+            Ok(())
+        }
+        fn extract_region(
+            &self,
+            _: &indexmap::IndexMap<String, carina_core::resource::Value>,
+        ) -> String {
+            String::new()
+        }
+        fn create_provider(
+            &self,
+            _: Option<&str>,
+            _: &carina_core::provider::ProviderReadyConfig,
+            _: carina_core::provider::InitializeOutcomeMint,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+        > {
+            Box::pin(async {
+                Err(carina_core::provider::ProviderError::internal(
+                    "completion fixture does not initialize providers",
+                ))
+            })
+        }
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            vec![
+                ResourceSchema::new("Catalog")
+                    .attribute(
+                        AttributeSchema::optional(
+                            "id",
+                            AttributeType::refined_string(
+                                Some(carina_core::schema::TypeIdentity::bare("SharedId")),
+                                None,
+                                None,
+                                None,
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            ]
+        }
+    }
+    let factories: Arc<Vec<Box<dyn carina_core::provider::ProviderFactory>>> =
+        Arc::new(vec![Box::new(StringCatalogFactory)]);
+    let schemas = carina_core::provider::collect_schemas(factories.as_slice());
+    let snapshot =
+        carina_core::provider::loaded_provider_snapshot_from_factories(factories, schemas);
+    let context = snapshot.provider_context().as_provider_context().clone();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "provider test {}\nprovider broken {}\narguments {\n  candidate: SharedId\n}\ntest.Counter {\n  count = 0\n}\n";
+    std::fs::write(&path, source).unwrap();
+    let doc = Document::new_with_path(source.into(), path.clone(), Arc::new(context));
+    let engine = crate::diagnostics::DiagnosticEngine::without_loaded_provider_schemas()
+        .with_provider_errors(std::collections::HashMap::from([(
+            "broken".into(),
+            "not initialized".into(),
+        )]));
+    let catalog = engine.catalog_for_document(&doc, Some(&path));
+    assert!(!catalog.custom_types_loaded());
+    let position = Position::new(6, 10);
+    let partial = provider.complete(&doc, position, Some(directory.path()), &catalog);
+    assert!(
+        partial.iter().any(|item| item.label == "candidate"),
+        "{:?}",
+        partial.iter().map(|item| &item.label).collect::<Vec<_>>()
+    );
+    let strict = provider.complete(
+        &doc,
+        position,
+        Some(directory.path()),
+        doc.provider_context(),
+    );
+    assert!(!strict.iter().any(|item| item.label == "candidate"));
+}
+
 #[test]
 fn custom_type_value_ref_includes_sibling_file_bindings() {
     use carina_core::schema::legacy_validator;
@@ -3464,7 +3587,7 @@ let attach = awscc.organizations.policy_target_attachment {
         line: 1,
         character: "  target_id = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(base));
+    let completions = provider.complete_for_test(&doc, position, Some(base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_prod.account_id"),
@@ -3508,7 +3631,7 @@ let b = awscc.s3.Bucket {
         line: 1,
         character: "  name = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(base));
+    let completions = provider.complete_for_test(&doc, position, Some(base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"stage_name"),
@@ -3574,7 +3697,7 @@ let attach = awscc.organizations.policy_target_attachment {
         line: 1,
         character: "  target_id = registry_prod.".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(base));
+    let completions = provider.complete_for_test(&doc, position, Some(base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"registry_prod.account_id"),
@@ -3625,7 +3748,7 @@ test.foo.bar {
         line: 5,
         character: "  attr = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&root.join("web")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("web")));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"network.vpc_id"),
@@ -3676,7 +3799,7 @@ test.foo.bar {
         line: 5,
         character: "  attr = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&root.join("web")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("web")));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     // Positive companion: prove the upstream pass actually ran by asserting
     // the matching-type export is offered. Otherwise the negative assertion
@@ -3751,7 +3874,7 @@ test.foo.bar {
         line: 9,
         character: "  attr = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&root.join("web")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("web")));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"network.vpc_id"),
@@ -3820,7 +3943,7 @@ awscc.ec2.SecurityGroup {
         line: 5,
         character: "  vpc_id = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&root.join("web")));
+    let completions = provider.complete_for_test(&doc, position, Some(&root.join("web")));
     let labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
     assert!(
         !labels.iter().any(|l| l == "network.vpc_id"),
@@ -3896,7 +4019,7 @@ exports {
 ",
         )],
     );
-    let completions = provider.complete(&doc, position, Some(&web_dir));
+    let completions = provider.complete_for_test(&doc, position, Some(&web_dir));
     let labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
     assert!(
         labels.iter().any(|l| l == "network.vpc_id"),
@@ -3929,7 +4052,7 @@ let main = awscc.ec2.Vpc {
             ("exports.crn", "exports {\n  vpc_id = main.vpc_id\n}\n"),
         ],
     );
-    let completions = provider.complete(&doc, position, Some(&web_dir));
+    let completions = provider.complete_for_test(&doc, position, Some(&web_dir));
     let labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
     assert!(
         labels.iter().any(|l| l == "network.vpc_id"),
@@ -3953,7 +4076,7 @@ fn unannotated_upstream_export_with_function_call_rhs_is_not_offered() {
             "exports {\n  vpc_id = lookup({a = '1'}, 'a', 'default')\n}\n",
         )],
     );
-    let completions = provider.complete(&doc, position, Some(&web_dir));
+    let completions = provider.complete_for_test(&doc, position, Some(&web_dir));
     let labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
     assert!(
         !labels.iter().any(|l| l == "network.vpc_id"),
@@ -4008,7 +4131,7 @@ fn interpolation_completion_empty_offers_in_scope_binding() {
         character: "  policy = \"arn:aws:iam::${".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"orgs"),
@@ -4031,7 +4154,7 @@ fn interpolation_completion_partial_offers_matching_binding() {
         character: "  policy = \"arn:aws:iam::${o".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"orgs"),
@@ -4052,7 +4175,7 @@ fn interpolation_completion_after_whitespace_offers_matching_binding() {
         character: "  policy = \"arn:aws:iam::${  o".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
     assert!(
         labels.contains(&"orgs"),
@@ -4080,7 +4203,7 @@ fn integer_operator_completion_offers_bindings_in_every_value_surface() {
         ] {
             let text = format!("{prefix}{tail}");
             let completions =
-                provider.complete(&create_document(&text), position_at_end(&text), None);
+                provider.complete_for_test(&create_document(&text), position_at_end(&text), None);
             let labels = completions
                 .iter()
                 .map(|completion| completion.label.as_str())
@@ -4112,7 +4235,7 @@ fn interpolation_completion_after_heredoc_body_punctuation_offers_binding() {
             character: "  policy = \"${ab".chars().count() as u32,
         };
 
-        let completions = provider.complete(&doc, position, Some(&base));
+        let completions = provider.complete_for_test(&doc, position, Some(&base));
         let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
         assert!(
             labels.contains(&"abc"),
@@ -4135,7 +4258,7 @@ fn interpolation_completion_dot_after_binding_offers_exports() {
         character: "  policy = \"arn:aws:iam::${orgs.".chars().count() as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"accounts"),
@@ -4182,7 +4305,7 @@ aws.s3.BucketPolicy {
         character: cursor_col as u32,
     };
 
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"orgs"),
@@ -4228,7 +4351,7 @@ let role = test.nested.resource {
         line: 8,
         character: "      leaf_field = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"oidc_provider_arn"),
@@ -4272,7 +4395,7 @@ let role = test.nested.resource {
         line: 11,
         character: "      leaf_field = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"helper"),
@@ -4325,7 +4448,7 @@ let role = test.nested.resource {
         line: 3,
         character: "      leaf_field = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     // The bare binding name (`orgs`) is also useful so the user can
     // tab-trigger it and then type `.` to descend into exports.
@@ -4375,7 +4498,7 @@ let role = test.nested.resource {
         line: 3,
         character: "      leaf_field = orgs.".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"accounts"),
@@ -4409,7 +4532,7 @@ test.nested.resource {
         line: 7,
         character: "      leaf_field = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"oidc_provider_arn"),
@@ -4447,7 +4570,7 @@ let role = test.nested.resource {
         line: 3,
         character: "      leaf_field = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"oidc_provider_arn"),
@@ -4489,7 +4612,7 @@ let role = test.foo.bar {
         line: 5,
         character: "  attr = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"helper"),
@@ -4522,7 +4645,7 @@ test.foo.bar {
         line: 5,
         character: "  attr = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"helper"),
@@ -4554,7 +4677,7 @@ awscc.ec2.SecurityGroup {
         line: 5,
         character: "  vpc_id = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"vpc"),
@@ -4592,7 +4715,7 @@ let role = test.foo.bar {
         line: 1,
         character: "  attr = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"helper"),
@@ -4642,7 +4765,7 @@ awscc.ec2.Vpc {
         line: 6,
         character: "  cidr_block = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"cidr"),
@@ -4669,7 +4792,7 @@ fn value_position_filters_literal_union_by_lifted_string_type() {
             character: format!("  {attribute} = ").chars().count() as u32,
         };
         provider
-            .complete(&doc, position, None)
+            .complete_for_test(&doc, position, None)
             .into_iter()
             .map(|item| item.label)
             .collect::<Vec<_>>()
@@ -4704,7 +4827,7 @@ fn value_position_filters_literal_union_by_lifted_string_type() {
         "arguments {\n  environment: 'dev' | 'prod'\n}\n\ntest.foo.bar {\n  count =\n}\n";
     let int_doc = create_document(int_text);
     let int_labels = int_provider
-        .complete(
+        .complete_for_test(
             &int_doc,
             Position {
                 line: 5,
@@ -4735,7 +4858,7 @@ fn value_position_filters_positive_int_using_its_scalar_kind() {
     for (attribute, expected) in [("count", true), ("label", false)] {
         let text =
             format!("arguments {{\n  n: PositiveInt\n}}\ntest.counter {{\n  {attribute} =\n}}\n");
-        let completions = provider.complete(
+        let completions = provider.complete_for_test(
             &create_document(&text),
             Position {
                 line: 4,
@@ -4771,7 +4894,7 @@ awscc.ec2.Vpc {
         line: 1,
         character: "  cidr_block = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for builtin in ["lower", "upper", "join", "env", "length", "keys", "flatten"] {
         assert!(
@@ -4802,7 +4925,7 @@ attributes {
         line: 1,
         character: "  whatever = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     for builtin in ["length", "lower", "upper", "join"] {
         assert!(
@@ -4837,7 +4960,7 @@ awscc.ec2.SecurityGroup {
         line: 5,
         character: "  vpc_id = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"vpc"),
@@ -4870,7 +4993,7 @@ awscc.ec2.SecurityGroup {
         line: 6,
         character: "  vpc_id = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"the_vpc"),
@@ -4908,7 +5031,7 @@ awscc.ec2.Vpc {
         line: 5,
         character: "  cidr_block = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"broken"),
@@ -4940,7 +5063,7 @@ attributes {
         line: 5,
         character: "  whatever = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"enabled"),
@@ -4980,7 +5103,7 @@ attributes {
         line: 6,
         character: "  role_arn = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"oidc_provider_arn"),
@@ -5011,7 +5134,7 @@ attributes {
         line: 5,
         character: "  vpc_arn = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, None);
+    let completions = provider.complete_for_test(&doc, position, None);
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"vpc"),
@@ -5044,7 +5167,7 @@ attributes {
         line: 1,
         character: "  role_arn = ".chars().count() as u32,
     };
-    let completions = provider.complete(&doc, position, Some(&base));
+    let completions = provider.complete_for_test(&doc, position, Some(&base));
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
         labels.contains(&"oidc_provider_arn"),

@@ -176,6 +176,33 @@ pub fn parse_file(
     Ok(parsed)
 }
 
+/// Read factory declarations without evaluating unrelated function/resource
+/// statements. Named provider instances do not request factory loading.
+pub fn parse_provider_factory_declarations(
+    input: &str,
+    source_file: &Path,
+) -> Result<Vec<super::ParserProviderConfig>, ParseError> {
+    let file = Arc::new(super::preprocess_file(input)?);
+    let pairs = file.parse()?;
+    let config = ProviderContext::default();
+    let ctx = ParseContext::new(&config, source_file, Arc::clone(&file));
+    let mut providers = Vec::new();
+    for pair in pairs.filter(|pair| pair.as_rule() == Rule::file) {
+        for statement in pair
+            .into_inner()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            if let Some(declaration) = statement
+                .into_inner()
+                .find(|pair| pair.as_rule() == Rule::provider_block)
+            {
+                providers.push(parse_provider_block(declaration, &ctx)?);
+            }
+        }
+    }
+    Ok(providers)
+}
+
 /// Collect top-level `let` names without evaluating their right-hand sides.
 ///
 /// Directory parsing uses this syntax-only pass to establish lexical scope

@@ -9450,12 +9450,28 @@ mod tests {
 
             canonicalize_resources_with_schemas(&mut resources, &registry)
                 .expect("a deferred expression owns evaluation of its enum-shaped arguments");
-            let deferred_result =
-                crate::resolver::resolve_ref_value(&resources[0].attributes["value"], &bindings)
-                    .expect("runtime expression must resolve");
-            let static_result =
-                crate::resolver::resolve_ref_value(&static_value, &ResolvedBindings::default())
-                    .expect("static expression must evaluate");
+            let deferred_result = crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| {
+                    crate::resolver::resolve_ref_value(
+                        &resources[0].attributes["value"],
+                        &bindings,
+                        session,
+                    )
+                },
+            )
+            .expect("runtime expression must resolve");
+            let static_result = crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| {
+                    crate::resolver::resolve_ref_value(
+                        &static_value,
+                        &ResolvedBindings::default(),
+                        session,
+                    )
+                },
+            )
+            .expect("static expression must evaluate");
 
             assert_eq!(deferred_result, static_result);
         }

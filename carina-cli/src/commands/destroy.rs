@@ -2506,13 +2506,18 @@ mod tests {
     #[tokio::test]
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-            &downstream,
+        let parsed = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
-            &carina_core::schema::SchemaRegistry::new(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_with_providerless_config(
+                    carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                    &downstream,
+                    session,
+                    &carina_core::schema::SchemaRegistry::new(),
+                )
+                .expect("test fixture crosses module resolution")
+            },
         )
-        .expect("test fixture crosses module resolution")
         .into_expanded()
         .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));

@@ -297,72 +297,74 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
     );
     let context = loaded_providers.provider_context();
     let schemas = loaded_providers.schema_registry();
-    let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
-        base_dir,
-        context,
-        &HashMap::new(),
-    )
-    .expect("the fixture directory must parse before module expansion");
-    let signatures = carina_core::module_resolver::load_resolved_module_signatures(
-        &directory.parsed,
-        base_dir,
-        context,
-    );
-    let binding_use_report = carina_core::validation::check_bare_binding_uses(
-        &directory.parsed,
-        &carina_core::validation::ValidationTypeContext::new(
+    carina_core::validation::deferred_types::with_session_for_test(context, |session| {
+        let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+            base_dir,
+            context,
+            &HashMap::new(),
+        )
+        .expect("the fixture directory must parse before module expansion");
+        let signatures = carina_core::module_resolver::load_resolved_module_signatures(
+            &directory.parsed,
+            base_dir,
+            context,
+        );
+        let binding_use_report = carina_core::validation::check_bare_binding_uses(
+            &directory.parsed,
+            &carina_core::validation::ValidationTypeContext::new(
+                &directory.parsed,
+                schemas,
+                context,
+                &signatures,
+            ),
+        );
+        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
             &directory.parsed,
             schemas,
-            context,
             &signatures,
-        ),
-    );
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
-        &directory.parsed,
-        schemas,
-        &signatures,
-        carina_core::parser::ProviderContext::unloaded(),
-    );
-    let covered_findings = carina_core::validation::check_module_calls(
-        carina_core::validation::ModuleCallCheckInput {
-            authored: &directory.parsed,
-            semantic: Some(&directory.parsed),
-            base_dir: Some(base_dir),
-            imported_signatures: &signatures,
-            provider_context: context,
+            session.catalog(),
+        );
+        let covered_findings = carina_core::validation::check_module_calls(
+            carina_core::validation::ModuleCallCheckInput {
+                authored: &directory.parsed,
+                semantic: Some(&directory.parsed),
+                base_dir: Some(base_dir),
+                imported_signatures: &signatures,
+                provider_context: session,
+                schemas,
+                binding_use_report: &binding_use_report,
+                bindings: &bindings,
+                reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+            },
+        );
+        match carina_core::module_resolver::resolve_modules_with_diagnostics(
+            &directory.parsed,
+            base_dir,
+            session,
             schemas,
-            binding_use_report: &binding_use_report,
-            bindings: &bindings,
-            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
-        },
-    );
-    match carina_core::module_resolver::resolve_modules_with_diagnostics(
-        &directory.parsed,
-        base_dir,
-        context,
-        schemas,
-        &covered_findings,
-    ) {
-        carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
-            assert!(
-                !graph.compositions.is_empty(),
-                "the expansion proof must include a composition"
-            );
+            &covered_findings,
+        ) {
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+                assert!(
+                    !graph.compositions.is_empty(),
+                    "the expansion proof must include a composition"
+                );
+            }
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
+                findings,
+                errors,
+            } => panic!(
+                "fixture must reach expanded diagnostics; constraint findings={findings:#?}, residual count={}",
+                errors.len(),
+            ),
+            carina_core::module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => {
+                panic!(
+                    "fixture must reach expanded diagnostics; residual count={}",
+                    errors.len()
+                )
+            }
         }
-        carina_core::module_resolver::ModuleResolutionDiagnosticResult::ConstraintFailed {
-            findings,
-            errors,
-        } => panic!(
-            "fixture must reach expanded diagnostics; constraint findings={findings:#?}, residual count={}",
-            errors.len(),
-        ),
-        carina_core::module_resolver::ModuleResolutionDiagnosticResult::Unowned { errors } => {
-            panic!(
-                "fixture must reach expanded diagnostics; residual count={}",
-                errors.len()
-            )
-        }
-    }
+    });
 }
 
 #[test]
@@ -3470,13 +3472,16 @@ awscc.cloudfront.Distribution {
         &schemas,
     )
     .expect("load caller configuration");
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        loaded.parsed,
-        fixture.path(),
-        &config,
-        &schemas,
-    )
-    .expect("expand module call without panicking");
+    let parsed =
+        carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                fixture.path(),
+                session,
+                &schemas,
+            )
+            .expect("expand module call without panicking")
+        });
 
     let expanded = parsed
         .resources

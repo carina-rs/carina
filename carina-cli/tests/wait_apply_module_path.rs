@@ -560,8 +560,17 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
             wait_aliases: &wait_aliases,
         },
     );
-    carina_core::resolver::resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
-        .expect("resolve_refs");
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            carina_core::resolver::resolve_refs_with_state_and_remote(
+                &mut resources_for_plan,
+                &bindings,
+                session,
+            )
+        },
+    )
+    .expect("resolve_refs");
 
     let resource_origins = sorted_resources.clone();
     let mut canonical_for_plan = carina_core::parser::ExpandedParsedFile::default();
@@ -660,6 +669,9 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         failures: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
+        provider_context: carina_core::parser::ProviderContext::clone(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,

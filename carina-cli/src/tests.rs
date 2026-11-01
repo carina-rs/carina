@@ -257,10 +257,15 @@ fn checked_exports(
     params: &[carina_core::parser::ExpandedInferredExportParam],
 ) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::ExpandedInferredExportParam>
 {
-    carina_core::validation::check_export_values_pre_apply(
-        params,
-        &carina_core::binding_index::ResolvedBindings::default(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &loaded_provider_context(),
+        |session| {
+            carina_core::validation::check_export_values_pre_apply(
+                params,
+                &carina_core::binding_index::ResolvedBindings::default(),
+                session,
+            )
+        },
     )
     .expect("test exports must pass the secret boundary")
 }
@@ -282,10 +287,15 @@ fn saved_provider_configs(
 ) -> carina_core::parser::SavedProviderConfigs {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
-    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider configs must resolve");
     carina_core::parser::SavedProviderConfigs::from(&resolved)
@@ -514,6 +524,9 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
     let outcome = carina_core::executor::execute_live_plan_for_test(
         &provider,
         LiveExecutionInput {
+            provider_context: carina_core::parser::ProviderContext::clone(
+                &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            ),
             plan: &plan,
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],

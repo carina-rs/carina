@@ -245,7 +245,7 @@ pub fn infer_type_from_value<P: PlaceholderKind, B: BindingAddress>(
         value,
         bindings,
         schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     )
 }
 

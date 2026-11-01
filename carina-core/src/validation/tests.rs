@@ -294,18 +294,20 @@ fn module_call_findings_for_test(
         parsed,
         &schemas,
         signatures,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
-    check_module_calls(ModuleCallCheckInput {
-        authored: parsed,
-        semantic: Some(parsed),
-        base_dir: Some(std::path::Path::new(".")),
-        imported_signatures: signatures,
-        provider_context,
-        schemas: &schemas,
-        binding_use_report: &binding_use_report,
-        bindings: &bindings,
-        reference_checks: ModuleCallReferenceChecks::Enabled,
+    crate::validation::deferred_types::with_session_for_test(provider_context, |session| {
+        check_module_calls(ModuleCallCheckInput {
+            authored: parsed,
+            semantic: Some(parsed),
+            base_dir: Some(std::path::Path::new(".")),
+            imported_signatures: signatures,
+            provider_context: session,
+            schemas: &schemas,
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: ModuleCallReferenceChecks::Enabled,
+        })
     })
 }
 
@@ -343,17 +345,19 @@ fn validate_resource_ref_types_for_test<
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
-    let bindings = crate::binding_index::BindingIndex::from_parsed(
-        parsed,
-        schemas,
-        crate::parser::ProviderContext::unloaded(),
-    );
-    let argument_names = parsed
-        .arguments
-        .iter()
-        .map(|argument| argument.name.clone())
-        .collect();
-    super::validate_resource_ref_types(parsed, schemas, &argument_names, &bindings)
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+            let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(parsed, schemas, None, &signatures, session);
+            let argument_names = parsed
+                .arguments
+                .iter()
+                .map(|argument| argument.name.clone())
+                .collect();
+            super::validate_resource_ref_types(parsed, schemas, &argument_names, &bindings)
+        },
+    )
 }
 
 #[test]
@@ -401,7 +405,7 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
     use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
 
     let unknown =
-        crate::parser::parse_type_expr_str("UndeclaredCount", ProviderContext::unloaded()).unwrap();
+        crate::parser::parse_type_expr_str("UndeclaredCount", &ProviderContext::default()).unwrap();
     let parsed = ParsedFile::default();
     let schemas = SchemaRegistry::new();
     let config = loaded_context_for_test(ProviderContext::default());
@@ -443,7 +447,7 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
 fn composition_reference_reports_declared_type_resolution_failure() {
     let parsed = crate::parser::parse(
         "let source = mock.test.Source {}",
-        ProviderContext::unloaded(),
+        &ProviderContext::default(),
     )
     .unwrap();
     let mut schemas = SchemaRegistry::new();
@@ -460,7 +464,7 @@ fn composition_reference_reports_declared_type_resolution_failure() {
     let config = loaded_context_for_test(ProviderContext::default());
     let index = BindingIndex::from_parsed(&parsed, &schemas, &config);
     let declared =
-        crate::parser::parse_type_expr_str("UndeclaredAccountId", ProviderContext::unloaded())
+        crate::parser::parse_type_expr_str("UndeclaredAccountId", &ProviderContext::default())
             .unwrap();
     let path = crate::resource::AuthoredAccessPath::new("source", "value");
     let result = composition_ref_error_kind(
@@ -715,7 +719,7 @@ mock.test.resource { name = f(r.name) }
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
@@ -745,7 +749,7 @@ let generated = for item in pending.items {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
@@ -771,7 +775,7 @@ let r2 = mock.test.resource { name = f() }
     let mismatch_bindings = crate::binding_index::BindingIndex::from_parsed(
         &mismatch,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let error = validate_user_function_ref_types_with_bindings(&mismatch, &mismatch_bindings)
         .expect_err("String function result passed to Int must be rejected");
@@ -792,7 +796,7 @@ let r2 = mock.test.resource { name = f() }
     let matching_bindings = crate::binding_index::BindingIndex::from_parsed(
         &matching,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     assert!(validate_user_function_ref_types_with_bindings(&matching, &matching_bindings).is_ok());
 }
@@ -830,7 +834,7 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
     let bindings = BindingIndex::from_parsed(
         &mismatch,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let error = validate_user_function_ref_types_with_bindings(&mismatch, &bindings)
         .expect_err("g(): String must not satisfy f(Int)");
@@ -845,7 +849,7 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
     let bindings = BindingIndex::from_parsed(
         &matching,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     assert!(validate_user_function_ref_types_with_bindings(&matching, &bindings).is_ok());
 }
@@ -1190,10 +1194,17 @@ fn lift_unloaded_schema_nominals_preserves_identity_without_guessing_kind() {
             crate::schema::TypeInSchema::schemaless(&sink).assignment_to(source),
             crate::schema::TypeAssignability::Mismatch
         );
-        assert!(matches!(
-            source.assignment_to(crate::schema::TypeInSchema::schemaless(&sink)),
-            crate::schema::TypeAssignability::Unchecked(_)
-        ));
+        let assignment = source.assignment_to(crate::schema::TypeInSchema::schemaless(&sink));
+        assert_eq!(
+            assignment,
+            crate::schema::TypeAssignability::Unchecked(
+                crate::schema::TypeAssignmentDeferral::new(nominal.clone()),
+            )
+        );
+        assert_eq!(
+            assignment.require_loaded(),
+            Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+        );
     }
 }
 
@@ -2182,13 +2193,15 @@ mock.test.Consumer { name = shared }
     let schemas = SchemaRegistry::new();
     let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
         .expect("load module fixture");
-    let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        fixture.path(),
-        &config,
-        &schemas,
-    )
-    .expect("expand nested module");
+    let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            parsed,
+            fixture.path(),
+            session,
+            &schemas,
+        )
+        .expect("expand nested module")
+    });
 
     assert_eq!(
         check_unused_bindings_in_resolved_file(&parsed),
@@ -4687,16 +4700,18 @@ fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
     );
     let bindings =
         BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures, &config);
-    let findings = check_module_calls_providerless(ModuleCallCheckInput {
-        authored: &parsed,
-        semantic: Some(&parsed),
-        base_dir: None,
-        imported_signatures: &signatures,
-        provider_context: &config,
-        schemas: &schemas,
-        binding_use_report: &report,
-        bindings: &bindings,
-        reference_checks: ModuleCallReferenceChecks::Enabled,
+    let findings = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        check_module_calls_providerless(ModuleCallCheckInput {
+            authored: &parsed,
+            semantic: Some(&parsed),
+            base_dir: None,
+            imported_signatures: &signatures,
+            provider_context: session,
+            schemas: &schemas,
+            binding_use_report: &report,
+            bindings: &bindings,
+            reference_checks: ModuleCallReferenceChecks::Enabled,
+        })
     });
     assert!(findings.is_empty(), "{findings:#?}");
 }
@@ -4926,20 +4941,23 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
         &parsed,
         &schemas,
         &signatures,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
-    let findings = check_module_calls(ModuleCallCheckInput {
-        authored: &parsed,
-        semantic: Some(&parsed),
-        base_dir: Some(fixture.path()),
-        imported_signatures: &signatures,
-        provider_context: &provider_context,
-        schemas: &schemas,
-        binding_use_report: &binding_use_report,
-        bindings: &bindings,
-        reference_checks: ModuleCallReferenceChecks::Enabled,
-    });
+    let findings =
+        crate::validation::deferred_types::with_session_for_test(&provider_context, |session| {
+            check_module_calls(ModuleCallCheckInput {
+                authored: &parsed,
+                semantic: Some(&parsed),
+                base_dir: Some(fixture.path()),
+                imported_signatures: &signatures,
+                provider_context: session,
+                schemas: &schemas,
+                binding_use_report: &binding_use_report,
+                bindings: &bindings,
+                reference_checks: ModuleCallReferenceChecks::Enabled,
+            })
+        });
 
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
     assert!(
@@ -5272,19 +5290,24 @@ let child = child_module { value = forwarded }
         &parsed,
         &schemas,
         &signatures,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
-    let authored = check_module_calls_providerless(ModuleCallCheckInput {
-        authored: &parsed,
-        semantic: Some(&parsed),
-        base_dir: None,
-        imported_signatures: &signatures,
-        provider_context: &ProviderContext::default(),
-        schemas: &schemas,
-        binding_use_report: &report,
-        bindings: &bindings,
-        reference_checks: ModuleCallReferenceChecks::Enabled,
-    });
+    let authored = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| {
+            check_module_calls_providerless(ModuleCallCheckInput {
+                authored: &parsed,
+                semantic: Some(&parsed),
+                base_dir: None,
+                imported_signatures: &signatures,
+                provider_context: session,
+                schemas: &schemas,
+                binding_use_report: &report,
+                bindings: &bindings,
+                reference_checks: ModuleCallReferenceChecks::Enabled,
+            })
+        },
+    );
     let expanded = check_expanded_module_calls::<crate::resource::ParserPlaceholder>(
         ExpandedModuleCallCheckInput::BindingUses {
             binding_use_report: &report,
@@ -5453,8 +5476,10 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
                 .expect("authored enum contains no parser placeholders"),
         ),
     }];
-    check_export_values_pre_apply(&exports, &ResolvedBindings::default(), &config)
-        .expect("export must validate");
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        check_export_values_pre_apply(&exports, &ResolvedBindings::default(), session)
+    })
+    .expect("export must validate");
 
     let parsed = crate::parser::parse(
         r#"
@@ -5531,7 +5556,7 @@ fn attribute_param_ref_type_mismatch_detected() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     // Attribute param: role_arn: iam_role_arn = role.role_name (MISMATCH: String vs iam_role_arn)
@@ -5604,7 +5629,7 @@ fn attribute_param_ref_type_resolves_terminal_schema_ref() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let params = vec![AttributeParameter::dummy(
         "value".to_string(),
@@ -5655,7 +5680,7 @@ fn attribute_param_ref_existence_checks_composition_attribute_membership_only() 
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
@@ -5707,7 +5732,7 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
@@ -5756,7 +5781,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let err = errors
@@ -5833,7 +5858,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -5866,7 +5891,7 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let err = errors
@@ -5923,7 +5948,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -5983,7 +6008,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let declaration_errors: Vec<_> = errors
@@ -6051,7 +6076,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -6114,7 +6139,7 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let call = ModuleCall::test(
@@ -6191,7 +6216,7 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let call = ModuleCall::test(
         "consumer".to_string(),
@@ -6267,7 +6292,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
     assert!(
@@ -6334,7 +6359,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
     assert!(
@@ -6382,7 +6407,7 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let result = validate_attribute_param_ref_types_with_bindings(&params, &bindings);
     assert!(
@@ -6415,7 +6440,7 @@ fn validate_attribute_params_against_target_group(
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     validate_attribute_param_ref_types_with_bindings(params, &bindings)
@@ -6462,7 +6487,7 @@ fn validate_attribute_params_against_target_group_tags(
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     validate_attribute_param_ref_types_with_bindings(params, &bindings)
@@ -6661,11 +6686,13 @@ fn resolve_and_validate_expanded_export_params(
     exports: &[RuntimeInferredExportParam],
     config: &LoadedProviderContext,
 ) -> Result<(), String> {
-    check_export_values_pre_apply(
-        exports,
-        &crate::binding_index::ResolvedBindings::default(),
-        config,
-    )
+    crate::validation::deferred_types::with_session_for_test(config, |session| {
+        check_export_values_pre_apply(
+            exports,
+            &crate::binding_index::ResolvedBindings::default(),
+            session,
+        )
+    })
     .map(|_| ())
 }
 
@@ -6681,10 +6708,15 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
             "not-a-bool".into(),
         ))),
     };
-    let error = check_export_values_pre_apply_providerless(
-        std::slice::from_ref(&builtin),
-        &ResolvedBindings::default(),
+    let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| {
+            check_export_values_pre_apply_providerless(
+                std::slice::from_ref(&builtin),
+                &ResolvedBindings::default(),
+                session,
+            )
+        },
     )
     .expect_err("built-in mismatch must still be diagnosed")
     .to_string();
@@ -6705,10 +6737,15 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
             vec!["identifier".to_string().into()],
         ))),
     };
-    check_export_values_pre_apply_providerless(
-        std::slice::from_ref(&custom),
-        &ResolvedBindings::default(),
+    crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| {
+            check_export_values_pre_apply_providerless(
+                std::slice::from_ref(&custom),
+                &ResolvedBindings::default(),
+                session,
+            )
+        },
     )
     .expect("providerless export checks must skip only the custom-type leaf");
 
@@ -6721,10 +6758,15 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
             "10.0.0.0/16".to_string().into(),
         ))),
     };
-    check_export_values_pre_apply_providerless(
-        std::slice::from_ref(&builtin_custom),
-        &ResolvedBindings::default(),
+    crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| {
+            check_export_values_pre_apply_providerless(
+                std::slice::from_ref(&builtin_custom),
+                &ResolvedBindings::default(),
+                session,
+            )
+        },
     )
     .expect("built-in custom types remain checkable without providers");
 }
@@ -6831,7 +6873,7 @@ fn validate_export_params_rejects_type_mismatch() {
 fn validate_export_params_rejects_decrypt_result_as_secret_export() {
     let plaintext = "hunter2SECRET";
     let config = loaded_context_for_test(ProviderContext {
-        decryptor: Some(Box::new(move |_, _| Ok(plaintext.to_string()))),
+        decryptor: Some(std::sync::Arc::new(move |_, _| Ok(plaintext.to_string()))),
         ..ProviderContext::default()
     });
     let value = crate::builtins::evaluate_builtin_with_config_to_value(
@@ -6869,7 +6911,9 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
     let builtin = crate::builtins::evaluate_builtin_to_value("upper", &[secret_string()])
         .expect("upper(secret(...)) must evaluate");
     let config = loaded_context_for_test(ProviderContext {
-        decryptor: Some(Box::new(|_, _| Ok("decrypted-secret".to_string()))),
+        decryptor: Some(std::sync::Arc::new(|_, _| {
+            Ok("decrypted-secret".to_string())
+        })),
         ..ProviderContext::default()
     });
     let decrypt = crate::builtins::evaluate_builtin_with_config_to_value(
@@ -6985,8 +7029,10 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
     }];
     let provider_context = loaded_context_for_test(ProviderContext::default());
     let pre_apply =
-        check_export_values_pre_apply(&exports, &bindings("alpha-id"), &provider_context)
-            .expect("pre-apply export check");
+        crate::validation::deferred_types::with_session_for_test(&provider_context, |session| {
+            check_export_values_pre_apply(&exports, &bindings("alpha-id"), session)
+        })
+        .expect("pre-apply export check");
     assert_eq!(
         pre_apply.display_values()[0].value,
         Some(RuntimeValue::Concrete(RuntimeConcreteValue::String(
@@ -6995,8 +7041,10 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
     );
 
     let post_apply =
-        resolve_export_values_post_apply(&pre_apply, &bindings("beta-id"), &provider_context)
-            .expect("post-apply export resolution");
+        crate::validation::deferred_types::with_session_for_test(&provider_context, |session| {
+            resolve_export_values_post_apply(&pre_apply, &bindings("beta-id"), session)
+        })
+        .expect("post-apply export resolution");
     assert_eq!(
         post_apply.as_slice()[0].value,
         Some(RuntimeValue::Concrete(RuntimeConcreteValue::String(
@@ -7314,7 +7362,7 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
@@ -7370,7 +7418,7 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
@@ -7421,7 +7469,7 @@ fn export_param_ref_type_mismatch_displays_resolved_nested_ref_names() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let error = validate_export_param_ref_types_with_bindings(&exports, &bindings)
@@ -7470,7 +7518,7 @@ fn export_param_ref_types_flags_unknown_attribute() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
@@ -7511,7 +7559,7 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
@@ -7582,7 +7630,7 @@ fn unchecked_export_checks_existence_and_attached_failure_skips_duplicate_walk()
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
 
     let all_errors =
@@ -7675,7 +7723,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
@@ -7732,7 +7780,7 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
@@ -7778,7 +7826,7 @@ fn validate_export_param_ref_types_skips_attached_inference_failure() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
@@ -7829,7 +7877,7 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        crate::parser::ProviderContext::unloaded(),
+        &crate::parser::ProviderContext::default(),
     );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(result.is_ok(), "got {:?}", result);
@@ -8938,7 +8986,10 @@ fn resolve_file_type_exprs_rejects_unknown_in_arguments() {
         validations: Vec::new(),
     });
 
-    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
+    let findings = crate::validation::deferred_types::with_session_for_test(
+        &enriched_context_with_iam_policy_arn(),
+        |session| resolve_file_type_exprs(&mut parsed, session),
+    );
 
     assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
     let only = findings[0].to_string();
@@ -8973,19 +9024,27 @@ fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
         message: "wording drift must not change typed coverage".to_string(),
     };
 
-    let bootstrap_report = resolve_file_type_exprs_report(
-        &mut parsed,
+    let bootstrap_report = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        Some(TypeResolutionParserError::new(source_file, &parser_error)),
+        |session| {
+            resolve_file_type_exprs_report(
+                &mut parsed,
+                session,
+                Some(TypeResolutionParserError::new(source_file, &parser_error)),
+            )
+        },
     );
     assert!(bootstrap_report.diagnostics().is_empty());
     assert!(!bootstrap_report.covered_parser_error());
 
-    let report = resolve_file_type_exprs_report(
-        &mut parsed,
-        &enriched_context,
-        Some(TypeResolutionParserError::new(source_file, &parser_error)),
-    );
+    let report =
+        crate::validation::deferred_types::with_session_for_test(&enriched_context, |session| {
+            resolve_file_type_exprs_report(
+                &mut parsed,
+                session,
+                Some(TypeResolutionParserError::new(source_file, &parser_error)),
+            )
+        });
 
     assert_eq!(report.diagnostics().len(), 1);
     assert!(report.covered_parser_error());
@@ -9014,7 +9073,10 @@ fn resolve_file_type_exprs_accepts_registered_bare_identity() {
         validations: Vec::new(),
     });
 
-    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
+    let findings = crate::validation::deferred_types::with_session_for_test(
+        &enriched_context_with_iam_policy_arn(),
+        |session| resolve_file_type_exprs(&mut parsed, session),
+    );
     assert!(
         findings.is_empty(),
         "registered bare custom type must pass the resolver; got: {findings:?}"
@@ -9082,7 +9144,10 @@ fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
         validations: Vec::new(),
     });
 
-    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
+    let findings = crate::validation::deferred_types::with_session_for_test(
+        &enriched_context_with_iam_policy_arn(),
+        |session| resolve_file_type_exprs(&mut parsed, session),
+    );
 
     let joined = findings
         .iter()
@@ -9117,12 +9182,17 @@ fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded
     let ctx = ProviderContext::default();
     assert!(!ctx.custom_types_loaded());
     assert!(ctx.known_custom_types().is_empty());
-    let findings = resolve_file_type_exprs(&mut parsed, &ctx);
+    let findings = crate::validation::deferred_types::with_session_for_test(&ctx, |session| {
+        resolve_file_type_exprs(&mut parsed, session)
+    });
     assert!(findings.is_empty());
 
     // Once schemas have loaded, the same declaration becomes an actionable
     // unknown custom type.
-    let findings = resolve_file_type_exprs(&mut parsed, &enriched_context_with_iam_policy_arn());
+    let findings = crate::validation::deferred_types::with_session_for_test(
+        &enriched_context_with_iam_policy_arn(),
+        |session| resolve_file_type_exprs(&mut parsed, session),
+    );
     assert_eq!(
         findings.len(),
         1,
