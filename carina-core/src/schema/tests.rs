@@ -957,6 +957,188 @@ fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
 }
 
 #[test]
+fn domain_name_builtins_accept_dns_names() {
+    for type_name in ["DomainName", "WildcardDomainName"] {
+        let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
+            .expect("Domain name types must be registered built-ins");
+        for domain in [
+            "a.b",
+            "example.com",
+            "EXAMPLE.Com",
+            "a.b-c.example",
+            "123.456",
+            "192.0.2.1",
+            "xn--bcher-kva.example",
+            "example.com.",
+            "EXAMPLE.Com.",
+        ] {
+            let result = validate(&Value::Concrete(ConcreteValue::String(domain.into())));
+            assert!(result.is_ok(), "{type_name}: {domain:?}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn domain_name_builtins_reject_invalid_dns_names() {
+    for (type_name, prefix) in [
+        ("DomainName", ""),
+        ("WildcardDomainName", ""),
+        ("WildcardDomainName", "*."),
+    ] {
+        let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
+            .expect("Domain name types must be registered built-ins");
+        for domain in [
+            "",
+            ".",
+            "..",
+            "localhost",
+            "localhost.",
+            ".example.com",
+            "example..com",
+            "example.com..",
+            "a..b",
+            "-example.com",
+            "example-.com",
+            "example.-com",
+            "example.com-",
+            "exa_mple.com",
+            "example.c_om",
+            " example.com",
+            "example.com ",
+            "exa mple.com",
+            "example.\tcom",
+            "example.com\n",
+            "example.com\r",
+            "example.com\0",
+            "example.\u{a0}com",
+            "b\u{fc}cher.example",
+            "https://example.com",
+            "example.com:443",
+            "example.com/path",
+        ] {
+            let domain = format!("{prefix}{domain}");
+            assert!(
+                validate(&Value::Concrete(ConcreteValue::String(
+                    domain.clone().into()
+                )))
+                .is_err(),
+                "{type_name} must reject {domain:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn domain_name_builtin_rejects_wildcards() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("DomainName"))
+        .expect("DomainName must be a registered built-in");
+    for domain in [
+        "*.example.com",
+        "*.example.com.",
+        "a.*.com",
+        "*foo.com",
+        "**.com",
+        "*",
+    ] {
+        assert!(
+            validate(&Value::Concrete(ConcreteValue::String(domain.into()))).is_err(),
+            "DomainName must reject {domain:?}"
+        );
+    }
+}
+
+#[test]
+fn wildcard_domain_name_builtin_accepts_only_entire_leftmost_wildcard() {
+    let validate = builtin_validator(
+        RefinedScalarKind::String,
+        &TypeIdentity::bare("WildcardDomainName"),
+    )
+    .expect("WildcardDomainName must be a registered built-in");
+    for (domain, valid) in [
+        ("*.example.com", true),
+        ("*.EXAMPLE.Com", true),
+        ("*.example.com.", true),
+        ("*.a.b-c.example", true),
+        ("*.xn--bcher-kva.example", true),
+        ("*.123.456", true),
+        ("*", false),
+        ("*.", false),
+        ("*.com", false),
+        ("*.com.", false),
+        ("a.*.com", false),
+        ("*foo.com", false),
+        ("**.com", false),
+        ("*.*.example.com", false),
+        ("example.com.*", false),
+        ("*.a.*.com", false),
+        ("*.foo*.com", false),
+        ("*..example.com", false),
+    ] {
+        let result = validate(&Value::Concrete(ConcreteValue::String(domain.into())));
+        assert_eq!(result.is_ok(), valid, "{domain:?}: {result:?}");
+    }
+}
+
+#[test]
+fn domain_name_builtins_enforce_label_and_name_length_boundaries() {
+    let max_name = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    assert_eq!(max_name.len(), 253);
+    let too_long = format!("{max_name}d");
+    assert_eq!(too_long.len(), 254);
+    for (type_name, prefix) in [
+        ("DomainName", ""),
+        ("WildcardDomainName", ""),
+        ("WildcardDomainName", "*."),
+    ] {
+        let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
+            .expect("Domain name types must be registered built-ins");
+        for (domain, valid) in [
+            (format!("{}.com", "a".repeat(63)), true),
+            (format!("a.{}", "b".repeat(63)), true),
+            (format!("a.{}.com", "b".repeat(63)), true),
+            (format!("{}.com", "a".repeat(64)), false),
+            (format!("a.{}", "b".repeat(64)), false),
+            (format!("a.{}.com", "b".repeat(64)), false),
+            (max_name.clone(), true),
+            (format!("{max_name}."), true),
+            (too_long.clone(), false),
+            (format!("{too_long}."), false),
+        ] {
+            let domain = format!("{prefix}{domain}");
+            let result = validate(&Value::Concrete(ConcreteValue::String(
+                domain.clone().into(),
+            )));
+            assert_eq!(result.is_ok(), valid, "{type_name}: {domain:?}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn domain_name_builtins_reject_non_string_values() {
+    for type_name in ["DomainName", "WildcardDomainName"] {
+        let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
+            .expect("Domain name types must be registered built-ins");
+        for value in [
+            Value::Concrete(ConcreteValue::Int(123)),
+            Value::Concrete(ConcreteValue::Float(1.2)),
+            Value::Concrete(ConcreteValue::Bool(true)),
+            Value::Concrete(ConcreteValue::List(vec![])),
+        ] {
+            assert!(
+                validate(&value).is_err(),
+                "{type_name} must reject {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn https_url_builtin_accepts_absolute_https_urls() {
     let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
         .expect("HttpsUrl must be a registered built-in");

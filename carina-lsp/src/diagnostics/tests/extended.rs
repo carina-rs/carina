@@ -3693,6 +3693,8 @@ fn builtin_custom_type_annotations_validate_attribute_values() {
     for (type_name, valid_value, invalid_value) in [
         ("Email", "\"user@example.com\"", "\"not-an-email\""),
         ("PositiveInt", "1", "0"),
+        ("DomainName", "\"EXAMPLE.Com.\"", "\"*.example.com\""),
+        ("WildcardDomainName", "\"*.example.com.\"", "\"a.*.com\""),
         (
             "HttpsUrl",
             "\"https://example.com:8443/keys?q=1#key\"",

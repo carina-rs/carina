@@ -9349,6 +9349,35 @@ fn type_expr_display_simple_is_pascal_case() {
 // --- Issue #1285: Validate fn call arguments for custom types ---
 
 #[test]
+fn user_fn_domain_name_custom_types_validate_arguments() {
+    for (type_name, domain, valid) in [
+        ("DomainName", "example.com", true),
+        ("DomainName", "EXAMPLE.Com.", true),
+        ("DomainName", "*.example.com", false),
+        ("DomainName", "example..com", false),
+        ("DomainName", "localhost", false),
+        ("WildcardDomainName", "example.com", true),
+        ("WildcardDomainName", "*.example.com.", true),
+        ("WildcardDomainName", "a.*.com", false),
+        ("WildcardDomainName", "*.com", false),
+    ] {
+        let input = format!(
+            "fn f(domain: {type_name}) {{ domain }}\nlet b = aws.s3_bucket {{ name = f({domain:?}) }}"
+        );
+        let result = parse(&input, &ProviderContext::default());
+        if valid {
+            assert!(result.is_ok(), "{type_name}: {domain:?}: {result:?}");
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains(&format!("parameter 'domain': expected {type_name}")),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
 fn user_fn_https_url_custom_type_validates_arguments() {
     for (url, valid) in [
         ("https://example.com:8443/oidc?q=1#keys", true),

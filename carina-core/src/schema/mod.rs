@@ -11928,6 +11928,48 @@ pub mod types {
         )
     }
 
+    /// DNS domain name (e.g., "example.com", "EXAMPLE.Com.").
+    ///
+    /// Requires at least two ASCII letter/digit/hyphen labels of 1–63 characters,
+    /// with no leading or trailing hyphens. Allows one trailing dot, excluded
+    /// from the 253-character name limit. Wildcards are rejected.
+    pub fn domain_name() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            TypeIdentity::bare("DomainName"),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_domain_name(s.expose_plaintext())
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
+
+    /// DNS domain name with an optional leftmost wildcard (e.g., "*.example.com").
+    ///
+    /// Accepts everything [`domain_name`] accepts, plus a single `*.` prefix.
+    /// The name after that prefix must be a valid DomainName, including its
+    /// 253-character limit; the wildcard prefix is excluded from that limit.
+    pub fn wildcard_domain_name() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            TypeIdentity::bare("WildcardDomainName"),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_wildcard_domain_name(s.expose_plaintext())
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
+
     /// Absolute HTTPS URL with a DNS, IPv4, or bracketed IPv6 host.
     ///
     /// Requires the lowercase `https://` scheme and forbids userinfo, whitespace,
@@ -12133,6 +12175,8 @@ pub fn builtin_validator_registry()
             types::ipv6_address(),
             types::ipv6_cidr(),
             types::email(),
+            types::domain_name(),
+            types::wildcard_domain_name(),
             types::https_url(),
             types::http_response_status_code(),
             types::redirect_protocol(),
@@ -12385,6 +12429,64 @@ pub fn validate_email(email: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a DNS domain name with at least two labels.
+///
+/// Each label contains 1–63 ASCII letters, digits, or hyphens, with no leading
+/// or trailing hyphen. Uppercase letters and a single trailing dot are accepted.
+/// The name excluding that dot must be at most 253 characters. Wildcards,
+/// underscores, empty labels, whitespace, and non-ASCII characters are rejected.
+///
+/// ```
+/// # use carina_core::schema::validate_domain_name;
+/// assert!(validate_domain_name("example.com").is_ok());
+/// assert!(validate_domain_name("EXAMPLE.Com.").is_ok());
+/// assert!(validate_domain_name("*.example.com").is_err());
+/// assert!(validate_domain_name("localhost").is_err());
+/// ```
+pub fn validate_domain_name(name: &str) -> Result<(), String> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.len() > 253 {
+        return Err(
+            "Domain name must be at most 253 characters excluding a trailing dot".to_string(),
+        );
+    }
+    if !name.contains('.') {
+        return Err("Domain name must contain at least two labels".to_string());
+    }
+    validate_dns_labels(name)
+}
+
+/// Validate a [`DomainName`](types::domain_name) with an optional `*.` prefix.
+///
+/// A wildcard must be the entire leftmost label. After removing it, the name
+/// must satisfy [`validate_domain_name`], including its length and label limits.
+///
+/// ```
+/// # use carina_core::schema::validate_wildcard_domain_name;
+/// assert!(validate_wildcard_domain_name("example.com").is_ok());
+/// assert!(validate_wildcard_domain_name("*.EXAMPLE.Com.").is_ok());
+/// assert!(validate_wildcard_domain_name("a.*.com").is_err());
+/// assert!(validate_wildcard_domain_name("*.com").is_err());
+/// ```
+pub fn validate_wildcard_domain_name(name: &str) -> Result<(), String> {
+    validate_domain_name(name.strip_prefix("*.").unwrap_or(name))
+}
+
+fn validate_dns_labels(name: &str) -> Result<(), String> {
+    for label in name.split('.') {
+        if !(1..=63).contains(&label.len())
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("DNS labels must contain 1–63 ASCII letters, digits, or hyphens and cannot start or end with a hyphen".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Validate an absolute URL with the lowercase `https://` scheme.
 ///
 /// DNS labels contain 1–63 ASCII letters, digits, or hyphens, with no leading or
@@ -12433,17 +12535,7 @@ pub fn validate_https_url(url: &str) -> Result<(), String> {
             host.parse::<std::net::Ipv4Addr>()
                 .map_err(|_| "HTTPS URL has an invalid IPv4 host".to_string())?;
         } else {
-            for label in host.split('.') {
-                if !(1..=63).contains(&label.len())
-                    || label.starts_with('-')
-                    || label.ends_with('-')
-                    || !label
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                {
-                    return Err("HTTPS URL host labels must contain 1–63 ASCII letters, digits, or hyphens and cannot start or end with a hyphen".to_string());
-                }
-            }
+            validate_dns_labels(host).map_err(|error| format!("HTTPS URL host: {error}"))?;
         }
         port
     };

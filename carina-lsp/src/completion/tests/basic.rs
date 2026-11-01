@@ -1002,6 +1002,12 @@ fn type_completion_includes_basic_types() {
     );
 
     // Built-in custom types should always appear (no provider needed)
+    for domain_type in ["DomainName", "WildcardDomainName"] {
+        assert!(
+            labels.contains(&domain_type),
+            "Missing {domain_type}: {labels:?}"
+        );
+    }
     for (_, identity) in carina_core::schema::builtin_validator_registry().keys() {
         let builtin_custom = &identity.kind;
         assert!(

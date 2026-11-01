@@ -467,6 +467,26 @@ mod tests {
     }
 
     #[test]
+    fn builtin_bare_custom_types_include_domain_names() {
+        let ctx = loaded_context(Default::default());
+        for (name, snake) in [
+            ("DomainName", "domain_name"),
+            ("WildcardDomainName", "wildcard_domain_name"),
+        ] {
+            assert!(
+                builtin_bare_custom_types()
+                    .iter()
+                    .any(|builtin| builtin == snake),
+                "{snake} must come from the built-in registry"
+            );
+            assert_eq!(
+                parse_type_expr_str(name, &ctx),
+                Some(TypeExpr::Simple(snake.to_string()))
+            );
+        }
+    }
+
+    #[test]
     fn parse_type_expr_str_accepts_every_builtin_validator_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());
         for (_, identity) in crate::schema::builtin_validator_registry().keys() {
