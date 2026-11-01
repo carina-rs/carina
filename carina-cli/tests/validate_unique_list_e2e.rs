@@ -1,6 +1,11 @@
 use std::process::Command;
 
 fn run(command: &str, claims: &str) -> std::process::Output {
+    let directory = project(claims, "");
+    run_in(directory.path(), command)
+}
+
+fn project(claims: &str, declarations: &str) -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -18,7 +23,7 @@ fn run(command: &str, claims: &str) -> std::process::Output {
     .unwrap();
     std::fs::write(
         directory.path().join("main.crn"),
-        format!("let subject = mock.actions.OidcSubject {{\n  claim_keys = [{claims}]\n}}\n"),
+        format!("{declarations}\nlet subject = mock.actions.OidcSubject {{\n  claim_keys = [{claims}]\n}}\n"),
     )
     .unwrap();
     let init = Command::new(env!("CARGO_BIN_EXE_carina"))
@@ -31,8 +36,13 @@ fn run(command: &str, claims: &str) -> std::process::Output {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
+    directory
+}
+
+fn run_in(directory: &std::path::Path, command: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_carina"))
-        .current_dir(directory.path())
+        .current_dir(directory)
+        .env("NO_COLOR", "1")
         .args([command, "."])
         .output()
         .unwrap()
@@ -79,4 +89,59 @@ fn plan_rejects_duplicate_canonical_list_elements() {
     );
     assert!(stderr.contains("Duplicate list element"), "{stderr}");
     assert!(stderr.contains("claim_keys"), "{stderr}");
+}
+
+#[test]
+fn plan_rejects_list_duplicate_from_upstream_coalesce_after_validate_passes() {
+    let directory = project(
+        "repo, upstream.claim ?? mock.actions.OidcSubject.ClaimKey.repo",
+        "let upstream = upstream_state { source = './upstream' }",
+    );
+    let upstream = directory.path().join("upstream");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::copy(
+        directory.path().join("providers.crn"),
+        upstream.join("providers.crn"),
+    )
+    .unwrap();
+    std::fs::write(
+        upstream.join("main.crn"),
+        r#"
+backend local { path = "carina.state.json" }
+exports {
+  claim: mock.actions.OidcSubject.ClaimKey = mock.actions.OidcSubject.ClaimKey.repo
+}
+"#,
+    )
+    .unwrap();
+    // The export was added to the upstream source after its last apply. Only
+    // plan reads the saved state and selects the enum-valued fallback.
+    let state = carina_state::StateFile::new();
+    std::fs::write(
+        upstream.join("carina.state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    let init = run_in(&upstream, "init");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let validate = run_in(directory.path(), "validate");
+    assert!(
+        validate.status.success(),
+        "validate must accept the still-deferred element: {}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let plan = run_in(directory.path(), "plan");
+    let stderr = String::from_utf8_lossy(&plan.stderr);
+    assert!(
+        !plan.status.success(),
+        "plan accepted the resolved duplicate: {stderr}"
+    );
+    assert!(stderr.contains("Duplicate list element"), "{stderr}");
+    assert!(stderr.contains("claim_keys"), "{stderr}");
+    assert!(stderr.contains("index 1 (first at index 0)"), "{stderr}");
 }

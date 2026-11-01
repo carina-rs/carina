@@ -214,6 +214,112 @@ pub(crate) fn top_level_let_binding_names(input: &str) -> Result<Vec<String>, Pa
     Ok(names)
 }
 
+/// Locate an authored attribute value or a literal descendant of it.
+///
+/// `scope` is a half-open range of zero-based source lines. Computed expressions
+/// have no literal descendants and return `None`. Grammar spans preserve quoted
+/// commas, comments, nested containers, and heredoc position mappings.
+pub fn attribute_value_source_span(
+    input: &str,
+    attribute: &str,
+    path: &crate::schema::FieldPath,
+    scope: Option<(u32, u32)>,
+) -> Result<Option<super::SourceSpan>, ParseError> {
+    use crate::schema::FieldPathStep;
+    use pest::iterators::Pair;
+
+    fn peel(mut pair: Pair<'_, Rule>) -> Option<Pair<'_, Rule>> {
+        while !matches!(pair.as_rule(), Rule::list | Rule::map | Rule::nested_block) {
+            let mut children = pair.into_inner();
+            pair = children.next()?;
+            if children.next().is_some() {
+                return None;
+            }
+        }
+        Some(pair)
+    }
+
+    fn named_value<'a>(pair: Pair<'a, Rule>, name: &str) -> Option<Pair<'a, Rule>> {
+        let pair = if pair.as_rule() == Rule::block_content {
+            pair.into_inner().next()?
+        } else {
+            pair
+        };
+        if !matches!(
+            pair.as_rule(),
+            Rule::attribute | Rule::map_entry | Rule::nested_block
+        ) {
+            return None;
+        }
+        let mut children = pair.clone().into_inner();
+        let key = children.next()?;
+        if key.as_str().trim_matches(['\'', '"']) != name {
+            return None;
+        }
+        if pair.as_rule() == Rule::nested_block {
+            Some(pair)
+        } else {
+            children.next()
+        }
+    }
+
+    fn descend<'a>(pair: Pair<'a, Rule>, steps: &[FieldPathStep]) -> Option<Pair<'a, Rule>> {
+        let Some((step, rest)) = steps.split_first() else {
+            return Some(pair);
+        };
+        let pair = peel(pair)?;
+        match step {
+            FieldPathStep::Index(index) if pair.as_rule() == Rule::list => {
+                descend(pair.into_inner().nth(*index)?, rest)
+            }
+            FieldPathStep::Field(name) => {
+                let mut matches = pair
+                    .into_inner()
+                    .filter_map(|child| named_value(child, name));
+                let first = matches.next()?;
+                if first.as_rule() == Rule::nested_block
+                    && let Some((FieldPathStep::Index(index), rest)) = rest.split_first()
+                {
+                    descend(std::iter::once(first).chain(matches).nth(*index)?, rest)
+                } else {
+                    descend(first, rest)
+                }
+            }
+            FieldPathStep::Index(_) => None,
+        }
+    }
+
+    let file = super::preprocess_file(input)?;
+    let mut values = file.parse()?.flatten().filter_map(|pair| {
+        if !matches!(
+            pair.as_rule(),
+            Rule::attribute | Rule::map_entry | Rule::nested_block
+        ) {
+            return None;
+        }
+        let span = super::SourceSpan::from_pest(&pair, &file);
+        let line = (span.start_line() - 1) as u32;
+        if scope.is_some_and(|(start, end)| line < start || line >= end) {
+            return None;
+        }
+        named_value(pair, attribute)
+    });
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    let selected = if first.as_rule() == Rule::nested_block
+        && let Some((FieldPathStep::Index(index), rest)) = path.steps().split_first()
+    {
+        std::iter::once(first)
+            .chain(values)
+            .nth(*index)
+            .and_then(|pair| descend(pair, rest))
+    } else {
+        descend(first, path.steps())
+    };
+    Ok(selected.map(|pair| super::SourceSpan::from_pest(&pair, &file)))
+}
+
 /// Return keyword spans for state blocks parsed as top-level statements.
 ///
 /// This uses the main DSL grammar rather than a textual keyword scan, so a

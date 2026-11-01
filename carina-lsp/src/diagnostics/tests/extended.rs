@@ -33,7 +33,15 @@ fn unique_list_diagnostics_use_canonical_values_in_a_directory() {
             assert!(diagnostic.message.contains("repo"), "{diagnostic:?}");
             assert!(diagnostic.message.contains("claim_keys"), "{diagnostic:?}");
             assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
-            assert_eq!(diagnostic.range.start, Position::new(1, 2));
+            let duplicate = claims.rsplit(", ").next().unwrap();
+            let start = source.lines().nth(1).unwrap().rfind(duplicate).unwrap() as u32;
+            assert_eq!(
+                diagnostic.range,
+                Range::new(
+                    Position::new(1, start),
+                    Position::new(1, start + duplicate.len() as u32)
+                )
+            );
         } else {
             assert!(diagnostics.is_empty(), "{diagnostics:?}");
         }
@@ -53,6 +61,9 @@ fn unique_list_diagnostics_cover_computed_and_nested_lists_in_a_directory() {
         ResourceSchema::new("test.UniqueLists")
             .attribute(AttributeSchema::optional("values", list.clone()).build())
             .attribute(
+                AttributeSchema::optional("matrix", AttributeType::list(list.clone())).build(),
+            )
+            .attribute(
                 AttributeSchema::optional(
                     "nested",
                     AttributeType::struct_(
@@ -70,6 +81,7 @@ fn unique_list_diagnostics_cover_computed_and_nested_lists_in_a_directory() {
         "values = split(\",\", \"repo,repo\")",
         "values = [\"repo\",\n    \"repo\"]",
         "nested = {\n    values = [\"repo\", \"repo\"]\n  }",
+        "matrix = [[\"repo\", \"repo\"]]",
     ] {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
@@ -83,6 +95,16 @@ fn unique_list_diagnostics_cover_computed_and_nested_lists_in_a_directory() {
             Some(DiagnosticSeverity::ERROR),
             "{body}: {diagnostics:?}"
         );
+        if let Some(offset) = source.rfind("\"repo\"") {
+            let before = &source[..offset];
+            let line = before.bytes().filter(|&byte| byte == b'\n').count() as u32;
+            let start = before.rsplit('\n').next().unwrap().len() as u32;
+            assert_eq!(
+                diagnostic.range,
+                Range::new(Position::new(line, start), Position::new(line, start + 6)),
+                "{body}: {diagnostics:?}"
+            );
+        }
     }
 }
 

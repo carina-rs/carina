@@ -340,14 +340,13 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
         AttrTypeKind::List {
             element_type,
             ordered,
-            length,
-            elements,
+            constraints,
         } => {
             encoder.tag(8);
             encode_attribute_type(encoder, element_type);
             encoder.bool(*ordered);
-            encode_optional_u64_range(encoder, *length);
-            encoder.tag(match elements {
+            encode_optional_u64_range(encoder, constraints.length());
+            encoder.tag(match constraints.elements() {
                 super::ListElements::AllowDuplicates => 0,
                 super::ListElements::Unique => 1,
             });

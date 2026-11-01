@@ -5499,8 +5499,7 @@ mod tests {
             carina_core::schema::Shape::List {
                 element_type: inner,
                 ordered,
-                length: _length,
-                elements: _elements,
+                constraints: _constraints,
             } => {
                 assert!(!ordered, "list should be unordered");
 
@@ -6583,12 +6582,11 @@ mod tests {
                 }
                 carina_core::schema::Shape::List {
                     ordered,
-                    length,
+                    constraints,
                     element_type: _element_type,
-                    elements: _elements,
                 } => {
                     assert!(ordered);
-                    assert_eq!(length, Some((Some(1), Some(3))));
+                    assert_eq!(constraints.length(), Some((Some(1), Some(3))));
                 }
                 other => panic!("unexpected lifted shape: {other:?}"),
             }

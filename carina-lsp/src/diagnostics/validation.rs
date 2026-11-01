@@ -30,17 +30,38 @@ impl DiagnosticEngine {
     ///
     /// `effective_type` carries both the resource definition map and the
     /// selected attribute path's input ancestry.
-    pub(super) fn validate_struct_value(
+    pub(super) fn validate_container_value(
         &self,
         doc: &Document,
         attr_name: &str,
         value: &Value,
         effective_type: &EffectiveType<'_>,
         value_range: Option<Range>,
+        scope: Option<(u32, u32)>,
     ) -> Vec<Diagnostic> {
         let errors = effective_type.validate_collect(value);
         let mut diagnostics = Vec::new();
         for (path, err) in errors {
+            if matches!(&err, TypeError::DuplicateListElement { .. })
+                && let Some(range) = self
+                    .value_range_for_path(doc, attr_name, &path, scope)
+                    .or_else(|| {
+                        self.range_for_path(doc, attr_name, &path)
+                            .map(|(line, col, end_col)| {
+                                Range::new(
+                                    tower_lsp::lsp_types::Position::new(line, col),
+                                    tower_lsp::lsp_types::Position::new(line, end_col),
+                                )
+                            })
+                    })
+            {
+                diagnostics.push(super::carina_diagnostic_range(
+                    range,
+                    DiagnosticSeverity::ERROR,
+                    err.with_attribute(attr_name).to_string(),
+                ));
+                continue;
+            }
             if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {
                 if path.is_empty() {
                     let tagged = err.clone().with_attribute(attr_name);
@@ -66,6 +87,28 @@ impl DiagnosticEngine {
             }
         }
         diagnostics
+    }
+
+    fn value_range_for_path(
+        &self,
+        doc: &Document,
+        attr_name: &str,
+        path: &FieldPath,
+        scope: Option<(u32, u32)>,
+    ) -> Option<Range> {
+        let span =
+            carina_core::parser::attribute_value_source_span(&doc.text(), attr_name, path, scope)
+                .ok()??;
+        Some(Range::new(
+            tower_lsp::lsp_types::Position::new(
+                (span.start_line() - 1) as u32,
+                (span.start_column() - 1) as u32,
+            ),
+            tower_lsp::lsp_types::Position::new(
+                (span.end_line() - 1) as u32,
+                (span.end_column() - 1) as u32,
+            ),
+        ))
     }
 
     /// Walk a [`FieldPath`] across the source `doc` and return the
@@ -104,7 +147,9 @@ impl DiagnosticEngine {
             let positions = self.find_all_block_positions(doc, attr_name);
             return positions
                 .get(block_index)
-                .map(|(line, col)| (*line, *col, *col + attr_name.len() as u32));
+                .copied()
+                .or_else(|| self.find_attribute_position(doc, attr_name, None))
+                .map(|(line, col)| (line, col, col + attr_name.len() as u32));
         };
 
         // The first name lookup goes through the LSP's existing
@@ -118,8 +163,8 @@ impl DiagnosticEngine {
         // For deeper paths (struct nested inside struct), descend by
         // re-using the same scanner with the previous field name as
         // the block name. This is approximate — LSP-side struct path
-        // resolution is best-effort — but matches what the legacy
-        // `validate_struct_value` was already doing.
+        // resolution is best-effort — but matches the legacy
+        // struct-validation behavior.
         let mut current_block = first_name.as_str();
         for step in name_steps.iter().skip(1) {
             if let FieldPathStep::Field(child) = step {

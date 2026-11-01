@@ -377,6 +377,210 @@ fn duplicate_list_element_diagnostics_preserve_context_and_mask_secrets() {
 }
 
 #[test]
+fn unique_list_constraints_collect_length_and_element_errors_together() {
+    let list = AttributeType::refined_list(
+        AttributeType::string(),
+        true,
+        Some((None, Some(2))),
+        ListElements::Unique,
+    );
+    for value in [
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("repo".into())),
+            Value::Concrete(ConcreteValue::String("repo".into())),
+            Value::Concrete(ConcreteValue::Int(7)),
+            Value::Concrete(ConcreteValue::String("repo".into())),
+        ])),
+        Value::Concrete(ConcreteValue::StringList(vec![
+            "repo".into(),
+            "repo".into(),
+            "repo".into(),
+        ])),
+    ] {
+        assert!(matches!(
+            list.validate(&value),
+            Err(TypeError::LengthOutOfRange { .. })
+        ));
+        assert!(
+            fit_value_to_type_on_path(
+                &list,
+                &value,
+                empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                &mut Vec::new(),
+            )
+            .is_none()
+        );
+        let errors = Schema::flat(list.clone()).validate_collect(&value);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|(_, error)| matches!(error, TypeError::LengthOutOfRange { .. }))
+                .count(),
+            1,
+            "{errors:?}"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|(_, error)| matches!(error, TypeError::DuplicateListElement { .. }))
+                .count(),
+            2,
+            "{errors:?}"
+        );
+        assert_eq!(
+            errors.len(),
+            if matches!(value, Value::Concrete(ConcreteValue::List(_))) {
+                4
+            } else {
+                3
+            },
+            "{errors:?}"
+        );
+    }
+}
+
+fn assert_mixed_sensitive_list_duplicate_is_masked(secret: bool, sensitive_first: bool) {
+    let plain = Value::Concrete(ConcreteValue::String("private-mixed-claim".into()));
+    let sensitive = if secret {
+        Value::Deferred(DeferredValue::Secret(Box::new(plain.clone())))
+    } else {
+        Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
+            "private-mixed-claim",
+        )))
+    };
+    let items = if sensitive_first {
+        vec![sensitive, plain]
+    } else {
+        vec![plain, sensitive]
+    };
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    let value = Value::Concrete(ConcreteValue::List(items));
+    let error = list.validate(&value).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            TypeError::DuplicateListElement {
+                value: DiagnosticValue::Masked,
+                index: 1,
+                first_index: 0,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(!format!("{error:?}: {error}").contains("private-mixed-claim"));
+    let errors = Schema::flat(list).validate_collect(&value);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(!format!("{errors:?}").contains("private-mixed-claim"));
+}
+
+#[test]
+fn unique_list_masks_secret_before_plain_duplicate() {
+    assert_mixed_sensitive_list_duplicate_is_masked(true, true);
+}
+
+#[test]
+fn unique_list_masks_plain_before_secret_duplicate() {
+    assert_mixed_sensitive_list_duplicate_is_masked(true, false);
+}
+
+#[test]
+fn unique_list_masks_diagnostic_sensitive_before_plain_duplicate() {
+    assert_mixed_sensitive_list_duplicate_is_masked(false, true);
+}
+
+#[test]
+fn unique_list_masks_plain_before_diagnostic_sensitive_duplicate() {
+    assert_mixed_sensitive_list_duplicate_is_masked(false, false);
+}
+
+#[test]
+fn unique_float_list_compares_integers_as_floats() {
+    let list = unique_list_from_protocol(AttributeType::float(), true);
+    for items in [
+        vec![ConcreteValue::Int(1), ConcreteValue::Float(1.0)],
+        vec![ConcreteValue::Float(1.0), ConcreteValue::Int(1)],
+    ] {
+        let value = Value::Concrete(ConcreteValue::List(
+            items.into_iter().map(Value::Concrete).collect(),
+        ));
+        assert!(matches!(
+            list.validate(&value),
+            Err(TypeError::DuplicateListElement {
+                index: 1,
+                first_index: 0,
+                ..
+            })
+        ));
+        assert_eq!(Schema::flat(list.clone()).validate_collect(&value).len(), 1);
+        for purpose in [
+            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+            CanonicalizationPurpose::State,
+        ] {
+            assert!(
+                fit_value_to_type_on_path(
+                    &list,
+                    &value,
+                    empty_defs_for_schema_walks(),
+                    FieldAncestry::WRITABLE,
+                    purpose,
+                    &mut Vec::new()
+                )
+                .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn unique_struct_list_compares_block_aliases_by_canonical_field_name() {
+    let element = AttributeType::struct_(
+        "Item",
+        vec![
+            StructField::required("canonical", AttributeType::string())
+                .with_block_name("alias")
+                .build(),
+        ],
+    );
+    let list = unique_list_from_protocol(element, true);
+    for names in [["canonical", "alias"], ["alias", "canonical"]] {
+        let value = Value::Concrete(ConcreteValue::List(
+            names
+                .into_iter()
+                .map(|name| {
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        name.into(),
+                        Value::Concrete(ConcreteValue::String("repo".into())),
+                    )])))
+                })
+                .collect(),
+        ));
+        assert!(matches!(
+            list.validate(&value),
+            Err(TypeError::DuplicateListElement {
+                index: 1,
+                first_index: 0,
+                ..
+            })
+        ));
+        assert_eq!(Schema::flat(list.clone()).validate_collect(&value).len(), 1);
+        assert!(
+            fit_value_to_type_on_path(
+                &list,
+                &value,
+                empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                &mut Vec::new()
+            )
+            .is_none()
+        );
+    }
+}
+
+#[test]
 fn field_group_members_require_two_distinct_field_names() {
     assert_eq!(
         FieldGroup::exactly_one(Vec::<String>::new()),
@@ -6615,8 +6819,7 @@ fn shape_ref_free_projects_non_ref_shape() {
         Shape::List {
             element_type: inner,
             ordered,
-            length: _length,
-            elements: _elements,
+            constraints: _constraints,
         } => {
             assert!(ordered);
             assert!(matches!(inner.kind(), AttrTypeKind::String { .. }));
@@ -13742,8 +13945,7 @@ fn raw_shape_passes_through_non_ref_variants() {
         RawShape::List {
             ordered,
             element_type: _element_type,
-            length: _length,
-            elements: _elements,
+            constraints: _constraints,
         } => assert!(ordered),
         other => panic!("expected RawShape::List, got {other:?}"),
     }
@@ -13751,8 +13953,7 @@ fn raw_shape_passes_through_non_ref_variants() {
         RawShape::List {
             ordered,
             element_type: _element_type,
-            length: _length,
-            elements: _elements,
+            constraints: _constraints,
         } => assert!(!ordered),
         other => panic!("expected RawShape::List(unordered), got {other:?}"),
     }

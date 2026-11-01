@@ -40,7 +40,7 @@ pub struct TypeIdentity {
 
 /// A validated long-form reference template.
 ///
-/// The only placeholders accepted by protocol v16 are `{partition}`,
+/// The only placeholders accepted by protocol v17 are `{partition}`,
 /// `{region}`, `{account}`, and `{name}`. The `{name}` placeholder appears
 /// exactly once and denotes the short form of the reference.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

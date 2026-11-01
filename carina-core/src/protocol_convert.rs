@@ -789,13 +789,12 @@ pub fn attribute_type_to_protocol(
         RawShape::List {
             element_type,
             ordered,
-            length,
-            elements,
+            constraints,
         } => Ok(protocol::AttributeType::List {
             element_type: Box::new(attribute_type_to_protocol(element_type)?),
             ordered,
-            length,
-            elements,
+            length: constraints.length(),
+            elements: constraints.elements(),
             validate: None,
         }),
         RawShape::Map { key, value } => Ok(protocol::AttributeType::Map {
@@ -2627,15 +2626,14 @@ mod tests {
                 let RawShape::List {
                     element_type: _element_type,
                     ordered: back_ordered,
-                    length,
-                    elements: back_elements,
+                    constraints,
                 } = decoded.raw_shape()
                 else {
                     panic!("list shape was lost");
                 };
                 assert_eq!(back_ordered, ordered);
-                assert_eq!(back_elements, elements);
-                assert_eq!(length, Some((Some(1), Some(3))));
+                assert_eq!(constraints.elements(), elements);
+                assert_eq!(constraints.length(), Some((Some(1), Some(3))));
             }
         }
     }
@@ -3877,10 +3875,9 @@ mod tests {
                     to_dsl: _to_dsl,
                 } => panic!("unexpected Enum builtin wire shape for {identity}"),
                 RawShape::List {
-                    elements: _elements,
                     element_type: _element_type,
                     ordered: _ordered,
-                    length: _length,
+                    constraints: _constraints,
                 } => panic!("unexpected List builtin wire shape for {identity}"),
                 RawShape::Map {
                     key: _key,
@@ -4096,10 +4093,9 @@ mod tests {
             decoded.raw_shape(),
             RawShape::List {
                 ordered: false,
-                length: Some((Some(1), Some(5))),
+                constraints,
                 element_type: _element_type,
-                elements: _elements,
-            }
+            } if constraints.length() == Some((Some(1), Some(5)))
         ));
     }
 

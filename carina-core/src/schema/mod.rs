@@ -219,6 +219,28 @@ mod type_identity;
 pub use carina_provider_protocol::types::{
     DslTransform, ListElements, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };
+
+/// Count and element policies enforced together when walking a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListConstraints {
+    length: Option<(Option<u64>, Option<u64>)>,
+    elements: ListElements,
+}
+
+impl ListConstraints {
+    pub const fn new(length: Option<(Option<u64>, Option<u64>)>, elements: ListElements) -> Self {
+        Self { length, elements }
+    }
+
+    pub const fn length(self) -> Option<(Option<u64>, Option<u64>)> {
+        self.length
+    }
+
+    pub const fn elements(self) -> ListElements {
+        self.elements
+    }
+}
+
 /// Per-resource operational configuration for provider timeouts and retries.
 pub use carina_provider_protocol::{OperationConfig, ReadBackBudget, ValidatorType};
 pub use resolved_attr_type::ResolvedAttrType;
@@ -1441,8 +1463,7 @@ pub(crate) enum AttrTypeKind {
     List {
         element_type: Box<AttributeType>,
         ordered: bool,
-        length: Option<(Option<u64>, Option<u64>)>,
-        elements: ListElements,
+        constraints: ListConstraints,
     },
     /// Map with typed keys and values.
     /// `key`: type constraint for map keys (e.g., `String` for unconstrained,
@@ -1531,8 +1552,7 @@ pub enum Shape<'a> {
     List {
         element_type: &'a AttributeType,
         ordered: bool,
-        length: Option<(Option<u64>, Option<u64>)>,
-        elements: ListElements,
+        constraints: ListConstraints,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
@@ -1627,14 +1647,12 @@ impl fmt::Debug for Shape<'_> {
             Shape::List {
                 element_type,
                 ordered,
-                length,
-                elements,
+                constraints,
             } => f
                 .debug_struct("Shape::List")
                 .field("element_type", element_type)
                 .field("ordered", ordered)
-                .field("length", length)
-                .field("elements", elements)
+                .field("constraints", constraints)
                 .finish_non_exhaustive(),
             Shape::Map { key, value } => f
                 .debug_struct("Shape::Map")
@@ -1706,8 +1724,7 @@ pub enum RawShape<'a> {
     List {
         element_type: &'a AttributeType,
         ordered: bool,
-        length: Option<(Option<u64>, Option<u64>)>,
-        elements: ListElements,
+        constraints: ListConstraints,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
@@ -1780,14 +1797,12 @@ impl fmt::Debug for RawShape<'_> {
             RawShape::List {
                 element_type,
                 ordered,
-                length,
-                elements,
+                constraints,
             } => f
                 .debug_struct("RawShape::List")
                 .field("element_type", element_type)
                 .field("ordered", ordered)
-                .field("length", length)
-                .field("elements", elements)
+                .field("constraints", constraints)
                 .finish_non_exhaustive(),
             RawShape::Map { key, value } => f
                 .debug_struct("RawShape::Map")
@@ -2328,8 +2343,7 @@ impl Schema {
             }
             AttrTypeKind::List {
                 element_type: inner,
-                length,
-                elements,
+                constraints,
                 ordered: _ordered,
             } => {
                 let Some(items) = (match concrete {
@@ -2351,23 +2365,22 @@ impl Schema {
                     ));
                     return;
                 };
-                if let Err(error) = validate_list_length(*length, items.len()) {
-                    out.push((path.clone(), error));
-                    return;
-                }
-                let mut tracker = ListElementTracker::new(*elements);
-                for (i, item) in items.iter().enumerate() {
-                    if let Some(fit) = fit_value_to_type_on_path(
+                for result in constraints.check(items.iter(), ancestry, |item| {
+                    fit_value_to_type_on_path(
                         inner,
                         item,
                         defs,
                         ancestry,
                         CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
                         &mut Vec::new(),
-                    ) && let Err(error) = tracker.check(i, item, &fit)
-                    {
-                        out.push((path.clone(), error));
+                    )
+                }) {
+                    if let Err(ListConstraintError { index, error }) = result {
+                        let error_path = index.map_or_else(|| path.clone(), |i| path.push_index(i));
+                        out.push((error_path, *error));
                     }
+                }
+                for (i, item) in items.iter().enumerate() {
                     let next_path = path.push_index(i);
                     Self::collect_attr_into(inner, defs, &next_path, item, ancestry, out);
                 }
@@ -2580,57 +2593,42 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
         }
         AttrTypeKind::List {
             element_type: inner,
-            length,
-            elements,
+            constraints,
             ordered: _ordered,
         } => {
-            if let Some(ConcreteValueRef::List(items)) = value.as_concrete() {
-                validate_list_length(*length, items.len())?;
-                let mut tracker = ListElementTracker::new(*elements);
-                for (i, item) in items.iter().enumerate() {
-                    if let Some(fit) = fit_value_to_type_on_path(
-                        inner,
-                        item,
-                        defs,
-                        ancestry,
-                        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-                        &mut Vec::new(),
-                    ) {
-                        tracker.check(i, item, &fit)?;
-                    } else {
-                        validate_attr_with_defs_and_ancestry(inner, item, defs, ancestry)
-                            .map_err(|error| error.at_list_index(i))?;
-                    }
+            let items: Cow<'_, [Value<P, B>]> = match value.as_concrete() {
+                Some(ConcreteValueRef::List(items)) => Cow::Borrowed(items),
+                Some(ConcreteValueRef::StringList(items)) => Cow::Owned(
+                    items
+                        .iter()
+                        .map(|item| Value::Concrete(ConcreteValue::String(item.clone())))
+                        .collect(),
+                ),
+                None => return Ok(()),
+                Some(_) => {
+                    return Err(TypeError::TypeMismatch {
+                        expected: attr.type_name(),
+                        got: value.type_name(),
+                    });
                 }
-                Ok(())
-            } else if let Some(ConcreteValueRef::StringList(items)) = value.as_concrete() {
-                validate_list_length(*length, items.len())?;
-                let mut tracker = ListElementTracker::new(*elements);
-                for (i, item) in items.iter().enumerate() {
-                    let item: Value<P, B> = Value::Concrete(ConcreteValue::String(item.clone()));
-                    if let Some(fit) = fit_value_to_type_on_path(
-                        inner,
-                        &item,
-                        defs,
-                        ancestry,
-                        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-                        &mut Vec::new(),
-                    ) {
-                        tracker.check(i, &item, &fit)?;
-                    } else {
-                        validate_attr_with_defs_and_ancestry(inner, &item, defs, ancestry)
-                            .map_err(|error| error.at_list_index(i))?;
-                    }
+            };
+            for result in constraints.check(items.iter(), ancestry, |item| {
+                fit_value_to_type_on_path(
+                    inner,
+                    item,
+                    defs,
+                    ancestry,
+                    CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                    &mut Vec::new(),
+                )
+            }) {
+                let (i, fit) = result.map_err(|failure| *failure.error)?;
+                if fit.is_none() {
+                    validate_attr_with_defs_and_ancestry(inner, &items[i], defs, ancestry)
+                        .map_err(|error| error.at_list_index(i))?;
                 }
-                Ok(())
-            } else if value.as_concrete().is_none() {
-                Ok(())
-            } else {
-                Err(TypeError::TypeMismatch {
-                    expected: attr.type_name(),
-                    got: value.type_name(),
-                })
             }
+            Ok(())
         }
         AttrTypeKind::Map { key, value: val_ty } => {
             if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
@@ -2801,14 +2799,12 @@ impl fmt::Debug for AttributeType {
             AttrTypeKind::List {
                 element_type,
                 ordered,
-                length,
-                elements,
+                constraints,
             } => f
                 .debug_struct("List")
                 .field("element_type", element_type)
                 .field("ordered", ordered)
-                .field("length", length)
-                .field("elements", elements)
+                .field("constraints", constraints)
                 .finish(),
             AttrTypeKind::Map { key, value } => f
                 .debug_struct("Map")
@@ -3185,13 +3181,11 @@ impl AttributeType {
             AttrTypeKind::List {
                 element_type,
                 ordered,
-                length,
-                elements,
+                constraints,
             } => Shape::List {
                 element_type: element_type.as_ref(),
                 ordered: *ordered,
-                length: *length,
-                elements: *elements,
+                constraints: *constraints,
             },
             AttrTypeKind::Map { key, value } => Shape::Map {
                 key: key.as_ref(),
@@ -3277,13 +3271,11 @@ impl AttributeType {
             AttrTypeKind::List {
                 element_type,
                 ordered,
-                length,
-                elements,
+                constraints,
             } => RawShape::List {
                 element_type: element_type.as_ref(),
                 ordered: *ordered,
-                length: *length,
-                elements: *elements,
+                constraints: *constraints,
             },
             AttrTypeKind::Map { key, value } => RawShape::Map {
                 key: key.as_ref(),
@@ -3623,8 +3615,7 @@ impl AttributeType {
             kind: AttrTypeKind::List {
                 element_type: Box::new(element_type),
                 ordered,
-                length,
-                elements,
+                constraints: ListConstraints::new(length, elements),
             },
         }
     }
@@ -4663,26 +4654,6 @@ fn validate_string_refinement(
     Ok(())
 }
 
-fn validate_list_length(
-    length: Option<(Option<u64>, Option<u64>)>,
-    count: usize,
-) -> Result<(), TypeError> {
-    if let Some((min, max)) = length {
-        let count_u64 = count as u64;
-        if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
-            return Err(TypeError::LengthOutOfRange {
-                value: format!("{count} items").into(),
-                length: count,
-                min,
-                max,
-                attribute: None,
-                type_name: Some("List".to_string()),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn validate_int_range(
     range: Option<(Option<i64>, Option<i64>)>,
     value: i64,
@@ -4817,8 +4788,10 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
     }
 }
 
-/// Equality is available only after a successful schema fit has resolved enum
-/// spellings. Deferred leaves make the entire element ineligible for comparison.
+/// Compare the canonical API JSON value after a successful schema fit, including
+/// float coercion, enum spellings, and canonical struct field names. Union members
+/// with the same JSON are the same element: `"repo"` and enum `repo`, or Int `5`
+/// and Duration `5s`. Deferred leaves make the entire element ineligible.
 #[derive(PartialEq, Eq, Hash)]
 struct KnownListElement(serde_json::Value);
 
@@ -4826,16 +4799,17 @@ impl KnownListElement {
     fn from_fit<P: PlaceholderKind, B: BindingAddress>(
         value: &Value<P, B>,
         fit: &Fit<'_>,
+        ancestry: FieldAncestry,
     ) -> Option<Self> {
         use serde_json::Value as Json;
         let canonical = match &fit.kind {
             FitKind::Enum { canonical, .. } => Json::String(canonical.api_value().to_string()),
-            FitKind::Union { fit, .. } => return Self::from_fit(value, fit),
+            FitKind::Union { fit, .. } => return Self::from_fit(value, fit, ancestry),
             FitKind::Secret(fit) => {
                 let Value::Deferred(DeferredValue::Secret(inner)) = value else {
                     return None;
                 };
-                return Self::from_fit(inner, fit);
+                return Self::from_fit(inner, fit, ancestry);
             }
             FitKind::List(fits) => {
                 let ConcreteValueRef::List(items) = value.as_concrete()? else {
@@ -4845,7 +4819,7 @@ impl KnownListElement {
                     items
                         .iter()
                         .zip(fits)
-                        .map(|(item, fit)| Self::from_fit(item, fit).map(|key| key.0))
+                        .map(|(item, fit)| Self::from_fit(item, fit, ancestry).map(|key| key.0))
                         .collect::<Option<_>>()?,
                 )
             }
@@ -4860,7 +4834,7 @@ impl KnownListElement {
                         .map(|(item, fit)| {
                             let item: Value<P, B> =
                                 Value::Concrete(ConcreteValue::String(item.clone()));
-                            Self::from_fit(&item, fit).map(|key| key.0)
+                            Self::from_fit(&item, fit, ancestry).map(|key| key.0)
                         })
                         .collect::<Option<_>>()?,
                 )
@@ -4874,12 +4848,15 @@ impl KnownListElement {
                         .zip(fits)
                         .map(|((key, value), fit)| {
                             let key = fit.canonical_key.as_ref().unwrap_or(key).clone();
-                            Self::from_fit(value, &fit.value).map(|value| (key, value.0))
+                            Self::from_fit(value, &fit.value, ancestry).map(|value| (key, value.0))
                         })
                         .collect::<Option<_>>()?,
                 )
             }
             FitKind::Struct(fits) => {
+                let AttrTypeKind::Struct { fields, .. } = &fit.attr.as_attr().kind else {
+                    return None;
+                };
                 let ConcreteValueRef::Map(map) = value.as_concrete()? else {
                     return None;
                 };
@@ -4887,7 +4864,9 @@ impl KnownListElement {
                     map.iter()
                         .zip(fits)
                         .map(|((key, value), fit)| {
-                            Self::from_fit(value, fit).map(|value| (key.clone(), value.0))
+                            let field = struct_field_for_key(fields, key, ancestry)?;
+                            Self::from_fit(value, fit, ancestry.descend(field))
+                                .map(|value| (field.name.clone(), value.0))
                         })
                         .collect::<Option<_>>()?,
                 )
@@ -4897,6 +4876,11 @@ impl KnownListElement {
                 ConcreteValueRef::EnumIdentifier(raw) => Json::String(raw.to_string()),
                 ConcreteValueRef::CanonicalEnum(canonical) => {
                     Json::String(canonical.api_value().to_string())
+                }
+                ConcreteValueRef::Int(n)
+                    if matches!(fit.attr.as_attr().kind, AttrTypeKind::Float { .. }) =>
+                {
+                    Json::Number(serde_json::Number::from_f64(n as f64)?)
                 }
                 ConcreteValueRef::Int(n) => Json::from(n),
                 ConcreteValueRef::Float(n) => Json::Number(serde_json::Number::from_f64(n)?),
@@ -4912,46 +4896,77 @@ impl KnownListElement {
     }
 }
 
-struct ListElementTracker {
-    elements: ListElements,
-    seen: HashMap<KnownListElement, usize>,
+/// A count failure belongs to the list; a duplicate belongs to its later item.
+struct ListConstraintError {
+    index: Option<usize>,
+    error: Box<TypeError>,
 }
 
-impl ListElementTracker {
-    fn new(elements: ListElements) -> Self {
-        Self {
-            elements,
-            seen: HashMap::new(),
-        }
-    }
-
-    fn check<P: PlaceholderKind, B: BindingAddress>(
-        &mut self,
-        index: usize,
-        value: &Value<P, B>,
-        fit: &Fit<'_>,
-    ) -> Result<(), TypeError> {
-        match self.elements {
-            ListElements::AllowDuplicates => return Ok(()),
-            ListElements::Unique => {}
-        }
-        let Some(key) = KnownListElement::from_fit(value, fit) else {
-            return Ok(());
-        };
-        if let Some(&first_index) = self.seen.get(&key) {
-            return Err(TypeError::DuplicateListElement {
-                value: if value.contains_diagnostic_sensitive_string() {
-                    DiagnosticValue::Masked
-                } else {
-                    crate::value::format_value(value).into()
+impl ListConstraints {
+    /// Check count and canonical element equality through one traversal. The
+    /// caller controls early exit by consuming the first error or every result.
+    fn check<'schema, P, B, I>(
+        self,
+        items: I,
+        ancestry: FieldAncestry,
+        mut fit_item: impl FnMut(&Value<P, B>) -> Option<Fit<'schema>>,
+    ) -> impl Iterator<Item = Result<(usize, Option<Fit<'schema>>), ListConstraintError>>
+    where
+        P: PlaceholderKind,
+        B: BindingAddress,
+        I: ExactSizeIterator,
+        I::Item: std::borrow::Borrow<Value<P, B>>,
+    {
+        let count = items.len();
+        let length_error = self.length.and_then(|(min, max)| {
+            let count_u64 = count as u64;
+            (min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max)).then(
+                || ListConstraintError {
+                    index: None,
+                    error: Box::new(TypeError::LengthOutOfRange {
+                        value: format!("{count} items").into(),
+                        length: count,
+                        min,
+                        max,
+                        attribute: None,
+                        type_name: Some("List".to_string()),
+                    }),
                 },
-                index,
-                first_index,
-                attribute: None,
-            });
-        }
-        self.seen.insert(key, index);
-        Ok(())
+            )
+        });
+        let mut seen: HashMap<KnownListElement, (usize, bool)> = HashMap::new();
+        length_error
+            .into_iter()
+            .map(Err)
+            .chain(items.enumerate().map(move |(index, item)| {
+                let value = std::borrow::Borrow::borrow(&item);
+                let fit = fit_item(value);
+                if self.elements == ListElements::Unique
+                    && let Some(fit) = &fit
+                    && let Some(key) = KnownListElement::from_fit(value, fit, ancestry)
+                {
+                    let sensitive = crate::value::contains_secret(value)
+                        || value.contains_diagnostic_sensitive_string();
+                    if let Some((first_index, first_sensitive)) = seen.get_mut(&key) {
+                        *first_sensitive |= sensitive;
+                        return Err(ListConstraintError {
+                            index: Some(index),
+                            error: Box::new(TypeError::DuplicateListElement {
+                                value: if *first_sensitive {
+                                    DiagnosticValue::Masked
+                                } else {
+                                    crate::value::format_value(value).into()
+                                },
+                                index,
+                                first_index: *first_index,
+                                attribute: None,
+                            }),
+                        });
+                    }
+                    seen.insert(key, (index, sensitive));
+                }
+                Ok((index, fit))
+            }))
     }
 }
 
@@ -5152,26 +5167,25 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
         (
             AT::List {
                 element_type,
-                length,
-                elements,
+                constraints,
                 ordered: _ordered,
             },
             ConcreteValueRef::List(items),
         ) => {
-            validate_list_length(*length, items.len()).ok()?;
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
-            let mut tracker = ListElementTracker::new(*elements);
-            for (index, item) in items.iter().enumerate() {
-                let child = fit_value_to_type_on_path(
+            for result in constraints.check(items.iter(), ancestry, |item| {
+                fit_value_to_type_on_path(
                     element_type,
                     item,
                     defs,
                     ancestry,
                     purpose,
                     &mut Vec::new(),
-                )?;
-                tracker.check(index, item, &child).ok()?;
+                )
+            }) {
+                let (_, child) = result.ok()?;
+                let child = child?;
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
@@ -5180,27 +5194,28 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
         (
             AT::List {
                 element_type,
-                length,
-                elements,
+                constraints,
                 ordered: _ordered,
             },
             ConcreteValueRef::StringList(items),
         ) => {
-            validate_list_length(*length, items.len()).ok()?;
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
-            let mut tracker = ListElementTracker::new(*elements);
-            for (index, item) in items.iter().enumerate() {
-                let item: Value<P, B> = Value::Concrete(ConcreteValue::String(item.clone()));
-                let child = fit_value_to_type_on_path(
+            let values = items
+                .iter()
+                .map(|item| Value::Concrete(ConcreteValue::String(item.clone())));
+            for result in constraints.check(values, ancestry, |item: &Value<P, B>| {
+                fit_value_to_type_on_path(
                     element_type,
-                    &item,
+                    item,
                     defs,
                     ancestry,
                     purpose,
                     &mut Vec::new(),
-                )?;
-                tracker.check(index, &item, &child).ok()?;
+                )
+            }) {
+                let (_, child) = result.ok()?;
+                let child = child?;
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
@@ -9530,8 +9545,7 @@ fn identified_declaration_kind(
         RawShape::List {
             element_type: _element_type,
             ordered: _ordered,
-            length: _length,
-            elements: _elements,
+            constraints: _constraints,
         } => None,
         RawShape::Map {
             key: _key,
@@ -9595,8 +9609,7 @@ fn identified_declaration_scalar_kind(attribute_type: &AttributeType) -> Option<
         RawShape::List {
             element_type: _element_type,
             ordered: _ordered,
-            length: _length,
-            elements: _elements,
+            constraints: _constraints,
         } => None,
         RawShape::Map {
             key: _key,
@@ -9645,8 +9658,7 @@ fn visit_identified_declarations(
         RawShape::List {
             element_type,
             ordered: _,
-            length: _length,
-            elements: _elements,
+            constraints: _constraints,
         } => visit_identified_declarations(element_type, visitor),
         RawShape::Map { key, value } => {
             visit_identified_declarations(key, visitor);

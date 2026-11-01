@@ -1717,18 +1717,12 @@ impl DiagnosticEngine {
                                     },
                                     _value,
                                 ) => None,
-                                // Validate List item types (non-Struct items only;
-                                // List<Struct> is handled by validate_struct_value below).
-                                // Use `Shape` on the inner so a
-                                // `List<Ref<Struct>>` correctly defers to
-                                // the struct-validation pass (carina#3349).
+                                // Lists use the path-tagged collector below, including
+                                // nested lists whose leaf error needs every index.
                                 (
                                     carina_core::schema::Shape::List { .. },
                                     Value::Concrete(ConcreteValue::List(_)),
-                                ) if !contains_struct => effective_attribute
-                                    .validate(attr_value)
-                                    .err()
-                                    .and_then(&mut diagnose_schema_error),
+                                ) => None,
                                 // Validate Map value types
                                 (
                                     carina_core::schema::Shape::Map { .. },
@@ -1779,7 +1773,7 @@ impl DiagnosticEngine {
                                 }
                             }
 
-                            // Struct field validation. The wrapper borrows
+                            // Container validation. The wrapper borrows
                             // the schema's `AttributeType` directly so we
                             // don't deep-clone the field set on every
                             // keystroke (LSP `analyze` is on
@@ -1792,13 +1786,24 @@ impl DiagnosticEngine {
                             // struct-field validation. Same bug class as
                             // carina#3349 — a raw match arm would silently
                             // drop `Ref` and skip the entire pass.
-                            if contains_struct {
-                                let nested_diagnostics = self.validate_struct_value(
+                            if contains_struct
+                                || (matches!(
+                                    effective_type.shape(),
+                                    carina_core::schema::Shape::List { .. }
+                                ) && matches!(
+                                    attr_value,
+                                    Value::Concrete(
+                                        ConcreteValue::List(_) | ConcreteValue::StringList(_)
+                                    )
+                                ))
+                            {
+                                let nested_diagnostics = self.validate_container_value(
                                     doc,
                                     attr_name,
                                     attr_value,
                                     &effective_type,
                                     self.find_attribute_value_range(doc, attr_name, scope),
+                                    scope,
                                 );
                                 if !nested_diagnostics.is_empty() {
                                     reported_attribute_diagnostics.insert(attr_name.clone());
