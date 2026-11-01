@@ -15,10 +15,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
 use crate::parser::{File, ResourceRef};
-use crate::resource::{ModuleSource, ParserPlaceholder};
+use crate::resource::{BindingAddress, ModuleSource, ParserPlaceholder};
 
-type ParsedResourceRef<'a, D> =
-    ResourceRef<'a, ModuleSource, ParserPlaceholder, ParserPlaceholder, D>;
+type ParsedResourceRef<'a, D, B> =
+    ResourceRef<'a, ModuleSource, ParserPlaceholder, ParserPlaceholder, D, B>;
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,9 +79,11 @@ impl DependsOnDiagnostic {
 ///
 /// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<D: crate::parser::DeferredForPhaseTraversal>(
-    rref: ParsedResourceRef<'_, D>,
-) -> &[String] {
+fn depends_on_of<B, D>(rref: ParsedResourceRef<'_, D, B>) -> &[B]
+where
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     rref.directives()
         .map_or(&[][..], |d| d.depends_on.as_slice())
 }
@@ -89,9 +91,13 @@ fn depends_on_of<D: crate::parser::DeferredForPhaseTraversal>(
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
-pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
-    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
-) -> Vec<DependsOnDiagnostic> {
+pub fn validate_depends_on<E, B, D>(
+    parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+) -> Vec<DependsOnDiagnostic>
+where
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     // Common-case fast path: the vast majority of resources will have
     // no `depends_on` set, and the checks below allocate per-resource.
     // Walk top-level + for-body template resources so loops are covered
@@ -105,7 +111,7 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
 
     let mut diags = Vec::new();
 
-    let bindings_by_name: HashMap<&str, ParsedResourceRef<'_, D>> = parsed
+    let bindings_by_name: HashMap<&str, ParsedResourceRef<'_, D, B>> = parsed
         .iter_all_resources()
         .filter_map(|rref| rref.binding().map(|n| (n, rref)))
         .collect();
@@ -128,9 +134,9 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
 
     let mut check_resource =
         |binding: Option<&str>,
-         attributes: &indexmap::IndexMap<String, crate::resource::Value<ParserPlaceholder>>,
-         dependency_bindings: &std::collections::BTreeSet<String>,
-         depends_on: &[String]| {
+         attributes: &indexmap::IndexMap<String, crate::resource::Value<ParserPlaceholder, B>>,
+         dependency_bindings: &std::collections::BTreeSet<B>,
+         depends_on: &[B]| {
             if depends_on.is_empty() {
                 return;
             }
@@ -139,7 +145,7 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
             // back to), so an unbound resource just gets the other checks.
             let self_name = binding.unwrap_or("(anonymous)");
 
-            let mut value_ref_deps: HashSet<String> = HashSet::new();
+            let mut value_ref_deps: HashSet<B> = HashSet::new();
             for value in attributes.values() {
                 collect_dependencies(value, &mut value_ref_deps);
             }
@@ -157,20 +163,20 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                             "directives.depends_on on '{}': binding '{}' is listed multiple times",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name),
+                        .at_element(self_name, dep_name.as_str()),
                     );
                     }
                     continue;
                 }
 
-                if dep_name == self_name {
+                if dep_name.as_str() == self_name {
                     diags.push(
                         DependsOnDiagnostic::error(format!(
                             "directives.depends_on on '{}': self-reference is not allowed \
                          (binding '{}' depends on itself)",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name),
+                        .at_element(self_name, dep_name.as_str()),
                     );
                     continue;
                 }
@@ -182,7 +188,7 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                          is not a valid depends_on target",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name),
+                        .at_element(self_name, dep_name.as_str()),
                     );
                     continue;
                 }
@@ -196,7 +202,7 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                         "directives.depends_on on '{}': binding '{}' is not declared in this scope",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name),
+                    .at_element(self_name, dep_name.as_str()),
                 );
                     continue;
                 };
@@ -208,19 +214,19 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                          depends_on targets (binding '{}')",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name),
+                        .at_element(self_name, dep_name.as_str()),
                     );
                     continue;
                 }
 
-                if value_ref_deps.contains(dep_name.as_str()) {
+                if value_ref_deps.contains(dep_name) {
                     diags.push(
                         DependsOnDiagnostic::warning(format!(
                             "directives.depends_on on '{}': edge to '{}' is redundant; \
                          '{}' is already referenced by value",
                             self_name, dep_name, dep_name
                         ))
-                        .at_element(self_name, dep_name),
+                        .at_element(self_name, dep_name.as_str()),
                     );
                 }
             }

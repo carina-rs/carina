@@ -8,7 +8,15 @@ use crate::plan::{
     PlanErrorKind, PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
     SchemaNotRegisteredError,
 };
-use crate::resource::{ConcreteValue, ResolvedResourceId, Resource, ResourceIdentity};
+use crate::resource::{
+    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDirectives as Directives, ExpandedResource as Resource, ExpandedValue as Value,
+    RelativeBindingName, ResolvedResourceId, ResourceIdentity, RootScope,
+};
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn diff_test(
     desired: &Resource,
@@ -370,7 +378,7 @@ fn in_flight_orphan_is_create_in_flight_orphan_error() {
     ));
     let orphans = Orphans::from([Orphan::create_in_flight(
         pending,
-        Some("orphan".to_string()),
+        Some(absolute_binding("orphan")),
         Directives::default(),
     )]);
     let plan = create_plan(
@@ -427,7 +435,7 @@ fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
     let orphan_id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
     let orphans = Orphans::from([Orphan::create_outcome_unknown(
         unknown_create_outcome(orphan_id.clone()),
-        Some("orphan".to_string()),
+        Some(absolute_binding("orphan")),
         Directives::default(),
     )]);
     let orphan_plan = create_plan(
@@ -453,7 +461,7 @@ fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
 
 #[test]
 fn import_replacement_suppresses_only_the_matching_provider_instance() {
-    let imported = Resource::with_provider(
+    let imported: Resource = Resource::with_provider(
         "mock",
         "test.Resource",
         "shared",
@@ -473,7 +481,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
     );
     let orphans = Orphans::from([Orphan::create_outcome_unknown(
         unknown_create_outcome(other_id.clone()),
-        Some("shared".to_string()),
+        Some(absolute_binding("shared")),
         Directives::default(),
     )]);
     let managed = ResolvedResource::collect_resolved([imported]).unwrap();
@@ -486,7 +494,14 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
 
     let plan = create_plan_with_cascades(
         &desired,
-        &managed,
+        CascadeDependents::new(
+            &managed,
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
         &[],
         &ProviderRouter::new(),
         PlanPriorStates::new(&current, &orphans),
@@ -497,7 +512,8 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &[],
         &HashSet::from([replacement]),
     )
-    .unwrap();
+    .unwrap()
+    .finish(|_| {});
 
     assert!(plan.effects().is_empty());
     assert_eq!(plan.errors().len(), 1);
@@ -682,6 +698,264 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
     .expect("plan comparison succeeds");
 
     assert!(plan.effects().is_empty(), "unexpected plan: {plan:?}");
+}
+
+fn nested_create_only_schema() -> ResourceSchema {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    ResourceSchema::new("example.Widget").attribute(
+        AttributeSchema::required(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("immutable", AttributeType::string())
+                        .create_only()
+                        .build(),
+                    StructField::required("mutable", AttributeType::string()).build(),
+                ],
+            ),
+        )
+        .build(),
+    )
+}
+
+fn nested_config(mutable: &str, immutable: Option<&str>) -> Value {
+    let mut fields = IndexMap::from([(
+        "mutable".to_string(),
+        Value::Concrete(ConcreteValue::String(mutable.into())),
+    )]);
+    if let Some(immutable) = immutable {
+        fields.insert(
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::String(immutable.into())),
+        );
+    }
+    Value::Concrete(ConcreteValue::Map(fields))
+}
+
+fn nested_create_only_plan(
+    desired_mutable: &str,
+    current_mutable: &str,
+    authored_immutable: bool,
+) -> Plan {
+    let desired = Resource::new("example.Widget", "widget")
+        .with_attribute("config", nested_config(desired_mutable, None));
+    let id = desired.id.clone();
+    let schema = nested_create_only_schema();
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        schema
+            .validate()
+            .expect("nested create-only fixture schema must be valid"),
+    );
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                nested_config(current_mutable, Some("provider-or-authored")),
+            )]),
+        ),
+    )]);
+    let mut config_children = HashMap::from([("mutable".to_string(), ExplicitFields::Leaf)]);
+    if authored_immutable {
+        config_children.insert("immutable".to_string(), ExplicitFields::Leaf);
+    }
+    let prev_explicit = HashMap::from([(
+        id,
+        ExplicitFields::Struct {
+            children: HashMap::from([(
+                "config".to_string(),
+                ExplicitFields::Struct {
+                    children: config_children,
+                },
+            )]),
+        },
+    )]);
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &registry,
+        std::slice::from_ref(&desired),
+    );
+
+    create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &registry,
+        &empty_lifted_saved_attrs(),
+        &prev_explicit,
+        &Orphans::new(),
+        &[],
+    )
+}
+
+#[test]
+fn removing_authored_nested_create_only_field_plans_replacement() {
+    let plan = nested_create_only_plan("same", "same", true);
+
+    assert!(!plan.has_errors(), "unexpected errors: {:?}", plan.errors());
+    assert_eq!(plan.summary().replace, 1, "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().update, 0, "unexpected plan: {plan:?}");
+}
+
+#[test]
+fn provider_filled_nested_create_only_field_does_not_replace() {
+    let plan = nested_create_only_plan("new", "old", false);
+
+    assert!(!plan.has_errors(), "unexpected errors: {:?}", plan.errors());
+    assert_eq!(plan.summary().replace, 0, "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().update, 1, "unexpected plan: {plan:?}");
+}
+
+fn plan_nested_create_only_with_authoring(
+    schema: ResourceSchema,
+    desired_config: Value,
+    current_config: Value,
+    authoring: ExplicitFields,
+) -> Plan {
+    let desired =
+        Resource::new("example.Widget", "widget").with_attribute("config", desired_config);
+    let id = desired.id.clone();
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        schema.validate().expect("valid nested create-only schema"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(
+            id.clone(),
+            existing_state(
+                id.clone(),
+                HashMap::from([("config".to_string(), current_config)]),
+            ),
+        )]),
+        &registry,
+        std::slice::from_ref(&desired),
+    );
+    create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &registry,
+        &empty_lifted_saved_attrs(),
+        &HashMap::from([(id, authoring)]),
+        &Orphans::new(),
+        &[],
+    )
+}
+
+#[test]
+fn authored_empty_struct_removes_nested_create_only_only_with_authoring_evidence() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    for recorded in [true, false] {
+        let schema = ResourceSchema::new("example.Widget").attribute(
+            AttributeSchema::required(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("immutable", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let current_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::String("authored-or-provider".into())),
+        )])));
+        let authoring = if recorded {
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "config".to_string(),
+                    ExplicitFields::Struct {
+                        children: HashMap::from([("immutable".to_string(), ExplicitFields::Leaf)]),
+                    },
+                )]),
+            }
+        } else {
+            ExplicitFields::Unrecorded
+        };
+        let plan = plan_nested_create_only_with_authoring(
+            schema,
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            current_config,
+            authoring,
+        );
+
+        assert!(!plan.has_errors(), "unexpected plan: {plan:?}");
+        assert_eq!(plan.summary().replace, usize::from(recorded), "{plan:?}");
+        assert_eq!(plan.summary().update, 0, "{plan:?}");
+        if !recorded {
+            assert!(
+                plan.effects().is_empty(),
+                "no authored removal is recorded: {plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_empty_nested_create_only_struct_does_not_replace_mutable_update() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let schema = ResourceSchema::new("example.Widget").attribute(
+        AttributeSchema::required(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional(
+                        "immutable",
+                        AttributeType::struct_(
+                            "Immutable",
+                            vec![StructField::optional("key", AttributeType::string()).build()],
+                        ),
+                    )
+                    .create_only()
+                    .build(),
+                    StructField::required("mutable", AttributeType::string()).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
+    let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "mutable".to_string(),
+            Value::Concrete(ConcreteValue::String("new".into())),
+        ),
+        (
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        ),
+    ])));
+    let current_config = nested_config("old", None);
+    let authoring = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "config".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([("mutable".to_string(), ExplicitFields::Leaf)]),
+            },
+        )]),
+    };
+    let plan =
+        plan_nested_create_only_with_authoring(schema, desired_config, current_config, authoring);
+
+    assert!(!plan.has_errors(), "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().replace, 0, "{plan:?}");
+    assert_eq!(plan.summary().update, 1, "{plan:?}");
 }
 
 struct HintProvider {
@@ -2037,7 +2311,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
         Value::Concrete(ConcreteValue::Bool(true)),
     )])));
     let desired = Resource::new("awscc.cloudfront.Distribution", "distribution")
-        .with_binding("distribution")
+        .with_root_binding("distribution")
         .with_attribute("distribution_config", desired_config);
 
     let current_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -2052,7 +2326,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     ])));
     let distribution_attrs = HashMap::from([("distribution_config".to_string(), current_config)]);
     let distribution_state = existing_state(distribution_id.clone(), distribution_attrs.clone())
-        .with_dependency_bindings(BTreeSet::from(["web_acl".to_string()]));
+        .with_root_dependency_bindings(BTreeSet::from(["web_acl".to_string()]));
     let web_acl_state = existing_state(web_acl_id.clone(), HashMap::new())
         .with_identifier("arn:aws:wafv2:acl/test");
     let current_states = HashMap::from([(distribution_id.clone(), distribution_state)]);
@@ -2076,7 +2350,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     )]);
     let orphans = Orphans::from([Orphan::from_state(
         web_acl_state,
-        Some("web_acl".to_string()),
+        Some(absolute_binding("web_acl")),
         Directives::default(),
     )]);
 
@@ -2153,7 +2427,7 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
         )]),
     )
     .with_identifier("service-123")
-    .with_dependency_bindings(BTreeSet::from(["network".to_string()]));
+    .with_root_dependency_bindings(BTreeSet::from(["network".to_string()]));
     assert!(
         orphan_state
             .attributes
@@ -2164,7 +2438,7 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
 
     let orphans = Orphans::from([Orphan::from_state(
         orphan_state,
-        Some("service".to_string()),
+        Some(absolute_binding("service")),
         Directives::default(),
     )]);
 
@@ -2198,8 +2472,11 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
     else {
         panic!("expected orphan Delete, got {delete:?}");
     };
-    assert_eq!(binding.as_deref(), Some("service"));
-    assert_eq!(dependencies, &HashSet::from(["network".to_string()]));
+    assert_eq!(
+        binding.as_ref().map(AbsoluteBindingAddress::as_str),
+        Some("service")
+    );
+    assert_eq!(dependencies, &HashSet::from([absolute_binding("network")]));
 }
 
 #[test]
@@ -2216,7 +2493,7 @@ fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_pr
             )]),
         )
         .with_identifier("service-123"),
-        Some("service".to_string()),
+        Some(absolute_binding("service")),
         Directives::default(),
     );
 
@@ -2256,7 +2533,7 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
     let new_id = ResourceId::with_identity("example.Service", "new");
     let orphan = Orphan::from_state(
         existing_state(old_id.clone(), HashMap::new()),
-        Some("service".to_string()),
+        Some(absolute_binding("service")),
         Directives::default(),
     );
     let mut orphans: Orphans = [orphan].into_iter().collect();
@@ -2439,10 +2716,10 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
     let orphan_id = ResourceId::with_identity("example.Service", "removed-service");
     let orphan_state =
         existing_state(orphan_id.clone(), HashMap::new()).with_identifier("service-123");
-    let directives = Directives::default().with_depends_on(vec!["x".to_string()]);
+    let directives = Directives::default().with_depends_on(vec![absolute_binding("x")]);
     let orphans = Orphans::from([Orphan::from_state(
         orphan_state,
-        Some("service".to_string()),
+        Some(absolute_binding("service")),
         directives,
     )]);
 
@@ -2476,8 +2753,11 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
     else {
         panic!("expected orphan Delete, got {delete:?}");
     };
-    assert_eq!(dependencies, &HashSet::from(["x".to_string()]));
-    assert_eq!(explicit_dependencies, &HashSet::from(["x".to_string()]));
+    assert_eq!(dependencies, &HashSet::from([absolute_binding("x")]));
+    assert_eq!(
+        explicit_dependencies,
+        &HashSet::from([absolute_binding("x")]),
+    );
 }
 
 #[test]
@@ -2487,12 +2767,12 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
     let producer_id = ResourceId::with_identity("example.Producer", "producer-id");
     let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
     let producer = Resource::new("example.Producer", "producer-id")
-        .with_binding("producer")
+        .with_root_binding("producer")
         .with_attribute(
             "replace_key",
             Value::Concrete(ConcreteValue::String("new".into())),
         );
-    let consumer = Resource::new("example.Consumer", "consumer-id").with_binding("consumer");
+    let consumer = Resource::new("example.Consumer", "consumer-id").with_root_binding("consumer");
     let producer_state = existing_state(
         producer_id.clone(),
         HashMap::from([(
@@ -2508,7 +2788,7 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
             Value::Concrete(ConcreteValue::String("producer-old".into())),
         )]),
     )
-    .with_dependency_bindings(BTreeSet::from(["producer".to_string()]));
+    .with_root_dependency_bindings(BTreeSet::from(["producer".to_string()]));
     let current_states = HashMap::from([
         (producer_id.clone(), producer_state),
         (consumer_id.clone(), consumer_state),
@@ -2575,8 +2855,8 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
     let dependency_id = ResourceId::with_identity("example.Dependency", "dependency-id");
     let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
     let consumer = Resource::new("example.Consumer", "consumer-id")
-        .with_binding("consumer")
-        .with_dependency_bindings(BTreeSet::from(["dependency".to_string()]))
+        .with_root_binding("consumer")
+        .with_root_dependency_bindings(BTreeSet::from(["dependency".to_string()]))
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let consumer_state = existing_state(
         consumer_id.clone(),
@@ -2585,13 +2865,13 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
             Value::Concrete(ConcreteValue::Int(1)),
         )]),
     )
-    .with_dependency_bindings(BTreeSet::from(["dependency".to_string()]));
+    .with_root_dependency_bindings(BTreeSet::from(["dependency".to_string()]));
     let dependency_state =
         existing_state(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
     let current_states = HashMap::from([(consumer_id, consumer_state)]);
     let orphans = Orphans::from([Orphan::from_state(
         dependency_state,
-        Some("dependency".to_string()),
+        Some(absolute_binding("dependency")),
         Directives::default(),
     )]);
 
@@ -2634,7 +2914,7 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
     let dependency_id = ResourceId::with_identity("example.Dependency", "dependency-id");
     let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
     let consumer = Resource::new("example.Consumer", "consumer-id")
-        .with_binding("consumer")
+        .with_root_binding("consumer")
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let consumer_state = existing_state(
         consumer_id.clone(),
@@ -2648,11 +2928,11 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
     let current_states = HashMap::from([(consumer_id.clone(), consumer_state)]);
     let directives_map = HashMap::from([(
         consumer_id,
-        Directives::default().with_depends_on(vec!["dependency".to_string()]),
+        Directives::default().with_depends_on(vec![absolute_binding("dependency")]),
     )]);
     let orphans = Orphans::from([Orphan::from_state(
         dependency_state,
-        Some("dependency".to_string()),
+        Some(absolute_binding("dependency")),
         Directives::default(),
     )]);
 
@@ -4417,22 +4697,23 @@ fn wait_binding_lowers_to_wait_effect() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
     // A downstream consumer that references the wait binding and is
     // itself a pending change (Create) — carina#3101: the wait is
     // emitted only when it gates a real downstream change.
-    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
     consumer
         .dependency_bindings
-        .insert("cert_issued".to_string());
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, consumer];
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert.status == 'ready'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("ready".into())),
         },
         timeout_secs: Some(75 * 60),
@@ -4501,15 +4782,18 @@ fn wait_binding_lowers_to_wait_effect() {
 fn unresolved_wait_enum_identifier_is_a_plan_error() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    let job = Resource::new("job.Job", "job").with_binding("job");
-    let mut consumer = Resource::new("job.Consumer", "consumer").with_binding("consumer");
-    consumer.dependency_bindings.insert("job_ready".to_string());
+    let job = Resource::new("job.Job", "job").with_root_binding("job");
+    let mut consumer = Resource::new("job.Consumer", "consumer").with_root_binding("consumer");
+    consumer
+        .dependency_bindings
+        .insert(absolute_binding("job_ready"));
     let wait = WaitBinding {
-        binding: "job_ready".into(),
-        target: "job".into(),
+        binding: absolute_binding("job_ready"),
+        target: absolute_binding("job"),
         until_raw: "job.state == ready".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["job".to_string(), "state".to_string()],
+            root: absolute_binding("job"),
+            attribute_segments: vec!["state".to_string()],
             rhs: Value::Concrete(ConcreteValue::enum_identifier("ready")),
         },
         timeout_secs: None,
@@ -4558,24 +4842,22 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::schema::{AttributeSchema, ResourceSchema, StructField, TypeIdentity};
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert");
-    let mut consumer =
-        Resource::with_provider("aws", "consumer.Thing", "consumer", None).with_binding("consumer");
+    let cert =
+        Resource::with_provider("aws", "acm.Certificate", "cert", None).with_root_binding("cert");
+    let mut consumer = Resource::with_provider("aws", "consumer.Thing", "consumer", None)
+        .with_root_binding("consumer");
     consumer
         .dependency_bindings
-        .insert("cert_renewed".to_string());
+        .insert(absolute_binding("cert_renewed"));
     let wait = WaitBinding {
-        binding: "cert_renewed".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_renewed"),
+        target: absolute_binding("cert"),
         until_raw:
             "cert.renewal_summary.renewal_status == aws.acm.Certificate.RenewalStatus.success"
                 .to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec![
-                "cert".to_string(),
-                "renewal_summary".to_string(),
-                "renewal_status".to_string(),
-            ],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["renewal_summary".to_string(), "renewal_status".to_string()],
             rhs: Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.acm.Certificate.RenewalStatus.success",
             )),
@@ -4650,16 +4932,19 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let job = Resource::with_provider("test", "job.Job", "job", None).with_binding("job");
+    let job = Resource::with_provider("test", "job.Job", "job", None).with_root_binding("job");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
-        .with_binding("consumer");
-    consumer.dependency_bindings.insert("job_ready".to_string());
+        .with_root_binding("consumer");
+    consumer
+        .dependency_bindings
+        .insert(absolute_binding("job_ready"));
     let wait = WaitBinding {
-        binding: "job_ready".into(),
-        target: "job".into(),
+        binding: absolute_binding("job_ready"),
+        target: absolute_binding("job"),
         until_raw: "job.labels.state == 'ready'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["job".into(), "labels".into(), "state".into()],
+            root: absolute_binding("job"),
+            attribute_segments: vec!["labels".into(), "state".into()],
             rhs: Value::Concrete(ConcreteValue::String("ready".into())),
         },
         timeout_secs: None,
@@ -4718,16 +5003,19 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::schema::{AttributeSchema, ResourceSchema, TypeIdentity};
 
-    let job = Resource::with_provider("test", "job.Job", "job", None).with_binding("job");
+    let job = Resource::with_provider("test", "job.Job", "job", None).with_root_binding("job");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
-        .with_binding("consumer");
-    consumer.dependency_bindings.insert("job_ready".to_string());
+        .with_root_binding("consumer");
+    consumer
+        .dependency_bindings
+        .insert(absolute_binding("job_ready"));
     let wait = WaitBinding {
-        binding: "job_ready".into(),
-        target: "job".into(),
+        binding: absolute_binding("job_ready"),
+        target: absolute_binding("job"),
         until_raw: "job.statuses.primary == test.job.Job.Status.ready".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["job".into(), "statuses".into(), "primary".into()],
+            root: absolute_binding("job"),
+            attribute_segments: vec!["statuses".into(), "primary".into()],
             rhs: Value::Concrete(ConcreteValue::enum_identifier("test.job.Job.Status.ready")),
         },
         timeout_secs: None,
@@ -4825,21 +5113,21 @@ let renewed = wait cert {
     let validation = crate::validation::wait::validate_wait_bindings(&parsed, &schemas);
     assert_eq!(validation.len(), 1);
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert");
-    let mut consumer =
-        Resource::with_provider("aws", "consumer.Thing", "consumer", None).with_binding("consumer");
-    consumer.dependency_bindings.insert("renewed".to_string());
+    let cert =
+        Resource::with_provider("aws", "acm.Certificate", "cert", None).with_root_binding("cert");
+    let mut consumer = Resource::with_provider("aws", "consumer.Thing", "consumer", None)
+        .with_root_binding("consumer");
+    consumer
+        .dependency_bindings
+        .insert(absolute_binding("renewed"));
     let wait = WaitBinding {
-        binding: "renewed".into(),
-        target: "cert".into(),
+        binding: absolute_binding("renewed"),
+        target: absolute_binding("cert"),
         until_raw: "cert.renewal_summary.renewal_status == aws.acm.Certificate.RenewalStatus.bogus"
             .to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec![
-                "cert".to_string(),
-                "renewal_summary".to_string(),
-                "renewal_status".to_string(),
-            ],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["renewal_summary".to_string(), "renewal_status".to_string()],
             rhs: Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.acm.Certificate.RenewalStatus.bogus",
             )),
@@ -4882,23 +5170,24 @@ let renewed = wait cert {
 #[test]
 fn data_source_wait_is_a_plan_error_and_emits_no_wait_effect() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
-    use crate::resource::DataSource;
+    use crate::resource::ExpandedDataSource as DataSource;
 
-    let lookup =
-        DataSource::with_provider("test", "lookup.Job", "lookup", None).with_binding("lookup");
+    let mut lookup = DataSource::with_provider("test", "lookup.Job", "lookup", None);
+    lookup.binding = Some(absolute_binding("lookup"));
     let identity_collision =
-        Resource::with_provider("test", "managed.Job", "lookup", None).with_binding("managed");
+        Resource::with_provider("test", "managed.Job", "lookup", None).with_root_binding("managed");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
-        .with_binding("consumer");
+        .with_root_binding("consumer");
     consumer
         .dependency_bindings
-        .insert("lookup_found".to_string());
+        .insert(absolute_binding("lookup_found"));
     let wait = WaitBinding {
-        binding: "lookup_found".into(),
-        target: "lookup".into(),
+        binding: absolute_binding("lookup_found"),
+        target: absolute_binding("lookup"),
         until_raw: "lookup.status == test.lookup.Job.Status.found".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["lookup".to_string(), "status".to_string()],
+            root: absolute_binding("lookup"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::enum_identifier(
                 "test.lookup.Job.Status.found",
             )),
@@ -4940,21 +5229,22 @@ fn data_source_wait_is_a_plan_error_and_emits_no_wait_effect() {
 fn create_plan_records_error_for_empty_predicate_attr_path() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
     // The wait must gate a pending downstream change, otherwise
     // create_plan legitimately skips emitting or lowering the wait.
-    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
     consumer
         .dependency_bindings
-        .insert("cert_issued".to_string());
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, consumer];
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: Vec::new(),
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: None,
@@ -5019,7 +5309,12 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         }
         "#,
     )
-    .expect("parsed file should be valid")
+    .expect("parsed file should be valid");
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("plan fixture crosses the module-resolution seam")
     .into_expanded()
     .expect("plan fixture contains no parser placeholders");
     let provider = HintProvider {
@@ -5052,7 +5347,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         unreachable!();
     };
     assert!(
-        explicit_dependencies.contains("validation_records"),
+        explicit_dependencies.contains(&absolute_binding("validation_records")),
         "provider satisfier hint should add validation_records; got {explicit_dependencies:?}"
     );
 }
@@ -5063,23 +5358,24 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::wait::BindingPattern;
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
-    let dependency = Resource::new("route53.RecordSet", "record").with_binding("something");
-    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
+    let dependency = Resource::new("route53.RecordSet", "record").with_root_binding("something");
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
     consumer
         .dependency_bindings
-        .insert("cert_issued".to_string());
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dependency, consumer];
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: None,
-        depends_on: vec!["something".into()],
+        depends_on: vec![absolute_binding("something")],
         line: 1,
     };
     let provider = HintProvider {
@@ -5112,7 +5408,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
         unreachable!();
     };
     assert_eq!(explicit_dependencies.len(), 1);
-    assert!(explicit_dependencies.contains("something"));
+    assert!(explicit_dependencies.contains(&absolute_binding("something")));
 }
 
 #[test]
@@ -5121,13 +5417,13 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
     // Downstream consumer with a pending change so the wait gates
     // something (carina#3101).
-    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
+    let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
     consumer
         .dependency_bindings
-        .insert("cert_issued".to_string());
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, consumer];
 
     let mut schemas = SchemaRegistry::new();
@@ -5142,11 +5438,12 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     );
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: None,
@@ -5187,11 +5484,12 @@ fn wait_with_unknown_target_emits_plan_error() {
     let resources: Vec<Resource> = vec![];
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "nonexistent".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("nonexistent"),
         until_raw: "nonexistent.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["nonexistent".to_string(), "status".to_string()],
+            root: absolute_binding("nonexistent"),
+            attribute_segments: vec!["status".to_string()],
             // Target lookup must win over predicate sealing even when the
             // parser has correctly typed an unquoted RHS as an enum
             // identifier.
@@ -5237,9 +5535,10 @@ fn wait_with_unknown_target_emits_plan_error() {
 fn wait_omitted_when_all_consumers_unchanged() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
-    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
+    dist.dependency_bindings
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
     // Both resources already exist with identical state → NoChange,
@@ -5261,11 +5560,12 @@ fn wait_omitted_when_all_consumers_unchanged() {
     );
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: Some(60),
@@ -5307,18 +5607,20 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
+    let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
     // `dist` is new (absent from managed current state) → Create → mutating.
-    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
+    dist.dependency_bindings
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: Some(60),
@@ -5366,15 +5668,16 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     // cert: exists with status == ISSUED and is unchanged (desired
     // matches state) → NoChange, no mutating effect on the target.
     let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
-        .with_binding("cert")
+        .with_root_binding("cert")
         .with_attribute(
             "status",
             Value::Concrete(ConcreteValue::String("ISSUED".into())),
         );
     // dist is new (absent from managed current state) → Create → mutating.
     // It references the wait binding, so the wait "gates a pending change".
-    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
+    dist.dependency_bindings
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
     let mut cert_state_attrs = HashMap::new();
@@ -5390,11 +5693,12 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     );
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert.status == aws.acm.Certificate.Status.issued".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.acm.Certificate.Status.issued",
             )),
@@ -5467,17 +5771,19 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     // cert is new (absent from managed current state) → Create → mutating
     // target. Even though no cached state exists, the wait must poll
     // post-apply.
-    let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
-    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
+    dist.dependency_bindings
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: Some(60),
@@ -5525,13 +5831,14 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
     // the predicate, BUT it has a
     // pending Update (desired `domain_name` differs from state).
     let cert = Resource::new("acm.Certificate", "cert")
-        .with_binding("cert")
+        .with_root_binding("cert")
         .with_attribute(
             "domain_name",
             Value::Concrete(ConcreteValue::String("new.example.com".into())),
         );
-    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
+    dist.dependency_bindings
+        .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
     let mut cert_state_attrs = HashMap::new();
@@ -5554,11 +5861,12 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
     );
 
     let wait = WaitBinding {
-        binding: "cert_issued".into(),
-        target: "cert".into(),
+        binding: absolute_binding("cert_issued"),
+        target: absolute_binding("cert"),
         until_raw: "cert.status == ISSUED".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
+            root: absolute_binding("cert"),
+            attribute_segments: vec!["status".to_string()],
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: Some(60),

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
-use carina_core::resource::ResourceIdentity;
+use carina_core::resource::{ResourceIdentity, absolute_binding_address_for_test};
 use carina_state::{ResourceState, StateFile};
 
 const ANONYMOUS_IDENTITY: &str = "mock_compute_instance_11111111";
@@ -27,7 +27,7 @@ fn applied_row(
         identifier,
     )
     .expect("fixture identifier is non-empty");
-    row.binding = binding.map(str::to_string);
+    row.binding = binding.map(absolute_binding_address_for_test);
     for (name, value) in attributes {
         row = row.with_attribute(*name, value.clone());
     }

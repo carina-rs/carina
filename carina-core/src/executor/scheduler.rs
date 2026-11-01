@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::binding_index::ResolvedBindings;
-use crate::effect::Effect;
+use crate::effect::{Effect, SchedulerKey};
 use crate::parser::DeferredForExpression;
 use crate::resource::ResourceId;
 
@@ -52,13 +52,13 @@ impl<'a, S> PureMetaStep<'a, S> {
 pub(super) enum PureMetaOutcome<S> {
     NotPureMeta,
     Materialized(Vec<Effect<S>>),
-    Failed,
+    Failed(super::DeferredCreateFailure),
 }
 
 pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
     effect: &Effect<S>,
     bindings: &ResolvedBindings,
-    ctx: &PureMetaCtx<'_, S>,
+    ctx: &PureMetaCtx<'_>,
 ) -> PureMetaOutcome<S> {
     let Some(step) = PureMetaStep::from_effect(effect) else {
         return PureMetaOutcome::NotPureMeta;
@@ -66,32 +66,15 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
 
     match dispatch_deferred_create(step.effect, step.template, bindings, ctx) {
         DeferredDispatchResult::Materialized(children) => PureMetaOutcome::Materialized(children),
-        DeferredDispatchResult::MaterializeFailed => PureMetaOutcome::Failed,
+        DeferredDispatchResult::MaterializeFailed(failure) => PureMetaOutcome::Failed(failure),
     }
 }
 
 /// Equality-bearing key used to carry failures across scheduler phases.
 /// Unbound loops retain their stable system key here; this value must never
 /// be rendered to users.
-pub(super) fn failure_dependency_key<S>(effect: &Effect<S>) -> Option<String> {
-    match effect {
-        Effect::DeferredCreate(payload) => {
-            Some(payload.template.target().scheduler_key().to_string())
-        }
-        Effect::DeferredReplace(payload) => {
-            Some(payload.template.target().scheduler_key().to_string())
-        }
-        Effect::ReleaseListKeys { .. } => None,
-        Effect::Read { .. }
-        | Effect::Create(_)
-        | Effect::ResumeCreate { .. }
-        | Effect::Update { .. }
-        | Effect::Delete { .. }
-        | Effect::Import { .. }
-        | Effect::Remove { .. }
-        | Effect::Move { .. }
-        | Effect::Wait { .. } => effect.binding_name(),
-    }
+pub(super) fn failure_dependency_keys<S>(effect: &Effect<S>) -> Vec<SchedulerKey> {
+    effect.scheduling_keys()
 }
 
 /// User-facing label for waiting and dependency-failure messages.
@@ -108,7 +91,7 @@ pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
         | Effect::Import { .. }
         | Effect::Remove { .. }
         | Effect::Move { .. }
-        | Effect::Wait { .. } => effect.binding_name(),
+        | Effect::Wait { .. } => effect.binding_address().map(ToString::to_string),
     }
 }
 
@@ -236,7 +219,7 @@ pub(super) struct FailureView<'a, S> {
     pub(super) effects: &'a [Effect<S>],
     pub(super) deps_of: &'a HashMap<usize, HashSet<usize>>,
     pub(super) failed_indices: &'a HashSet<usize>,
-    failed_dependency_labels: HashMap<String, String>,
+    failed_dependency_labels: HashMap<SchedulerKey, String>,
 }
 
 impl<'a, S> FailureView<'a, S> {
@@ -247,13 +230,16 @@ impl<'a, S> FailureView<'a, S> {
     ) -> Self {
         let failed_dependency_labels = failed_indices
             .iter()
-            .filter_map(|idx| {
+            .flat_map(|idx| {
                 let effect = effects.get(*idx)?;
-                Some((
-                    failure_dependency_key(effect)?,
-                    failure_display_name(effect)?,
-                ))
+                let label = failure_display_name(effect)?;
+                Some(
+                    failure_dependency_keys(effect)
+                        .into_iter()
+                        .map(move |key| (key, label.clone())),
+                )
             })
+            .flatten()
             .collect();
         Self {
             effects,
@@ -278,9 +264,9 @@ impl<'a, S> FailureView<'a, S> {
         }
 
         self.effects[idx]
-            .blocking_bindings()
+            .blocking_keys()
             .into_iter()
-            .find_map(|binding| self.failed_dependency_labels.get(&binding).cloned())
+            .find_map(|key| self.failed_dependency_labels.get(&key).cloned())
             .map(FailedDependency::Labeled)
     }
 
@@ -295,7 +281,61 @@ mod tests {
     use crate::effect::{DeferredCreatePayload, EffectGeneration};
 
     #[test]
-    fn cross_phase_unbound_failure_uses_source_location_not_scheduler_key() {
+    fn resource_identity_does_not_collide_with_binding_failure_key() {
+        use crate::resource::{
+            ConcreteValue, ResolvedResource, ResolvedResourceId, RootScope, Value,
+        };
+        use crate::wait::{AttrPath, ManagedWaitTarget, WaitPredicate};
+        use std::time::Duration;
+
+        let shared = RootScope::new().resolve("shared".into());
+        let target = ResolvedResource::from_id(ResolvedResourceId::new(ResourceId::with_identity(
+            "test.Resource",
+            "shared",
+        )));
+        let effects: Vec<Effect> = vec![
+            Effect::Delete {
+                id: ResolvedResourceId::new(ResourceId::with_identity(
+                    "test.Resource",
+                    "different-resource",
+                )),
+                identifier: crate::effect::fixture_applied_identifier("failed-resource"),
+                generation: EffectGeneration::Current,
+                directives: crate::resource::Directives::default(),
+                binding: Some(shared),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            },
+            Effect::Wait {
+                identity: crate::resource::absolute_binding_address_for_test(
+                    "wait_for_shared_resource",
+                ),
+                target_id: ManagedWaitTarget::for_test(&target),
+                until: WaitPredicate::equals(
+                    AttrPath::single("status"),
+                    Value::Concrete(ConcreteValue::String("ready".into())),
+                )
+                .expect("valid wait predicate"),
+                until_surface: "shared.status == ready".to_string(),
+                timeout: Duration::from_secs(60),
+                interval: Duration::from_secs(1),
+                explicit_dependencies: HashSet::new(),
+            },
+        ];
+        let deps_of = HashMap::new();
+        let failed_indices = HashSet::from([0]);
+
+        assert!(
+            FailureView::new(&effects, &deps_of, &failed_indices)
+                .find_failed_dependency(1)
+                .is_none(),
+            "a failed binding named `shared` must not masquerade as the distinct resource identity `shared`",
+        );
+    }
+
+    #[test]
+    fn unbound_loop_key_is_distinct_from_binding_and_graph_edge_uses_source_location() {
         let parsed = crate::parser::parse_file(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
@@ -304,7 +344,12 @@ mod tests {
             std::path::Path::new("main.crn"),
             &crate::parser::ProviderContext::default(),
         )
-        .expect("unbound deferred loop parses")
+        .expect("unbound deferred loop parses");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded()
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = parsed.deferred_for_expressions()[0].clone();
@@ -321,18 +366,27 @@ mod tests {
                 identifier: crate::effect::fixture_applied_identifier("dependent"),
                 generation: EffectGeneration::Current,
                 directives: crate::resource::Directives::default(),
-                binding: Some("dependent".to_string()),
+                binding: Some(crate::resource::RootScope::new().resolve("dependent".into())),
                 dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::from([scheduler_key]),
+                explicit_dependencies: HashSet::from([
+                    crate::resource::RootScope::new().resolve(scheduler_key.into())
+                ]),
                 blocked_by_updates: HashSet::new(),
             },
         ];
-        let deps_of = HashMap::new();
         let failed_indices = HashSet::from([0]);
 
+        assert!(
+            FailureView::new(&effects, &HashMap::new(), &failed_indices)
+                .find_failed_dependency(1)
+                .is_none(),
+            "a binding that spells like an unbound-loop key must remain a distinct scheduler key",
+        );
+
+        let deps_of = HashMap::from([(1, HashSet::from([0]))]);
         let failed = FailureView::new(&effects, &deps_of, &failed_indices)
             .find_failed_dependency(1)
-            .expect("the cross-phase dependency must be recognized");
+            .expect("the explicit graph dependency must be recognized");
 
         assert!(matches!(failed, FailedDependency::Labeled(label) if label == "main.crn:2"));
     }

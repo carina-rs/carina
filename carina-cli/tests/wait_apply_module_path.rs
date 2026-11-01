@@ -53,7 +53,9 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
         ExecutionOutcome::Completed(result) => result,
         ExecutionOutcome::Cancelled(result) => panic!(
             "uncancelled execution returned Cancelled: success={}, failure={}, skip={}",
-            result.success_count, result.failure_count, result.skip_count
+            result.success_count,
+            result.failure_count(),
+            result.skip_count
         ),
     }
 }
@@ -326,7 +328,7 @@ fn apply_path_propagates_module_wait_binding() {
     .expect("load_configuration_with_config should succeed");
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
-    let providers = ProviderLoad::for_test(
+    let providers = ProviderLoad::for_test_with_provider_phase(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
@@ -379,11 +381,11 @@ fn apply_path_propagates_module_wait_binding() {
         .iter()
         .find(|r| r.id.resource_type == "cloudfront.Distribution")
         .expect("expanded Distribution must be present");
-    let deps = carina_core::deps::get_resource_value_ref_dependencies(
-        carina_core::parser::ResourceRef::Resource(dist),
-    );
+    let deps = carina_core::deps::get_resource_dependencies(dist);
     assert!(
-        deps.contains("r.cert_issued"),
+        deps.contains(&carina_core::resource::absolute_binding_address_for_test(
+            "r.cert_issued",
+        )),
         "expanded Distribution must depend on the prefixed wait \
          binding `r.cert_issued`; deps were {deps:?}"
     );
@@ -425,7 +427,7 @@ fn apply_path_propagates_module_wait_binding() {
     let composition_r = parsed
         .compositions
         .iter()
-        .any(|r| r.binding.as_deref() == Some("r"));
+        .any(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("r"));
     // This assertion encodes the hypothesis. If it FAILS showing
     // binding="r", we've found the apply-path root cause: the nested
     // ref binds to the composition module proxy, not the wait binding.
@@ -449,7 +451,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
     .expect("load_configuration_with_config should succeed");
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
-    let providers = ProviderLoad::for_test(
+    let providers = ProviderLoad::for_test_with_provider_phase(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
@@ -490,8 +492,8 @@ impl ExecutionObserver for CollectingObserver {
                 .push(format!("effect interrupted: {}", effect.resource_id()));
             return;
         }
-        if let carina_core::executor::ExecutionEvent::EffectFailed { error, .. } = e {
-            self.failures.lock().unwrap().push(error.to_string());
+        if let carina_core::executor::ExecutionEvent::EffectFailed { failure, .. } = e {
+            self.failures.lock().unwrap().push(failure.to_string());
         }
     }
 }
@@ -521,7 +523,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
-    let providers = ProviderLoad::for_test(
+    let providers = ProviderLoad::for_test_with_provider_phase(
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
@@ -689,7 +691,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .await,
     );
     let failures = observer.failures.lock().unwrap().clone();
-    (result.failure_count, result.skip_count, failures)
+    (result.failure_count(), result.skip_count, failures)
 }
 
 /// Positive control: when the cert read publishes `certificate_arn`,

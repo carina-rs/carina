@@ -1,0 +1,8 @@
+arguments {
+  label:    String
+  upstream: mock.test.resource
+}
+
+let local = {
+  attr = "wire-compat-secret"
+}

@@ -21,7 +21,7 @@ use carina_core::provider::{
 use carina_core::resource::{
     ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue, EnumValueResolver,
     ProviderResource, RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource,
-    ResourceId, State, Value,
+    ResourceId, State, Value, absolute_binding_address_for_test,
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
@@ -73,6 +73,13 @@ fn delete_request_without_schema() -> DeleteRequest {
 
 fn provider_resources(resources: Vec<Resource>) -> Vec<ProviderResource> {
     resources.into_iter().map(ProviderResource::from).collect()
+}
+
+fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+    carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+        .resolve_root_for_test()
+        .into_expanded()
+        .expect("root resource reference contains no placeholders")
 }
 
 fn create_state_for_writeback(outcome: CreateOutcome) -> State {
@@ -4587,7 +4594,7 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
         .await
         .expect("normalizer should initialize");
 
-    let peer_ref = Value::resource_ref("peer", "identifier", vec![]);
+    let peer_ref = root_resource_ref("peer", "identifier");
     let mut resource = Resource::with_provider("mock", "test.resource", "ref-bearing", None);
     resource.set_attr(
         "tags",
@@ -4603,7 +4610,7 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
         "pending",
         Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
             DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
-                binding: "pending".to_string(),
+                binding: absolute_binding_address_for_test("pending"),
             }),
         )])),
     );
@@ -4626,7 +4633,7 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
                 values.as_slice(),
                 [Value::Deferred(DeferredValue::Unknown(
                     ApplyTimeUnknown::UpstreamAllExports { binding }
-                ))] if binding == "pending"
+                ))] if binding.as_str() == "pending"
             )
     ));
     assert_eq!(
@@ -4686,7 +4693,7 @@ async fn wasm_normalize_desired_accepts_and_restores_deferred_required_together_
         "primary",
         Value::Concrete(ConcreteValue::String("configured".into())),
     );
-    let deferred = Value::resource_ref("upstream", "identifier", Vec::new());
+    let deferred = root_resource_ref("upstream", "identifier");
     resource.set_attr("companion", deferred.clone());
     let mut resources = provider_resources(vec![resource]);
 
@@ -5454,10 +5461,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         "__mock_normalize_desired_error__",
         None,
     )]);
-    desired_resources[0].set_attr(
-        "peer",
-        Value::resource_ref("peer", "identifier", Vec::new()),
-    );
+    desired_resources[0].set_attr("peer", root_resource_ref("peer", "identifier"));
     let desired_before = desired_resources.clone();
     let error = normalizer
         .normalize_desired(&mut desired_resources)

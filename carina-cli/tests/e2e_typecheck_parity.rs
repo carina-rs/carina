@@ -143,12 +143,9 @@ fn cli_validated_file(
         &SchemaRegistry::new(),
     )
     .expect("load CLI fixture");
-    let carina_core::config_loader::LoadedConfig {
-        parsed,
-        duplicate_declarations,
-        ..
-    } = loaded;
-    let providers = carina_cli::wiring::ProviderLoad::for_test(
+    let parsed = loaded.parsed;
+    let duplicate_declarations = loaded.duplicate_declarations;
+    let providers = carina_cli::wiring::ProviderLoad::for_test_with_provider_phase(
         carina_cli::wiring::LoadedProviderFactory::for_test(factories),
         &parsed.providers,
     );

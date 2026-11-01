@@ -4,12 +4,17 @@
 //! design. The grammar piece lives in `carina.pest::wait_expr`.
 
 use super::primary::parse_duration_secs;
-use crate::parser::ast::BindingName;
 use crate::parser::error::ParseError;
 use crate::parser::{ParserUntilPredicate as UntilPredicateAst, ParserWaitBinding as WaitBinding};
 use crate::parser::{Rule, first_inner};
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{
+    ConcreteValue as GenericConcreteValue, NoPlaceholder, RelativeBindingName,
+    Value as GenericValue,
+};
 use pest::iterators::Pair;
+
+type Value = GenericValue<NoPlaceholder, RelativeBindingName>;
+type ConcreteValue = GenericConcreteValue<NoPlaceholder, RelativeBindingName>;
 
 /// Parse a `wait` expression into a [`WaitBinding`].
 ///
@@ -40,7 +45,7 @@ pub(crate) fn parse_wait_expr(
     let mut until_predicate: Option<UntilPredicateAst> = None;
     let mut timeout_secs: Option<u64> = None;
     let mut timeout_seen = false;
-    let mut depends_on: Vec<String> = Vec::new();
+    let mut depends_on: Vec<RelativeBindingName> = Vec::new();
     let mut depends_on_seen = false;
 
     for attr_pair in inner {
@@ -92,7 +97,7 @@ pub(crate) fn parse_wait_expr(
                 depends_on_seen = true;
                 for ident in child.into_inner() {
                     if ident.as_rule() == Rule::identifier {
-                        depends_on.push(ident.as_str().to_string());
+                        depends_on.push(RelativeBindingName::new(ident.as_str()));
                     }
                 }
             }
@@ -114,12 +119,12 @@ pub(crate) fn parse_wait_expr(
     };
 
     Ok(WaitBinding {
-        binding: BindingName::from(binding_name),
-        target: BindingName::from(target),
+        binding: RelativeBindingName::from(binding_name),
+        target: RelativeBindingName::from(target),
         until_raw,
         until_predicate,
         timeout_secs,
-        depends_on: depends_on.into_iter().map(BindingName::from).collect(),
+        depends_on,
         line,
     })
 }
@@ -166,10 +171,15 @@ fn lower_validate_expr_to_until(
 
     let lhs_pair = unwrap_wait_arithmetic(lhs_pair, line)?;
     let rhs_pair = unwrap_wait_arithmetic(rhs_pair, line)?;
-    let lhs_segments = lower_until_lhs(lhs_pair, target_binding, line)?;
+    let mut lhs_segments = lower_until_lhs(lhs_pair, target_binding, line)?;
+    let root = RelativeBindingName::new(lhs_segments.remove(0));
     let rhs = lower_until_rhs(rhs_pair, line)?;
 
-    Ok(UntilPredicateAst { lhs_segments, rhs })
+    Ok(UntilPredicateAst {
+        root,
+        attribute_segments: lhs_segments,
+        rhs,
+    })
 }
 
 /// Remove the validation-only arithmetic precedence wrappers when they contain
@@ -446,7 +456,8 @@ mod tests {
             we.until_raw,
             "cert.status == aws.acm.Certificate.Status.Issued"
         );
-        assert_eq!(we.until_predicate.lhs_segments, vec!["cert", "status"]);
+        assert_eq!(we.until_predicate.root, "cert");
+        assert_eq!(we.until_predicate.attribute_segments, vec!["status"]);
         // The RHS is kept as the typed RAW dotted identifier here; enum-alias
         // resolution to the canonical AWS value happens downstream when
         // `create_plan` resolves the predicate against the target schema.
@@ -525,9 +536,10 @@ mod tests {
         let we =
             parse_one("wait cert {\n    until = cert.renewal_summary.renewal_status == SUCCESS\n}");
         assert_eq!(
-            we.until_predicate.lhs_segments,
-            vec!["cert", "renewal_summary", "renewal_status"]
+            we.until_predicate.attribute_segments,
+            vec!["renewal_summary", "renewal_status"]
         );
+        assert_eq!(we.until_predicate.root, "cert");
     }
 
     #[test]

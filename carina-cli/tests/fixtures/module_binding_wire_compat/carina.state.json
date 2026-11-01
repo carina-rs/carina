@@ -1,0 +1,423 @@
+{
+  "version": 20,
+  "exports_version": 1,
+  "serial": 4,
+  "lineage": "5ab578ba-14d7-4fcb-8e4d-4b1db4ee9d62",
+  "carina_version": "0.9.0",
+  "resources": [
+    {
+      "resource_type": "test.resource",
+      "identity": "root",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "root",
+          "identifier": "root-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "root",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "direct.deferred_source",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "direct-deferred-source",
+          "identifier": "direct-deferred-source-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "direct.deferred_source",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "direct.seed",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "identifier": "direct-seed-id",
+          "name": "direct-seed"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "direct.seed",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "direct.consumer",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "comment": {
+            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$2ghf0jP4fsTZ4M0eURm8fQ$2uhND2u6b84XOSrM8aAUax6Dij5iOjoxu9IFAyKorgM"
+          },
+          "identifier": "direct-consumer-id",
+          "name": "direct-consumer"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "depends_on": [
+          "direct.seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "comment": {
+            "kind": "leaf"
+          },
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "direct.consumer",
+      "dependency_bindings": [
+        "direct.seed",
+        "root"
+      ]
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "direct.nested.leaf",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "identifier": "direct-nested-id",
+          "name": "direct-nested"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "depends_on": [
+          "direct.consumer"
+        ]
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "direct.nested.leaf",
+      "dependency_bindings": [
+        "direct.consumer"
+      ]
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "looped[0].deferred_source",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "loop-deferred-source",
+          "identifier": "loop-deferred-source-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "looped[0].deferred_source",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "looped[0].seed",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "identifier": "loop-seed-id",
+          "name": "loop-seed"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "looped[0].seed",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "looped[0].consumer",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "identifier": "loop-consumer-id",
+          "name": "loop-consumer",
+          "comment": {
+            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$3/lNzuUAZ4XAthQClVHa9g$URnTIHskUKGM/K//WRKaDQ/jhSXH9P2Mf2sGPzeVwM0"
+          }
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "depends_on": [
+          "looped[0].seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          },
+          "comment": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "looped[0].consumer",
+      "dependency_bindings": [
+        "looped[0].seed",
+        "root"
+      ]
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "looped[0].nested.leaf",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "identifier": "loop-nested-id",
+          "name": "loop-nested"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "depends_on": [
+          "looped[0].consumer"
+        ]
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "looped[0].nested.leaf",
+      "dependency_bindings": [
+        "looped[0].consumer"
+      ]
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "direct.children.first",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "direct-first-child",
+          "identifier": "direct-first-child-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "direct.children.first",
+      "dependency_bindings": [
+        "direct.deferred_source"
+      ]
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "looped[0].children.first",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "identifier": "loop-first-child-id",
+          "name": "loop-first-child"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "looped[0].children.first",
+      "dependency_bindings": [
+        "looped[0].deferred_source"
+      ]
+    }
+  ]
+}

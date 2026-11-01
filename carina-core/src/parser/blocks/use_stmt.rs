@@ -7,7 +7,7 @@ use crate::parser::ast::{SourceSpan, UseStatement};
 use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{AuthoredConcreteValue as ConcreteValue, AuthoredValue as Value};
 
 /// Parse import expression (RHS of `let name = use { source = "path" }`)
 pub(in crate::parser) fn parse_use_expr(

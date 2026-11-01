@@ -10,9 +10,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::detail_rows::DetailRow;
-use crate::effect::Effect;
+use crate::effect::{Effect, SchedulerKey};
 use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, ReplaceDisplayInfo};
-use crate::resource::{ConcreteValue, DeferredValue, LoopSlot, Value};
+use crate::resource::{AbsoluteBindingAddress, ConcreteValue, DeferredValue, LoopSlot, Value};
 use crate::value::{
     RenderedValue, is_upstream_deferred_marker_value, render_value_with_upstream_deferred_label,
 };
@@ -70,19 +70,31 @@ pub fn deferred_summary_for_plan<S>(plan: &Plan<S>) -> DeferredSummaryForPlan {
     DeferredSummaryForPlan { entries }
 }
 
-pub fn deferred_for_source<S>(template: &crate::parser::DeferredForExpression<S>) -> String {
+pub fn deferred_for_source<S>(
+    template: &crate::parser::DeferredForExpression<
+        S,
+        crate::resource::NoPlaceholder,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    >,
+) -> String {
     crate::value::format_value(&template.iterable)
 }
 
 pub fn deferred_for_verb<S>(
     plan: &Plan<S>,
-    template: &crate::parser::DeferredForExpression<S>,
+    template: &crate::parser::DeferredForExpression<
+        S,
+        crate::resource::NoPlaceholder,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    >,
 ) -> &'static str {
     let roots = template.root_bindings();
     if plan.effects().iter().any(|effect| {
         effect
-            .binding_name()
-            .is_some_and(|binding| roots.contains(&binding))
+            .binding_address()
+            .is_some_and(|binding| roots.contains(binding))
     }) {
         "applies"
     } else {
@@ -91,7 +103,12 @@ pub fn deferred_for_verb<S>(
 }
 
 pub fn deferred_for_display_name<S>(
-    template: &crate::parser::DeferredForExpression<S>,
+    template: &crate::parser::DeferredForExpression<
+        S,
+        crate::resource::NoPlaceholder,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    >,
     verb: &str,
 ) -> String {
     let upstream_binding = template.binding_description();
@@ -105,7 +122,12 @@ pub fn deferred_for_display_name<S>(
 }
 
 pub fn deferred_for_detail_rows<S>(
-    template: &crate::parser::DeferredForExpression<S>,
+    template: &crate::parser::DeferredForExpression<
+        S,
+        crate::resource::NoPlaceholder,
+        LoopSlot,
+        AbsoluteBindingAddress,
+    >,
     upstream_binding: &str,
     verb: &str,
 ) -> Vec<DetailRow> {
@@ -124,7 +146,7 @@ pub fn deferred_for_detail_rows<S>(
 }
 
 pub fn render_deferred_for_template_value(
-    value: &Value<LoopSlot>,
+    value: &Value<LoopSlot, AbsoluteBindingAddress>,
     upstream_binding: &str,
     verb: &str,
 ) -> RenderedValue {
@@ -140,10 +162,26 @@ pub fn render_deferred_for_template_value(
 /// Intermediate data for tree-building: maps from effect indices to their
 /// bindings, dependency sets, and resource types.
 pub struct DependencyGraph {
-    pub binding_to_effect: HashMap<String, usize>,
-    pub effect_deps: HashMap<usize, HashSet<String>>,
+    pub(crate) binding_to_effect: HashMap<SchedulerKey, usize>,
+    pub(crate) effect_deps: HashMap<usize, HashSet<SchedulerKey>>,
     pub effect_bindings: HashMap<usize, String>,
     pub effect_types: HashMap<usize, String>,
+}
+
+impl DependencyGraph {
+    /// Dependency/dependent effect-index pairs, without exposing scheduler keys
+    /// as untyped display strings to graph consumers.
+    pub fn dependency_edges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.effect_deps
+            .iter()
+            .flat_map(move |(dependent, dependencies)| {
+                dependencies.iter().filter_map(move |dependency| {
+                    self.binding_to_effect
+                        .get(dependency)
+                        .map(|dependency| (*dependency, *dependent))
+                })
+            })
+    }
 }
 
 /// Build the dependency graph maps from a plan's effects.
@@ -163,8 +201,8 @@ pub fn build_dependency_graph_from_effects<'a, E, S>(
 where
     E: AsRef<Effect<S>>,
 {
-    let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
-    let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
+    let mut binding_to_effect: HashMap<SchedulerKey, usize> = HashMap::new();
+    let mut effect_deps: HashMap<usize, HashSet<SchedulerKey>> = HashMap::new();
     let mut effect_bindings: HashMap<usize, String> = HashMap::new();
     let mut effect_types: HashMap<usize, String> = HashMap::new();
     let replacement_display: Vec<_> = replacement_display.into_iter().collect();
@@ -183,119 +221,143 @@ where
             continue;
         }
 
-        let (resource, mut deps): (Option<crate::parser::ResourceRef<'_, S>>, HashSet<String>) =
-            match effect {
-                // carina#3181 PR D / #3308: `Create`/`Update`/`Read`
-                // all carry a typestate struct — reach them through the
-                // shared `ResourceRef` view, and assemble the dependency
-                // set from value refs + the effect's explicit depends_on.
-                Effect::Create(_)
-                | Effect::ResumeCreate { .. }
-                | Effect::Update { .. }
-                | Effect::Read { .. } => {
-                    let rl = effect
-                        .as_resource_ref()
-                        .expect("variant carries a resource");
-                    let deps = effect.blocking_bindings().into_iter().collect();
-                    (Some(rl), deps)
-                }
-                Effect::Delete {
-                    id,
-                    binding,
-                    generation,
-                    dependencies,
-                    ..
-                } => {
-                    let deps = dependencies.clone();
-                    let is_current = generation.is_current();
-                    if let Some(b) = binding {
-                        if is_current {
-                            binding_to_effect.insert(b.clone(), idx);
-                        }
-                        effect_bindings.insert(idx, b.clone());
-                    } else {
-                        let fallback = id.to_string();
-                        if is_current {
-                            binding_to_effect.insert(fallback.clone(), idx);
-                        }
-                        effect_bindings.insert(idx, fallback);
+        let (resource, mut deps) = match effect {
+            // carina#3181 PR D / #3308: `Create`/`Update`/`Read`
+            // all carry a typestate struct — reach them through the
+            // shared `ResourceRef` view, and assemble the dependency
+            // set from value refs + the effect's explicit depends_on.
+            Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Read { .. } => {
+                let rl = effect
+                    .as_resource_ref()
+                    .expect("variant carries a resource");
+                let deps: HashSet<SchedulerKey> = effect.blocking_keys().into_iter().collect();
+                (Some(rl), deps)
+            }
+            Effect::Delete {
+                id,
+                binding,
+                generation,
+                dependencies,
+                ..
+            } => {
+                let deps = dependencies
+                    .iter()
+                    .cloned()
+                    .map(SchedulerKey::Binding)
+                    .collect();
+                let is_current = generation.is_current();
+                if is_current {
+                    for key in effect.scheduling_keys() {
+                        binding_to_effect.insert(key, idx);
                     }
-                    effect_types.insert(idx, id.resource_type.clone());
-                    effect_deps.insert(idx, deps);
-                    continue;
                 }
-                Effect::Import { id, .. } | Effect::Remove { id, .. } => {
-                    let fallback = id.to_string();
-                    binding_to_effect.insert(fallback.clone(), idx);
-                    effect_bindings.insert(idx, fallback);
-                    effect_types.insert(idx, id.resource_type.clone());
-                    effect_deps.insert(idx, HashSet::new());
-                    continue;
-                }
-                Effect::Move { to, .. } => {
-                    let fallback = to.to_string();
-                    binding_to_effect.insert(fallback.clone(), idx);
-                    effect_bindings.insert(idx, fallback);
-                    effect_types.insert(idx, to.resource_type.clone());
-                    effect_deps.insert(idx, HashSet::new());
-                    continue;
-                }
-                Effect::ReleaseListKeys { id, .. } => {
+                if let Some(b) = binding {
+                    let b = b.to_string();
+                    effect_bindings.insert(idx, b.clone());
+                } else {
                     let fallback = id.to_string();
                     effect_bindings.insert(idx, fallback);
-                    effect_types.insert(idx, id.resource_type.clone());
-                    effect_deps.insert(idx, HashSet::new());
-                    continue;
                 }
-                Effect::Wait {
-                    identity,
-                    target_id,
-                    ..
-                } => {
-                    // Scheduling uses `Effect::blocking_bindings()` so
-                    // wait targets and explicit wait-block dependencies
-                    // both block dispatch. The display tree intentionally
-                    // uses only the target edge because it visualizes the
-                    // structural "wait gates this resource" relationship.
-                    let mut deps = HashSet::new();
-                    deps.insert(target_id.id().identity_str().to_string());
-                    let binding = identity.to_string();
-                    binding_to_effect.insert(binding.clone(), idx);
-                    effect_bindings.insert(idx, binding.clone());
-                    effect_types.insert(idx, "wait".to_string());
-                    effect_deps.insert(idx, deps);
-                    continue;
+                effect_types.insert(idx, id.resource_type.clone());
+                effect_deps.insert(idx, deps);
+                continue;
+            }
+            Effect::Import { id, .. } | Effect::Remove { id, .. } => {
+                let fallback = id.to_string();
+                for key in effect.scheduling_keys() {
+                    binding_to_effect.insert(key, idx);
                 }
-                Effect::DeferredCreate(payload) => {
-                    let fallback = payload.id().to_string();
-                    binding_to_effect.insert(fallback.clone(), idx);
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, id.resource_type.clone());
+                effect_deps.insert(idx, HashSet::new());
+                continue;
+            }
+            Effect::Move { to, .. } => {
+                let fallback = to.to_string();
+                for key in effect.scheduling_keys() {
+                    binding_to_effect.insert(key, idx);
+                }
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, to.resource_type.clone());
+                effect_deps.insert(idx, HashSet::new());
+                continue;
+            }
+            Effect::ReleaseListKeys { id, .. } => {
+                let fallback = id.to_string();
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, id.resource_type.clone());
+                effect_deps.insert(idx, HashSet::new());
+                continue;
+            }
+            Effect::Wait {
+                identity,
+                target_id,
+                ..
+            } => {
+                // Scheduling uses `Effect::blocking_bindings()` so
+                // wait targets and explicit wait-block dependencies
+                // both block dispatch. The display tree intentionally
+                // uses only the target edge because it visualizes the
+                // structural "wait gates this resource" relationship.
+                let mut deps = HashSet::new();
+                deps.insert(SchedulerKey::Resource(target_id.id().identity().clone()));
+                let binding = identity.to_string();
+                binding_to_effect.insert(SchedulerKey::Binding(identity.clone()), idx);
+                effect_bindings.insert(idx, binding.clone());
+                effect_types.insert(idx, "wait".to_string());
+                effect_deps.insert(idx, deps);
+                continue;
+            }
+            Effect::DeferredCreate(payload) => {
+                let template = &payload.template;
+                let fallback = payload.id().to_string();
+                for key in effect.scheduling_keys() {
+                    binding_to_effect.insert(key, idx);
+                }
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, "deferred_for".to_string());
+                effect_deps.insert(
+                    idx,
+                    template
+                        .root_bindings()
+                        .into_iter()
+                        .map(SchedulerKey::Binding)
+                        .collect(),
+                );
+                continue;
+            }
+            Effect::DeferredReplace(payload) => {
+                let fallback = payload.id().to_string();
+                for key in effect.scheduling_keys() {
+                    binding_to_effect.insert(key, idx);
+                }
+                for delete in payload.deletes.iter() {
                     binding_to_effect
-                        .insert(payload.template.target().scheduler_key().to_string(), idx);
-                    effect_bindings.insert(idx, fallback);
-                    effect_types.insert(idx, "deferred_for".to_string());
-                    effect_deps.insert(idx, payload.template.root_bindings().into_iter().collect());
-                    continue;
-                }
-                Effect::DeferredReplace(payload) => {
-                    let fallback = payload.id().to_string();
-                    binding_to_effect.insert(fallback.clone(), idx);
-                    binding_to_effect
-                        .insert(payload.template.target().scheduler_key().to_string(), idx);
-                    for delete in payload.deletes.iter() {
-                        if let Some(binding) = &delete.binding {
-                            binding_to_effect.insert(binding.clone(), idx);
-                        }
+                        .insert(SchedulerKey::Resource(delete.id.identity().clone()), idx);
+                    if let Some(binding) = &delete.binding {
+                        binding_to_effect.insert(SchedulerKey::Binding(binding.clone()), idx);
                     }
-                    effect_bindings.insert(idx, fallback);
-                    effect_types.insert(idx, "deferred_for".to_string());
-                    effect_deps.insert(idx, payload.template.root_bindings().into_iter().collect());
-                    continue;
                 }
-            };
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, "deferred_for".to_string());
+                effect_deps.insert(
+                    idx,
+                    payload
+                        .template
+                        .root_bindings()
+                        .into_iter()
+                        .map(SchedulerKey::Binding)
+                        .collect(),
+                );
+                continue;
+            }
+        };
 
         if let Some(r) = resource {
             let mut replacement_binding = None;
-            let mut replacement_binding_aliases = Vec::new();
             if let Some(metadata) = replacement_create_info.get(&idx)
                 && let Some(Effect::Delete {
                     id,
@@ -304,28 +366,21 @@ where
                     ..
                 }) = effects.get(metadata.delete_idx).map(AsRef::as_ref)
             {
-                deps.extend(dependencies.iter().cloned());
+                deps.extend(dependencies.iter().cloned().map(SchedulerKey::Binding));
+                binding_to_effect.insert(SchedulerKey::Resource(id.identity().clone()), idx);
                 if let Some(binding) = binding {
-                    replacement_binding = Some(binding.clone());
-                    replacement_binding_aliases.push(binding.clone());
-                } else {
-                    replacement_binding_aliases.push(id.to_string());
+                    replacement_binding = Some(binding);
+                    binding_to_effect.insert(SchedulerKey::Binding(binding.clone()), idx);
                 }
             }
 
-            let resource_binding = r.binding().map(str::to_string);
             let binding = replacement_binding
-                .or_else(|| resource_binding.clone())
+                .or_else(|| r.binding_address())
+                .map(ToString::to_string)
                 .unwrap_or_else(|| r.id().to_string());
-            for alias in replacement_binding_aliases {
-                binding_to_effect.insert(alias, idx);
+            for key in effect.scheduling_keys() {
+                binding_to_effect.insert(key, idx);
             }
-            if let Some(resource_binding) = resource_binding
-                && resource_binding != binding
-            {
-                binding_to_effect.insert(resource_binding, idx);
-            }
-            binding_to_effect.insert(binding.clone(), idx);
             effect_bindings.insert(idx, binding);
             effect_types.insert(idx, r.id().resource_type.clone());
         }
@@ -357,8 +412,6 @@ pub fn build_single_parent_tree<S>(
     let effect_deps = &graph.effect_deps;
     let effect_bindings = &graph.effect_bindings;
     let effect_types = &graph.effect_types;
-
-    let effect_binding_set: HashSet<&str> = binding_to_effect.keys().map(|s| s.as_str()).collect();
 
     // Step 1: Build the full reverse dependency map (all parents)
     let mut all_dependents: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -397,12 +450,12 @@ pub fn build_single_parent_tree<S>(
         let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
         children.sort_by_key(|a| sort_key(a));
         if !children.is_empty() {
-            let binding_of_idx = effect_bindings.get(&idx).map(|s| s.as_str());
             let all_dependents_have_other_deps = children.iter().all(|&child_idx| {
                 effect_deps.get(&child_idx).is_some_and(|child_deps| {
                     child_deps.iter().any(|d| {
-                        effect_binding_set.contains(d.as_str())
-                            && Some(d.as_str()) != binding_of_idx
+                        binding_to_effect
+                            .get(d)
+                            .is_some_and(|dependency_idx| *dependency_idx != idx)
                     })
                 })
             });
@@ -589,30 +642,89 @@ mod tests {
     use crate::effect::{
         ChangedCreateOnly, DeferredReplaceDelete, DeferredReplacePayload, NonEmptyDeletes,
     };
-    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
     use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
     use crate::resource::{
-        ConcreteValue, DeferredValue, Directives, InterpolationPart, PathSegment, ResolvedResource,
-        Resource, ResourceId, ResourceIdentity, State, Subscript, Value,
+        Directives, ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+        ExpandedValue as Value, LoopSlot, PathSegment, RelativeBindingName, ResolvedResource,
+        Resource, ResourceId, RootScope, State, Subscript,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::time::Duration;
+
+    type LoopValue = crate::resource::Value<LoopSlot>;
+    type LoopConcreteValue = crate::resource::ConcreteValue<LoopSlot>;
+    type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
+    type LoopInterpolationPart = crate::resource::InterpolationPart<LoopSlot>;
+    type LoopResource = crate::resource::Resource<crate::resource::ModuleSource, LoopSlot>;
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
     }
 
+    fn absolute(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
+    }
+
+    #[test]
+    fn binding_spelling_cannot_steal_a_resource_identity_dependency() {
+        let actual = Resource::new("test.Resource", "shared").with_root_binding("actual");
+        let alias = Resource::new("test.Resource", "unrelated").with_root_binding("shared");
+        let consumer = Resource::new("test.Resource", "consumer")
+            .with_root_binding("consumer")
+            .with_attribute(
+                "comment",
+                Value::root_resource_ref("shared", "identifier", vec![]),
+            );
+        let actual = resolved(actual);
+        let target_id = crate::wait::ManagedWaitTarget::new(&actual);
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(actual));
+        plan.add(Effect::Create(resolved(alias)));
+        plan.add(Effect::Wait {
+            identity: absolute("ready"),
+            target_id,
+            until: WaitPredicate::equals(
+                AttrPath::single("identifier"),
+                Value::Concrete(ConcreteValue::String("ready".into())),
+            )
+            .expect("valid wait predicate"),
+            until_surface: "actual.identifier == 'ready'".to_string(),
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(1),
+            explicit_dependencies: HashSet::new(),
+        });
+        plan.add(Effect::Create(resolved(consumer)));
+
+        let graph = build_dependency_graph(&plan);
+        let (roots, dependents) = build_single_parent_tree(&plan, &graph);
+        assert_eq!(roots, vec![0, 1]);
+        assert_eq!(
+            dependents.get(&0),
+            Some(&vec![2]),
+            "wait must use the resource identity"
+        );
+        assert_eq!(
+            dependents.get(&1),
+            Some(&vec![3]),
+            "value reference must use the binding"
+        );
+    }
+
     #[test]
     fn deferred_for_source_renders_the_complete_coalesce_expression() {
-        let template_resource = Resource::new("test.Child", "children");
+        let template_resource = LoopResource::new("test.Child", "children");
         let deferred = DeferredForExpression::new(
             None,
             1,
             "for x in (up.items ?? fallback.items)".to_string(),
-            crate::parser::DeferredForTarget::bound("children").expect("fixture binding is valid"),
+            crate::parser::DeferredForTarget::bound(
+                crate::resource::absolute_binding_address_for_test("children"),
+            )
+            .expect("fixture binding is valid"),
             Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(Value::resource_ref("up", "items", Vec::new())),
-                default: Box::new(Value::resource_ref("fallback", "items", Vec::new())),
+                value: Box::new(Value::root_resource_ref("up", "items", Vec::new())),
+                default: Box::new(Value::root_resource_ref("fallback", "items", Vec::new())),
             }),
             ForBinding::Simple("x".to_string()),
             template_resource,
@@ -623,7 +735,7 @@ mod tests {
 
     #[test]
     fn deferred_for_display_hides_direct_placeholder_access_but_keeps_expressions() {
-        let placeholder = Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value));
+        let placeholder = LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value));
         let direct_access = crate::resource::apply_postfix_access(
             crate::resource::apply_postfix_access(
                 placeholder.clone(),
@@ -647,7 +759,7 @@ mod tests {
         );
         assert_eq!(
             render_deferred_for_template_value(
-                &Value::Concrete(ConcreteValue::List(vec![direct_access])),
+                &LoopValue::Concrete(LoopConcreteValue::List(vec![direct_access])),
                 "cert",
                 "applies",
             )
@@ -656,10 +768,10 @@ mod tests {
         );
 
         let expression = crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::FunctionCall {
+            LoopValue::Deferred(LoopDeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    LoopValue::Concrete(LoopConcreteValue::String("/".into())).into(),
                     placeholder.into(),
                 ],
                 source_line: (0).into(),
@@ -679,7 +791,7 @@ mod tests {
 
     #[test]
     fn deferred_for_display_does_not_rewrite_marker_text_inside_strings() {
-        let value = Value::Concrete(ConcreteValue::String(
+        let value = LoopValue::Concrete(LoopConcreteValue::String(
             "(known after upstream apply: user text)".into(),
         ));
 
@@ -691,9 +803,9 @@ mod tests {
 
     #[test]
     fn deferred_for_display_does_not_rewrite_marker_text_inside_map_keys() {
-        let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+        let value = LoopValue::Concrete(LoopConcreteValue::Map(indexmap::IndexMap::from([(
             "(known after upstream apply: x)".to_string(),
-            Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
+            LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
         )])));
 
         assert_eq!(
@@ -705,7 +817,7 @@ mod tests {
     #[test]
     fn deferred_for_display_rewrites_access_inside_interpolation() {
         let access = crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
+            LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
             PathSegment::Field {
                 name: "resource_record_name".to_string(),
             },
@@ -713,9 +825,9 @@ mod tests {
             crate::resource::AccessMissPolicy::Error,
         )
         .unwrap();
-        let value = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(access),
-            InterpolationPart::Literal(".example".into()),
+        let value = LoopValue::Deferred(LoopDeferredValue::Interpolation(vec![
+            LoopInterpolationPart::Expr(access),
+            LoopInterpolationPart::Literal(".example".into()),
         ]));
 
         assert_eq!(
@@ -726,7 +838,7 @@ mod tests {
 
     #[test]
     fn compact_hint_preserves_dotted_string_value() {
-        let resource = Resource::new("test.resource", "dotted-name").with_attribute(
+        let resource: Resource = Resource::new("test.resource", "dotted-name").with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("A.json".into())),
         );
@@ -739,9 +851,10 @@ mod tests {
 
     #[test]
     fn explicit_only_depends_on_edge_is_in_dependency_graph() {
-        let role = Resource::new("iam.Role", "role").with_binding("role".to_string());
-        let mut bucket = Resource::new("s3.Bucket", "bucket").with_binding("bucket".to_string());
-        bucket.directives.depends_on = vec!["role".to_string()];
+        let role = Resource::new("iam.Role", "role").with_root_binding("role".to_string());
+        let mut bucket =
+            Resource::new("s3.Bucket", "bucket").with_root_binding("bucket".to_string());
+        bucket.directives.depends_on = vec![absolute("role")];
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(role)));
@@ -750,14 +863,14 @@ mod tests {
 
         let bucket_idx = *graph
             .binding_to_effect
-            .get("bucket")
+            .get(&SchedulerKey::Binding(absolute("bucket")))
             .expect("bucket effect indexed by binding");
         let bucket_deps = graph
             .effect_deps
             .get(&bucket_idx)
             .expect("bucket effect has deps map entry");
         assert!(
-            bucket_deps.contains("role"),
+            bucket_deps.contains(&SchedulerKey::Binding(absolute("role"))),
             "explicit depends_on edge should be in dependency graph; got {:?}",
             bucket_deps
         );
@@ -765,8 +878,8 @@ mod tests {
 
     #[test]
     fn replacement_delete_dependencies_and_binding_merge_into_create_node() {
-        let igw = Resource::new("ec2.InternetGateway", "igw").with_binding("internet_gateway");
-        let create = Resource::new("ec2.Vpc", "vpc").with_binding("vpc_new");
+        let igw = Resource::new("ec2.InternetGateway", "igw").with_root_binding("internet_gateway");
+        let create = Resource::new("ec2.Vpc", "vpc").with_root_binding("vpc_new");
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(igw)));
         plan.add_replacement(ReplacementGroup {
@@ -777,9 +890,9 @@ mod tests {
                 )),
                 identifier: crate::effect::fixture_applied_identifier("vpc-123"),
                 directives: Directives::default(),
-                binding: Some("vpc_old".to_string()),
-                dependencies: HashSet::from(["internet_gateway".to_string()]),
-                explicit_dependencies: HashSet::from(["internet_gateway".to_string()]),
+                binding: Some(absolute("vpc_old")),
+                dependencies: HashSet::from([absolute("internet_gateway")]),
+                explicit_dependencies: HashSet::from([absolute("internet_gateway")]),
             },
             create_before_destroy: true,
             changed_create_only: ChangedCreateOnly::new(vec!["cidr_block".to_string()]).unwrap(),
@@ -799,17 +912,26 @@ mod tests {
             !graph.effect_deps.contains_key(&2),
             "replacement delete should not be a graph entry"
         );
-        assert_eq!(graph.binding_to_effect.get("vpc_old"), Some(&1));
-        assert_eq!(graph.binding_to_effect.get("vpc_new"), Some(&1));
+        assert_eq!(
+            graph
+                .binding_to_effect
+                .get(&SchedulerKey::Binding(absolute("vpc_old"))),
+            Some(&1)
+        );
+        assert_eq!(
+            graph
+                .binding_to_effect
+                .get(&SchedulerKey::Binding(absolute("vpc_new"))),
+            Some(&1)
+        );
         assert_eq!(
             graph.effect_bindings.get(&1).map(String::as_str),
             Some("vpc_old")
         );
         assert!(
-            graph
-                .effect_deps
-                .get(&1)
-                .is_some_and(|deps| deps.contains("internet_gateway")),
+            graph.effect_deps.get(&1).is_some_and(
+                |deps| deps.contains(&SchedulerKey::Binding(absolute("internet_gateway")))
+            ),
             "delete-side dependencies should be merged into create deps"
         );
 
@@ -821,16 +943,16 @@ mod tests {
     #[test]
     fn deposed_delete_does_not_steal_current_binding_parentage() {
         let main = Resource::new("ec2.Vpc", "main")
-            .with_binding("main")
+            .with_root_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let subnet = Resource::new("ec2.Subnet", "subnet")
-            .with_binding("subnet")
+            .with_root_binding("subnet")
             .with_attribute(
                 "vpc_id",
-                Value::resource_ref("main".to_string(), "vpc_id".to_string(), vec![]),
+                Value::root_resource_ref("main".to_string(), "vpc_id".to_string(), vec![]),
             )
             .with_attribute(
                 "cidr_block",
@@ -858,7 +980,7 @@ mod tests {
                 crate::resource::DeposedKey::new_unique(),
             ),
             directives: Directives::default(),
-            binding: Some("main".to_string()),
+            binding: Some(absolute("main")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -866,7 +988,9 @@ mod tests {
 
         let graph = build_dependency_graph(&plan);
         assert_eq!(
-            graph.binding_to_effect.get("main"),
+            graph
+                .binding_to_effect
+                .get(&SchedulerKey::Binding(absolute("main"))),
             Some(&0),
             "current instance must keep the binding used by dependents"
         );
@@ -893,15 +1017,17 @@ mod tests {
 
     #[test]
     fn child_render_items_renders_deferred_replace_normally() {
-        let template_resource =
-            Resource::new("aws.route53.Record", "ignored").with_binding("validation_records");
+        let template_resource = LoopResource::new("aws.route53.Record", "ignored")
+            .with_absolute_binding(absolute("validation_records"));
         let deferred = DeferredForExpression::new(
             None,
             1,
             "for opt in cert.domain_validation_options".to_string(),
-            crate::parser::DeferredForTarget::bound("validation_records")
-                .expect("fixture binding is valid"),
-            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            crate::parser::DeferredForTarget::bound(
+                crate::resource::absolute_binding_address_for_test("validation_records"),
+            )
+            .expect("fixture binding is valid"),
+            Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
@@ -915,7 +1041,7 @@ mod tests {
                 )),
                 identifier: crate::effect::fixture_applied_identifier("record-0"),
                 directives: Directives::default(),
-                binding: Some("validation_records[0]".to_string()),
+                binding: Some(absolute("validation_records[0]")),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),
@@ -931,7 +1057,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("record-0"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
+            binding: Some(absolute("validation_records[0]")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -944,7 +1070,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("record-abc"),
             generation: crate::effect::EffectGeneration::Current,
             directives: Directives::default(),
-            binding: Some("validation_records[abc]".to_string()),
+            binding: Some(absolute("validation_records[abc]")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -962,15 +1088,17 @@ mod tests {
 
     #[test]
     fn dependency_graph_indexes_deferred_replace_delete_bindings() {
-        let template_resource =
-            Resource::new("aws.route53.Record", "ignored").with_binding("validation_records");
+        let template_resource = LoopResource::new("aws.route53.Record", "ignored")
+            .with_absolute_binding(absolute("validation_records"));
         let deferred = DeferredForExpression::new(
             None,
             1,
             "for opt in cert.domain_validation_options".to_string(),
-            crate::parser::DeferredForTarget::bound("validation_records")
-                .expect("fixture binding is valid"),
-            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            crate::parser::DeferredForTarget::bound(
+                crate::resource::absolute_binding_address_for_test("validation_records"),
+            )
+            .expect("fixture binding is valid"),
+            Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
@@ -984,7 +1112,7 @@ mod tests {
                 )),
                 identifier: crate::effect::fixture_applied_identifier("record-0"),
                 directives: Directives::default(),
-                binding: Some("validation_records[0]".to_string()),
+                binding: Some(absolute("validation_records[0]")),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),
@@ -993,7 +1121,9 @@ mod tests {
             template: Box::new(deferred),
         })));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("wait_validation_record_0"),
+            identity: crate::resource::absolute_binding_address_for_test(
+                "wait_validation_record_0",
+            ),
             target_id: crate::wait::ManagedWaitTarget::new(
                 &crate::resource::ResolvedResource::new(Resource::new(
                     "route53.Record",
@@ -1013,21 +1143,25 @@ mod tests {
 
         let graph = build_dependency_graph(&plan);
         assert_eq!(
-            graph.binding_to_effect.get("validation_records[0]"),
+            graph
+                .binding_to_effect
+                .get(&SchedulerKey::Binding(absolute("validation_records[0]"))),
             Some(&0)
         );
 
         let wait_idx = *graph
             .binding_to_effect
-            .get("wait_validation_record_0")
+            .get(&SchedulerKey::Binding(absolute("wait_validation_record_0")))
             .expect("wait effect indexed by binding");
         let wait_deps = graph
             .effect_deps
             .get(&wait_idx)
             .expect("wait effect has deps map entry");
         assert!(
-            wait_deps.contains("validation_records[0]"),
-            "wait should depend on the deferred replace's absorbed delete binding; got {wait_deps:?}"
+            wait_deps.contains(&SchedulerKey::Resource(
+                crate::resource::ResourceIdentity::new("validation_records[0]")
+            )),
+            "wait should depend on the deferred replace's absorbed resource identity; got {wait_deps:?}"
         );
 
         let (_roots, dependents) = build_single_parent_tree(&plan, &graph);

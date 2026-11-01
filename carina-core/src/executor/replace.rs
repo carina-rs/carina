@@ -19,7 +19,7 @@ pub(super) enum SingleEffectResult<'a, S> {
     Read {
         started: StartedEffect<'a, S>,
         resource: Box<DataSource<S>>,
-        outcome: Result<(SecretPreservingAttributes, State), String>,
+        outcome: Result<(SecretPreservingAttributes, State), super::EffectFailureKind>,
         duration: Duration,
     },
     /// `Effect::Wait` execution outcome. On success carries the

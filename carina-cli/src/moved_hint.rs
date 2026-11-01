@@ -674,7 +674,8 @@ mod tests {
                     "bootstrap",
                     "network",
                     vec!["cidr".into()],
-                ),
+                )
+                .resolve_root_for_test(),
             })),
         );
 

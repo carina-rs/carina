@@ -14,10 +14,11 @@
 //! This file walks every `Value` in a representative parsed file and
 //! asserts the invariants hold for every interpolation found.
 
-use carina_core::parser::parse_file_and_resolve;
-use carina_core::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+use carina_core::resource::{
+    BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, PlaceholderKind, Value,
+};
 
-fn check_value(v: &Value, path: &str) {
+fn check_value<P: PlaceholderKind, B: BindingAddress>(v: &Value<P, B>, path: &str) {
     match v {
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             // (1) at least one Expr
@@ -90,6 +91,21 @@ fn check_value(v: &Value, path: &str) {
     }
 }
 
+fn parse_root_and_resolve(source: &str) -> carina_core::parser::ExpandedParsedFile {
+    let root = tempfile::tempdir().expect("canonicalization fixture root");
+    std::fs::write(root.path().join("canonicalize.crn"), source)
+        .expect("write canonicalization fixture");
+    let parsed = carina_core::config_loader::parse_directory(
+        root.path(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse should succeed");
+    carina_core::module_resolver::resolve_modules_providerless(parsed, root.path())
+        .expect("module-resolution boundary should succeed")
+        .into_expanded()
+        .expect("canonicalization fixture contains no parser placeholders")
+}
+
 #[test]
 fn parse_resolve_yields_canonical_interpolations() {
     // A fixture that exercises every collapse rule:
@@ -116,15 +132,7 @@ fn parse_resolve_yields_canonical_interpolations() {
         }
     "#;
 
-    let parsed = parse_file_and_resolve(src, std::path::Path::new("canonicalize.crn"))
-        .expect("parse should succeed");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
-        std::path::Path::new("."),
-    )
-    .expect("module-resolution boundary should succeed")
-    .into_expanded()
-    .expect("canonicalization fixture contains no parser placeholders");
+    let parsed = parse_root_and_resolve(src);
 
     for resource in &parsed.resources {
         for (k, v) in &resource.attributes {
@@ -164,15 +172,7 @@ fn double_quoted_literal_is_canonical_string() {
           name  = "no-interpolation-here"
         }
     "#;
-    let parsed = parse_file_and_resolve(src, std::path::Path::new("canonicalize.crn"))
-        .expect("parse should succeed");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
-        std::path::Path::new("."),
-    )
-    .expect("module-resolution boundary should succeed")
-    .into_expanded()
-    .expect("canonicalization fixture contains no parser placeholders");
+    let parsed = parse_root_and_resolve(src);
     let resource = &parsed.resources[0];
     let value = resource.attributes.get("name").expect("name attribute");
     assert!(

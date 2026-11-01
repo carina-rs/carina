@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use carina_core::hint::ProjectCommand;
-use carina_core::resource::ResourceIdentityError;
+use carina_core::resource::{AbsoluteBindingAddress, ResourceIdentityError};
 use std::path::Path;
 use thiserror::Error;
 
@@ -83,6 +83,79 @@ impl std::fmt::Display for InvalidResourceIdentityError {
 
 impl std::error::Error for InvalidResourceIdentityError {}
 
+/// A state JSON decoding failure with its backend location and structural JSON
+/// path retained separately from serde's typed terminal error.
+#[derive(Debug)]
+pub struct InvalidStateJsonError {
+    context: String,
+    json_path: String,
+    state_location: Option<String>,
+    source: serde_json::Error,
+}
+
+impl InvalidStateJsonError {
+    pub(crate) fn new(context: String, json_path: String, source: serde_json::Error) -> Self {
+        Self {
+            context,
+            json_path,
+            state_location: None,
+            source,
+        }
+    }
+
+    fn set_state_location(&mut self, location: String) {
+        self.state_location = Some(location);
+    }
+}
+
+impl std::fmt::Display for InvalidStateJsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(location) = &self.state_location {
+            writeln!(f, "Failed to read state file at {location}")?;
+        }
+        write!(
+            f,
+            "{}: {} at JSON location {}. The state file is corrupted or hand-edited; restore it from a backup.",
+            self.context, self.source, self.json_path
+        )
+    }
+}
+
+impl std::error::Error for InvalidStateJsonError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// A checked persisted-address transformation failed to deserialize its
+/// result. Keep the original typed address and serde error for diagnostics.
+#[derive(Debug)]
+pub struct InvalidCanonicalBindingError {
+    binding: AbsoluteBindingAddress,
+    state_location: Option<String>,
+    source: serde_json::Error,
+}
+
+impl std::fmt::Display for InvalidCanonicalBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(location) = &self.state_location {
+            writeln!(f, "Failed to read state file at {location}")?;
+        }
+        write!(
+            f,
+            "Invalid state file: cannot canonicalize persisted binding address {:?}: {}",
+            self.binding.as_str(),
+            self.source,
+        )
+    }
+}
+
+impl std::error::Error for InvalidCanonicalBindingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Errors that can occur when interacting with a state backend
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -128,6 +201,14 @@ pub enum BackendError {
         location: String,
         error: Box<BackendError>,
     },
+
+    /// State JSON failed to decode at a structurally identified location.
+    #[error(transparent)]
+    InvalidStateJson(InvalidStateJsonError),
+
+    /// Checked binding-address canonicalization failed, retaining its cause.
+    #[error(transparent)]
+    InvalidCanonicalBinding(InvalidCanonicalBindingError),
 
     /// An identity transformation produced a value that cannot be represented.
     #[error("Invalid state file: {context}: {error}")]
@@ -471,6 +552,17 @@ impl BackendError {
         Self::Configuration(message.into())
     }
 
+    pub(crate) fn invalid_canonical_binding(
+        binding: AbsoluteBindingAddress,
+        error: serde_json::Error,
+    ) -> Self {
+        Self::InvalidCanonicalBinding(InvalidCanonicalBindingError {
+            binding,
+            state_location: None,
+            source: error,
+        })
+    }
+
     /// Attach the concrete backend location to state-row validation errors.
     pub fn with_state_location(mut self, location: impl Into<String>) -> Self {
         if let Self::InvalidResourceIdentity(error) = &mut self {
@@ -486,6 +578,14 @@ impl BackendError {
             Self::InvalidResourceIdentity(mut error) => {
                 error.set_state_location(location);
                 Self::InvalidResourceIdentity(error)
+            }
+            Self::InvalidStateJson(mut error) => {
+                error.set_state_location(location);
+                Self::InvalidStateJson(error)
+            }
+            Self::InvalidCanonicalBinding(mut error) => {
+                error.state_location = Some(location);
+                Self::InvalidCanonicalBinding(error)
             }
             error => Self::StateRead {
                 location,

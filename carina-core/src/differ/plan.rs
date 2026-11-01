@@ -4,9 +4,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
 
-use crate::effect::{ChangedCreateOnly, Effect, OutcomeUnknownImportReplacement, TemporaryName};
+use crate::effect::{
+    ChangedCreateOnly, DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload,
+    Effect, EffectGeneration, NonEmptyDeletes, OutcomeUnknownImportReplacement, TemporaryName,
+};
 use crate::identifier::generate_random_suffix;
-use crate::parser::WaitBinding;
+use crate::parser::{DeferredForExpression, ResolvedDeferredForExpressions, WaitBinding};
 use crate::plan::{
     CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
@@ -14,22 +17,152 @@ use crate::plan::{
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
 use crate::resource::{
-    ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, PlanInputDesiredResources,
-    ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, State, Value, plan_input_desired_resources,
+    AbsoluteBindingAddress, CanonicalComparisonAttributes, ConcreteValue, Current, DataSource,
+    Directives, PlanInputCurrent, PlanInputDesired, PlanInputDesiredResources, ResolvedDataSource,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
+    plan_input_desired_resources,
 };
 use crate::schema::{
-    ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
-    WAIT_DEFAULT_TIMEOUT,
+    AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec,
+    WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
 use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
 use super::{
-    ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates, PlannedListKeyRelease,
-    PresentDiff, diff_present_with_releases,
+    ComparisonContext, ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates,
+    PlannedListKeyRelease, PresentDiff, comparison::AuthoredRemovalEvidence,
+    diff_present_with_releases, type_aware_equal,
 };
+
+#[cfg(test)]
+#[path = "deferred_tests.rs"]
+mod deferred_tests;
+
+/// Select how a finalized deferred loop crosses the plan-time expansion seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredForExpansionChoice {
+    /// Expand now, preserving a parser residual if expansion is still unresolved.
+    Expand,
+    /// Retain the template for apply-time expansion and planning dependencies.
+    Retain,
+}
+
+/// The apply-time target set retained for one planning call.
+///
+/// Partition finalized loops with [`Self::partition_for_expansion`], which may
+/// produce an empty set. Within one planning call, CBD promotion inspects the
+/// same owned set that deferred-effect emission consumes exactly once. The
+/// private, non-cloneable owner carries that set from [`CascadeDependents`] to
+/// [`PendingCascadePlan::finish`].
+///
+/// ```compile_fail,E0423
+/// use carina_core::differ::DeferredCreateTargets;
+/// let targets = DeferredCreateTargets(Vec::new());
+/// ```
+///
+/// ```compile_fail,E0599
+/// use carina_core::differ::DeferredCreateTargets;
+/// let targets = DeferredCreateTargets::default();
+/// ```
+///
+/// The retained owner cannot be reused for another planning call.
+///
+/// ```compile_fail,E0382
+/// use carina_core::differ::{CascadeDependents, DeferredCreateTargets};
+/// fn reuse(targets: DeferredCreateTargets) {
+///     let first = CascadeDependents::new(&[], targets);
+///     let second = CascadeDependents::new(&[], targets);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct DeferredCreateTargets(ResolvedDeferredForExpressions);
+
+impl DeferredCreateTargets {
+    /// Select plan-time expansion candidates and retain the complementary
+    /// target set as one owner. This is also how a no-deferred configuration
+    /// produces its (empty) target set; callers cannot substitute an iterator.
+    pub fn partition_for_expansion(
+        expressions: ResolvedDeferredForExpressions,
+        mut classify: impl FnMut(&DeferredForExpression) -> DeferredForExpansionChoice,
+    ) -> (ResolvedDeferredForExpressions, Self) {
+        let (selected, retained) = expressions
+            .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
+        (selected, Self(retained))
+    }
+
+    /// Read-only templates, also retained in the expanded parser view for
+    /// diagnostics and validation. Only planning may emit their effects.
+    pub fn templates(&self) -> &ResolvedDeferredForExpressions {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Dependents and the owned deferred targets used by replacement planning.
+///
+/// The same target owner is consulted before replacement decomposition and
+/// consumed afterward to emit DeferredCreate/DeferredReplace effects.
+///
+/// ```compile_fail,E0308
+/// use carina_core::differ::CascadeDependents;
+/// let dependents = CascadeDependents::new(&[], std::iter::empty());
+/// ```
+pub struct CascadeDependents<'a> {
+    managed: &'a [ResolvedResource],
+    deferred: DeferredCreateTargets,
+}
+
+impl<'a> CascadeDependents<'a> {
+    pub fn new(managed: &'a [ResolvedResource], deferred: DeferredCreateTargets) -> Self {
+        Self { managed, deferred }
+    }
+}
+
+/// Cascaded diff awaiting the remaining, caller-owned planning effects.
+///
+/// The retained targets stay with this builder until [`Self::finish`] adds their
+/// effects last, after deposed cleanup and state-block adjustments. Its fields
+/// are private; finalization consumes the builder and returns the completed plan.
+///
+/// ```compile_fail,E0616
+/// use carina_core::differ::PendingCascadePlan;
+/// use carina_core::plan::Plan;
+/// fn bypass(builder: PendingCascadePlan) -> Plan { builder.plan }
+/// ```
+///
+/// ```compile_fail,E0382
+/// use carina_core::differ::PendingCascadePlan;
+/// fn finish_twice(builder: PendingCascadePlan) {
+///     let first = builder.finish(|_| {});
+///     let second = builder.finish(|_| {});
+/// }
+/// ```
+#[must_use = "finish planning to emit the retained deferred targets"]
+pub struct PendingCascadePlan {
+    plan: Plan,
+    deferred: DeferredCreateTargets,
+}
+
+impl PendingCascadePlan {
+    /// Complete the remaining planning steps, then emit the very same deferred
+    /// targets already consulted during CBD promotion. The callback sees only
+    /// the diff plan, preserving the historical ancillary-effect ordering.
+    pub fn finish(self, complete: impl FnOnce(&mut Plan)) -> Plan {
+        let Self { mut plan, deferred } = self;
+        complete(&mut plan);
+        add_deferred_create_effects(&mut plan, deferred);
+        plan
+    }
+}
 
 fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {
     for release in releases {
@@ -58,12 +191,365 @@ struct RefAttr {
     hint: String,
 }
 
-/// Check which changed attributes are create-only according to the schema
-fn find_changed_create_only(changed_attributes: &[String], schema: &ResourceSchema) -> Vec<String> {
-    let create_only_attrs = schema.create_only_attributes();
+fn contains_authored_create_only_value(
+    attr_type: &AttributeType,
+    value: &Value,
+    schema: &ResourceSchema,
+) -> bool {
+    contains_authored_create_only_value_on_path(attr_type, value, schema, &mut Vec::new())
+}
+
+fn contains_authored_create_only_value_on_path<'schema>(
+    attr_type: &'schema AttributeType,
+    value: &Value,
+    schema: &'schema ResourceSchema,
+    ref_chain: &mut Vec<&'schema str>,
+) -> bool {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return false;
+            }
+            let Some(definition) = schema.defs.get(name) else {
+                return false;
+            };
+            ref_chain.push(name);
+            let contains =
+                contains_authored_create_only_value_on_path(definition, value, schema, ref_chain);
+            ref_chain.pop();
+            contains
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return false;
+            };
+            items.iter().any(|item| {
+                contains_authored_create_only_value_on_path(element_type, item, schema, ref_chain)
+            })
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return false;
+            };
+            entries.values().any(|entry| {
+                contains_authored_create_only_value_on_path(value_type, entry, schema, ref_chain)
+            })
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return false;
+            };
+            fields.iter().any(|field| {
+                entries.get(&field.name).is_some_and(|field_value| {
+                    field.create_only
+                        || contains_authored_create_only_value_on_path(
+                            &field.field_type,
+                            field_value,
+                            schema,
+                            ref_chain,
+                        )
+                })
+            })
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => false,
+    }
+}
+
+struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
+    desired_items: &'items [&'items Value],
+    current_items: &'items [Value],
+    element_type: &'schema AttributeType,
+    schema: &'schema ResourceSchema,
+    context: &'context ComparisonContext<'comparison>,
+    removal_evidence: AuthoredRemovalEvidence,
+    current_matches: &'items mut [Option<usize>],
+}
+
+impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
+    fn matches(&mut self, desired_index: usize, seen_current: &mut [bool]) -> bool {
+        for current_index in 0..self.current_items.len() {
+            if seen_current[current_index]
+                || !create_only_values_compatible(
+                    self.element_type,
+                    &self.current_items[current_index],
+                    self.desired_items[desired_index],
+                    self.schema,
+                    self.context,
+                    self.removal_evidence,
+                )
+            {
+                continue;
+            }
+            seen_current[current_index] = true;
+            if self.current_matches[current_index]
+                .is_none_or(|previous_desired| self.matches(previous_desired, seen_current))
+            {
+                self.current_matches[current_index] = Some(desired_index);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn create_only_values_compatible(
+    attr_type: &AttributeType,
+    current: &Value,
+    desired: &Value,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
+) -> bool {
+    create_only_values_compatible_on_path(
+        attr_type,
+        current,
+        desired,
+        schema,
+        context,
+        removal_evidence,
+        &mut Vec::new(),
+    )
+}
+
+fn authored_create_only_value_is_compatible(
+    attr_type: &AttributeType,
+    current: Option<&Value>,
+    desired: &Value,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
+) -> bool {
+    !contains_authored_create_only_value(attr_type, desired, schema)
+        || current.is_some_and(|current| {
+            create_only_values_compatible(
+                attr_type,
+                current,
+                desired,
+                schema,
+                context,
+                removal_evidence,
+            )
+        })
+}
+
+fn create_only_values_compatible_on_path<'schema>(
+    attr_type: &'schema AttributeType,
+    current: &Value,
+    desired: &Value,
+    schema: &'schema ResourceSchema,
+    context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
+    ref_chain: &mut Vec<&'schema str>,
+) -> bool {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return true;
+            }
+            let Some(definition) = schema.defs.get(name) else {
+                return true;
+            };
+            ref_chain.push(name);
+            let compatible = create_only_values_compatible_on_path(
+                definition,
+                current,
+                desired,
+                schema,
+                context,
+                removal_evidence,
+                ref_chain,
+            );
+            ref_chain.pop();
+            compatible
+        }
+        AttrTypeKind::List {
+            element_type,
+            ordered,
+            ..
+        } => {
+            let Value::Concrete(ConcreteValue::List(desired_items)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::List(current_items)) = current else {
+                return !desired_items
+                    .iter()
+                    .any(|item| contains_authored_create_only_value(element_type, item, schema));
+            };
+            if *ordered {
+                desired_items.iter().enumerate().all(|(index, desired)| {
+                    authored_create_only_value_is_compatible(
+                        element_type,
+                        current_items.get(index),
+                        desired,
+                        schema,
+                        context,
+                        removal_evidence,
+                    )
+                })
+            } else {
+                let desired_items = desired_items
+                    .iter()
+                    .filter(|item| contains_authored_create_only_value(element_type, item, schema))
+                    .collect::<Vec<_>>();
+                let mut current_matches = vec![None; current_items.len()];
+                let mut matcher = UnorderedCreateOnlyMatcher {
+                    desired_items: &desired_items,
+                    current_items,
+                    element_type,
+                    schema,
+                    context,
+                    removal_evidence,
+                    current_matches: &mut current_matches,
+                };
+                (0..desired_items.len()).all(|desired_index| {
+                    matcher.matches(desired_index, &mut vec![false; current_items.len()])
+                })
+            }
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(desired_entries)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::Map(current_entries)) = current else {
+                return !desired_entries
+                    .values()
+                    .any(|entry| contains_authored_create_only_value(value_type, entry, schema));
+            };
+            desired_entries.iter().all(|(key, desired)| {
+                authored_create_only_value_is_compatible(
+                    value_type,
+                    current_entries.get(key),
+                    desired,
+                    schema,
+                    context,
+                    removal_evidence,
+                )
+            })
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(desired_fields)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::Map(current_fields)) = current else {
+                return !contains_authored_create_only_value(attr_type, desired, schema);
+            };
+            fields.iter().all(|field| {
+                let Some(desired) = desired_fields.get(&field.name) else {
+                    return match removal_evidence {
+                        AuthoredRemovalEvidence::Recorded => {
+                            current_fields.get(&field.name).is_none_or(|current| {
+                                !field.create_only
+                                    && !contains_authored_create_only_value(
+                                        &field.field_type,
+                                        current,
+                                        schema,
+                                    )
+                            })
+                        }
+                        AuthoredRemovalEvidence::Unrecorded => true,
+                    };
+                };
+                if field.create_only {
+                    return current_fields.get(&field.name).is_some_and(|current| {
+                        type_aware_equal(
+                            current,
+                            desired,
+                            Some(&field.field_type),
+                            &schema.defs,
+                            context,
+                        )
+                    });
+                }
+                authored_create_only_value_is_compatible(
+                    &field.field_type,
+                    current_fields.get(&field.name),
+                    desired,
+                    schema,
+                    context,
+                    removal_evidence,
+                )
+            })
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => true,
+    }
+}
+
+pub(super) fn find_changed_create_only(
+    changed_attributes: &[String],
+    current_attributes: &CanonicalComparisonAttributes,
+    removal_evidence: AuthoredRemovalEvidence,
+    desired: &PlanInputDesired<'_>,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+) -> Vec<String> {
+    let top_level = schema.create_only_attributes();
     changed_attributes
         .iter()
-        .filter(|attr| create_only_attrs.contains(&attr.as_str()))
+        .filter(|attribute| {
+            if top_level.contains(&attribute.as_str()) {
+                return true;
+            }
+
+            let Some(attribute_schema) = schema.attributes().get(attribute.as_str()) else {
+                return false;
+            };
+            let Some(desired_value) = desired.comparison_attributes().get(attribute.as_str())
+            else {
+                // An authored empty struct canonicalizes to absence, but it
+                // still removes any previously authored create-only leaves.
+                // Keep comparison absence from inventing additions of empty
+                // nested create-only structs during unrelated updates.
+                return removal_evidence == AuthoredRemovalEvidence::Recorded
+                    && desired
+                        .authored()
+                        .attributes
+                        .contains_key(attribute.as_str())
+                    && current_attributes
+                        .get(attribute.as_str())
+                        .is_some_and(|current| {
+                            contains_authored_create_only_value(
+                                attribute_schema.attr_type(),
+                                current,
+                                schema,
+                            )
+                        });
+            };
+            let Some(current) = current_attributes.get(attribute.as_str()) else {
+                return contains_authored_create_only_value(
+                    attribute_schema.attr_type(),
+                    desired_value,
+                    schema,
+                );
+            };
+            !create_only_values_compatible(
+                attribute_schema.attr_type(),
+                current,
+                desired_value,
+                schema,
+                context,
+                removal_evidence,
+            )
+        })
         .cloned()
         .collect()
 }
@@ -98,7 +584,7 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
     }
 
     value.visit_binding_refs(&mut |binding| {
-        if hit.is_none() && binding == target_binding {
+        if hit.is_none() && binding.as_str() == target_binding {
             hit = Some(binding.to_string());
         }
     });
@@ -158,7 +644,8 @@ pub fn generate_temporary_name(
                 resource_type: resource.id.display_type(),
                 resource_identity: resource
                     .binding
-                    .clone()
+                    .as_ref()
+                    .map(ToString::to_string)
                     .unwrap_or_else(|| resource.id.identity_display().to_string()),
             }
             .into());
@@ -320,7 +807,7 @@ pub fn create_plan(
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
 ) -> ProviderResult<Plan> {
     create_plan_with_provider(
         managed,
@@ -350,7 +837,7 @@ pub fn create_plan_for_test(
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
 ) -> ProviderResult<Plan> {
     let (registry, comparison_provider) = crate::provider::comparison_fixture_for_test(
         registry,
@@ -381,7 +868,7 @@ pub(crate) fn create_plan_with_provider(
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
 ) -> ProviderResult<Plan> {
     let desired = plan_input_desired_resources(managed, registry);
     let managed_current = prior_states.materialize_current_states(desired.authored(), registry);
@@ -403,10 +890,17 @@ pub(crate) fn create_plan_with_provider(
     Ok(build.plan)
 }
 
+/// Cascade replacements and retain their deferred targets in the returned
+/// builder. Finalization emits those targets after the remaining planning
+/// effects; they cannot be added through a separate public planning pass.
+///
+/// ```compile_fail,E0432
+/// use carina_core::differ::add_deferred_create_effects;
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan_with_cascades(
     managed: &PlanInputDesiredResources<'_>,
-    unresolved_managed: &[ResolvedResource],
+    dependents: CascadeDependents<'_>,
     data_sources: &[DataSource],
     provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
@@ -414,9 +908,9 @@ pub fn create_plan_with_cascades(
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<Plan> {
+) -> ProviderResult<PendingCascadePlan> {
     let managed_current = prior_states.materialize_current_states(managed.authored(), registry);
     let mut build = create_plan_parts(
         managed,
@@ -434,14 +928,111 @@ pub fn create_plan_with_cascades(
     cascade_dependent_updates(
         &mut build.plan,
         &mut build.pending_replaces,
-        unresolved_managed,
+        &dependents,
         &managed_current,
         registry,
+        provider,
         outcome_unknown_import_replacements,
-    );
+    )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
-    Ok(build.plan)
+    Ok(PendingCascadePlan {
+        plan: build.plan,
+        deferred: dependents.deferred,
+    })
+}
+
+/// Add apply-time deferred-for re-expansion effects to the plan.
+///
+/// Matching orphan `Delete` effects are absorbed into `DeferredReplace`; targets
+/// with no matching deletes remain plain `DeferredCreate` effects.
+fn add_deferred_create_effects(plan: &mut Plan, targets: DeferredCreateTargets) {
+    let mut deletes_to_absorb: HashSet<ResourceId> = HashSet::new();
+    let mut deferred_effects = Vec::new();
+
+    for template in targets.0 {
+        let deletes: Vec<DeferredReplaceDelete> = plan
+            .effects()
+            .iter()
+            .filter_map(|effect| {
+                let Effect::Delete {
+                    id,
+                    identifier,
+                    generation: EffectGeneration::Current,
+                    directives,
+                    binding,
+                    dependencies,
+                    explicit_dependencies,
+                    blocked_by_updates,
+                } = effect
+                else {
+                    return None;
+                };
+
+                if deletes_to_absorb.contains(id.as_inner())
+                    || id.provider != template.template_resource_id().provider
+                    || id.resource_type != template.template_resource_id().resource_type
+                    || id.provider_instance != template.template_resource_id().provider_instance
+                {
+                    return None;
+                }
+                let matches = binding.as_ref().is_some_and(|binding| {
+                    super::binding_matches_deferred_template(binding, template.target())
+                });
+                matches.then(|| DeferredReplaceDelete {
+                    id: id.clone(),
+                    identifier: identifier.clone(),
+                    directives: directives.clone(),
+                    binding: binding.clone(),
+                    dependencies: dependencies.clone(),
+                    explicit_dependencies: explicit_dependencies.clone(),
+                    blocked_by_updates: blocked_by_updates.clone(),
+                })
+            })
+            .collect();
+
+        if deletes.is_empty() {
+            deferred_effects.push(Effect::DeferredCreate(DeferredCreatePayload::new(
+                Box::new(template),
+            )));
+        } else {
+            deletes_to_absorb.extend(deletes.iter().map(|delete| delete.id.clone().into_inner()));
+            deferred_effects.push(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+                deletes: NonEmptyDeletes::try_new(deletes)
+                    .expect("planner checked non-empty deletes"),
+                template: Box::new(template),
+            })));
+        }
+    }
+
+    if !deletes_to_absorb.is_empty() {
+        plan.retain(|effect| match effect {
+            Effect::Delete {
+                id,
+                generation: EffectGeneration::Current,
+                ..
+            } => !deletes_to_absorb.contains(id),
+            Effect::Delete {
+                generation: EffectGeneration::Deposed(_),
+                ..
+            }
+            | Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate(_)
+            | Effect::DeferredReplace(_) => true,
+        });
+    }
+
+    for effect in deferred_effects {
+        plan.add(effect);
+    }
 }
 
 struct PlanBuild {
@@ -460,7 +1051,7 @@ fn create_plan_parts(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &super::Orphans,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> ProviderResult<PlanBuild> {
     let mut plan = Plan::new();
@@ -577,8 +1168,22 @@ fn create_plan_parts(
                         }
 
                         let identifier = present.identifier().clone();
-                        let changed_create_only =
-                            find_changed_create_only(&changed_attributes, schema);
+                        let authored_views = super::comparison::project_authored_attribute_views(
+                            comparison_desired.comparison_attributes(),
+                            current_attributes,
+                            saved,
+                            prev_explicit_for_resource,
+                            Some(schema),
+                            context,
+                        );
+                        let changed_create_only = find_changed_create_only(
+                            &changed_attributes,
+                            authored_views.current(),
+                            authored_views.removal_evidence(),
+                            comparison_desired,
+                            schema,
+                            context,
+                        );
 
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
@@ -683,7 +1288,7 @@ fn create_plan_parts(
             ));
             continue;
         }
-        let binding = orphan.binding().map(str::to_owned);
+        let binding = orphan.binding_address().cloned();
         let dependencies = dependencies_from_prior_state(state, directives.clone());
         let explicit_dependencies = directives.depends_on.iter().cloned().collect();
         plan.add(Effect::Delete {
@@ -749,7 +1354,8 @@ fn create_plan_parts(
             SchemaKind::Resource,
         );
         let until = match resolve_wait_predicate(
-            &wb.until_predicate.lhs_segments,
+            &wb.until_predicate.root,
+            &wb.until_predicate.attribute_segments,
             wb.until_predicate.rhs.clone(),
             schema.as_deref(),
         ) {
@@ -785,13 +1391,13 @@ fn create_plan_parts(
         // produces the wait + its dependency edge (carina#3085 /
         // carina#3061 behavior preserved).
         let gates_a_pending_change = authored_managed.iter().any(|m| {
-            get_resource_dependencies(m).contains(wb.binding.as_str())
+            get_resource_dependencies(m).contains(&wb.binding)
                 && plan
                     .effects()
                     .iter()
                     .any(|e| e.resource_id() == &m.id && e.is_mutating())
         }) || data_sources.iter().any(|d| {
-            crate::deps::get_data_source_dependencies(d).contains(wb.binding.as_str())
+            crate::deps::get_data_source_dependencies(d).contains(&wb.binding)
                 && plan
                     .effects()
                     .iter()
@@ -847,11 +1453,8 @@ fn create_plan_parts(
         if !wait_has_work {
             continue;
         }
-        let mut explicit_dependencies: HashSet<String> = wb
-            .depends_on
-            .iter()
-            .map(|d| d.as_str().to_string())
-            .collect();
+        let mut explicit_dependencies: HashSet<AbsoluteBindingAddress> =
+            wb.depends_on.iter().cloned().collect();
         // Provider hints supplement user-authored ordering. They are additive
         // because `depends_on` is the user's source of truth and must never be
         // weakened by provider-derived knowledge.
@@ -863,7 +1466,7 @@ fn create_plan_parts(
         )?);
 
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new(wb.binding.as_str()),
+            identity: wb.binding.clone(),
             target_id: target,
             until,
             until_surface: wb.until_raw.clone(),
@@ -903,7 +1506,11 @@ pub fn block_deletes_on_prior_consumer_updates(
     plan: &mut Plan,
     prior_directives: &HashMap<ResourceId, Directives>,
 ) {
-    let consumers: Vec<(ResourceIdentity, HashSet<String>, HashSet<String>)> = plan
+    let consumers: Vec<(
+        ResourceIdentity,
+        HashSet<AbsoluteBindingAddress>,
+        HashSet<AbsoluteBindingAddress>,
+    )> = plan
         .effects()
         .iter()
         .filter_map(|effect| match effect {
@@ -954,7 +1561,10 @@ pub fn block_deletes_on_prior_consumer_updates(
     }
 }
 
-fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashSet<String> {
+fn dependencies_from_prior_state(
+    state: &State,
+    directives: Directives,
+) -> HashSet<AbsoluteBindingAddress> {
     state
         .dependency_bindings
         .iter()
@@ -1022,7 +1632,8 @@ pub(super) fn temporary_name_for_cbd(
             resource_type: resource.id.display_type(),
             resource_identity: resource
                 .binding
-                .clone()
+                .as_ref()
+                .map(ToString::to_string)
                 .unwrap_or_else(|| resource.id.identity_display().to_string()),
         })?;
     generate_temporary_name(resource, from, schema.as_schema())
@@ -1077,7 +1688,7 @@ fn decompose_replace_into_effects(
 fn known_binding_names(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
-) -> HashSet<String> {
+) -> HashSet<AbsoluteBindingAddress> {
     managed
         .iter()
         .filter_map(|resource| resource.binding.clone())
@@ -1092,44 +1703,73 @@ fn known_binding_names(
 fn cascade_dependent_updates(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[ResolvedResource],
+    dependents: &CascadeDependents<'_>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) {
+) -> ProviderResult<()> {
     loop {
-        promote_referenced_replaces_to_cbd(plan, pending_replaces, unresolved_managed, registry);
+        promote_referenced_replaces_to_cbd(plan, pending_replaces, dependents, registry);
 
         if pending_replaces.is_empty() {
-            return;
+            return Ok(());
         }
 
         let promoted = promote_pending_replaces_for_dependents(
             plan,
             pending_replaces,
-            unresolved_managed,
+            // Deferred children have no concrete desired identities here.
+            // Their prior rows are orphan deletes grouped into DeferredReplace
+            // by this planner, which replaces them at materialization, including
+            // template attributes with create-only producer references.
+            dependents.managed,
             current_states,
             registry,
+            comparison_provider,
             outcome_unknown_import_replacements,
-        );
+        )?;
 
         if !promoted {
             break;
         }
     }
+    Ok(())
 }
 
 fn promote_referenced_replaces_to_cbd(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[ResolvedResource],
+    dependents: &CascadeDependents<'_>,
     registry: &SchemaRegistry,
 ) {
     let ref_targets = pending_reference_targets(pending_replaces, false);
     let mut promote = Vec::new();
 
-    for resource in unresolved_managed {
-        let deps = get_resource_dependencies(resource);
+    let managed_dependencies = dependents.managed.iter().map(|resource| {
+        (
+            Some(&resource.id),
+            resource
+                .binding
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| resource.id.identity_display().to_string()),
+            get_resource_dependencies(resource),
+        )
+    });
+    let deferred_dependencies = dependents.deferred.templates().iter().map(|deferred| {
+        let mut dependencies =
+            get_resource_dependencies(deferred.template_resource().as_resource());
+        // Header bindings shadow top-level names only inside the body. The
+        // iterable still resolves in the enclosing scope.
+        for local in deferred.binding.names() {
+            dependencies.retain(|binding| binding.as_str() != local);
+        }
+        dependencies.extend(deferred.root_bindings());
+        (None, deferred.target().display_name(), dependencies)
+    });
+
+    for (dependent_id, dependent_name, deps) in managed_dependencies.chain(deferred_dependencies) {
         for dep in &deps {
             let Some(replaced_identity) = ref_targets.get(dep) else {
                 continue;
@@ -1137,24 +1777,37 @@ fn promote_referenced_replaces_to_cbd(
             let Some(pending) = pending_replaces.get(replaced_identity) else {
                 continue;
             };
-            if pending.create_before_destroy || pending.create.id == resource.id {
+            if pending.create_before_destroy
+                || dependent_id.is_some_and(|id| pending.create.id == *id)
+            {
                 continue;
             }
-            promote.push(replaced_identity.clone());
+            promote.push((replaced_identity.clone(), dependent_name.clone()));
         }
     }
 
-    promote.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    promote.dedup();
+    promote.sort_by(|(left_id, left_name), (right_id, right_name)| {
+        left_id
+            .as_str()
+            .cmp(right_id.as_str())
+            .then_with(|| left_name.cmp(right_name))
+    });
+    promote.dedup_by(|(left, _), (right, _)| left == right);
 
-    for identity in promote {
+    for (identity, dependent) in promote {
         let result = pending_replaces
             .get_mut(&identity)
             .map(|pending| mark_pending_create_before_destroy(pending, registry));
         if let Some(Err(err)) = result
             && let Some(pending) = pending_replaces.remove(&identity)
         {
-            plan.add_error(PlanError::new(pending.create.id.clone(), err.into()));
+            plan.add_error(PlanError::new(
+                pending.create.id.clone(),
+                PlanErrorKind::CreateBeforeDestroyRequiredByDependent {
+                    dependent,
+                    cause: err,
+                },
+            ));
         }
     }
 }
@@ -1189,8 +1842,9 @@ fn promote_pending_replaces_for_dependents(
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> bool {
+) -> ProviderResult<bool> {
     let ref_targets = pending_reference_targets(pending_replaces, true);
     let mut promoted = false;
 
@@ -1206,7 +1860,7 @@ fn promote_pending_replaces_for_dependents(
                 continue;
             }
 
-            let ref_attrs = cascade_ref_attrs(&resource.attributes, dep);
+            let ref_attrs = cascade_ref_attrs(&resource.attributes, dep.as_str());
             if ref_attrs.is_empty() {
                 continue;
             }
@@ -1215,15 +1869,24 @@ fn promote_pending_replaces_for_dependents(
                 .iter()
                 .map(|ref_attr| ref_attr.attribute.clone())
                 .collect();
-            let Some(owner_schema) = registry.get(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                SchemaKind::Resource,
-            ) else {
+            let Some(current) = current_states.get(&resource.id) else {
                 continue;
             };
-            let create_only_refs =
-                find_changed_create_only(&ref_attr_names, owner_schema.schema().as_schema());
+            let Current::Present(_) = current.current() else {
+                continue;
+            };
+            let resolved_comparison = comparison_provider.comparison_for(registry, &resource.id)?;
+            let owner_schema = resolved_comparison.owner_schema();
+            let schema = owner_schema.schema().as_schema();
+            let desired = PlanInputDesired::with_resource_schema(resource, Some(schema));
+            let create_only_refs = find_changed_create_only(
+                &ref_attr_names,
+                current.comparison_attributes(),
+                AuthoredRemovalEvidence::Unrecorded,
+                &desired,
+                schema,
+                resolved_comparison.context(),
+            );
 
             if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
                 let ref_hints: Vec<(String, String)> = ref_attrs
@@ -1284,19 +1947,18 @@ fn promote_pending_replaces_for_dependents(
         }
     }
 
-    promoted
+    Ok(promoted)
 }
 
 fn pending_reference_targets(
     pending_replaces: &HashMap<ResourceIdentity, PendingReplace>,
     create_before_destroy_only: bool,
-) -> HashMap<String, ResourceIdentity> {
+) -> HashMap<AbsoluteBindingAddress, ResourceIdentity> {
     let mut targets = HashMap::new();
     for (identity, pending) in pending_replaces {
         if create_before_destroy_only && !pending.create_before_destroy {
             continue;
         }
-        targets.insert(identity.as_str().to_string(), identity.clone());
         if let Some(binding) = &pending.create.binding {
             targets.insert(binding.clone(), identity.clone());
         }

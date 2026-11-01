@@ -1,6 +1,6 @@
 //! `flatten(list)` built-in function
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
 
 use super::value_type_name;
 
@@ -18,7 +18,9 @@ use super::value_type_name;
 /// flatten([["a", "b"], ["c"]])   // => ["a", "b", "c"]
 /// flatten([[1, 2], 3, [4]])      // => [1, 2, 3, 4]
 /// ```
-pub(crate) fn builtin_flatten(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_flatten<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!("flatten() expects 1 argument, got {}", args.len()));
     }
@@ -47,7 +49,7 @@ pub(crate) fn builtin_flatten(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
     fn flatten_nested_lists() {
@@ -192,7 +194,7 @@ mod tests {
 
     #[test]
     fn flatten_wrong_arg_count_zero() {
-        let result = evaluate_builtin("flatten", &[]);
+        let result: Result<Value, String> = evaluate_builtin("flatten", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
     }
