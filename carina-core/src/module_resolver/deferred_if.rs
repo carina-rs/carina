@@ -432,9 +432,9 @@ fn first_dropped_reference(
         if let Some(binding) = find(&deferred.iterable) {
             return Some(binding);
         }
-        match &deferred.body {
+        match deferred.body() {
             DeferredForBody::Resource(resource) => {
-                if let Some(binding) = resource.attributes.values().find_map(&find) {
+                if let Some(binding) = resource.attributes().values().find_map(&find) {
                     return Some(binding);
                 }
             }

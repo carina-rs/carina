@@ -1627,10 +1627,10 @@ impl<S> PlanFileContents<S> {
                 Effect::Remove { id } => {
                     insert(&mut references, id, SchemaKind::Resource);
                 }
-                Effect::DeferredCreate { id: _id, template } => {
+                Effect::DeferredCreate(payload) => {
                     insert(
                         &mut references,
-                        &template.template_resource.id,
+                        payload.template.template_resource_id(),
                         SchemaKind::Resource,
                     );
                 }
@@ -1659,7 +1659,7 @@ impl<S> PlanFileContents<S> {
                 Effect::DeferredReplace(payload) => {
                     insert(
                         &mut references,
-                        &payload.template.template_resource.id,
+                        payload.template.template_resource_id(),
                         SchemaKind::Resource,
                     );
                     for delete in &payload.deletes {
@@ -1720,9 +1720,9 @@ impl<S> PlanFileContents<S> {
                 | Effect::Import { id, .. }
                 | Effect::Remove { id }
                 | Effect::ReleaseListKeys { id, .. } => insert(&mut instances, id),
-                Effect::DeferredCreate { id, template } => {
-                    insert(&mut instances, id);
-                    insert(&mut instances, &template.template_resource.id);
+                Effect::DeferredCreate(payload) => {
+                    insert(&mut instances, payload.id());
+                    insert(&mut instances, payload.template.template_resource_id());
                 }
                 Effect::Move { from, to, .. } => {
                     insert(&mut instances, from);
@@ -1732,7 +1732,7 @@ impl<S> PlanFileContents<S> {
                     insert(&mut instances, target_id.id().as_inner());
                 }
                 Effect::DeferredReplace(payload) => {
-                    insert(&mut instances, &payload.template.template_resource.id);
+                    insert(&mut instances, payload.template.template_resource_id());
                     for delete in &payload.deletes {
                         insert(&mut instances, &delete.id);
                     }
@@ -1818,10 +1818,10 @@ impl UnresolvedPlanFileContents {
                 | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => {
                     insert(&mut references, id, SchemaKind::Resource);
                 }
-                UnresolvedSavedEffect::DeferredCreate { template, .. } => {
+                UnresolvedSavedEffect::DeferredCreate(payload) => {
                     insert(
                         &mut references,
-                        &template.template_resource.id,
+                        payload.template.template_resource_id(),
                         SchemaKind::Resource,
                     );
                 }
@@ -1839,7 +1839,7 @@ impl UnresolvedPlanFileContents {
                 UnresolvedSavedEffect::DeferredReplace(payload) => {
                     insert(
                         &mut references,
-                        &payload.template.template_resource.id,
+                        payload.template.template_resource_id(),
                         SchemaKind::Resource,
                     );
                     for delete in &payload.deletes {
@@ -1897,9 +1897,9 @@ impl UnresolvedPlanFileContents {
                 | UnresolvedSavedEffect::Import { id, .. }
                 | UnresolvedSavedEffect::Remove { id }
                 | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => insert(&mut instances, id),
-                UnresolvedSavedEffect::DeferredCreate { id, template } => {
-                    insert(&mut instances, id);
-                    insert(&mut instances, &template.template_resource.id);
+                UnresolvedSavedEffect::DeferredCreate(payload) => {
+                    insert(&mut instances, payload.id());
+                    insert(&mut instances, payload.template.template_resource_id());
                 }
                 UnresolvedSavedEffect::Move { from, to, .. } => {
                     insert(&mut instances, from);
@@ -1909,7 +1909,7 @@ impl UnresolvedPlanFileContents {
                     insert(&mut instances, target_id.id().as_inner());
                 }
                 UnresolvedSavedEffect::DeferredReplace(payload) => {
-                    insert(&mut instances, &payload.template.template_resource.id);
+                    insert(&mut instances, payload.template.template_resource_id());
                     for delete in &payload.deletes {
                         insert(&mut instances, &delete.id);
                     }
@@ -2235,35 +2235,6 @@ impl PlanFile {
             Ok(())
         }
 
-        fn validate_deferred_template(
-            template: &carina_core::parser::SavedDeferredForExpression,
-            location: &str,
-        ) -> Result<(), String> {
-            match &template.target {
-                carina_core::parser::DeferredForTarget::Bound { binding } => {
-                    require_identity(&template.template_resource.id, location)?;
-                    if template.template_resource.id.identity_str() != Some(binding.as_str()) {
-                        return Err(format!(
-                            "Invalid saved plan: {location} identity does not match bound deferred target `{binding}`"
-                        ));
-                    }
-                    Ok(())
-                }
-                carina_core::parser::DeferredForTarget::Unbound { .. } => {
-                    if matches!(
-                        template.template_resource.id.identity_state(),
-                        carina_core::resource::ResourceIdentityState::Pending(_)
-                    ) {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "Invalid saved plan: {location} for an unbound deferred target must have a pending resource identity"
-                        ))
-                    }
-                }
-            }
-        }
-
         for (index, resource) in self.sorted_resources.iter().enumerate() {
             require_identity(&resource.id, &format!("sorted_resources[{index}]"))?;
         }
@@ -2389,16 +2360,8 @@ impl PlanFile {
                     require_identity(from, &format!("{location}.from"))?;
                     require_identity(to, &format!("{location}.to"))?;
                 }
-                UnresolvedSavedEffect::DeferredCreate { id, template, .. } => {
-                    require_identity(id, &location)?;
-                    validate_deferred_template(template, &format!("{location}.template_resource"))?;
-                }
+                UnresolvedSavedEffect::DeferredCreate(_) => {}
                 UnresolvedSavedEffect::DeferredReplace(payload) => {
-                    require_identity(&payload.id, &location)?;
-                    validate_deferred_template(
-                        &payload.template,
-                        &format!("{location}.template_resource"),
-                    )?;
                     for (delete_index, delete) in payload.deletes.iter().enumerate() {
                         require_identity(
                             &delete.id,
@@ -2470,7 +2433,7 @@ impl PlanFile {
                 | UnresolvedSavedEffect::Move { .. }
                 | UnresolvedSavedEffect::ReleaseListKeys { .. }
                 | UnresolvedSavedEffect::Wait { .. }
-                | UnresolvedSavedEffect::DeferredCreate { .. }
+                | UnresolvedSavedEffect::DeferredCreate(_)
                 | UnresolvedSavedEffect::DeferredReplace(_) => {
                     return Err(format!(
                         "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at {}, expected Delete",
@@ -2900,7 +2863,7 @@ impl MovedOrigins {
                 | Effect::Remove { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => None,
             })
             .collect();
@@ -2924,7 +2887,7 @@ impl MovedOrigins {
                 | UnresolvedSavedEffect::Remove { .. }
                 | UnresolvedSavedEffect::ReleaseListKeys { .. }
                 | UnresolvedSavedEffect::Wait { .. }
-                | UnresolvedSavedEffect::DeferredCreate { .. }
+                | UnresolvedSavedEffect::DeferredCreate(_)
                 | UnresolvedSavedEffect::DeferredReplace(_) => None,
             })
             .collect();

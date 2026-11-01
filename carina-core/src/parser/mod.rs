@@ -38,9 +38,10 @@ pub use crate::eval_value::StructuralHandleKind;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
-    BindingScopeId, BindingUseOwner, CallExpansion, ConsumerArgumentParameter,
-    ConsumerAttributeParameter, DeferredForBody, DeferredForExpansionError, DeferredForExpression,
-    DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, ExpandedFile,
+    BindingScopeId, BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, CallExpansion,
+    ConsumerArgumentParameter, ConsumerAttributeParameter, DeferredForBody,
+    DeferredForExpansionError, DeferredForExpression, DeferredForPhaseTraversal, DeferredForSite,
+    DeferredForTarget, DeferredForTemplateAddress, DeferredForTemplateResource, ExpandedFile,
     ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedFile, ExpansionKey,
     ExportParamLike, ExportParameter, File, FnParam, InferredExportParam, InferredFile,
     IntoExpandedExportParam, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallId,

@@ -410,7 +410,7 @@ fn parse_if_body(
                 Ok(IfBodyResult::Resource(Box::new(resource)))
             }
             (IfBodyForm::DataSource, Rule::read_resource_expr) => {
-                target.reject_unbound_read(LoopKind::If)?;
+                target.bound_read_target(LoopKind::If)?;
                 let data_source = parse_read_resource_expr(
                     inner,
                     &local_ctx,

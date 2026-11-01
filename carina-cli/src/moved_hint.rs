@@ -241,7 +241,7 @@ pub fn detect_moved_block_hints<S>(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => None,
         })
         .collect::<Vec<_>>();
@@ -263,7 +263,7 @@ pub fn detect_moved_block_hints<S>(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => {}
         }
     }

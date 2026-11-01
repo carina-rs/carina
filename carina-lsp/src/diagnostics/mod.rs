@@ -1082,7 +1082,7 @@ impl DiagnosticEngine {
                     ResourceRef::Deferred {
                         resource: m,
                         deferred: _deferred,
-                    } => self.schemas.get_for(m),
+                    } => self.schemas.get_for(m.as_resource()),
                     ResourceRef::DataSource(d) => self.schemas.get_for_data_source(d),
                     ResourceRef::LiveComposition(_) => None,
                 };
@@ -1238,7 +1238,7 @@ impl DiagnosticEngine {
                         ResourceRef::Deferred {
                             resource,
                             deferred: _deferred,
-                        } => Some(resource),
+                        } => Some(resource.as_resource()),
                         ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
                     };
                     if let Some(resource) = ignore_changes_resource

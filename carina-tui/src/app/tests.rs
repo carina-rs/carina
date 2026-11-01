@@ -106,28 +106,23 @@ fn removed_plan_shows_each_abandoned_deposed_generation() {
 #[test]
 fn deferred_create_uses_create_symbol_and_kind() {
     let template_resource =
-        Resource::new("route53.Record", "validation_records").with_binding("validation_records");
-    let deferred = DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.Record".to_string(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
-        },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        binding: ForBinding::Simple("opt".to_string()),
+        Resource::with_provider("aws", "route53.Record", "validation_records", None)
+            .with_binding("validation_records");
+    let deferred = DeferredForExpression::new(
+        None,
+        1,
+        "for opt in cert.domain_validation_options".to_string(),
+        carina_core::parser::DeferredForTarget::bound("validation_records")
+            .expect("fixture binding is valid"),
+        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        ForBinding::Simple("opt".to_string()),
         template_resource,
-    };
+    );
 
     let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
-        template: Box::new(deferred),
-    });
+    plan.add(Effect::DeferredCreate(
+        carina_core::effect::DeferredCreatePayload::new(Box::new(deferred)),
+    ));
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.nodes.len(), 1);

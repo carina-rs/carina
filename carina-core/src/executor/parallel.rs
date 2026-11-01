@@ -105,16 +105,16 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
         }
         for (gate_idx, candidate) in effects.iter().enumerate() {
             let template = match candidate {
-                Effect::DeferredCreate { template, .. } => template.as_ref(),
+                Effect::DeferredCreate(payload) => payload.template.as_ref(),
                 Effect::DeferredReplace(payload) => payload.template.as_ref(),
                 _ => continue,
             };
             if matches!(
-                template.target,
+                template.target(),
                 crate::parser::DeferredForTarget::Unbound { .. }
-            ) && template.template_resource.id.provider == id.provider
-                && template.template_resource.id.resource_type == id.resource_type
-                && template.template_resource.id.provider_instance == id.provider_instance
+            ) && template.template_resource_id().provider == id.provider
+                && template.template_resource_id().resource_type == id.resource_type
+                && template.template_resource_id().provider_instance == id.provider_instance
             {
                 deps_of.entry(gate_idx).or_default().insert(delete_idx);
             }
@@ -134,7 +134,7 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
         }
 
         let is_unbound = matches!(
-            payload.template.target,
+            payload.template.target(),
             crate::parser::DeferredForTarget::Unbound { .. }
         );
 
@@ -195,7 +195,7 @@ pub(super) fn is_runtime_noop<S: Clone>(
         | Effect::Update { .. }
         | Effect::Delete { .. }
         | Effect::Wait { .. }
-        | Effect::DeferredCreate { .. }
+        | Effect::DeferredCreate(_)
         | Effect::DeferredReplace(_) => false,
     }
 }
@@ -378,7 +378,7 @@ pub(super) async fn execute_effects_sequential<
         .filter_map(|effect| match effect {
             Effect::DeferredReplace(payload)
                 if matches!(
-                    payload.template.target,
+                    payload.template.target(),
                     crate::parser::DeferredForTarget::Unbound { .. }
                 ) =>
             {
@@ -572,7 +572,7 @@ pub(super) async fn execute_effects_sequential<
                 }
                 PureMetaOutcome::Materialized(children) => {
                     let template = match &effect {
-                        Effect::DeferredCreate { template, .. } => template.as_ref(),
+                        Effect::DeferredCreate(payload) => payload.template.as_ref(),
                         Effect::DeferredReplace(payload) => payload.template.as_ref(),
                         _ => unreachable!("pure meta materialization has a deferred template"),
                     };
@@ -665,7 +665,7 @@ pub(super) async fn execute_effects_sequential<
                 | Effect::Move { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => None,
             };
             let completed_ref = &completed;
@@ -802,7 +802,7 @@ pub(super) async fn execute_effects_sequential<
                         | Effect::Remove { .. }
                         | Effect::Move { .. }
                         | Effect::ReleaseListKeys { .. } => SingleEffectResult::ReadNoOp,
-                        Effect::DeferredCreate { .. } => unreachable!(
+                        Effect::DeferredCreate(_) => unreachable!(
                             "DeferredCreate is handled synchronously before provider dispatch"
                         ),
                         Effect::DeferredReplace(_) => unreachable!(
@@ -1143,6 +1143,7 @@ pub(super) async fn execute_effects_sequential<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect::DeferredCreatePayload;
     use crate::effect::deps::reads::{KnownReads, ReadsSet};
     use crate::effect::deps::{
         ScheduleInputs, WritesSet, build_effect_dependency_analysis as build_dependency_analysis,
@@ -1212,24 +1213,12 @@ mod tests {
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),
             },
-            Effect::DeferredCreate {
-                id: crate::resource::ResolvedResourceId::with_provider_identity(
-                    "mock",
-                    "__deferred_for",
-                    "first_loop",
-                    None,
-                ),
-                template: Box::new(unbound_deferred_template_in("a.crn")),
-            },
-            Effect::DeferredCreate {
-                id: crate::resource::ResolvedResourceId::with_provider_identity(
-                    "mock",
-                    "__deferred_for",
-                    "second_loop",
-                    None,
-                ),
-                template: Box::new(unbound_deferred_template_in("b.crn")),
-            },
+            Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(
+                unbound_deferred_template_in("a.crn"),
+            ))),
+            Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(
+                unbound_deferred_template_in("b.crn"),
+            ))),
         ];
         let mut deps_of = HashMap::from([
             (0usize, HashSet::new()),

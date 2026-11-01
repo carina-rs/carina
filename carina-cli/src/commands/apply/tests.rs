@@ -1002,12 +1002,12 @@ for account_id in orgs.accounts {
     let bound = deferred.next().expect("bound deferred loop");
     let unbound = deferred.next().expect("unbound deferred loop");
     assert!(matches!(
-        &bound.target,
-        carina_core::parser::DeferredForTarget::Bound { binding }
-            if binding == "bound_items"
+        bound.target(),
+        carina_core::parser::DeferredForTarget::Bound(target)
+            if target.binding() == "bound_items"
     ));
     assert!(matches!(
-        &unbound.target,
+        unbound.target(),
         carina_core::parser::DeferredForTarget::Unbound { .. }
     ));
 
@@ -1023,24 +1023,12 @@ for account_id in orgs.accounts {
         to: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
         origin: Some(origin.clone()),
     });
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-            "mock",
-            "test.resource",
-            "bound_pending",
-            None,
-        )),
-        template: Box::new(bound),
-    });
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-            "mock",
-            "test.resource",
-            "unbound_pending",
-            None,
-        )),
-        template: Box::new(unbound),
-    });
+    plan.add(Effect::DeferredCreate(
+        carina_core::effect::DeferredCreatePayload::new(Box::new(bound)),
+    ));
+    plan.add(Effect::DeferredCreate(
+        carina_core::effect::DeferredCreatePayload::new(Box::new(unbound)),
+    ));
 
     let plan_file = record_with_builtin_mock_schemas(PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
@@ -1107,14 +1095,14 @@ for account_id in orgs.accounts {
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            UnresolvedSavedEffect::DeferredCreate { template, .. } => Some(&template.target),
+            UnresolvedSavedEffect::DeferredCreate(payload) => Some(payload.template.target()),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert!(targets.iter().any(|target| matches!(
         target,
-        carina_core::parser::DeferredForTarget::Bound { binding }
-            if binding == "bound_items"
+        carina_core::parser::DeferredForTarget::Bound(bound)
+            if bound.binding() == "bound_items"
     )));
     assert!(targets.iter().any(|target| matches!(
         target,

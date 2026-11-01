@@ -2839,6 +2839,102 @@ fn binding_state_entries_for(
         .collect()
 }
 
+#[test]
+fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
+    use crate::schema::StructField;
+
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![StructField::optional("label", AttributeType::string()).build()],
+                ),
+            )
+            .create_only()
+            .build(),
+        )
+        .validate()
+        .expect("schema fixture must be valid");
+    let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let inline = Resource::new("test.Widget", "inline").with_attribute("config", empty.clone());
+    let deferred = Resource::new("test.Widget", "deferred").with_attribute(
+        "config",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("source", "config"),
+        }),
+    );
+    let find_state = |binding: &str| {
+        (binding == "source")
+            .then(|| AnonymousIdBindingStateInfo {
+                name: "source".to_string(),
+                attribute_values: HashMap::from([("config".to_string(), empty.clone())]),
+            })
+            .into_iter()
+            .collect()
+    };
+    let state = StateCreateOnlyValues::from_state_attributes(
+        &schema,
+        &HashMap::from([("config".to_string(), empty.clone())]),
+    );
+
+    for desired in [&inline, &deferred] {
+        let desired =
+            DesiredCreateOnlyValues::from_resource(desired, schema.as_schema(), &find_state);
+        assert!(
+            !desired.has_configured_values(),
+            "an empty struct must be identical to an unconfigured identity input"
+        );
+        assert_eq!(
+            desired.resolved_subset_match(
+                &state,
+                schema.as_schema(),
+                &crate::differ::exact_comparison_context_for_tests(),
+            ),
+            (0, true),
+        );
+    }
+}
+
+#[test]
+fn non_empty_create_only_value_keeps_its_deterministic_identity_string() {
+    use crate::schema::StructField;
+
+    let schema = ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional(
+                        "labels",
+                        AttributeType::union(vec![
+                            AttributeType::string(),
+                            AttributeType::list(AttributeType::string()),
+                        ]),
+                    )
+                    .build(),
+                ],
+            ),
+        )
+        .create_only()
+        .build(),
+    );
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "labels".to_string(),
+        Value::Concrete(ConcreteValue::String("configured".into())),
+    )])));
+    let resource = Resource::new("test.Widget", "example").with_attribute("config", value.clone());
+    let hash_inputs = stable_anonymous_hash_inputs(&resource, &schema);
+
+    assert_eq!(
+        hash_inputs.get("config"),
+        Some(&deterministic_value_string(&value)),
+        "comparison canonicalization must not alter source-based anonymous identity hashing",
+    );
+}
+
 fn association_state_entry(
     registry: &SchemaRegistry,
     name: &str,
@@ -7268,6 +7364,75 @@ fn legacy_loop_detector_exact_match() {
 }
 
 #[test]
+fn legacy_loop_detector_treats_empty_create_only_struct_as_unconfigured() {
+    use crate::schema::StructField;
+
+    let source = concat!(
+        "for value in ['stable'] {\n",
+        "  mock.ec2.Vpc {\n",
+        "    identity_input = value\n",
+        "    config = {}\n",
+        "  }\n",
+        "}",
+    );
+    let mut resources = parse_loop_fixture(source, "legacy-empty-config.crn");
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("identity_input", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .create_only()
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("single loop element must have a stable anonymous identity");
+    let state = anonymous_state_entry(
+        &registry,
+        "mock",
+        "ec2.Vpc",
+        "_for0[0]",
+        None,
+        None,
+        [
+            ("identity_input", concrete_string("stable")),
+            (
+                "config",
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+        ],
+    );
+
+    let moves = detect_legacy_loop_moves_for_test(
+        &resources,
+        &registry,
+        &[state],
+        &StateBlockClaims::empty(),
+        &[],
+    );
+
+    assert_eq!(
+        moves.len(),
+        1,
+        "an absent-equivalent create-only value must not veto legacy-row migration"
+    );
+}
+
+#[test]
 fn legacy_loop_detector_ignores_extra_persisted_provider_defaults() {
     let (resource, registry) = resolved_single_loop_resource(None);
     let state = anonymous_state_entry(
@@ -7477,13 +7642,13 @@ import {
         &crate::parser::ProviderContext::default(),
     )
     .expect("bound discard loop and state blocks parse");
-    assert!(matches!(
-        parsed.parsed_deferred_for_expressions(),
-        [crate::parser::ParsedDeferredForExpression {
-            target: crate::parser::DeferredForTarget::Bound { binding },
-            ..
-        }] if binding == "_"
-    ));
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+    assert_eq!(
+        parsed.parsed_deferred_for_expressions()[0]
+            .target()
+            .bound_binding(),
+        Some("_")
+    );
 
     let errors =
         check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &parsed.resources);
