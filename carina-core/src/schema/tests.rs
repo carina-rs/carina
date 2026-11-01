@@ -7,6 +7,9 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 
+fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+    crate::resource::RootScope::new().resolve(crate::resource::RelativeBindingName::new(binding))
+}
 type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
 type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
 type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
@@ -14,12 +17,24 @@ type Resource =
     crate::resource::Resource<crate::resource::ModuleSource, crate::resource::NoPlaceholder>;
 type LoopValue = crate::resource::Value<crate::resource::LoopSlot>;
 type LoopDeferredValue = crate::resource::DeferredValue<crate::resource::LoopSlot>;
-type ParserValue = crate::resource::Value<crate::resource::ParserPlaceholder>;
-type ParserConcreteValue = crate::resource::ConcreteValue<crate::resource::ParserPlaceholder>;
-type ParserResource =
-    crate::resource::Resource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder>;
-type ParserDataSource =
-    crate::resource::DataSource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder>;
+type ParserValue = crate::resource::Value<
+    crate::resource::ParserPlaceholder,
+    crate::resource::RelativeBindingName,
+>;
+type ParserConcreteValue = crate::resource::ConcreteValue<
+    crate::resource::ParserPlaceholder,
+    crate::resource::RelativeBindingName,
+>;
+type ParserResource = crate::resource::Resource<
+    crate::resource::ModuleSource,
+    crate::resource::ParserPlaceholder,
+    crate::resource::RelativeBindingName,
+>;
+type ParserDataSource = crate::resource::DataSource<
+    crate::resource::ModuleSource,
+    crate::resource::ParserPlaceholder,
+    crate::resource::RelativeBindingName,
+>;
 
 #[test]
 fn field_group_members_require_two_distinct_field_names() {
@@ -329,11 +344,11 @@ fn group_presence_counts_unknown_and_reference_values() {
     for deferred in [
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                binding: "computed_after_apply".to_string(),
+                binding: absolute_binding("computed_after_apply"),
             },
         )),
         Value::Deferred(DeferredValue::BindingRef {
-            binding: "computed_after_apply".to_string(),
+            binding: absolute_binding("computed_after_apply"),
         }),
     ] {
         let written = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -874,7 +889,7 @@ fn attribute_builder_methods_preserve_each_mode() {
     assert!(optional.default.is_some());
     assert!(optional.write_only);
     assert!(optional.create_only);
-    assert!(optional.identity);
+    assert_eq!(optional.identity_mode, IdentityMode::Required);
     assert_eq!(optional.description, Some("optional description"));
     assert_eq!(optional.provider_name, Some("Optional"));
     assert_eq!(optional.block_name, Some("optional_block"));
@@ -894,7 +909,7 @@ fn attribute_builder_methods_preserve_each_mode() {
     assert_eq!(required.declared_input_mode, InputMode::Required);
     assert!(required.write_only);
     assert!(required.create_only);
-    assert!(required.identity);
+    assert_eq!(required.identity_mode, IdentityMode::Required);
     assert_eq!(required.description, Some("required description"));
     assert_eq!(required.provider_name, Some("Required"));
     assert_eq!(required.block_name, Some("required_block"));
@@ -913,12 +928,23 @@ fn attribute_builder_methods_preserve_each_mode() {
     assert_eq!(provider_populated.description, Some("output description"));
     assert_eq!(provider_populated.provider_name, Some("Output"));
     assert!(provider_populated.deferred_populate);
+
+    let when_present = AttributeSchema::optional("when_present", AttributeType::string())
+        .create_only()
+        .identity_when_present()
+        .build();
+    let when_present = when_present.parts();
+    assert_eq!(when_present.declared_input_mode, InputMode::Optional);
+    assert!(when_present.create_only);
+    assert_eq!(when_present.identity_mode, IdentityMode::WhenPresent);
 }
 
 #[test]
 fn struct_field_builder_methods_preserve_each_mode() {
     let optional = StructField::optional("optional", AttributeType::string())
         .write_only()
+        .create_only()
+        .identity()
         .with_description("optional description")
         .with_provider_name("Optional")
         .with_block_name("optional_block")
@@ -927,6 +953,8 @@ fn struct_field_builder_methods_preserve_each_mode() {
     let optional = optional.parts();
     assert_eq!(optional.declared_input_mode, InputMode::Optional);
     assert!(optional.write_only);
+    assert!(optional.create_only);
+    assert_eq!(optional.identity_mode, IdentityMode::Required);
     assert_eq!(optional.description, Some("optional description"));
     assert_eq!(optional.provider_name, Some("Optional"));
     assert_eq!(optional.block_name, Some("optional_block"));
@@ -934,6 +962,8 @@ fn struct_field_builder_methods_preserve_each_mode() {
 
     let required = StructField::required("required", AttributeType::string())
         .write_only()
+        .create_only()
+        .identity()
         .with_description("required description")
         .with_provider_name("Required")
         .with_block_name("required_block")
@@ -942,6 +972,8 @@ fn struct_field_builder_methods_preserve_each_mode() {
     let required = required.parts();
     assert_eq!(required.declared_input_mode, InputMode::Required);
     assert!(required.write_only);
+    assert!(required.create_only);
+    assert_eq!(required.identity_mode, IdentityMode::Required);
     assert_eq!(required.description, Some("required description"));
     assert_eq!(required.provider_name, Some("Required"));
     assert_eq!(required.block_name, Some("required_block"));
@@ -962,6 +994,94 @@ fn struct_field_builder_methods_preserve_each_mode() {
     assert_eq!(provider_populated.provider_name, Some("Output"));
     assert_eq!(provider_populated.block_name, Some("output_block"));
     assert!(provider_populated.deferred_populate);
+
+    let when_present = StructField::optional("when_present", AttributeType::string())
+        .create_only()
+        .identity_when_present()
+        .build();
+    let when_present = when_present.parts();
+    assert_eq!(when_present.declared_input_mode, InputMode::Optional);
+    assert!(when_present.create_only);
+    assert_eq!(when_present.identity_mode, IdentityMode::WhenPresent);
+}
+
+#[test]
+fn identity_paths_are_typed_and_include_top_level_and_nested_fields() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let schema = ResourceSchema::new("test.Budget")
+        .attribute(
+            AttributeSchema::required("account_id", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required(
+                "budget",
+                AttributeType::struct_(
+                    "BudgetData",
+                    vec![
+                        StructField::required("budget_name", AttributeType::string())
+                            .create_only()
+                            .identity()
+                            .build(),
+                        StructField::optional("limit", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("identity fields are immutable user input");
+
+    let paths = schema.identity_paths();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(
+        paths[0].segments(),
+        &[IdentityPathSegment::Attribute("account_id".to_string())]
+    );
+    assert_eq!(
+        paths[1].segments(),
+        &[
+            IdentityPathSegment::Attribute("budget".to_string()),
+            IdentityPathSegment::StructField("budget_name".to_string()),
+        ]
+    );
+    assert_eq!(paths[0].to_string(), "account_id");
+    assert_eq!(paths[1].to_string(), "budget.budget_name");
+}
+
+#[test]
+fn schema_admission_rejects_identity_below_provider_populated_ancestor() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let error = ResourceSchema::new("test.Output")
+        .attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::struct_(
+                    "Output",
+                    vec![
+                        StructField::optional("provider_key", AttributeType::string())
+                            .create_only()
+                            .identity()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect_err("effective provider output cannot declare identity");
+
+    assert!(
+        error.issues().any(|(path, message)| {
+            path == "output.provider_key"
+                && message.contains("identity field appears below a provider-populated ancestor")
+        }),
+        "{error}",
+    );
 }
 
 #[test]
@@ -1161,7 +1281,7 @@ fn schema_admission_rejects_deferred_defaults_recursively() {
             PatternAttributeSchema::optional("name", PatternAttributeType::string())
                 .with_default(Value::Deferred(DeferredValue::Unknown(
                     crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                        binding: "upstream".to_string(),
+                        binding: absolute_binding("upstream"),
                     },
                 )))
                 .build(),
@@ -1622,6 +1742,229 @@ fn schema_admission_rejects_write_only_fields_inside_union_members() {
 }
 
 #[test]
+fn schema_admission_rejects_create_only_fields_inside_union_members() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::union(vec![AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("immutable", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    ],
+                )]),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("config"), "{error}");
+    assert!(
+        error.contains("union members cannot be create-only-bearing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_identity_without_create_only_witness() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let mut attribute = AttributeSchema::optional("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    attribute.create_only = false;
+    let attribute_error = admission_error(ResourceSchema::new("test.Widget").attribute(attribute));
+    assert!(
+        attribute_error.contains("identity requires create-only"),
+        "{attribute_error}"
+    );
+
+    let mut field = StructField::optional("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    field.create_only = false;
+    let field_error = admission_error(ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field])).build(),
+    ));
+    assert!(
+        field_error.contains("identity requires create-only"),
+        "{field_error}"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_when_present_identity_without_optional_create_only_witness() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let mut attribute = AttributeSchema::optional("name", AttributeType::string())
+        .create_only()
+        .identity_when_present()
+        .build();
+    attribute.create_only = false;
+    let attribute_error = admission_error(ResourceSchema::new("test.Widget").attribute(attribute));
+    assert!(
+        attribute_error.contains("identity requires create-only"),
+        "{attribute_error}"
+    );
+
+    let mut required_attribute = AttributeSchema::required("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    required_attribute.identity_mode = IdentityMode::WhenPresent;
+    let required_attribute_error =
+        admission_error(ResourceSchema::new("test.Widget").attribute(required_attribute));
+    assert!(
+        required_attribute_error.contains("when-present identity requires optional input"),
+        "{required_attribute_error}"
+    );
+
+    let mut field = StructField::optional("name", AttributeType::string())
+        .create_only()
+        .identity_when_present()
+        .build();
+    field.create_only = false;
+    let field_error = admission_error(ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field])).build(),
+    ));
+    assert!(
+        field_error.contains("identity requires create-only"),
+        "{field_error}"
+    );
+
+    let mut required_field = StructField::required("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    required_field.identity_mode = IdentityMode::WhenPresent;
+    let required_field_error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_("Config", vec![required_field]),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        required_field_error.contains("when-present identity requires optional input"),
+        "{required_field_error}"
+    );
+}
+
+#[test]
+fn schema_admission_applies_existing_identity_rules_to_when_present_mode() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let provider_populated = admission_error(
+        ResourceSchema::new("test.Output").attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::struct_(
+                    "Output",
+                    vec![
+                        StructField::optional("provider_key", AttributeType::string())
+                            .create_only()
+                            .identity_when_present()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        provider_populated.contains("identity field appears below a provider-populated ancestor"),
+        "{provider_populated}"
+    );
+
+    let non_scalar = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                .create_only()
+                .identity_when_present()
+                .build(),
+        ),
+    );
+    assert!(
+        non_scalar.contains("identity value must have a scalar or enum type"),
+        "{non_scalar}"
+    );
+
+    let below_collection = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "items",
+                AttributeType::list(AttributeType::struct_(
+                    "Item",
+                    vec![
+                        StructField::optional("key", AttributeType::string())
+                            .create_only()
+                            .identity_when_present()
+                            .build(),
+                    ],
+                )),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        below_collection
+            .contains("identity cannot be declared inside a list, map, or union element"),
+        "{below_collection}"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_non_scalar_identity_leaves() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let top_level = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                .create_only()
+                .identity()
+                .build(),
+        ),
+    );
+    assert!(
+        top_level.contains("identity value must have a scalar or enum type"),
+        "{top_level}"
+    );
+
+    let nested = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional(
+                            "names",
+                            AttributeType::list(AttributeType::string()),
+                        )
+                        .create_only()
+                        .identity()
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        nested.contains("identity value must have a scalar or enum type"),
+        "{nested}"
+    );
+}
+
+#[test]
 fn schema_admission_rejects_provider_populated_fields_marked_write_only() {
     let mut field =
         PatternStructField::provider_populated("secret", PatternAttributeType::string()).build();
@@ -1768,7 +2111,7 @@ fn schema_admission_checks_identified_types_inside_referenced_definitions() {
 }
 
 #[test]
-fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
+fn schema_admission_rejects_closed_enum_transform_not_representable_in_v16() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
         PatternResourceSchema::new("test.Widget").attribute(
@@ -1787,12 +2130,12 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v13"), "{error}");
+    assert!(error.contains("protocol v16"), "{error}");
     assert!(error.contains("transform"), "{error}");
 }
 
 #[test]
-fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
+fn config_schema_admission_enforces_scalar_and_v16_enum_invariants() {
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
@@ -1820,7 +2163,7 @@ fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v13"), "{rendered}");
+    assert!(rendered.contains("protocol v16"), "{rendered}");
 }
 
 #[test]
@@ -1926,7 +2269,8 @@ fn declared_tags_validator_executes_on_a_validated_schema() {
 
 #[test]
 fn unavailable_type_name_matches_the_equivalent_function_call() {
-    let args = vec![Value::Concrete(ConcreteValue::String("NAME".into())).into()];
+    let args: Vec<crate::resource::FunctionArgument> =
+        vec![Value::Concrete(ConcreteValue::String("NAME".into())).into()];
     let call = Value::Deferred(DeferredValue::FunctionCall {
         name: crate::builtins::BuiltinFunction::env,
         args: args.clone(),
@@ -2731,7 +3075,7 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
         )
         .validate()
         .expect("enum validation schema must be valid");
-    let mut attrs = HashMap::new();
+    let mut attrs: HashMap<String, Value> = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
         Value::Concrete(ConcreteValue::String("aaa".into())),
@@ -3745,7 +4089,7 @@ fn custom_type_accepts_resource_ref() {
     // ResourceRef values resolve to strings at runtime, so Custom types should accept them
     let ipv4 = admit_builtin_type(types::ipv4_cidr());
     assert!(
-        ipv4.validate(&Value::resource_ref(
+        ipv4.validate(&Value::root_resource_ref(
             "vpc".to_string(),
             "cidr_block".to_string(),
             vec![]
@@ -3755,7 +4099,7 @@ fn custom_type_accepts_resource_ref() {
 
     let ipv6 = admit_builtin_type(types::ipv6_cidr());
     assert!(
-        ipv6.validate(&Value::resource_ref(
+        ipv6.validate(&Value::root_resource_ref(
             "subnet".to_string(),
             "ipv6_cidr".to_string(),
             vec![]
@@ -3989,7 +4333,7 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
     let unknown = || {
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".to_string(),
+                binding: absolute_binding("upstream"),
             },
         ))
     };
@@ -4088,7 +4432,7 @@ fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
         Value::Concrete(ConcreteValue::List(vec![
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "upstream".to_string(),
+                    binding: absolute_binding("upstream"),
                 },
             )),
             Value::Concrete(ConcreteValue::String("INVALID".into())),
@@ -4806,7 +5150,7 @@ fn validate_union_type() {
     // Valid: ResourceRef is accepted by Custom members
     assert!(
         union_type
-            .validate(&Value::resource_ref(
+            .validate(&Value::root_resource_ref(
                 "gw".to_string(),
                 "id".to_string(),
                 vec![]
@@ -5304,6 +5648,9 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
             )])),
         );
     let unresolved_ref = ParserValue::resource_ref("source", "rules", Vec::new());
+    let resolved_unresolved_ref = unresolved_ref
+        .clone()
+        .resolve_root(&crate::resource::RootScope::new());
     let unresolved_resource = ParserResource::with_provider("test", "thing", "consumer", None)
         .with_attribute("rule", unresolved_ref.clone());
     let evaluated = crate::parser::ParsedFile {
@@ -5316,7 +5663,7 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
     };
 
     let (evaluated, unresolved) = resolve_config_block_names(
-        evaluated,
+        crate::module_resolver::expand_root_directory_file(evaluated),
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
     )
@@ -5325,7 +5672,7 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
     assert!(evaluated.resources[0].attributes.contains_key("rules"));
     assert!(!evaluated.resources[0].attributes.contains_key("rule"));
     let unresolved = &unresolved[0].attributes;
-    assert_eq!(unresolved.get("rules"), Some(&unresolved_ref));
+    assert_eq!(unresolved.get("rules"), Some(&resolved_unresolved_ref));
     assert!(!unresolved.contains_key("rule"));
 }
 
@@ -5372,6 +5719,9 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
             )]))),
         );
     let unresolved_ref = ParserValue::resource_ref("source", "transitions", Vec::new());
+    let resolved_unresolved_ref = unresolved_ref
+        .clone()
+        .resolve_root(&crate::resource::RootScope::new());
     let unresolved_resource = ParserResource::with_provider("test", "thing", "consumer", None)
         .with_attribute(
             "lifecycle_configuration",
@@ -5390,7 +5740,7 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
     };
 
     let (evaluated, unresolved) = resolve_config_block_names(
-        evaluated,
+        crate::module_resolver::expand_root_directory_file(evaluated),
         crate::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         &schemas,
     )
@@ -5398,19 +5748,19 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
 
     for resource in [&evaluated.resources[0], &unresolved[0]] {
         let lifecycle = match resource.get_attr("lifecycle_configuration") {
-            Some(ParserValue::Concrete(ParserConcreteValue::Map(map))) => map,
+            Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(map))) => map,
             _ => panic!("expected lifecycle map"),
         };
         assert!(lifecycle.contains_key("transition"));
         assert!(!lifecycle.contains_key("transitions"));
     }
     let unresolved_lifecycle = match unresolved[0].get_attr("lifecycle_configuration") {
-        Some(ParserValue::Concrete(ParserConcreteValue::Map(map))) => map,
+        Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(map))) => map,
         _ => panic!("expected unresolved lifecycle map"),
     };
     assert_eq!(
         unresolved_lifecycle.get("transition"),
-        Some(&unresolved_ref)
+        Some(&resolved_unresolved_ref)
     );
 }
 
@@ -9950,7 +10300,7 @@ mod validate_collect_tests {
         );
         let v = map_value(vec![(
             "vpc_id",
-            Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
+            Value::root_resource_ref("vpc".to_string(), "id".to_string(), vec![]),
         )]);
         let errors = crate::schema::Schema::flat(ty.clone()).validate_collect(&v);
         assert!(
@@ -12255,7 +12605,7 @@ fn validate_skips_value_unknown_for_primitive_types() {
     assert!(AttributeType::bool().validate(&unknown).is_ok());
 
     let upstream = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-        path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+        path: AccessPath::root_with_fields("net", "vpc", vec!["vpc_id".into()]),
     }));
     assert!(AttributeType::string().validate(&upstream).is_ok());
     assert!(AttributeType::int().validate(&upstream).is_ok());
@@ -12769,7 +13119,7 @@ mod enum_binding_collision {
     fn bare_binding_matching_dsl_alias_passes_through_schema_validation() {
         let t = flow_log_resource_type();
         let value = Value::Deferred(DeferredValue::BindingRef {
-            binding: "vpc".to_string(),
+            binding: absolute_binding("vpc"),
         });
         assert!(t.validate(&value).is_ok());
     }
@@ -12778,7 +13128,7 @@ mod enum_binding_collision {
     fn bare_binding_matching_canonical_value_passes_through_schema_validation() {
         let t = flow_log_resource_type();
         let value = Value::Deferred(DeferredValue::BindingRef {
-            binding: "VPC".to_string(),
+            binding: absolute_binding("VPC"),
         });
         assert!(t.validate(&value).is_ok());
     }
@@ -12791,7 +13141,7 @@ mod enum_binding_collision {
         // can still surface other errors downstream.
         let t = flow_log_resource_type();
         let value = Value::Deferred(DeferredValue::BindingRef {
-            binding: "some_other_name".to_string(),
+            binding: absolute_binding("some_other_name"),
         });
         assert!(t.validate(&value).is_ok());
     }
@@ -12802,7 +13152,7 @@ mod enum_binding_collision {
         // deferred-aware pass-through behavior.
         let t = AttributeType::string();
         let value = Value::Deferred(DeferredValue::BindingRef {
-            binding: "vpc".to_string(),
+            binding: absolute_binding("vpc"),
         });
         assert!(t.validate(&value).is_ok());
     }
@@ -13474,7 +13824,7 @@ fn select_union_member_no_match_is_none() {
 fn select_union_member_deferred_value_is_none() {
     let union = principal_union_schema();
     let v = Value::Deferred(DeferredValue::BindingRef {
-        binding: "some_ref".to_string(),
+        binding: absolute_binding("some_ref"),
     });
     assert!(select_union_member_for_test(&union, &v).is_none());
 }
@@ -13701,7 +14051,7 @@ fn schema_fingerprint_fixture_with(
     } else {
         Value::Concrete(ConcreteValue::Map(default_map))
     };
-    let mut first = AttributeSchema::optional(
+    let first = AttributeSchema::optional(
         "first",
         AttributeType::list(AttributeType::struct_(
             "Nested",
@@ -13719,16 +14069,21 @@ fn schema_fingerprint_fixture_with(
     } else {
         "first_block"
     });
-    if change != Some(FingerprintChange::CreateOnly) {
-        first = first.create_only();
-    }
-    if change != Some(FingerprintChange::WriteOnly) {
-        first = first.write_only();
-    }
-    if change != Some(FingerprintChange::Identity) {
-        first = first.identity();
-    }
-    let first = first.build();
+    let first = if change == Some(FingerprintChange::WriteOnly) {
+        first
+    } else {
+        first.write_only()
+    };
+    let first = if change == Some(FingerprintChange::CreateOnly) {
+        first.build()
+    } else {
+        let first = first.create_only();
+        if change == Some(FingerprintChange::Identity) {
+            first.build()
+        } else {
+            first.identity().build()
+        }
+    };
 
     let second_type = if change == Some(FingerprintChange::AttributeType) {
         AttributeType::bool()
@@ -13993,6 +14348,42 @@ fn resource_schema_semantic_fingerprint_covers_nested_write_only() {
         write_only.semantic_fingerprint(),
         "nested write-only observability changes saved-plan compatibility",
     );
+}
+
+#[test]
+fn resource_schema_semantic_fingerprint_covers_nested_create_only_and_identity() {
+    let schema_with_field = |field: StructField| {
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field]))
+                    .build(),
+            )
+            .semantic_fingerprint()
+    };
+
+    let mutable =
+        schema_with_field(StructField::optional("natural_key", AttributeType::string()).build());
+    let create_only = schema_with_field(
+        StructField::optional("natural_key", AttributeType::string())
+            .create_only()
+            .build(),
+    );
+    let identity = schema_with_field(
+        StructField::optional("natural_key", AttributeType::string())
+            .create_only()
+            .identity()
+            .build(),
+    );
+    let when_present = schema_with_field(
+        StructField::optional("natural_key", AttributeType::string())
+            .create_only()
+            .identity_when_present()
+            .build(),
+    );
+
+    assert_ne!(mutable, create_only);
+    assert_ne!(create_only, identity);
+    assert_ne!(identity, when_present);
 }
 
 #[test]

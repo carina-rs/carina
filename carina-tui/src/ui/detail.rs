@@ -358,7 +358,7 @@ fn render_detail_row_to_rows(rows: &mut Vec<Row<'_>>, row: &DetailRow, is_select
 mod tests {
     use super::*;
     use carina_core::detail_rows::{ListOfMapsDiffItem, MapExpandedEntry, NonEmptyListOfMapsBlock};
-    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
     use carina_core::value::{PrettyValue, RenderedKey};
     use indexmap::IndexMap;
     use ratatui::backend::TestBackend;

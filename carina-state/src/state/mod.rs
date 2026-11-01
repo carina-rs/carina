@@ -21,10 +21,12 @@ use carina_core::provider::{
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
+#[cfg(any(test, feature = "test-utils"))]
+use carina_core::resource::absolute_binding_address_for_test;
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    PersistedDirectives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, State,
-    Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, Directives, PartialReadMarker,
+    PendingReRead, PersistedDirectives, ResolvedResource, ResolvedResourceId, ResourceId,
+    ResourceIdentity, State, Value,
 };
 use carina_core::schema::{
     CompiledResourceSchema as ResourceSchema, FieldName, SchemaKind, SchemaRegistry,
@@ -35,10 +37,11 @@ use carina_core::value::{
     merge_secrets_into_observation_json, merge_secrets_into_provider_json,
     union_secret_shapes_after_resolution,
 };
+use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::backend::{BackendError, InvalidResourceIdentityError};
+use crate::backend::{BackendError, InvalidResourceIdentityError, InvalidStateJsonError};
 
 #[cfg(any(test, feature = "test-utils"))]
 fn persisted_attributes_from_test_json(
@@ -702,10 +705,53 @@ impl std::fmt::Display for ErrorSourceChain<'_> {
 
 #[derive(Debug)]
 pub(crate) enum StateFileDecodeError {
-    Json(serde_json::Error),
-    ExportsVersionTooNew { found: u32, supported: u32 },
+    Json {
+        json_path: String,
+        source: serde_json::Error,
+    },
+    ExportsVersionTooNew {
+        found: u32,
+        supported: u32,
+    },
     InvalidResourceIdentity(InvalidResourceIdentityError),
     Validation(String),
+}
+
+impl StateFileDecodeError {
+    fn json_at_root(source: serde_json::Error) -> Self {
+        Self::Json {
+            json_path: "<root>".to_string(),
+            source,
+        }
+    }
+
+    fn json_at_path(path: &serde_path_to_error::Path, source: serde_json::Error) -> Self {
+        let path = path.to_string();
+        Self::Json {
+            json_path: if path == "." {
+                "<root>".to_string()
+            } else {
+                path
+            },
+            source,
+        }
+    }
+
+    fn json_in_resource(
+        index: usize,
+        path: &serde_path_to_error::Path,
+        source: serde_json::Error,
+    ) -> Self {
+        let path = path.to_string();
+        let json_path = if path == "." {
+            format!("resources[{index}]")
+        } else if path.starts_with('[') {
+            format!("resources[{index}]{path}")
+        } else {
+            format!("resources[{index}].{path}")
+        };
+        Self::Json { json_path, source }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -773,12 +819,13 @@ fn map_state_file_decode_error(
             BackendError::ExportsVersionTooNew { found, supported }
         }
         StateFileDecodeError::InvalidResourceIdentity(error) => error.into(),
-        StateFileDecodeError::Json(error) => match migration_from {
-            Some(version) => BackendError::InvalidState(format!(
-                "Failed to migrate state file from v{version}: {error}"
-            )),
-            None => BackendError::InvalidState(format!("Failed to parse state file: {error}")),
-        },
+        StateFileDecodeError::Json { json_path, source } => {
+            let context = match migration_from {
+                Some(version) => format!("Failed to migrate state file from v{version}"),
+                None => "Failed to parse state file".to_string(),
+            };
+            BackendError::InvalidStateJson(InvalidStateJsonError::new(context, json_path, source))
+        }
         StateFileDecodeError::Validation(message) => match migration_from {
             Some(version) => BackendError::InvalidState(format!(
                 "Failed to migrate state file from v{version}: {message}"
@@ -796,8 +843,15 @@ impl StateFile {
     /// (carina#3731). Parsing here still validates duplicate identities on
     /// every parse (carina#2858).
     pub(crate) fn from_json_str(content: &str) -> Result<Self, StateFileDecodeError> {
-        let unchecked: UncheckedStateFile =
-            serde_json::from_str(content).map_err(StateFileDecodeError::Json)?;
+        let mut deserializer = serde_json::Deserializer::from_str(content);
+        let unchecked: UncheckedStateFile = serde_path_to_error::deserialize(&mut deserializer)
+            .map_err(|error| {
+                let path = error.path().clone();
+                StateFileDecodeError::json_at_path(&path, error.into_inner())
+            })?;
+        deserializer
+            .end()
+            .map_err(StateFileDecodeError::json_at_root)?;
         classify_exports_version(unchecked.version, unchecked.exports_version)?;
         let resources = unchecked
             .resources
@@ -836,7 +890,17 @@ impl StateFile {
                         ),
                     ));
                 }
-                serde_json::from_value(value).map_err(StateFileDecodeError::Json)
+                let _: EncodedResourceState = serde_path_to_error::deserialize(
+                    value.clone().into_deserializer(),
+                )
+                .map_err(|error| {
+                    let path = error.path().clone();
+                    StateFileDecodeError::json_in_resource(index, &path, error.into_inner())
+                })?;
+                serde_path_to_error::deserialize(value.into_deserializer()).map_err(|error| {
+                    let path = error.path().clone();
+                    StateFileDecodeError::json_in_resource(index, &path, error.into_inner())
+                })
             })
             .collect::<Result<Vec<ResourceState>, StateFileDecodeError>>()?;
         let exports = decode_persisted_exports(unchecked.exports)?;
@@ -1503,6 +1567,15 @@ impl StateFile {
     /// without a `moved` block.
     fn canonicalize_addresses(&mut self) -> Result<(), BackendError> {
         use carina_core::utils::canonicalize_map_key_address;
+
+        fn canonicalize_binding(
+            binding: AbsoluteBindingAddress,
+        ) -> Result<AbsoluteBindingAddress, BackendError> {
+            let canonical = carina_core::utils::canonicalize_map_key_address(binding.as_str());
+            serde_json::from_value(serde_json::Value::String(canonical))
+                .map_err(|error| BackendError::invalid_canonical_binding(binding, error))
+        }
+
         for r in &mut self.resources {
             r.identity =
                 ResourceIdentity::try_from(canonicalize_map_key_address(r.identity.as_str()))
@@ -1515,14 +1588,13 @@ impl StateFile {
                         ),
                         error,
                     })?;
-            if let Some(b) = r.binding.as_ref() {
-                r.binding = Some(canonicalize_map_key_address(b));
+            if let Some(binding) = r.binding.take() {
+                r.binding = Some(canonicalize_binding(binding)?);
             }
-            r.dependency_bindings = r
-                .dependency_bindings
-                .iter()
-                .map(|d| canonicalize_map_key_address(d))
-                .collect();
+            r.dependency_bindings = std::mem::take(&mut r.dependency_bindings)
+                .into_iter()
+                .map(canonicalize_binding)
+                .collect::<Result<_, _>>()?;
         }
         Ok(())
     }
@@ -2221,7 +2293,7 @@ pub struct DeposedInstance {
     /// Last known attributes of the old instance.
     attributes: PersistedAttributes,
     /// Binding dependencies inherited from the old row.
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 /// Attributes admitted to a deposed generation by a state-owned writeback
@@ -2259,7 +2331,7 @@ impl DeposedInstance {
         identifier: String,
         provider_instance: Option<String>,
         attributes: DeposedAttributes,
-        dependency_bindings: BTreeSet<String>,
+        dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
     ) -> Self {
         Self {
             key,
@@ -2285,7 +2357,10 @@ impl DeposedInstance {
             identifier,
             provider_instance,
             DeposedAttributes(persisted_attributes_from_test_json(attributes)),
-            dependency_bindings,
+            dependency_bindings
+                .into_iter()
+                .map(absolute_binding_address_for_test)
+                .collect(),
         )
     }
 
@@ -2452,7 +2527,7 @@ pub struct ResourceState {
     /// The binding name for this resource (from `let` bindings in DSL).
     /// Stored so orphan Delete effects can have tree structure.
     #[serde(default)]
-    pub binding: Option<String>,
+    pub binding: Option<AbsoluteBindingAddress>,
     /// Binding names of resources this resource depends on (via ResourceRef).
     /// Stored so orphan Delete effects can have tree structure.
     ///
@@ -2461,7 +2536,7 @@ pub struct ResourceState {
     /// (serde transparently coerces array → BTreeSet, deduping any
     /// duplicates and re-serializing in sorted order on next write).
     #[serde(default)]
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 /// Owned resource row proven not to contain a create continuation.
@@ -2497,7 +2572,7 @@ struct EncodedDeposedInstance {
     #[serde(default)]
     provider_instance: Option<String>,
     attributes: HashMap<String, serde_json::Value>,
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 #[derive(Deserialize)]
@@ -2520,9 +2595,9 @@ struct EncodedResourceState {
     #[serde(default)]
     explicit: ExplicitFields,
     #[serde(default)]
-    binding: Option<String>,
+    binding: Option<AbsoluteBindingAddress>,
     #[serde(default)]
-    dependency_bindings: BTreeSet<String>,
+    dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
 }
 
 impl<'de> Deserialize<'de> for ResourceState {
@@ -3815,7 +3890,7 @@ struct LegacyPersistedDirectives {
     #[serde(default)]
     prevent_destroy: bool,
     #[serde(default)]
-    depends_on: Vec<String>,
+    depends_on: Vec<AbsoluteBindingAddress>,
     #[serde(default)]
     provider_instance: Option<String>,
 }

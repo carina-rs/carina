@@ -6,14 +6,20 @@ use std::collections::HashSet;
 use crate::plan::{
     PlanErrorKind, PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
 };
-use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
+use crate::resource::{
+    ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+    ExpandedResource as Resource, ExpandedValue as Value, ResourceIdentity,
+    absolute_binding_address_for_test as absolute_binding,
+};
+use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use indexmap::IndexMap;
 
 fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.to_string().into()))
 }
 
 fn ref_value(binding: &str, attribute: &str) -> Value {
-    Value::resource_ref(binding.to_string(), attribute.to_string(), vec![])
+    Value::root_resource_ref(binding.to_string(), attribute.to_string(), vec![])
 }
 
 fn state(id: &ResourceId, attrs: &[(&str, Value)], identifier: &str) -> State {
@@ -96,7 +102,7 @@ fn subnet_schema(
 
 fn vpc_resources(create_before_destroy: bool) -> (Resource, Resource) {
     let mut unresolved = Resource::new("ec2.Vpc", "my-vpc")
-        .with_binding("vpc")
+        .with_root_binding("vpc")
         .with_attribute("name", string("vpc-main"))
         .with_attribute("cidr_block", string("10.1.0.0/16"));
     unresolved.directives.create_before_destroy = create_before_destroy;
@@ -105,7 +111,7 @@ fn vpc_resources(create_before_destroy: bool) -> (Resource, Resource) {
 
 fn subnet_resources(_vpc_ref_create_only: bool, independent_update: bool) -> (Resource, Resource) {
     let unresolved = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
+        .with_root_binding("subnet")
         .with_attribute("name", string("subnet-main"))
         .with_attribute("vpc_id", ref_value("vpc", "vpc_id"))
         .with_attribute("cidr_block", string("10.1.1.0/24"))
@@ -119,7 +125,7 @@ fn subnet_resources(_vpc_ref_create_only: bool, independent_update: bool) -> (Re
         )
         .with_attribute("availability_zone", string("us-east-1a"));
     let managed = Resource::new("ec2.Subnet", "my-subnet")
-        .with_binding("subnet")
+        .with_root_binding("subnet")
         .with_attribute("name", string("subnet-main"))
         .with_attribute("vpc_id", string("vpc-old"))
         .with_attribute("cidr_block", string("10.1.1.0/24"))
@@ -207,6 +213,55 @@ fn standard_states() -> HashMap<ResourceId, State> {
             ),
         ),
     ])
+}
+
+fn nested_subnet_resources() -> (Resource, Resource, State, ResourceSchema) {
+    let id = ResourceId::with_identity("ec2.NestedSubnet", "my-subnet");
+    let network = |vpc_id: Value| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("vpc_id".to_string(), vpc_id),
+            ("cidr_block".to_string(), string("10.1.1.0/24")),
+        ])))
+    };
+    let managed = Resource::new("ec2.NestedSubnet", "my-subnet")
+        .with_absolute_binding(absolute_binding("subnet"))
+        .with_attribute("name", string("subnet-main"))
+        .with_attribute("network", network(string("vpc-old")));
+    let unresolved = Resource::new("ec2.NestedSubnet", "my-subnet")
+        .with_absolute_binding(absolute_binding("subnet"))
+        .with_attribute("name", string("subnet-main"))
+        .with_attribute("network", network(ref_value("vpc", "vpc_id")));
+    let current = state(
+        &id,
+        &[
+            ("name", string("subnet-main")),
+            ("network", network(string("vpc-old"))),
+        ],
+        "subnet-123",
+    );
+    let schema = ResourceSchema::new("ec2.NestedSubnet")
+        .attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required(
+                "network",
+                AttributeType::struct_(
+                    "Network",
+                    vec![
+                        StructField::required("vpc_id", AttributeType::string())
+                            .create_only()
+                            .build(),
+                        StructField::required("cidr_block", AttributeType::string()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .with_unique_name_attribute("name");
+    (managed, unresolved, current, schema)
 }
 
 fn replacement_indices(plan: &Plan, id: &ResourceId) -> (usize, usize) {
@@ -340,6 +395,42 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
             .cascade_ref_hints
             .contains(&("vpc_id".to_string(), "vpc.vpc_id".to_string()))
     );
+}
+
+#[test]
+fn cascade_generates_replace_when_nested_create_only_field_references_replaced_resource() {
+    let mut schemas = base_schemas(false);
+    let (managed_subnet, unresolved_subnet, subnet_state, subnet_schema) =
+        nested_subnet_resources();
+    schemas.insert(
+        "",
+        subnet_schema
+            .validate()
+            .expect("nested subnet schema fixture must be valid"),
+    );
+    let (managed_vpc, unresolved_vpc) = vpc_resources(true);
+    let vpc_id = managed_vpc.id.clone();
+    let subnet_id = managed_subnet.id.clone();
+    let mut states = standard_states();
+    states.remove(&ResourceId::with_identity("ec2.Subnet", "my-subnet"));
+    states.insert(subnet_id.clone(), subnet_state);
+
+    let plan = plan_for(
+        vec![managed_vpc, managed_subnet],
+        vec![unresolved_vpc, unresolved_subnet],
+        states,
+        &schemas,
+    );
+
+    assert!(update_for(&plan, &subnet_id).is_none());
+    let metadata = replacement_metadata(&plan, &subnet_id);
+    assert!(metadata.changed_create_only.contains("network"));
+    assert!(
+        metadata
+            .cascade_ref_hints
+            .contains(&("network".to_string(), "vpc.vpc_id".to_string()))
+    );
+    assert!(delete_blocked_by(&plan, &vpc_id).contains(&ResourceIdentity::new("my-subnet")));
 }
 
 #[test]
@@ -577,7 +668,7 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
 }
 
 #[test]
-fn chained_cbd_anonymous_middle_node_auto_promoted() {
+fn chained_cbd_middle_binding_distinct_from_identity_auto_promoted() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
@@ -641,27 +732,29 @@ fn chained_cbd_anonymous_middle_node_auto_promoted() {
     );
 
     let mut producer = Resource::new("test.Producer", "producer")
-        .with_binding("a")
+        .with_root_binding("a")
         .with_attribute("name", string("producer"))
         .with_attribute("shape", string("new"));
     producer.directives.create_before_destroy = true;
     let unresolved_producer = producer.clone();
 
     let managed_middle = Resource::new("test.Middle", "anon-b")
+        .with_root_binding("middle")
         .with_attribute("name", string("middle"))
         .with_attribute("a_id", string("a-old"));
     let unresolved_middle = Resource::new("test.Middle", "anon-b")
+        .with_root_binding("middle")
         .with_attribute("name", string("middle"))
         .with_attribute("a_id", ref_value("a", "producer_id"));
 
     let managed_consumer = Resource::new("test.Consumer", "consumer")
-        .with_binding("c")
+        .with_root_binding("c")
         .with_attribute("name", string("consumer"))
         .with_attribute("b_id", string("b-old"));
     let unresolved_consumer = Resource::new("test.Consumer", "consumer")
-        .with_binding("c")
+        .with_root_binding("c")
         .with_attribute("name", string("consumer"))
-        .with_attribute("b_id", ref_value("anon-b", "b_id"));
+        .with_attribute("b_id", ref_value("middle", "b_id"));
 
     let producer_id = producer.id.clone();
     let middle_id = managed_middle.id.clone();
@@ -713,11 +806,207 @@ fn chained_cbd_anonymous_middle_node_auto_promoted() {
     assert!(update_for(&plan, &consumer_id).is_some());
     assert!(
         delete_blocked_by(&plan, &producer_id).contains(&ResourceIdentity::new("anon-b")),
-        "producer delete should wait for anonymous middle replacement"
+        "producer delete should wait for the middle replacement's resource identity"
     );
     assert!(
         delete_blocked_by(&plan, &middle_id).contains(&ResourceIdentity::new("consumer")),
-        "anonymous middle delete should wait for downstream consumer update"
+        "middle delete should wait for downstream consumer update"
+    );
+}
+
+const COLLIDING_BINDING: &str = "mock_test_replaceable_deadbeef";
+
+struct BindingIdentityCollisionFixture {
+    plan: Plan,
+    unresolved: Vec<Resource>,
+    anonymous_id: ResourceId,
+    consumer_id: ResourceId,
+}
+
+fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
+    let mut directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    directory.push("tests/fixtures/dependency_key_collision");
+    let parsed = crate::config_loader::parse_directory(
+        &directory,
+        &crate::parser::ProviderContext::default(),
+    )
+    .expect("multi-file collision fixture parses");
+    let parsed = crate::module_resolver::resolve_modules_providerless(parsed, &directory)
+        .expect("multi-file collision fixture crosses root expansion")
+        .into_expanded()
+        .expect("collision fixture contains no parser placeholders");
+    let mut unresolved = parsed.resources;
+
+    let anonymous = unresolved
+        .iter_mut()
+        .find(|resource| {
+            resource.id.resource_type == "test.replaceable" && resource.binding.is_none()
+        })
+        .expect("fixture contains the anonymous replaceable resource");
+    anonymous
+        .id
+        .set_identity(ResourceIdentity::new(COLLIDING_BINDING));
+    let anonymous_id = anonymous.id.clone();
+
+    let consumer_id = unresolved
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == "consumer")
+        })
+        .expect("fixture contains the consumer binding")
+        .id
+        .clone();
+
+    let mut managed = unresolved.clone();
+    let managed_consumer = managed
+        .iter_mut()
+        .find(|resource| resource.id == consumer_id)
+        .expect("managed fixture contains consumer");
+    managed_consumer.set_attr("anchor_id", string("anchor-id"));
+
+    let anchor_id = managed
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == COLLIDING_BINDING)
+        })
+        .expect("fixture contains the colliding let binding")
+        .id
+        .clone();
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        (ResourceSchema::new("test.replaceable")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("shape", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("name"))
+        .validate()
+        .expect("replaceable fixture schema is valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.anchor")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("identifier", AttributeType::string()).build(),
+            )
+            .validate()
+            .expect("anchor fixture schema is valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.consumer")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::required("anchor_id", AttributeType::string()).build())
+            .attribute(AttributeSchema::required("note", AttributeType::string()).build())
+            .validate()
+            .expect("consumer fixture schema is valid"),
+    );
+
+    let states = HashMap::from([
+        (
+            anonymous_id.clone(),
+            state(
+                &anonymous_id,
+                &[("name", string("anonymous")), ("shape", string("old"))],
+                "anonymous-id",
+            ),
+        ),
+        (
+            anchor_id.clone(),
+            state(&anchor_id, &[("name", string("anchor"))], "anchor-id"),
+        ),
+        (
+            consumer_id.clone(),
+            state(
+                &consumer_id,
+                &[
+                    ("name", string("consumer")),
+                    ("anchor_id", string("anchor-id")),
+                    ("note", string("old")),
+                ],
+                "consumer-id",
+            ),
+        ),
+    ]);
+
+    let plan = plan_for(managed, unresolved.clone(), states, &schemas);
+    BindingIdentityCollisionFixture {
+        plan,
+        unresolved,
+        anonymous_id,
+        consumer_id,
+    }
+}
+
+#[test]
+fn binding_spelling_collision_does_not_promote_anonymous_replace_to_cbd() {
+    let fixture = binding_identity_collision_fixture();
+    let metadata = replacement_metadata(&fixture.plan, &fixture.anonymous_id);
+
+    assert!(
+        !metadata.create_before_destroy,
+        "a dependency on the typed let binding must not promote an unrelated anonymous identity"
+    );
+}
+
+#[test]
+fn binding_spelling_collision_does_not_link_apply_dag_to_anonymous_replace() {
+    let fixture = binding_identity_collision_fixture();
+    let anonymous_create = fixture
+        .plan
+        .effects()
+        .iter()
+        .position(|effect| {
+            matches!(effect, Effect::Create(resource) if resource.id == fixture.anonymous_id)
+        })
+        .expect("fixture plan contains anonymous replacement create");
+    let consumer_update = fixture
+        .plan
+        .effects()
+        .iter()
+        .position(
+            |effect| matches!(effect, Effect::Update { to, .. } if to.id == fixture.consumer_id),
+        )
+        .expect("fixture plan contains consumer update");
+    let unresolved = fixture
+        .unresolved
+        .into_iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                crate::effect::deps::UnresolvedResource::from_pre_resolve(resource),
+            )
+        })
+        .collect();
+    let analysis = crate::effect::deps::build_effect_dependency_analysis(
+        fixture.plan.effects(),
+        &unresolved,
+        &[],
+        crate::effect::deps::ScheduleInputs::Apply,
+    )
+    .expect("fixture dependency graph is valid");
+
+    assert!(
+        !analysis
+            .deps_of(consumer_update)
+            .expect("consumer has a dependency set")
+            .contains(&anonymous_create),
+        "the apply DAG must not resolve a binding through an equal-spelling resource identity"
     );
 }
 
@@ -745,20 +1034,24 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         ],
         "subnet-old",
     )
-    .with_dependency_bindings(["vpc".to_string()].into());
+    .with_dependency_bindings([absolute_binding("vpc")].into());
     let orphans = Orphans::from([Orphan::from_state(
         child_state,
-        Some("subnets.a".to_string()),
+        Some(absolute_binding("subnets.a")),
         Directives::default(),
     )]);
 
-    let template_resource: Resource<ModuleSource, LoopSlot> =
-        Resource::new("ec2.Subnet", "subnets").with_binding("subnets");
+    let template_resource: crate::resource::Resource<
+        ModuleSource,
+        LoopSlot,
+        crate::resource::AbsoluteBindingAddress,
+    > = crate::resource::Resource::new("ec2.Subnet", "subnets")
+        .with_absolute_binding(absolute_binding("subnets"));
     let deferred = DeferredForExpression::new(
         Some("main.crn".to_string()),
         2,
         "for _, subnet in vpc.subnets".to_string(),
-        DeferredForTarget::bound("subnets").expect("fixture binding is valid"),
+        DeferredForTarget::bound(absolute_binding("subnets")).expect("fixture binding is valid"),
         ref_value("vpc", "subnets"),
         ForBinding::Map("_".to_string(), "subnet".to_string()),
         template_resource,
@@ -877,13 +1170,21 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
         let id = managed.id.clone();
         let managed = ResolvedResource::collect_resolved([managed]).unwrap();
         let unresolved = ResolvedResource::collect_resolved([unresolved]).unwrap();
-        let template: Resource<ModuleSource, LoopSlot> = Resource::new("ec2.Subnet", "subnets")
-            .with_attribute("vpc_id", Value::resource_ref("vpc", "vpc_id", vec![]));
+        let template: crate::resource::Resource<
+            ModuleSource,
+            LoopSlot,
+            crate::resource::AbsoluteBindingAddress,
+        > = crate::resource::Resource::new("ec2.Subnet", "subnets").with_attribute(
+            "vpc_id",
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef {
+                path: crate::resource::AccessPath::root("vpc", "vpc_id"),
+            }),
+        );
         let deferred = DeferredForExpression::new(
             None,
             1,
             "for vpc in other.items".into(),
-            DeferredForTarget::bound("subnets").unwrap(),
+            DeferredForTarget::bound(absolute_binding("subnets")).unwrap(),
             ref_value("other", "items"),
             binding,
             template,
@@ -939,11 +1240,19 @@ fn deferred_create_cbd_plan(
 
     let (managed, unresolved) = vpc_resources(false);
     let id = managed.id.clone();
-    let managed =
-        ResolvedResource::collect_resolved([managed.with_binding(producer_binding)]).unwrap();
-    let unresolved =
-        ResolvedResource::collect_resolved([unresolved.with_binding(producer_binding)]).unwrap();
-    let template: Resource<ModuleSource, LoopSlot> = Resource::new("ec2.Subnet", "subnets");
+    let managed = ResolvedResource::collect_resolved([
+        managed.with_absolute_binding(absolute_binding(producer_binding))
+    ])
+    .unwrap();
+    let unresolved = ResolvedResource::collect_resolved([
+        unresolved.with_absolute_binding(absolute_binding(producer_binding))
+    ])
+    .unwrap();
+    let template: crate::resource::Resource<
+        ModuleSource,
+        LoopSlot,
+        crate::resource::AbsoluteBindingAddress,
+    > = crate::resource::Resource::new("ec2.Subnet", "subnets");
     let deferred = DeferredForExpression::new(
         Some("main.crn".into()),
         2,
@@ -994,7 +1303,7 @@ fn deferred_create_cbd_plan(
 fn planning_uses_retained_targets_for_both_cbd_and_deferred_effects() {
     let (plan, producer) = deferred_create_cbd_plan(
         "vpc",
-        crate::parser::DeferredForTarget::bound("same_retained_target").unwrap(),
+        crate::parser::DeferredForTarget::bound(absolute_binding("same_retained_target")).unwrap(),
         &base_schemas(false),
     );
     assert!(replacement_metadata(&plan, &producer).create_before_destroy);
@@ -1015,7 +1324,10 @@ fn planning_uses_retained_targets_for_both_cbd_and_deferred_effects() {
         templates[0].target().bound_binding(),
         Some("same_retained_target")
     );
-    assert_eq!(templates[0].root_bindings(), ["vpc".to_string()].into());
+    assert_eq!(
+        templates[0].root_bindings(),
+        [absolute_binding("vpc")].into()
+    );
     assert_deferred_create_cbd_is_acyclic(&plan, &producer);
 }
 
@@ -1077,7 +1389,7 @@ fn unbound_deferred_for_promotes_replaced_producer_to_cbd() {
 fn module_scoped_deferred_for_promotes_its_prefixed_producer_to_cbd() {
     let (plan, id) = deferred_create_cbd_plan(
         "network.vpc",
-        crate::parser::DeferredForTarget::bound("network.subnets").unwrap(),
+        crate::parser::DeferredForTarget::bound(absolute_binding("network.subnets")).unwrap(),
         &base_schemas(false),
     );
     assert_deferred_create_cbd_is_acyclic(&plan, &id);
@@ -1087,7 +1399,7 @@ fn module_scoped_deferred_for_promotes_its_prefixed_producer_to_cbd() {
 fn deferred_create_without_prior_children_promotes_replaced_producer_to_cbd() {
     let (plan, id) = deferred_create_cbd_plan(
         "vpc",
-        crate::parser::DeferredForTarget::bound("subnets").unwrap(),
+        crate::parser::DeferredForTarget::bound(absolute_binding("subnets")).unwrap(),
         &base_schemas(false),
     );
     assert_deferred_create_cbd_is_acyclic(&plan, &id);
@@ -1114,7 +1426,7 @@ fn impossible_cbd_promotion_names_deferred_and_managed_dependents() {
     );
     let (deferred, _) = deferred_create_cbd_plan(
         "vpc",
-        crate::parser::DeferredForTarget::bound("subnets").unwrap(),
+        crate::parser::DeferredForTarget::bound(absolute_binding("subnets")).unwrap(),
         &schemas,
     );
     let (managed_vpc, unresolved_vpc) = vpc_resources(false);

@@ -1,0 +1,9 @@
+let mock_test_replaceable_deadbeef = mock.test.anchor {
+  name = "anchor"
+}
+
+let consumer = mock.test.consumer {
+  name      = "consumer"
+  anchor_id = mock_test_replaceable_deadbeef.identifier
+  note      = "new"
+}

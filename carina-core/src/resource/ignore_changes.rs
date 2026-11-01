@@ -3,7 +3,9 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
-use super::{CanonicalComparisonAttributes, ConcreteValue, PlaceholderKind, Resource, Value};
+use super::{
+    BindingAddress, CanonicalComparisonAttributes, ConcreteValue, PlaceholderKind, Resource, Value,
+};
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, EffectiveType, LeafPath, LeafPathSegment, Shape,
     ShapeWalkBudget, ValidatedResourceSchema,
@@ -333,15 +335,15 @@ impl Display for IgnoreChangeError {
 
 impl std::error::Error for IgnoreChangeError {}
 
-struct ValueCursor<'a, P: PlaceholderKind> {
+struct ValueCursor<'a, P: PlaceholderKind, B: BindingAddress> {
     leaf: Vec<LeafPathSegment>,
-    value: &'a Value<P>,
+    value: &'a Value<P, B>,
 }
 
 /// Resolve authored ignore paths against the effective schema and the values
 /// written in the same resource block.
-pub fn resolve_ignore_changes<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+pub fn resolve_ignore_changes<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     schema: &ValidatedResourceSchema,
 ) -> Result<ResolvedIgnoreChanges, Vec<IgnoreChangeError>> {
     let mut errors = Vec::new();
@@ -369,8 +371,8 @@ pub fn resolve_ignore_changes<S, P: PlaceholderKind>(
     }
 }
 
-fn resolve_one_ignore_change<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+fn resolve_one_ignore_change<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     schema: &ValidatedResourceSchema,
     path: &ParsedIgnorePath,
 ) -> Result<Vec<ResolvedIgnorePath>, IgnoreChangeError> {
@@ -488,9 +490,9 @@ fn resolve_one_ignore_change<S, P: PlaceholderKind>(
         .collect())
 }
 
-fn normalize_authored_struct_block<'a, P: PlaceholderKind>(
+fn normalize_authored_struct_block<'a, P: PlaceholderKind, B: BindingAddress>(
     value_type: &EffectiveType<'_>,
-    cursors: &mut Vec<ValueCursor<'a, P>>,
+    cursors: &mut Vec<ValueCursor<'a, P, B>>,
 ) {
     if !matches!(value_type.shape(), Shape::Struct { .. }) {
         return;

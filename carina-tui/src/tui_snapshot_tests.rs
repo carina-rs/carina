@@ -12,8 +12,8 @@ use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect,
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::plan::Plan;
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Directives, LoopSlot, ModuleSource, ResolvedResource, Resource,
-    ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, DeferredValue, Directives, LoopSlot, ModuleSource,
+    ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::SchemaRegistry;
 
@@ -27,6 +27,17 @@ fn resolved(resource: Resource) -> ResolvedResource {
 
 fn create(resource: Resource) -> Effect {
     Effect::Create(resolved(resource))
+}
+
+fn absolute(binding: &str) -> AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(binding)
+}
+
+fn root_ref(binding: &str, attribute: &str) -> Value {
+    carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+        .resolve_root_for_test()
+        .into_expanded()
+        .expect("TUI snapshot fixture contains no parser placeholder")
 }
 
 /// Render the TUI into a string, optionally selecting a specific node.
@@ -59,7 +70,7 @@ fn build_all_create_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(create(
         Resource::new("ec2.Vpc", "my-vpc")
-            .with_binding("vpc")
+            .with_absolute_binding(absolute("vpc"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -67,23 +78,17 @@ fn build_all_create_plan() -> Plan {
     ));
     plan.add(create(
         Resource::new("ec2.RouteTable", "my-rt")
-            .with_binding("rt")
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
+            .with_absolute_binding(absolute("rt"))
+            .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
     ));
     plan.add(create(
         Resource::new("ec2.Subnet", "my-subnet")
-            .with_binding("subnet")
+            .with_absolute_binding(absolute("subnet"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
             )
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
+            .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
     ));
     plan
 }
@@ -107,7 +112,7 @@ fn build_mixed_operations_plan() -> Plan {
         ),
         to: resolved(
             Resource::new("ec2.Vpc", "my-vpc")
-                .with_binding("vpc")
+                .with_absolute_binding(absolute("vpc"))
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -121,15 +126,12 @@ fn build_mixed_operations_plan() -> Plan {
     });
     plan.add(create(
         Resource::new("ec2.SecurityGroup", "my-sg")
-            .with_binding("sg")
+            .with_absolute_binding(absolute("sg"))
             .with_attribute(
                 "group_description",
                 Value::Concrete(ConcreteValue::String("Web security group".into())),
             )
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
+            .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
     ));
     plan.add(Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -139,7 +141,7 @@ fn build_mixed_operations_plan() -> Plan {
         identifier: crate::fixture_applied_identifier("subnet-12345678"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
-        binding: Some("old_subnet".to_string()),
+        binding: Some(absolute("old_subnet")),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: HashSet::new(),
@@ -158,7 +160,7 @@ fn build_deposed_delete_plan() -> Plan {
             carina_core::resource::DeposedKey::new_unique(),
         ),
         directives: Directives::default(),
-        binding: Some("main".to_string()),
+        binding: Some(absolute("main")),
         dependencies: HashSet::new(),
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
@@ -226,7 +228,7 @@ fn build_map_key_diff_plan() -> Plan {
         ),
         to: resolved(
             Resource::new("ec2.Vpc", "my-vpc")
-                .with_binding("vpc")
+                .with_absolute_binding(absolute("vpc"))
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -241,7 +243,7 @@ fn build_map_key_diff_plan() -> Plan {
 fn build_deferred_for_plan() -> Plan {
     let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::with_provider("aws", "route53.Record", "validation_records", None)
-            .with_binding("validation_records");
+            .with_absolute_binding(absolute("validation_records"));
     template_resource
         .attributes
         .extend(deferred_record_attributes());
@@ -249,9 +251,11 @@ fn build_deferred_for_plan() -> Plan {
         None,
         1,
         "for opt in cert.domain_validation_options".to_string(),
-        carina_core::parser::DeferredForTarget::bound("validation_records")
-            .expect("fixture binding is valid"),
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        carina_core::parser::DeferredForTarget::bound(
+            carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        root_ref("cert", "domain_validation_options"),
         ForBinding::Simple("opt".to_string()),
         template_resource,
     );
@@ -277,7 +281,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     )
     .expect("parse anonymous deferred-for target");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )
     .expect("resolve anonymous deferred-for target");
@@ -298,7 +302,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
         1,
         "for opt in cert.domain_validation_options".to_string(),
         target,
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        root_ref("cert", "domain_validation_options"),
         ForBinding::Simple("opt".to_string()),
         template_resource,
     );
@@ -314,7 +318,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
 fn build_deferred_replace_plan() -> Plan {
     let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::with_provider("aws", "route53.Record", "validation_records", None)
-            .with_binding("validation_records");
+            .with_absolute_binding(absolute("validation_records"));
     template_resource
         .attributes
         .extend(deferred_record_attributes());
@@ -322,9 +326,11 @@ fn build_deferred_replace_plan() -> Plan {
         None,
         1,
         "for opt in cert.domain_validation_options".to_string(),
-        carina_core::parser::DeferredForTarget::bound("validation_records")
-            .expect("fixture binding is valid"),
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        carina_core::parser::DeferredForTarget::bound(
+            carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        root_ref("cert", "domain_validation_options"),
         ForBinding::Simple("opt".to_string()),
         template_resource,
     );
@@ -339,8 +345,8 @@ fn build_deferred_replace_plan() -> Plan {
             )),
             identifier: crate::fixture_applied_identifier("record-0"),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
+            binding: Some(absolute("validation_records[0]")),
+            dependencies: HashSet::from([absolute("cert")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         }])
@@ -352,7 +358,7 @@ fn build_deferred_replace_plan() -> Plan {
 
 fn certificate_resource() -> Resource {
     Resource::new("acm.Certificate", "cert")
-        .with_binding("cert")
+        .with_absolute_binding(absolute("cert"))
         .with_attribute(
             "domain_name",
             Value::Concrete(ConcreteValue::String("registry.example.com".into())),
@@ -405,7 +411,7 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
     )
     .expect("parse anonymous-loop fixture");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )
     .expect("resolve anonymous-loop fixture")
@@ -515,7 +521,7 @@ fn snapshot_create_with_schema() {
     let mut plan = Plan::new();
     plan.add(create(
         Resource::new("ec2.Vpc", "my-vpc")
-            .with_binding("vpc")
+            .with_absolute_binding(absolute("vpc"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -650,7 +656,7 @@ fn build_moved_with_changes_plan() -> Plan {
         ),
         to: resolved(
             Resource::new("ec2.Vpc", "new_vpc")
-                .with_binding("new_vpc")
+                .with_absolute_binding(absolute("new_vpc"))
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -675,10 +681,7 @@ fn build_moved_with_changes_plan() -> Plan {
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
             )
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("new_vpc".to_string(), "vpc_id".to_string(), vec![]),
-            ),
+            .with_attribute("vpc_id", root_ref("new_vpc", "vpc_id")),
     ));
     plan
 }

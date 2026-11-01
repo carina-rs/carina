@@ -1,5 +1,7 @@
 use super::*;
-use carina_core::resource::{DeferredValue, PendingReRead, ReReadReason};
+use carina_core::resource::{
+    DeferredValue, PendingReRead, ReReadReason, absolute_binding_address_for_test,
+};
 use carina_core::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
@@ -117,7 +119,10 @@ fn v19_migrates_to_v20_without_rewriting_resource_data() {
         serde_json::json!({"kind": "unspecified"})
     );
     assert_eq!(
-        state.resources()[0].binding.as_deref(),
+        state.resources()[0]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
         Some("carried_binding")
     );
     assert_eq!(
@@ -263,7 +268,10 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
         .expect("outcome-unknown row remains addressable");
     assert_eq!(row.identifier(), None);
     assert!(row.refreshable().is_none());
-    assert_eq!(row.binding.as_deref(), Some("unknown_binding"));
+    assert_eq!(
+        row.binding.as_ref().map(|binding| binding.as_str()),
+        Some("unknown_binding")
+    );
     assert_eq!(row.deposed.len(), 1);
 
     let encoded = serde_json::to_value(&state).expect("v20 state must serialize");
@@ -700,7 +708,7 @@ fn v19_state_rejects_partial_read_marker_with_empty_missing_attributes() {
         "exports": {}
     });
 
-    let message = invalid_state_message(check_and_migrate(&json.to_string()));
+    let message = invalid_state_json_message(check_and_migrate(&json.to_string()));
 
     assert!(
         message.contains("partial-read marker must contain at least one missing attribute"),
@@ -903,6 +911,9 @@ fn v14_to_current_preserves_write_only_partial_and_deposed_fields() {
             "identifier": "cloud-id",
             "attributes": { "name": "example", "password": "masked" },
             "write_only_attributes": ["password"],
+            "directives": {
+                "depends_on": ["upstream"]
+            },
             "partial_read": {
                 "detail": "provider read omitted status",
                 "missing_attributes": ["status"]
@@ -942,6 +953,11 @@ fn v14_to_current_preserves_write_only_partial_and_deposed_fields() {
     assert!(nested_write_only.is_empty());
     assert!(partial_read.is_some());
     assert_eq!(state.resources()[0].deposed.len(), 1);
+    assert_eq!(
+        state.resources()[0].directives.depends_on,
+        [absolute_binding("upstream")],
+        "legacy directive dependencies must cross migration through checked absolute addresses"
+    );
 }
 
 const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
@@ -1008,6 +1024,14 @@ fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
 
 fn resolved(resource: &carina_core::resource::Resource) -> carina_core::resource::ResolvedResource {
     carina_core::resource::ResolvedResource::new(resource.clone())
+}
+
+fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+    absolute_binding_address_for_test(name)
+}
+
+fn absolute_bindings<const N: usize>(names: [&str; N]) -> BTreeSet<AbsoluteBindingAddress> {
+    names.into_iter().map(absolute_binding).collect()
 }
 
 fn list_rule(port: i64, description: Option<&str>) -> Value {
@@ -1439,7 +1463,7 @@ fn upsert_resource_preserves_existing_deposed_generations() {
             "cidr_block".to_string(),
             serde_json::json!("10.255.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["igw".to_string()]),
+        dependency_bindings: absolute_bindings(["igw"]),
     });
     state
         .upsert_resource(existing)
@@ -1498,7 +1522,7 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
             "cidr_block".to_string(),
             serde_json::json!("10.255.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["igw".to_string()]),
+        dependency_bindings: absolute_bindings(["igw"]),
     });
     state
         .upsert_resource(existing)
@@ -1608,8 +1632,10 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
     resource.explicit = ExplicitFields::Struct {
         children: HashMap::from([("cidr_block".to_string(), ExplicitFields::Leaf)]),
     };
-    resource.binding = Some("vpc".to_string());
-    resource.dependency_bindings.insert("internet".to_string());
+    resource.binding = Some(absolute_binding("vpc"));
+    resource
+        .dependency_bindings
+        .insert(absolute_binding("internet"));
     resource.set_write_only_attributes_for_test(vec!["token".to_string()]);
     resource.set_partial_read_for_test(PartialReadMarker::new(
         PendingReRead::incomplete("partial"),
@@ -1623,7 +1649,7 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
             "cidr_block".to_string(),
             serde_json::json!("10.0.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::from(["network".to_string()]),
+        dependency_bindings: absolute_bindings(["network"]),
     });
     state
         .upsert_resource(resource)
@@ -2013,10 +2039,10 @@ fn test_resource_state_serialization_with_binding_and_deps() {
 
     let deserialized: ResourceState = serde_json::from_str(json).unwrap();
     assert_eq!(deserialized.identity.as_str(), "my-bucket");
-    assert_eq!(deserialized.binding, Some("my_bucket".to_string()));
+    assert_eq!(deserialized.binding, Some(absolute_binding("my_bucket")));
     assert_eq!(
         deserialized.dependency_bindings,
-        BTreeSet::from(["vpc".to_string(), "subnet".to_string()])
+        absolute_bindings(["vpc", "subnet"])
     );
 }
 
@@ -4568,7 +4594,7 @@ fn build_state_for_resource_does_not_hide_current_content_behind_deposed_generat
     let id = ResourceId::with_provider_identity("mock", "test.resource", "current", None);
     let mut row = ResourceState::new("test.resource", "current", "mock")
         .with_attribute("name", serde_json::json!("current"));
-    row.binding = Some("current".to_string());
+    row.binding = Some(absolute_binding("current"));
     row.deposed.push(DeposedInstance::from_persisted_json(
         DeposedKey::new_unique(),
         "old-id".to_string(),
@@ -4594,7 +4620,7 @@ fn removing_last_deposed_generation_retains_malformed_current_instance() {
     let key = DeposedKey::new_unique();
     let mut row = ResourceState::new("test.resource", identity, "mock")
         .with_attribute("name", serde_json::json!("current"));
-    row.binding = Some("current".to_string());
+    row.binding = Some(absolute_binding("current"));
     row.deposed.push(DeposedInstance::from_persisted_json(
         key.clone(),
         "old-id".to_string(),
@@ -4680,11 +4706,14 @@ fn removing_last_deposed_generation_retains_explicit_true_shell() {
 fn test_from_provider_state_stores_binding_and_dependencies() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
-    let mut resource = Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None);
-    resource.binding = Some("my_subnet".to_string());
+    let mut resource: Resource = Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None);
+    resource.binding = Some(absolute_binding("my_subnet"));
     resource.set_attr(
         "vpc_id".to_string(),
-        Value::resource_ref("my_vpc".to_string(), "vpc_id".to_string(), vec![]),
+        carina_core::resource::AuthoredValue::resource_ref("my_vpc", "vpc_id", vec![])
+            .resolve_root_for_test()
+            .into_expanded()
+            .expect("resource reference contains no parser placeholder"),
     );
 
     let provider_state = ProviderState {
@@ -4711,11 +4740,8 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         None,
     )
     .unwrap();
-    assert_eq!(rs.binding, Some("my_subnet".to_string()));
-    assert_eq!(
-        rs.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
-    );
+    assert_eq!(rs.binding, Some(absolute_binding("my_subnet")));
+    assert_eq!(rs.dependency_bindings, absolute_bindings(["my_vpc"]));
 }
 
 #[test]
@@ -4745,10 +4771,10 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::try_applied("ec2.Subnet", "orphan-subnet", "awscc", "subnet-123")
         .expect("fixture identifier is non-empty");
-    rs.binding = Some("my_subnet".to_string());
-    rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
+    rs.binding = Some(absolute_binding("my_subnet"));
+    rs.dependency_bindings = absolute_bindings(["my_vpc"]);
     rs.directives.set_prevent_destroy(true);
-    rs.directives.depends_on = vec!["security_group".to_string()];
+    rs.directives.depends_on = vec![absolute_binding("security_group")];
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -4785,10 +4811,13 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     );
     assert_eq!(orphan.binding(), Some("my_subnet"));
     assert!(orphan.directives().explicitly_prevents_destroy());
-    assert_eq!(orphan.directives().depends_on, ["security_group"]);
+    assert_eq!(
+        orphan.directives().depends_on,
+        vec![absolute_binding("security_group")]
+    );
     assert_eq!(
         orphan_state.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
+        absolute_bindings(["my_vpc"])
     );
 
     let fresh = carina_core::resource::State::existing(
@@ -4814,10 +4843,13 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     assert_eq!(refreshed.binding(), Some("my_subnet"));
     assert_eq!(refreshed_state.id, id);
     assert!(refreshed.directives().explicitly_prevents_destroy());
-    assert_eq!(refreshed.directives().depends_on, ["security_group"]);
+    assert_eq!(
+        refreshed.directives().depends_on,
+        vec![absolute_binding("security_group")]
+    );
     assert_eq!(
         refreshed_state.dependency_bindings,
-        BTreeSet::from(["my_vpc".to_string()])
+        absolute_bindings(["my_vpc"])
     );
     assert!(refreshed_state.attributes.contains_key("cidr_block"));
 }
@@ -5148,9 +5180,11 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         delete_rows,
         vec![carina_core::detail_rows::DetailRow::Attribute {
             key: "name".to_string(),
-            value: carina_core::value::render_value(&Value::Concrete(ConcreteValue::String(
-                "old".into(),
-            ))),
+            value: carina_core::value::render_value(
+                &carina_core::resource::ExpandedValue::Concrete(
+                    carina_core::resource::ExpandedConcreteValue::String("old".into()),
+                ),
+            ),
             ref_binding: None,
             annotation: None,
         }]
@@ -5416,7 +5450,7 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
         "exports": {},
     });
 
-    let message = invalid_state_message(check_and_migrate(&state.to_string()));
+    let message = invalid_state_json_message(check_and_migrate(&state.to_string()));
     assert!(
         message.contains("persisted attribute \"event_pattern\""),
         "{message}"
@@ -5433,7 +5467,7 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
         },
         "dependency_bindings": [],
     }]);
-    let message = invalid_state_message(check_and_migrate(&state.to_string()));
+    let message = invalid_state_json_message(check_and_migrate(&state.to_string()));
     assert!(
         message.contains("persisted attribute \"mode\""),
         "{message}"
@@ -5757,7 +5791,7 @@ fn test_build_orphans_excludes_desired() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::try_applied("ec2.Subnet", "kept-subnet", "awscc", "subnet-456")
         .expect("fixture identifier is non-empty");
-    rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
+    rs.dependency_bindings = absolute_bindings(["my_vpc"]);
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -5823,11 +5857,90 @@ fn state_json_with_resources(version: u32, resources: Vec<serde_json::Value>) ->
     state.to_string()
 }
 
+#[test]
+fn canonical_binding_error_preserves_the_typed_serde_source() {
+    let terminal = serde_json::from_value::<AbsoluteBindingAddress>(serde_json::json!(""))
+        .expect_err("empty persisted addresses are invalid");
+    let detail = terminal.to_string();
+    // A valid address cannot currently canonicalize to an empty one. Exercise
+    // the production error mapper directly to guard that defensive path.
+    let error = BackendError::invalid_canonical_binding(
+        absolute_binding("app.children[\"key\"]"),
+        terminal,
+    )
+    .with_state_read_location("/tmp/project/carina.state.json");
+    let source = std::error::Error::source(&error).expect("serde error must not be flattened");
+    let source = source
+        .downcast_ref::<serde_json::Error>()
+        .expect("typed serde source");
+    assert_eq!(source.classify(), serde_json::error::Category::Data);
+    assert_eq!(source.to_string(), detail);
+    assert!(error.to_string().contains("app.children"));
+    assert!(error.to_string().contains("/tmp/project/carina.state.json"));
+}
+
+#[test]
+fn state_json_wrapper_renders_serde_detail_without_rewording_it() {
+    for (binding, detail) in [
+        (
+            serde_json::json!(""),
+            "an absolute binding address cannot be empty",
+        ),
+        (serde_json::json!(true), "invalid type: boolean"),
+    ] {
+        let mut resource = persisted_resource("mock", "test.resource", "valid");
+        resource["binding"] = binding;
+        let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![resource]);
+        let error = check_and_migrate(&json)
+            .expect_err("invalid binding must fail to load")
+            .with_state_read_location("/tmp/project/carina.state.json");
+        let message = error.to_string();
+        assert!(
+            message.contains(detail),
+            "serde detail must be rendered: {message}"
+        );
+        assert!(
+            message.contains("/tmp/project/carina.state.json"),
+            "{message}"
+        );
+        assert!(
+            message.contains("at JSON location resources[0].binding"),
+            "{message}"
+        );
+        assert!(message.contains("corrupted or hand-edited"), "{message}");
+        assert!(message.contains("restore it from a backup"), "{message}");
+        let source = std::error::Error::source(&error).expect("typed serde source is retained");
+        assert!(source.is::<serde_json::Error>(), "{source:?}");
+    }
+}
+
 fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
     match result.expect_err("invalid state must be rejected") {
         BackendError::InvalidState(message) => message,
         other => panic!("expected InvalidState, got {other}"),
     }
+}
+
+fn invalid_state_json_message(result: Result<MigratedStateFile, BackendError>) -> String {
+    let error = result.expect_err("invalid persisted JSON must be rejected");
+    assert!(
+        matches!(&error, BackendError::InvalidStateJson(_error)),
+        "expected a typed JSON failure, got {error:?}"
+    );
+    let source = std::error::Error::source(&error).expect("serde cause must be retained");
+    assert_eq!(
+        source
+            .downcast_ref::<serde_json::Error>()
+            .expect("typed serde cause")
+            .classify(),
+        serde_json::error::Category::Data
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("at JSON location resources[0]"),
+        "{message}"
+    );
+    message
 }
 
 #[test]
@@ -6527,12 +6640,13 @@ fn typed_data_source_cleanup_removes_historical_null_identifier_row() {
     }"#;
 
     let mut state = check_and_migrate(json).expect("read").into_state();
-    let data_source = carina_core::resource::DataSource::with_provider(
-        "aws",
-        "iam.Roles",
-        "admin_access_roles",
-        None,
-    );
+    let data_source: carina_core::resource::DataSource =
+        carina_core::resource::DataSource::with_provider(
+            "aws",
+            "iam.Roles",
+            "admin_access_roles",
+            None,
+        );
     assert_eq!(state.remove_legacy_data_source_rows(&[data_source]), 1);
     assert!(state.find_resource("awscc", "s3.Bucket", "log").is_some());
     assert!(
@@ -6564,7 +6678,7 @@ fn typed_data_source_cleanup_preserves_managed_row_with_identifier() {
     }"#;
 
     let mut state = check_and_migrate(json).expect("read").into_state();
-    let data_source =
+    let data_source: carina_core::resource::DataSource =
         carina_core::resource::DataSource::with_provider("test", "shared.Type", "shared", None);
 
     assert_eq!(state.remove_legacy_data_source_rows(&[data_source]), 0);
@@ -8552,7 +8666,12 @@ fn published_null_export_is_absent_for_coalesce_resolution() {
     );
     let default = Value::Concrete(ConcreteValue::List(Vec::new()));
     let expression = Value::Deferred(DeferredValue::Coalesce {
-        value: Box::new(Value::resource_ref("up", "accounts", Vec::new())),
+        value: Box::new(
+            carina_core::resource::AuthoredValue::resource_ref("up", "accounts", Vec::new())
+                .resolve_root_for_test()
+                .into_expanded()
+                .expect("upstream reference contains no parser placeholder"),
+        ),
         default: Box::new(default.clone()),
     });
 
@@ -8569,7 +8688,7 @@ fn published_exports_build_remote_bindings_ignores_resource_bindings() {
     let mut resource = ResourceState::try_applied("ec2.Vpc", "vpc_123", "awscc", "vpc-123")
         .expect("fixture identifier is non-empty")
         .with_attribute("vpc_id", serde_json::Value::String("vpc-123".to_string()));
-    resource.binding = Some("vpc".to_string());
+    resource.binding = Some(absolute_binding("vpc"));
     state
         .upsert_resource(resource)
         .expect("test state setup must be valid");
@@ -8611,8 +8730,15 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
     let state = check_and_migrate(&json).expect("load state").into_state();
     let r = &state.resources[0];
     assert_eq!(r.identity.as_str(), "_accounts.registry_prod");
-    assert_eq!(r.binding.as_deref(), Some("_accounts.registry_prod"));
-    let deps: Vec<&str> = r.dependency_bindings.iter().map(String::as_str).collect();
+    assert_eq!(
+        r.binding.as_ref().map(AbsoluteBindingAddress::as_str),
+        Some("_accounts.registry_prod")
+    );
+    let deps: Vec<&str> = r
+        .dependency_bindings
+        .iter()
+        .map(AbsoluteBindingAddress::as_str)
+        .collect();
     assert!(deps.contains(&"other.a"));
     assert!(deps.contains(&"_envs['prod-east']"));
 }
@@ -8624,9 +8750,7 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
 /// error rather than a debug-formatted string in state JSON.
 #[test]
 fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
-    use carina_core::resource::{
-        AccessPath, DeferredValue, Resource, State as ProviderState, Value,
-    };
+    use carina_core::resource::{DeferredValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let provider_state = ProviderState {
@@ -8635,7 +8759,12 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         attributes: [(
             "owner".to_string(),
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+                path: carina_core::resource::AuthoredAccessPath::with_fields(
+                    "net",
+                    "vpc",
+                    vec!["vpc_id".into()],
+                )
+                .resolve_root_for_test(),
             }),
         )]
         .into_iter()

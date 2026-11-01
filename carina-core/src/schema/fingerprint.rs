@@ -12,13 +12,13 @@ use sha2::{Digest, Sha256};
 use super::{
     AttrTypeKind, CompiledAttributeSchema as AttributeSchema,
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
-    CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, InputMode,
-    OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation, SchemaKind,
-    TypeIdentity, UniqueNameSpec, ValidatorType,
+    CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, IdentityMode,
+    InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation,
+    SchemaKind, TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v6";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v7";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -241,7 +241,7 @@ fn encode_attribute_schema(encoder: &mut CanonicalEncoder, schema: &AttributeSch
         block_name,
         write_only,
         keyed_partial_update,
-        identity,
+        identity_mode,
         deferred_populate,
     } = schema;
 
@@ -257,7 +257,7 @@ fn encode_attribute_schema(encoder: &mut CanonicalEncoder, schema: &AttributeSch
     encoder.option(keyed_partial_update.as_ref(), |encoder, keyed| {
         encoder.string(keyed.key_field().as_str());
     });
-    encoder.bool(*identity);
+    encode_identity_mode(encoder, *identity_mode);
     encoder.bool(*deferred_populate);
 }
 
@@ -400,6 +400,8 @@ fn encode_struct_field(encoder: &mut CanonicalEncoder, field: &StructField) {
         block_name,
         deferred_populate,
         write_only,
+        create_only,
+        identity_mode,
     } = field;
     encoder.string(name);
     encode_attribute_type(encoder, field_type);
@@ -408,6 +410,16 @@ fn encode_struct_field(encoder: &mut CanonicalEncoder, field: &StructField) {
     encoder.option(block_name.as_deref(), CanonicalEncoder::string);
     encoder.bool(*deferred_populate);
     encoder.bool(*write_only);
+    encoder.bool(*create_only);
+    encode_identity_mode(encoder, *identity_mode);
+}
+
+fn encode_identity_mode(encoder: &mut CanonicalEncoder, mode: IdentityMode) {
+    match mode {
+        IdentityMode::None => encoder.tag(0),
+        IdentityMode::Required => encoder.tag(1),
+        IdentityMode::WhenPresent => encoder.tag(2),
+    }
 }
 
 fn encode_schema_kind(encoder: &mut CanonicalEncoder, kind: SchemaKind) {

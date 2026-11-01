@@ -135,6 +135,8 @@ impl PatternStructField<Draft> {
             block_name,
             deferred_populate,
             write_only,
+            create_only,
+            identity_mode,
         } = self;
         Some(PatternStructField {
             name,
@@ -145,6 +147,8 @@ impl PatternStructField<Draft> {
             block_name,
             deferred_populate,
             write_only,
+            create_only,
+            identity_mode,
         })
     }
 }
@@ -167,7 +171,7 @@ impl PatternAttributeSchema<Draft> {
             block_name,
             write_only,
             keyed_partial_update,
-            identity,
+            identity_mode,
             deferred_populate,
         } = self;
         let attr_type = attr_type.compile_patterns(
@@ -187,7 +191,7 @@ impl PatternAttributeSchema<Draft> {
             block_name,
             write_only,
             keyed_partial_update,
-            identity,
+            identity_mode,
             deferred_populate,
         })
     }

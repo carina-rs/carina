@@ -10,7 +10,8 @@ homepage.workspace = true
 
 [features]
 test-shutdown = []
-test-utils = ["dep:tempfile"]
+test-support = []
+test-utils = ["dep:tempfile", "test-support"]
 
 [dependencies]
 carina-provider-protocol = { path = "../carina-provider-protocol" }

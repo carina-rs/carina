@@ -4,20 +4,24 @@
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
+use crate::binding_index::{BindingCompleteness, BindingValueSource, ResolvedBindings};
 use crate::differ::ComparisonContext;
 use crate::effect::ResolvedMove;
-use crate::parser::ProviderConfig;
+use crate::name_override::NameOverride;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
 use crate::provider::{ComparisonResolutionError, ProviderFactory, ProviderRouter};
 use crate::resource::{
-    AnonymousIdentityModuleSource, ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue,
-    LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind, ResolvedResourceId,
-    Resource, ResourceId, ResourceIdentity, Value, ValueString,
+    AnonymousIdentityModuleSource, ApplyTimeUnknown, BindingAddress, ConcreteValue, DataSource,
+    DeferredValue, LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value, ValueString,
 };
 use crate::schema::{
-    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
-    SchemaRegistry, Shape, ValidatedResourceSchema,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, IdentityMode,
+    IdentityPath, IdentityPathSegment, SchemaRegistry, Shape, ValidatedResourceSchema,
 };
 use crate::validation::is_string_compatible_type;
 use crate::value::{CanonicalizedProviderConfigs, CanonicalizedResources};
@@ -148,76 +152,406 @@ pub fn generate_random_suffix() -> String {
 /// fields that cannot change in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnonymousIdentityBasis {
-    /// At least one configured create-only or schema identity attribute is
-    /// set, so the normal identifier hash is based on immutable input.
+    /// Every declared identity path is complete (including typed
+    /// when-present absence), or (when no identity is declared) at least one
+    /// configured create-only attribute is set, so the normal identifier hash
+    /// is based on immutable input.
     Stable,
     /// No stable schema attribute is set, so the identifier is derived from
     /// mutable user attributes.
     AttributeDerived,
+    /// The schema declares identity paths, but at least one required value is
+    /// absent or one written value has no stable value or reference expression
+    /// at plan time. Anonymous resources cannot derive an address from this
+    /// basis.
+    IncompleteDeclaredIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CompleteIdentityValue {
+    /// An optional when-present identity path that was not written at all.
+    Absent,
+    /// A user-written value in its schema-canonical spelling.
+    Written(String),
+    /// An authored expression whose leaves are references or literals. The
+    /// deterministic spelling is hashed, so resolving its references later
+    /// cannot change this identity input.
+    ReferenceExpression(String),
+    /// A generated-name prefix written through `<attribute>_prefix`.
+    Prefix(String),
+    /// An authored expression written through `<attribute>_prefix`. Its
+    /// deterministic spelling is hashed independently from an ordinary
+    /// identity expression and from a literal generated-name prefix.
+    PrefixExpression(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CompleteIdentityValues(BTreeMap<IdentityPath, CompleteIdentityValue>);
+
+impl CompleteIdentityValues {
+    fn as_map(&self) -> &BTreeMap<IdentityPath, CompleteIdentityValue> {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityValues {
+    Complete(CompleteIdentityValues),
+    Incomplete { missing_paths: Vec<IdentityPath> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnonymousIdentityInputs {
+    /// A schema with declared identity hashes only those paths. Completeness
+    /// is carried in the type so an incomplete set cannot reach the hash
+    /// function.
+    DeclaredIdentity(IdentityValues),
+    /// The legacy rule, retained byte-for-byte for schemas without identity.
+    CreateOnly(BTreeMap<String, String>),
+}
+
+fn top_level_stable_hash_value<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
+    attribute: &str,
+) -> Option<String> {
+    if let Some(prefix) = resource.prefixes.get(attribute) {
+        return Some(format!("Prefix({prefix:?})"));
+    }
+
+    let unresolved_prefix = format!("{attribute}_prefix");
+    resource
+        .attributes
+        .get(&unresolved_prefix)
+        .map(|value| match value {
+            Value::Concrete(ConcreteValue::String(prefix)) => {
+                format!("Prefix({:?})", prefix.expose_plaintext())
+            }
+            value => format!("Prefix({})", deterministic_value_string(value)),
+        })
+        .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
+}
+
+fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> bool {
+    match value {
+        Value::Concrete(ConcreteValue::List(values)) => {
+            values.iter().all(value_has_authored_plan_time_expression)
+        }
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            values.values().all(value_has_authored_plan_time_expression)
+        }
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::StringList(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Duration(_),
+        ) => true,
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .all(value_has_authored_plan_time_expression),
+        Value::Deferred(DeferredValue::ResourceRef { .. } | DeferredValue::BindingRef { .. }) => {
+            true
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            value_has_authored_plan_time_expression(value)
+                && value_has_authored_plan_time_expression(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_has_authored_plan_time_expression(expression.lhs())
+                && value_has_authored_plan_time_expression(expression.rhs())
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            parts.iter().all(|part| match part {
+                crate::resource::InterpolationPart::Literal(_) => true,
+                crate::resource::InterpolationPart::Expr(value) => {
+                    value_has_authored_plan_time_expression(value)
+                }
+            })
+        }
+        Value::Deferred(DeferredValue::FunctionCall { args, .. })
+        | Value::Deferred(DeferredValue::ResolvedFunctionCall { args, .. }) => args
+            .iter()
+            .all(|argument| value_has_authored_plan_time_expression(argument.walker_value())),
+        Value::Deferred(DeferredValue::Access(access)) => {
+            value_has_authored_plan_time_expression(access.base())
+        }
+        // Declared identity is rendered into a public address suffix. Even a
+        // fully-authored secret leaf is therefore incomplete: hashing its
+        // deterministic spelling would disclose plaintext-derived material.
+        // The legacy create-only hash does not call this predicate.
+        Value::Deferred(DeferredValue::Secret(_)) => false,
+        Value::Deferred(
+            DeferredValue::Unavailable { .. }
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
+        ) => false,
+    }
+}
+
+enum IdentityPathInput<'a, P: PlaceholderKind, B: BindingAddress> {
+    /// No value was authored at this path.
+    Absent,
+    /// An ancestor was written, but its plan-time shape is unavailable, so
+    /// the leaf cannot be classified as absent.
+    Unavailable,
+    GeneratedPrefix(&'a str),
+    AuthoredPrefix(&'a Value<P, B>),
+    Value(&'a Value<P, B>),
+}
+
+/// Missing roots or fields are absent; an unavailable ancestor shape is an error.
+fn value_at_identity_path<'a, P: PlaceholderKind, B: BindingAddress>(
+    root: Option<&'a Value<P, B>>,
+    path: &IdentityPath,
+) -> Result<Option<&'a Value<P, B>>, ()> {
+    let Some(mut value) = root else {
+        return Ok(None);
+    };
+    for field in path.struct_fields() {
+        let Value::Concrete(ConcreteValue::Map(fields)) = value else {
+            return Err(());
+        };
+        let Some(field_value) = fields.get(field) else {
+            return Ok(None);
+        };
+        value = field_value;
+    }
+    Ok(Some(value))
+}
+
+fn identity_path_input<'a, S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &'a Resource<S, P, B>,
+    path: &IdentityPath,
+) -> IdentityPathInput<'a, P, B> {
+    if path.segments().len() == 1 {
+        if let Some(prefix) = resource.prefixes.get(path.attribute_name()) {
+            return IdentityPathInput::GeneratedPrefix(prefix);
+        }
+        if let Some(prefix) = resource
+            .attributes
+            .get(&format!("{}_prefix", path.attribute_name()))
+        {
+            return IdentityPathInput::AuthoredPrefix(prefix);
+        }
+    }
+    match value_at_identity_path(resource.get_attr(path.attribute_name()), path) {
+        Ok(None) => IdentityPathInput::Absent,
+        Ok(Some(value)) => IdentityPathInput::Value(value),
+        Err(()) => IdentityPathInput::Unavailable,
+    }
+}
+
+fn complete_identity_value<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
+    schema: &ValidatedResourceSchema,
+    path: &IdentityPath,
+) -> Option<CompleteIdentityValue> {
+    let node = schema.effective_node_at_identity_path(path)?;
+    let identity_mode = node.identity_mode();
+    match identity_path_input(resource, path) {
+        IdentityPathInput::Absent if identity_mode.allows_absence() => {
+            Some(CompleteIdentityValue::Absent)
+        }
+        IdentityPathInput::Absent | IdentityPathInput::Unavailable => None,
+        IdentityPathInput::GeneratedPrefix(prefix) => {
+            Some(CompleteIdentityValue::Prefix(format!("Prefix({prefix:?})")))
+        }
+        IdentityPathInput::AuthoredPrefix(Value::Concrete(ConcreteValue::String(prefix))) => Some(
+            CompleteIdentityValue::Prefix(format!("Prefix({:?})", prefix.expose_plaintext())),
+        ),
+        IdentityPathInput::AuthoredPrefix(value @ Value::Deferred(_))
+            if value_has_authored_plan_time_expression(value) =>
+        {
+            Some(CompleteIdentityValue::PrefixExpression(
+                deterministic_value_string(value),
+            ))
+        }
+        IdentityPathInput::AuthoredPrefix(
+            Value::Concrete(
+                ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::List(_)
+                | ConcreteValue::Map(_)
+                | ConcreteValue::StringList(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Duration(_),
+            )
+            | Value::Deferred(_),
+        ) => None,
+        IdentityPathInput::Value(value @ Value::Deferred(_))
+            if value_has_authored_plan_time_expression(value) =>
+        {
+            Some(CompleteIdentityValue::ReferenceExpression(
+                deterministic_value_string(value),
+            ))
+        }
+        IdentityPathInput::Value(value) if value_has_authored_plan_time_expression(value) => {
+            schema_canonical_value_string(value, Some(node.field_type()), schema.as_schema().defs())
+                .map(CompleteIdentityValue::Written)
+        }
+        IdentityPathInput::Value(
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::List(_)
+                | ConcreteValue::Map(_)
+                | ConcreteValue::StringList(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Duration(_),
+            )
+            | Value::Deferred(_),
+        ) => None,
+    }
 }
 
 /// Return the immutable schema inputs that participate in an anonymous
 /// resource's standard identity hash.
 ///
-/// This is the single definition of both "stable identity basis" and the
-/// bytes hashed for that basis. An unresolved `<attribute>_prefix` is treated
-/// identically to the same prefix after [`resolve_attr_prefixes`] moves it into
-/// [`Resource::prefixes`].
-fn stable_anonymous_hash_inputs<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
-    schema: &ResourceSchema,
-) -> BTreeMap<String, String> {
-    let mut inputs = BTreeMap::new();
-    for attribute in schema
-        .create_only_attributes()
-        .into_iter()
-        .chain(schema.identity_attributes())
-    {
-        if inputs.contains_key(attribute) {
-            continue;
+/// This is the single selection seam for the identity-only and legacy
+/// create-only rules. For both rules, an unresolved top-level
+/// `<attribute>_prefix` is treated identically to the same stable user prefix
+/// after [`resolve_attr_prefixes`] moves it into [`Resource::prefixes`]. Nested
+/// identity paths read their value directly from the enclosing concrete struct.
+fn anonymous_identity_inputs<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
+    schema: &ValidatedResourceSchema,
+) -> AnonymousIdentityInputs {
+    if !schema.identity_paths().is_empty() {
+        let mut values = BTreeMap::new();
+        let mut missing_paths = Vec::new();
+        for path in schema.identity_paths() {
+            match complete_identity_value(resource, schema, path) {
+                Some(value) => {
+                    values.insert(path.clone(), value);
+                }
+                None => missing_paths.push(path.clone()),
+            }
         }
-
-        let hash_value = if let Some(prefix) = resource.prefixes.get(attribute) {
-            Some(format!("Prefix({prefix:?})"))
+        let values = if missing_paths.is_empty() {
+            IdentityValues::Complete(CompleteIdentityValues(values))
         } else {
-            let unresolved_prefix = format!("{attribute}_prefix");
-            resource
-                .attributes
-                .get(&unresolved_prefix)
-                .map(|value| match value {
-                    Value::Concrete(ConcreteValue::String(prefix)) => {
-                        format!("Prefix({:?})", prefix.expose_plaintext())
-                    }
-                    value => format!("Prefix({})", deterministic_value_string(value)),
-                })
-                .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
+            IdentityValues::Incomplete { missing_paths }
         };
+        AnonymousIdentityInputs::DeclaredIdentity(values)
+    } else {
+        let values = schema
+            .as_schema()
+            .create_only_attributes()
+            .into_iter()
+            .filter_map(|attribute| {
+                top_level_stable_hash_value(resource, attribute)
+                    .map(|value| (attribute.to_string(), value))
+            })
+            .collect();
+        AnonymousIdentityInputs::CreateOnly(values)
+    }
+}
 
-        if let Some(hash_value) = hash_value {
-            inputs.insert(attribute.to_string(), hash_value);
+fn anonymous_identity_basis(inputs: &AnonymousIdentityInputs) -> AnonymousIdentityBasis {
+    match inputs {
+        AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(_)) => {
+            AnonymousIdentityBasis::Stable
+        }
+        AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Incomplete { .. }) => {
+            AnonymousIdentityBasis::IncompleteDeclaredIdentity
+        }
+        AnonymousIdentityInputs::CreateOnly(values) if !values.is_empty() => {
+            AnonymousIdentityBasis::Stable
+        }
+        AnonymousIdentityInputs::CreateOnly(_) => AnonymousIdentityBasis::AttributeDerived,
+    }
+}
+
+fn encode_count(hasher: &mut Sha256, count: usize) {
+    let count = u64::try_from(count).expect("identity encoding count fits in u64");
+    hasher.update(count.to_le_bytes());
+}
+
+fn encode_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    encode_count(hasher, value.len());
+    hasher.update(value);
+}
+
+/// Hash schema-declared identity with a versioned canonical byte encoding.
+///
+/// Encoding `v1` is: domain string; provider-entry count followed by sorted
+/// `key,value` UTF-8 strings; identity-path count followed by each path's
+/// segment count, a segment tag (`0` attribute, `1` struct field), its UTF-8
+/// name, and a value-kind tag (`0` written, `1` reference expression, `2`
+/// literal prefix, `3` prefix expression, `4` absent). Kinds `0` through `3`
+/// are followed by the deterministic value spelling; kind `4` has no payload.
+/// Counts and every string's byte length are unsigned 64-bit little-endian
+/// integers. SHA-256 is truncated to its first 32 bits for the existing
+/// eight-hex-character address suffix. Tags `0` through `3` are stable and
+/// retain their original encodings.
+fn hash_declared_identity_inputs(
+    provider_identity: &BTreeMap<String, String>,
+    identity: &CompleteIdentityValues,
+) -> u32 {
+    let mut hasher = Sha256::new();
+    encode_length_prefixed(&mut hasher, b"carina-anonymous-identity-v1");
+    encode_count(&mut hasher, provider_identity.len());
+    for (key, value) in provider_identity {
+        encode_length_prefixed(&mut hasher, key.as_bytes());
+        encode_length_prefixed(&mut hasher, value.as_bytes());
+    }
+    encode_count(&mut hasher, identity.as_map().len());
+    for (path, value) in identity.as_map() {
+        encode_count(&mut hasher, path.segments().len());
+        for segment in path.segments() {
+            let (tag, bytes) = match segment {
+                IdentityPathSegment::Attribute(name) => (0, name.as_bytes()),
+                IdentityPathSegment::StructField(name) => (1, name.as_bytes()),
+            };
+            hasher.update([tag]);
+            encode_length_prefixed(&mut hasher, bytes);
+        }
+        let (tag, bytes) = match value {
+            CompleteIdentityValue::Absent => (4, None),
+            CompleteIdentityValue::Written(value) => (0, Some(value.as_bytes())),
+            CompleteIdentityValue::ReferenceExpression(value) => (1, Some(value.as_bytes())),
+            CompleteIdentityValue::Prefix(value) => (2, Some(value.as_bytes())),
+            CompleteIdentityValue::PrefixExpression(value) => (3, Some(value.as_bytes())),
+        };
+        hasher.update([tag]);
+        if let Some(bytes) = bytes {
+            encode_length_prefixed(&mut hasher, bytes);
         }
     }
-    inputs
+    let digest = hasher.finalize();
+    u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 has four bytes"))
 }
 
 /// Classify the identity basis for an anonymous resource.
 ///
 /// Returns `None` when the resource has no schema, so its identity basis is
-/// unknown. Otherwise, presence is what matters here, not whether a value is
-/// concrete yet. A deferred create-only or identity value will become
-/// concrete later but is still an immutable identity input.
-pub fn classify_anonymous_identity_basis<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+/// unknown. Otherwise, the selected policy input values determine whether the
+/// basis is stable. Declared identity is incomplete when any required selected
+/// value is absent or any written value has no stable expression at plan time.
+/// When-present absence is a complete typed value. Authored resource
+/// references are complete because their expressions, rather than their later
+/// resolved values, enter the hash.
+pub fn classify_anonymous_identity_basis<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     registry: &SchemaRegistry,
 ) -> Option<AnonymousIdentityBasis> {
     let schema = registry.get_for(resource)?;
-    let schema = schema.as_schema();
-
-    if stable_anonymous_hash_inputs(resource, schema).is_empty() {
-        Some(AnonymousIdentityBasis::AttributeDerived)
-    } else {
-        Some(AnonymousIdentityBasis::Stable)
-    }
+    Some(anonymous_identity_basis(&anonymous_identity_inputs(
+        resource,
+        schema.schema(),
+    )))
 }
 
 #[derive(Debug, Clone)]
@@ -261,7 +595,9 @@ impl Ord for AnonymousResourceKind {
 }
 
 impl AnonymousResourceKind {
-    fn of<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(resource: &Resource<S, P>) -> Self {
+    fn of<S: AnonymousIdentityModuleSource, P: PlaceholderKind, B: BindingAddress>(
+        resource: &Resource<S, P, B>,
+    ) -> Self {
         let module_scope = resource
             .module_source
             .as_ref()
@@ -284,6 +620,174 @@ impl AnonymousResourceKind {
     }
 }
 
+/// Authored source range retained for one anonymous-identity error member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnonymousIdentitySourceLocation {
+    file: PathBuf,
+    span: SourceSpan,
+}
+
+impl AnonymousIdentitySourceLocation {
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    pub fn span(&self) -> SourceSpan {
+        self.span
+    }
+}
+
+/// One concrete declaration represented by a typed anonymous-identity error.
+///
+/// The process-local pending [`ResourceId`] is a system-assigned identity even
+/// before a persistent anonymous address can be computed. Carrying it through
+/// canonicalization lets source-aware callers map the exact declaration
+/// without re-running identity policy on a raw resource shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnonymousIdentityErrorMember {
+    resource_id: ResourceId,
+    source_locations: Vec<AnonymousIdentitySourceLocation>,
+}
+
+impl AnonymousIdentityErrorMember {
+    fn from_resource<S: AnonymousIdentityModuleSource, P: PlaceholderKind, B: BindingAddress>(
+        resource: &Resource<S, P, B>,
+    ) -> Self {
+        let source_locations = if let Some(origin) = resource.loop_provenance.display_origin()
+            && let Some(span) = origin.source_span()
+        {
+            vec![AnonymousIdentitySourceLocation {
+                file: PathBuf::from(origin.file()),
+                span,
+            }]
+        } else {
+            resource
+                .module_source
+                .as_ref()
+                .into_iter()
+                .flat_map(AnonymousIdentityModuleSource::anonymous_authored_locations)
+                .map(|(file, span)| AnonymousIdentitySourceLocation { file, span })
+                .collect()
+        };
+        Self {
+            resource_id: resource.id.clone(),
+            source_locations,
+        }
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn source_locations(&self) -> &[AnonymousIdentitySourceLocation] {
+        &self.source_locations
+    }
+}
+
+fn anonymous_identity_error_members<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
+    resources: &[Resource<S, P, B>],
+    resource_indices: &[usize],
+) -> Vec<AnonymousIdentityErrorMember> {
+    resource_indices
+        .iter()
+        .map(|&index| AnonymousIdentityErrorMember::from_resource(&resources[index]))
+        .collect()
+}
+
+/// An anonymous resource whose schema-declared identity cannot produce an
+/// address because one or more values have no authored plan-time material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteDeclaredIdentity {
+    kind: AnonymousResourceKind,
+    missing_paths: Vec<IdentityPath>,
+    members: Vec<AnonymousIdentityErrorMember>,
+}
+
+impl IncompleteDeclaredIdentity {
+    /// Identity paths whose values have no authored plan-time material.
+    pub fn missing_paths(&self) -> &[IdentityPath] {
+        &self.missing_paths
+    }
+
+    /// Every concrete declaration represented by this grouped failure.
+    pub fn members(&self) -> &[AnonymousIdentityErrorMember] {
+        &self.members
+    }
+}
+
+impl std::fmt::Display for IncompleteDeclaredIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let paths = self
+            .missing_paths
+            .iter()
+            .map(|path| format!("'{path}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (value_noun, unavailable_verb, repair_noun) = if self.missing_paths.len() == 1 {
+            ("identity value", "is", "the identity value")
+        } else {
+            ("identity values", "are", "each identity value")
+        };
+        write!(
+            formatter,
+            "Anonymous resource of type '{}' cannot derive an address because {value_noun} \
+             {paths} {unavailable_verb} not available as a written value or authored expression \
+             at plan time. Write {repair_noun} or give the resource a name with `let`.",
+            self.kind.display_type(),
+        )
+    }
+}
+
+impl std::error::Error for IncompleteDeclaredIdentity {}
+
+/// Find every anonymous declaration group with incomplete schema-declared
+/// identity. Equal failures are grouped so CLI output is deterministic while
+/// source-aware callers can still attach the error to each declaration.
+pub fn check_incomplete_declared_identities<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
+    resources: &[Resource<S, P, B>],
+    registry: &SchemaRegistry,
+) -> Vec<IncompleteDeclaredIdentity> {
+    let mut failures = BTreeMap::<
+        (AnonymousResourceKind, Vec<IdentityPath>),
+        Vec<AnonymousIdentityErrorMember>,
+    >::new();
+    for resource in resources {
+        if resource.binding.is_some() || resource.id.identity_str().is_some() {
+            continue;
+        }
+        let Some(schema) = registry.get_for(resource) else {
+            continue;
+        };
+        let AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Incomplete { missing_paths }) =
+            anonymous_identity_inputs(resource, schema.schema())
+        else {
+            continue;
+        };
+        failures
+            .entry((AnonymousResourceKind::of(resource), missing_paths))
+            .or_default()
+            .push(AnonymousIdentityErrorMember::from_resource(resource));
+    }
+    failures
+        .into_iter()
+        .map(
+            |((kind, missing_paths), members)| IncompleteDeclaredIdentity {
+                kind,
+                missing_paths,
+                members,
+            },
+        )
+        .collect()
+}
+
 /// A group of anonymous resources whose identities would all be derived from
 /// mutable attributes within the same ownership scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,9 +799,9 @@ impl AttributeDerivedAnonymousResourceConflict {
     /// Return whether `resource` is one of the declarations represented by
     /// this conflict. This lets source-aware callers attach the shared error to
     /// each declaration without reimplementing the grouping rule.
-    pub fn includes<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
+    pub fn includes<S: AnonymousIdentityModuleSource, P: PlaceholderKind, B: BindingAddress>(
         &self,
-        resource: &Resource<S, P>,
+        resource: &Resource<S, P, B>,
         registry: &SchemaRegistry,
     ) -> bool {
         resource.binding.is_none()
@@ -357,6 +861,10 @@ pub struct LoopAnonymousIdentityConflict {
 }
 
 impl LoopAnonymousIdentityConflict {
+    pub fn origin(&self) -> &LoopElementOrigin {
+        &self.origin
+    }
+
     pub fn file(&self) -> &str {
         self.origin.file()
     }
@@ -416,30 +924,86 @@ impl std::fmt::Display for LoopAnonymousIdentityConflict {
 
 impl std::error::Error for LoopAnonymousIdentityConflict {}
 
-/// A generated anonymous identifier shared by declarations that cannot be
-/// repaired as one authored loop rewrite.
+/// The invariant violated by an anonymous-resource collision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonymousResourceIdentifierCollisionKind {
+    /// Distinct identity inputs produced the same generated address.
+    SharedAddress,
+    /// The declarations have the same complete schema-declared natural key.
+    EqualDeclaredIdentity { same_identifier: bool },
+}
+
+/// Anonymous declarations that either share one generated address or declare
+/// the same complete natural key for one provider and resource type, regardless
+/// of provider instance.
 #[derive(Debug, Clone)]
 pub struct AnonymousResourceIdentifierCollision {
-    first_type: String,
-    second_type: String,
     identifier: String,
+    kind: AnonymousResourceIdentifierCollisionKind,
+    members: Vec<AnonymousIdentityErrorMember>,
 }
 
 impl AnonymousResourceIdentifierCollision {
-    /// Generated identity shared by the conflicting declarations.
+    /// The shared address, or the first declaration's address when equal
+    /// natural keys occur below different module prefixes.
     pub fn identifier(&self) -> &str {
         &self.identifier
+    }
+
+    /// The typed invariant violated by this collision.
+    pub fn kind(&self) -> AnonymousResourceIdentifierCollisionKind {
+        self.kind
+    }
+
+    /// Every concrete declaration participating in this collision.
+    pub fn members(&self) -> &[AnonymousIdentityErrorMember] {
+        &self.members
     }
 }
 
 impl std::fmt::Display for AnonymousResourceIdentifierCollision {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Anonymous resource identifier collision: '{}' and '{}' produce the same identifier \
-             '{}'. Use `let` bindings to give them distinct names.",
-            self.first_type, self.second_type, self.identifier,
-        )
+        let first_type = self.members[0].resource_id.display_type();
+        match self.kind {
+            AnonymousResourceIdentifierCollisionKind::SharedAddress => write!(
+                formatter,
+                "Anonymous resource identifier collision: '{}' and '{}' produce the same \
+                 identifier '{}'. Use `let` bindings to give them distinct names.",
+                first_type,
+                self.members[1].resource_id.display_type(),
+                self.identifier,
+            ),
+            AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity { same_identifier } => {
+                let first_provider_instance = self
+                    .members
+                    .first()
+                    .and_then(|member| member.resource_id.provider_instance.as_deref());
+                let provider_scope = if self.members.iter().all(|member| {
+                    member.resource_id.provider_instance.as_deref() == first_provider_instance
+                }) {
+                    "on the same provider route"
+                } else {
+                    "across provider instances"
+                };
+                if same_identifier {
+                    write!(
+                        formatter,
+                        "Anonymous resources of type '{}' {provider_scope} have equal declared \
+                         identity values and produce address '{}'. Give one of them a name with \
+                         `let`.",
+                        first_type, self.identifier,
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "Anonymous resources of type '{}' {provider_scope} have equal declared \
+                         identity values even though their module-scoped addresses differ. Give \
+                         one of them a name with `let`.",
+                        first_type,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -448,6 +1012,8 @@ impl std::error::Error for AnonymousResourceIdentifierCollision {}
 /// Typed failures from anonymous identity assignment.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum AnonymousIdentityError {
+    #[error(transparent)]
+    IncompleteDeclaredIdentity(Box<IncompleteDeclaredIdentity>),
     #[error(transparent)]
     AttributeDerived(Box<AttributeDerivedAnonymousResourceConflict>),
     #[error(transparent)]
@@ -538,7 +1104,7 @@ pub fn compute_anonymous_identifiers_with_factories<
     P: PlaceholderKind,
 >(
     resources: CanonicalizedResources<'_, S, P>,
-    providers: &[ProviderConfig<P>],
+    providers: &[crate::parser::ProviderConfig<P, crate::resource::AbsoluteBindingAddress>],
     factories: &[Box<dyn ProviderFactory>],
     registry: &SchemaRegistry,
     conflict_policy: AnonymousIdentityConflictPolicy,
@@ -571,6 +1137,12 @@ pub fn compute_anonymous_identifiers_with_factories<
 impl From<AttributeDerivedAnonymousResourceConflict> for AnonymousIdentityError {
     fn from(error: AttributeDerivedAnonymousResourceConflict) -> Self {
         Self::AttributeDerived(Box::new(error))
+    }
+}
+
+impl From<IncompleteDeclaredIdentity> for AnonymousIdentityError {
+    fn from(error: IncompleteDeclaredIdentity) -> Self {
+        Self::IncompleteDeclaredIdentity(Box::new(error))
     }
 }
 
@@ -701,8 +1273,8 @@ fn has_legacy_synthetic_identity_segment(identity: &str) -> bool {
 /// current resource, include that resource's resolved address in the repair
 /// text.
 pub fn check_legacy_loop_move_targets<S>(
-    state_blocks: &[StateBlock<impl PlaceholderKind>],
-    resources: &[Resource<S, impl PlaceholderKind>],
+    state_blocks: &[StateBlock<impl PlaceholderKind, impl crate::resource::BindingAddress>],
+    resources: &[Resource<S, impl PlaceholderKind, impl crate::resource::BindingAddress>],
 ) -> Vec<LegacyLoopMoveTargetError> {
     state_blocks
         .iter()
@@ -779,8 +1351,9 @@ pub fn check_legacy_loop_move_targets<S>(
 pub fn check_attribute_derived_anonymous_resource_conflicts<
     S: AnonymousIdentityModuleSource,
     P: PlaceholderKind,
+    B: BindingAddress,
 >(
-    resources: &[Resource<S, P>],
+    resources: &[Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> Vec<AttributeDerivedAnonymousResourceConflict> {
     let mut counts = BTreeMap::<AnonymousResourceKind, usize>::new();
@@ -813,18 +1386,21 @@ pub fn check_attribute_derived_anonymous_resource_conflicts<
 /// identity for them, so removing the binding would turn valid lint advice
 /// into a later hard error. Stable and singleton attribute-derived resources
 /// remain safe to anonymize.
-pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
-    resources: &[Resource<crate::resource::ModuleSource, P>],
+pub(crate) fn identity_required_bindings<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
+    resources: &[Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> HashSet<String> {
     let mut required = HashSet::new();
-    let mut resources_by_kind =
-        BTreeMap::<AnonymousResourceKind, Vec<&Resource<crate::resource::ModuleSource, P>>>::new();
+    let mut resources_by_kind = BTreeMap::<AnonymousResourceKind, Vec<&Resource<S, P, B>>>::new();
     for resource in resources {
         match classify_anonymous_identity_basis(resource, registry) {
             None => {
                 if let Some(binding) = &resource.binding {
-                    required.insert(binding.clone());
+                    required.insert(binding.to_string());
                 }
             }
             Some(AnonymousIdentityBasis::AttributeDerived) => {
@@ -832,6 +1408,11 @@ pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
                     .entry(AnonymousResourceKind::of(resource))
                     .or_default()
                     .push(resource);
+            }
+            Some(AnonymousIdentityBasis::IncompleteDeclaredIdentity) => {
+                if let Some(binding) = &resource.binding {
+                    required.insert(binding.to_string());
+                }
             }
             Some(AnonymousIdentityBasis::Stable) => {}
         }
@@ -842,7 +1423,7 @@ pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
             .into_values()
             .filter(|resources| resources.len() >= 2)
             .flatten()
-            .filter_map(|resource| resource.binding.clone()),
+            .filter_map(|resource| resource.binding.as_ref().map(ToString::to_string)),
     );
     required
 }
@@ -856,8 +1437,8 @@ pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
 /// - Generates a temporary name: `prefix + random_suffix`
 ///
 /// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
-pub fn resolve_attr_prefixes<P: PlaceholderKind>(
-    resources: &mut [Resource<crate::resource::ModuleSource, P>],
+pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
+    resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
@@ -1012,7 +1593,9 @@ pub fn reconcile_prefixed_names(
 ///
 /// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
 /// so the output is consistent across runs (HashMap iteration order is random).
-fn deterministic_value_string<P: PlaceholderKind>(value: &Value<P>) -> String {
+fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> String {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
             "ModuleIf({}, {}, {})",
@@ -1146,11 +1729,11 @@ fn deterministic_value_string<P: PlaceholderKind>(value: &Value<P>) -> String {
 }
 
 /// Stable concrete-value spelling used to decide whether a create-only value
-/// can participate in reconciliation. This deliberately has no provider
-/// context: anonymous identity hashing remains source-spelling based through
-/// [`deterministic_value_string`], while comparison canonicalization happens
-/// only at the matching seam below.
-fn comparable_create_only_value_string(value: &Value) -> Option<String> {
+/// can participate in reconciliation. Provider-independent schema
+/// canonicalization is layered on top by [`schema_canonical_value_string`].
+fn comparable_create_only_value_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> Option<String> {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
@@ -1181,7 +1764,7 @@ fn comparable_create_only_value_string(value: &Value) -> Option<String> {
                 .join(", ")
         )),
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            let mut entries: Vec<_> = map.iter().collect();
             entries.sort_by_key(|(key, _)| *key);
             let parts: Vec<String> = entries
                 .iter()
@@ -1195,8 +1778,40 @@ fn comparable_create_only_value_string(value: &Value) -> Option<String> {
     }
 }
 
-fn comparable_create_only_feature_string(value: &Value) -> String {
+fn comparable_create_only_feature_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> String {
     comparable_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
+}
+
+/// Provider-independent canonical spelling for identity and create-only keys.
+/// Enum identifiers, provider/state strings, and already-canonical enum values
+/// all reduce to the schema's API value.
+fn schema_canonical_value_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Option<String> {
+    if attr_type
+        .is_some_and(|attr_type| matches!(attr_type.shape_with_defs(defs), Shape::Enum { .. }))
+    {
+        let attr_type = attr_type.expect("checked above");
+        let resolver = crate::resource::EnumValueResolver::with_defs(attr_type, defs);
+        let canonical = match value {
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => resolver.resolve_raw(raw).ok(),
+            Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+                resolver.resolve_state_text(canonical.api_value()).ok()
+            }
+            Value::Concrete(ConcreteValue::String(value)) => {
+                resolver.resolve_state_text(value.expose_plaintext()).ok()
+            }
+            _ => None,
+        };
+        if let Some(canonical) = canonical {
+            return Some(format!("EnumApiValue({:?})", canonical.api_value()));
+        }
+    }
+    comparable_create_only_value_string(value)
 }
 
 /// Canonical comparison spelling for one create-only value under the owning
@@ -1227,7 +1842,7 @@ fn canonical_create_only_value_string(
                 .canonical_string(value.expose_plaintext(), identity, to_dsl)
                 .into_owned(),
         ),
-        _ => comparable_create_only_value_string(value),
+        _ => schema_canonical_value_string(value, attr_type, defs),
     }
 }
 
@@ -1323,9 +1938,9 @@ pub(crate) fn closest_unique_simhash_match<C: Copy>(
 /// Map values are expanded so each entry becomes a separate feature (e.g., `tags.Environment`),
 /// allowing SimHash to produce close hashes when only one map entry changes.
 /// Non-map values use `deterministic_value_string` as the feature value.
-pub(crate) fn flatten_value_for_simhash<P: PlaceholderKind>(
+pub(crate) fn flatten_value_for_simhash<P: PlaceholderKind, B: BindingAddress>(
     prefix: &str,
-    value: &Value<P>,
+    value: &Value<P, B>,
     out: &mut std::collections::BTreeMap<String, String>,
 ) {
     match value {
@@ -1411,9 +2026,9 @@ pub fn anonymous_identity_discriminator(identity: &ResourceIdentity) -> Option<S
 /// This is the shared feature set used by both anonymous identifier computation
 /// (when the schema has no create-only attributes) and `compute_resource_simhash`
 /// so the two always agree on what a resource's anonymous ID would be.
-fn simhash_from_identity_and_resource<S, P: PlaceholderKind>(
+fn simhash_from_identity_and_resource<S, P: PlaceholderKind, B: BindingAddress>(
     identity_values: &BTreeMap<String, String>,
-    resource: &Resource<S, P>,
+    resource: &Resource<S, P, B>,
 ) -> SimHash {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
@@ -1589,7 +2204,7 @@ fn module_name_from_instance_prefix(prefix: &str) -> String {
         .unwrap_or_else(|| "module".to_string())
 }
 
-fn discover_loop_module_prefix_collisions<S, P: PlaceholderKind>(
+fn discover_loop_module_prefix_collisions<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
     resources: &[Resource<S, P>],
 ) -> LoopModuleCollisionDiscovery {
     let mut by_current_prefix = BTreeMap::<String, Vec<(usize, usize)>>::new();
@@ -1644,13 +2259,17 @@ fn discover_loop_module_prefix_collisions<S, P: PlaceholderKind>(
                 });
             }
         } else {
-            let first = &resources[distinct_origins[0].0];
-            let second = &resources[distinct_origins[1].0];
             plain_errors.push(
                 AnonymousResourceIdentifierCollision {
-                    first_type: first.id.display_type(),
-                    second_type: second.id.display_type(),
                     identifier: current_prefix.clone(),
+                    kind: AnonymousResourceIdentifierCollisionKind::SharedAddress,
+                    members: anonymous_identity_error_members(
+                        resources,
+                        &distinct_origins
+                            .iter()
+                            .map(|(resource_index, _)| *resource_index)
+                            .collect::<Vec<_>>(),
+                    ),
                 }
                 .into(),
             );
@@ -1731,7 +2350,7 @@ fn loop_module_conflicts<S, P: PlaceholderKind>(
 #[cfg(test)]
 pub fn compute_anonymous_identifiers_for_test(
     resources: &mut [Resource],
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
@@ -1748,7 +2367,9 @@ pub fn compute_anonymous_identifiers_for_test(
 }
 
 /// Compute stable identifiers for anonymous resources (those without ResourceId identity).
-/// Uses create-only properties and provider identity attributes to generate a deterministic hash.
+/// Declared identity paths are the complete resource-side hash input when
+/// present; schemas without them retain the legacy create-only fallback.
+/// Provider identity attributes are included under either rule.
 ///
 /// `identity_attributes_fn` takes a provider name and returns the list of identity attribute names
 /// for that provider (e.g., `["region"]`).
@@ -1768,6 +2389,11 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
 
     let mut module_collision_discovery = discover_loop_module_prefix_collisions(resources);
     let mut identity_errors = std::mem::take(&mut module_collision_discovery.plain_errors);
+    identity_errors.extend(
+        check_incomplete_declared_identities(resources, registry)
+            .into_iter()
+            .map(AnonymousIdentityError::from),
+    );
     let mut direct_conflict_sources = Vec::new();
 
     if conflict_policy.rejects_attribute_derived() {
@@ -1806,8 +2432,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         }
     }
 
-    // First pass: compute identifiers and detect collisions
-    let mut computed: Vec<(usize, String, BTreeMap<String, String>)> = Vec::new();
+    // First pass: compute identifiers and detect collisions.
+    let mut computed: Vec<(usize, String, AnonymousIdentityInputs)> = Vec::new();
 
     for (idx, resource) in resources.iter().enumerate() {
         if resource.id.identity_str().is_some() {
@@ -1823,7 +2449,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
-        let schema = schema.as_schema();
 
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
@@ -1840,26 +2465,42 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
             }
         }
 
-        let hash_values = stable_anonymous_hash_inputs(resource, schema);
-        let use_simhash = hash_values.is_empty();
-
-        let hash_suffix = if use_simhash {
-            // Use SimHash for locality-sensitive hashing: similar inputs produce
-            // similar hashes, enabling Hamming distance reconciliation.
-            let simhash = simhash_from_identity_and_resource(&identity_values, resource);
-            AnonymousHashSuffix::SimHash(simhash)
-        } else {
-            // Use standard hash for create-only properties
-            let mut hasher = std::hash::DefaultHasher::new();
-            for (k, v) in &identity_values {
-                k.hash(&mut hasher);
-                v.hash(&mut hasher);
+        let hash_values = anonymous_identity_inputs(resource, schema.schema());
+        let hash_suffix = match &hash_values {
+            AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(values)) => {
+                AnonymousHashSuffix::Standard(hash_declared_identity_inputs(
+                    &identity_values,
+                    values,
+                ))
             }
-            for (k, v) in &hash_values {
-                k.hash(&mut hasher);
-                v.hash(&mut hasher);
+            AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Incomplete { .. }) => {
+                // The typed error was collected above. There is deliberately
+                // no hash branch for incomplete identity values.
+                continue;
             }
-            AnonymousHashSuffix::Standard((hasher.finish() & 0xFFFFFFFF) as u32)
+            AnonymousIdentityInputs::CreateOnly(values) if values.is_empty() => {
+                // Use SimHash for locality-sensitive hashing: similar inputs
+                // produce similar hashes, enabling Hamming-distance
+                // reconciliation for the legacy no-identity rule.
+                AnonymousHashSuffix::SimHash(simhash_from_identity_and_resource(
+                    &identity_values,
+                    resource,
+                ))
+            }
+            AnonymousIdentityInputs::CreateOnly(values) => {
+                // Preserve the legacy create-only encoding exactly for
+                // resource types that declare no identity paths.
+                let mut hasher = std::hash::DefaultHasher::new();
+                for (key, value) in &identity_values {
+                    key.hash(&mut hasher);
+                    value.hash(&mut hasher);
+                }
+                for (key, value) in values {
+                    key.hash(&mut hasher);
+                    value.hash(&mut hasher);
+                }
+                AnonymousHashSuffix::Standard((hasher.finish() & 0xFFFFFFFF) as u32)
+            }
         };
         let hash_str = hash_suffix.discriminator();
 
@@ -1908,6 +2549,75 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         .map(|(index, identity, _)| (*index, identity.clone()))
         .collect::<HashMap<_, _>>();
 
+    // Neither a module-instance prefix nor a provider-instance route is part
+    // of the persisted state-row key. Detect equal complete declared
+    // identities by provider and resource type before grouping ordinary
+    // address collisions, so different scoped addresses and routes cannot
+    // hide one real-world key that state cannot represent independently.
+    let mut declared_identity_groups =
+        BTreeMap::<(String, String, CompleteIdentityValues), Vec<usize>>::new();
+    for (computed_index, (resource_index, _, inputs)) in computed.iter().enumerate() {
+        let AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(values)) = inputs
+        else {
+            continue;
+        };
+        let resource = &resources[*resource_index];
+        declared_identity_groups
+            .entry((
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+                values.clone(),
+            ))
+            .or_default()
+            .push(computed_index);
+    }
+    let mut reported_declared_identity_groups = Vec::<BTreeSet<usize>>::new();
+    for (_, collision_members) in declared_identity_groups {
+        if collision_members.len() < 2 {
+            continue;
+        }
+        let resource_indices = collision_members
+            .iter()
+            .map(|&computed_index| computed[computed_index].0)
+            .collect::<Vec<_>>();
+        let mut has_direct_member = false;
+        for origin in resource_indices
+            .iter()
+            .filter_map(|&index| resources[index].loop_provenance.direct_origin().cloned())
+        {
+            has_direct_member = true;
+            record_direct_loop_conflict(
+                &mut direct_conflict_sources,
+                LoopConflictReason::IdenticalIdentityInputs,
+                &origin,
+            );
+        }
+        let has_plain_member = resource_indices
+            .iter()
+            .any(|&index| resources[index].loop_provenance.direct_origin().is_none());
+        if has_direct_member && !has_plain_member {
+            reported_declared_identity_groups
+                .push(collision_members.into_iter().collect::<BTreeSet<_>>());
+            continue;
+        }
+        let first_identifier = &computed[collision_members[0]].1;
+        let same_identifier = collision_members
+            .iter()
+            .all(|&computed_index| &computed[computed_index].1 == first_identifier);
+        identity_errors.push(
+            AnonymousResourceIdentifierCollision {
+                identifier: first_identifier.clone(),
+                kind: AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity {
+                    same_identifier,
+                },
+                members: anonymous_identity_error_members(resources, &resource_indices),
+            }
+            .into(),
+        );
+        reported_declared_identity_groups
+            .push(collision_members.into_iter().collect::<BTreeSet<_>>());
+    }
+
     // Detect collisions among identities generated in this pass.
     let mut collisions: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (computed_index, (_, identifier, _)) in computed.iter().enumerate() {
@@ -1918,6 +2628,13 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
     }
     for (identifier, collision_members) in collisions {
         if collision_members.len() < 2 {
+            continue;
+        }
+        if reported_declared_identity_groups.iter().any(|reported| {
+            collision_members
+                .iter()
+                .all(|member| reported.contains(member))
+        }) {
             continue;
         }
         let resource_indices: Vec<usize> = collision_members
@@ -1932,7 +2649,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
             continue;
         }
         let first_inputs = &computed[collision_members[0]].2;
-        let identical_stable_inputs = !first_inputs.is_empty()
+        let identical_stable_inputs = anonymous_identity_basis(first_inputs)
+            == AnonymousIdentityBasis::Stable
             && collision_members
                 .iter()
                 .all(|&computed_index| &computed[computed_index].2 == first_inputs);
@@ -1958,9 +2676,9 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         }
         identity_errors.push(
             AnonymousResourceIdentifierCollision {
-                first_type: resources[resource_indices[0]].id.display_type(),
-                second_type: resources[resource_indices[1]].id.display_type(),
                 identifier,
+                kind: AnonymousResourceIdentifierCollisionKind::SharedAddress,
+                members: anonymous_identity_error_members(resources, &resource_indices),
             }
             .into(),
         );
@@ -1997,9 +2715,9 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         }
         identity_errors.push(
             AnonymousResourceIdentifierCollision {
-                first_type: resources[resource_indices[0]].id.display_type(),
-                second_type: resources[resource_indices[1]].id.display_type(),
                 identifier: identity,
+                kind: AnonymousResourceIdentifierCollisionKind::SharedAddress,
+                members: anonymous_identity_error_members(resources, &resource_indices),
             }
             .into(),
         );
@@ -2045,7 +2763,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
 #[cfg(test)]
 pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
     resources: &mut [Resource],
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
@@ -2067,7 +2785,7 @@ pub struct AnonymousIdStateInfo {
     projected_id: ResolvedResourceId,
     origin_id: ResolvedResourceId,
     create_only_values: StateCreateOnlyValues,
-    identity_values: StateIdentityValues,
+    identity_values: StateRowIdentityValues,
 }
 
 impl AnonymousIdStateInfo {
@@ -2077,18 +2795,21 @@ impl AnonymousIdStateInfo {
     /// The full typed ids keep the effective name, persisted origin, and
     /// provider route together. A projection across provider or resource type
     /// is rejected instead of allowing callers to assemble inconsistent
-    /// identity fields.
-    pub fn try_from_state_attributes(
+    /// identity fields. Schema-declared identity values use each name
+    /// override's original value, so callers do not need to distinguish a
+    /// temporary unique name from the resource's authored identity.
+    pub fn try_from_state_row(
         origin_id: ResolvedResourceId,
         projected_id: Option<ResolvedResourceId>,
         schema: &ValidatedResourceSchema,
         attributes: &HashMap<String, Value>,
+        name_overrides: &HashMap<String, NameOverride>,
     ) -> Option<Self> {
         Self::try_from_comparable_values(
             origin_id,
             projected_id,
             StateCreateOnlyValues::from_state_attributes(schema, attributes),
-            StateIdentityValues::from_state_attributes(schema, attributes),
+            StateRowIdentityValues::from_state_row(schema, attributes, name_overrides),
         )
     }
 
@@ -2105,7 +2826,7 @@ impl AnonymousIdStateInfo {
             origin_id,
             projected_id,
             StateCreateOnlyValues::default(),
-            StateIdentityValues::default(),
+            StateRowIdentityValues::default(),
         )
     }
 
@@ -2113,7 +2834,7 @@ impl AnonymousIdStateInfo {
         origin_id: ResolvedResourceId,
         projected_id: Option<ResolvedResourceId>,
         create_only_values: StateCreateOnlyValues,
-        identity_values: StateIdentityValues,
+        identity_values: StateRowIdentityValues,
     ) -> Option<Self> {
         let projected_id = projected_id.unwrap_or_else(|| origin_id.clone());
         if origin_id.provider() != projected_id.provider()
@@ -2155,84 +2876,308 @@ impl AnonymousIdStateInfo {
     }
 }
 
-/// Canonical state-side values for schema identity attributes that are not
-/// also create-only. Attributes in both sets are owned exclusively by the
-/// create-only seam.
+/// Canonical state-side values for every schema-declared identity path.
+///
+/// Identity is necessarily create-only, but this projection remains separate
+/// from top-level create-only reconciliation: identity-declared address
+/// migrations must match the real-world key and must not be redirected by a
+/// different mutable create-only collection from the legacy hash rule. Values
+/// are built only from a complete state row plus its name overrides, which
+/// substitute authored original names for temporary replacement names.
 #[derive(Clone, Default)]
-struct StateIdentityValues {
-    values: HashMap<String, ResolvedCreateOnlyValue>,
+struct StateRowIdentityValues {
+    values: BTreeMap<IdentityPath, StateIdentityValue>,
+    override_hidden_attributes: BTreeSet<String>,
 }
 
-impl StateIdentityValues {
-    fn from_state_attributes(
+/// Preserve path presence even when a persisted value cannot be compared.
+#[derive(Clone)]
+enum StateIdentityValue {
+    Absent,
+    Comparable(ResolvedCreateOnlyValue),
+    Uncomparable,
+}
+
+impl StateIdentityValue {
+    fn at_path(root: Option<&Value>, path: &IdentityPath) -> Self {
+        match value_at_identity_path(root, path) {
+            Ok(None) => Self::Absent,
+            Ok(Some(value)) => ResolvedCreateOnlyValue::from_value(value.clone())
+                .map(Self::Comparable)
+                .unwrap_or(Self::Uncomparable),
+            Err(()) => Self::Uncomparable,
+        }
+    }
+}
+
+impl StateRowIdentityValues {
+    fn from_state_row(
         schema: &ValidatedResourceSchema,
         observed_attributes: &HashMap<String, Value>,
+        name_overrides: &HashMap<String, NameOverride>,
     ) -> Self {
         let mut canonical = observed_attributes.clone();
+        let identity_attributes = schema
+            .identity_paths()
+            .iter()
+            .map(|path| path.attribute_name())
+            .collect::<BTreeSet<_>>();
+        let mut unknown_override_origins = BTreeSet::new();
+        for (attribute, override_) in name_overrides {
+            if !identity_attributes.contains(attribute.as_str()) {
+                continue;
+            }
+            match &override_.original_value {
+                Some(original_value) => {
+                    canonical.insert(
+                        attribute.clone(),
+                        Value::Concrete(ConcreteValue::String(original_value.clone().into())),
+                    );
+                }
+                None => {
+                    unknown_override_origins.insert(attribute.clone());
+                }
+            }
+        }
         crate::value::canonicalize_state_attribute_map_with_schema(
             &mut canonical,
             schema.as_schema(),
         );
-        let resource_schema = schema.as_schema();
-        let create_only = resource_schema
-            .create_only_attributes()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<HashSet<_>>();
-        let values = resource_schema
-            .identity_attributes()
-            .into_iter()
-            .filter(|attribute| !create_only.contains(*attribute))
-            .filter_map(|attribute| {
-                canonical
-                    .get(attribute)
-                    .cloned()
-                    .and_then(ResolvedCreateOnlyValue::from_value)
-                    .map(|value| (attribute.to_string(), value))
+        let values = schema
+            .identity_paths()
+            .iter()
+            .map(|path| {
+                let value = if unknown_override_origins.contains(path.attribute_name()) {
+                    StateIdentityValue::Uncomparable
+                } else {
+                    StateIdentityValue::at_path(canonical.get(path.attribute_name()), path)
+                };
+                (path.clone(), value)
             })
             .collect();
-        Self { values }
+        Self {
+            values,
+            override_hidden_attributes: unknown_override_origins,
+        }
     }
 }
 
-/// Desired schema identity values used only to disambiguate legacy loop
-/// owners. Create-only attributes, including overlaps, are represented by
-/// [`DesiredCreateOnlyValues`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredIdentityRowOutcome {
+    Match,
+    Mismatch,
+    Undecidable(DeclaredIdentityRowUndecidability),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredIdentityRowUndecidability {
+    DesiredUnresolved,
+    StateUncomparable,
+    OverrideOriginUnknown { attributes: BTreeSet<String> },
+    DesiredUnresolvedAndOverrideOriginUnknown { attributes: BTreeSet<String> },
+}
+
+impl DeclaredIdentityRowUndecidability {
+    fn desired_is_unresolved(&self) -> bool {
+        match self {
+            Self::DesiredUnresolved | Self::DesiredUnresolvedAndOverrideOriginUnknown { .. } => {
+                true
+            }
+            Self::StateUncomparable | Self::OverrideOriginUnknown { .. } => false,
+        }
+    }
+
+    fn override_hidden_attributes(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::DesiredUnresolved | Self::StateUncomparable => None,
+            Self::OverrideOriginUnknown { attributes }
+            | Self::DesiredUnresolvedAndOverrideOriginUnknown { attributes } => Some(attributes),
+        }
+    }
+}
+
+/// Desired values for every schema-declared identity path.
 struct DesiredIdentityValues {
-    values: HashMap<String, DesiredCreateOnlyValue>,
+    values: BTreeMap<IdentityPath, DesiredIdentityValue>,
+}
+
+enum DesiredIdentityValue {
+    Absent,
+    Resolved(ResolvedCreateOnlyValue),
+    Prefix(String),
+    Unresolved,
 }
 
 impl DesiredIdentityValues {
     fn from_resource(
         resource: &Resource,
-        schema: &ResourceSchema,
+        schema: &ValidatedResourceSchema,
         find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     ) -> Self {
-        let create_only = schema
-            .create_only_attributes()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<HashSet<_>>();
-        let values = desired_comparable_values(
-            resource,
-            schema,
-            schema
-                .identity_attributes()
-                .into_iter()
-                .filter(|attribute| !create_only.contains(*attribute)),
-            find_state_by_binding,
-            true,
-        );
+        let values = schema
+            .identity_paths()
+            .iter()
+            .filter_map(|path| match identity_path_input(resource, path) {
+                IdentityPathInput::Absent => schema
+                    .effective_node_at_identity_path(path)
+                    .is_some_and(|node| node.identity_mode() == IdentityMode::WhenPresent)
+                    .then(|| (path.clone(), DesiredIdentityValue::Absent)),
+                IdentityPathInput::Unavailable => None,
+                IdentityPathInput::GeneratedPrefix(prefix) => Some((
+                    path.clone(),
+                    DesiredIdentityValue::Prefix(prefix.to_string()),
+                )),
+                IdentityPathInput::AuthoredPrefix(Value::Concrete(ConcreteValue::String(
+                    prefix,
+                ))) => Some((
+                    path.clone(),
+                    DesiredIdentityValue::Prefix(prefix.expose_plaintext().to_string()),
+                )),
+                IdentityPathInput::AuthoredPrefix(value) => {
+                    let value = resolve_deferred_create_only_value(value, find_state_by_binding)
+                        .and_then(|resolved| match resolved {
+                            Value::Concrete(ConcreteValue::String(prefix)) => Some(
+                                DesiredIdentityValue::Prefix(prefix.expose_plaintext().to_string()),
+                            ),
+                            Value::Concrete(
+                                ConcreteValue::Int(_)
+                                | ConcreteValue::Float(_)
+                                | ConcreteValue::Bool(_)
+                                | ConcreteValue::List(_)
+                                | ConcreteValue::Map(_)
+                                | ConcreteValue::StringList(_)
+                                | ConcreteValue::EnumIdentifier(_)
+                                | ConcreteValue::CanonicalEnum(_)
+                                | ConcreteValue::Duration(_),
+                            )
+                            | Value::Deferred(_) => None,
+                        })
+                        .unwrap_or(DesiredIdentityValue::Unresolved);
+                    Some((path.clone(), value))
+                }
+                IdentityPathInput::Value(value) if path.segments().len() == 1 => {
+                    let value = canonical_or_resolved_create_only_value(
+                        value,
+                        schema.as_schema(),
+                        path.attribute_name(),
+                        find_state_by_binding,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(DesiredIdentityValue::Resolved)
+                    .unwrap_or(DesiredIdentityValue::Unresolved);
+                    Some((path.clone(), value))
+                }
+                IdentityPathInput::Value(value) => {
+                    let resolved = resolve_deferred_create_only_value(value, find_state_by_binding)
+                        .unwrap_or_else(|| value.clone());
+                    let value = ResolvedCreateOnlyValue::from_value(resolved)
+                        .map(DesiredIdentityValue::Resolved)
+                        .unwrap_or(DesiredIdentityValue::Unresolved);
+                    Some((path.clone(), value))
+                }
+            })
+            .collect();
         Self { values }
     }
 
-    fn resolved_subset_match(
+    fn compare_row(
         &self,
-        state_values: &StateIdentityValues,
-        schema: &ResourceSchema,
+        state_values: &StateRowIdentityValues,
+        schema: &ValidatedResourceSchema,
         context: &ComparisonContext<'_>,
-    ) -> (usize, bool) {
-        resolved_subset_match(&self.values, &state_values.values, schema, context)
+    ) -> DeclaredIdentityRowOutcome {
+        let mut desired_unresolved = false;
+        let mut override_hidden_attributes = BTreeSet::new();
+        let mut state_uncomparable = false;
+
+        for path in schema.identity_paths() {
+            let desired = self
+                .values
+                .get(path)
+                .unwrap_or(&DesiredIdentityValue::Unresolved);
+            if state_values
+                .override_hidden_attributes
+                .contains(path.attribute_name())
+            {
+                desired_unresolved |= matches!(desired, DesiredIdentityValue::Unresolved);
+                override_hidden_attributes.insert(path.attribute_name().to_string());
+                continue;
+            }
+            let state = state_values
+                .values
+                .get(path)
+                .unwrap_or(&StateIdentityValue::Uncomparable);
+            match (desired, state) {
+                (DesiredIdentityValue::Absent, StateIdentityValue::Absent) => {}
+                (
+                    DesiredIdentityValue::Absent,
+                    StateIdentityValue::Comparable(_) | StateIdentityValue::Uncomparable,
+                )
+                | (
+                    DesiredIdentityValue::Resolved(_) | DesiredIdentityValue::Prefix(_),
+                    StateIdentityValue::Absent,
+                ) => return DeclaredIdentityRowOutcome::Mismatch,
+                (
+                    DesiredIdentityValue::Unresolved,
+                    StateIdentityValue::Absent
+                    | StateIdentityValue::Comparable(_)
+                    | StateIdentityValue::Uncomparable,
+                ) => {
+                    desired_unresolved = true;
+                }
+                (
+                    DesiredIdentityValue::Resolved(_) | DesiredIdentityValue::Prefix(_),
+                    StateIdentityValue::Uncomparable,
+                ) => {
+                    state_uncomparable = true;
+                }
+                (
+                    DesiredIdentityValue::Resolved(desired),
+                    StateIdentityValue::Comparable(state),
+                ) => {
+                    let Some(node) = schema.effective_node_at_identity_path(path) else {
+                        return DeclaredIdentityRowOutcome::Mismatch;
+                    };
+                    if !desired.semantically_equal(
+                        state,
+                        schema.as_schema(),
+                        node.field_type(),
+                        context,
+                    ) {
+                        return DeclaredIdentityRowOutcome::Mismatch;
+                    }
+                }
+                (DesiredIdentityValue::Prefix(prefix), StateIdentityValue::Comparable(state)) => {
+                    let Some(node) = schema.effective_node_at_identity_path(path) else {
+                        return DeclaredIdentityRowOutcome::Mismatch;
+                    };
+                    if !state.starts_with(prefix, schema.as_schema(), node.field_type(), context) {
+                        return DeclaredIdentityRowOutcome::Mismatch;
+                    }
+                }
+            }
+        }
+
+        match (desired_unresolved, override_hidden_attributes.is_empty()) {
+            (true, true) => DeclaredIdentityRowOutcome::Undecidable(
+                DeclaredIdentityRowUndecidability::DesiredUnresolved,
+            ),
+            (false, false) => DeclaredIdentityRowOutcome::Undecidable(
+                DeclaredIdentityRowUndecidability::OverrideOriginUnknown {
+                    attributes: override_hidden_attributes,
+                },
+            ),
+            (true, false) => DeclaredIdentityRowOutcome::Undecidable(
+                DeclaredIdentityRowUndecidability::DesiredUnresolvedAndOverrideOriginUnknown {
+                    attributes: override_hidden_attributes,
+                },
+            ),
+            (false, true) if state_uncomparable => DeclaredIdentityRowOutcome::Undecidable(
+                DeclaredIdentityRowUndecidability::StateUncomparable,
+            ),
+            (false, true) => DeclaredIdentityRowOutcome::Match,
+        }
     }
 }
 
@@ -2247,26 +3192,44 @@ fn legacy_row_stable_identity_matches(
         return Ok(None);
     };
     let comparison = comparison_provider.comparison_for(registry, &candidate.resource.id)?;
-    let schema = schema.as_schema();
-    let desired_create_only =
-        DesiredCreateOnlyValues::from_resource(candidate.resource, schema, find_state_by_binding);
-    let desired_identity =
-        DesiredIdentityValues::from_resource(candidate.resource, schema, find_state_by_binding);
-    if state_entry.create_only_values.is_empty() && state_entry.identity_values.values.is_empty() {
+    let schema = schema.schema();
+    if !schema.identity_paths().is_empty() {
+        let desired_identity =
+            DesiredIdentityValues::from_resource(candidate.resource, schema, find_state_by_binding);
+        return Ok(
+            match desired_identity.compare_row(
+                &state_entry.identity_values,
+                schema,
+                comparison.context(),
+            ) {
+                DeclaredIdentityRowOutcome::Match => Some(true),
+                DeclaredIdentityRowOutcome::Mismatch => Some(false),
+                DeclaredIdentityRowOutcome::Undecidable(
+                    DeclaredIdentityRowUndecidability::DesiredUnresolved
+                    | DeclaredIdentityRowUndecidability::StateUncomparable
+                    | DeclaredIdentityRowUndecidability::OverrideOriginUnknown { .. }
+                    | DeclaredIdentityRowUndecidability::DesiredUnresolvedAndOverrideOriginUnknown {
+                        ..
+                    },
+                ) => None,
+            },
+        );
+    }
+
+    let desired_create_only = DesiredCreateOnlyValues::from_resource(
+        candidate.resource,
+        schema.as_schema(),
+        find_state_by_binding,
+    );
+    if state_entry.create_only_values.is_empty() {
         return Ok(None);
     }
     let (create_only_count, create_only_matches) = desired_create_only.resolved_subset_match(
         state_entry.create_only_values(),
-        schema,
+        schema.as_schema(),
         comparison.context(),
     );
-    let (identity_count, identity_matches) = desired_identity.resolved_subset_match(
-        &state_entry.identity_values,
-        schema,
-        comparison.context(),
-    );
-    Ok(((create_only_count + identity_count) > 0)
-        .then_some(create_only_matches && identity_matches))
+    Ok((create_only_count > 0).then_some(create_only_matches))
 }
 
 type LegacyLoopAddressKey = (String, String, String, Option<String>);
@@ -2431,8 +3394,8 @@ pub fn detect_legacy_loop_address_moves(
     Ok(migrations)
 }
 
-/// Cross-resource state information used to resolve simple deferred
-/// create-only references like `route_table_id = private_rtb.id`.
+/// Cross-resource state information used to resolve deferred create-only
+/// references like `route_table_id = private_rtb.id` and longer access paths.
 #[derive(Clone)]
 pub struct AnonymousIdBindingStateInfo {
     /// The resource name stored in state. Let-bound resources are usually
@@ -2451,21 +3414,32 @@ fn resolve_deferred_create_only_value(
     value: &Value,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Option<Value> {
-    let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
-        return None;
-    };
-    if !path.segments().is_empty() {
+    let root_bindings = value.root_bindings();
+    if root_bindings.is_empty() {
         return None;
     }
-
-    let candidates: Vec<AnonymousIdBindingStateInfo> = find_state_by_binding(path.binding())
-        .into_iter()
-        .filter(|entry| state_entry_matches_binding_scope(path.binding(), &entry.name))
-        .collect();
-    let [entry] = candidates.as_slice() else {
-        return None;
-    };
-    entry.attribute_values.get(path.attribute()).cloned()
+    let mut bindings = ResolvedBindings::default();
+    for binding in root_bindings {
+        let candidates = find_state_by_binding(binding.as_str())
+            .into_iter()
+            .filter(|entry| state_entry_matches_binding_scope(binding.as_str(), &entry.name))
+            .collect::<Vec<_>>();
+        let [entry] = candidates.as_slice() else {
+            continue;
+        };
+        bindings.set_with_completeness(
+            binding.as_str(),
+            entry.attribute_values.clone(),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+    }
+    match crate::resolver::resolve_ref_value_status(value, &bindings).ok()? {
+        crate::resolver::ValueResolution::Present(resolved) => Some(resolved),
+        crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_) => {
+            None
+        }
+    }
 }
 
 fn canonical_or_resolved_create_only_value(
@@ -2504,42 +3478,30 @@ impl ResolvedCreateOnlyValue {
         &self,
         other: &Self,
         schema: &ResourceSchema,
-        attribute: &str,
+        attr_type: &AttributeType,
         context: &ComparisonContext<'_>,
     ) -> bool {
-        schema
-            .attributes
-            .get(attribute)
-            .is_some_and(|attribute_schema| {
-                crate::differ::type_aware_equal(
-                    &self.value,
-                    &other.value,
-                    Some(&attribute_schema.attr_type),
-                    &schema.defs,
-                    context,
-                )
-            })
+        crate::differ::type_aware_equal(
+            &self.value,
+            &other.value,
+            Some(attr_type),
+            &schema.defs,
+            context,
+        )
     }
 
     fn starts_with(
         &self,
         prefix: &str,
         schema: &ResourceSchema,
-        attribute: &str,
+        attr_type: &AttributeType,
         context: &ComparisonContext<'_>,
     ) -> bool {
-        let Some(attribute_schema) = schema.attributes.get(attribute) else {
-            return false;
-        };
-        let state_key = canonical_create_only_value_string(
-            &self.value,
-            Some(&attribute_schema.attr_type),
-            &schema.defs,
-            context,
-        );
+        let state_key =
+            canonical_create_only_value_string(&self.value, Some(attr_type), &schema.defs, context);
         let prefix_key = canonical_create_only_value_string(
             &Value::Concrete(ConcreteValue::String(prefix.into())),
-            Some(&attribute_schema.attr_type),
+            Some(attr_type),
             &schema.defs,
             context,
         );
@@ -2564,11 +3526,18 @@ impl DesiredCreateOnlyValue {
         attribute: &str,
         context: &ComparisonContext<'_>,
     ) -> Option<bool> {
+        let attr_type = schema
+            .attributes
+            .get(attribute)
+            .map(|attribute| &attribute.attr_type);
         match self {
-            Self::Resolved(desired) => {
-                Some(desired.semantically_equal(state, schema, attribute, context))
-            }
-            Self::Prefix(prefix) => Some(state.starts_with(prefix, schema, attribute, context)),
+            Self::Resolved(desired) => Some(attr_type.is_some_and(|attr_type| {
+                desired.semantically_equal(state, schema, attr_type, context)
+            })),
+            Self::Prefix(prefix) => Some(
+                attr_type
+                    .is_some_and(|attr_type| state.starts_with(prefix, schema, attr_type, context)),
+            ),
             Self::Unresolved => None,
         }
     }
@@ -2809,28 +3778,188 @@ impl StateCreateOnlyValues {
     }
 }
 
+/// A complete declared identity that cannot select one legacy state row
+/// without operator intent.
+#[derive(Debug, Clone)]
+pub struct AmbiguousDeclaredIdentityMatch {
+    resource: ResolvedResourceId,
+    candidate_rows: Vec<ResolvedResourceId>,
+}
+
+impl AmbiguousDeclaredIdentityMatch {
+    /// The desired anonymous resource whose identity matched multiple rows.
+    pub fn resource(&self) -> &ResolvedResourceId {
+        &self.resource
+    }
+
+    /// Persisted rows that matched the resource's complete declared identity.
+    pub fn candidate_rows(&self) -> &[ResolvedResourceId] {
+        &self.candidate_rows
+    }
+}
+
+fn display_candidate_rows(candidate_rows: &[ResolvedResourceId]) -> String {
+    candidate_rows
+        .iter()
+        .map(|candidate| format!("`{candidate}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl std::fmt::Display for AmbiguousDeclaredIdentityMatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let candidates = display_candidate_rows(&self.candidate_rows);
+        write!(
+            formatter,
+            "Anonymous resource `{}` has complete declared identity matching more than one \
+             unclaimed legacy state row: {candidates}. Add a `moved` block to select the \
+             intended state row.",
+            self.resource,
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousDeclaredIdentityMatch {}
+
+/// One legacy row whose identity-bearing name override has no recorded
+/// permanent value.
+#[derive(Debug, Clone)]
+pub struct UnknownIdentityOverrideOriginRow {
+    row: ResolvedResourceId,
+    attributes: Vec<String>,
+}
+
+impl UnknownIdentityOverrideOriginRow {
+    pub fn row(&self) -> &ResolvedResourceId {
+        &self.row
+    }
+
+    pub fn attributes(&self) -> &[String] {
+        &self.attributes
+    }
+}
+
+/// Legacy state cannot expose the natural-key value hidden by a temporary
+/// name override, so automatic reconciliation requires operator intent.
+#[derive(Debug, Clone)]
+pub struct UnknownIdentityOverrideOrigin {
+    resource: ResolvedResourceId,
+    candidate_rows: Vec<UnknownIdentityOverrideOriginRow>,
+}
+
+impl UnknownIdentityOverrideOrigin {
+    pub fn resource(&self) -> &ResolvedResourceId {
+        &self.resource
+    }
+
+    pub fn candidate_rows(&self) -> &[UnknownIdentityOverrideOriginRow] {
+        &self.candidate_rows
+    }
+}
+
+impl std::fmt::Display for UnknownIdentityOverrideOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let candidates = self
+            .candidate_rows
+            .iter()
+            .map(|candidate| {
+                let attributes = candidate
+                    .attributes
+                    .iter()
+                    .map(|attribute| format!("`{attribute}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("`{}` ({attributes})", candidate.row)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "Anonymous resource `{}` cannot safely reconcile legacy state because the original \
+             identity value behind a temporary name override was not recorded for {candidates}. \
+             Add a `moved` block to select the intended state row.",
+            self.resource,
+        )
+    }
+}
+
+impl std::error::Error for UnknownIdentityOverrideOrigin {}
+
+/// A complete authored identity expression could not be evaluated from the
+/// available binding state while legacy rows remain eligible for migration.
+#[derive(Debug, Clone)]
+pub struct UnresolvedDeclaredIdentityMigration {
+    resource: ResolvedResourceId,
+    candidate_rows: Vec<ResolvedResourceId>,
+}
+
+impl UnresolvedDeclaredIdentityMigration {
+    pub fn resource(&self) -> &ResolvedResourceId {
+        &self.resource
+    }
+
+    pub fn candidate_rows(&self) -> &[ResolvedResourceId] {
+        &self.candidate_rows
+    }
+}
+
+impl std::fmt::Display for UnresolvedDeclaredIdentityMigration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let candidates = display_candidate_rows(&self.candidate_rows);
+        write!(
+            formatter,
+            "Anonymous resource `{}` has an authored declared-identity expression that cannot \
+             be evaluated from binding state while unclaimed legacy state rows remain: \
+             {candidates}. Add a `moved` block to select the intended state row.",
+            self.resource,
+        )
+    }
+}
+
+impl std::error::Error for UnresolvedDeclaredIdentityMigration {}
+
+/// Failures that prevent safe anonymous-state reconciliation.
+#[derive(Debug, thiserror::Error)]
+pub enum AnonymousIdentifierReconciliationError {
+    /// The initialized provider comparison context was unavailable.
+    #[error(transparent)]
+    Comparison(#[from] ComparisonResolutionError),
+    /// More than one legacy row has the same complete declared identity.
+    #[error(transparent)]
+    AmbiguousDeclaredIdentity(#[from] AmbiguousDeclaredIdentityMatch),
+    /// A candidate row's temporary name override lost its permanent origin.
+    #[error(transparent)]
+    UnknownIdentityOverrideOrigin(#[from] UnknownIdentityOverrideOrigin),
+    /// Authored identity evaluation was impossible while legacy rows remain.
+    #[error(transparent)]
+    UnresolvedDeclaredIdentity(#[from] UnresolvedDeclaredIdentityMigration),
+}
+
 /// Reconcile anonymous resource identifiers with existing state.
 ///
-/// When a create-only property changes on an anonymous resource, the computed
-/// hash-based identifier changes. This function detects such cases by comparing
-/// create-only property values and returns a resolved move from the old state
-/// row to the resource's freshly computed identifier when at least one
-/// create-only property matches (partial match). The desired resource identity
-/// is immutable at this boundary, so every match preserves the invariant that
-/// an anonymous identity is derived from its current identity inputs.
+/// For schemas with declared identity, this function matches a legacy state
+/// row only when every typed identity-path value recorded in state equals the
+/// desired value. Desired when-present absence matches only absence of that
+/// path in state. Other create-only values are ignored. For schemas without
+/// identity, it retains the historical full/partial create-only matching and
+/// SimHash fallback. Every accepted match returns a resolved move from the old
+/// row to the resource's freshly computed identifier.
 ///
 /// `find_state_by_type` takes (provider, resource_type) and returns screened
-/// state entries for that resource type with their create-only attribute
-/// values. Existence checks inspect every entry, while heuristic matching only
-/// inspects unclaimed candidates.
+/// state entries for that resource type with their identity-path and
+/// create-only values. Existence checks inspect every entry, while heuristic
+/// matching only inspects unclaimed candidates.
 /// `find_state_by_binding` takes a binding name and returns state entries
-/// carrying that binding across resource types, for resolving single-hop
-/// deferred create-only refs of the exact form `binding.attr`. Binding
-/// resolution is unresolvable when zero state entries match and ambiguous when
-/// multiple state entries with the same binding are visible in scope; both
-/// cases yield no value and are not errors. Dotted bindings are already
-/// module-qualified by their binding string, while bare bindings only resolve
-/// against dot-free root state entry names.
+/// carrying that binding across resource types, for resolving deferred
+/// create-only refs rooted at `binding.attr`, including longer access paths.
+/// Binding resolution is unresolvable when zero state entries match and ambiguous when
+/// multiple state entries with the same binding are visible in scope. Dotted
+/// bindings are already module-qualified by their binding string, while bare
+/// bindings only resolve against dot-free root state entry names. An
+/// unresolved ordinary create-only value remains eligible for partial-match
+/// reconciliation. An unresolved declared-identity expression instead returns
+/// a typed error when an unclaimed legacy row exists, because silently skipping
+/// that row would turn an address migration into delete plus create.
 /// Binding lookup reads an exact address's attributes; it does not select an
 /// identity to adopt or re-key, so it is not an identity-candidate source.
 /// A configured create-only attribute whose desired value cannot be resolved
@@ -2861,7 +3990,7 @@ pub fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
-) -> Result<Vec<ResolvedMove>, ComparisonResolutionError> {
+) -> Result<Vec<ResolvedMove>, AnonymousIdentifierReconciliationError> {
     let mut moves = Vec::new();
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for id in resources
@@ -2902,7 +4031,8 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         };
         let comparison = comparison_provider.comparison_for(registry, &resource.id)?;
-        let schema = schema.as_schema();
+        let validated_schema = schema.schema();
+        let schema = validated_schema.as_schema();
 
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
         let key = (
@@ -2915,6 +4045,120 @@ pub fn reconcile_anonymous_identifiers(
             .all()
             .any(|entry| entry.name() == resource_identity)
         {
+            continue;
+        }
+
+        let candidate_is_available = |entry: &AnonymousIdStateInfo| {
+            entry.name() != resource_identity
+                && !used_names
+                    .get(&key)
+                    .is_some_and(|names| names.contains(entry.name()))
+                && !claimed_names
+                    .get(&key)
+                    .is_some_and(|names| names.contains(entry.name()))
+        };
+
+        if !validated_schema.identity_paths().is_empty() {
+            let available_candidates = state_entries
+                .candidates()
+                .filter(|entry| candidate_is_available(entry));
+
+            let desired_identity = DesiredIdentityValues::from_resource(
+                resource,
+                validated_schema,
+                find_state_by_binding,
+            );
+            let candidate_outcomes = available_candidates
+                .map(|entry| {
+                    let outcome = desired_identity.compare_row(
+                        &entry.identity_values,
+                        validated_schema,
+                        comparison.context(),
+                    );
+                    (entry, outcome)
+                })
+                .collect::<Vec<_>>();
+
+            let mut unknown_override_rows = candidate_outcomes
+                .iter()
+                .filter_map(|(entry, outcome)| match outcome {
+                    DeclaredIdentityRowOutcome::Match | DeclaredIdentityRowOutcome::Mismatch => {
+                        None
+                    }
+                    DeclaredIdentityRowOutcome::Undecidable(reason) => reason
+                        .override_hidden_attributes()
+                        .map(|attributes| UnknownIdentityOverrideOriginRow {
+                            row: entry.origin_id().clone(),
+                            attributes: attributes.iter().cloned().collect(),
+                        }),
+                })
+                .collect::<Vec<_>>();
+            if !unknown_override_rows.is_empty() {
+                unknown_override_rows.sort_by_key(|candidate| candidate.row.to_string());
+                return Err(UnknownIdentityOverrideOrigin {
+                    resource: resolved_resource_id,
+                    candidate_rows: unknown_override_rows,
+                }
+                .into());
+            }
+
+            let mut unresolved_candidate_rows = candidate_outcomes
+                .iter()
+                .filter_map(|(entry, outcome)| match outcome {
+                    DeclaredIdentityRowOutcome::Match | DeclaredIdentityRowOutcome::Mismatch => {
+                        None
+                    }
+                    DeclaredIdentityRowOutcome::Undecidable(reason) => reason
+                        .desired_is_unresolved()
+                        .then(|| entry.origin_id().clone()),
+                })
+                .collect::<Vec<_>>();
+            if !unresolved_candidate_rows.is_empty() {
+                unresolved_candidate_rows.sort_by_key(ToString::to_string);
+                return Err(UnresolvedDeclaredIdentityMigration {
+                    resource: resolved_resource_id,
+                    candidate_rows: unresolved_candidate_rows,
+                }
+                .into());
+            }
+
+            let matches = candidate_outcomes
+                .iter()
+                .filter_map(|(entry, outcome)| match outcome {
+                    DeclaredIdentityRowOutcome::Match => Some(*entry),
+                    DeclaredIdentityRowOutcome::Mismatch => None,
+                    DeclaredIdentityRowOutcome::Undecidable(
+                        DeclaredIdentityRowUndecidability::DesiredUnresolved
+                        | DeclaredIdentityRowUndecidability::StateUncomparable
+                        | DeclaredIdentityRowUndecidability::OverrideOriginUnknown { .. }
+                        | DeclaredIdentityRowUndecidability::DesiredUnresolvedAndOverrideOriginUnknown {
+                            ..
+                        },
+                    ) => None,
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [matched_entry] => {
+                    moves.push(matched_entry.move_to(resolved_resource_id));
+                    claimed_names
+                        .entry(key)
+                        .or_default()
+                        .insert(matched_entry.name().to_string());
+                }
+                [] => {}
+                _ => {
+                    let mut candidate_rows = matches
+                        .iter()
+                        .map(|entry| entry.origin_id().clone())
+                        .collect::<Vec<_>>();
+                    candidate_rows.sort_by_key(ToString::to_string);
+                    return Err(AmbiguousDeclaredIdentityMatch {
+                        resource: resolved_resource_id,
+                        candidate_rows,
+                    }
+                    .into());
+                }
+            }
             continue;
         }
 
@@ -2932,15 +4176,7 @@ pub fn reconcile_anonymous_identifiers(
 
             let candidates = state_entries
                 .candidates()
-                .filter(|entry| entry.name() != resource_identity)
-                .filter(|entry| {
-                    !used_names
-                        .get(&key)
-                        .is_some_and(|names| names.contains(entry.name()))
-                        && !claimed_names
-                            .get(&key)
-                            .is_some_and(|names| names.contains(entry.name()))
-                })
+                .filter(|entry| candidate_is_available(entry))
                 .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
                     Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
                     _ => None,
@@ -2973,17 +4209,7 @@ pub fn reconcile_anonymous_identifiers(
         let mut full_matches: Vec<&AnonymousIdStateInfo> = Vec::new();
         let mut partial_matches: Vec<&AnonymousIdStateInfo> = Vec::new();
         for entry in state_entries.candidates() {
-            if entry.name() == resource_identity {
-                // Same identifier, no reconciliation needed
-                continue;
-            }
-            if used_names
-                .get(&key)
-                .is_some_and(|names| names.contains(entry.name()))
-                || claimed_names
-                    .get(&key)
-                    .is_some_and(|names| names.contains(entry.name()))
-            {
+            if !candidate_is_available(entry) {
                 continue;
             }
 
@@ -3140,8 +4366,8 @@ impl<'a> AnonymousToNamedStateLookup<'a> {
 ///
 /// Returns resolved moves from each old anonymous state row to the matched
 /// named resource. The wiring layer applies them before running the differ.
-/// `find_state_by_binding` resolves the same single-hop `binding.attr`
-/// references as [`reconcile_anonymous_identifiers`]; missing or ambiguous
+/// `find_state_by_binding` resolves the same `binding.attr`-rooted reference
+/// chains as [`reconcile_anonymous_identifiers`]; missing or ambiguous
 /// binding rows leave that create-only value unresolved. Unlike anonymous
 /// reconciliation's documented partial matching, rename detection never uses
 /// a create-only subset: every configured value must be resolved before the
@@ -3345,7 +4571,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {

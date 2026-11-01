@@ -334,10 +334,9 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
         "RolePolicy must be present after expansion",
     );
     assert!(
-        parsed
-            .compositions
-            .iter()
-            .any(|v| v.binding.as_deref() == Some("bs.bootstrap")),
+        parsed.compositions.iter().any(|v| {
+            v.binding.as_ref().map(|binding| binding.as_str()) == Some("bs.bootstrap")
+        }),
         "composition `bs.bootstrap` must be present after expansion",
     );
 

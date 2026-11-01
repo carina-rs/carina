@@ -16,9 +16,9 @@ use crate::provider::{
     StateTransformMap,
 };
 use crate::resource::{
-    CanonicalComparisonAttributes, Current, Directives, PlanInputCurrent, PlanInputDesired,
-    PresentResourceState, ResolvedResource, Resource, ResourceId, State, UnidentifiedState, Value,
-    into_plan_input_current_map,
+    AbsoluteBindingAddress, CanonicalComparisonAttributes, Current, Directives, PlanInputCurrent,
+    PlanInputDesired, PresentResourceState, ResolvedResource, Resource, ResourceId, State,
+    UnidentifiedState, Value, into_plan_input_current_map,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaRegistry, ValidatedResourceSchema,
@@ -139,10 +139,23 @@ pub fn managed_binding_stability(
             );
             continue;
         }
-        let create_only = schema.as_schema().create_only_attributes();
-        if changed_attributes
-            .iter()
-            .any(|attribute| create_only.contains(&attribute.as_str()))
+        let authored_views = comparison::project_authored_attribute_views(
+            desired.comparison_attributes(),
+            current_attributes,
+            comparison_saved.get(&resource.id),
+            prev_explicit.get(&resource.id),
+            Some(schema.as_schema()),
+            context,
+        );
+        if !plan::find_changed_create_only(
+            &changed_attributes,
+            authored_views.current(),
+            authored_views.removal_evidence(),
+            &desired,
+            schema.as_schema(),
+            context,
+        )
+        .is_empty()
         {
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;
@@ -170,14 +183,14 @@ pub fn managed_binding_stability(
 #[derive(Debug, Clone, PartialEq)]
 pub struct Orphan {
     current: Current,
-    binding: Option<String>,
+    binding: Option<AbsoluteBindingAddress>,
     directives: Directives,
 }
 
 impl Orphan {
     pub fn absent(
         state: crate::resource::AbsentState,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
         directives: Directives,
     ) -> Self {
         Self {
@@ -190,7 +203,7 @@ impl Orphan {
     #[cfg(test)]
     pub(crate) fn from_state(
         state: State,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
         directives: Directives,
     ) -> Self {
         Self {
@@ -202,7 +215,7 @@ impl Orphan {
 
     pub fn present(
         present: PresentResourceState,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
         directives: Directives,
     ) -> Self {
         Self {
@@ -214,7 +227,7 @@ impl Orphan {
 
     pub fn missing_identifier(
         state: UnidentifiedState,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
         directives: Directives,
     ) -> Self {
         Self {
@@ -226,7 +239,7 @@ impl Orphan {
 
     pub fn create_in_flight(
         pending: crate::provider::InFlightCreate,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
         directives: Directives,
     ) -> Self {
         Self {
@@ -238,7 +251,7 @@ impl Orphan {
 
     pub fn create_outcome_unknown(
         unknown: crate::provider::UnknownCreateOutcome,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
         directives: Directives,
     ) -> Self {
         Self {
@@ -257,7 +270,11 @@ impl Orphan {
     }
 
     pub fn binding(&self) -> Option<&str> {
-        self.binding.as_deref()
+        self.binding.as_ref().map(AbsoluteBindingAddress::as_str)
+    }
+
+    pub fn binding_address(&self) -> Option<&AbsoluteBindingAddress> {
+        self.binding.as_ref()
     }
 
     pub fn directives(&self) -> &Directives {
@@ -839,7 +856,7 @@ fn create_plan_for_tests(
     saved_attrs: &crate::provider::LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &Orphans,
-    wait_bindings: &[crate::parser::WaitBinding],
+    wait_bindings: &[crate::parser::WaitBinding<crate::resource::AbsoluteBindingAddress>],
 ) -> crate::plan::Plan {
     let managed =
         ResolvedResource::collect_resolved_with_schemas(managed.iter().cloned(), registry)
@@ -893,13 +910,15 @@ pub(crate) use comparison::{
 /// Returns true when `binding` is one direct child emitted by the deferred-for
 /// template. List children use a numeric index (`items[0]`); map children use
 /// the canonical address spelling (`items.key` or `items['key with space']`).
-pub fn binding_matches_deferred_template(
-    binding: &str,
-    target: &crate::parser::DeferredForTarget,
+pub fn binding_matches_deferred_template<B: crate::resource::BindingAddress>(
+    binding: &B,
+    target: &crate::parser::DeferredForTarget<B>,
 ) -> bool {
-    let Some(template_binding_name) = target.bound_binding() else {
-        return target.matches_legacy_binding(binding);
+    let Some(template_binding) = target.bound_binding_address() else {
+        return target.matches_legacy_binding(binding.as_str());
     };
+    let binding = binding.as_str();
+    let template_binding_name = template_binding.as_str();
     let Some(suffix) = binding.strip_prefix(template_binding_name) else {
         return false;
     };

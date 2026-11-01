@@ -22,7 +22,7 @@ use crate::parser::{
 };
 use crate::resource::{
     ConcreteValue, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin, LoopKind,
-    LoopSlot, LoopSource, ParserPlaceholder, UnboundLoopTemplate,
+    LoopSlot, LoopSource, ParserPlaceholder, RelativeBindingName, UnboundLoopTemplate,
 };
 
 /// Binding pattern for a for expression
@@ -83,7 +83,7 @@ pub(crate) enum ForBodyResult {
 /// Whether a loop body produces user-bound or anonymous resources.
 #[derive(Debug, Clone)]
 pub(crate) enum LoopParseTarget {
-    Bound(crate::parser::BoundDeferredTarget),
+    Bound(crate::parser::BoundDeferredTarget<RelativeBindingName>),
     Unbound(UnboundLoopTemplate),
 }
 
@@ -196,10 +196,7 @@ fn record_deferred_for_expression(
     };
 
     let parsed = ParsedDeferredForExpression::new(
-        None,
-        line,
-        span,
-        header,
+        (None, line, span, header),
         target.deferred_target(),
         iterable,
         iterable_state,
@@ -232,7 +229,7 @@ impl LoopParseTarget {
     pub(crate) fn bound_read_target(
         &self,
         kind: LoopKind,
-    ) -> Result<&crate::parser::BoundDeferredTarget, ParseError> {
+    ) -> Result<&crate::parser::BoundDeferredTarget<RelativeBindingName>, ParseError> {
         match self {
             Self::Bound(target) => Ok(target),
             Self::Unbound(template) => Err(template.unbound_read_error(kind)),
@@ -284,7 +281,7 @@ impl LoopParseTarget {
         }
     }
 
-    fn deferred_target(&self) -> DeferredForTarget {
+    fn deferred_target(&self) -> DeferredForTarget<RelativeBindingName> {
         match self {
             Self::Bound(target) => DeferredForTarget::Bound(target.clone()),
             Self::Unbound(template) => DeferredForTarget::Unbound {
@@ -594,7 +591,9 @@ pub(crate) fn parse_for_expr(
                     for_line,
                     for_span,
                     header,
-                    Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
+                    Value::Deferred(DeferredValue::BindingRef {
+                        binding: RelativeBindingName::new(s.clone()),
+                    }),
                     iterable_state,
                 )?;
                 return Ok((resources, data_sources, module_calls));
@@ -818,10 +817,10 @@ pub(crate) fn parse_for_body(
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = match (target, element.as_ref()) {
                     (LoopParseTarget::Bound(_), Some(element)) => {
-                        Some(target.element_address(element))
+                        Some(RelativeBindingName::new(target.element_address(element)))
                     }
                     (LoopParseTarget::Bound(bound), None) => {
-                        Some(bound.template_address().to_string())
+                        Some(bound.template_address().binding_address().clone())
                     }
                     (LoopParseTarget::Unbound(_), _) => None,
                 };

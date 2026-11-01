@@ -6,7 +6,11 @@ use crate::schema::{
 
 use crate::explicit::ExplicitFields;
 use crate::provider::ReferenceScope;
-use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, ValueString};
+use crate::resource::{
+    CanonicalEnumValue, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource, ExpandedValue as Value,
+    ValueString,
+};
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, ReferenceForm, ReferenceForms, ReferenceTemplate,
     TypeIdentity,

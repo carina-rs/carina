@@ -962,9 +962,12 @@ mod tests {
             None,
             1,
             "for opt in cert.domain_validation_options".to_string(),
-            carina_core::parser::DeferredForTarget::bound("validation_records")
-                .expect("fixture binding is valid"),
-            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            carina_core::parser::DeferredForTarget::bound(
+                carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            )
+            .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new())
+                .resolve_root_for_test(),
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
@@ -1002,9 +1005,12 @@ mod tests {
             None,
             1,
             "for opt in cert.domain_validation_options".to_string(),
-            carina_core::parser::DeferredForTarget::bound("validation_records")
-                .expect("fixture binding is valid"),
-            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            carina_core::parser::DeferredForTarget::bound(
+                carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            )
+            .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new())
+                .resolve_root_for_test(),
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );

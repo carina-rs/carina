@@ -46,6 +46,7 @@ log = "0.4"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 similar = "2"
 resvg = { version = "0.49", default-features = false, features = ["text"] }
 thiserror = "2"

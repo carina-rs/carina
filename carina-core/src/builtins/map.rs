@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 
-use crate::resource::{ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -20,7 +20,9 @@ use super::value_type_name;
 /// map(".id", [{name: "a", id: "1"}, {name: "b", id: "2"}])  // => ["1", "2"]
 /// subnets |> map(".subnet_id")  // pipe syntax
 /// ```
-pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_map<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!("map() requires 2 arguments, got {}", args.len()));
     }
@@ -37,7 +39,7 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
 
     match &args[1] {
         Value::Concrete(ConcreteValue::List(items)) => {
-            let mapped: Result<Vec<Value>, String> = items
+            let mapped: Result<Vec<Value<NoPlaceholder, B>>, String> = items
                 .iter()
                 .map(|item| match item {
                     Value::Concrete(ConcreteValue::Map(map)) => map
@@ -53,7 +55,7 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
             Ok(Value::Concrete(ConcreteValue::List(mapped?)))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let mapped: Result<IndexMap<String, Value>, String> = map
+            let mapped: Result<IndexMap<String, Value<NoPlaceholder, B>>, String> = map
                 .iter()
                 .map(|(k, v)| match v {
                     Value::Concrete(ConcreteValue::Map(inner)) => inner
@@ -88,7 +90,7 @@ mod tests {
     use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     fn make_map(pairs: Vec<(&str, Value)>) -> Value {
         Value::Concrete(ConcreteValue::Map(
@@ -182,7 +184,7 @@ mod tests {
 
     #[test]
     fn map_error_wrong_arg_count_zero() {
-        let result = evaluate_builtin("map", &[]);
+        let result: Result<Value, String> = evaluate_builtin("map", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("requires 2 arguments"));
     }

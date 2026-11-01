@@ -115,7 +115,7 @@ pub(super) fn value_lines_styled<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
     use carina_core::value::render_value;
 
     #[test]
@@ -125,7 +125,10 @@ mod tests {
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Concrete(ConcreteValue::Int(42)),
             Value::Concrete(ConcreteValue::enum_identifier("Mode.enabled")),
-            Value::resource_ref("server", "id", Vec::new()),
+            carina_core::resource::AuthoredValue::resource_ref("server", "id", Vec::new())
+                .resolve_root_for_test()
+                .into_expanded()
+                .expect("value-view fixture contains no parser placeholder"),
         ])));
         let spans = value_spans(&rendered);
 

@@ -3,8 +3,16 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 
-use crate::resource::ConcreteValue;
+use crate::resource::{
+    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDirectives as Directives, ExpandedResource as Resource, ExpandedValue as Value,
+    RelativeBindingName, RootScope,
+};
 use indexmap::IndexMap;
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn diff_test(
     desired: &Resource,
@@ -687,6 +695,337 @@ fn replace_when_create_only_attr_changed() {
         &metadata.changed_create_only[..],
         &["cidr_block".to_string()]
     );
+}
+
+fn nested_create_only_plan(immutable: &str, mutable: &str) -> (Plan, ResourceId) {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let id = ResourceId::with_identity("test.NestedReplacement", "example");
+    let nested_value = |immutable: &str, mutable: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "immutable".to_string(),
+                Value::Concrete(ConcreteValue::String(immutable.into())),
+            ),
+            (
+                "mutable".to_string(),
+                Value::Concrete(ConcreteValue::String(mutable.into())),
+            ),
+        ])))
+    };
+    let desired = Resource::new("test.NestedReplacement", "example")
+        .with_attribute("settings", nested_value(immutable, mutable));
+    let current = existing_state(
+        id.clone(),
+        HashMap::from([("settings".to_string(), nested_value("old-key", "old-value"))]),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        crate::schema::ResourceSchema::new("test.NestedReplacement")
+            .attribute(
+                AttributeSchema::required(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::required("immutable", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("mutable", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current_states = HashMap::from([(id.clone(), current)]);
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states,
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    (plan, id)
+}
+
+fn omitted_optional_nested_create_only_fixture() -> (Resource, State, SchemaRegistry) {
+    use crate::schema::ResourceSchema;
+
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let id = ResourceId::with_identity("budgets.Budget", "monthly");
+    let desired_budget = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "budget_type".to_string(),
+        Value::Concrete(ConcreteValue::String("FORECASTED".into())),
+    )])));
+    let current_budget = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "budget_name".to_string(),
+            Value::Concrete(ConcreteValue::String("provider-default".into())),
+        ),
+        (
+            "budget_type".to_string(),
+            Value::Concrete(ConcreteValue::String("ACTUAL".into())),
+        ),
+    ])));
+    let desired =
+        Resource::new("budgets.Budget", "monthly").with_attribute("budget", desired_budget);
+    let current = existing_state(id, HashMap::from([("budget".to_string(), current_budget)]));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("budgets.Budget")
+            .attribute(
+                AttributeSchema::required(
+                    "budget",
+                    AttributeType::struct_(
+                        "BudgetData",
+                        vec![
+                            StructField::optional("budget_name", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("budget_type", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    (desired, current, schemas)
+}
+
+#[test]
+fn replace_when_nested_create_only_field_changes() {
+    let (plan, id) = nested_create_only_plan("new-key", "old-value");
+
+    let metadata = replacement_metadata(&plan, &id);
+    assert_eq!(&metadata.changed_create_only[..], &["settings".to_string()]);
+}
+
+#[test]
+fn update_when_only_mutable_sibling_of_nested_create_only_field_changes() {
+    let (plan, id) = nested_create_only_plan("old-key", "new-value");
+
+    assert_eq!(plan.effects().len(), 1);
+    assert!(matches!(
+        &plan.effects()[0],
+        Effect::Update {
+            changed_attributes,
+            ..
+        } if changed_attributes == &["settings".to_string()]
+    ));
+    assert!(
+        plan.replace_display.is_empty(),
+        "unexpected replacement for {id}"
+    );
+}
+
+fn unordered_nested_create_only_plan(desired_items: Vec<Value>) -> (Plan, ResourceId) {
+    use crate::schema::ResourceSchema;
+
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let id = ResourceId::with_identity("test.UnorderedNestedReplacement", "example");
+    let desired = Resource::new("test.UnorderedNestedReplacement", "example")
+        .with_attribute("items", Value::Concrete(ConcreteValue::List(desired_items)));
+    let current = existing_state(
+        id.clone(),
+        HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                item("a", "old"),
+                item("b", "stable"),
+            ])),
+        )]),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.UnorderedNestedReplacement")
+            .attribute(
+                AttributeSchema::required(
+                    "items",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Item",
+                        vec![
+                            StructField::required("key", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("description", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            HashMap::from([(id.clone(), current)]),
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    (plan, id)
+}
+
+#[test]
+fn unordered_nested_create_only_reorder_with_mutable_change_is_update() {
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let (plan, id) = unordered_nested_create_only_plan(vec![item("b", "stable"), item("a", "new")]);
+
+    assert!(
+        plan.replace_display.is_empty(),
+        "unexpected replacement for {id}"
+    );
+    assert!(matches!(
+        plan.effects(),
+        [Effect::Update {
+            changed_attributes,
+            ..
+        }] if changed_attributes == &["items".to_string()]
+    ));
+}
+
+#[test]
+fn unordered_nested_create_only_addition_is_replace() {
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let (plan, id) = unordered_nested_create_only_plan(vec![
+        item("b", "stable"),
+        item("a", "old"),
+        item("c", "new"),
+    ]);
+
+    let metadata = replacement_metadata(&plan, &id);
+    assert_eq!(&metadata.changed_create_only[..], &["items".to_string()]);
+}
+
+#[test]
+fn update_when_optional_nested_create_only_field_is_omitted_but_present_in_state() {
+    let (desired, current, schemas) = omitted_optional_nested_create_only_fixture();
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(id.clone(), current)]);
+
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states,
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(plan.replace_display.is_empty(), "unexpected replacement");
+    assert!(matches!(
+        plan.effects(),
+        [Effect::Update {
+            changed_attributes,
+            ..
+        }] if changed_attributes == &["budget".to_string()]
+    ));
+}
+
+#[test]
+fn managed_binding_stays_updating_when_omitted_nested_create_only_value_is_in_state() {
+    let (desired, current, schemas) = omitted_optional_nested_create_only_fixture();
+    let id = desired.id.clone();
+    let managed =
+        ResolvedResource::collect_resolved_with_schemas(std::iter::once(desired.clone()), &schemas)
+            .expect("budget fixture must resolve");
+    let (schemas, provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        managed.iter().map(|resource| &resource.id),
+    );
+    let current_states = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(id.clone(), current)]),
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let stability = managed_binding_stability(
+        &managed,
+        &current_states,
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &provider,
+    )
+    .expect("comparison fixture must resolve");
+
+    assert!(matches!(
+        stability.get(&id),
+        Some(ManagedBindingStability::Updating {
+            changed_attributes,
+            ..
+        }) if changed_attributes == &HashSet::from(["budget".to_string()])
+    ));
 }
 
 fn create_only_nested_write_only_fixture<R: crate::schema::PatternForm>(
@@ -1411,10 +1750,10 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
 
     let orphan_id = ResourceId::with_identity("subnet", "my-subnet");
     let orphan_state = existing_state(orphan_id.clone(), HashMap::new())
-        .with_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
+        .with_root_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
     let orphans = crate::differ::Orphans::from([Orphan::from_state(
         orphan_state,
-        Some("my_subnet".to_string()),
+        Some(absolute_binding("my_subnet")),
         crate::resource::Directives::default(),
     )]);
 
@@ -1449,12 +1788,12 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
             ..
         } => {
             assert_eq!(
-                binding.as_deref(),
+                binding.as_ref().map(AbsoluteBindingAddress::as_str),
                 Some("my_subnet"),
                 "Orphan Delete should preserve the typed binding"
             );
             assert!(
-                dependencies.contains("my_vpc"),
+                dependencies.contains(&absolute_binding("my_vpc")),
                 "Orphan Delete should preserve typed dependency bindings"
             );
         }

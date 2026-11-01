@@ -6,14 +6,20 @@ use std::sync::{Arc, Mutex};
 use indexmap::IndexMap;
 
 use crate::executor::normalized::{apply_desired_normalization, apply_desired_normalization_slice};
-use crate::parser::ProviderConfig;
+use crate::parser::ExpandedProviderConfig as ProviderConfig;
 use crate::provider::{
     BoxFuture, NoopNormalizer, ProviderError, ProviderNormalizer, ProviderResult, ready_noop,
 };
 use crate::resource::{
-    ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Resource, Value,
+    ApplyTimeUnknown, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDeferredValue as DeferredValue, ExpandedInterpolationPart as InterpolationPart,
+    ExpandedResource as Resource, ExpandedValue as Value, RelativeBindingName, RootScope,
 };
 use crate::schema::SchemaRegistry;
+
+fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn provider_config(default_tags: IndexMap<String, Value>) -> ProviderConfig {
     ProviderConfig {
@@ -97,7 +103,7 @@ async fn normalized_resource_rejects_block_aliases_returned_by_provider_normaliz
     };
 
     let error = apply_desired_normalization(
-        Resource::with_provider("test", "thing", "example", None),
+        Resource::<crate::resource::ModuleSource>::with_provider("test", "thing", "example", None),
         &[],
         &normalizer,
         &schemas,
@@ -151,7 +157,7 @@ async fn normalized_resource_rejects_nested_block_aliases_returned_by_provider_n
     };
 
     let error = apply_desired_normalization(
-        Resource::with_provider("test", "thing", "example", None),
+        Resource::<crate::resource::ModuleSource>::with_provider("test", "thing", "example", None),
         &[],
         &normalizer,
         &schemas,
@@ -205,8 +211,9 @@ async fn normalization_error_stops_later_stages() {
 
     let mut default_tags = IndexMap::new();
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
-    let mut resources = vec![Resource::with_provider("test", "thing", "example", None)];
-    let peer_ref = Value::resource_ref("peer", "identifier", vec![]);
+    let mut resources: Vec<Resource> =
+        vec![Resource::with_provider("test", "thing", "example", None)];
+    let peer_ref = Value::root_resource_ref("peer", "identifier", vec![]);
     resources[0].set_attr("peer", peer_ref.clone());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -252,7 +259,7 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
             Value::Concrete(ConcreteValue::Float(f64::NAN)),
         ),
     ]);
-    let mut resource = Resource::with_provider("test", "thing", "example", None);
+    let mut resource: Resource = Resource::with_provider("test", "thing", "example", None);
     resource.set_attr("name", string_value("unchanged"));
     let mut resources = vec![resource];
     let original = resources.clone();
@@ -293,7 +300,8 @@ async fn unresolved_enum_default_tag_fails_before_mutating_resources() {
         "Mode".to_string(),
         Value::Concrete(ConcreteValue::enum_identifier("test.Mode.allow")),
     )]);
-    let mut resources = vec![Resource::with_provider("test", "thing", "example", None)];
+    let mut resources: Vec<Resource> =
+        vec![Resource::with_provider("test", "thing", "example", None)];
     let original = resources.clone();
 
     let error = apply_desired_normalization_slice(
@@ -425,7 +433,7 @@ async fn desired_normalization_runs_stages_in_order() {
     let normalizer = OrderNormalizer {
         calls: Arc::clone(&calls),
     };
-    let mut resource = Resource::with_provider("test", "thing", "example", None);
+    let mut resource: Resource = Resource::with_provider("test", "thing", "example", None);
     resource.set_attr("subjects", string_value("one"));
     let mut default_tags = IndexMap::new();
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
@@ -444,9 +452,9 @@ async fn desired_normalization_runs_stages_in_order() {
         calls.lock().unwrap().clone(),
         vec![format!(
             "normalize_desired:{:?}",
-            Some(Value::<crate::resource::NoPlaceholder>::Concrete(
-                ConcreteValue::StringList(vec!["one".into()])
-            ))
+            Some(Value::Concrete(ConcreteValue::StringList(vec![
+                "one".into()
+            ])))
         )],
         "canonicalization must run before normalize_desired"
     );
@@ -520,7 +528,7 @@ async fn desired_normalization_lifts_guest_string_alias_to_api_enum() {
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let resource = Resource::with_provider("test", "thing", "example", None);
+    let resource: Resource = Resource::with_provider("test", "thing", "example", None);
 
     let normalized = apply_desired_normalization(resource, &[], &StringAliasNormalizer, &schemas)
         .await
@@ -583,7 +591,7 @@ async fn desired_normalization_rejects_guest_dotted_string_without_shape_strippi
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let resource = Resource::with_provider("test", "thing", "example", None);
+    let resource: Resource = Resource::with_provider("test", "thing", "example", None);
 
     let error = apply_desired_normalization(resource, &[], &DottedStringNormalizer, &schemas)
         .await
@@ -595,7 +603,7 @@ async fn desired_normalization_rejects_guest_dotted_string_without_shape_strippi
 
 #[tokio::test]
 async fn desired_normalization_merges_non_empty_provider_default_tags() {
-    let resource = Resource::with_provider("test", "thing", "example", None);
+    let resource: Resource = Resource::with_provider("test", "thing", "example", None);
     let mut default_tags = IndexMap::new();
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
     let schemas = order_schema();
@@ -624,8 +632,8 @@ async fn desired_normalization_merges_non_empty_provider_default_tags() {
 
 #[tokio::test]
 async fn desired_normalization_merges_default_tags_into_ref_bearing_tags() {
-    let peer_ref = Value::resource_ref("peer", "identifier", vec![]);
-    let mut resource = Resource::with_provider("test", "thing", "example", None);
+    let peer_ref = Value::root_resource_ref("peer", "identifier", vec![]);
+    let mut resource: Resource = Resource::with_provider("test", "thing", "example", None);
     resource.set_attr(
         "tags",
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -672,8 +680,8 @@ async fn desired_normalization_merges_default_tags_into_ref_bearing_tags() {
 
 #[tokio::test]
 async fn desired_normalization_resolves_enum_alias_nested_with_resource_ref() {
-    let peer_ref = Value::resource_ref("peer", "identifier", vec![]);
-    let mut resource = Resource::with_provider("test", "thing", "example", None);
+    let peer_ref = Value::root_resource_ref("peer", "identifier", vec![]);
+    let mut resource: Resource = Resource::with_provider("test", "thing", "example", None);
     resource.set_attr(
         "settings",
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -714,7 +722,7 @@ async fn desired_normalization_scopes_default_tags_to_provider_instance() {
     let mut second_config = provider_config(second_tags);
     second_config.binding = Some("second".to_string());
 
-    let mut resources = vec![
+    let mut resources: Vec<Resource> = vec![
         Resource::with_provider("test", "thing", "default", None),
         Resource::with_provider("test", "thing", "named", Some("second".to_string())),
     ];
@@ -764,7 +772,7 @@ async fn desired_normalization_scopes_default_tags_to_provider_instance() {
 #[tokio::test]
 async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
     let default_tags = IndexMap::from([("ManagedBy".to_string(), string_value("carina"))]);
-    let mut resources = vec![
+    let mut resources: Vec<Resource> = vec![
         Resource::with_provider("test", "list_tags", "list", None),
         Resource::with_provider("test", "struct_tags", "struct", None),
         Resource::with_provider("test", "numeric_map_tags", "map", None),
@@ -873,14 +881,14 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
         }
     }
 
-    let deferred = Value::resource_ref("role", "arn", vec![]);
-    let mut resource = Resource::new("test", "thing");
+    let deferred = Value::root_resource_ref("role", "arn", vec![]);
+    let mut resource: Resource = Resource::new("test", "thing");
     resource.set_attr("role_arn", deferred.clone());
     resource.set_attr(
         "pending",
         Value::Deferred(DeferredValue::Unknown(
             ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".to_string(),
+                binding: absolute_binding("upstream"),
             },
         )),
     );
@@ -953,9 +961,9 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
 
     let ref_interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("role:".into()),
-        InterpolationPart::Expr(Value::resource_ref("role", "arn", vec![])),
+        InterpolationPart::Expr(Value::root_resource_ref("role", "arn", vec![])),
     ]));
-    let mut resource = Resource::with_provider("test", "thing", "example", None);
+    let mut resource: Resource = Resource::with_provider("test", "thing", "example", None);
     resource.set_attr("subjects", string_value("one"));
     resource.set_attr("ref_subjects", ref_interpolation.clone());
 
@@ -1014,7 +1022,7 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
 
 #[tokio::test]
 async fn apply_desired_normalization_is_idempotent() {
-    let mut resource = Resource::new("test", "thing");
+    let mut resource: Resource = Resource::new("test", "thing");
     resource.set_attr("name", string_value("v1"));
 
     let first = apply_desired_normalization(resource, &[], &NoopNormalizer, &SchemaRegistry::new())

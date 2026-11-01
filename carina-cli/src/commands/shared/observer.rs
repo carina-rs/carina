@@ -326,6 +326,10 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
     fn dummy_create_effect() -> Effect {
         Effect::Create(resolved(Resource::new("aws.s3.Bucket", "demo")))
     }
@@ -333,8 +337,7 @@ mod tests {
     fn dummy_wait_effect() -> Effect {
         let target = resolved(Resource::new("aws.acm.Certificate", "demo"));
         Effect::Wait {
-            identity: carina_core::resource::ResourceIdentity::try_from("demo_ready".to_string())
-                .unwrap(),
+            identity: absolute_binding("demo_ready"),
             target_id: carina_core::wait::ManagedWaitTarget::for_test(&target),
             until: equals_predicate(AttrPath::single("status"), "issued"),
             until_surface: "demo.status == issued".to_string(),
@@ -350,7 +353,7 @@ mod tests {
             identifier: crate::fixture_applied_identifier("mock-id"),
             generation,
             directives: Default::default(),
-            binding: Some("same".to_string()),
+            binding: Some(absolute_binding("same")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -477,7 +480,8 @@ mod tests {
         let attrs = HashMap::from([(
             "status".to_string(),
             Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-                path: AccessPath::with_fields("bootstrap", "network", vec!["status".into()]),
+                path: AccessPath::with_fields("bootstrap", "network", vec!["status".into()])
+                    .resolve_root_for_test(),
             })),
         )]);
         let predicate = equals_predicate(AttrPath::single("missing"), "present");

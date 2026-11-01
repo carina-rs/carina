@@ -20,7 +20,9 @@ use carina_core::executor::{
     AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
     ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
 };
-use carina_core::parser::{LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext};
+use carina_core::parser::{
+    ExpandedProviderConfig, LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext,
+};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, ProviderError, ProviderResult,
@@ -29,6 +31,7 @@ use carina_core::provider::{
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Directives, ParsedIgnorePath,
     ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
+    absolute_binding_address_for_test,
 };
 use carina_core::schema::SchemaRegistry;
 use carina_core::value::PersistedValue;
@@ -67,6 +70,10 @@ fn resolved(resource: Resource) -> ResolvedResource {
 
 fn loaded_provider_context() -> LoadedProviderContext {
     LoadedProviderContext::empty_for_test()
+}
+
+fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAddress {
+    absolute_binding_address_for_test(spelling)
 }
 
 #[test]
@@ -187,7 +194,7 @@ impl ProviderFactory for EvidenceTestFactory {
     }
 }
 
-fn provider_config_for_evidence_test(name: &str) -> ProviderConfig {
+fn provider_config_for_evidence_test(name: &str) -> ExpandedProviderConfig {
     ProviderConfig {
         name: name.to_string(),
         attributes: IndexMap::new(),
@@ -209,7 +216,7 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
             }) as Box<dyn ProviderFactory>
         })
         .collect();
-    let ctx = ValidatedConfig::from_factories_for_test(
+    let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
         (),
         factories,
         contents.provider_configs.as_provider_configs(),
@@ -271,7 +278,7 @@ fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportSta
 }
 
 fn saved_provider_configs(
-    configs: Vec<ProviderConfig>,
+    configs: Vec<ExpandedProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
@@ -1290,7 +1297,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: "cert_issued".into(),
+        identity: absolute_binding("cert_issued"),
         target_id: ManagedWaitTarget::for_test(&resolved(Resource::new("acm.Certificate", "cert"))),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -1307,7 +1314,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
     assert!(!has_changes);
 }
 
-fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
+fn make_awscc_provider(region_dsl: &str) -> ExpandedProviderConfig {
     let mut attrs = IndexMap::new();
     attrs.insert(
         "region".to_string(),
@@ -2678,7 +2685,12 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
     let result = run_state_refresh_locked(
         validated_config,
@@ -2728,7 +2740,12 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2797,7 +2814,12 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2919,7 +2941,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
 
     let data_source_id = ResourceId::with_provider_identity("mock", "test.lookup", "lookup", None);
     let mut data_source = DataSource::with_provider("mock", "test.lookup", "lookup", None);
-    data_source.binding = Some("lookup".to_string());
+    data_source.binding = Some(absolute_binding("lookup"));
     let data_sources = vec![data_source];
     let data_source_state = State::existing(
         data_source_id.clone(),
@@ -2938,7 +2960,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
         name: "answer".to_string(),
         static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("lookup", "answer"),
+            path: AccessPath::new("lookup", "answer").resolve_root_for_test(),
         })),
     }];
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
@@ -2989,7 +3011,7 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         &carina_core::parser::ProviderContext::default(),
     )
     .unwrap();
-    let ctx = WiringContext::new_for_test_with_placeholders(vec![], &parsed.providers);
+    let ctx = WiringContext::new_for_test_with_provider_phase(vec![], &parsed.providers);
 
     assert!(
         ctx.factories().is_empty(),
@@ -3333,12 +3355,11 @@ fn import_effect_preserves_resource_metadata_in_state() {
     // overwrite the ResourceState with a bare ResourceState::new(), stripping
     // directives, prefixes, desired_keys, binding, and dependency_bindings.
 
-    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None)
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        )
-        .with_binding("my_vpc_binding");
+    let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_attribute(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+    );
+    resource.binding = Some(absolute_binding("my_vpc_binding"));
     resource.directives.force_delete = true;
     resource
         .prefixes
@@ -3410,7 +3431,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     );
     assert_eq!(
         saved_resource.binding,
-        Some("my_vpc_binding".to_string()),
+        Some(absolute_binding("my_vpc_binding")),
         "binding should be preserved after import"
     );
     assert_eq!(
@@ -3974,7 +3995,7 @@ fn plan_file_with_bound_deferred_replace_template() -> PlanFile {
         ),
         identifier: AppliedIdentifier::new("provider-id").expect("fixture identifier is non-empty"),
         directives: Directives::default(),
-        binding: Some("children[0]".to_string()),
+        binding: Some(absolute_binding("children[0]")),
         dependencies: HashSet::new(),
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
@@ -4063,8 +4084,9 @@ fn plan_file_load_reports_deferred_template_provider_type_mismatch_first() {
 fn plan_file_validation_rejects_mismatched_bound_deferred_template_identity() {
     let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
         .expect("serialize bound deferred template");
-    let other_target = carina_core::parser::BoundDeferredTarget::new("other_children")
-        .expect("fixture binding is non-empty");
+    let other_target =
+        carina_core::parser::BoundDeferredTarget::new(absolute_binding("other_children"))
+            .expect("fixture binding is non-empty");
     json["plan"]["effects"][0]["DeferredCreate"]["template"]["template_resource"]["id"]["identity"] =
         json!(other_target.template_address().to_string());
     let error = serde_json::from_value::<PlanFile>(json)
@@ -4196,7 +4218,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
     let target_id = managed_target.resolved_id().as_inner().clone();
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: "lookup_ready".into(),
+        identity: absolute_binding("lookup_ready"),
         target_id: ManagedWaitTarget::for_test(&managed_target),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -4268,8 +4290,8 @@ fn replace_saved_wait_target(plan_file: PlanFile, target: &ResourceId) -> PlanFi
 
 #[test]
 fn plan_file_validation_rejects_wait_target_present_only_in_data_sources() {
-    let data_source =
-        DataSource::with_provider("mock", "test.lookup", "lookup", None).with_binding("lookup");
+    let mut data_source = DataSource::with_provider("mock", "test.lookup", "lookup", None);
+    data_source.binding = Some(absolute_binding("lookup"));
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.data_sources.push(data_source.clone());
     contents.data_source_values.push(SavedDataSourceValue {
@@ -4321,8 +4343,8 @@ fn plan_file_validation_accepts_unchanged_managed_wait_target() {
 
 #[test]
 fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
-    let data_source =
-        DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
+    let mut data_source = DataSource::with_provider("mock", "iam.Roles", "roles", None);
+    data_source.binding = Some(absolute_binding("roles"));
     let mut plan = Plan::new();
     plan.add(Effect::Read {
         resource: resolved_data_source(data_source.clone()),
@@ -4553,7 +4575,7 @@ fn plan_file_decode_rejects_duplicate_schema_fingerprint() {
     );
 }
 
-fn builtin_mock_provider_config() -> ProviderConfig {
+fn builtin_mock_provider_config() -> ExpandedProviderConfig {
     ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
@@ -4567,7 +4589,11 @@ fn builtin_mock_provider_config() -> ProviderConfig {
 }
 
 fn builtin_mock_recording_context() -> ValidatedConfig<()> {
-    ValidatedConfig::from_factories_for_test((), Vec::new(), &[builtin_mock_provider_config()])
+    ValidatedConfig::from_factories_for_test_with_provider_phase(
+        (),
+        Vec::new(),
+        &[builtin_mock_provider_config()],
+    )
 }
 
 #[test]
@@ -4757,7 +4783,7 @@ fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
 
 #[test]
 fn recording_invalid_provider_artifact_inventory_does_not_panic() {
-    let configured = ProviderConfig {
+    let configured = ExpandedProviderConfig {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -4781,7 +4807,8 @@ fn recording_invalid_provider_artifact_inventory_does_not_panic() {
     contents.sorted_resources.clear();
     contents.current_states.clear();
 
-    let ctx = ValidatedConfig::from_factories_for_test((), Vec::new(), &[configured]);
+    let ctx =
+        ValidatedConfig::from_factories_for_test_with_provider_phase((), Vec::new(), &[configured]);
     let error = contents
         .record_for_test(&ctx, Vec::new())
         .expect_err("a configured provider without a loaded artifact must be rejected");
@@ -4950,7 +4977,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
         name: "role_arn".to_string(),
         static_type: fixture_unchecked_export_static_type(),
         value: Some(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("role", "web_acl_arn"),
+            path: AccessPath::new("role", "web_acl_arn").resolve_root_for_test(),
         })),
     }];
 
@@ -5112,9 +5139,9 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let lock = LockInfo::for_test("apply");
 
     let mut resource_a = Resource::with_provider("mock", "test.resource", "a", None);
-    resource_a.binding = Some("a".to_string());
+    resource_a.binding = Some(absolute_binding("a"));
     let mut resource_b = Resource::with_provider("mock", "test.resource", "b", None);
-    resource_b.binding = Some("b".to_string());
+    resource_b.binding = Some(absolute_binding("b"));
     let sorted_resources = vec![resolved(resource_a.clone()), resolved(resource_b)];
     let export_resources = sorted_resources
         .iter()
@@ -5158,14 +5185,14 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
             name: "ax".to_string(),
             static_type: fixture_unchecked_export_static_type(),
             value: Some(Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("a", "id"),
+                path: AccessPath::new("a", "id").resolve_root_for_test(),
             })),
         },
         InferredExportParam {
             name: "bx".to_string(),
             static_type: fixture_unchecked_export_static_type(),
             value: Some(Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("b", "id"),
+                path: AccessPath::new("b", "id").resolve_root_for_test(),
             })),
         },
     ];
@@ -5242,7 +5269,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     let lock = LockInfo::for_test("apply");
 
     let mut resource = Resource::with_provider("mock", "test.resource", "created", None);
-    resource.binding = Some("created".to_string());
+    resource.binding = Some(absolute_binding("created"));
     let sorted_resources = vec![resolved(resource.clone())];
     let export_resources = vec![resource.clone()];
     let resource_id = resource.id.clone();

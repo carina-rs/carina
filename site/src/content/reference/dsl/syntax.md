@@ -172,7 +172,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-Carina generates the resource's state identity from a hash of the attributes its schema marks as create-only or identifying. When none of those are set, the identity is derived from the resource's other (mutable) attributes; two such anonymous resources of the same type in the same scope are rejected as ambiguous. Bind them with `let` to give them distinct, stable identities.
+If the schema declares identity paths, Carina generates the resource's state identity from only those values; paths may name top-level attributes or nested struct fields whose leaf is a scalar or enum. Other create-only values can force replacement without changing the address. Written values are schema-canonicalized. References and composite expressions over references and literals are hashed by their deterministic authored spelling, so their addresses stay stable after apply-time resolution; generated names hash a separately typed prefix. An absent value or an expression containing an unknown or unavailable leaf is an error: write the value or bind the resource with `let`. A schema with no declared identity falls back to configured top-level create-only attributes and, when none are configured, to the resource's other attributes. Multiple resources using that attribute-derived fallback are rejected as ambiguous. Equal declared identity values, including equal expression spellings plus equal written values, are also rejected.
 
 ### Named Resources (Let Bindings)
 
@@ -238,7 +238,7 @@ awscc.ec2.IpamPool {
 
 ### Directives
 
-A `directives` block inside a resource carries Carina-side instructions (`depends_on`, `create_before_destroy`, `prevent_destroy`, `force_delete`, `provider`, `ignore_changes`). In provider protocol 13, only delete requests carry the resolved provider-visible directives. See the [directives reference](/reference/dsl/directives/) for the full list, schema-default destruction protection, and the `ignore_changes` path rules.
+A `directives` block inside a resource carries Carina-side instructions (`depends_on`, `create_before_destroy`, `prevent_destroy`, `force_delete`, `provider`, `ignore_changes`). In provider protocol 16, only delete requests carry the resolved provider-visible directives. See the [directives reference](/reference/dsl/directives/) for the full list, schema-default destruction protection, and the `ignore_changes` path rules.
 
 ```crn
 awscc.s3.Bucket {

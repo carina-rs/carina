@@ -1,6 +1,6 @@
 //! `env(name)` built-in function
 
-use crate::resource::{ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -15,7 +15,9 @@ use super::value_type_name;
 /// env("HOME")          // => "/home/user"
 /// env("DB_PASSWORD")   // => "s3cret"
 /// ```
-pub(crate) fn builtin_env(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_env<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!(
             "env() expects 1 argument (variable name), got {}",
@@ -45,7 +47,7 @@ pub(crate) fn builtin_env(args: &[Value]) -> Result<Value, String> {
 mod tests {
     use crate::ValueDescription;
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
     use crate::value::{format_value, value_to_json};
 
     #[test]
@@ -101,7 +103,7 @@ mod tests {
 
     #[test]
     fn env_error_on_no_args() {
-        let args = vec![];
+        let args: Vec<Value> = vec![];
         let result = evaluate_builtin("env", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
