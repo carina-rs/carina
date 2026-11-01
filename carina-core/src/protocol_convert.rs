@@ -31,7 +31,7 @@ use indexmap::IndexMap;
 
 use crate::provider::{
     AppliedState, PartialReadDiagnostic, PatchOp, ProviderDirectives, ReadOutcome, UpdateOutcome,
-    UpdatePatch,
+    UpdateOutcomeKind, UpdatePatch,
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, RedactedSecretHash, Resource, ResourceId,
@@ -2331,11 +2331,11 @@ pub fn try_update_outcome_to_protocol(
     outcome: &UpdateOutcome,
     state_after_patch: protocol::PersistedState,
 ) -> Result<protocol::UpdateOutcome, ProtocolConvertError> {
-    match outcome {
-        UpdateOutcome::Success { state } => Ok(protocol::UpdateOutcome::Success {
+    match outcome.kind() {
+        UpdateOutcomeKind::Success { state } => Ok(protocol::UpdateOutcome::Success {
             state: try_applied_update_state_to_protocol(state, state_after_patch)?,
         }),
-        UpdateOutcome::PartialSuccess { state, diagnostic } => {
+        UpdateOutcomeKind::PartialSuccess { state, diagnostic } => {
             let PartialReadDiagnostic {
                 reason,
                 missing_attributes,
@@ -2372,9 +2372,9 @@ pub fn protocol_update_outcome_to_core(
     outcome: &protocol::UpdateOutcome,
 ) -> Result<UpdateOutcome, ProtocolConvertError> {
     match outcome {
-        protocol::UpdateOutcome::Success { state } => Ok(UpdateOutcome::Success {
-            state: protocol_applied_persisted_state_to_core(state)?,
-        }),
+        protocol::UpdateOutcome::Success { state } => Ok(UpdateOutcome::success(
+            protocol_applied_persisted_state_to_core(state)?,
+        )),
         protocol::UpdateOutcome::PartialSuccess { state, diagnostic } => {
             let protocol::PartialReadDiagnostic {
                 reason,

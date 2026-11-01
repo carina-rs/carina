@@ -12,18 +12,18 @@ The host and the provider talk through a versioned protocol. `carina-provider-pr
 Every time Carina starts a provider, for `validate`, `plan`, `apply` or any other command that uses it, it checks that version first and refuses to go further if it is out of range. `carina init` only downloads and records the provider without starting it, so a mismatch shows up at the first command after `init`:
 
 ```text
-provider 'hello' was built against protocol version 12 but this host requires at least version 13; rebuild the provider against the current carina protocol
+provider 'hello' was built against protocol version 14 but this host requires at least version 15; rebuild the provider against the current carina protocol
 ```
 
 ```text
-provider 'hello' was built against protocol version 14 but this host supports up to version 13; upgrade carina to load this provider
+provider 'hello' was built against protocol version 16 but this host supports up to version 15; upgrade carina to load this provider
 ```
 
 Since v0.5.0, the first release that checks the version, every release has set the minimum equal to the protocol version it speaks, so a provider has to be built for exactly the protocol version of the Carina that loads it:
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Next release after v0.9.0 (unreleased) | 13 | 13 |
+| Next release after v0.9.0 (unreleased) | 15 | 15 |
 | v0.9.0 | 12 | 12 |
 | v0.8.0 | 12 | 12 |
 | v0.7.1 | 12 | 12 |

@@ -7,8 +7,10 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 use crate::PERSISTED_SECRET_KEY;
+pub use crate::{PendingPhase, PollFinality, PollRequest};
 
 fn default_true() -> bool {
     true
@@ -942,11 +944,46 @@ pub enum Observation<R, E> {
     ReadFailed(E),
 }
 
+/// Progress of an initial or resumed create. Read-back always has an identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum CreateProgress {
+    Operating {
+        identifier: Option<AppliedIdentifier>,
+    },
+    ReadingBack {
+        identifier: AppliedIdentifier,
+    },
+}
+
+impl CreateProgress {
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        match self {
+            Self::Operating { identifier } => identifier.as_ref(),
+            Self::ReadingBack { identifier } => Some(identifier),
+        }
+    }
+
+    pub fn phase(&self) -> crate::PendingPhase {
+        match self {
+            Self::Operating { .. } => crate::PendingPhase::Operation,
+            Self::ReadingBack { .. } => crate::PendingPhase::ReadBack,
+        }
+    }
+
+    pub fn into_identifier(self) -> Option<AppliedIdentifier> {
+        match self {
+            Self::Operating { identifier } => identifier,
+            Self::ReadingBack { identifier } => Some(identifier),
+        }
+    }
+}
+
 /// An unfinished initial create, including the immutable `sent` declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCreate<T> {
     pub token: T,
-    pub identifier: Option<AppliedIdentifier>,
+    pub progress: CreateProgress,
     pub sent: Sent,
     pub poll_after_secs: u32,
 }
@@ -955,21 +992,20 @@ impl<T> PendingCreate<T> {
     pub fn token(&self) -> &T {
         &self.token
     }
-
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
-
     pub fn sent(&self) -> &Sent {
         &self.sent
     }
-
     pub fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
-
-    pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, Sent, u32) {
-        (self.token, self.identifier, self.sent, self.poll_after_secs)
+    pub fn phase(&self) -> crate::PendingPhase {
+        self.progress.phase()
+    }
+    pub fn into_parts(self) -> (T, CreateProgress, Sent, u32) {
+        (self.token, self.progress, self.sent, self.poll_after_secs)
     }
 }
 
@@ -984,7 +1020,7 @@ pub struct CreateInFlight<T, E> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumePending<T> {
     pub token: T,
-    pub identifier: Option<AppliedIdentifier>,
+    pub progress: CreateProgress,
     pub poll_after_secs: u32,
 }
 
@@ -992,17 +1028,33 @@ impl<T> ResumePending<T> {
     pub fn token(&self) -> &T {
         &self.token
     }
-
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
-
     pub fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
+    pub fn phase(&self) -> crate::PendingPhase {
+        self.progress.phase()
+    }
+    pub fn into_parts(self) -> (T, CreateProgress, u32) {
+        (self.token, self.progress, self.poll_after_secs)
+    }
+}
 
-    pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, u32) {
-        (self.token, self.identifier, self.poll_after_secs)
+/// An unfinished delete operation. Delete has no post-apply read-back phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDelete<T> {
+    pub token: T,
+    pub poll_after_secs: u32,
+}
+
+impl<T> PendingDelete<T> {
+    pub fn new(token: T, poll_after_secs: u32) -> Self {
+        Self {
+            token,
+            poll_after_secs,
+        }
     }
 }
 
@@ -1101,6 +1153,11 @@ pub enum ResumeStep<A, D, T> {
     Completed {
         identifier: AppliedIdentifier,
         attributes: A,
+    },
+    PartialSuccess {
+        identifier: AppliedIdentifier,
+        attributes: A,
+        diagnostic: D,
     },
     Pending(ResumePending<T>),
     Resent(CreateStep<A, D, T>),
@@ -1582,6 +1639,33 @@ pub struct OperationConfig {
     pub create_max_retries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_back: Option<ReadBackBudget>,
+}
+
+/// Non-zero host-owned budget for a post-create or post-update read-back.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct ReadBackBudget {
+    timeout_secs: NonZeroU64,
+}
+
+impl ReadBackBudget {
+    pub const fn new(timeout_secs: NonZeroU64) -> Self {
+        Self { timeout_secs }
+    }
+
+    pub fn from_secs(timeout_secs: u64) -> Option<Self> {
+        NonZeroU64::new(timeout_secs).map(Self::new)
+    }
+
+    pub const fn timeout_secs(self) -> NonZeroU64 {
+        self.timeout_secs
+    }
+
+    pub fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.get())
+    }
 }
 
 impl OperationConfig {
@@ -1595,6 +1679,13 @@ impl OperationConfig {
         timeout_secs
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::DEFAULT_OPERATION_BUDGET)
+    }
+
+    /// Return the configured read-back budget, or the host fallback.
+    pub fn read_back_budget(&self) -> std::time::Duration {
+        self.read_back
+            .map(ReadBackBudget::duration)
+            .unwrap_or(crate::DEFAULT_READ_BACK_BUDGET)
     }
 }
 
@@ -2097,7 +2188,9 @@ mod tests {
     fn in_flight_verdict_conversions_preserve_the_continuation() {
         let pending = PendingCreate {
             token: "next-token".to_string(),
-            identifier: Some(AppliedIdentifier::new("resource-123").unwrap()),
+            progress: CreateProgress::ReadingBack {
+                identifier: AppliedIdentifier::new("resource-123").unwrap(),
+            },
             sent: Sent::only(["name"]),
             poll_after_secs: 7,
         };
@@ -2131,7 +2224,9 @@ mod tests {
         let in_flight = ResumeInFlight {
             pending: ResumePending {
                 token: "resume-token".to_string(),
-                identifier: Some(AppliedIdentifier::new("resource-456").unwrap()),
+                progress: CreateProgress::Operating {
+                    identifier: Some(AppliedIdentifier::new("resource-456").unwrap()),
+                },
                 poll_after_secs: 11,
             },
             error: "resume interrupted".to_string(),
@@ -2165,8 +2260,8 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v13_state_json_bytes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 14);
+    fn ordered_maps_preserve_v15_state_json_bytes() {
+        assert_eq!(crate::PROTOCOL_VERSION, 15);
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),
@@ -3065,16 +3160,25 @@ mod tests {
             create_timeout_secs: None,
             create_max_retries: None,
             update_timeout_secs: Some(900),
+            read_back: ReadBackBudget::from_secs(120),
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"delete_timeout_secs\":1800"));
         assert!(json.contains("\"update_timeout_secs\":900"));
+        assert!(json.contains("\"read_back\":{\"timeout_secs\":120}"));
         assert!(!json.contains("create_timeout_secs"));
 
         let back: OperationConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.delete_timeout_secs, Some(1800));
         assert_eq!(back.create_timeout_secs, None);
         assert_eq!(back.update_timeout_secs, Some(900));
+        assert_eq!(
+            back.read_back
+                .expect("read-back budget")
+                .timeout_secs()
+                .get(),
+            120
+        );
     }
 
     #[test]
@@ -3101,6 +3205,19 @@ mod tests {
         assert_eq!(
             OperationConfig::default().budget(crate::OperationKind::Create),
             crate::DEFAULT_OPERATION_BUDGET
+        );
+        assert_eq!(
+            OperationConfig::default().read_back_budget(),
+            crate::DEFAULT_READ_BACK_BUDGET
+        );
+    }
+
+    #[test]
+    fn read_back_budget_rejects_zero_seconds() {
+        assert!(ReadBackBudget::from_secs(0).is_none());
+        assert!(
+            serde_json::from_str::<ReadBackBudget>(r#"{"timeout_secs":0}"#).is_err(),
+            "deserialization must not bypass the non-zero budget type",
         );
     }
 
