@@ -221,6 +221,10 @@ pub use carina_provider_protocol::types::{
 };
 
 /// Count and element policies enforced together when walking a list.
+///
+/// Elements containing secrets or diagnostic-sensitive strings are skipped for
+/// uniqueness, like unresolved elements, to avoid revealing equality. The
+/// provider remains the final authority for such values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListConstraints {
     length: Option<(Option<u64>, Option<u64>)>,
@@ -228,7 +232,10 @@ pub struct ListConstraints {
 }
 
 impl ListConstraints {
-    pub const fn new(length: Option<(Option<u64>, Option<u64>)>, elements: ListElements) -> Self {
+    pub(crate) const fn new(
+        length: Option<(Option<u64>, Option<u64>)>,
+        elements: ListElements,
+    ) -> Self {
         Self { length, elements }
     }
 
@@ -2365,16 +2372,22 @@ impl Schema {
                     ));
                     return;
                 };
-                for result in constraints.check(items.iter(), ancestry, |item| {
-                    fit_value_to_type_on_path(
-                        inner,
-                        item,
-                        defs,
-                        ancestry,
-                        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-                        &mut Vec::new(),
-                    )
-                }) {
+                for result in constraints.check(
+                    items.iter(),
+                    defs,
+                    ancestry,
+                    CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                    |item| {
+                        fit_value_to_type_on_path(
+                            inner,
+                            item,
+                            defs,
+                            ancestry,
+                            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                            &mut Vec::new(),
+                        )
+                    },
+                ) {
                     if let Err(ListConstraintError { index, error }) = result {
                         let error_path = index.map_or_else(|| path.clone(), |i| path.push_index(i));
                         out.push((error_path, *error));
@@ -2612,17 +2625,29 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
                     });
                 }
             };
-            for result in constraints.check(items.iter(), ancestry, |item| {
-                fit_value_to_type_on_path(
-                    inner,
-                    item,
-                    defs,
-                    ancestry,
-                    CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-                    &mut Vec::new(),
-                )
-            }) {
-                let (i, fit) = result.map_err(|failure| *failure.error)?;
+            for result in constraints.check(
+                items.iter(),
+                defs,
+                ancestry,
+                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                |item| {
+                    fit_value_to_type_on_path(
+                        inner,
+                        item,
+                        defs,
+                        ancestry,
+                        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                        &mut Vec::new(),
+                    )
+                },
+            ) {
+                let (i, fit) = result.map_err(|failure| {
+                    let error = *failure.error;
+                    match failure.index {
+                        Some(index) => error.at_list_index(index),
+                        None => error,
+                    }
+                })?;
                 if fit.is_none() {
                     validate_attr_with_defs_and_ancestry(inner, &items[i], defs, ancestry)
                         .map_err(|error| error.at_list_index(i))?;
@@ -4788,10 +4813,10 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
     }
 }
 
-/// Compare the canonical API JSON value after a successful schema fit, including
-/// float coercion, enum spellings, and canonical struct field names. Union members
-/// with the same JSON are the same element: `"repo"` and enum `repo`, or Int `5`
-/// and Duration `5s`. Deferred leaves make the entire element ineligible.
+/// Compare the ordinary JSON of a value canonicalized with its successful fit
+/// for the active purpose. Unresolved elements and elements containing secrets
+/// or diagnostic-sensitive strings are not comparable: even a masked duplicate
+/// would reveal equality. The provider remains the final authority for them.
 #[derive(PartialEq, Eq, Hash)]
 struct KnownListElement(serde_json::Value);
 
@@ -4799,100 +4824,14 @@ impl KnownListElement {
     fn from_fit<P: PlaceholderKind, B: BindingAddress>(
         value: &Value<P, B>,
         fit: &Fit<'_>,
+        defs: &BTreeMap<String, AttributeType>,
         ancestry: FieldAncestry,
+        purpose: CanonicalizationPurpose<'_>,
     ) -> Option<Self> {
-        use serde_json::Value as Json;
-        let canonical = match &fit.kind {
-            FitKind::Enum { canonical, .. } => Json::String(canonical.api_value().to_string()),
-            FitKind::Union { fit, .. } => return Self::from_fit(value, fit, ancestry),
-            FitKind::Secret(fit) => {
-                let Value::Deferred(DeferredValue::Secret(inner)) = value else {
-                    return None;
-                };
-                return Self::from_fit(inner, fit, ancestry);
-            }
-            FitKind::List(fits) => {
-                let ConcreteValueRef::List(items) = value.as_concrete()? else {
-                    return None;
-                };
-                Json::Array(
-                    items
-                        .iter()
-                        .zip(fits)
-                        .map(|(item, fit)| Self::from_fit(item, fit, ancestry).map(|key| key.0))
-                        .collect::<Option<_>>()?,
-                )
-            }
-            FitKind::StringList(fits) => {
-                let ConcreteValueRef::StringList(items) = value.as_concrete()? else {
-                    return None;
-                };
-                Json::Array(
-                    items
-                        .iter()
-                        .zip(fits)
-                        .map(|(item, fit)| {
-                            let item: Value<P, B> =
-                                Value::Concrete(ConcreteValue::String(item.clone()));
-                            Self::from_fit(&item, fit, ancestry).map(|key| key.0)
-                        })
-                        .collect::<Option<_>>()?,
-                )
-            }
-            FitKind::Map(fits) => {
-                let ConcreteValueRef::Map(map) = value.as_concrete()? else {
-                    return None;
-                };
-                Json::Object(
-                    map.iter()
-                        .zip(fits)
-                        .map(|((key, value), fit)| {
-                            let key = fit.canonical_key.as_ref().unwrap_or(key).clone();
-                            Self::from_fit(value, &fit.value, ancestry).map(|value| (key, value.0))
-                        })
-                        .collect::<Option<_>>()?,
-                )
-            }
-            FitKind::Struct(fits) => {
-                let AttrTypeKind::Struct { fields, .. } = &fit.attr.as_attr().kind else {
-                    return None;
-                };
-                let ConcreteValueRef::Map(map) = value.as_concrete()? else {
-                    return None;
-                };
-                Json::Object(
-                    map.iter()
-                        .zip(fits)
-                        .map(|((key, value), fit)| {
-                            let field = struct_field_for_key(fields, key, ancestry)?;
-                            Self::from_fit(value, fit, ancestry.descend(field))
-                                .map(|value| (field.name.clone(), value.0))
-                        })
-                        .collect::<Option<_>>()?,
-                )
-            }
-            FitKind::PassThrough => match value.as_concrete()? {
-                ConcreteValueRef::String(text) => Json::String(text.expose_plaintext().to_owned()),
-                ConcreteValueRef::EnumIdentifier(raw) => Json::String(raw.to_string()),
-                ConcreteValueRef::CanonicalEnum(canonical) => {
-                    Json::String(canonical.api_value().to_string())
-                }
-                ConcreteValueRef::Int(n)
-                    if matches!(fit.attr.as_attr().kind, AttrTypeKind::Float { .. }) =>
-                {
-                    Json::Number(serde_json::Number::from_f64(n as f64)?)
-                }
-                ConcreteValueRef::Int(n) => Json::from(n),
-                ConcreteValueRef::Float(n) => Json::Number(serde_json::Number::from_f64(n)?),
-                ConcreteValueRef::Bool(b) => Json::Bool(b),
-                ConcreteValueRef::Duration(d) => Json::from(d.as_secs()),
-                ConcreteValueRef::List(_)
-                | ConcreteValueRef::StringList(_)
-                | ConcreteValueRef::Map(_) => return None,
-            },
-            FitKind::Deferred | FitKind::Coalesce { .. } => return None,
-        };
-        Some(Self(canonical))
+        if crate::value::contains_secret(value) || value.contains_diagnostic_sensitive_string() {
+            return None;
+        }
+        crate::value::canonical_json_with_fit(value.clone(), fit, defs, ancestry, purpose).map(Self)
     }
 }
 
@@ -4908,7 +4847,9 @@ impl ListConstraints {
     fn check<'schema, P, B, I>(
         self,
         items: I,
+        defs: &BTreeMap<String, AttributeType>,
         ancestry: FieldAncestry,
+        purpose: CanonicalizationPurpose<'_>,
         mut fit_item: impl FnMut(&Value<P, B>) -> Option<Fit<'schema>>,
     ) -> impl Iterator<Item = Result<(usize, Option<Fit<'schema>>), ListConstraintError>>
     where
@@ -4934,7 +4875,7 @@ impl ListConstraints {
                 },
             )
         });
-        let mut seen: HashMap<KnownListElement, (usize, bool)> = HashMap::new();
+        let mut seen: HashMap<KnownListElement, usize> = HashMap::new();
         length_error
             .into_iter()
             .map(Err)
@@ -4943,27 +4884,21 @@ impl ListConstraints {
                 let fit = fit_item(value);
                 if self.elements == ListElements::Unique
                     && let Some(fit) = &fit
-                    && let Some(key) = KnownListElement::from_fit(value, fit, ancestry)
+                    && let Some(key) =
+                        KnownListElement::from_fit(value, fit, defs, ancestry, purpose)
                 {
-                    let sensitive = crate::value::contains_secret(value)
-                        || value.contains_diagnostic_sensitive_string();
-                    if let Some((first_index, first_sensitive)) = seen.get_mut(&key) {
-                        *first_sensitive |= sensitive;
+                    if let Some(first_index) = seen.get(&key) {
                         return Err(ListConstraintError {
                             index: Some(index),
                             error: Box::new(TypeError::DuplicateListElement {
-                                value: if *first_sensitive {
-                                    DiagnosticValue::Masked
-                                } else {
-                                    crate::value::format_value(value).into()
-                                },
+                                value: crate::value::format_value(value).into(),
                                 index,
                                 first_index: *first_index,
                                 attribute: None,
                             }),
                         });
                     }
-                    seen.insert(key, (index, sensitive));
+                    seen.insert(key, index);
                 }
                 Ok((index, fit))
             }))
@@ -5174,7 +5109,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
         ) => {
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
-            for result in constraints.check(items.iter(), ancestry, |item| {
+            for result in constraints.check(items.iter(), defs, ancestry, purpose, |item| {
                 fit_value_to_type_on_path(
                     element_type,
                     item,
@@ -5204,16 +5139,18 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
             let values = items
                 .iter()
                 .map(|item| Value::Concrete(ConcreteValue::String(item.clone())));
-            for result in constraints.check(values, ancestry, |item: &Value<P, B>| {
-                fit_value_to_type_on_path(
-                    element_type,
-                    item,
-                    defs,
-                    ancestry,
-                    purpose,
-                    &mut Vec::new(),
-                )
-            }) {
+            for result in
+                constraints.check(values, defs, ancestry, purpose, |item: &Value<P, B>| {
+                    fit_value_to_type_on_path(
+                        element_type,
+                        item,
+                        defs,
+                        ancestry,
+                        purpose,
+                        &mut Vec::new(),
+                    )
+                })
+            {
                 let (_, child) = result.ok()?;
                 let child = child?;
                 exactness.combine(child.exactness);

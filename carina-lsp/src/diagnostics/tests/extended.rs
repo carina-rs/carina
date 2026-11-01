@@ -8,6 +8,232 @@ const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is d
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
+fn unique_list_scope_fixture(second_body: &str) -> (String, Vec<Diagnostic>) {
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.UniqueLists")
+            .with_unique_name_attribute("name")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "tags_list",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "modes",
+                    AttributeType::list(AttributeType::enum_(
+                        carina_core::schema::TypeIdentity::new(Some("mock"), ["test"], "Mode"),
+                        Some(vec!["allow".into()]),
+                        vec![],
+                        None,
+                        None,
+                    )),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "values",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        None,
+                        ListElements::Unique,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "matrix",
+                    AttributeType::refined_list(
+                        AttributeType::list(AttributeType::string()),
+                        true,
+                        None,
+                        ListElements::Unique,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let source = format!(
+        "mock.test.UniqueLists {{\n  name = \"first\"\n  tags_list = [\"ok\"]\n  modes = [allow]\n  values = [\"first\"]\n}}\nmock.test.UniqueLists {{\n  name = \"second\"\n  {second_body}\n}}\n"
+    );
+    std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+    (source, diagnostics)
+}
+
+#[test]
+fn unique_list_item_errors_stay_in_the_second_resource() {
+    for (body, message) in [
+        ("tags_list = [\"ok\", 5]", "expected String"),
+        ("modes = [allow, invalid]", "invalid"),
+    ] {
+        let body = format!("{body}\n  values = [\"repo\", \"repo\"]");
+        let (_, diagnostics) = unique_list_scope_fixture(&body);
+        let diagnostic = only_message_diagnostic(&diagnostics, message);
+        assert_eq!(diagnostic.range.start.line, 8, "{diagnostics:?}");
+        assert_eq!(diagnostic.range.end.line, 8, "{diagnostics:?}");
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        let duplicate = only_message_diagnostic(&diagnostics, "Duplicate list element");
+        assert_eq!(duplicate.range.start.line, 9, "{diagnostics:?}");
+        assert_eq!(duplicate.range.end.line, 9, "{diagnostics:?}");
+    }
+}
+
+#[test]
+fn unique_list_count_error_stays_in_the_second_resource() {
+    use carina_core::schema::{AttributeType, ListElements, ValidatedConfigSchema};
+    let schema = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+        "values".to_string(),
+        AttributeType::refined_list(
+            AttributeType::string(),
+            true,
+            Some((Some(1), None)),
+            ListElements::Unique,
+        ),
+    )]))
+    .unwrap();
+    let effective_type = schema.effective_type("values").unwrap();
+    let document = create_document(
+        "mock.test.UniqueLists {\n  values = [\"ok\"]\n}\nmock.test.UniqueLists {\n  values = []\n}\n",
+    );
+    let resource = document
+        .parsed()
+        .unwrap()
+        .iter_all_resources()
+        .nth(1)
+        .unwrap();
+    let attributes = resource.attributes();
+    let (diagnostics, reported_duplicate) = test_engine().validate_container_value(
+        &document,
+        "values",
+        attributes.get("values").unwrap(),
+        &effective_type,
+        None,
+        Some((3, 6)),
+    );
+    let diagnostic = only_message_diagnostic(&diagnostics, "outside allowed range");
+    assert_eq!(diagnostic.range.start.line, 4, "{diagnostics:?}");
+    assert!(!reported_duplicate);
+}
+
+#[test]
+fn unique_list_item_errors_retain_the_attribute_suffix() {
+    for (body, attribute, message) in [
+        ("tags_list = [\"ok\", 5]", "tags_list", "expected String"),
+        ("modes = [allow, invalid]", "modes", "invalid"),
+    ] {
+        let (_, diagnostics) = unique_list_scope_fixture(body);
+        let diagnostic = only_message_diagnostic(&diagnostics, message);
+        assert!(
+            diagnostic.message.contains(&format!("for '{attribute}'")),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn unique_list_duplicates_stay_in_the_second_resource() {
+    let (source, diagnostics) = unique_list_scope_fixture("values = [\"repo\", \"repo\"]");
+    let diagnostic = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    let start = source.lines().nth(8).unwrap().rfind("\"repo\"").unwrap() as u32;
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(8, start), Position::new(8, start + 6)),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn unique_list_item_error_does_not_suppress_a_resolved_duplicate() {
+    let (_, diagnostics) = unique_list_scope_fixture("matrix = [[\"${1 + 0}\"], [\"1\"], [5]]");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("expected String")),
+        "{diagnostics:?}"
+    );
+    let duplicate = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    assert_eq!(duplicate.range.start.line, 8, "{diagnostics:?}");
+    assert_eq!(duplicate.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let schema = ResourceSchema::new("test.UniqueLists")
+        .attribute(
+            AttributeSchema::optional(
+                "matrix",
+                AttributeType::refined_list(
+                    AttributeType::list(AttributeType::string()),
+                    true,
+                    None,
+                    ListElements::Unique,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let document = create_document(
+        "mock.test.UniqueLists {\n  matrix = [split(\",\", \"repo\"), [\"repo\"], [5]]\n}\n",
+    );
+    let resource = document
+        .parsed()
+        .unwrap()
+        .iter_all_resources()
+        .next()
+        .unwrap();
+    let attributes = resource.attributes();
+    let value = attributes.get("matrix").unwrap();
+    let effective_attribute = schema.effective_attribute("matrix").unwrap();
+    let effective_type = effective_attribute.value_type();
+    let engine = test_engine();
+    let (diagnostics, reported_duplicate) = engine.validate_container_value(
+        &document,
+        "matrix",
+        value,
+        &effective_type,
+        None,
+        Some((0, 3)),
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert!(diagnostics[0].message.contains("expected String"));
+    assert!(
+        !reported_duplicate,
+        "an item error must not suppress a duplicate in a later pass"
+    );
+    let evaluated = carina_core::parser::evaluate_static_value_for_validation(
+        value,
+        document.provider_context(),
+    )
+    .unwrap();
+    let errors = effective_type.validate_collect(&evaluated);
+    assert!(
+        errors
+            .iter()
+            .any(|(_, error)| matches!(error, TypeError::DuplicateListElement { .. })),
+        "{errors:?}"
+    );
+}
+
 #[test]
 fn unique_list_diagnostics_use_canonical_values_in_a_directory() {
     let mut schemas = SchemaRegistry::new();

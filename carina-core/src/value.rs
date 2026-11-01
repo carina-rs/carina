@@ -292,7 +292,6 @@ const LEGACY_ENUM_KEY: &str = "Enum";
 #[derive(Clone, Copy)]
 enum JsonEncoding {
     /// Provider/function JSON: preserve user keys and send enum API values.
-    #[cfg(any(test, feature = "test-utils"))]
     Ordinary,
     /// State/export JSON: reserve `$` keys and retain canonical enum identity.
     Persisted,
@@ -303,7 +302,6 @@ enum JsonEncoding {
 impl JsonEncoding {
     fn context(self) -> SerializationContext {
         match self {
-            #[cfg(any(test, feature = "test-utils"))]
             Self::Ordinary => SerializationContext::ValueToJson,
             Self::Persisted => SerializationContext::StateWriteback,
             Self::LegacySecretMaterial => SerializationContext::SecretRedaction,
@@ -702,7 +700,6 @@ fn value_to_json_inner(
             Ok(serde_json::Value::String(s.to_string()))
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => match encoding {
-            #[cfg(any(test, feature = "test-utils"))]
             JsonEncoding::Ordinary => Ok(serde_json::Value::String(c.api_value().to_string())),
             JsonEncoding::Persisted => Ok(canonical_enum_to_json(c, PERSISTED_ENUM_KEY)),
             JsonEncoding::LegacySecretMaterial => Ok(canonical_enum_to_json(c, LEGACY_ENUM_KEY)),
@@ -5596,7 +5593,7 @@ fn canonicalize_resolved_value_for_purpose<
         purpose,
         visited_refs,
     ) {
-        canonicalize_with_fit(value, fit, defs, purpose, error_policy)
+        canonicalize_with_fit(value, &fit, defs, ancestry, purpose, error_policy)
     } else {
         canonicalize_without_fit(
             value,
@@ -5610,13 +5607,38 @@ fn canonicalize_resolved_value_for_purpose<
     }
 }
 
+/// Encode a successful fit through the same canonicalization used by values.
+/// Address-bearing or unresolved values cannot form an ordinary JSON key.
+pub(crate) fn canonical_json_with_fit<H: PlaceholderKind, B: BindingAddress>(
+    value: Value<H, B>,
+    fit: &crate::schema::Fit<'_>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    ancestry: crate::schema::FieldAncestry,
+    purpose: CanonicalizationPurpose<'_>,
+) -> Option<serde_json::Value> {
+    let canonical = canonicalize_with_fit(
+        value,
+        fit,
+        defs,
+        ancestry,
+        purpose,
+        RejectEnumResolutionErrors,
+    )
+    .ok()?
+    .try_map_placeholder::<crate::resource::NoPlaceholder, ()>(&mut |_| Err(()))
+    .ok()?
+    .try_into_address_free_absolute()?;
+    value_to_json_inner(&canonical, None, false, JsonEncoding::Ordinary, false).ok()
+}
+
 /// Consume a successful fit witness without re-validating any selected Union
 /// member or re-resolving any enum. The value and witness have identical tree
 /// shapes by construction.
 fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
     value: Value<H, B>,
-    fit: crate::schema::Fit<'_>,
+    fit: &crate::schema::Fit<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
+    ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
 ) -> Result<Value<H, B>, P::Error> {
@@ -5625,9 +5647,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
         return Ok(canonicalize_to_string_list(value));
     }
 
-    match (value, fit.kind) {
+    match (value, &fit.kind) {
         (Value::Deferred(DeferredValue::Secret(value)), crate::schema::FitKind::Secret(fit)) => {
-            canonicalize_with_fit(*value, *fit, defs, purpose, error_policy)
+            canonicalize_with_fit(*value, fit, defs, ancestry, purpose, error_policy)
                 .map(|value| Value::Deferred(DeferredValue::Secret(Box::new(value))))
                 .map_err(|error| error_policy.mask_secret(error))
         }
@@ -5638,9 +5660,16 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 default: default_fit,
             },
         ) => {
-            let value = canonicalize_with_fit(*value, *value_fit, defs, purpose, error_policy)?;
-            let default =
-                canonicalize_with_fit(*default, *default_fit, defs, purpose, error_policy)?;
+            let value =
+                canonicalize_with_fit(*value, value_fit, defs, ancestry, purpose, error_policy)?;
+            let default = canonicalize_with_fit(
+                *default,
+                default_fit,
+                defs,
+                ancestry,
+                purpose,
+                error_policy,
+            )?;
             Ok(Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(value),
                 default: Box::new(default),
@@ -5652,7 +5681,7 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
             // consuming both here makes the single selection decision
             // explicit and prevents a second member lookup.
             let _chosen_member = member;
-            canonicalize_with_fit(value, *fit, defs, purpose, error_policy)
+            canonicalize_with_fit(value, fit, defs, ancestry, purpose, error_policy)
         }
         (
             _,
@@ -5660,7 +5689,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 canonical,
                 rewrite: true,
             },
-        ) => Ok(Value::Concrete(ConcreteValue::CanonicalEnum(canonical))),
+        ) => Ok(Value::Concrete(ConcreteValue::CanonicalEnum(
+            canonical.clone(),
+        ))),
         (value, crate::schema::FitKind::Enum { rewrite: false, .. }) => Ok(value),
         (Value::Concrete(ConcreteValue::List(items)), crate::schema::FitKind::List(fits)) => {
             debug_assert_eq!(items.len(), fits.len());
@@ -5669,7 +5700,7 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 .zip(fits)
                 .enumerate()
                 .map(|(index, (item, fit))| {
-                    canonicalize_with_fit(item, fit, defs, purpose, error_policy)
+                    canonicalize_with_fit(item, fit, defs, ancestry, purpose, error_policy)
                         .map_err(|error| error_policy.at_list_index(index, error))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -5688,6 +5719,7 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                         Value::Concrete(ConcreteValue::String(item)),
                         fit,
                         defs,
+                        ancestry,
                         purpose,
                         error_policy,
                     )
@@ -5716,9 +5748,15 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 .zip(fits)
                 .map(|((key, value), fit)| {
                     let canonical_key = fit.canonical_key.clone().unwrap_or_else(|| key.clone());
-                    let value =
-                        canonicalize_with_fit(value, fit.value, defs, purpose, error_policy)
-                            .map_err(|error| error_policy.at_map_value(key.clone(), error))?;
+                    let value = canonicalize_with_fit(
+                        value,
+                        &fit.value,
+                        defs,
+                        ancestry,
+                        purpose,
+                        error_policy,
+                    )
+                    .map_err(|error| error_policy.at_map_value(key.clone(), error))?;
                     Ok((key, canonical_key, value))
                 })
                 .collect::<Result<Vec<_>, P::Error>>()?;
@@ -5728,23 +5766,50 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
         }
         (Value::Concrete(ConcreteValue::Map(map)), crate::schema::FitKind::Struct(fits)) => {
             debug_assert_eq!(map.len(), fits.len());
+            let AttrTypeKind::Struct { fields, .. } = &fit.attr.as_attr().kind else {
+                unreachable!("a struct witness must have a struct type");
+            };
             let fields = map
                 .into_iter()
                 .zip(fits)
                 .filter_map(|((key, value), fit)| {
                     let resolved_type = fit.attr;
-                    canonicalize_with_fit(value, fit, defs, purpose, error_policy)
-                        .map_err(|error| error_policy.at_struct_field(key.clone(), error))
-                        .map(|value| {
-                            (!(matches!(purpose, CanonicalizationPurpose::State)
-                                && crate::schema::reads_as_absent(&value, resolved_type)))
-                            .then_some(value)
+                    let field = crate::schema::struct_field_for_key(fields, &key, ancestry)
+                        .expect("a successful struct fit must retain its field");
+                    canonicalize_with_fit(
+                        value,
+                        fit,
+                        defs,
+                        ancestry.descend(field),
+                        purpose,
+                        error_policy,
+                    )
+                    .map_err(|error| error_policy.at_struct_field(key.clone(), error))
+                    .map(|value| {
+                        (!(matches!(purpose, CanonicalizationPurpose::State)
+                            && crate::schema::reads_as_absent(&value, resolved_type)))
+                        .then_some(value)
+                    })
+                    .transpose()
+                    .map(|result| {
+                        result.map(|value| {
+                            let key = if purpose.canonicalizes_full_shape() {
+                                field.name.clone()
+                            } else {
+                                key
+                            };
+                            (key, value)
                         })
-                        .transpose()
-                        .map(|result| result.map(|value| (key, value)))
+                    })
                 })
                 .collect::<Result<IndexMap<_, _>, P::Error>>()?;
             Ok(Value::Concrete(ConcreteValue::Map(fields)))
+        }
+        (Value::Concrete(ConcreteValue::Int(n)), crate::schema::FitKind::PassThrough)
+            if purpose.canonicalizes_full_shape()
+                && matches!(fit.attr.as_attr().kind, AttrTypeKind::Float { .. }) =>
+        {
+            Ok(Value::Concrete(ConcreteValue::Float(n as f64)))
         }
         (value, crate::schema::FitKind::PassThrough | crate::schema::FitKind::Deferred) => {
             Ok(value)
@@ -12547,6 +12612,70 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_float_converts_integer_to_float() {
+        let canonical = canonicalize_state_with_type(
+            Value::Concrete(ConcreteValue::Int(1)),
+            &AttributeType::float(),
+            crate::schema::empty_defs_for_schema_walks(),
+        );
+        assert!(matches!(
+            canonical,
+            Value::Concrete(ConcreteValue::Float(1.0))
+        ));
+    }
+
+    #[test]
+    fn canonicalize_wait_rhs_preserves_struct_field_spelling() {
+        let element = AttributeType::struct_(
+            "Item",
+            vec![
+                crate::schema::StructField::required("canonical", AttributeType::string())
+                    .with_block_name("alias")
+                    .build(),
+            ],
+        );
+        let value: Value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "alias".into(),
+            Value::Concrete(ConcreteValue::String("x".into())),
+        )])));
+        let canonical = unwrap_infallible(canonicalize_with_type_for_purpose(
+            value.clone(),
+            &element,
+            crate::schema::empty_defs_for_schema_walks(),
+            crate::schema::FieldAncestry::WRITABLE,
+            CanonicalizationPurpose::WaitRhs,
+            PreserveEnumResolutionErrors,
+        ));
+        assert_eq!(canonical, value);
+    }
+
+    #[test]
+    fn canonicalize_struct_uses_canonical_field_names() {
+        let element = AttributeType::struct_(
+            "Item",
+            vec![
+                crate::schema::StructField::required("canonical", AttributeType::string())
+                    .with_block_name("alias")
+                    .build(),
+            ],
+        );
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "alias".into(),
+            Value::Concrete(ConcreteValue::String("x".into())),
+        )])));
+        let canonical = canonicalize_state_with_type(
+            value,
+            &element,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
+        let Value::Concrete(ConcreteValue::Map(fields)) = canonical else {
+            panic!("expected struct");
+        };
+        assert!(fields.contains_key("canonical"), "{fields:?}");
+        assert!(!fields.contains_key("alias"));
+    }
+
+    #[test]
     fn canonicalize_recurses_into_struct_via_block_name() {
         let t = AttributeType::struct_(
             "Statement".to_string(),
@@ -12567,7 +12696,7 @@ mod tests {
         match canon {
             Value::Concrete(ConcreteValue::Map(m)) => {
                 assert_eq!(
-                    m.get("action"),
+                    m.get("actions"),
                     Some(&Value::Concrete(ConcreteValue::StringList(vec![
                         "s3:GetObject".into()
                     ])))

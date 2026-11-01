@@ -1565,7 +1565,9 @@ impl DiagnosticEngine {
                                 if let Some(diagnostic) =
                                     build_schema_diagnostic_from_error(&tagged, range)
                                 {
-                                    reported_attribute_diagnostics.insert(attr_name.clone());
+                                    if is_duplicate_list_error(&tagged) {
+                                        reported_attribute_diagnostics.insert(attr_name.clone());
+                                    }
                                     diagnostics.push(diagnostic);
                                     None
                                 } else {
@@ -1797,15 +1799,16 @@ impl DiagnosticEngine {
                                     )
                                 ))
                             {
-                                let nested_diagnostics = self.validate_container_value(
-                                    doc,
-                                    attr_name,
-                                    attr_value,
-                                    &effective_type,
-                                    self.find_attribute_value_range(doc, attr_name, scope),
-                                    scope,
-                                );
-                                if !nested_diagnostics.is_empty() {
+                                let (nested_diagnostics, reported_duplicate) = self
+                                    .validate_container_value(
+                                        doc,
+                                        attr_name,
+                                        attr_value,
+                                        &effective_type,
+                                        self.find_attribute_value_range(doc, attr_name, scope),
+                                        scope,
+                                    );
+                                if reported_duplicate {
                                     reported_attribute_diagnostics.insert(attr_name.clone());
                                 }
                                 diagnostics.extend(nested_diagnostics);
@@ -1876,7 +1879,7 @@ impl DiagnosticEngine {
                             // Statically evaluated expressions may first become known
                             // in this pass. Suppress a list refinement only when the
                             // attribute pass actually emitted its diagnostic.
-                            if matches!(&error, TypeError::DuplicateListElement { .. })
+                            if is_duplicate_list_error(&error)
                                 && error.attribute_name().is_some_and(|attribute| {
                                     reported_attribute_diagnostics.contains(attribute)
                                 })
@@ -1884,6 +1887,7 @@ impl DiagnosticEngine {
                                 continue;
                             }
                             if !is_masked_secret_error
+                                && !is_duplicate_list_error(&error)
                                 && matches!(
                                     &error,
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
@@ -2265,7 +2269,7 @@ impl DiagnosticEngine {
     ) -> Option<Range> {
         self.find_attribute_value_range(doc, attr_name, scope)
             .or_else(|| {
-                if !matches!(error, TypeError::DuplicateListElement { .. }) {
+                if !is_duplicate_list_error(error) {
                     return None;
                 }
                 self.find_attribute_position(doc, attr_name, scope)
@@ -2543,15 +2547,23 @@ fn build_enum_diagnostic(
     build_schema_diagnostic_from_error(&reshaped, value_range)
 }
 
+fn is_duplicate_list_error(error: &TypeError) -> bool {
+    match error {
+        TypeError::DuplicateListElement { .. } => true,
+        TypeError::ListItemError { inner, .. }
+        | TypeError::MapKeyError { inner, .. }
+        | TypeError::MapValueError { inner, .. }
+        | TypeError::StructFieldError { inner, .. } => is_duplicate_list_error(inner),
+        _ => false,
+    }
+}
+
 pub(super) fn build_schema_diagnostic_from_error(
     error: &carina_core::schema::TypeError,
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {
     let range = value_range?;
-    if matches!(
-        error,
-        carina_core::schema::TypeError::DuplicateListElement { .. }
-    ) {
+    if is_duplicate_list_error(error) {
         return Some(carina_diagnostic_range(
             range,
             DiagnosticSeverity::ERROR,

@@ -290,20 +290,24 @@ pub fn attribute_value_source_span(
     }
 
     let file = super::preprocess_file(input)?;
-    let mut values = file.parse()?.flatten().filter_map(|pair| {
-        if !matches!(
-            pair.as_rule(),
-            Rule::attribute | Rule::map_entry | Rule::nested_block
-        ) {
-            return None;
-        }
-        let span = super::SourceSpan::from_pest(&pair, &file);
-        let line = (span.start_line() - 1) as u32;
-        if scope.is_some_and(|(start, end)| line < start || line >= end) {
-            return None;
-        }
-        named_value(pair, attribute)
-    });
+    let mut values = file
+        .parse()?
+        .flatten()
+        .filter(|pair| {
+            matches!(
+                pair.as_rule(),
+                Rule::anonymous_resource | Rule::resource_expr | Rule::read_resource_expr
+            )
+        })
+        .flat_map(|resource| resource.into_inner())
+        .filter_map(|pair| {
+            let span = super::SourceSpan::from_pest(&pair, &file);
+            let line = (span.start_line() - 1) as u32;
+            if scope.is_some_and(|(start, end)| line < start || line >= end) {
+                return None;
+            }
+            named_value(pair, attribute)
+        });
     let Some(first) = values.next() else {
         return Ok(None);
     };

@@ -972,11 +972,12 @@ async fn wasm_schema_preserves_unique_list_refinement() {
     assert!(
         matches!(
             error,
-            carina_core::schema::TypeError::DuplicateListElement {
-                index: 1,
-                first_index: 0,
-                ..
-            }
+            carina_core::schema::TypeError::ListItemError { index: 1, ref inner }
+                if matches!(inner.as_ref(), carina_core::schema::TypeError::DuplicateListElement {
+                    index: 1,
+                    first_index: 0,
+                    ..
+                })
         ),
         "{error:?}"
     );
