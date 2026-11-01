@@ -243,6 +243,40 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
+    /// A lexical value declaration is authoritative independently of the
+    /// caller expression later substituted for that value.
+    pub(crate) fn from_value_declaration(type_expr: &crate::parser::TypeExpr) -> Option<Self> {
+        fn is_value_constraint(type_expr: &crate::parser::TypeExpr) -> bool {
+            use crate::parser::TypeExpr;
+
+            match type_expr {
+                // Legacy Ref annotations also accept value-shaped arguments.
+                // Their handle transport type must not erase the actual
+                // value's identity evidence at a resource schema sink.
+                TypeExpr::Ref(_path) | TypeExpr::DottedUnresolved(_path) => false,
+                TypeExpr::List(inner) | TypeExpr::Map(inner) => is_value_constraint(inner),
+                TypeExpr::Struct { fields } => fields
+                    .iter()
+                    .all(|(_name, field)| is_value_constraint(field)),
+                TypeExpr::Union(members) => members.iter().all(is_value_constraint),
+                TypeExpr::String
+                | TypeExpr::Bool
+                | TypeExpr::Int
+                | TypeExpr::Float
+                | TypeExpr::Duration
+                | TypeExpr::Simple(_)
+                | TypeExpr::SchemaType { owned: _ }
+                | TypeExpr::StringLiteral(_) => true,
+            }
+        }
+
+        if !is_value_constraint(type_expr) {
+            return None;
+        }
+        crate::validation::lift_type_expr(type_expr)
+            .map(|attr_type| Self::new(attr_type, BTreeMap::new()))
+    }
+
     fn new(attr_type: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
         Self {
             authoritative: AuthoritativeTypeConstraint::Direct(ResolvedTypeConstraint::new(
@@ -2694,6 +2728,28 @@ impl<'a> IterableBindings<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn value_declaration_source_keeps_legacy_handle_values_inferred() {
+        use crate::parser::{ResourceTypePath, TypeExpr};
+
+        let handle = TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc"));
+        for declaration in [
+            handle.clone(),
+            TypeExpr::List(Box::new(handle.clone())),
+            TypeExpr::Map(Box::new(handle.clone())),
+            TypeExpr::Struct {
+                fields: vec![("value".to_string(), handle.clone())],
+            },
+            TypeExpr::Union(vec![TypeExpr::String, handle]),
+        ] {
+            assert!(
+                super::ResolvedRefType::from_value_declaration(&declaration).is_none(),
+                "a legacy handle annotation must not erase substituted value evidence: {declaration:?}",
+            );
+        }
+        assert!(super::ResolvedRefType::from_value_declaration(&TypeExpr::String).is_some());
+    }
+
     use super::*;
     use crate::parser::{
         ArgumentParameter, RelativeBindingName, ResourceTypePath, TypeExpr, UntilPredicateAst,

@@ -736,7 +736,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             AbsoluteBindingAddress,
         > = crate::parser::ParserBindingMetadata::default();
         let mut expanded_binding_uses =
-            resolve_module_binding_uses(module.bare_binding_uses(), &module_scope_resolver)
+            resolve_module_binding_uses::<P>(module, &module_scope_resolver)
                 .map_err(contextualize_access_error)?;
         for resource in module.resources.iter().chain(&selected.resources) {
             let source_file = module
@@ -2279,28 +2279,43 @@ fn reject_dropped_conditional_references(
     })
 }
 
-fn resolve_module_binding_uses(
-    uses: &ParsedBindingUses,
+fn resolve_module_binding_uses<P: TypeResolutionPolicy>(
+    module: &ParsedFile,
     resolver: &ModuleScopeResolver<'_>,
 ) -> Result<ParsedBindingUses<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
     let mut resolved = ParsedBindingUses::default();
-    for record in uses.records() {
+    for record in module.bare_binding_uses().records() {
         let source = match &record.source {
             BareBindingSource::Value {
                 value,
                 declared_type,
             } => {
-                let parameter = if let Value::Deferred(DeferredValue::Placeholder(
+                let parameter_name = if let Value::Deferred(DeferredValue::Placeholder(
                     ParserPlaceholder::ModuleArgument {
                         name,
                         diagnostic: _,
                     },
                 )) = value.as_ref()
                 {
-                    resolver.arguments.arguments.get(name)
+                    Some(name)
                 } else {
                     None
                 };
+                // The caller's value crosses the binding phase here, but a
+                // module-body use is checked against the parameter's declared
+                // type. Re-inferring that use from the substituted value would
+                // blame the module body before the expanded call boundary can
+                // diagnose an unannotated composition output in the caller.
+                let declared_type = declared_type.clone().or_else(|| {
+                    let name = parameter_name?;
+                    let parameter = module.arguments.iter().find(|arg| &arg.name == name)?;
+                    P::resolve_static_type(&parameter.static_type, resolver.arguments.config)
+                        .known()
+                        .cloned()
+                        .map(std::sync::Arc::new)
+                });
+                let parameter =
+                    parameter_name.and_then(|name| resolver.arguments.arguments.get(name));
                 match parameter.map(|argument| argument.value_ref()) {
                     Some(StructuralOperandRef::Value(value)) => BareBindingSource::Value {
                         value: std::sync::Arc::new(value.clone()),

@@ -3754,6 +3754,52 @@ pub fn validate_resource_ref_types<
     validate_resource_ref_types_inner(parsed, registry, bindings)
 }
 
+/// Recover the lexical type of a bare value that became an entire reference
+/// attribute during expansion. The runtime reference stays absolute; only its
+/// module-body type source comes from the declaration checked before expansion.
+fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
+    parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    resource_id: &crate::resource::ResourceId,
+    attribute: &str,
+    value: &GenericValue<ParserPlaceholder, B>,
+) -> Option<(&'a str, ResolvedRefType)> {
+    let GenericValue::Deferred(DeferredValue::ResourceRef { path: _path }) = value else {
+        return None;
+    };
+    parsed.bare_binding_uses().records().iter().find_map(|record| {
+        let owns_resource = match &record.authored.owner {
+            crate::parser::BindingUseOwner::Resource(address) => {
+                address.resource_id() == resource_id
+            }
+            crate::parser::BindingUseOwner::ModuleArgument {
+                call: _call,
+                argument: _argument,
+                value_span: _value_span,
+            } => false,
+        };
+        let path = record.authored.path.segments();
+        if !owns_resource
+            || path.len() != 1
+            || !matches!(path.first(), Some(crate::parser::AttributePathSegment::Attribute(name)) if name == attribute)
+        {
+            return None;
+        }
+        match &record.source {
+            crate::parser::BareBindingSource::Value {
+                value: source,
+                declared_type,
+            } => {
+                if source.as_ref() != value {
+                    return None;
+                }
+                let source = ResolvedRefType::from_value_declaration(declared_type.as_deref()?)?;
+                Some((record.authored.name.as_str(), source))
+            }
+            crate::parser::BareBindingSource::Structural(_handle) => None,
+        }
+    })
+}
+
 fn validate_resource_ref_types_inner<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
@@ -3784,8 +3830,14 @@ fn validate_resource_ref_types_inner<
         |resource_id: &crate::resource::ResourceId,
          resource_location: String,
          attrs: &indexmap::IndexMap<String, GenericValue<ParserPlaceholder, B>>,
-         validated_schema: crate::schema::OwnerBoundResourceSchema<'_>| {
+         validated_schema: crate::schema::OwnerBoundResourceSchema<'_>,
+         module_source: Option<&crate::resource::ModuleSource>| {
             for (attr_name, attr_value) in attrs {
+                let declared_source = module_source
+                    .and_then(crate::resource::ModuleSource::module_call)
+                    .and_then(|_call| {
+                        module_resource_ref_declaration(parsed, resource_id, attr_name, attr_value)
+                    });
                 let effective_sink = validated_schema
                     .effective_attribute_by_authored_name(attr_name)
                     .map(|attribute| attribute.value_type());
@@ -3804,6 +3856,10 @@ fn validate_resource_ref_types_inner<
                         ) else {
                             return;
                         };
+                        let source = declared_source
+                            .as_ref()
+                            .map(|(_name, declared)| declared)
+                            .unwrap_or(&source);
                         if matches!(
                             reference,
                             ReferencePathRef::Access(path) if !path.segments().is_empty()
@@ -3857,13 +3913,23 @@ fn validate_resource_ref_types_inner<
                         }
                         Some(RefSink::TypeExpr(_)) | None => return,
                     };
-                    match check_deferred_access_type(
-                        access,
-                        sink_type,
-                        &inference_bindings,
-                        registry,
-                        bindings,
-                    ) {
+                    let checked = match declared_source.as_ref() {
+                        Some((name, declared)) => declared
+                            .is_assignable_to_sink(sink_type)
+                            .map_err(|mismatch| DeferredAccessTypeError::TypeMismatch {
+                                expected: sink_type.resolved_type_name(),
+                                actual: mismatch.actual_type_name().to_string(),
+                                origin: format!("from {name}"),
+                            }),
+                        None => check_deferred_access_type(
+                            access,
+                            sink_type,
+                            &inference_bindings,
+                            registry,
+                            bindings,
+                        ),
+                    };
+                    match checked {
                         Ok(()) => {}
                         Err(DeferredAccessTypeError::InvalidAccess { error }) => {
                             all_errors.push(format!("{}: {}", resource_location, error));
@@ -3918,14 +3984,16 @@ fn validate_resource_ref_types_inner<
 
     for rref in parsed.iter_all_resources() {
         // A deferred for-expression template body is always managed.
-        let schema = match rref {
+        let (schema, module_source) = match rref {
             ResourceRef::LiveComposition(_) => continue,
-            ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-            ResourceRef::Resource(m) => registry.get_for(m),
+            ResourceRef::DataSource(d) => {
+                (registry.get_for_data_source(d), d.module_source.as_ref())
+            }
+            ResourceRef::Resource(m) => (registry.get_for(m), m.module_source.as_ref()),
             ResourceRef::Deferred {
                 resource: m,
                 deferred: _deferred,
-            } => registry.get_for(m.as_resource()),
+            } => (registry.get_for(m.as_resource()), m.module_source()),
         };
         let Some(validated_schema) = schema else {
             continue;
@@ -3948,6 +4016,7 @@ fn validate_resource_ref_types_inner<
             resource_location,
             attrs.as_ref(),
             validated_schema,
+            module_source,
         );
     }
 
