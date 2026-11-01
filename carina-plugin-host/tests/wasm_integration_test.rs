@@ -27,7 +27,7 @@ use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{
     AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
-    GuestCallBudget, WasmProviderFactory, WasmProviderLoadError,
+    GuestCallBudget, SchemaOnlyWasmProviderFactory, WasmProviderFactory, WasmProviderLoadError,
 };
 use carina_provider_resolver::{
     LockFile, ProviderLoadIdentity, ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
@@ -1004,6 +1004,32 @@ async fn schema_only_loads_an_aws_world_without_a_credential_source() {
             .schemas()
             .iter()
             .any(|schema| schema.parts().resource_type == "test.aws_credentials")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_only_metadata_factory_links_aws_credentials_without_a_credential_source() {
+    let path = skip_if_no_aws_http_wasm!();
+    let user_dirs = carina_core::TestUserDirs::new();
+    let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+
+    let factory = SchemaOnlyWasmProviderFactory::from_bytes(
+        mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws),
+        &user_dirs,
+    )
+    .await
+    .expect("metadata-only loading must link the AWS credential import without a source");
+
+    assert_eq!(factory.name(), "aws");
+    assert!(
+        factory
+            .schemas()
+            .iter()
+            .any(|schema| schema.parts().resource_type == "test.aws_credentials")
+    );
+    assert!(
+        !user_dirs.compiled_wasm_cache_dir().exists(),
+        "metadata-only loading must not write a precompile cache"
     );
 }
 

@@ -2928,6 +2928,40 @@ fn add_wasi_sans_sockets_to_linker<T: WasiView>(linker: &mut Linker<T>) -> wasmt
     Ok(())
 }
 
+/// Register host imports in one place for runtime and metadata-only loads.
+///
+/// Linking an interface does not grant its capabilities: schema-only stores
+/// use the same typed credential import, but its host implementation returns
+/// the no-credentials error without consulting a credential source.
+fn create_linker(
+    engine: &Engine,
+    network: &GuestNetwork,
+    world: InstantiationWorld,
+) -> Result<Linker<HostState>, WasmBindingCreationError> {
+    let mut linker = Linker::new(engine);
+    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
+    })?;
+    match world {
+        InstantiationWorld::Basic => {}
+        InstantiationWorld::HttpEnabled => {
+            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(
+                |error| {
+                    WasmBindingCreationError::Instantiation(
+                        error.context("Failed to add wasi:http to linker"),
+                    )
+                },
+            )?;
+        }
+    }
+    add_aws_credentials_to_linker(&mut linker, network).map_err(|error| {
+        WasmBindingCreationError::Instantiation(
+            error.context("Failed to add AWS credentials to linker"),
+        )
+    })?;
+    Ok(linker)
+}
+
 async fn create_instance(
     engine: &Engine,
     component: &Component,
@@ -2935,16 +2969,7 @@ async fn create_instance(
     network: GuestNetwork,
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let mut linker = Linker::new(engine);
-    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
-        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
-    })?;
-    add_aws_credentials_to_linker(&mut linker, &network).map_err(|error| {
-        WasmBindingCreationError::Instantiation(
-            error.context("Failed to add AWS credentials to linker"),
-        )
-    })?;
-
+    let linker = create_linker(engine, &network, InstantiationWorld::Basic)?;
     let mut store = GuestStore::new(engine, label, network, None, build_store_limits(), budget);
 
     let bindings = WasmBindings::instantiate_basic(&mut store, component, &linker)
@@ -3156,18 +3181,7 @@ async fn create_instance_with_http(
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let mut linker = Linker::new(engine);
-    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
-        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
-    })?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|error| {
-        WasmBindingCreationError::Instantiation(error.context("Failed to add wasi:http to linker"))
-    })?;
-    add_aws_credentials_to_linker(&mut linker, &network).map_err(|error| {
-        WasmBindingCreationError::Instantiation(
-            error.context("Failed to add AWS credentials to linker"),
-        )
-    })?;
+    let linker = create_linker(engine, &network, InstantiationWorld::HttpEnabled)?;
 
     let mut store = GuestStore::new_with_http_test_route(
         engine,
@@ -3191,32 +3205,29 @@ async fn create_instance_with_http(
 /// Instantiate only the stable provider metadata interface.
 ///
 /// The store is deliberately kind-less: it receives neither AWS nor GitHub
-/// credentials, and the existing HTTP hook rejects every provider-specific
-/// destination for `kind == None`. Supplying the HTTP imports still lets
-/// providers compiled with the HTTP-enabled world instantiate; no metadata
-/// call is granted network access.
+/// credentials, and its HTTP hook rejects every destination. Linking the same
+/// host imports as the HTTP runtime world lets current and released providers
+/// instantiate without granting metadata calls credentials or network access.
 async fn create_schema_only_bindings(
     engine: &Engine,
     component: &Component,
     label: Arc<ProviderLabel>,
 ) -> Result<(GuestStore, SchemaOnlyBindings), WasmProviderLoadError> {
     let budget = GuestCallBudget::PRODUCTION;
+    let network = GuestNetwork::SchemaOnly;
+    let linker =
+        create_linker(engine, &network, InstantiationWorld::HttpEnabled).map_err(|failure| {
+            single_attempt_load_error(engine, component, InstantiationWorld::HttpEnabled, failure)
+        })?;
     let mut store = GuestStore::new_with_http_test_route(
         engine,
         label,
-        GuestNetwork::SchemaOnly,
+        network,
         Some(WasiHttpCtx::new()),
         build_store_limits(),
         budget,
         None,
     );
-    let mut linker = Linker::new(engine);
-    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
-        WasmProviderLoadError::from(format!("Failed to add WASI to linker: {error}"))
-    })?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|error| {
-        WasmProviderLoadError::from(format!("Failed to add wasi:http to linker: {error}"))
-    })?;
     let bindings = SchemaOnlyBindings::instantiate(&mut store, component, &linker)
         .await
         .map_err(|failure| {

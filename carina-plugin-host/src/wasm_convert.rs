@@ -5751,6 +5751,35 @@ mod tests {
     }
 
     #[test]
+    fn schema_only_loads_released_protocol_v12_schema_fixtures() {
+        for (resource_type, json) in [
+            (
+                "acm.Certificate",
+                include_str!(
+                    "../tests/fixtures/protocol-v12/aws-acm-domain-validation-options.json"
+                ),
+            ),
+            (
+                "ec2.EgressOnlyInternetGateway",
+                include_str!(
+                    "../tests/fixtures/protocol-v12/released-aws-egress-only-internet-gateway.json"
+                ),
+            ),
+            (
+                "ec2.Vpc",
+                include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
+            ),
+        ] {
+            let witness =
+                json_to_schema_only_provider_schema(json, CoreValidatedConfigSchema::default(), 12)
+                    .expect(
+                        "released v12 schema metadata must load through the migration-only decoder",
+                    );
+            assert_eq!(witness.resources()[0].parts().resource_type, resource_type);
+        }
+    }
+
+    #[test]
     fn schema_only_v12_upgrade_distinguishes_fields_from_attribute_names() {
         let config = json_to_schema_only_attribute_types(
             r#"{
@@ -6947,7 +6976,7 @@ mod tests {
     fn schema_only_protocol_check_admits_v12_without_weakening_runtime_check() {
         let info = r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#;
 
-        assert!(schema_only_protocol_version(info).is_ok());
+        assert!(check_schema_only_protocol_version(info).is_ok());
         assert!(check_protocol_version(info).is_err());
     }
 }
