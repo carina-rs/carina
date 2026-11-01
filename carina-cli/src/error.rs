@@ -892,17 +892,7 @@ pub enum AppError {
     /// Anonymous state reconciliation found no safe unique legacy row.
     #[error(transparent)]
     AnonymousIdentifierReconciliation(
-        #[from] carina_core::identifier::AmbiguousDeclaredIdentityMatch,
-    ),
-
-    /// A temporary unique-name override hid the persisted identity origin.
-    #[error(transparent)]
-    UnknownIdentityOverrideOrigin(#[from] carina_core::identifier::UnknownIdentityOverrideOrigin),
-
-    /// A legacy-row migration needs an identity expression that state cannot evaluate.
-    #[error(transparent)]
-    UnresolvedDeclaredIdentityMigration(
-        #[from] carina_core::identifier::UnresolvedDeclaredIdentityMigration,
+        #[from] Box<carina_core::identifier::AnonymousIdentifierReconciliationError>,
     ),
 
     /// A module argument constraint became decidable during an operation.
@@ -1227,25 +1217,6 @@ impl AppError {
             source => Self::StateBucketPreparation(StateBucketPreparationError {
                 source: Box::new(source),
             }),
-        }
-    }
-}
-
-impl From<carina_core::identifier::AnonymousIdentifierReconciliationError> for AppError {
-    fn from(error: carina_core::identifier::AnonymousIdentifierReconciliationError) -> Self {
-        match error {
-            carina_core::identifier::AnonymousIdentifierReconciliationError::Comparison(error) => {
-                Self::ComparisonResolution(error)
-            }
-            carina_core::identifier::AnonymousIdentifierReconciliationError::AmbiguousDeclaredIdentity(
-                error,
-            ) => Self::AnonymousIdentifierReconciliation(error),
-            carina_core::identifier::AnonymousIdentifierReconciliationError::UnknownIdentityOverrideOrigin(
-                error,
-            ) => Self::UnknownIdentityOverrideOrigin(error),
-            carina_core::identifier::AnonymousIdentifierReconciliationError::UnresolvedDeclaredIdentity(
-                error,
-            ) => Self::UnresolvedDeclaredIdentityMigration(error),
         }
     }
 }

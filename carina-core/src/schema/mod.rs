@@ -819,10 +819,9 @@ impl InputMode {
 }
 
 /// How a create-only schema value contributes to anonymous resource identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityMode {
     /// The value does not participate in anonymous identity.
-    #[default]
     None,
     /// The value must have a stable plan-time value or authored expression.
     /// This mode remains available on optional input for compatibility; an
@@ -8268,10 +8267,6 @@ impl<'a> EffectiveAttribute<'a> {
         self.attribute.create_only
     }
 
-    pub fn is_identity(&self) -> bool {
-        self.attribute.identity_mode.is_identity()
-    }
-
     pub fn identity_mode(&self) -> IdentityMode {
         self.attribute.identity_mode
     }
@@ -8370,14 +8365,6 @@ impl<'a> EffectiveField<'a> {
 
     pub fn is_write_only(&self) -> bool {
         self.field.write_only
-    }
-
-    pub fn is_create_only(&self) -> bool {
-        self.field.create_only
-    }
-
-    pub fn is_identity(&self) -> bool {
-        self.field.identity_mode.is_identity()
     }
 
     pub fn identity_mode(&self) -> IdentityMode {
@@ -8828,6 +8815,22 @@ impl ValidatedResourceSchema {
             node = EffectiveSchemaNode::Field(field);
         }
         Some(node)
+    }
+
+    /// Resolve a validated identity path to its effective schema node.
+    pub fn effective_node_at_identity_path(
+        &self,
+        path: &IdentityPath,
+    ) -> Option<EffectiveSchemaNode<'_>> {
+        let names =
+            path.segments()
+                .iter()
+                .map(|segment| match segment {
+                    IdentityPathSegment::Attribute(name)
+                    | IdentityPathSegment::StructField(name) => name.clone(),
+                })
+                .collect::<Vec<_>>();
+        self.effective_node_at_path(&names)
     }
 
     /// Resolve an authored DSL path, including active block aliases, while
@@ -10145,7 +10148,7 @@ fn collect_identity_paths_in_type(
     }
 }
 
-fn identity_leaf_is_scalar_or_enum(
+pub(crate) fn identity_leaf_is_scalar_or_enum(
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
     ref_chain: &mut Vec<String>,
@@ -10410,6 +10413,15 @@ struct CreateOnlyTypeAnalysis {
     union_conflict: bool,
 }
 
+impl CreateOnlyTypeAnalysis {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            contains_create_only: self.contains_create_only || other.contains_create_only,
+            union_conflict: self.union_conflict || other.union_conflict,
+        }
+    }
+}
+
 fn type_create_only_analysis<'schema>(
     attr_type: &'schema AttributeType,
     defs: &'schema BTreeMap<String, AttributeType>,
@@ -10432,31 +10444,26 @@ fn type_create_only_analysis<'schema>(
             type_create_only_analysis(element_type, defs, ref_chain)
         }
         AttrTypeKind::Map { value, .. } => type_create_only_analysis(value, defs, ref_chain),
-        AttrTypeKind::Struct { fields, .. } => {
-            fields
-                .iter()
-                .fold(CreateOnlyTypeAnalysis::default(), |analysis, field| {
-                    let nested = type_create_only_analysis(&field.field_type, defs, ref_chain);
-                    CreateOnlyTypeAnalysis {
-                        contains_create_only: analysis.contains_create_only
-                            || field.create_only
-                            || nested.contains_create_only,
-                        union_conflict: analysis.union_conflict || nested.union_conflict,
-                    }
-                })
-        }
-        AttrTypeKind::Union(members) => {
-            let nested = members.as_raw_slice().iter().fold(
+        AttrTypeKind::Struct { fields, .. } => fields
+            .iter()
+            .map(|field| {
+                let mut nested = type_create_only_analysis(&field.field_type, defs, ref_chain);
+                nested.contains_create_only |= field.create_only;
+                nested
+            })
+            .fold(
                 CreateOnlyTypeAnalysis::default(),
-                |analysis, member| {
-                    let member = type_create_only_analysis(member, defs, ref_chain);
-                    CreateOnlyTypeAnalysis {
-                        contains_create_only: analysis.contains_create_only
-                            || member.contains_create_only,
-                        union_conflict: analysis.union_conflict || member.union_conflict,
-                    }
-                },
-            );
+                CreateOnlyTypeAnalysis::merge,
+            ),
+        AttrTypeKind::Union(members) => {
+            let nested = members
+                .as_raw_slice()
+                .iter()
+                .map(|member| type_create_only_analysis(member, defs, ref_chain))
+                .fold(
+                    CreateOnlyTypeAnalysis::default(),
+                    CreateOnlyTypeAnalysis::merge,
+                );
             CreateOnlyTypeAnalysis {
                 union_conflict: nested.contains_create_only || nested.union_conflict,
                 ..nested
@@ -10471,35 +10478,6 @@ fn type_create_only_analysis<'schema>(
         | AttrTypeKind::Duration
         | AttrTypeKind::Enum { .. } => CreateOnlyTypeAnalysis::default(),
     }
-}
-
-/// A schema shape that cannot safely project nested create-only leaves.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateOnlySchemaConflict {
-    attribute: String,
-}
-
-impl CreateOnlySchemaConflict {
-    pub fn attribute(&self) -> &str {
-        &self.attribute
-    }
-
-    pub fn message(&self) -> &'static str {
-        "union members cannot be create-only-bearing"
-    }
-}
-
-fn first_create_only_conflict_in(
-    attributes: &BTreeMap<String, AttributeSchema>,
-    defs: &BTreeMap<String, AttributeType>,
-) -> Option<CreateOnlySchemaConflict> {
-    attributes.iter().find_map(|(name, attribute)| {
-        type_create_only_analysis(&attribute.attr_type, defs, &mut Vec::new())
-            .union_conflict
-            .then(|| CreateOnlySchemaConflict {
-                attribute: name.clone(),
-            })
-    })
 }
 
 fn validate_keyed_partial_update(
@@ -10977,10 +10955,16 @@ impl ResourceSchema {
             push_schema_issue(&mut issues, &location, conflict.message());
         }
 
-        if let Some(conflict) = self.first_create_only_conflict() {
-            let location =
-                SchemaValidationIssueLocation::Attribute(conflict.attribute().to_string());
-            push_schema_issue(&mut issues, &location, conflict.message());
+        if let Some((name, _)) = self.attributes.iter().find(|(_, attribute)| {
+            type_create_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new())
+                .union_conflict
+        }) {
+            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            push_schema_issue(
+                &mut issues,
+                &location,
+                "union members cannot be create-only-bearing",
+            );
         }
 
         normalize_issues(&mut issues);
@@ -11103,12 +11087,6 @@ impl ResourceSchema {
     /// write-only provenance.
     pub fn first_write_only_conflict(&self) -> Option<WriteOnlySchemaConflict> {
         first_write_only_conflict_in(&self.attributes, &self.defs)
-    }
-
-    /// Return the first schema shape that cannot safely project nested
-    /// create-only provenance.
-    pub fn first_create_only_conflict(&self) -> Option<CreateOnlySchemaConflict> {
-        first_create_only_conflict_in(&self.attributes, &self.defs)
     }
 
     /// Return whether a top-level attribute contains a nested write-only field.

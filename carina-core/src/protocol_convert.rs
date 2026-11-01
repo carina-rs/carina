@@ -42,7 +42,8 @@ use crate::schema::{
     FieldGroupKind, IdentityMode, InputMode, RawShape, ResourceSchema, ResourceSchemaParts,
     ResourceSchemaValidationError, ResourceValidation, SchemaKind, SchemaValidationIssueLocation,
     StructField, StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    ValidatedProviderSchemaWitness, ValidatedResourceSchema, empty_defs_for_schema_walks,
+    identity_leaf_is_scalar_or_enum,
 };
 
 fn field_group_to_protocol(group: &FieldGroup) -> protocol::FieldGroup {
@@ -1026,12 +1027,14 @@ pub fn protocol_to_attribute_schema(
     if identity_mode.is_identity() && !*create_only {
         return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
     }
-    if identity_mode == IdentityMode::WhenPresent && input_mode == InputMode::Required {
-        return Err(
-            SchemaDecodeError::when_present_identity_requires_optional().prepend_attribute(name)
-        );
-    }
-    if identity_mode.is_identity() && !protocol_identity_leaf_is_scalar_or_enum(&attr_type) {
+    // References are checked once the resource's definitions are available.
+    if identity_mode.is_identity()
+        && identity_leaf_is_scalar_or_enum(
+            &attr_type,
+            empty_defs_for_schema_walks(),
+            &mut Vec::new(),
+        ) == Some(false)
+    {
         return Err(SchemaDecodeError::identity_requires_scalar_or_enum().prepend_attribute(name));
     }
 
@@ -1068,17 +1071,17 @@ pub fn protocol_to_attribute_schema(
             if let Some(key_field) = keyed_partial_update {
                 builder = builder.keyed_partial_update(key_field.clone());
             }
-            if *create_only {
+            Ok(if *create_only {
                 let builder = builder.create_only();
                 let builder = match identity_mode {
                     IdentityMode::None => builder,
                     IdentityMode::Required => builder.identity(),
                     IdentityMode::WhenPresent => builder.identity_when_present(),
                 };
-                Ok(builder.build())
+                builder.build()
             } else {
-                Ok(builder.build())
-            }
+                builder.build()
+            })
         }
         InputMode::Required => {
             if default.is_some() {
@@ -1117,7 +1120,7 @@ pub fn protocol_to_attribute_schema(
             if let Some(key_field) = keyed_partial_update {
                 builder = builder.keyed_partial_update(key_field.clone());
             }
-            if *create_only {
+            Ok(if *create_only {
                 let builder = builder.create_only();
                 let builder = match identity_mode {
                     IdentityMode::None => builder,
@@ -1127,10 +1130,10 @@ pub fn protocol_to_attribute_schema(
                             .prepend_attribute(name));
                     }
                 };
-                Ok(builder.build())
+                builder.build()
             } else {
-                Ok(builder.build())
-            }
+                builder.build()
+            })
         }
         InputMode::ProviderPopulated => {
             for (present, modifier) in [
@@ -1590,11 +1593,6 @@ pub fn protocol_to_struct_field(
     if identity_mode.is_identity() && !*create_only {
         return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
     }
-    if identity_mode == IdentityMode::WhenPresent && input_mode == InputMode::Required {
-        return Err(
-            SchemaDecodeError::when_present_identity_requires_optional().prepend_attribute(name)
-        );
-    }
     if input_mode == InputMode::ProviderPopulated {
         for (present, modifier) in [
             (*create_only, "create_only"),
@@ -1610,7 +1608,13 @@ pub fn protocol_to_struct_field(
     }
     let field_type =
         protocol_to_attribute_type(field_type).map_err(|error| error.prepend_attribute(name))?;
-    if identity_mode.is_identity() && !protocol_identity_leaf_is_scalar_or_enum(&field_type) {
+    if identity_mode.is_identity()
+        && identity_leaf_is_scalar_or_enum(
+            &field_type,
+            empty_defs_for_schema_walks(),
+            &mut Vec::new(),
+        ) == Some(false)
+    {
         return Err(SchemaDecodeError::identity_requires_scalar_or_enum().prepend_attribute(name));
     }
 
@@ -1632,17 +1636,17 @@ pub fn protocol_to_struct_field(
             if *deferred_populate {
                 builder = builder.deferred_populate();
             }
-            if *create_only {
+            Ok(if *create_only {
                 let builder = builder.create_only();
                 let builder = match identity_mode {
                     IdentityMode::None => builder,
                     IdentityMode::Required => builder.identity(),
                     IdentityMode::WhenPresent => builder.identity_when_present(),
                 };
-                Ok(builder.build())
+                builder.build()
             } else {
-                Ok(builder.build())
-            }
+                builder.build()
+            })
         }
         InputMode::Required => {
             let mut builder = StructField::required(name.clone(), field_type);
@@ -1661,7 +1665,7 @@ pub fn protocol_to_struct_field(
             if *deferred_populate {
                 builder = builder.deferred_populate();
             }
-            if *create_only {
+            Ok(if *create_only {
                 let builder = builder.create_only();
                 let builder = match identity_mode {
                     IdentityMode::None => builder,
@@ -1671,10 +1675,10 @@ pub fn protocol_to_struct_field(
                             .prepend_attribute(name));
                     }
                 };
-                Ok(builder.build())
+                builder.build()
             } else {
-                Ok(builder.build())
-            }
+                builder.build()
+            })
         }
         InputMode::ProviderPopulated => {
             let mut builder = StructField::provider_populated(name.clone(), field_type);
@@ -1693,19 +1697,6 @@ pub fn protocol_to_struct_field(
             Ok(builder.build())
         }
     }
-}
-
-fn protocol_identity_leaf_is_scalar_or_enum(attribute_type: &AttributeType) -> bool {
-    matches!(
-        attribute_type.raw_shape(),
-        RawShape::String { .. }
-            | RawShape::Int { .. }
-            | RawShape::Float { .. }
-            | RawShape::Bool
-            | RawShape::Duration
-            | RawShape::Enum { .. }
-            | RawShape::Ref(_)
-    )
 }
 
 fn protocol_to_input_mode(required: bool, read_only: bool) -> Result<InputMode, SchemaDecodeError> {
@@ -3542,6 +3533,7 @@ mod tests {
         required_attribute.identity = protocol::IdentityMode::WhenPresent;
         let error = protocol_to_attribute_schema(&required_attribute)
             .expect_err("when-present identity must reject required input");
+        assert!(matches!(&error, SchemaDecodeError::InvalidSchema { .. }));
         assert_eq!(
             error.to_string(),
             "attribute 'name': when-present identity requires optional input"
@@ -3557,6 +3549,7 @@ mod tests {
         required_field.identity = protocol::IdentityMode::WhenPresent;
         let error = protocol_to_struct_field(&required_field)
             .expect_err("nested when-present identity must reject required input");
+        assert!(matches!(&error, SchemaDecodeError::InvalidSchema { .. }));
         assert_eq!(
             error.to_string(),
             "attribute 'name': when-present identity requires optional input"
@@ -3591,6 +3584,10 @@ mod tests {
 
         let attribute_error = protocol_to_attribute_schema(attribute)
             .expect_err("protocol attribute identity must be scalar or enum");
+        assert!(matches!(
+            &attribute_error,
+            SchemaDecodeError::InvalidSchema { .. }
+        ));
         assert_eq!(
             attribute_error.to_string(),
             "attribute 'names': identity value must have a scalar or enum type"
@@ -3616,6 +3613,10 @@ mod tests {
 
         let field_error = protocol_to_struct_field(&wire)
             .expect_err("protocol struct-field identity must be scalar or enum");
+        assert!(matches!(
+            &field_error,
+            SchemaDecodeError::InvalidSchema { .. }
+        ));
         assert_eq!(
             field_error.to_string(),
             "attribute 'names': identity value must have a scalar or enum type"

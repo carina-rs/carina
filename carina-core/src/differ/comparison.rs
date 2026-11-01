@@ -1013,16 +1013,8 @@ impl AuthoredAttributeViews {
         &self.current
     }
 
-    fn saved(&self) -> Option<&CanonicalComparisonAttributes> {
-        self.saved.as_ref()
-    }
-
     pub(super) fn removal_evidence(&self) -> AuthoredRemovalEvidence {
         self.removal_evidence
-    }
-
-    fn previously_authored_top_level_attributes(&self) -> &[String] {
-        &self.previously_authored_top_level_attributes
     }
 }
 
@@ -1072,17 +1064,16 @@ pub(super) fn project_authored_attribute_views(
                 .into_attributes()
         },
     );
-    let saved = match saved {
-        Some(saved) => match projection.as_ref() {
-            Some(projection) => Some(
+    let saved = saved.map(|saved| {
+        projection.as_ref().map_or_else(
+            || saved.clone(),
+            |projection| {
                 projection
                     .project_attributes(saved.clone())
-                    .into_attributes(),
-            ),
-            None => Some(saved.clone()),
-        },
-        None => None,
-    };
+                    .into_attributes()
+            },
+        )
+    });
     AuthoredAttributeViews {
         current,
         saved,
@@ -1148,8 +1139,8 @@ pub(super) fn find_changed_attributes_with_ignores(
         schema,
         context,
     );
-    let projected_current = projected.current();
-    let projected_saved = projected.saved();
+    let projected_current = &projected.current;
+    let projected_saved = projected.saved.as_ref();
 
     let observed_for_ignored = raw_saved.map_or_else(
         || projected_current.clone(),
@@ -1268,7 +1259,7 @@ pub(super) fn find_changed_attributes_with_ignores(
     // attribute removal is not detected for those rows. A later desired-backed
     // state write can seed the record from desired keys (never provider keys),
     // after which removals of those recorded keys are detectable.
-    for key in projected.previously_authored_top_level_attributes() {
+    for key in &projected.previously_authored_top_level_attributes {
         if desired.contains_key(key) {
             continue;
         }

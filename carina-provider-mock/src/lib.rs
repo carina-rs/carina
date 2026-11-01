@@ -311,105 +311,18 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .build(),
             )
             .with_unique_name_attribute("name"),
-        ResourceSchema::new("test.nested_identity")
-            .attribute(
-                AttributeSchema::required(
-                    "identity",
-                    AttributeType::struct_(
-                        "NestedIdentity",
-                        vec![
-                            StructField::required("key", AttributeType::string())
-                                .create_only()
-                                .identity()
-                                .build(),
-                        ],
-                    ),
-                )
-                .build(),
+    ]
+    .into_iter()
+    .chain(anonymous_identity_schemas().into_iter().map(|schema| {
+        if schema.resource_type() == "budgets.Budget" {
+            schema.attribute(
+                AttributeSchema::optional("cost_filters", AttributeType::string()).build(),
             )
-            .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
-        ResourceSchema::new("test.unique_identity")
-            .attribute(
-                AttributeSchema::required("name", AttributeType::string())
-                    .create_only()
-                    .identity()
-                    .build(),
-            )
-            .attribute(
-                AttributeSchema::required("replacement_key", AttributeType::string())
-                    .create_only()
-                    .build(),
-            )
-            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
-            .with_unique_name_attribute("name"),
-        ResourceSchema::new("budgets.Budget")
-            .attribute(
-                AttributeSchema::required(
-                    "budget",
-                    AttributeType::struct_(
-                        "BudgetData",
-                        vec![
-                            StructField::optional("budget_name", AttributeType::string())
-                                .create_only()
-                                .identity()
-                                .build(),
-                            StructField::required("budget_type", AttributeType::string()).build(),
-                            StructField::required("time_unit", AttributeType::string()).build(),
-                        ],
-                    ),
-                )
-                .build(),
-            )
-            .attribute(
-                AttributeSchema::optional(
-                    "notifications_with_subscribers",
-                    AttributeType::list(AttributeType::struct_(
-                        "NotificationWithSubscribers",
-                        vec![
-                            StructField::required("notification_type", AttributeType::string())
-                                .build(),
-                            StructField::required("threshold", AttributeType::float()).build(),
-                        ],
-                    )),
-                )
-                .create_only()
-                .build(),
-            )
-            .attribute(AttributeSchema::optional("cost_filters", AttributeType::string()).build()),
-        ResourceSchema::new("route53.HostedZone")
-            .attribute(
-                AttributeSchema::required("name", AttributeType::string())
-                    .create_only()
-                    .build(),
-            )
-            .attribute(AttributeSchema::provider_populated("id", AttributeType::string()).build()),
-        ResourceSchema::new("route53.RecordSet")
-            .attribute(
-                AttributeSchema::required("hosted_zone_id", AttributeType::string())
-                    .create_only()
-                    .identity()
-                    .build(),
-            )
-            .attribute(
-                AttributeSchema::required("name", AttributeType::string())
-                    .create_only()
-                    .identity()
-                    .build(),
-            )
-            .attribute(
-                AttributeSchema::required("type", AttributeType::string())
-                    .create_only()
-                    .identity()
-                    .build(),
-            )
-            .attribute(
-                AttributeSchema::optional(
-                    "resource_records",
-                    AttributeType::list(AttributeType::string()),
-                )
-                .create_only()
-                .build(),
-            ),
+        } else {
+            schema
+        }
+    }))
+    .chain([
         ResourceSchema::new("compute.Instance")
             .attribute(
                 AttributeSchema::optional("name", AttributeType::string())
@@ -478,16 +391,134 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
         ResourceSchema::new("test.Thing")
             .attribute(AttributeSchema::required("name", AttributeType::string()).build())
             .with_unique_name_attribute("name"),
-    ];
+    ]);
 
     schemas
-        .into_iter()
         .map(|schema| {
             schema
                 .validate()
                 .expect("built-in mock resource schema must be valid")
         })
         .collect()
+}
+
+/// Identity schemas shared by the built-in and process mock providers.
+pub fn anonymous_identity_schemas() -> Vec<ResourceSchema> {
+    vec![
+        ResourceSchema::new("test.nested_identity")
+            .attribute(
+                AttributeSchema::required(
+                    "identity",
+                    AttributeType::struct_(
+                        "NestedIdentity",
+                        vec![
+                            StructField::required("key", AttributeType::string())
+                                .create_only()
+                                .identity()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+        ResourceSchema::new("test.unique_identity")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("replacement_key", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .with_unique_name_attribute("name"),
+        ResourceSchema::new("budgets.Budget")
+            .attribute(
+                AttributeSchema::required(
+                    "budget",
+                    AttributeType::struct_(
+                        "BudgetData",
+                        vec![
+                            StructField::optional("budget_name", AttributeType::string())
+                                .create_only()
+                                .identity()
+                                .build(),
+                            StructField::required("budget_type", AttributeType::string()).build(),
+                            StructField::required("time_unit", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "notifications_with_subscribers",
+                    AttributeType::list(AttributeType::struct_(
+                        "NotificationWithSubscribers",
+                        vec![
+                            StructField::required("notification_type", AttributeType::string())
+                                .build(),
+                            StructField::required("threshold", AttributeType::float()).build(),
+                        ],
+                    )),
+                )
+                .create_only()
+                .build(),
+            ),
+        ResourceSchema::new("route53.HostedZone")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::provider_populated("id", AttributeType::string()).build()),
+        ResourceSchema::new("route53.RecordSet")
+            .attribute(
+                AttributeSchema::required("hosted_zone_id", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("type", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "resource_records",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .create_only()
+                .build(),
+            ),
+    ]
+}
+
+/// Values generated by the mock provider after a resource is created.
+pub fn generated_attribute(
+    resource_type: &str,
+    identity: Option<&str>,
+    name: Option<&str>,
+) -> Option<(&'static str, String)> {
+    match resource_type {
+        "test.resource" => name
+            .or(identity)
+            .map(|identity| ("identifier", format!("{identity}-id"))),
+        "route53.HostedZone" => identity.map(|identity| ("id", format!("{identity}-id"))),
+        _ => None,
+    }
 }
 
 /// Aggregate schema witness exposed by Carina's built-in mock provider.
@@ -896,18 +927,6 @@ impl MockProvider {
         })
     }
 
-    fn generated_attribute(id: &ResourceId, name: Option<&str>) -> Option<(&'static str, String)> {
-        match id.resource_type.as_str() {
-            "test.resource" => name
-                .or_else(|| id.identity_str())
-                .map(|identity| ("identifier", format!("{identity}-id"))),
-            "route53.HostedZone" => id
-                .identity_str()
-                .map(|identity| ("id", format!("{identity}-id"))),
-            _ => None,
-        }
-    }
-
     fn populate_generated_attribute_json(
         id: &ResourceId,
         attrs: &mut HashMap<String, PersistedValue>,
@@ -920,7 +939,9 @@ impl MockProvider {
                     Value::Concrete(ConcreteValue::String(value)) => Some(value.into_plaintext()),
                     _ => None,
                 });
-        if let Some((attribute, value)) = Self::generated_attribute(id, name.as_deref()) {
+        if let Some((attribute, value)) =
+            generated_attribute(&id.resource_type, id.identity_str(), name.as_deref())
+        {
             attrs.entry(attribute.to_string()).or_insert_with(|| {
                 PersistedValue::encode_provider_value(
                     &Value::Concrete(ConcreteValue::String(value.into())),
@@ -939,7 +960,9 @@ impl MockProvider {
                 _ => None,
             })
             .map(str::to_string);
-        if let Some((attribute, value)) = Self::generated_attribute(id, name.as_deref()) {
+        if let Some((attribute, value)) =
+            generated_attribute(&id.resource_type, id.identity_str(), name.as_deref())
+        {
             attrs
                 .entry(attribute.to_string())
                 .or_insert_with(|| Value::Concrete(ConcreteValue::String(value.into())));

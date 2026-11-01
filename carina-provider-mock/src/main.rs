@@ -5,8 +5,7 @@ use carina_core::resource::{
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType, ReadBackBudget,
-    ResourceSchema as CoreResourceSchema, StructField as CoreStructField,
-    ValidatedConfigSchema as CoreValidatedConfigSchema,
+    ResourceSchema as CoreResourceSchema, ValidatedConfigSchema as CoreValidatedConfigSchema,
     ValidatedResourceSchema as CoreValidatedResourceSchema, legacy_validator,
 };
 use carina_plugin_sdk::types::*;
@@ -470,12 +469,18 @@ impl MockProcessProvider {
             );
         }
         let id = &request.resource.id;
-        if id.resource_type == "route53.HostedZone" {
+        if id.resource_type == "route53.HostedZone"
+            && let Some((attribute, value)) = carina_provider_mock::generated_attribute(
+                &id.resource_type,
+                Some(&id.identity),
+                None,
+            )
+        {
             request
                 .resource
                 .attributes
-                .entry("id".to_string())
-                .or_insert_with(|| Value::String(format!("{}-id", id.identity)));
+                .entry(attribute.to_string())
+                .or_insert_with(|| Value::String(value));
         }
         request.resource.attributes
     }
@@ -775,136 +780,18 @@ impl CarinaProvider for MockProcessProvider {
                 .with_description("Mock desired-normalization three-way attribute probe")
                 .validate()
                 .expect("normalization probe schema must be valid"),
-            CoreResourceSchema::new("test.nested_identity")
-                .attribute(
-                    CoreAttributeSchema::required(
-                        "identity",
-                        CoreAttributeType::struct_(
-                            "NestedIdentity",
-                            vec![
-                                CoreStructField::required("key", CoreAttributeType::string())
-                                    .create_only()
-                                    .identity()
-                                    .build(),
-                            ],
-                        ),
-                    )
-                    .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::optional("description", CoreAttributeType::string())
-                        .build(),
-                )
-                .validate()
-                .expect("nested identity mock schema must be valid"),
-            CoreResourceSchema::new("test.unique_identity")
-                .attribute(
-                    CoreAttributeSchema::required("name", CoreAttributeType::string())
-                        .create_only()
-                        .identity()
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::required("replacement_key", CoreAttributeType::string())
-                        .create_only()
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::optional("description", CoreAttributeType::string())
-                        .build(),
-                )
-                .with_unique_name_attribute("name")
-                .validate()
-                .expect("unique-name identity mock schema must be valid"),
-            CoreResourceSchema::new("budgets.Budget")
-                .attribute(
-                    CoreAttributeSchema::required(
-                        "budget",
-                        CoreAttributeType::struct_(
-                            "BudgetData",
-                            vec![
-                                CoreStructField::optional(
-                                    "budget_name",
-                                    CoreAttributeType::string(),
-                                )
-                                .create_only()
-                                .identity()
-                                .build(),
-                                CoreStructField::required(
-                                    "budget_type",
-                                    CoreAttributeType::string(),
-                                )
-                                .build(),
-                                CoreStructField::required("time_unit", CoreAttributeType::string())
-                                    .build(),
-                            ],
-                        ),
-                    )
-                    .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::optional(
-                        "notifications_with_subscribers",
-                        CoreAttributeType::list(CoreAttributeType::struct_(
-                            "NotificationWithSubscribers",
-                            vec![
-                                CoreStructField::required(
-                                    "notification_type",
-                                    CoreAttributeType::string(),
-                                )
-                                .build(),
-                                CoreStructField::required("threshold", CoreAttributeType::float())
-                                    .build(),
-                            ],
-                        )),
-                    )
-                    .create_only()
-                    .build(),
-                )
-                .validate()
-                .expect("Budget-shaped mock schema must be valid"),
-            CoreResourceSchema::new("route53.HostedZone")
-                .attribute(
-                    CoreAttributeSchema::required("name", CoreAttributeType::string())
-                        .create_only()
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::provider_populated("id", CoreAttributeType::string())
-                        .build(),
-                )
-                .validate()
-                .expect("HostedZone-shaped mock schema must be valid"),
-            CoreResourceSchema::new("route53.RecordSet")
-                .attribute(
-                    CoreAttributeSchema::required("hosted_zone_id", CoreAttributeType::string())
-                        .create_only()
-                        .identity()
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::required("name", CoreAttributeType::string())
-                        .create_only()
-                        .identity()
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::required("type", CoreAttributeType::string())
-                        .create_only()
-                        .identity()
-                        .build(),
-                )
-                .attribute(
-                    CoreAttributeSchema::optional(
-                        "resource_records",
-                        CoreAttributeType::list(CoreAttributeType::string()),
-                    )
-                    .create_only()
-                    .build(),
-                )
-                .validate()
-                .expect("RecordSet-shaped mock schema must be valid"),
         ]
+        .into_iter()
+        .chain(
+            carina_provider_mock::anonymous_identity_schemas()
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("mock identity schema must be valid")
+                }),
+        )
+        .collect()
     }
 
     fn reference_forms(&self) -> carina_core::schema::ReferenceForms {

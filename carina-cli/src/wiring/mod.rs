@@ -2874,7 +2874,8 @@ fn reconcile_anonymous_identifiers_with_ctx(
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
         claims,
-    )?)
+    )
+    .map_err(Box::new)?)
 }
 
 fn detect_legacy_loop_moves_with_ctx(

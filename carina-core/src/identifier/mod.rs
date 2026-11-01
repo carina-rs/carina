@@ -232,17 +232,6 @@ fn top_level_stable_hash_value<S, P: PlaceholderKind>(
         .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
 }
 
-fn identity_path_field_names(path: &IdentityPath) -> Vec<String> {
-    path.segments()
-        .iter()
-        .map(|segment| match segment {
-            IdentityPathSegment::Attribute(name) | IdentityPathSegment::StructField(name) => {
-                name.clone()
-            }
-        })
-        .collect()
-}
-
 fn value_has_authored_plan_time_expression<P: PlaceholderKind>(value: &Value<P>) -> bool {
     match value {
         Value::Concrete(ConcreteValue::List(values)) => {
@@ -316,6 +305,26 @@ enum IdentityPathInput<'a, P: PlaceholderKind> {
     Value(&'a Value<P>),
 }
 
+/// Missing roots or fields are absent; an unavailable ancestor shape is an error.
+fn value_at_identity_path<'a, P: PlaceholderKind>(
+    root: Option<&'a Value<P>>,
+    path: &IdentityPath,
+) -> Result<Option<&'a Value<P>>, ()> {
+    let Some(mut value) = root else {
+        return Ok(None);
+    };
+    for field in path.struct_fields() {
+        let Value::Concrete(ConcreteValue::Map(fields)) = value else {
+            return Err(());
+        };
+        let Some(field_value) = fields.get(field) else {
+            return Ok(None);
+        };
+        value = field_value;
+    }
+    Ok(Some(value))
+}
+
 fn identity_path_input<'a, S, P: PlaceholderKind>(
     resource: &'a Resource<S, P>,
     path: &IdentityPath,
@@ -331,32 +340,11 @@ fn identity_path_input<'a, S, P: PlaceholderKind>(
             return IdentityPathInput::AuthoredPrefix(prefix);
         }
     }
-    let Some(mut value) = resource.get_attr(path.attribute_name()) else {
-        return IdentityPathInput::Absent;
-    };
-    for field in path.struct_fields() {
-        value = match value {
-            Value::Concrete(ConcreteValue::Map(fields)) => {
-                let Some(value) = fields.get(field) else {
-                    return IdentityPathInput::Absent;
-                };
-                value
-            }
-            Value::Concrete(
-                ConcreteValue::String(_)
-                | ConcreteValue::Int(_)
-                | ConcreteValue::Float(_)
-                | ConcreteValue::Bool(_)
-                | ConcreteValue::List(_)
-                | ConcreteValue::StringList(_)
-                | ConcreteValue::EnumIdentifier(_)
-                | ConcreteValue::CanonicalEnum(_)
-                | ConcreteValue::Duration(_),
-            )
-            | Value::Deferred(_) => return IdentityPathInput::Unavailable,
-        };
+    match value_at_identity_path(resource.get_attr(path.attribute_name()), path) {
+        Ok(None) => IdentityPathInput::Absent,
+        Ok(Some(value)) => IdentityPathInput::Value(value),
+        Err(()) => IdentityPathInput::Unavailable,
     }
-    IdentityPathInput::Value(value)
 }
 
 fn complete_identity_value<S, P: PlaceholderKind>(
@@ -364,8 +352,8 @@ fn complete_identity_value<S, P: PlaceholderKind>(
     schema: &ValidatedResourceSchema,
     path: &IdentityPath,
 ) -> Option<CompleteIdentityValue> {
-    let names = identity_path_field_names(path);
-    let identity_mode = schema.effective_node_at_path(&names)?.identity_mode();
+    let node = schema.effective_node_at_identity_path(path)?;
+    let identity_mode = node.identity_mode();
     match identity_path_input(resource, path) {
         IdentityPathInput::Absent if identity_mode.allows_absence() => {
             Some(CompleteIdentityValue::Absent)
@@ -406,7 +394,6 @@ fn complete_identity_value<S, P: PlaceholderKind>(
             ))
         }
         IdentityPathInput::Value(value) if value_has_authored_plan_time_expression(value) => {
-            let node = schema.effective_node_at_path(&names)?;
             schema_canonical_value_string(value, Some(node.field_type()), schema.as_schema().defs())
                 .map(CompleteIdentityValue::Written)
         }
@@ -523,35 +510,23 @@ fn hash_declared_identity_inputs(
     for (path, value) in identity.as_map() {
         encode_count(&mut hasher, path.segments().len());
         for segment in path.segments() {
-            match segment {
-                IdentityPathSegment::Attribute(name) => {
-                    hasher.update([0]);
-                    encode_length_prefixed(&mut hasher, name.as_bytes());
-                }
-                IdentityPathSegment::StructField(name) => {
-                    hasher.update([1]);
-                    encode_length_prefixed(&mut hasher, name.as_bytes());
-                }
-            }
+            let (tag, bytes) = match segment {
+                IdentityPathSegment::Attribute(name) => (0, name.as_bytes()),
+                IdentityPathSegment::StructField(name) => (1, name.as_bytes()),
+            };
+            hasher.update([tag]);
+            encode_length_prefixed(&mut hasher, bytes);
         }
-        match value {
-            CompleteIdentityValue::Absent => hasher.update([4]),
-            CompleteIdentityValue::Written(value) => {
-                hasher.update([0]);
-                encode_length_prefixed(&mut hasher, value.as_bytes());
-            }
-            CompleteIdentityValue::ReferenceExpression(value) => {
-                hasher.update([1]);
-                encode_length_prefixed(&mut hasher, value.as_bytes());
-            }
-            CompleteIdentityValue::Prefix(value) => {
-                hasher.update([2]);
-                encode_length_prefixed(&mut hasher, value.as_bytes());
-            }
-            CompleteIdentityValue::PrefixExpression(value) => {
-                hasher.update([3]);
-                encode_length_prefixed(&mut hasher, value.as_bytes());
-            }
+        let (tag, bytes) = match value {
+            CompleteIdentityValue::Absent => (4, None),
+            CompleteIdentityValue::Written(value) => (0, Some(value.as_bytes())),
+            CompleteIdentityValue::ReferenceExpression(value) => (1, Some(value.as_bytes())),
+            CompleteIdentityValue::Prefix(value) => (2, Some(value.as_bytes())),
+            CompleteIdentityValue::PrefixExpression(value) => (3, Some(value.as_bytes())),
+        };
+        hasher.update([tag]);
+        if let Some(bytes) = bytes {
+            encode_length_prefixed(&mut hasher, bytes);
         }
     }
     let digest = hasher.finalize();
@@ -951,11 +926,10 @@ pub enum AnonymousResourceIdentifierCollisionKind {
 }
 
 /// Anonymous declarations that either share one generated address or declare
-/// the same complete natural key on one provider route.
+/// the same complete natural key for one provider and resource type, regardless
+/// of provider instance.
 #[derive(Debug, Clone)]
 pub struct AnonymousResourceIdentifierCollision {
-    first_type: String,
-    second_type: String,
     identifier: String,
     kind: AnonymousResourceIdentifierCollisionKind,
     members: Vec<AnonymousIdentityErrorMember>,
@@ -981,12 +955,15 @@ impl AnonymousResourceIdentifierCollision {
 
 impl std::fmt::Display for AnonymousResourceIdentifierCollision {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let first_type = self.members[0].resource_id.display_type();
         match self.kind {
             AnonymousResourceIdentifierCollisionKind::SharedAddress => write!(
                 formatter,
                 "Anonymous resource identifier collision: '{}' and '{}' produce the same \
                  identifier '{}'. Use `let` bindings to give them distinct names.",
-                self.first_type, self.second_type, self.identifier,
+                first_type,
+                self.members[1].resource_id.display_type(),
+                self.identifier,
             ),
             AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity { same_identifier } => {
                 let first_provider_instance = self
@@ -1006,7 +983,7 @@ impl std::fmt::Display for AnonymousResourceIdentifierCollision {
                         "Anonymous resources of type '{}' {provider_scope} have equal declared \
                          identity values and produce address '{}'. Give one of them a name with \
                          `let`.",
-                        self.first_type, self.identifier,
+                        first_type, self.identifier,
                     )
                 } else {
                     write!(
@@ -1014,7 +991,7 @@ impl std::fmt::Display for AnonymousResourceIdentifierCollision {
                         "Anonymous resources of type '{}' {provider_scope} have equal declared \
                          identity values even though their module-scoped addresses differ. Give \
                          one of them a name with `let`.",
-                        self.first_type,
+                        first_type,
                     )
                 }
             }
@@ -2264,12 +2241,8 @@ fn discover_loop_module_prefix_collisions<S: AnonymousIdentityModuleSource, P: P
                 });
             }
         } else {
-            let first = &resources[distinct_origins[0].0];
-            let second = &resources[distinct_origins[1].0];
             plain_errors.push(
                 AnonymousResourceIdentifierCollision {
-                    first_type: first.id.display_type(),
-                    second_type: second.id.display_type(),
                     identifier: current_prefix.clone(),
                     kind: AnonymousResourceIdentifierCollisionKind::SharedAddress,
                     members: anonymous_identity_error_members(
@@ -2615,8 +2588,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
             .all(|&computed_index| &computed[computed_index].1 == first_identifier);
         identity_errors.push(
             AnonymousResourceIdentifierCollision {
-                first_type: resources[resource_indices[0]].id.display_type(),
-                second_type: resources[resource_indices[1]].id.display_type(),
                 identifier: first_identifier.clone(),
                 kind: AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity {
                     same_identifier,
@@ -2687,8 +2658,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         }
         identity_errors.push(
             AnonymousResourceIdentifierCollision {
-                first_type: resources[resource_indices[0]].id.display_type(),
-                second_type: resources[resource_indices[1]].id.display_type(),
                 identifier,
                 kind: AnonymousResourceIdentifierCollisionKind::SharedAddress,
                 members: anonymous_identity_error_members(resources, &resource_indices),
@@ -2728,8 +2697,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         }
         identity_errors.push(
             AnonymousResourceIdentifierCollision {
-                first_type: resources[resource_indices[0]].id.display_type(),
-                second_type: resources[resource_indices[1]].id.display_type(),
                 identifier: identity,
                 kind: AnonymousResourceIdentifierCollisionKind::SharedAddress,
                 members: anonymous_identity_error_members(resources, &resource_indices),
@@ -2915,34 +2882,13 @@ enum StateIdentityValue {
 
 impl StateIdentityValue {
     fn at_path(root: Option<&Value>, path: &IdentityPath) -> Self {
-        let Some(mut value) = root else {
-            return Self::Absent;
-        };
-        for field in path.struct_fields() {
-            value = match value {
-                Value::Concrete(ConcreteValue::Map(fields)) => {
-                    let Some(value) = fields.get(field) else {
-                        return Self::Absent;
-                    };
-                    value
-                }
-                Value::Concrete(
-                    ConcreteValue::String(_)
-                    | ConcreteValue::Int(_)
-                    | ConcreteValue::Float(_)
-                    | ConcreteValue::Bool(_)
-                    | ConcreteValue::List(_)
-                    | ConcreteValue::StringList(_)
-                    | ConcreteValue::EnumIdentifier(_)
-                    | ConcreteValue::CanonicalEnum(_)
-                    | ConcreteValue::Duration(_),
-                )
-                | Value::Deferred(_) => return Self::Uncomparable,
-            };
+        match value_at_identity_path(root, path) {
+            Ok(None) => Self::Absent,
+            Ok(Some(value)) => ResolvedCreateOnlyValue::from_value(value.clone())
+                .map(Self::Comparable)
+                .unwrap_or(Self::Uncomparable),
+            Err(()) => Self::Uncomparable,
         }
-        ResolvedCreateOnlyValue::from_value(value.clone())
-            .map(Self::Comparable)
-            .unwrap_or(Self::Uncomparable)
     }
 }
 
@@ -3054,13 +3000,10 @@ impl DesiredIdentityValues {
             .identity_paths()
             .iter()
             .filter_map(|path| match identity_path_input(resource, path) {
-                IdentityPathInput::Absent => {
-                    let names = identity_path_field_names(path);
-                    schema
-                        .effective_node_at_path(&names)
-                        .is_some_and(|node| node.identity_mode() == IdentityMode::WhenPresent)
-                        .then(|| (path.clone(), DesiredIdentityValue::Absent))
-                }
+                IdentityPathInput::Absent => schema
+                    .effective_node_at_identity_path(path)
+                    .is_some_and(|node| node.identity_mode() == IdentityMode::WhenPresent)
+                    .then(|| (path.clone(), DesiredIdentityValue::Absent)),
                 IdentityPathInput::Unavailable => None,
                 IdentityPathInput::GeneratedPrefix(prefix) => Some((
                     path.clone(),
@@ -3175,12 +3118,23 @@ impl DesiredIdentityValues {
                     DesiredIdentityValue::Resolved(desired),
                     StateIdentityValue::Comparable(state),
                 ) => {
-                    if !desired.semantically_equal_at_identity_path(state, schema, path, context) {
+                    let Some(node) = schema.effective_node_at_identity_path(path) else {
+                        return DeclaredIdentityRowOutcome::Mismatch;
+                    };
+                    if !desired.semantically_equal(
+                        state,
+                        schema.as_schema(),
+                        node.field_type(),
+                        context,
+                    ) {
                         return DeclaredIdentityRowOutcome::Mismatch;
                     }
                 }
                 (DesiredIdentityValue::Prefix(prefix), StateIdentityValue::Comparable(state)) => {
-                    if !state.starts_with_at_identity_path(prefix, schema, path, context) {
+                    let Some(node) = schema.effective_node_at_identity_path(path) else {
+                        return DeclaredIdentityRowOutcome::Mismatch;
+                    };
+                    if !state.starts_with(prefix, schema.as_schema(), node.field_type(), context) {
                         return DeclaredIdentityRowOutcome::Mismatch;
                     }
                 }
@@ -3506,90 +3460,31 @@ impl ResolvedCreateOnlyValue {
         &self,
         other: &Self,
         schema: &ResourceSchema,
-        attribute: &str,
+        attr_type: &AttributeType,
         context: &ComparisonContext<'_>,
     ) -> bool {
-        schema
-            .attributes
-            .get(attribute)
-            .is_some_and(|attribute_schema| {
-                crate::differ::type_aware_equal(
-                    &self.value,
-                    &other.value,
-                    Some(&attribute_schema.attr_type),
-                    &schema.defs,
-                    context,
-                )
-            })
+        crate::differ::type_aware_equal(
+            &self.value,
+            &other.value,
+            Some(attr_type),
+            &schema.defs,
+            context,
+        )
     }
 
     fn starts_with(
         &self,
         prefix: &str,
         schema: &ResourceSchema,
-        attribute: &str,
+        attr_type: &AttributeType,
         context: &ComparisonContext<'_>,
     ) -> bool {
-        let Some(attribute_schema) = schema.attributes.get(attribute) else {
-            return false;
-        };
-        let state_key = canonical_create_only_value_string(
-            &self.value,
-            Some(&attribute_schema.attr_type),
-            &schema.defs,
-            context,
-        );
+        let state_key =
+            canonical_create_only_value_string(&self.value, Some(attr_type), &schema.defs, context);
         let prefix_key = canonical_create_only_value_string(
             &Value::Concrete(ConcreteValue::String(prefix.into())),
-            Some(&attribute_schema.attr_type),
+            Some(attr_type),
             &schema.defs,
-            context,
-        );
-        state_key
-            .zip(prefix_key)
-            .is_some_and(|(state, prefix)| state.starts_with(&prefix))
-    }
-
-    fn semantically_equal_at_identity_path(
-        &self,
-        other: &Self,
-        schema: &ValidatedResourceSchema,
-        path: &IdentityPath,
-        context: &ComparisonContext<'_>,
-    ) -> bool {
-        let names = identity_path_field_names(path);
-        schema.effective_node_at_path(&names).is_some_and(|node| {
-            crate::differ::type_aware_equal(
-                &self.value,
-                &other.value,
-                Some(node.field_type()),
-                schema.as_schema().defs(),
-                context,
-            )
-        })
-    }
-
-    fn starts_with_at_identity_path(
-        &self,
-        prefix: &str,
-        schema: &ValidatedResourceSchema,
-        path: &IdentityPath,
-        context: &ComparisonContext<'_>,
-    ) -> bool {
-        let names = identity_path_field_names(path);
-        let Some(node) = schema.effective_node_at_path(&names) else {
-            return false;
-        };
-        let state_key = canonical_create_only_value_string(
-            &self.value,
-            Some(node.field_type()),
-            schema.as_schema().defs(),
-            context,
-        );
-        let prefix_key = canonical_create_only_value_string(
-            &Value::Concrete(ConcreteValue::String(prefix.into())),
-            Some(node.field_type()),
-            schema.as_schema().defs(),
             context,
         );
         state_key
@@ -3613,11 +3508,18 @@ impl DesiredCreateOnlyValue {
         attribute: &str,
         context: &ComparisonContext<'_>,
     ) -> Option<bool> {
+        let attr_type = schema
+            .attributes
+            .get(attribute)
+            .map(|attribute| &attribute.attr_type);
         match self {
-            Self::Resolved(desired) => {
-                Some(desired.semantically_equal(state, schema, attribute, context))
-            }
-            Self::Prefix(prefix) => Some(state.starts_with(prefix, schema, attribute, context)),
+            Self::Resolved(desired) => Some(attr_type.is_some_and(|attr_type| {
+                desired.semantically_equal(state, schema, attr_type, context)
+            })),
+            Self::Prefix(prefix) => Some(
+                attr_type
+                    .is_some_and(|attr_type| state.starts_with(prefix, schema, attr_type, context)),
+            ),
             Self::Unresolved => None,
         }
     }
@@ -3878,14 +3780,17 @@ impl AmbiguousDeclaredIdentityMatch {
     }
 }
 
+fn display_candidate_rows(candidate_rows: &[ResolvedResourceId]) -> String {
+    candidate_rows
+        .iter()
+        .map(|candidate| format!("`{candidate}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl std::fmt::Display for AmbiguousDeclaredIdentityMatch {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let candidates = self
-            .candidate_rows
-            .iter()
-            .map(|candidate| format!("`{candidate}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let candidates = display_candidate_rows(&self.candidate_rows);
         write!(
             formatter,
             "Anonymous resource `{}` has complete declared identity matching more than one \
@@ -3982,12 +3887,7 @@ impl UnresolvedDeclaredIdentityMigration {
 
 impl std::fmt::Display for UnresolvedDeclaredIdentityMigration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let candidates = self
-            .candidate_rows
-            .iter()
-            .map(|candidate| format!("`{candidate}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let candidates = display_candidate_rows(&self.candidate_rows);
         write!(
             formatter,
             "Anonymous resource `{}` has an authored declared-identity expression that cannot \
@@ -4143,8 +4043,7 @@ pub fn reconcile_anonymous_identifiers(
         if !validated_schema.identity_paths().is_empty() {
             let available_candidates = state_entries
                 .candidates()
-                .filter(|entry| candidate_is_available(entry))
-                .collect::<Vec<_>>();
+                .filter(|entry| candidate_is_available(entry));
 
             let desired_identity = DesiredIdentityValues::from_resource(
                 resource,
@@ -4152,8 +4051,6 @@ pub fn reconcile_anonymous_identifiers(
                 find_state_by_binding,
             );
             let candidate_outcomes = available_candidates
-                .iter()
-                .copied()
                 .map(|entry| {
                     let outcome = desired_identity.compare_row(
                         &entry.identity_values,

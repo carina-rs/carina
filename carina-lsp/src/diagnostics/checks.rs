@@ -749,6 +749,24 @@ fn collect_enum_provider_namespaces(
     }
 }
 
+type AnonymousIdentityGraph = (
+    Vec<carina_core::resource::Resource<carina_core::resource::ModuleSource, ParserPlaceholder>>,
+    Vec<carina_core::parser::ProviderConfig<ParserPlaceholder>>,
+);
+
+fn anonymous_identity_graph<E: Clone, D>(
+    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+    schemas: &carina_core::schema::SchemaRegistry,
+) -> Option<AnonymousIdentityGraph>
+where
+    D: Clone + carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder>,
+{
+    let mut identity_graph = parsed.clone();
+    carina_core::schema::resolve_file_block_names_with_schemas(&mut identity_graph, schemas)
+        .ok()?;
+    Some((identity_graph.resources, identity_graph.providers))
+}
+
 impl DiagnosticEngine {
     /// Report anonymous resources that would share an identity scheme derived
     /// from mutable attributes. The core check owns classification and
@@ -809,28 +827,13 @@ impl DiagnosticEngine {
         expanded: Option<&carina_core::parser::ModuleResolvedParsedFile>,
         configuration_root: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
-        let (mut resources, providers) = if let Some(expanded) = expanded {
-            let mut identity_graph = expanded.clone();
-            if carina_core::schema::resolve_file_block_names_with_schemas(
-                &mut identity_graph,
-                &self.schemas,
-            )
-            .is_err()
-            {
-                return Vec::new();
-            }
-            (identity_graph.resources, identity_graph.providers)
+        let graph = if let Some(expanded) = expanded {
+            anonymous_identity_graph(expanded, &self.schemas)
         } else {
-            let mut identity_graph = directory.clone();
-            if carina_core::schema::resolve_file_block_names_with_schemas(
-                &mut identity_graph,
-                &self.schemas,
-            )
-            .is_err()
-            {
-                return Vec::new();
-            }
-            (identity_graph.resources, identity_graph.providers)
+            anonymous_identity_graph(directory, &self.schemas)
+        };
+        let Some((mut resources, providers)) = graph else {
+            return Vec::new();
         };
         let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
             &mut resources,

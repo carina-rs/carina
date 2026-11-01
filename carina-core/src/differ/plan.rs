@@ -60,7 +60,15 @@ struct RefAttr {
     hint: String,
 }
 
-fn contains_authored_create_only_value<'schema>(
+fn contains_authored_create_only_value(
+    attr_type: &AttributeType,
+    value: &Value,
+    schema: &ResourceSchema,
+) -> bool {
+    contains_authored_create_only_value_on_path(attr_type, value, schema, &mut Vec::new())
+}
+
+fn contains_authored_create_only_value_on_path<'schema>(
     attr_type: &'schema AttributeType,
     value: &Value,
     schema: &'schema ResourceSchema,
@@ -76,7 +84,7 @@ fn contains_authored_create_only_value<'schema>(
             };
             ref_chain.push(name);
             let contains =
-                contains_authored_create_only_value(definition, value, schema, ref_chain);
+                contains_authored_create_only_value_on_path(definition, value, schema, ref_chain);
             ref_chain.pop();
             contains
         }
@@ -85,7 +93,7 @@ fn contains_authored_create_only_value<'schema>(
                 return false;
             };
             items.iter().any(|item| {
-                contains_authored_create_only_value(element_type, item, schema, ref_chain)
+                contains_authored_create_only_value_on_path(element_type, item, schema, ref_chain)
             })
         }
         AttrTypeKind::Map {
@@ -95,7 +103,7 @@ fn contains_authored_create_only_value<'schema>(
                 return false;
             };
             entries.values().any(|entry| {
-                contains_authored_create_only_value(value_type, entry, schema, ref_chain)
+                contains_authored_create_only_value_on_path(value_type, entry, schema, ref_chain)
             })
         }
         AttrTypeKind::Struct { fields, .. } => {
@@ -105,7 +113,7 @@ fn contains_authored_create_only_value<'schema>(
             fields.iter().any(|field| {
                 entries.get(&field.name).is_some_and(|field_value| {
                     field.create_only
-                        || contains_authored_create_only_value(
+                        || contains_authored_create_only_value_on_path(
                             &field.field_type,
                             field_value,
                             schema,
@@ -147,7 +155,6 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
                     self.schema,
                     self.context,
                     self.removal_evidence,
-                    &mut Vec::new(),
                 )
             {
                 continue;
@@ -164,7 +171,47 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
     }
 }
 
-fn create_only_values_compatible<'schema>(
+fn create_only_values_compatible(
+    attr_type: &AttributeType,
+    current: &Value,
+    desired: &Value,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
+) -> bool {
+    create_only_values_compatible_on_path(
+        attr_type,
+        current,
+        desired,
+        schema,
+        context,
+        removal_evidence,
+        &mut Vec::new(),
+    )
+}
+
+fn authored_create_only_value_is_compatible(
+    attr_type: &AttributeType,
+    current: Option<&Value>,
+    desired: &Value,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
+) -> bool {
+    !contains_authored_create_only_value(attr_type, desired, schema)
+        || current.is_some_and(|current| {
+            create_only_values_compatible(
+                attr_type,
+                current,
+                desired,
+                schema,
+                context,
+                removal_evidence,
+            )
+        })
+}
+
+fn create_only_values_compatible_on_path<'schema>(
     attr_type: &'schema AttributeType,
     current: &Value,
     desired: &Value,
@@ -182,7 +229,7 @@ fn create_only_values_compatible<'schema>(
                 return true;
             };
             ref_chain.push(name);
-            let compatible = create_only_values_compatible(
+            let compatible = create_only_values_compatible_on_path(
                 definition,
                 current,
                 desired,
@@ -203,40 +250,25 @@ fn create_only_values_compatible<'schema>(
                 return true;
             };
             let Value::Concrete(ConcreteValue::List(current_items)) = current else {
-                return !desired_items.iter().any(|item| {
-                    contains_authored_create_only_value(element_type, item, schema, &mut Vec::new())
-                });
+                return !desired_items
+                    .iter()
+                    .any(|item| contains_authored_create_only_value(element_type, item, schema));
             };
             if *ordered {
                 desired_items.iter().enumerate().all(|(index, desired)| {
-                    !contains_authored_create_only_value(
+                    authored_create_only_value_is_compatible(
                         element_type,
+                        current_items.get(index),
                         desired,
                         schema,
-                        &mut Vec::new(),
-                    ) || current_items.get(index).is_some_and(|current| {
-                        create_only_values_compatible(
-                            element_type,
-                            current,
-                            desired,
-                            schema,
-                            context,
-                            removal_evidence,
-                            &mut Vec::new(),
-                        )
-                    })
+                        context,
+                        removal_evidence,
+                    )
                 })
             } else {
                 let desired_items = desired_items
                     .iter()
-                    .filter(|item| {
-                        contains_authored_create_only_value(
-                            element_type,
-                            item,
-                            schema,
-                            &mut Vec::new(),
-                        )
-                    })
+                    .filter(|item| contains_authored_create_only_value(element_type, item, schema))
                     .collect::<Vec<_>>();
                 let mut current_matches = vec![None; current_items.len()];
                 let mut matcher = UnorderedCreateOnlyMatcher {
@@ -260,23 +292,19 @@ fn create_only_values_compatible<'schema>(
                 return true;
             };
             let Value::Concrete(ConcreteValue::Map(current_entries)) = current else {
-                return !desired_entries.values().any(|entry| {
-                    contains_authored_create_only_value(value_type, entry, schema, &mut Vec::new())
-                });
+                return !desired_entries
+                    .values()
+                    .any(|entry| contains_authored_create_only_value(value_type, entry, schema));
             };
             desired_entries.iter().all(|(key, desired)| {
-                !contains_authored_create_only_value(value_type, desired, schema, &mut Vec::new())
-                    || current_entries.get(key).is_some_and(|current| {
-                        create_only_values_compatible(
-                            value_type,
-                            current,
-                            desired,
-                            schema,
-                            context,
-                            removal_evidence,
-                            &mut Vec::new(),
-                        )
-                    })
+                authored_create_only_value_is_compatible(
+                    value_type,
+                    current_entries.get(key),
+                    desired,
+                    schema,
+                    context,
+                    removal_evidence,
+                )
             })
         }
         AttrTypeKind::Struct { fields, .. } => {
@@ -284,12 +312,7 @@ fn create_only_values_compatible<'schema>(
                 return true;
             };
             let Value::Concrete(ConcreteValue::Map(current_fields)) = current else {
-                return !contains_authored_create_only_value(
-                    attr_type,
-                    desired,
-                    schema,
-                    &mut Vec::new(),
-                );
+                return !contains_authored_create_only_value(attr_type, desired, schema);
             };
             fields.iter().all(|field| {
                 let Some(desired) = desired_fields.get(&field.name) else {
@@ -301,7 +324,6 @@ fn create_only_values_compatible<'schema>(
                                         &field.field_type,
                                         current,
                                         schema,
-                                        &mut Vec::new(),
                                     )
                             })
                         }
@@ -319,22 +341,14 @@ fn create_only_values_compatible<'schema>(
                         )
                     });
                 }
-                !contains_authored_create_only_value(
+                authored_create_only_value_is_compatible(
                     &field.field_type,
+                    current_fields.get(&field.name),
                     desired,
                     schema,
-                    &mut Vec::new(),
-                ) || current_fields.get(&field.name).is_some_and(|current| {
-                    create_only_values_compatible(
-                        &field.field_type,
-                        current,
-                        desired,
-                        schema,
-                        context,
-                        removal_evidence,
-                        &mut Vec::new(),
-                    )
-                })
+                    context,
+                    removal_evidence,
+                )
             })
         }
         AttrTypeKind::Union(_)
@@ -386,7 +400,6 @@ pub(super) fn find_changed_create_only(
                                 attribute_schema.attr_type(),
                                 current,
                                 schema,
-                                &mut Vec::new(),
                             )
                         });
             };
@@ -395,7 +408,6 @@ pub(super) fn find_changed_create_only(
                     attribute_schema.attr_type(),
                     desired_value,
                     schema,
-                    &mut Vec::new(),
                 );
             };
             !create_only_values_compatible(
@@ -405,7 +417,6 @@ pub(super) fn find_changed_create_only(
                 schema,
                 context,
                 removal_evidence,
-                &mut Vec::new(),
             )
         })
         .cloned()

@@ -1694,11 +1694,10 @@ impl OperationConfig {
 /// This is a closed protocol-v16 enum. The field carrying it is required on
 /// every attribute and struct-field record so host/provider skew fails before
 /// schema semantics can be misinterpreted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityMode {
     /// The value does not participate in anonymous identity.
-    #[default]
     None,
     /// The value must be available at plan time, even when its input mode is
     /// optional.
