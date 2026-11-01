@@ -450,21 +450,6 @@ mod tests {
         assert_eq!(parse_type_expr_str("IamOidcProviderArn", &ctx), None);
     }
 
-    /// Built-in DSL custom types from the core validator registry
-    /// are always accepted, even when no provider has registered any
-    /// validators — they are part of `carina-core` itself.
-    #[test]
-    fn parse_type_expr_str_accepts_builtins_when_custom_types_are_loaded() {
-        let ctx = loaded_context(Default::default());
-        for snake in builtin_bare_custom_types().keys() {
-            let name = snake_to_pascal(snake);
-            assert!(
-                matches!(parse_type_expr_str(&name, &ctx), Some(TypeExpr::Simple(_))),
-                "built-in custom type '{name}' must parse with loaded custom types"
-            );
-        }
-    }
-
     #[test]
     fn parse_type_expr_str_accepts_every_builtin_validator_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());

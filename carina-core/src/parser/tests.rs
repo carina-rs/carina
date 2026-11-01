@@ -10202,6 +10202,23 @@ fn parse_decrypt_without_decryptor_errors() {
 }
 
 #[test]
+fn builtin_custom_type_validation_uses_declared_scalar_kind() {
+    let error = validate_custom_type(
+        &TypeIdentity::bare("PositiveInt"),
+        &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("5".into())),
+        &ProviderContext::default(),
+    )
+    .expect_err("a string cannot satisfy an Int refinement")
+    .to_string();
+
+    assert!(
+        error.contains("Type mismatch: expected PositiveInt"),
+        "{error}"
+    );
+    assert!(!error.contains("unknown custom type"), "{error}");
+}
+
+#[test]
 fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
     let identity = TypeIdentity::bare("CustomType");
     let config = ProviderContext {

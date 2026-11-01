@@ -498,7 +498,7 @@ fn validate_identified_declaration(
 /// statically (e.g., ResourceRef, FunctionCall, Interpolation are
 /// deferred).
 ///
-/// Bare built-in identities use the kind-aware built-in registry. Provider
+/// Bare built-in identities use their registry declarations. Provider
 /// identities must already have resolved schema owners and route through those
 /// factories, even if their descriptive identity collides with a built-in.
 pub fn validate_custom_type<P: PlaceholderKind>(
@@ -518,71 +518,34 @@ pub fn validate_custom_type<P: PlaceholderKind>(
         GenericValue::Deferred(_deferred) => {}
     }
 
-    use crate::schema::RefinedScalarKind;
-
-    let builtin_kind = match value {
-        GenericValue::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => {
-            Some(RefinedScalarKind::String)
-        }
-        GenericValue::Concrete(ConcreteValue::Int(_)) => {
-            if crate::schema::builtin_validator(RefinedScalarKind::Int, identity).is_some() {
-                Some(RefinedScalarKind::Int)
-            } else {
-                Some(RefinedScalarKind::Float)
-            }
-        }
-        GenericValue::Concrete(ConcreteValue::Float(_)) => Some(RefinedScalarKind::Float),
-        GenericValue::Concrete(
-            ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::List(_)
-            | ConcreteValue::StringList(_)
-            | ConcreteValue::Map(_),
+    let declaration = crate::schema::builtin_type_registry()
+        .get(identity)
+        .ok_or_else(|| {
+            crate::provider::ProviderError::invalid_input(format!(
+                "unknown custom type `{identity}`; provider-owned annotations must resolve to an owner-qualified schema type"
+            ))
+        })?;
+    validate_builtin_custom_type(declaration, value).map_err(|error| {
+        crate::provider::ProviderError::invalid_input_caused_by(
+            "Custom type validation failed",
+            error,
         )
-        | GenericValue::Deferred(_) => None,
-    };
-    if let Some(kind) = builtin_kind
-        && let Some(validator) = crate::schema::builtin_validator(kind, identity)
-    {
-        let validation_value = match value {
-            GenericValue::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                GenericValue::Concrete(ConcreteValue::String(raw.as_str().to_string().into()))
-            }
-            GenericValue::Concrete(ConcreteValue::String(value)) => {
-                GenericValue::Concrete(ConcreteValue::String(value.clone()))
-            }
-            GenericValue::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-                GenericValue::Concrete(ConcreteValue::CanonicalEnum(value.clone()))
-            }
-            GenericValue::Concrete(ConcreteValue::Int(value)) => {
-                GenericValue::Concrete(ConcreteValue::Int(*value))
-            }
-            GenericValue::Concrete(ConcreteValue::Float(value)) => {
-                GenericValue::Concrete(ConcreteValue::Float(*value))
-            }
-            GenericValue::Concrete(
-                ConcreteValue::Bool(_)
-                | ConcreteValue::Duration(_)
-                | ConcreteValue::List(_)
-                | ConcreteValue::StringList(_)
-                | ConcreteValue::Map(_),
-            )
-            | GenericValue::Deferred(_) => {
-                unreachable!("a built-in custom-type validator accepts only scalar values")
-            }
-        };
-        return validator(&validation_value).map_err(|error| {
-            crate::provider::ProviderError::invalid_input_caused_by(
-                "Custom type validation failed",
-                error,
-            )
-        });
-    }
+    })
+}
 
-    Err(crate::provider::ProviderError::invalid_input(format!(
-        "unknown custom type `{identity}`; provider-owned annotations must resolve to an owner-qualified schema type"
-    )))
+/// Validate a core declaration's scalar shape and constraints, preserving the
+/// DSL's textual interpretation of unresolved enum identifiers.
+pub(crate) fn validate_builtin_custom_type<P: PlaceholderKind>(
+    declaration: &crate::schema::AttributeType,
+    value: &GenericValue<P>,
+) -> Result<(), crate::schema::TypeError> {
+    if let GenericValue::Concrete(ConcreteValue::EnumIdentifier(raw)) = value {
+        declaration.validate_identified_scalar_value(&GenericValue::<P>::Concrete(
+            ConcreteValue::String(raw.as_str().to_string().into()),
+        ))
+    } else {
+        declaration.validate_identified_scalar_value(value)
+    }
 }
 
 /// Validate an authored provider schema annotation against every owner that

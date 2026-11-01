@@ -1071,16 +1071,19 @@ fn builtin_type_documentation_matches_registry() {
     let documented = section
         .lines()
         .filter_map(|line| {
-            line.strip_prefix("| `")?
-                .split('`')
-                .next()
-                .map(str::to_string)
+            let (name, rest) = line.strip_prefix("| `")?.split_once('`')?;
+            let base = rest.split('|').nth(1)?.trim();
+            Some((name.to_string(), base.to_string()))
         })
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<std::collections::BTreeMap<_, _>>();
     let registered = builtin_type_registry()
-        .keys()
-        .map(|identity| identity.kind.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+        .iter()
+        .map(|(identity, declaration)| {
+            let kind = identified_declaration_scalar_kind(declaration)
+                .expect("every core built-in must declare a scalar kind");
+            (identity.kind.clone(), kind.to_string())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(
         documented, registered,
         "keep the DSL reference in sync with core built-ins"
@@ -1122,7 +1125,10 @@ fn domain_name_builtins_accept_dns_names() {
             "EXAMPLE.Com",
             "a.b-c.example",
             "123.456",
+            "1.2.3.4",
             "192.0.2.1",
+            "example.123",
+            "example.0xFF",
             "xn--bcher-kva.example",
             "example.com.",
             "EXAMPLE.Com.",
@@ -1418,6 +1424,42 @@ fn https_url_builtin_rejects_invalid_urls() {
             validate(&Value::Concrete(ConcreteValue::String(url.clone().into()))).is_err(),
             "{url:?} should be rejected"
         );
+    }
+}
+
+#[test]
+fn https_url_builtin_requires_canonical_ipv4_when_host_ends_in_a_number() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    for (host, valid) in [
+        ("123", false),
+        ("4294967295", false),
+        ("0x7f.1", false),
+        ("0x7f000001", false),
+        ("0X7F000001", false),
+        ("0x", false),
+        ("0X", false),
+        ("example.123", false),
+        ("example.09", false),
+        ("example.0x", false),
+        ("example.0X", false),
+        ("example.0xFF", false),
+        ("example.0Xff", false),
+        ("1.2.3.0x4", false),
+        ("01.2.3.4", false),
+        ("1.2.3.256", false),
+        ("1.2.3.4", true),
+        ("0.0.0.0", true),
+        ("255.255.255.255", true),
+        ("example.123a", true),
+        ("example.0xg", true),
+        ("123.example", true),
+    ] {
+        for suffix in ["", ".", ":443/path?q=1#fragment", ".:443/path?q=1#fragment"] {
+            let url = format!("https://{host}{suffix}");
+            let result = validate(&Value::Concrete(ConcreteValue::String(url.clone().into())));
+            assert_eq!(result.is_ok(), valid, "{url:?}: {result:?}");
+        }
     }
 }
 

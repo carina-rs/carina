@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::ValueDescription;
 use crate::parser::{
-    LoadedProviderContext, ProviderContext, TypeExpr, validate_custom_type,
+    LoadedProviderContext, ProviderContext, TypeExpr, validate_builtin_custom_type,
     validate_schema_custom_type_with_context,
 };
 use crate::resource::{ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind, Value};
@@ -414,25 +414,23 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
             Value::Concrete(ConcreteValue::Duration(_)) => Ok(()),
             _ => Err(mismatch(expected, value)),
         },
-        TypeExpr::Simple(name) => match value {
-            Value::Concrete(
-                ConcreteValue::String(_)
-                | ConcreteValue::EnumIdentifier(_)
-                | ConcreteValue::CanonicalEnum(_)
-                | ConcreteValue::Int(_)
-                | ConcreteValue::Float(_),
-            ) => {
-                let identity =
-                    crate::schema::TypeIdentity::bare(crate::parser::snake_to_pascal(name));
-                if identified_scalar_shape_is_supported(&identity, value, config, false) {
-                    validate_custom_type(&identity, value, config)
-                        .map_err(|error| validation_mismatch(expected, value, error.to_string()))
-                } else {
-                    Err(mismatch(expected, value))
-                }
-            }
-            _ => Err(mismatch(expected, value)),
-        },
+        TypeExpr::Simple(name) => {
+            let declaration = crate::parser::builtin_bare_custom_types()
+                .get(name)
+                .ok_or_else(|| {
+                    validation_mismatch(
+                        expected,
+                        value,
+                        format!(
+                            "unknown custom type `{expected}`; provider-owned annotations must resolve to an owner-qualified schema type"
+                        ),
+                    )
+                })?;
+            validate_builtin_custom_type(declaration, value).map_err(|error| match error {
+                crate::schema::TypeError::TypeMismatch { .. } => mismatch(expected, value),
+                error => validation_mismatch(expected, value, error.to_string()),
+            })
+        }
         TypeExpr::List(inner) => match value {
             Value::Concrete(ConcreteValue::List(items)) => {
                 for (index, item) in items.iter().enumerate() {
@@ -504,8 +502,7 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
                 | ConcreteValue::Int(_)
                 | ConcreteValue::Float(_),
             ) => {
-                let identity = owned.identity();
-                if identified_scalar_shape_is_supported(identity, value, config, true) {
+                if schema_scalar_shape_is_supported(value, config) {
                     match provider_custom_types {
                         ProviderCustomTypeValidation::Loaded => {
                             validate_schema_custom_type_with_context(owned, value, config).map_err(
@@ -638,46 +635,18 @@ fn custom_type_validation_mismatch<P: PlaceholderKind>(
     }
 }
 
-fn identified_scalar_shape_is_supported<P: PlaceholderKind>(
-    identity: &crate::schema::TypeIdentity,
+fn schema_scalar_shape_is_supported<P: PlaceholderKind>(
     value: &Value<P>,
     config: &ProviderContext,
-    owner_routed: bool,
 ) -> bool {
     match value {
-        Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => true,
-        Value::Concrete(ConcreteValue::CanonicalEnum(_)) => {
-            owner_routed
-                || ![
-                    crate::schema::RefinedScalarKind::String,
-                    crate::schema::RefinedScalarKind::Int,
-                    crate::schema::RefinedScalarKind::Float,
-                ]
-                .into_iter()
-                .any(|kind| crate::schema::builtin_validator(kind, identity).is_some())
-        }
-        Value::Concrete(ConcreteValue::Int(_)) => {
-            (!owner_routed
-                && (crate::schema::builtin_validator(
-                    crate::schema::RefinedScalarKind::Int,
-                    identity,
-                )
-                .is_some()
-                    || crate::schema::builtin_validator(
-                        crate::schema::RefinedScalarKind::Float,
-                        identity,
-                    )
-                    .is_some()))
-                || (owner_routed && config.custom_types_loaded())
-        }
-        Value::Concrete(ConcreteValue::Float(_)) => {
-            (!owner_routed
-                && crate::schema::builtin_validator(
-                    crate::schema::RefinedScalarKind::Float,
-                    identity,
-                )
-                .is_some())
-                || (owner_routed && config.custom_types_loaded())
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_),
+        ) => true,
+        Value::Concrete(ConcreteValue::Int(_) | ConcreteValue::Float(_)) => {
+            config.custom_types_loaded()
         }
         Value::Concrete(
             ConcreteValue::Bool(_)

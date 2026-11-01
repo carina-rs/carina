@@ -3532,7 +3532,10 @@ impl AttributeType {
 
     /// Validate one already-identified scalar declaration without opening a
     /// public rootless constructor for arbitrary resource-path types.
-    pub(crate) fn validate_identified_scalar_value(&self, value: &Value) -> Result<(), TypeError> {
+    pub(crate) fn validate_identified_scalar_value<P: PlaceholderKind>(
+        &self,
+        value: &Value<P>,
+    ) -> Result<(), TypeError> {
         debug_assert!(matches!(
             self.kind,
             AttrTypeKind::String { .. }
@@ -12030,8 +12033,10 @@ pub mod types {
     /// and control characters. An optional decimal port must be in `1..=65535`.
     /// Paths, queries, and fragments use ASCII URL characters or percent escapes.
     /// Single-label hosts such as `localhost` and trailing-dot FQDNs are
-    /// accepted; the host has no 253-character cap. Length caps and restrictions
-    /// on ports or queries belong to attributes. RFC 6570 templates such as
+    /// accepted; the host has no 253-character cap. A decimal or `0x`/`0X` hex
+    /// last label (including bare `0x`/`0X`) requires canonical dotted-quad IPv4.
+    /// Length caps and restrictions on ports or queries belong to attributes.
+    /// RFC 6570 templates such as
     /// `{proxy}` are rejected, so this type is unsuitable for API Gateway HTTP
     /// integration URIs that contain templates.
     ///
@@ -12684,9 +12689,10 @@ fn validate_dns_labels(name: &str) -> Result<(), String> {
 /// DNS labels contain 1–63 ASCII letters, digits, or hyphens, with no leading or
 /// trailing hyphen. Single-label hosts such as `localhost` and trailing-dot
 /// FQDNs such as `example.com.` are allowed; the host has no 253-character cap.
-/// Dotted numeric hosts must be standard IPv4 addresses. IPv6 literals must be
-/// bracketed and cannot contain a zone identifier. An optional port is decimal
-/// and in `1..=65535` (leading zeros are allowed).
+/// Following WHATWG's "ends in a number" rule, a last label of decimal digits
+/// or `0x`/`0X` followed by zero or more hex digits requires canonical dotted-quad
+/// IPv4. IPv6 literals must be bracketed and cannot contain a zone identifier.
+/// An optional port is decimal and in `1..=65535` (leading zeros are allowed).
 ///
 /// Optional path, query, and fragment follow RFC 3986 character and percent-escape
 /// syntax. Literal whitespace and control characters are rejected everywhere;
@@ -12732,7 +12738,14 @@ fn validate_https_url_syntax(url: &str) -> Result<(), String> {
         if host.is_empty() {
             return Err("HTTPS URL must have a host".to_string());
         }
-        if host.contains('.') && host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        let last_label = host.rsplit('.').next().unwrap_or(host);
+        let ends_in_a_number = (!last_label.is_empty()
+            && last_label.bytes().all(|b| b.is_ascii_digit()))
+            || last_label
+                .strip_prefix("0x")
+                .or_else(|| last_label.strip_prefix("0X"))
+                .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        if ends_in_a_number {
             host.parse::<std::net::Ipv4Addr>()
                 .map_err(|_| "HTTPS URL has an invalid IPv4 host".to_string())?;
         } else {

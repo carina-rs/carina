@@ -1892,11 +1892,7 @@ fn check_integer_result_sink(
         }) => attr_type.in_schema(defs),
         Some(RefSink::TypeExpr(type_expr)) => {
             let Some(expected) = lift_type_expr(type_expr, schemas) else {
-                return Err(DeferredAccessTypeError::TypeMismatch {
-                    expected: type_expr.to_string(),
-                    actual: "Int".to_string(),
-                    origin: format!("from {}", crate::value::format_value(value)),
-                });
+                return Ok(());
             };
             if actual.is_assignable_to(crate::schema::TypeInSchema::schemaless(&expected)) {
                 return Ok(());

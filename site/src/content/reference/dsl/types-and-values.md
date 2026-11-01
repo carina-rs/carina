@@ -368,7 +368,7 @@ Primitive type names are PascalCase (`String`, not `string`). The built-in refin
 
 `DomainName` and `WildcardDomainName` accept uppercase letters, punycode, and numeric labels, including a numeric last label and dotted-IPv4-looking strings. Numeric labels deliberately match ACM's domain-name regex. Underscores are rejected, so these types are unsuitable for Route53 record names such as `_acme-challenge` or `_dmarc`.
 
-`HttpsUrl` accepts single-label hosts such as `localhost`, trailing-dot FQDNs such as `https://example.com.`, IPv4 addresses, and bracketed IPv6 addresses. DNS labels have a 63-character limit, but the host has no 253-character cap. RFC 6570 templates such as `{proxy}` are rejected, so use another type for API Gateway HTTP integration URIs that contain templates. Attribute schemas may impose additional length or URL restrictions.
+`HttpsUrl` accepts single-label hosts such as `localhost`, trailing-dot FQDNs such as `https://example.com.`, IPv4 addresses, and bracketed IPv6 addresses. A host whose last label is decimal digits or `0x`/`0X` followed by zero or more hex digits must be a canonical dotted-quad IPv4 address; forms such as `https://123` and `https://0x7f.1` are rejected. DNS labels have a 63-character limit, but the host has no 253-character cap. RFC 6570 templates such as `{proxy}` are rejected, so use another type for API Gateway HTTP integration URIs that contain templates. Attribute schemas may impose additional length or URL restrictions.
 
 ### Generic Types
 

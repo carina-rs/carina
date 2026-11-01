@@ -500,6 +500,18 @@ let invalid = mock.test.Consumer { label = source.count + 1 }
 }
 
 #[test]
+fn module_attribute_integer_arithmetic_keeps_unliftable_sink_unchecked() {
+    let parsed = crate::parser::parse(
+        "arguments { a: Int = 1 }\nattributes { p: Port = a + 1 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("an unloaded custom-type annotation must parse");
+
+    validate_resource_ref_types_for_test(&parsed, &SchemaRegistry::new())
+        .expect("a sink without a known declaration must remain unchecked");
+}
+
+#[test]
 fn module_attribute_integer_arithmetic_uses_declared_argument_types() {
     let valid = crate::parser::parse(
         r#"
@@ -3306,6 +3318,101 @@ fn empty_arguments_in_root_ok() {
 }
 
 // --- rendered_typecheck_result tests ---
+
+#[test]
+fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
+    for (name, value) in [
+        ("positive_int", ConcreteValue::String("5".into())),
+        ("positive_int", ConcreteValue::Float(5.0)),
+        ("positive_int", ConcreteValue::Bool(true)),
+        ("domain_name", ConcreteValue::Int(5)),
+        ("email", ConcreteValue::Int(5)),
+    ] {
+        let expected = TypeExpr::Simple(name.to_string());
+        let value = Value::Concrete(value);
+        let error = typecheck::check_type_expr_value_with_context(
+            &expected,
+            &value,
+            &ProviderContext::default(),
+            typecheck::TypecheckInference::Unavailable,
+        )
+        .expect_err("the declared scalar kind must be checked before its validator");
+        assert!(
+            matches!(
+                &error,
+                typecheck::TypeExprValueError::Mismatch {
+                    validator_message: None,
+                    ..
+                }
+            ),
+            "{name}: {error}"
+        );
+        if name == "positive_int" && matches!(value, Value::Concrete(ConcreteValue::String(_))) {
+            assert_eq!(error.to_string(), "expected PositiveInt, got string '5'");
+        }
+    }
+}
+
+#[test]
+fn bare_builtin_custom_types_run_declared_validators() {
+    for (name, invalid, message, valid) in [
+        (
+            "positive_int",
+            ConcreteValue::Int(0),
+            "Value must be positive",
+            ConcreteValue::Int(5),
+        ),
+        (
+            "domain_name",
+            ConcreteValue::String("a_b.com".into()),
+            "Invalid domain name 'a_b.com'",
+            ConcreteValue::String("example.com".into()),
+        ),
+        (
+            "email",
+            ConcreteValue::String("invalid-email".into()),
+            "Invalid email",
+            ConcreteValue::String("user@example.com".into()),
+        ),
+    ] {
+        let expected = TypeExpr::Simple(name.to_string());
+        let error = rendered_typecheck_result(
+            &expected,
+            &Value::Concrete(invalid),
+            &ProviderContext::default(),
+        )
+        .expect("the declaration's validator must reject invalid values of the right kind");
+        assert!(error.contains(message), "{name}: {error}");
+        assert!(
+            rendered_typecheck_result(
+                &expected,
+                &Value::Concrete(valid),
+                &ProviderContext::default(),
+            )
+            .is_none(),
+            "{name}: valid value must pass"
+        );
+    }
+}
+
+#[test]
+fn bare_builtin_custom_types_validate_enum_identifier_text() {
+    for (name, text, valid) in [
+        ("domain_name", "example.com", true),
+        ("domain_name", "a_b.com", false),
+        ("positive_int", "5", false),
+    ] {
+        let error = rendered_typecheck_result(
+            &TypeExpr::Simple(name.to_string()),
+            &Value::Concrete(ConcreteValue::enum_identifier(text.to_string())),
+            &ProviderContext::default(),
+        );
+        assert_eq!(error.is_none(), valid, "{name}: {text}: {error:?}");
+        if let Some(error) = error {
+            assert!(!error.contains("unknown custom type"), "{error}");
+        }
+    }
+}
 
 #[test]
 fn rendered_typecheck_result_error_uses_pascal_case() {
