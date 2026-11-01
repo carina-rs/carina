@@ -1765,7 +1765,7 @@ mod tests {
         analysis.into_deps_of().remove(&1).unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_marked_unsatisfiable_when_only_waits_in_flight() {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -1876,7 +1876,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_marked_unsatisfiable_when_failing_sibling_blocks_consumer_inside_wait_subtree() {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),

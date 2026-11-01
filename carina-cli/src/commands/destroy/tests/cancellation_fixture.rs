@@ -15,6 +15,7 @@ pub(super) struct DestroyCancellationFixture {
     ready_result_barrier: Option<crate::commands::destroy::DestroyReadyResultBarrier>,
     refresh_drain_barrier: Option<RefreshDrainBarrier>,
     provider_ready_path: Option<std::path::PathBuf>,
+    provider_release_path: Option<std::path::PathBuf>,
     provider_read_ready_path: Option<std::path::PathBuf>,
     provider_read_outcome_path: Option<std::path::PathBuf>,
 }
@@ -27,6 +28,7 @@ impl DestroyCancellationFixture {
             ready_result_barrier: None,
             refresh_drain_barrier: None,
             provider_ready_path: None,
+            provider_release_path: None,
             provider_read_ready_path: None,
             provider_read_outcome_path: None,
         }
@@ -118,25 +120,28 @@ impl DestroyCancellationFixture {
 
     pub(super) fn with_blocked_delete(mut self, name: &str) -> Self {
         let ready_path = self.base.readiness_path("mock-delete-ready");
+        let release_path = self.base.readiness_path("mock-delete-release");
         self.base.update_mock(|behavior, _| {
             behavior.delete_delay = Some(SelectedDelay {
                 address: format!("test.resource.{name}"),
                 duration: Duration::from_secs(60),
             });
             behavior.observations.delete_ready = Some(ready_path.clone());
+            behavior.delete_release = Some(release_path.clone());
         });
         self.provider_ready_path = Some(ready_path);
+        self.provider_release_path = Some(release_path);
         self
     }
 
-    pub(super) fn with_delayed_delete(mut self, name: &str, delay: Duration) -> Self {
-        self.base.update_mock(|behavior, _| {
-            behavior.delete_delay = Some(SelectedDelay {
-                address: format!("test.resource.{name}"),
-                duration: delay,
-            });
-        });
-        self
+    pub(super) fn release_blocked_delete(&self) {
+        std::fs::write(
+            self.provider_release_path
+                .as_ref()
+                .expect("blocked delete must be configured"),
+            b"",
+        )
+        .expect("write the mock delete release handshake");
     }
 
     pub(super) fn with_blocked_read(mut self, name: &str) -> Self {
@@ -180,6 +185,7 @@ impl DestroyCancellationFixture {
             .provider_read_ready_path
             .as_ref()
             .expect("blocked read must be configured");
+        // wall-clock-ok: hang guard for actual provider readiness and refresh-drain handshakes.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !ready_path.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -194,6 +200,7 @@ impl DestroyCancellationFixture {
             .provider_ready_path
             .as_ref()
             .expect("blocked delete must be configured");
+        // wall-clock-ok: hang guard for actual provider readiness and refresh-drain handshakes.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !ready_path.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -212,6 +219,7 @@ impl DestroyCancellationFixture {
     }
 
     pub(super) async fn wait_for_refresh_drain(&self) {
+        // wall-clock-ok: hang guard for actual provider readiness and refresh-drain handshakes.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             self.refresh_drain_barrier

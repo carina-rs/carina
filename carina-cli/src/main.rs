@@ -1586,6 +1586,7 @@ mod cursor_abort_tests {
             let _ = reader.read_to_end(&mut output);
             sent.send(output).unwrap();
         });
+        // wall-clock-ok: original 10s hang guard for a real PTY child to abort and close its output.
         let output = received
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap_or_else(|error| {

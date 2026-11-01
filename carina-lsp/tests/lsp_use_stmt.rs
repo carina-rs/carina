@@ -1,7 +1,5 @@
 mod support;
 
-use std::time::Duration;
-
 use support::TestClient;
 
 /// Regression for #2196 (empty-candidate side).
@@ -44,7 +42,7 @@ async fn test_use_source_path_completion_offers_anchors_in_leaf_dir() {
     let uri = format!("file://{}", main_path.display());
     client.open_document(&uri, main_text).await;
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.wait_for_diagnostics(&uri).await;
 
     // Cursor at end of line 1 (after the `.`).
     let last_line = main_text.lines().next_back().unwrap();
@@ -97,8 +95,7 @@ async fn test_use_source_path_completion_multiline() {
     let uri = format!("file://{}", crn_path.display());
     client.open_document(&uri, text).await;
 
-    // Small delay to let the server process didOpen.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.wait_for_diagnostics(&uri).await;
 
     // Cursor at the end of the `source = './modules/` line (line 1).
     let second_line = text.lines().nth(1).unwrap();
@@ -160,7 +157,7 @@ async fn test_use_block_offers_source_attribute() {
     let uri = format!("file://{}", main_path.display());
     client.open_document(&uri, main_text).await;
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.wait_for_diagnostics(&uri).await;
 
     // Line 1, col 0 — inside the block, attribute-name position.
     let response = client._request_completion(&uri, 1, 0).await;

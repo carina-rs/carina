@@ -197,6 +197,7 @@ impl ProjectFixture {
 fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
+        // wall-clock-ok: hang guard for state/readiness written by a real child process.
         assert!(
             Instant::now() < deadline,
             "provider readiness handshake was not written: {}",
@@ -219,6 +220,7 @@ fn wait_for_state(
         {
             return;
         }
+        // wall-clock-ok: hang guard for state/readiness written by a real child process.
         assert!(
             Instant::now() < deadline,
             "state condition was not met before timeout: {}",

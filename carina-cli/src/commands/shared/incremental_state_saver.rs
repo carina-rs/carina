@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(backend.serials(), [1, 2]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cleanup_stop_aborts_an_in_flight_checkpoint_before_final_write() {
         let backend = Arc::new(RecordingBackend::slow_first());
         let saver = start_saver(backend.clone());
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(backend.serials(), [2]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn normal_stop_escalates_to_cleanup_while_a_checkpoint_is_hung() {
         let backend = Arc::new(RecordingBackend::slow_first());
         let saver = start_saver(backend.clone());

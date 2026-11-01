@@ -107,6 +107,8 @@ impl GuestComputeState {
 }
 
 struct GuestStoreState {
+    #[cfg(test)]
+    armed_wall_budget: Option<(tokio::time::Instant, tokio::time::Instant)>,
     budget: GuestCallBudget,
     compute: GuestComputeState,
 }
@@ -114,6 +116,8 @@ struct GuestStoreState {
 impl GuestStoreState {
     fn new(budget: GuestCallBudget) -> Self {
         Self {
+            #[cfg(test)]
+            armed_wall_budget: None,
             budget,
             compute: GuestComputeState::new(),
         }
@@ -161,6 +165,8 @@ impl WasiHttpView for HostState {
 /// state while its mutex is held; unshared initialization paths discard the
 /// store directly.
 pub(super) struct GuestStore {
+    #[cfg(any(test, feature = "test-utils"))]
+    deadline_observer: Option<super::PollObserverForTest>,
     store: Store<HostState>,
 }
 
@@ -245,7 +251,11 @@ impl GuestStore {
             }
             Ok(())
         });
-        Self { store }
+        Self {
+            #[cfg(any(test, feature = "test-utils"))]
+            deadline_observer: None,
+            store,
+        }
     }
 
     /// Run guest code under this store's wall-clock budget.
@@ -262,11 +272,55 @@ impl GuestStore {
         T: 'static,
         F: Future<Output = T> + 's,
     {
+        self.call_with_start(tokio::time::Instant::now(), f).await
+    }
+
+    // Supplying the origin separately lets tests model synchronous setup time
+    // with the documented paused clock, without polling an advance future.
+    async fn call_with_start<'s, T, F>(
+        &'s mut self,
+        started: tokio::time::Instant,
+        f: impl FnOnce(&'s mut Store<HostState>) -> F,
+    ) -> Result<T, WallBudgetExceeded>
+    where
+        T: 'static,
+        F: Future<Output = T> + 's,
+    {
         let wall = self.store.data().guest.budget.wall;
+        let deadline = started.checked_add(wall);
+        #[cfg(test)]
+        self.record_armed_wall_budget_for_test(started, deadline);
         let store = &mut self.store;
-        tokio::time::timeout(wall, async move { f(store).await })
-            .await
-            .map_err(|_elapsed| WallBudgetExceeded { wall })
+        let body = async move { f(store).await };
+        let call = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, body),
+            // Delegate unrepresentable deadlines to Tokio so its far-future
+            // fallback stays identical to timeout's behavior.
+            None => tokio::time::timeout(wall, body),
+        };
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(observer) = &self.deadline_observer {
+            observer(super::PollEventForTest::GuestCallDeadlineCreated { wall });
+        }
+        call.await.map_err(|_elapsed| WallBudgetExceeded { wall })
+    }
+
+    #[cfg(test)]
+    fn record_armed_wall_budget_for_test(
+        &mut self,
+        started: tokio::time::Instant,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        self.store.data_mut().guest.armed_wall_budget =
+            deadline.map(|deadline| (started, deadline));
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn set_deadline_observer_for_test(
+        &mut self,
+        observer: Option<super::PollObserverForTest>,
+    ) {
+        self.deadline_observer = observer;
     }
 
     pub(super) fn begin_create_call(&mut self, recorder: CallEgressRecorder) {
@@ -319,7 +373,7 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wall_budget_includes_synchronous_guest_call_setup() {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
@@ -334,10 +388,23 @@ mod tests {
             GuestCallBudget::new(Duration::from_secs(30), Duration::from_millis(20)),
         );
 
+        let call_start = tokio::time::Instant::now();
+        // Model 50ms of synchronous setup after the origin was captured. The
+        // 20ms deadline is already past when the closure returns its future.
+        tokio::time::advance(Duration::from_millis(50)).await;
         let result = store
-            .call(|_store| {
-                std::thread::sleep(Duration::from_millis(50));
-                tokio::time::sleep(Duration::from_millis(1))
+            .call_with_start(call_start, |_store| {
+                // This is the synchronous setup closure, before it has
+                // returned a future. The actual timeout deadline must already
+                // be armed from the call's start, before any setup executes.
+                let (started, deadline) = _store
+                    .data()
+                    .guest
+                    .armed_wall_budget
+                    .expect("the deadline must be armed before synchronous setup");
+                assert_eq!(started, call_start);
+                assert_eq!(deadline, call_start + Duration::from_millis(20));
+                std::future::pending::<()>()
             })
             .await;
 
@@ -345,6 +412,47 @@ mod tests {
             result.is_err(),
             "synchronous setup before the returned future must consume the wall budget"
         );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            call_start + Duration::from_millis(50)
+        );
+
+        // Match Tokio's far-future fallback for an unrepresentable budget.
+        store.set_budget(GuestCallBudget::new(Duration::from_secs(30), Duration::MAX));
+        let call = store.call(|_| std::future::pending::<()>());
+        tokio::pin!(call);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(call.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(call.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wall_budget_expires_at_the_configured_deadline() {
+        let mut config = wasmtime::Config::new();
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).unwrap();
+        let budget = GuestCallBudget::new(Duration::from_secs(30), Duration::from_secs(2));
+        let mut store = GuestStore::new(
+            &engine,
+            test_provider_label(),
+            GuestNetwork::SchemaOnly,
+            None,
+            wasmtime::StoreLimitsBuilder::new().build(),
+            budget,
+        );
+        let call = store.call(|_| std::future::pending::<()>());
+        tokio::pin!(call);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(call.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(budget.wall() - Duration::from_millis(1)).await;
+        assert!(call.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let error = call
+            .await
+            .expect_err("a pending call must exhaust its budget");
+        assert_eq!(error.wall, budget.wall());
     }
 
     #[test]

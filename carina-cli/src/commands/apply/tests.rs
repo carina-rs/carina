@@ -306,6 +306,7 @@ fn spawn_mock_http_server(
                 match listener.accept() {
                     Ok(connection) => break connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // wall-clock-ok: hang guard for the real loopback server accept; no speed property is asserted.
                         assert!(Instant::now() < deadline, "server accept timed out");
                         std::thread::sleep(Duration::from_millis(10));
                     }
@@ -5367,7 +5368,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
 async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let mut fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
-        .with_delayed_create("slow", Duration::from_millis(75));
+        .with_blocked_create("slow");
     fixture.use_mock_file(fixture.config_path().join("source-apply-mock-state.json"));
     let loaded = load_configuration_with_config(
         fixture.config_path(),
@@ -5393,7 +5394,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
     let backend = fixture.lock_loss_backend_handle();
 
-    let error = run_apply_locked_canonical(
+    let apply = run_apply_locked_canonical(
         validated_config,
         true,
         backend.clone(),
@@ -5404,9 +5405,18 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
         false,
-    )
-    .await
-    .expect_err("heartbeat lock loss must fail apply");
+    );
+    tokio::pin!(apply);
+    tokio::select! {
+        () = fixture.wait_for_blocked_create() => {},
+        outcome = &mut apply => panic!("apply returned before the mock create blocked: {outcome:?}"),
+    }
+    backend.provider_is_blocked();
+    backend.wait_for_renewal_failure().await;
+    fixture.release_blocked_create();
+    let error = apply
+        .await
+        .expect_err("heartbeat lock loss must fail apply");
 
     assert!(matches!(error, AppError::StateLockLost { .. }));
     let rendered = error.to_string();
@@ -5425,7 +5435,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
 async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
     let mut fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
-        .with_delayed_create("slow", Duration::from_millis(75));
+        .with_blocked_create("slow");
     fixture.use_mock_file(fixture.config_path().join("saved-plan-mock-state.json"));
     let mut resource: Resource = Resource::with_provider("mock", "test.resource", "slow", None);
     resource.binding = Some(absolute_binding("slow"));
@@ -5480,7 +5490,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
     let backend = fixture.lock_loss_backend_handle();
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
 
-    let error = run_apply_from_plan_locked(
+    let apply = run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
         fixture.provider_context(),
@@ -5495,9 +5505,18 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
         false,
-    )
-    .await
-    .expect_err("heartbeat lock loss must fail saved-plan apply");
+    );
+    tokio::pin!(apply);
+    tokio::select! {
+        () = fixture.wait_for_blocked_create() => {},
+        outcome = &mut apply => panic!("apply returned before the mock create blocked: {outcome:?}"),
+    }
+    backend.provider_is_blocked();
+    backend.wait_for_renewal_failure().await;
+    fixture.release_blocked_create();
+    let error = apply
+        .await
+        .expect_err("heartbeat lock loss must fail saved-plan apply");
 
     assert!(matches!(error, AppError::StateLockLost { .. }));
     assert_eq!(backend.locked_writes(), 0, "lost lock must not save state");

@@ -1156,7 +1156,14 @@ impl MockProvider {
             if let Err(error) = Self::signal_ready(&self.behavior.observations.create_ready) {
                 return Err(attempt.untracked(error));
             }
-            tokio::time::sleep(delay).await;
+            if let Some(release) = &self.behavior.create_release {
+                // Readiness/release files order tests without a finite sleep.
+                while !release.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
         }
 
         let state_guard = match self.lock_state_file() {
@@ -1770,7 +1777,14 @@ impl Provider for MockProvider {
                 .and_then(|delay| delay.for_resource(&id))
             {
                 Self::signal_ready(&self.behavior.observations.delete_ready)?;
-                tokio::time::sleep(delay).await;
+                if let Some(release) = &self.behavior.delete_release {
+                    // Readiness/release files order tests without a finite sleep.
+                    while !release.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
             }
 
             if let Some(path) = self.behavior.observations.delete_log.clone() {
@@ -1801,7 +1815,7 @@ impl Provider for MockProvider {
 mod tests {
     use super::*;
     use carina_core::resource::NoPlaceholder;
-    use std::time::Instant;
+    use std::time::Duration;
 
     fn delete_request_without_schema() -> DeleteRequest {
         DeleteRequest::resolve(
@@ -2991,43 +3005,204 @@ mod tests {
     }
 
     #[test]
+    fn create_release_handshake_keeps_create_pending_until_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ready = tmp.path().join("create-ready");
+        let release = tmp.path().join("create-release");
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                create_delay: Some(SelectedDelay {
+                    address: "test.resource.slow".to_owned(),
+                    duration: Duration::from_millis(25),
+                }),
+                create_release: Some(release.clone()),
+                observations: MockObservations {
+                    create_ready: Some(ready.clone()),
+                    ..MockObservations::default()
+                },
+                ..MockBehavior::default()
+            },
+            MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
+        )
+        .create_provider();
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
+        let resource = Resource::with_provider("mock", "test.resource", "slow", None)
+            .with_attribute("name", string_value("slow"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let (initially_pending, ready_seen, still_pending, released, outcome) =
+            runtime.block_on(async {
+                let create = dispatch_mock_create(&provider, id, resource);
+                tokio::pin!(create);
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                let first = create.as_mut().poll(&mut context);
+                let initially_pending = first.is_pending();
+                let ready_seen = ready.exists();
+                tokio::time::advance(Duration::from_secs(60)).await;
+                let after_wait = if initially_pending {
+                    create.as_mut().poll(&mut context)
+                } else {
+                    first
+                };
+                let still_pending = after_wait.is_pending();
+                let released = fs::write(&release, b"");
+                let outcome = match after_wait {
+                    std::task::Poll::Ready(result) => Some(result),
+                    std::task::Poll::Pending if released.is_ok() => Some(create.await),
+                    std::task::Poll::Pending => None,
+                };
+                (
+                    initially_pending,
+                    ready_seen,
+                    still_pending,
+                    released,
+                    outcome,
+                )
+            });
+
+        assert!(initially_pending);
+        assert!(ready_seen, "the mock must report when its create is parked");
+        assert!(still_pending, "elapsed time must not release the create");
+        released.unwrap();
+        outcome.unwrap().unwrap();
+    }
+
+    #[test]
+    fn create_delay_delays_matching_resource_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                create_delay: Some(SelectedDelay {
+                    address: "test.resource.slow".to_owned(),
+                    duration: Duration::from_millis(25),
+                }),
+                ..MockBehavior::default()
+            },
+            MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
+        )
+        .create_provider();
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
+        let resource = Resource::with_provider("mock", "test.resource", "slow", None)
+            .with_attribute("name", string_value("slow"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let (outcome, elapsed) = runtime.block_on(async {
+            let started = tokio::time::Instant::now();
+            let outcome = dispatch_mock_create(&provider, id, resource).await;
+            (outcome, started.elapsed())
+        });
+
+        outcome.unwrap();
+        assert_eq!(elapsed, Duration::from_millis(25));
+    }
+
+    #[test]
+    fn delete_release_handshake_keeps_delete_pending_until_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ready = tmp.path().join("delete-ready");
+        let release = tmp.path().join("delete-release");
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                delete_delay: Some(SelectedDelay {
+                    address: "test.resource.slow".to_owned(),
+                    duration: Duration::from_millis(25),
+                }),
+                delete_release: Some(release.clone()),
+                observations: MockObservations {
+                    delete_ready: Some(ready.clone()),
+                    ..MockObservations::default()
+                },
+                ..MockBehavior::default()
+            },
+            MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
+        )
+        .create_provider();
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
+        let identifier = AppliedIdentifier::new("mock-id").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        let (initially_pending, ready_seen, still_pending, released, outcome) =
+            runtime.block_on(async {
+                let delete = provider.delete(&id, &identifier, delete_request_without_schema());
+                tokio::pin!(delete);
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                let first = delete.as_mut().poll(&mut context);
+                let initially_pending = first.is_pending();
+                let ready_seen = ready.exists();
+                tokio::time::advance(Duration::from_secs(60)).await;
+                let after_wait = if initially_pending {
+                    delete.as_mut().poll(&mut context)
+                } else {
+                    first
+                };
+                let still_pending = after_wait.is_pending();
+                let released = fs::write(&release, b"");
+                let outcome = match after_wait {
+                    std::task::Poll::Ready(result) => Some(result),
+                    std::task::Poll::Pending if released.is_ok() => Some(delete.await),
+                    std::task::Poll::Pending => None,
+                };
+                (
+                    initially_pending,
+                    ready_seen,
+                    still_pending,
+                    released,
+                    outcome,
+                )
+            });
+
+        assert!(initially_pending);
+        assert!(ready_seen, "the mock must report when its delete is parked");
+        assert!(still_pending, "elapsed time must not release the delete");
+        released.unwrap();
+        outcome.unwrap().unwrap();
+    }
+
+    #[test]
     fn delete_delay_delays_matching_resource_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let provider = ConfiguredBuiltinMock::new(
-            MockBehavior::default(),
+            MockBehavior {
+                delete_delay: Some(SelectedDelay {
+                    address: "test.resource.slow".to_owned(),
+                    duration: Duration::from_millis(25),
+                }),
+                ..MockBehavior::default()
+            },
             MockScope::file(state_file).unwrap(),
         )
         .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .start_paused(true)
             .build()
             .unwrap();
 
-        let provider = ConfiguredBuiltinMock::new(
-            MockBehavior {
-                delete_delay: Some(SelectedDelay {
-                    address: "test.resource.slow".to_owned(),
-                    duration: std::time::Duration::from_millis(25),
-                }),
-                ..MockBehavior::default()
-            },
-            provider.scope.clone(),
-        )
-        .create_provider();
-
-        let started = Instant::now();
         let identifier =
             AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
-        runtime
-            .block_on(provider.delete(&id, &identifier, delete_request_without_schema()))
-            .unwrap();
-        let elapsed = started.elapsed();
+        let (outcome, elapsed) = runtime.block_on(async {
+            let started = tokio::time::Instant::now();
+            let outcome = provider
+                .delete(&id, &identifier, delete_request_without_schema())
+                .await;
+            (outcome, tokio::time::Instant::now() - started)
+        });
 
-        assert!(
-            elapsed >= std::time::Duration::from_millis(25),
-            "matching delete should be delayed by at least 25ms, elapsed {elapsed:?}"
-        );
+        outcome.unwrap();
+        assert_eq!(elapsed, Duration::from_millis(25));
     }
 }

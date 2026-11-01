@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(*exit_calls.lock().unwrap(), vec![130]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn second_signal_during_cleanup_does_not_exit_before_state_flush_and_lock_release() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let state_flushed = Arc::new(AtomicBool::new(false));
@@ -430,6 +430,7 @@ mod tests {
             exit,
         ));
 
+        // wall-clock-ok: all callers pause Tokio time; this helper bounds supervisor liveness on that clock.
         let outcome = tokio::time::timeout(CLEANUP_DEADLINE + Duration::from_secs(1), supervisor)
             .await
             .expect("a closed signal stream must retain a cleanup deadline")

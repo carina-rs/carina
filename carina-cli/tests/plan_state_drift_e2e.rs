@@ -97,6 +97,7 @@ fn plan_with_concurrent_writer(dir: &std::path::Path, concurrent_writer: impl Fn
     // Wait for the binary to signal it has captured the T0 snapshot.
     let start = std::time::Instant::now();
     while !t0_done.exists() {
+        // wall-clock-ok: hang guard for the real plan process to reach its drift-check handshake.
         assert!(
             start.elapsed() < Duration::from_secs(30),
             "carina plan never reached the T0 handshake"
