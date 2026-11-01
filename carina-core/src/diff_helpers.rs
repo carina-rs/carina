@@ -12,7 +12,8 @@ use indexmap::IndexMap;
 use crate::differ::ComparisonContext;
 use crate::resource::{CanonicalComparisonAttributes, Value};
 use crate::schema::{
-    AttributeType, ResourceSchema, ValidatedResourceSchema, empty_defs_for_schema_walks,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    ValidatedResourceSchema, empty_defs_for_schema_walks,
 };
 use crate::value::CanonicalState;
 
@@ -422,10 +423,15 @@ pub(crate) fn compute_string_list_diff_by<T, U>(
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
     use crate::resource::{ConcreteValue, ValueString};
     use crate::schema::{
-        AttributeSchema, ResourceSchema, StructField, empty_defs_for_schema_walks,
+        CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+        empty_defs_for_schema_walks,
     };
 
     fn resource_attribute_values_equal(
@@ -468,26 +474,30 @@ mod tests {
 
     #[test]
     fn resource_equality_canonicalizes_provider_output_with_effective_ancestry() {
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::provider_populated(
+                PatternAttributeSchema::provider_populated(
                     "output",
-                    AttributeType::union(vec![
-                        AttributeType::struct_(
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::struct_(
                             "Output",
                             vec![
-                                StructField::required("eventual", AttributeType::string()).build(),
-                                StructField::optional(
+                                PatternStructField::required(
+                                    "eventual",
+                                    PatternAttributeType::string(),
+                                )
+                                .build(),
+                                PatternStructField::optional(
                                     "mode",
-                                    AttributeType::union(vec![
-                                        AttributeType::string(),
-                                        AttributeType::list(AttributeType::string()),
+                                    PatternAttributeType::union(vec![
+                                        PatternAttributeType::string(),
+                                        PatternAttributeType::list(PatternAttributeType::string()),
                                     ]),
                                 )
                                 .build(),
                             ],
                         ),
-                        AttributeType::map(AttributeType::string()),
+                        PatternAttributeType::map(PatternAttributeType::string()),
                     ]),
                 )
                 .build(),
@@ -515,13 +525,13 @@ mod tests {
 
     #[test]
     fn resource_equality_does_not_resolve_top_level_block_aliases() {
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "rules",
-                    AttributeType::union(vec![
-                        AttributeType::string(),
-                        AttributeType::list(AttributeType::string()),
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::string(),
+                        PatternAttributeType::list(PatternAttributeType::string()),
                     ]),
                 )
                 .with_block_name("rule")

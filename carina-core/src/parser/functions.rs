@@ -487,7 +487,10 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
 pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
     resolver: &'resolver dyn crate::parser::CustomTypeResolver,
     schema: crate::schema::OwnerBoundResourceSchema<'schema>,
-) -> impl Fn(&crate::schema::AttributeType, &GenericValue) -> Result<(), crate::schema::TypeError>
+) -> impl Fn(
+    &crate::schema::CompiledAttributeType,
+    &GenericValue,
+) -> Result<(), crate::schema::TypeError>
 + use<'resolver, 'schema> {
     let owner = schema.owner();
     move |declared_type, value| {
@@ -506,7 +509,10 @@ pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
 /// for that config. No provider-name comparison or owner lookup is involved.
 pub fn custom_type_lookup_for_factory<'a>(
     factory: &'a dyn crate::provider::ProviderFactory,
-) -> impl Fn(&crate::schema::AttributeType, &GenericValue) -> Result<(), crate::schema::TypeError>
+) -> impl Fn(
+    &crate::schema::CompiledAttributeType,
+    &GenericValue,
+) -> Result<(), crate::schema::TypeError>
 + use<'a> {
     move |declared_type, value| {
         validate_identified_declaration(declared_type, |declaration| {
@@ -521,7 +527,7 @@ pub fn custom_type_lookup_for_factory<'a>(
 }
 
 fn validate_identified_declaration(
-    declared_type: &crate::schema::AttributeType,
+    declared_type: &crate::schema::CompiledAttributeType,
     validate: impl FnOnce(
         crate::parser::IdentifiedCustomTypeDeclaration<'_>,
     ) -> Result<(), crate::schema::TypeError>,

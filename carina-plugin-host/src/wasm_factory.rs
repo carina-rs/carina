@@ -6643,9 +6643,10 @@ impl WasmProvider {
             }
         };
         // Persisted resume state has no scheduling metadata, while WIT requires
-        // both fields. The WIT/SDK contract marks these first-call values as
-        // non-authoritative; the provider's returned pending phase drives the
-        // host from this point onward.
+        // both fields. This operation-phase placeholder allows saved read-back
+        // tokens to resume with an identifier: SDK dispatch only rejects a
+        // backward phase transition. Returned pending or preserved progress
+        // establishes the phase used by subsequent polls.
         let initial = self.call_resume_record(
             id.clone(),
             wit_id,
@@ -9946,6 +9947,36 @@ mod tests {
         );
         assert!(!err.contains("carina init"), "{err}");
         assert!(!err.contains("bump the provider lock"), "{err}");
+    }
+
+    #[test]
+    fn pattern_diagnostics_are_rendered_once_in_provider_load_error() {
+        let detail = wasm_convert::json_to_attribute_types(
+            r#"{
+                "first":{"type":"String","pattern":"(?=x)"},
+                "second":{"type":"String","pattern":"["}
+            }"#,
+        )
+        .unwrap_err();
+        let diagnostic = ProviderSchemaDecodeDiagnostic(detail);
+        let rendered = diagnostic.to_string();
+        assert!(std::error::Error::source(&diagnostic).is_none());
+        for pattern in ["(?=x)", "["] {
+            let error = carina_core::schema::CompiledPattern::try_new(pattern).unwrap_err();
+            assert_eq!(
+                rendered.matches(&error.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(&error.reason.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+        }
+        let error = provider_schema_decode_error("bad-provider", "9.9.9", diagnostic.0);
+        assert_eq!(error.to_string().matches(&rendered).count(), 1);
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

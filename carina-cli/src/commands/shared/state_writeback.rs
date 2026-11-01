@@ -24,7 +24,7 @@ use carina_core::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, ModuleSource, PersistedDirectiveFieldChange,
     PersistedDirectives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
-use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_core::schema::{CompiledResourceSchema as ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
@@ -2082,6 +2082,10 @@ mod post_apply_states_tests {
 
 #[cfg(test)]
 mod apply_state_save_tests {
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
+    };
+
     use super::*;
     use carina_core::differ::create_plan_for_test as create_plan;
     use carina_core::effect::{
@@ -2095,7 +2099,7 @@ mod apply_state_save_tests {
         ApplyTimeUnknown, ConcreteValue, DeferredValue, Directives, ResolvedResourceId, Resource,
         ResourceId, State, Value,
     };
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use carina_core::schema::SchemaRegistry;
     use carina_state::{CurrentInstance, DeposedInstance, DeposedKey, NameOverride};
 
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
@@ -2904,15 +2908,21 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            (PatternResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::optional("replacement_key", AttributeType::string())
-                        .create_only()
+                    PatternAttributeSchema::optional("comment", PatternAttributeType::string())
                         .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional(
+                        "replacement_key",
+                        PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 ))
@@ -3034,11 +3044,17 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("ec2.InternetGateway")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            (PatternResourceSchema::new("ec2.InternetGateway")
                 .attribute(
-                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
                         .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "tags",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
                 ))
             .validate()
             .expect("schema fixture must be valid"),
@@ -3678,8 +3694,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("test.resource").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .create_only()
                     .build(),
@@ -3804,16 +3820,26 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            (PatternResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 )
-                .attribute(AttributeSchema::optional("api_key", AttributeType::string()).build())
                 .attribute(
-                    AttributeSchema::optional("unsent_secret", AttributeType::string()).build(),
+                    PatternAttributeSchema::optional("api_key", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "unsent_secret",
+                        PatternAttributeType::string(),
+                    )
+                    .build(),
                 ))
             .validate()
             .expect("schema fixture must be valid"),
@@ -3925,8 +3951,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("test.resource").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .create_only()
                     .build(),
@@ -4133,8 +4159,9 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+            (PatternResourceSchema::new("test.resource").attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            ))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -4219,14 +4246,20 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            (PatternResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 )
-                .attribute(AttributeSchema::optional("api_key", AttributeType::string()).build()))
+                .attribute(
+                    PatternAttributeSchema::optional("api_key", PatternAttributeType::string())
+                        .build(),
+                ))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -6095,8 +6128,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("test.resource").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             ))
@@ -6157,8 +6190,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            (ResourceSchema::new("db.Instance").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("db.Instance").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             ))
@@ -6281,10 +6314,13 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            (ResourceSchema::new("route53.Record")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            (PatternResourceSchema::new("route53.Record")
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 ))
@@ -6350,14 +6386,17 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
+            (PatternResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::optional("replacement_key", AttributeType::string())
-                        .create_only()
-                        .build(),
+                    PatternAttributeSchema::optional(
+                        "replacement_key",
+                        PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 )
@@ -6627,8 +6666,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            (ResourceSchema::new("route53.Record").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("route53.Record").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             ))
@@ -6923,8 +6962,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "",
-            (ResourceSchema::new("ec2.Vpc").attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+            (PatternResourceSchema::new("ec2.Vpc").attribute(
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             ))
@@ -7006,13 +7045,16 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            (ResourceSchema::new("s3.Bucket")
+            (PatternResourceSchema::new("s3.Bucket")
                 .attribute(
-                    AttributeSchema::optional("bucket_name", AttributeType::string())
+                    PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                         .create_only()
                         .build(),
                 )
-                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .attribute(
+                    PatternAttributeSchema::optional("comment", PatternAttributeType::string())
+                        .build(),
+                )
                 .with_coexisting_replacement())
             .validate()
             .expect("schema fixture must be valid"),
@@ -7711,7 +7753,7 @@ mod stage4_unknown_err_tests {
 
     #[test]
     fn canonical_enum_serializes_as_typed_object() {
-        let attr_type = carina_core::schema::AttributeType::enum_(
+        let attr_type = carina_core::schema::CompiledAttributeType::enum_(
             carina_core::schema::TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
             Some(vec!["vpc".to_string()]),
             Vec::new(),

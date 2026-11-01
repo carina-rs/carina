@@ -13,8 +13,9 @@ use crate::resource::{
     value_at_leaf,
 };
 use crate::schema::{
-    AttributeType, DslTransform, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
-    ResourceSchema, TypeIdentity, empty_defs_for_schema_walks,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, DslTransform,
+    LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, TypeIdentity,
+    empty_defs_for_schema_walks,
 };
 use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
 
@@ -467,7 +468,7 @@ where
 fn type_aware_struct_equal(
     a: &IndexMap<String, Value>,
     b: &IndexMap<String, Value>,
-    fields: &[crate::schema::StructField],
+    fields: &[crate::schema::CompiledStructField],
     defs: &BTreeMap<String, AttributeType>,
     context: &ComparisonContext<'_>,
 ) -> bool {

@@ -4,7 +4,7 @@ use carina_plugin_sdk::core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, ValidatedResourceSchema,
 };
 use carina_plugin_sdk::types::{AppliedIdentifier, CreateRequest, ProviderError, Value};
-use carina_plugin_sdk::{CreateAttempt, CreateStep, CreateVerdict, Sent};
+use carina_plugin_sdk::{CreateAttempt, CreateStep, CreateVerdict, PhasedToken, Sent};
 
 const URL_ATTRIBUTE: &str = "url";
 const METHOD_ATTRIBUTE: &str = "method";
@@ -188,9 +188,13 @@ pub struct ProbedCreate {
 }
 
 impl ProbedCreate {
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+    pub fn pending<T: PhasedToken>(
+        self,
+        token: T::Operation,
+        poll_after_secs: u32,
+    ) -> CreateStep<T> {
         self.attempt
-            .pending(token, Sent::AllRequestAttributes, poll_after_secs)
+            .pending::<T>(token, Sent::AllRequestAttributes, poll_after_secs)
     }
 
     pub fn untracked<T>(self, error: ProviderError) -> CreateVerdict<T> {
@@ -237,7 +241,8 @@ pub fn wasi_http_send_phase(url: &str, method: &str, body: &str, kind: ProbeKind
         *request.body_mut() = body.as_bytes().to_vec().into();
 
         match futures::executor::block_on(connector.call(request)) {
-            Ok(_) => "success".to_string(),
+            Ok(response) if response.status().is_success() => "success".to_string(),
+            Ok(response) => format!("status:{}", response.status().as_u16()),
             Err(error) => {
                 let sdk_error: SdkError<(), ()> = SdkError::dispatch_failure(error);
                 let SdkError::DispatchFailure(dispatch) = &sdk_error else {

@@ -1,3 +1,6 @@
+use crate::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
@@ -69,17 +72,18 @@ impl ProviderNormalizer for AttributeReturningNormalizer {
 
 #[tokio::test]
 async fn normalized_resource_rejects_block_aliases_returned_by_provider_normalizer() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("thing").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("thing").attribute(
+            PatternAttributeSchema::optional(
                 "rules",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "Rule",
-                    vec![StructField::optional("action", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("action", PatternAttributeType::string())
+                            .build(),
+                    ],
                 )),
             )
             .with_block_name("rule")
@@ -116,16 +120,14 @@ async fn normalized_resource_rejects_block_aliases_returned_by_provider_normaliz
 
 #[tokio::test]
 async fn normalized_resource_rejects_nested_block_aliases_returned_by_provider_normalizer() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
-    let condition = AttributeType::struct_(
+    let condition = PatternAttributeType::struct_(
         "Condition",
-        vec![StructField::optional("value", AttributeType::string()).build()],
+        vec![PatternStructField::optional("value", PatternAttributeType::string()).build()],
     );
-    let rule = AttributeType::struct_(
+    let rule = PatternAttributeType::struct_(
         "Rule",
         vec![
-            StructField::optional("conditions", AttributeType::list(condition))
+            PatternStructField::optional("conditions", PatternAttributeType::list(condition))
                 .with_block_name("condition")
                 .build(),
         ],
@@ -133,8 +135,9 @@ async fn normalized_resource_rejects_nested_block_aliases_returned_by_provider_n
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("thing")
-            .attribute(AttributeSchema::optional("rules", AttributeType::list(rule)).build()))
+        (PatternResourceSchema::new("thing").attribute(
+            PatternAttributeSchema::optional("rules", PatternAttributeType::list(rule)).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -215,10 +218,10 @@ async fn normalization_error_stops_later_stages() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (crate::schema::ResourceSchema::new("thing").attribute(
-            crate::schema::AttributeSchema::optional(
+        (PatternResourceSchema::new("thing").attribute(
+            PatternAttributeSchema::optional(
                 "tags",
-                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                PatternAttributeType::map(PatternAttributeType::string()),
             )
             .build(),
         ))
@@ -318,11 +321,9 @@ async fn unresolved_enum_default_tag_fails_before_mutating_resources() {
 }
 
 fn order_schema() -> SchemaRegistry {
-    use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, StructField, enum_identity,
-    };
+    use crate::schema::enum_identity;
 
-    let mode = AttributeType::enum_(
+    let mode = PatternAttributeType::enum_(
         enum_identity("Mode", Some("test.thing")),
         Some(vec!["friendly".to_string()]),
         Vec::new(),
@@ -332,40 +333,44 @@ fn order_schema() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("thing")
+        (PatternResourceSchema::new("thing")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "subjects",
-                    AttributeType::union(vec![
-                        AttributeType::string(),
-                        AttributeType::list(AttributeType::string()),
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::string(),
+                        PatternAttributeType::list(PatternAttributeType::string()),
                     ]),
                 )
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "ref_subjects",
-                    AttributeType::union(vec![
-                        AttributeType::string(),
-                        AttributeType::list(AttributeType::string()),
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::string(),
+                        PatternAttributeType::list(PatternAttributeType::string()),
                     ]),
                 )
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
             )
-            .attribute(AttributeSchema::optional("mode", mode.clone()).build())
+            .attribute(PatternAttributeSchema::optional("mode", mode.clone()).build())
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Settings",
                         vec![
-                            StructField::optional("mode", mode).build(),
-                            StructField::optional("peer", AttributeType::string()).build(),
+                            PatternStructField::optional("mode", mode).build(),
+                            PatternStructField::optional("peer", PatternAttributeType::string())
+                                .build(),
                         ],
                     ),
                 )
@@ -507,10 +512,10 @@ async fn desired_normalization_lifts_guest_string_alias_to_api_enum() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (crate::schema::ResourceSchema::new("thing").attribute(
-            crate::schema::AttributeSchema::optional(
+        (PatternResourceSchema::new("thing").attribute(
+            PatternAttributeSchema::optional(
                 "mode",
-                crate::schema::AttributeType::enum_(
+                PatternAttributeType::enum_(
                     crate::schema::enum_identity("Mode", Some("test.thing")),
                     Some(vec!["Allow".to_string(), "Deny".to_string()]),
                     vec![("Allow".to_string(), "allow".to_string())],
@@ -570,10 +575,10 @@ async fn desired_normalization_rejects_guest_dotted_string_without_shape_strippi
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (crate::schema::ResourceSchema::new("thing").attribute(
-            crate::schema::AttributeSchema::optional(
+        (PatternResourceSchema::new("thing").attribute(
+            PatternAttributeSchema::optional(
                 "mode",
-                crate::schema::AttributeType::enum_(
+                PatternAttributeType::enum_(
                     crate::schema::enum_identity("Mode", Some("test.thing")),
                     Some(vec!["Allow".to_string(), "Deny".to_string()]),
                     vec![("Allow".to_string(), "allow".to_string())],
@@ -707,8 +712,6 @@ async fn desired_normalization_resolves_enum_alias_nested_with_resource_ref() {
 
 #[tokio::test]
 async fn desired_normalization_scopes_default_tags_to_provider_instance() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
     let mut default_tags = IndexMap::new();
     default_tags.insert("Inst".to_string(), string_value("default"));
     let default_config = provider_config(default_tags);
@@ -726,8 +729,12 @@ async fn desired_normalization_scopes_default_tags_to_provider_instance() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("thing").attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        (PatternResourceSchema::new("thing").attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -764,8 +771,6 @@ async fn desired_normalization_scopes_default_tags_to_provider_instance() {
 
 #[tokio::test]
 async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
     let default_tags = IndexMap::from([("ManagedBy".to_string(), string_value("carina"))]);
     let mut resources: Vec<Resource> = vec![
         Resource::with_provider("test", "list_tags", "list", None),
@@ -775,20 +780,27 @@ async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("list_tags").attribute(
-            AttributeSchema::optional("tags", AttributeType::list(AttributeType::string())).build(),
+        (PatternResourceSchema::new("list_tags").attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::list(PatternAttributeType::string()),
+            )
+            .build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "test",
-        (ResourceSchema::new("struct_tags").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("struct_tags").attribute(
+            PatternAttributeSchema::optional(
                 "tags",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Tags",
-                    vec![StructField::optional("owner", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("owner", PatternAttributeType::string())
+                            .build(),
+                    ],
                 ),
             )
             .build(),
@@ -798,8 +810,12 @@ async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
     );
     schemas.insert(
         "test",
-        (ResourceSchema::new("numeric_map_tags").attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::int())).build(),
+        (PatternResourceSchema::new("numeric_map_tags").attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::int()),
+            )
+            .build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),

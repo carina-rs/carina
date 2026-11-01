@@ -192,6 +192,12 @@
 //! let _ = ResourceSchema::new("test.Widget").with_validator(|_| Ok(()));
 //! ```
 
+mod compile_schema;
+mod compiled_pattern;
+pub use compiled_pattern::{
+    Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
+};
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -446,8 +452,9 @@ where
 /// Provider-owned call sites pair this declaration with its schema owner before
 /// invoking the owning factory. A [`TypeIdentity`] alone is descriptive metadata
 /// and is never used as routing authority.
-pub type CustomTypeLookup<'a> =
-    &'a (dyn Fn(&AttributeType, &Value) -> Result<(), TypeError> + Send + Sync + 'a);
+pub type CustomTypeLookup<'a> = &'a (
+        dyn Fn(&PatternAttributeType<Compiled>, &Value) -> Result<(), TypeError> + Send + Sync + 'a
+    );
 
 /// A [`CustomTypeLookup`] that approves every value. Pass to
 /// `validate_with_origins_and_lookup` from contexts that have no
@@ -481,11 +488,11 @@ fn attributes_without_placeholders<P: PlaceholderKind, B: BindingAddress>(
 /// plugins, where the real validator lives behind the factory's
 /// `validate_custom_type`).
 fn walk_custom_lookup<P: PlaceholderKind, B: BindingAddress>(
-    attr_type: &AttributeType,
+    attr_type: &PatternAttributeType<Compiled>,
     value: &Value<P, B>,
     attr_name: Option<&str>,
     lookup: CustomTypeLookup<'_>,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
+    defs: &std::collections::BTreeMap<String, PatternAttributeType<Compiled>>,
     errors: &mut Vec<TypeError>,
 ) {
     let mut visited_refs = Vec::new();
@@ -501,11 +508,11 @@ fn walk_custom_lookup<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn walk_custom_lookup_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    attr_type: &'a AttributeType,
+    attr_type: &'a PatternAttributeType<Compiled>,
     value: &Value<P, B>,
     attr_name: Option<&str>,
     lookup: CustomTypeLookup<'_>,
-    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    defs: &'a std::collections::BTreeMap<String, PatternAttributeType<Compiled>>,
     errors: &mut Vec<TypeError>,
     visited_refs: &mut Vec<&'a str>,
 ) {
@@ -728,7 +735,7 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn run_identified_lookup<P: PlaceholderKind, B: BindingAddress>(
-    attribute_type: &AttributeType,
+    attribute_type: &PatternAttributeType<Compiled>,
     identity: Option<&TypeIdentity>,
     value: &Value<P, B>,
     attr_name: Option<&str>,
@@ -971,11 +978,11 @@ impl IdentityMode {
 /// );
 /// ```
 #[derive(Debug, Clone)]
-pub struct StructField {
+pub struct PatternStructField<R: PatternForm = Draft> {
     /// Field name (snake_case, e.g., "ip_protocol")
     pub(crate) name: String,
     /// Field type
-    pub(crate) field_type: AttributeType,
+    pub(crate) field_type: PatternAttributeType<R>,
     /// Whether user input for this field is optional, required, or forbidden.
     declared_input_mode: InputMode,
     /// Description of this field
@@ -1001,14 +1008,14 @@ pub struct StructField {
     pub(crate) identity_mode: IdentityMode,
 }
 
-/// Exhaustive read-only view of a [`StructField`].
+/// Exhaustive read-only declaration view for draft and compiled struct fields.
 ///
 /// This deliberately has no `#[non_exhaustive]`: conversion seams should
 /// destructure every field so additions become compile errors.
 #[derive(Debug, Clone, Copy)]
-pub struct StructFieldParts<'a> {
+pub struct StructFieldParts<'a, R: PatternForm = Draft> {
     pub name: &'a str,
-    pub field_type: &'a AttributeType,
+    pub field_type: &'a PatternAttributeType<R>,
     /// The mode written on this field declaration, before reference-path
     /// ancestry is applied. Ordinary consumers must use an [`EffectiveField`]
     /// obtained from a validated schema witness instead.
@@ -1023,34 +1030,34 @@ pub struct StructFieldParts<'a> {
 }
 
 /// Builder for an optional user-input struct field.
-pub struct OptionalStructFieldBuilder {
-    field: StructField,
+pub struct OptionalStructFieldBuilder<R: PatternForm = Draft> {
+    field: PatternStructField<R>,
 }
 
 /// Builder for a required user-input struct field.
-pub struct RequiredStructFieldBuilder {
-    field: StructField,
+pub struct RequiredStructFieldBuilder<R: PatternForm = Draft> {
+    field: PatternStructField<R>,
 }
 
 /// Builder for an optional create-only user-input struct field.
-pub struct CreateOnlyOptionalStructFieldBuilder {
-    field: StructField,
+pub struct CreateOnlyOptionalStructFieldBuilder<R: PatternForm = Draft> {
+    field: PatternStructField<R>,
 }
 
 /// Builder for a required create-only user-input struct field.
-pub struct CreateOnlyRequiredStructFieldBuilder {
-    field: StructField,
+pub struct CreateOnlyRequiredStructFieldBuilder<R: PatternForm = Draft> {
+    field: PatternStructField<R>,
 }
 
 /// Builder for a provider-populated struct field.
-pub struct ProviderPopulatedStructFieldBuilder {
-    field: StructField,
+pub struct ProviderPopulatedStructFieldBuilder<R: PatternForm = Draft> {
+    field: PatternStructField<R>,
 }
 
-impl StructField {
+impl<R: PatternForm> PatternStructField<R> {
     fn with_input_mode(
         name: impl Into<String>,
-        field_type: AttributeType,
+        field_type: PatternAttributeType<R>,
         input_mode: InputMode,
     ) -> Self {
         Self {
@@ -1069,8 +1076,8 @@ impl StructField {
 
     pub fn optional(
         name: impl Into<String>,
-        field_type: AttributeType,
-    ) -> OptionalStructFieldBuilder {
+        field_type: PatternAttributeType<R>,
+    ) -> OptionalStructFieldBuilder<R> {
         OptionalStructFieldBuilder {
             field: Self::with_input_mode(name, field_type, InputMode::Optional),
         }
@@ -1078,8 +1085,8 @@ impl StructField {
 
     pub fn required(
         name: impl Into<String>,
-        field_type: AttributeType,
-    ) -> RequiredStructFieldBuilder {
+        field_type: PatternAttributeType<R>,
+    ) -> RequiredStructFieldBuilder<R> {
         RequiredStructFieldBuilder {
             field: Self::with_input_mode(name, field_type, InputMode::Required),
         }
@@ -1087,14 +1094,14 @@ impl StructField {
 
     pub fn provider_populated(
         name: impl Into<String>,
-        field_type: AttributeType,
-    ) -> ProviderPopulatedStructFieldBuilder {
+        field_type: PatternAttributeType<R>,
+    ) -> ProviderPopulatedStructFieldBuilder<R> {
         ProviderPopulatedStructFieldBuilder {
             field: Self::with_input_mode(name, field_type, InputMode::ProviderPopulated),
         }
     }
 
-    pub fn parts(&self) -> StructFieldParts<'_> {
+    pub fn parts(&self) -> StructFieldParts<'_, R> {
         StructFieldParts {
             name: &self.name,
             field_type: &self.field_type,
@@ -1113,7 +1120,7 @@ impl StructField {
         &self.name
     }
 
-    pub fn field_type(&self) -> &AttributeType {
+    pub fn field_type(&self) -> &PatternAttributeType<R> {
         &self.field_type
     }
 
@@ -1153,7 +1160,7 @@ impl FieldAncestry {
         }
     }
 
-    pub(crate) fn effective_input_mode(self, field: &StructField) -> InputMode {
+    pub(crate) fn effective_input_mode(self, field: &CompiledStructField) -> InputMode {
         if self.provider_populated {
             InputMode::ProviderPopulated
         } else {
@@ -1161,13 +1168,13 @@ impl FieldAncestry {
         }
     }
 
-    pub(crate) fn block_name(self, field: &StructField) -> Option<&str> {
+    pub(crate) fn block_name(self, field: &CompiledStructField) -> Option<&str> {
         (!self.effective_input_mode(field).is_provider_populated())
             .then_some(field.block_name.as_deref())
             .flatten()
     }
 
-    pub(crate) fn descend(self, field: &StructField) -> Self {
+    pub(crate) fn descend(self, field: &CompiledStructField) -> Self {
         Self {
             in_secret: self.in_secret,
             ..Self::from_input_mode(self.effective_input_mode(field))
@@ -1184,7 +1191,7 @@ impl FieldAncestry {
 
 macro_rules! impl_user_input_struct_field_builder {
     ($builder:ident) => {
-        impl $builder {
+        impl<R: PatternForm> $builder<R> {
             pub fn write_only(mut self) -> Self {
                 self.field.write_only = true;
                 self
@@ -1213,7 +1220,7 @@ macro_rules! impl_user_input_struct_field_builder {
                 self
             }
 
-            pub fn build(self) -> StructField {
+            pub fn build(self) -> PatternStructField<R> {
                 self.field
             }
         }
@@ -1225,15 +1232,15 @@ impl_user_input_struct_field_builder!(RequiredStructFieldBuilder);
 impl_user_input_struct_field_builder!(CreateOnlyOptionalStructFieldBuilder);
 impl_user_input_struct_field_builder!(CreateOnlyRequiredStructFieldBuilder);
 
-impl OptionalStructFieldBuilder {
-    pub fn create_only(mut self) -> CreateOnlyOptionalStructFieldBuilder {
+impl<R: PatternForm> OptionalStructFieldBuilder<R> {
+    pub fn create_only(mut self) -> CreateOnlyOptionalStructFieldBuilder<R> {
         self.field.create_only = true;
         CreateOnlyOptionalStructFieldBuilder { field: self.field }
     }
 }
 
-impl RequiredStructFieldBuilder {
-    pub fn create_only(mut self) -> CreateOnlyRequiredStructFieldBuilder {
+impl<R: PatternForm> RequiredStructFieldBuilder<R> {
+    pub fn create_only(mut self) -> CreateOnlyRequiredStructFieldBuilder<R> {
         self.field.create_only = true;
         CreateOnlyRequiredStructFieldBuilder { field: self.field }
     }
@@ -1241,7 +1248,7 @@ impl RequiredStructFieldBuilder {
 
 macro_rules! impl_identity_struct_field_builder {
     ($builder:ident) => {
-        impl $builder {
+        impl<R: PatternForm> $builder<R> {
             pub fn identity(mut self) -> Self {
                 self.field.identity_mode = IdentityMode::Required;
                 self
@@ -1253,14 +1260,14 @@ macro_rules! impl_identity_struct_field_builder {
 impl_identity_struct_field_builder!(CreateOnlyOptionalStructFieldBuilder);
 impl_identity_struct_field_builder!(CreateOnlyRequiredStructFieldBuilder);
 
-impl CreateOnlyOptionalStructFieldBuilder {
+impl<R: PatternForm> CreateOnlyOptionalStructFieldBuilder<R> {
     pub fn identity_when_present(mut self) -> Self {
         self.field.identity_mode = IdentityMode::WhenPresent;
         self
     }
 }
 
-impl ProviderPopulatedStructFieldBuilder {
+impl<R: PatternForm> ProviderPopulatedStructFieldBuilder<R> {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.field.description = Some(description.into());
         self
@@ -1284,7 +1291,7 @@ impl ProviderPopulatedStructFieldBuilder {
         self
     }
 
-    pub fn build(self) -> StructField {
+    pub fn build(self) -> PatternStructField<R> {
         self.field
     }
 }
@@ -1398,9 +1405,52 @@ impl fmt::Display for IdentityPath {
 /// (silent `Ref` drop in a wildcard arm of an external `match`) is
 /// structurally impossible at the type level.
 #[derive(Clone)]
-pub struct AttributeType {
-    pub(crate) kind: AttrTypeKind,
+pub struct PatternAttributeType<R: PatternForm = Draft> {
+    pub(crate) kind: AttrTypeKind<R>,
 }
+
+/// Provider-facing draft type. Schema admission compiles all of its patterns.
+///
+/// Drafts cannot enter a value-validation API:
+///
+/// ```compile_fail
+/// use carina_core::resource::EnumValueResolver;
+/// use carina_core::schema::{AttributeType, ResourceSchema, TypeIdentity};
+/// let draft = AttributeType::enum_(
+///     TypeIdentity::bare("Mode"), Some(vec!["x".into()]), vec![], None, None,
+/// );
+/// let schema = ResourceSchema::new("test.Draft");
+/// let resolved = schema.resolve_of(&draft).as_attr();
+/// let _ = EnumValueResolver::new(resolved).resolve_state_text("x");
+/// ```
+///
+/// Admit the declaration before resolving enum values:
+///
+/// ```
+/// use carina_core::resource::EnumValueResolver;
+/// use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+/// let draft = AttributeType::enum_(
+///     TypeIdentity::bare("Mode"), Some(vec!["x".into()]), vec![], None, None,
+/// );
+/// let admitted = ResourceSchema::new("test.Admitted")
+///     .attribute(AttributeSchema::optional("mode", draft).build())
+///     .validate()
+///     .unwrap();
+/// let schema = admitted.as_schema();
+/// let resolved = schema.resolve_of(schema.attributes()["mode"].attr_type()).as_attr();
+/// let value = EnumValueResolver::new(resolved).resolve_state_text("x").unwrap();
+/// assert_eq!(value.api_value(), "x");
+/// ```
+pub type AttributeType = PatternAttributeType<Draft>;
+pub type StructField = PatternStructField<Draft>;
+pub type AttributeSchema = PatternAttributeSchema<Draft>;
+pub type ResourceSchema = PatternResourceSchema<Draft>;
+
+/// An attribute type whose string patterns are compiled regexes.
+pub type CompiledAttributeType = PatternAttributeType<Compiled>;
+pub type CompiledStructField = PatternStructField<Compiled>;
+pub type CompiledAttributeSchema = PatternAttributeSchema<Compiled>;
+pub type CompiledResourceSchema = PatternResourceSchema<Compiled>;
 
 /// An [`AttributeType`] paired with the named definitions that give its
 /// [`AttrTypeKind::Ref`] nodes meaning.
@@ -1409,9 +1459,9 @@ pub struct AttributeType {
 /// Carrying each definition map inside this wrapper prevents the source and
 /// sink maps from being exchanged as indistinguishable positional arguments.
 #[derive(Clone, Copy)]
-pub struct TypeInSchema<'a> {
-    attr: &'a AttributeType,
-    defs: &'a BTreeMap<String, AttributeType>,
+pub struct TypeInSchema<'a, R: PatternForm = Draft> {
+    attr: &'a PatternAttributeType<R>,
+    defs: &'a BTreeMap<String, PatternAttributeType<R>>,
 }
 
 /// Internal variant enum carried by [`AttributeType`]. `pub(crate)` so
@@ -1420,11 +1470,11 @@ pub struct TypeInSchema<'a> {
 /// downstream crates. External code uses [`AttrTypeKind::shape`] (the
 /// `Ref`-peeled view) or the constructor methods on [`AttributeType`].
 #[derive(Clone)]
-pub(crate) enum AttrTypeKind {
+pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     /// String
     String {
         binding: RefinementBinding,
-        pattern: Option<String>,
+        pattern: Option<R::Pattern>,
         length: Option<(Option<u64>, Option<u64>)>,
         to_dsl: Option<DslTransform>,
     },
@@ -1466,7 +1516,7 @@ pub(crate) enum AttrTypeKind {
         /// declarations. Most enum values are strings, but preserving
         /// the base keeps the WASM wire form's type evidence available
         /// after conversion into the unified core enum.
-        base: Box<AttributeType>,
+        base: Box<PatternAttributeType<R>>,
         /// Closed API values when the provider can enumerate them.
         /// `None` keeps host-side validator semantics for dynamic enum
         /// spaces such as regions and availability zones.
@@ -1482,7 +1532,7 @@ pub(crate) enum AttrTypeKind {
     /// if false, order is ignored (multiset comparison).
     /// Defaults to true (matching CloudFormation's insertionOrder default).
     List {
-        element_type: Box<AttributeType>,
+        element_type: Box<PatternAttributeType<R>>,
         ordered: bool,
         constraints: ListConstraints,
     },
@@ -1491,17 +1541,17 @@ pub(crate) enum AttrTypeKind {
     /// `Enum` for condition operators).
     /// `value`: type of map values.
     Map {
-        key: Box<AttributeType>,
-        value: Box<AttributeType>,
+        key: Box<PatternAttributeType<R>>,
+        value: Box<PatternAttributeType<R>>,
     },
     /// Struct (named object with typed fields)
     Struct {
         name: String,
-        fields: Vec<StructField>,
+        fields: Vec<PatternStructField<R>>,
         field_groups: Vec<FieldGroup>,
     },
     /// Union of multiple types (value is valid if it matches any member)
-    Union(UnionMemberTypes),
+    Union(UnionMemberTypes<R>),
     /// Named reference into the enclosing resource or rootless definition map.
     ///
     /// Used to express cyclic struct definitions
@@ -1535,7 +1585,7 @@ pub(crate) enum AttrTypeKind {
 /// `AttrTypeKind::shape` match is non-exhaustive against the source
 /// enum and the compiler will surface the omission.
 #[derive(Clone, Copy)]
-pub enum Shape<'a> {
+pub enum Shape<'a, R: PatternForm = Draft> {
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
@@ -1563,7 +1613,7 @@ pub enum Shape<'a> {
     /// Namespaced enum — see [`AttrTypeKind::Enum`].
     Enum {
         identity: &'a TypeIdentity,
-        base: &'a AttributeType,
+        base: &'a PatternAttributeType<R>,
         values: Option<&'a [String]>,
         dsl_aliases: &'a [(String, String)],
         validate: Option<&'a CustomValidator>,
@@ -1571,14 +1621,14 @@ pub enum Shape<'a> {
     },
     /// List with element type and ordering — see [`AttrTypeKind::List`].
     List {
-        element_type: &'a AttributeType,
+        element_type: &'a PatternAttributeType<R>,
         ordered: bool,
         constraints: ListConstraints,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
-        key: &'a AttributeType,
-        value: &'a AttributeType,
+        key: &'a PatternAttributeType<R>,
+        value: &'a PatternAttributeType<R>,
     },
     /// Named struct — see [`AttrTypeKind::Struct`].
     Struct { name: &'a str },
@@ -1616,7 +1666,7 @@ impl ShapeWalkBudget {
     }
 }
 
-impl fmt::Debug for Shape<'_> {
+impl<R: PatternForm> fmt::Debug for Shape<'_, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Shape::String {
@@ -1707,7 +1757,7 @@ impl fmt::Debug for Shape<'_> {
 /// projections; the `AttrTypeKind::raw_shape` match is non-exhaustive
 /// against the source enum and the compiler will surface the omission.
 #[derive(Clone, Copy)]
-pub enum RawShape<'a> {
+pub enum RawShape<'a, R: PatternForm = Draft> {
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
@@ -1735,7 +1785,7 @@ pub enum RawShape<'a> {
     /// Namespaced enum — see [`AttrTypeKind::Enum`].
     Enum {
         identity: &'a TypeIdentity,
-        base: &'a AttributeType,
+        base: &'a PatternAttributeType<R>,
         values: Option<&'a [String]>,
         dsl_aliases: &'a [(String, String)],
         validate: Option<&'a CustomValidator>,
@@ -1743,30 +1793,30 @@ pub enum RawShape<'a> {
     },
     /// List with element type and ordering — see [`AttrTypeKind::List`].
     List {
-        element_type: &'a AttributeType,
+        element_type: &'a PatternAttributeType<R>,
         ordered: bool,
         constraints: ListConstraints,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
-        key: &'a AttributeType,
-        value: &'a AttributeType,
+        key: &'a PatternAttributeType<R>,
+        value: &'a PatternAttributeType<R>,
     },
     /// Named struct — see [`AttrTypeKind::Struct`].
     Struct {
         name: &'a str,
-        fields: &'a [StructField],
+        fields: &'a [PatternStructField<R>],
         field_groups: &'a [FieldGroup],
     },
     /// Union of types — see [`AttrTypeKind::Union`].
-    Union(&'a [AttributeType]),
+    Union(&'a [PatternAttributeType<R>]),
     /// Named reference into the enclosing schema's definition map.
     /// Carries the name; the receiver re-emits an `AttributeType::ref_(name)`
     /// and looks up the definition in its own copy of `defs`.
     Ref(&'a str),
 }
 
-impl fmt::Debug for RawShape<'_> {
+impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RawShape::String {
@@ -1852,9 +1902,9 @@ impl fmt::Debug for RawShape<'_> {
 pub(crate) struct Schema {
     /// The root attribute type. May be a `Ref` into `defs`, or any
     /// other shape (`Struct`, `List`, primitive, ...).
-    pub(crate) root: AttributeType,
+    pub(crate) root: PatternAttributeType<Compiled>,
     /// Named definitions reachable via [`AttrTypeKind::Ref`].
-    pub(crate) defs: std::collections::BTreeMap<String, AttributeType>,
+    pub(crate) defs: std::collections::BTreeMap<String, PatternAttributeType<Compiled>>,
 }
 
 /// A genuinely rootless type owned by a validated pathless schema source.
@@ -1908,18 +1958,21 @@ pub struct RootlessType {
 
 impl RootlessType {
     #[cfg(test)]
-    pub(crate) fn new(root: AttributeType) -> Self {
+    pub(crate) fn new(root: CompiledAttributeType) -> Self {
         Self::with_defs(root, BTreeMap::new())
     }
 
     #[cfg(test)]
-    pub(crate) fn with_defs(root: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
+    pub(crate) fn with_defs(
+        root: CompiledAttributeType,
+        defs: BTreeMap<String, CompiledAttributeType>,
+    ) -> Self {
         Self {
             schema: Schema { root, defs },
         }
     }
 
-    fn from_validated_config_type(root: AttributeType) -> Self {
+    fn from_validated_config_type(root: PatternAttributeType<Compiled>) -> Self {
         Self {
             schema: Schema {
                 root,
@@ -2035,8 +2088,8 @@ impl RefResolutionFailure<'_> {
     }
 }
 
-struct RefPathResolution<'a> {
-    attr: &'a AttributeType,
+struct RefPathResolution<'a, R: PatternForm = Draft> {
+    attr: &'a PatternAttributeType<R>,
     restore_len: usize,
 }
 
@@ -2046,11 +2099,11 @@ struct RefPathResolution<'a> {
 /// All Ref walkers share this primitive. Callers deliberately map its three
 /// failures differently: schema validation returns a typed error, invariant
 /// walkers panic, and Union-member judgement treats them as no-match.
-fn resolve_refs_on_path<'a>(
-    attr: &'a AttributeType,
-    defs: &'a BTreeMap<String, AttributeType>,
+fn resolve_refs_on_path<'a, R: PatternForm>(
+    attr: &'a PatternAttributeType<R>,
+    defs: &'a BTreeMap<String, PatternAttributeType<R>>,
     visited_refs: &mut Vec<&'a str>,
-) -> Result<RefPathResolution<'a>, RefResolutionFailure<'a>> {
+) -> Result<RefPathResolution<'a, R>, RefResolutionFailure<'a>> {
     let restore_len = visited_refs.len();
     let mut current = attr;
     let mut chain_hops = 0;
@@ -2115,7 +2168,7 @@ impl Schema {
     /// must populate `defs`. Typical uses: unit-test fixtures, leaf
     /// validation, provider-config schemas that are known flat.
     #[cfg(test)]
-    pub(crate) fn flat(root: AttributeType) -> Self {
+    pub(crate) fn flat(root: PatternAttributeType<Compiled>) -> Self {
         Self {
             root,
             defs: std::collections::BTreeMap::new(),
@@ -2125,19 +2178,25 @@ impl Schema {
     /// Look up a named definition. Returns `None` if `name` is not in
     /// `defs`; callers should treat that as a type error.
     #[cfg(test)]
-    pub(crate) fn resolve(&self, name: &str) -> Option<&AttributeType> {
+    pub(crate) fn resolve(&self, name: &str) -> Option<&PatternAttributeType<Compiled>> {
         self.defs.get(name)
     }
 
     /// Resolve `ty` against this schema's definition map.
     #[cfg(test)]
-    pub(crate) fn resolve_of<'a>(&'a self, ty: &'a AttributeType) -> ResolvedAttrType<'a> {
+    pub(crate) fn resolve_of<'a>(
+        &'a self,
+        ty: &'a PatternAttributeType<Compiled>,
+    ) -> ResolvedAttrType<'a, Compiled> {
         ty.resolve_refs_with_defs(&self.defs)
     }
 
     /// Project `ty` onto a [`Shape`] using this schema's definition map.
     #[cfg(test)]
-    pub(crate) fn shape_of<'a>(&'a self, ty: &'a AttributeType) -> Shape<'a> {
+    pub(crate) fn shape_of<'a>(
+        &'a self,
+        ty: &'a PatternAttributeType<Compiled>,
+    ) -> Shape<'a, Compiled> {
         ty.shape_with_defs(&self.defs)
     }
 
@@ -2187,8 +2246,8 @@ impl Schema {
     }
 
     fn collect_attr_into<P: PlaceholderKind, B: BindingAddress>(
-        attr: &AttributeType,
-        defs: &BTreeMap<String, AttributeType>,
+        attr: &PatternAttributeType<Compiled>,
+        defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
         path: &FieldPath,
         value: &Value<P, B>,
         ancestry: FieldAncestry,
@@ -2218,8 +2277,8 @@ impl Schema {
     }
 
     fn collect_attr_into_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-        attr: &'a AttributeType,
-        defs: &'a BTreeMap<String, AttributeType>,
+        attr: &'a PatternAttributeType<Compiled>,
+        defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
         path: &FieldPath,
         value: &Value<P, B>,
         ancestry: FieldAncestry,
@@ -2512,7 +2571,7 @@ impl Schema {
     /// Validate one recursive child against this rootless schema's definitions.
     pub(crate) fn validate_attr<P: PlaceholderKind, B: BindingAddress>(
         &self,
-        attr: &AttributeType,
+        attr: &PatternAttributeType<Compiled>,
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
         validate_attr_with_defs(attr, value, &self.defs)
@@ -2520,17 +2579,17 @@ impl Schema {
 }
 
 fn validate_attr_with_defs<P: PlaceholderKind, B: BindingAddress>(
-    attr: &AttributeType,
+    attr: &PatternAttributeType<Compiled>,
     value: &Value<P, B>,
-    defs: &BTreeMap<String, AttributeType>,
+    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
 ) -> Result<(), TypeError> {
     validate_attr_with_defs_and_ancestry(attr, value, defs, FieldAncestry::WRITABLE)
 }
 
 pub(crate) fn validate_attr_with_defs_and_ancestry<P: PlaceholderKind, B: BindingAddress>(
-    attr: &AttributeType,
+    attr: &PatternAttributeType<Compiled>,
     value: &Value<P, B>,
-    defs: &BTreeMap<String, AttributeType>,
+    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
 ) -> Result<(), TypeError> {
     if fit_value_to_type_on_path(
@@ -2558,9 +2617,9 @@ pub(crate) fn validate_attr_with_defs_and_ancestry<P: PlaceholderKind, B: Bindin
 }
 
 fn validate_attr_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    attr: &'a AttributeType,
+    attr: &'a PatternAttributeType<Compiled>,
     value: &Value<P, B>,
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<(), TypeError> {
@@ -2590,9 +2649,9 @@ fn validate_attr_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
 /// success path: acceptance is exactly `fit.is_some()`, while the established
 /// shape-based Union error attribution remains unchanged.
 fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    attr: &'a AttributeType,
+    attr: &'a PatternAttributeType<Compiled>,
     value: &Value<P, B>,
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<(), TypeError> {
@@ -2782,19 +2841,19 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
     }
 }
 
-impl fmt::Debug for AttrTypeKind {
+impl<R: PatternForm> fmt::Debug for AttrTypeKind<R> {
     // Forward to AttributeType's Debug to keep one source of truth for
     // formatting. The wrapper is a transparent newtype-style struct,
     // so the rendered output is identical to the historical Debug.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Wrap in a transient AttributeType and dispatch through its
         // Debug impl.
-        let wrapped = AttributeType { kind: self.clone() };
+        let wrapped = PatternAttributeType { kind: self.clone() };
         fmt::Debug::fmt(&wrapped, f)
     }
 }
 
-impl fmt::Debug for AttributeType {
+impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
     // Hand-written so that `Custom.validate` (an `Arc<dyn Fn>`, which does
     // not implement `Debug`) can be rendered as a placeholder. Every other
     // variant matches what `#[derive(Debug)]` would produce.
@@ -2997,9 +3056,9 @@ impl fmt::Display for FieldPath {
 /// than panicking here. Shared by the ancestry-aware fit and diagnostic
 /// walkers so map-key validation cannot drift (carina#3347).
 pub(crate) fn lift_map_key<P: PlaceholderKind, B: BindingAddress>(
-    key_type: &AttributeType,
+    key_type: &PatternAttributeType<Compiled>,
     key: &str,
-    defs: &BTreeMap<String, AttributeType>,
+    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
 ) -> Value<P, B> {
     let mut visited_refs = Vec::new();
     let is_enum = resolve_refs_on_path(key_type, defs, &mut visited_refs)
@@ -3024,11 +3083,9 @@ pub(crate) fn lift_map_key<P: PlaceholderKind, B: BindingAddress>(
 /// to capture cyclic definitions; this constant is for sites that
 /// genuinely have no resource schema in scope (synthetic fixtures,
 /// validation helpers operating on a bare `AttributeType`).
-pub(crate) fn empty_defs_for_schema_walks()
--> &'static std::collections::BTreeMap<String, AttributeType> {
-    use std::sync::OnceLock;
-    static EMPTY: OnceLock<std::collections::BTreeMap<String, AttributeType>> = OnceLock::new();
-    EMPTY.get_or_init(std::collections::BTreeMap::new)
+pub(crate) fn empty_defs_for_schema_walks<R: PatternForm>()
+-> &'static BTreeMap<String, PatternAttributeType<R>> {
+    const { &BTreeMap::new() }
 }
 
 /// Whether this provider or persisted-state value represents absence.
@@ -3038,7 +3095,7 @@ pub(crate) fn empty_defs_for_schema_walks()
 /// Zero-field structs remain real marker values.
 pub(crate) fn reads_as_absent<H: PlaceholderKind, B: BindingAddress>(
     value: &Value<H, B>,
-    resolved_type: ResolvedAttrType<'_>,
+    resolved_type: ResolvedAttrType<'_, Compiled>,
 ) -> bool {
     matches!(value, Value::Concrete(ConcreteValue::Map(map)) if map.is_empty())
         && matches!(
@@ -3047,16 +3104,19 @@ pub(crate) fn reads_as_absent<H: PlaceholderKind, B: BindingAddress>(
         )
 }
 
-impl AttributeType {
+impl<R: PatternForm> PatternAttributeType<R> {
     /// Pair this type with the named definitions from its owning schema.
     ///
     /// Use the resulting [`TypeInSchema`] for cross-schema assignability so
     /// source and sink references are resolved against their respective maps.
-    /// Prefer [`ResourceSchema::type_in_schema`] when the owning resource
+    /// Prefer [`PatternResourceSchema::type_in_schema`] when the owning resource
     /// schema is available; this lower-level constructor is for separately
     /// derived contexts that carry a defs map explicitly. For schema-less,
     /// structurally Ref-free types, use [`TypeInSchema::schemaless`].
-    pub fn in_schema<'a>(&'a self, defs: &'a BTreeMap<String, AttributeType>) -> TypeInSchema<'a> {
+    pub fn in_schema<'a>(
+        &'a self,
+        defs: &'a BTreeMap<String, PatternAttributeType<R>>,
+    ) -> TypeInSchema<'a, R> {
         TypeInSchema { attr: self, defs }
     }
 
@@ -3080,8 +3140,8 @@ impl AttributeType {
     /// or wire-format bug, not user input.
     pub(crate) fn resolve_refs_with_defs<'a>(
         &'a self,
-        defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    ) -> ResolvedAttrType<'a> {
+        defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
+    ) -> ResolvedAttrType<'a, R> {
         let mut visited_refs = Vec::new();
         self.resolve_refs_with_defs_on_path(defs, &mut visited_refs)
     }
@@ -3090,9 +3150,9 @@ impl AttributeType {
     /// retaining its names for a subsequent non-consuming Union selection.
     pub(crate) fn resolve_refs_with_defs_on_path<'a>(
         &'a self,
-        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
         visited_refs: &mut Vec<&'a str>,
-    ) -> ResolvedAttrType<'a> {
+    ) -> ResolvedAttrType<'a, R> {
         match resolve_refs_on_path(self, defs, visited_refs) {
             Ok(resolution) => ResolvedAttrType::new_after_peel(resolution.attr),
             Err(failure) => panic_for_ref_resolution_failure(failure),
@@ -3104,9 +3164,9 @@ impl AttributeType {
     /// missing definitions and overlong chains retain invariant-panic semantics.
     pub(crate) fn resolve_refs_for_union_walk_on_path<'a>(
         &'a self,
-        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
         visited_refs: &mut Vec<&'a str>,
-    ) -> Option<ResolvedAttrType<'a>> {
+    ) -> Option<ResolvedAttrType<'a, R>> {
         match resolve_refs_on_path(self, defs, visited_refs) {
             Ok(resolution) => Some(ResolvedAttrType::new_after_peel(resolution.attr)),
             Err(RefResolutionFailure {
@@ -3136,15 +3196,15 @@ impl AttributeType {
     /// schema invariant as [`Self::resolve_refs_with_defs`]).
     pub(crate) fn shape_with_defs<'a>(
         &'a self,
-        defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    ) -> Shape<'a> {
+        defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
+    ) -> Shape<'a, R> {
         let resolved = self.resolve_refs_with_defs(defs).as_attr();
         Self::shape_from_resolved(resolved)
     }
 
     /// Project this type without a defs map. Returns an error instead
     /// of panicking if the top-level type is a schema-bound `Ref`.
-    pub fn shape_ref_free(&self) -> Result<Shape<'_>, RefEncountered> {
+    pub fn shape_ref_free(&self) -> Result<Shape<'_, R>, RefEncountered> {
         if let AttrTypeKind::Ref(name) = &self.kind {
             return Err(RefEncountered { name: name.clone() });
         }
@@ -3154,7 +3214,7 @@ impl AttributeType {
     pub fn struct_fields_ref_free_with_budget(
         &self,
         budget: &mut ShapeWalkBudget,
-    ) -> Result<Option<&[StructField]>, RefEncountered> {
+    ) -> Result<Option<&[PatternStructField<R>]>, RefEncountered> {
         if !budget.take() {
             return Ok(None);
         }
@@ -3170,7 +3230,7 @@ impl AttributeType {
     pub fn union_members_ref_free_with_budget(
         &self,
         budget: &mut ShapeWalkBudget,
-    ) -> Result<Option<UnionMembers<'_>>, RefEncountered> {
+    ) -> Result<Option<UnionMembers<'_, R>>, RefEncountered> {
         if !budget.take() {
             return Ok(None);
         }
@@ -3186,7 +3246,7 @@ impl AttributeType {
         )))
     }
 
-    fn shape_from_resolved(resolved: &AttributeType) -> Shape<'_> {
+    fn shape_from_resolved(resolved: &PatternAttributeType<R>) -> Shape<'_, R> {
         match &resolved.kind {
             AttrTypeKind::String {
                 binding,
@@ -3272,11 +3332,12 @@ impl AttributeType {
     /// acyclic schemas, flattening `Ref` discards the `defs` shape
     /// the receiver needs to reconstruct.
     ///
-    /// Walk-sites (differ, detail_rows, LSP, validation, ...) must
-    /// keep using [`Self::shape`] — `RawShape::Ref` is reachable here
+    /// Definition validation also uses this view before draft compilation.
+    /// Semantic walkers (differ, detail rows, LSP, value validation) use the
+    /// compiled [`EffectiveType::shape`] — `RawShape::Ref` is reachable here
     /// by design and a wildcard arm would silently re-introduce the
     /// carina#3349 bug class at the walk-site.
-    pub fn raw_shape<'a>(&'a self) -> RawShape<'a> {
+    pub fn raw_shape<'a>(&'a self) -> RawShape<'a, R> {
         match &self.kind {
             AttrTypeKind::String {
                 binding,
@@ -3358,13 +3419,13 @@ impl AttributeType {
     /// [`Self::shape`] (the `Ref`-peeled view); internal code that
     /// needs to dispatch on a `Ref`-bearing raw view uses this.
     #[inline]
-    pub(crate) fn kind(&self) -> &AttrTypeKind {
+    pub(crate) fn kind(&self) -> &AttrTypeKind<R> {
         &self.kind
     }
 
     /// Create the primitive `String` type.
     pub fn string() -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::String {
                 binding: RefinementBinding::MetadataOnly(None),
                 pattern: None,
@@ -3381,7 +3442,7 @@ impl AttributeType {
         provider: impl Into<String>,
         resource_type: impl Into<String>,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::ResourceHandle {
                 provider: provider.into(),
                 resource_type: resource_type.into(),
@@ -3392,7 +3453,7 @@ impl AttributeType {
     /// Lift a closed module string-literal type without widening away the
     /// distinction needed for resource-handle assignability.
     pub(crate) fn string_literal_set(values: Vec<String>) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::StringLiteralSet { values },
         }
     }
@@ -3400,11 +3461,11 @@ impl AttributeType {
     /// Create a String type with protocol-carried refinement metadata.
     pub fn refined_string(
         identity: Option<TypeIdentity>,
-        pattern: Option<String>,
+        pattern: Option<R::Pattern>,
         length: Option<(Option<u64>, Option<u64>)>,
         to_dsl: Option<DslTransform>,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::String {
                 binding: RefinementBinding::MetadataOnly(identity),
                 pattern,
@@ -3417,12 +3478,12 @@ impl AttributeType {
     /// Create a String type with refinement metadata and a custom validator.
     pub fn refined_string_with_validator(
         identity: TypeIdentity,
-        pattern: Option<String>,
+        pattern: Option<R::Pattern>,
         length: Option<(Option<u64>, Option<u64>)>,
         validate: CustomValidator,
         to_dsl: Option<DslTransform>,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::String {
                 binding: RefinementBinding::Validator {
                     identity,
@@ -3437,7 +3498,7 @@ impl AttributeType {
 
     /// Create the primitive `Int` type.
     pub fn int() -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Int {
                 binding: RefinementBinding::MetadataOnly(None),
                 range: None,
@@ -3450,7 +3511,7 @@ impl AttributeType {
         identity: Option<TypeIdentity>,
         range: Option<(Option<i64>, Option<i64>)>,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Int {
                 binding: RefinementBinding::MetadataOnly(identity),
                 range,
@@ -3464,7 +3525,7 @@ impl AttributeType {
         range: Option<(Option<i64>, Option<i64>)>,
         validate: CustomValidator,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Int {
                 binding: RefinementBinding::Validator {
                     identity,
@@ -3477,7 +3538,7 @@ impl AttributeType {
 
     /// Create the primitive `Float` type.
     pub fn float() -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Float {
                 binding: RefinementBinding::MetadataOnly(None),
                 range: None,
@@ -3490,7 +3551,7 @@ impl AttributeType {
         identity: Option<TypeIdentity>,
         range: Option<(Option<f64>, Option<f64>)>,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Float {
                 binding: RefinementBinding::MetadataOnly(identity),
                 range,
@@ -3504,7 +3565,7 @@ impl AttributeType {
         range: Option<(Option<f64>, Option<f64>)>,
         validate: CustomValidator,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Float {
                 binding: RefinementBinding::Validator {
                     identity,
@@ -3517,14 +3578,14 @@ impl AttributeType {
 
     /// Create the primitive `Bool` type.
     pub fn bool() -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Bool,
         }
     }
 
     /// Create the `Duration` primitive type.
     pub fn duration() -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Duration,
         }
     }
@@ -3580,7 +3641,7 @@ impl AttributeType {
     ) -> Self {
         Self::enum_with_base(
             identity,
-            AttributeType::string(),
+            Self::string(),
             values,
             dsl_aliases,
             validate,
@@ -3604,13 +3665,13 @@ impl AttributeType {
     /// applies directly; no host-process registry lookup is needed.
     pub fn enum_with_base(
         identity: TypeIdentity,
-        base: AttributeType,
+        base: PatternAttributeType<R>,
         values: Option<Vec<String>>,
         dsl_aliases: Vec<(String, String)>,
         validate: Option<CustomValidator>,
         to_dsl: Option<DslTransform>,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Enum {
                 identity,
                 base: Box::new(base),
@@ -3623,17 +3684,17 @@ impl AttributeType {
     }
 
     /// Create a `Struct` type.
-    pub fn struct_(name: impl Into<String>, fields: Vec<StructField>) -> Self {
+    pub fn struct_(name: impl Into<String>, fields: Vec<PatternStructField<R>>) -> Self {
         Self::struct_with_field_groups(name, fields, Vec::new())
     }
 
     /// Create a `Struct` type with declarative sibling-field constraints.
     pub fn struct_with_field_groups(
         name: impl Into<String>,
-        fields: Vec<StructField>,
+        fields: Vec<PatternStructField<R>>,
         field_groups: Vec<FieldGroup>,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Struct {
                 name: name.into(),
                 fields,
@@ -3643,8 +3704,8 @@ impl AttributeType {
     }
 
     /// Create a `Union` type from member types.
-    pub fn union(members: Vec<AttributeType>) -> Self {
-        AttributeType {
+    pub fn union(members: Vec<PatternAttributeType<R>>) -> Self {
+        PatternAttributeType {
             kind: AttrTypeKind::Union(UnionMemberTypes::new(members)),
         }
     }
@@ -3652,24 +3713,24 @@ impl AttributeType {
     /// Create a `Ref` type referencing a named definition in the
     /// enclosing resource or rootless definition map.
     pub fn ref_(name: impl Into<String>) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::Ref(name.into()),
         }
     }
 
     /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
-    pub fn list(inner: AttributeType) -> Self {
+    pub fn list(inner: PatternAttributeType<R>) -> Self {
         Self::refined_list(inner, true, None, ListElements::AllowDuplicates)
     }
 
     /// Create a List type with protocol-carried refinement metadata.
     pub fn refined_list(
-        element_type: AttributeType,
+        element_type: PatternAttributeType<R>,
         ordered: bool,
         length: Option<(Option<u64>, Option<u64>)>,
         elements: ListElements,
     ) -> Self {
-        AttributeType {
+        PatternAttributeType {
             kind: AttrTypeKind::List {
                 element_type: Box::new(element_type),
                 ordered,
@@ -3679,18 +3740,18 @@ impl AttributeType {
     }
 
     /// Create an unordered List type (insertionOrder=false).
-    pub fn unordered_list(inner: AttributeType) -> Self {
+    pub fn unordered_list(inner: PatternAttributeType<R>) -> Self {
         Self::refined_list(inner, false, None, ListElements::AllowDuplicates)
     }
 
     /// Create a Map type with unconstrained string keys.
-    pub fn map(value: AttributeType) -> Self {
-        Self::map_with_key(AttributeType::string(), value)
+    pub fn map(value: PatternAttributeType<R>) -> Self {
+        Self::map_with_key(Self::string(), value)
     }
 
     /// Create a Map type with a typed key constraint.
-    pub fn map_with_key(key: AttributeType, value: AttributeType) -> Self {
-        AttributeType {
+    pub fn map_with_key(key: PatternAttributeType<R>, value: PatternAttributeType<R>) -> Self {
+        PatternAttributeType {
             kind: AttrTypeKind::Map {
                 key: Box::new(key),
                 value: Box::new(value),
@@ -3734,6 +3795,68 @@ impl AttributeType {
         }
     }
 
+    /// Return the display name of this type.
+    pub fn type_name(&self) -> String {
+        match &self.kind {
+            AttrTypeKind::Bool => "Bool".to_string(),
+            AttrTypeKind::Duration => "Duration".to_string(),
+            AttrTypeKind::Enum { identity, .. } => identity.to_string(),
+            AttrTypeKind::String {
+                binding,
+                pattern,
+                length,
+                ..
+            } => custom_display_name(binding.identity(), pattern.as_deref(), length.as_ref()),
+            AttrTypeKind::ResourceHandle {
+                provider,
+                resource_type,
+                ..
+            } => format!("{provider}.{resource_type}"),
+            AttrTypeKind::StringLiteralSet { values, .. } => values
+                .iter()
+                .map(|value| display_string_literal(value))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            AttrTypeKind::Int { binding, .. } => binding
+                .identity()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "Int".to_string()),
+            AttrTypeKind::Float { binding, .. } => binding
+                .identity()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "Float".to_string()),
+            AttrTypeKind::List {
+                element_type: inner,
+                ..
+            } => format!("List<{}>", inner.type_name()),
+            AttrTypeKind::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
+            AttrTypeKind::Struct { name, .. } => format!("Struct({})", name),
+            AttrTypeKind::Union(types) => {
+                let names: Vec<String> =
+                    types.as_raw_slice().iter().map(|t| t.type_name()).collect();
+                names.join(" | ")
+            }
+            AttrTypeKind::Ref(name) => format!("Ref({name})"),
+        }
+    }
+
+    /// Check if this type is a String-based Custom type.
+    /// Used for cross-schema type compatibility: all String-based Custom types
+    /// are considered compatible with each other.
+    pub fn is_string_based_custom(&self) -> bool {
+        match &self.kind {
+            AttrTypeKind::String {
+                binding,
+                pattern,
+                length,
+                ..
+            } => binding.identity().is_some() || pattern.is_some() || length.is_some(),
+            _ => false,
+        }
+    }
+}
+
+impl PatternAttributeType<Compiled> {
     /// Check if a value conforms to this type.
     ///
     /// Top-level dispatcher (Phase 2 of RFC #2972):
@@ -3860,7 +3983,7 @@ impl AttributeType {
                 },
                 ConcreteValueRef::String(s),
             ) => {
-                validate_string_refinement(binding.identity(), pattern.as_deref(), *length, s)?;
+                validate_string_refinement(binding.identity(), pattern.as_ref(), *length, s)?;
                 binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
@@ -3936,7 +4059,7 @@ impl AttributeType {
             });
         }
         if let ConcreteValueRef::EnumIdentifier(raw) = value {
-            let enum_attr = AttributeType::enum_(
+            let enum_attr = CompiledAttributeType::enum_(
                 identity.clone(),
                 values.map(<[_]>::to_vec),
                 dsl_aliases.to_vec(),
@@ -4072,68 +4195,9 @@ impl AttributeType {
             })
         }
     }
-
-    pub fn type_name(&self) -> String {
-        match &self.kind {
-            AttrTypeKind::Bool => "Bool".to_string(),
-            AttrTypeKind::Duration => "Duration".to_string(),
-            AttrTypeKind::Enum { identity, .. } => identity.to_string(),
-            AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                ..
-            } => custom_display_name(binding.identity(), pattern.as_deref(), length.as_ref()),
-            AttrTypeKind::ResourceHandle {
-                provider,
-                resource_type,
-                ..
-            } => format!("{provider}.{resource_type}"),
-            AttrTypeKind::StringLiteralSet { values, .. } => values
-                .iter()
-                .map(|value| display_string_literal(value))
-                .collect::<Vec<_>>()
-                .join(" | "),
-            AttrTypeKind::Int { binding, .. } => binding
-                .identity()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "Int".to_string()),
-            AttrTypeKind::Float { binding, .. } => binding
-                .identity()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "Float".to_string()),
-            AttrTypeKind::List {
-                element_type: inner,
-                ..
-            } => format!("List<{}>", inner.type_name()),
-            AttrTypeKind::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
-            AttrTypeKind::Struct { name, .. } => format!("Struct({})", name),
-            AttrTypeKind::Union(types) => {
-                let names: Vec<String> =
-                    types.as_raw_slice().iter().map(|t| t.type_name()).collect();
-                names.join(" | ")
-            }
-            AttrTypeKind::Ref(name) => format!("Ref({name})"),
-        }
-    }
-
-    /// Check if this type is a String-based Custom type.
-    /// Used for cross-schema type compatibility: all String-based Custom types
-    /// are considered compatible with each other.
-    pub fn is_string_based_custom(&self) -> bool {
-        match &self.kind {
-            AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                ..
-            } => binding.identity().is_some() || pattern.is_some() || length.is_some(),
-            _ => false,
-        }
-    }
 }
 
-impl TypeInSchema<'_> {
+impl<R: PatternForm> TypeInSchema<'_, R> {
     /// Check if a value of this source type can be assigned to `sink`.
     /// Directional: narrowing source → wider sink is OK, but widening source →
     /// narrower sink is NG. Each side resolves references against the
@@ -4200,21 +4264,21 @@ impl TypeInSchema<'_> {
     /// differently refined source would re-introduce the silent-false-positive
     /// class that #2218 closed. Rule 10's no-evidence exception is limited to
     /// identity-less sinks and does not weaken those comparisons.
-    pub fn is_assignable_to(self, sink: TypeInSchema<'_>) -> bool {
+    pub fn is_assignable_to(self, sink: TypeInSchema<'_, R>) -> bool {
         let mut source_visited_refs = Vec::new();
         let mut sink_visited_refs = Vec::new();
         self.is_assignable_to_on_paths(sink, &mut source_visited_refs, &mut sink_visited_refs)
     }
 }
 
-impl<'source> TypeInSchema<'source> {
+impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// Pair a structurally Ref-free type with an empty definition context.
     ///
     /// Use this only when the type cannot contain [`AttrTypeKind::Ref`] at any
     /// depth, such as a type parsed from an exports annotation. A type derived
     /// from a resource schema must instead travel with that schema's defs via
-    /// [`ResourceSchema::type_in_schema`] or [`AttributeType::in_schema`].
-    pub fn schemaless(attr: &'source AttributeType) -> Self {
+    /// [`PatternResourceSchema::type_in_schema`] or [`PatternAttributeType::in_schema`].
+    pub fn schemaless(attr: &'source PatternAttributeType<R>) -> Self {
         attr.in_schema(empty_defs_for_schema_walks())
     }
 
@@ -4270,7 +4334,7 @@ impl<'source> TypeInSchema<'source> {
 
     fn is_assignable_to_on_paths<'sink>(
         self,
-        sink: TypeInSchema<'sink>,
+        sink: TypeInSchema<'sink, R>,
         source_visited_refs: &mut Vec<&'source str>,
         sink_visited_refs: &mut Vec<&'sink str>,
     ) -> bool {
@@ -4300,7 +4364,7 @@ impl<'source> TypeInSchema<'source> {
 
     fn is_assignable_to_resolved<'sink>(
         self,
-        sink: TypeInSchema<'sink>,
+        sink: TypeInSchema<'sink, R>,
         source_visited_refs: &mut Vec<&'source str>,
         sink_visited_refs: &mut Vec<&'sink str>,
     ) -> bool {
@@ -4679,14 +4743,13 @@ fn validation_error_message(err: TypeError) -> String {
 
 fn validate_string_refinement(
     identity: Option<&TypeIdentity>,
-    pattern: Option<&str>,
+    pattern: Option<&CompiledPattern>,
     length: Option<(Option<u64>, Option<u64>)>,
     s: &ValueString,
 ) -> Result<(), TypeError> {
     let type_name = identity.map(|id| id.kind.clone());
     if let Some(pattern) = pattern
-        && let Ok(re) = regex::Regex::new(pattern)
-        && !re.is_match(s.expose_plaintext())
+        && !pattern.is_match(s.expose_plaintext())
     {
         return Err(TypeError::PatternMismatch {
             value: s.into(),
@@ -4800,7 +4863,7 @@ impl Ord for FitExactness {
 /// validation or enum resolution a second time.
 pub(crate) struct Fit<'a> {
     exactness: FitExactness,
-    pub(crate) attr: ResolvedAttrType<'a>,
+    pub(crate) attr: ResolvedAttrType<'a, Compiled>,
     pub(crate) kind: FitKind<'a>,
 }
 
@@ -4821,7 +4884,7 @@ pub(crate) enum FitKind<'a> {
     Map(Vec<MapEntryFit<'a>>),
     Struct(Vec<Fit<'a>>),
     Union {
-        member: &'a AttributeType,
+        member: &'a CompiledAttributeType,
         fit: Box<Fit<'a>>,
     },
 }
@@ -4862,7 +4925,7 @@ impl KnownListElement {
     fn from_fit<P: PlaceholderKind, B: BindingAddress>(
         value: &Value<P, B>,
         fit: &Fit<'_>,
-        defs: &BTreeMap<String, AttributeType>,
+        defs: &BTreeMap<String, CompiledAttributeType>,
         purpose: CanonicalizationPurpose<'_>,
     ) -> Option<Self> {
         if crate::value::contains_secret(value) || value.contains_diagnostic_sensitive_string() {
@@ -4884,7 +4947,7 @@ impl ListConstraints {
     fn check<'schema, P, B, I>(
         self,
         items: I,
-        defs: &BTreeMap<String, AttributeType>,
+        defs: &BTreeMap<String, CompiledAttributeType>,
         ancestry: FieldAncestry,
         purpose: CanonicalizationPurpose<'_>,
         mut fit_item: impl FnMut(&Value<P, B>) -> Option<Fit<'schema>>,
@@ -4954,7 +5017,7 @@ impl ListConstraints {
 impl Fit<'_> {
     fn with_kind<'a>(
         exactness: FitExactness,
-        attr: &'a AttributeType,
+        attr: &'a CompiledAttributeType,
         kind: FitKind<'a>,
     ) -> Fit<'a> {
         Fit {
@@ -4986,7 +5049,7 @@ impl Ord for Fit<'_> {
 }
 
 struct UnionFit<'a> {
-    member: &'a AttributeType,
+    member: &'a CompiledAttributeType,
     fit: Fit<'a>,
 }
 
@@ -4996,9 +5059,9 @@ struct UnionFit<'a> {
 /// descent starts a fresh path because it consumes one value level, allowing a
 /// recursive schema to revisit the same definition for a child value.
 fn fit_value_to_type_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    attr: &'a AttributeType,
+    attr: &'a PatternAttributeType<Compiled>,
     value: &Value<P, B>,
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     visited_refs: &mut Vec<&'a str>,
@@ -5012,9 +5075,9 @@ fn fit_value_to_type_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
 }
 
 pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    attr: &'a AttributeType,
+    attr: &'a PatternAttributeType<Compiled>,
     value: &Value<P, B>,
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     visited_refs: &mut Vec<&'a str>,
@@ -5342,9 +5405,9 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
 }
 
 fn fit_union_members_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    members: &'a [AttributeType],
+    members: &'a [PatternAttributeType<Compiled>],
     value: &Value<P, B>,
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     visited_refs: &mut Vec<&'a str>,
@@ -5398,7 +5461,7 @@ struct RecognizedStructFields(IndexSet<String>);
 
 impl RecognizedStructFields {
     fn new<P: PlaceholderKind, B: BindingAddress>(
-        fields: &[StructField],
+        fields: &[CompiledStructField],
         map: &IndexMap<String, Value<P, B>>,
         ancestry: FieldAncestry,
     ) -> Self {
@@ -5471,9 +5534,9 @@ impl UnionMemberJudgement {
 /// declaration-order strict-max tie-break. Diagnostic selection preserves all
 /// co-maximal failures instead.
 fn union_member_judgement_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    member: &'a AttributeType,
+    member: &'a PatternAttributeType<Compiled>,
     value: ConcreteValueRef<'_, P, B>,
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> UnionMemberJudgement {
@@ -5591,7 +5654,7 @@ impl BestUnionMemberFailures {
     fn into_error<P: PlaceholderKind, B: BindingAddress>(
         self,
         value: ConcreteValueRef<'_, P, B>,
-        members: UnionMembers<'_>,
+        members: UnionMembers<'_, Compiled>,
         ancestry: FieldAncestry,
     ) -> TypeError {
         let BestUnionMemberFailures {
@@ -5700,7 +5763,7 @@ impl BestUnionMemberFailures {
 }
 
 fn describe_struct_union_members(
-    members: UnionMembers<'_>,
+    members: UnionMembers<'_, Compiled>,
     ancestry: FieldAncestry,
 ) -> Option<Vec<UnionStructAlternative>> {
     members
@@ -5740,17 +5803,17 @@ fn describe_struct_union_members(
 /// the same leaf error as a non-Union enum. It uses the established diagnostic
 /// rank and declaration-order tie break without turning shape into acceptance.
 pub(crate) fn closest_union_member_for_value_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    union: &'a AttributeType,
+    union: &'a PatternAttributeType<Compiled>,
     value: ConcreteValueRef<'_, P, B>,
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
-) -> Option<&'a AttributeType> {
+) -> Option<&'a CompiledAttributeType> {
     let AttrTypeKind::Union(members) = &union.kind else {
         return None;
     };
 
-    let mut best: Option<(UnionFailureRank, &'a AttributeType)> = None;
+    let mut best: Option<(UnionFailureRank, &'a CompiledAttributeType)> = None;
     for member in members.as_raw_slice() {
         let rank = union_member_judgement_on_path(member, value, defs, ancestry, visited_refs)
             .failure_rank;
@@ -5776,14 +5839,14 @@ pub(crate) fn closest_union_member_for_value_on_path<'a, P: PlaceholderKind, B: 
 /// routine. Canonicalization consumes the richer [`Fit`] witness directly, so
 /// it never has to select the member again.
 pub(crate) fn select_union_member_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    members: &'a [AttributeType],
+    members: &'a [PatternAttributeType<Compiled>],
     original: &Value<P, B>,
     value: ConcreteValueRef<'_, P, B>,
     expected: String,
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
-) -> Result<&'a AttributeType, TypeError> {
+) -> Result<&'a PatternAttributeType<Compiled>, TypeError> {
     if let Some(selected) = fit_union_members_on_path(
         members,
         original,
@@ -5853,10 +5916,10 @@ pub(crate) fn select_union_member_on_path<'a, P: PlaceholderKind, B: BindingAddr
 /// Fit, validation, diagnostics, and canonicalization all call this helper so
 /// accepted-key semantics cannot drift (#2214, #3877).
 pub(crate) fn struct_field_for_key<'a>(
-    fields: &'a [StructField],
+    fields: &'a [CompiledStructField],
     key: &str,
     ancestry: FieldAncestry,
-) -> Option<&'a StructField> {
+) -> Option<&'a CompiledStructField> {
     fields
         .iter()
         .rev()
@@ -5864,9 +5927,9 @@ pub(crate) fn struct_field_for_key<'a>(
 }
 
 fn struct_field_is_present<P: PlaceholderKind, B: BindingAddress>(
-    fields: &[StructField],
+    fields: &[CompiledStructField],
     map: &IndexMap<String, Value<P, B>>,
-    expected: &StructField,
+    expected: &CompiledStructField,
     ancestry: FieldAncestry,
 ) -> bool {
     map.keys().any(|key| {
@@ -5876,7 +5939,7 @@ fn struct_field_is_present<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn violated_struct_field_groups<'a, P: PlaceholderKind, B: BindingAddress>(
-    fields: &'a [StructField],
+    fields: &'a [CompiledStructField],
     field_groups: &'a [FieldGroup],
     map: &'a IndexMap<String, Value<P, B>>,
     ancestry: FieldAncestry,
@@ -5902,7 +5965,7 @@ fn violated_struct_field_groups<'a, P: PlaceholderKind, B: BindingAddress>(
 /// this gate before type-checking the field value, keeping writability policy
 /// and diagnostic precedence identical across the two walkers.
 fn validate_struct_field_assignment(
-    field: &StructField,
+    field: &CompiledStructField,
     input_name: &str,
     ancestry: FieldAncestry,
 ) -> Option<TypeError> {
@@ -5922,15 +5985,15 @@ fn validate_struct_field_assignment(
 /// schema-aware validators from acquiring different notions of a valid struct.
 fn validate_struct_fields<P: PlaceholderKind, B: BindingAddress, M, V>(
     struct_name: &str,
-    fields: &[StructField],
+    fields: &[CompiledStructField],
     map: &IndexMap<String, Value<P, B>>,
     ancestry: FieldAncestry,
     missing_required: M,
     mut validate_value: V,
 ) -> Result<(), TypeError>
 where
-    M: Fn(&StructField) -> TypeError,
-    V: FnMut(&str, &StructField, &Value<P, B>) -> Result<(), TypeError>,
+    M: Fn(&CompiledStructField) -> TypeError,
+    V: FnMut(&str, &CompiledStructField, &Value<P, B>) -> Result<(), TypeError>,
 {
     for field in fields {
         if ancestry.effective_input_mode(field).is_required()
@@ -6039,7 +6102,7 @@ fn i64_range_assignable_to_f64(
     sink_min <= source_min && source_max <= sink_max
 }
 
-impl fmt::Display for AttributeType {
+impl<R: PatternForm> fmt::Display for PatternAttributeType<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.type_name())
     }
@@ -7730,9 +7793,9 @@ impl CompletionValue {
 /// );
 /// ```
 #[derive(Debug, Clone)]
-pub struct AttributeSchema {
+pub struct PatternAttributeSchema<R: PatternForm = Draft> {
     pub(crate) name: String,
-    pub(crate) attr_type: AttributeType,
+    pub(crate) attr_type: PatternAttributeType<R>,
     /// Whether user input for this attribute is optional, required, or forbidden.
     pub(crate) input_mode: InputMode,
     pub(crate) default: Option<Value>,
@@ -7784,9 +7847,9 @@ pub struct AttributeSchema {
 /// This deliberately has no `#[non_exhaustive]`: conversion seams should
 /// destructure every field so additions become compile errors.
 #[derive(Debug, Clone, Copy)]
-pub struct AttributeSchemaParts<'a> {
+pub struct AttributeSchemaParts<'a, R: PatternForm = Draft> {
     pub name: &'a str,
-    pub attr_type: &'a AttributeType,
+    pub attr_type: &'a PatternAttributeType<R>,
     /// The declared top-level mode. Top-level attributes have no schema
     /// ancestor, so this is also their effective mode.
     pub declared_input_mode: InputMode,
@@ -7804,34 +7867,34 @@ pub struct AttributeSchemaParts<'a> {
 }
 
 /// Builder for an optional user-input attribute.
-pub struct OptionalAttributeSchemaBuilder {
-    attribute: AttributeSchema,
+pub struct OptionalAttributeSchemaBuilder<R: PatternForm = Draft> {
+    attribute: PatternAttributeSchema<R>,
 }
 
 /// Builder for a required user-input attribute.
-pub struct RequiredAttributeSchemaBuilder {
-    attribute: AttributeSchema,
+pub struct RequiredAttributeSchemaBuilder<R: PatternForm = Draft> {
+    attribute: PatternAttributeSchema<R>,
 }
 
 /// Builder for an optional create-only user-input attribute.
-pub struct CreateOnlyOptionalAttributeSchemaBuilder {
-    attribute: AttributeSchema,
+pub struct CreateOnlyOptionalAttributeSchemaBuilder<R: PatternForm = Draft> {
+    attribute: PatternAttributeSchema<R>,
 }
 
 /// Builder for a required create-only user-input attribute.
-pub struct CreateOnlyRequiredAttributeSchemaBuilder {
-    attribute: AttributeSchema,
+pub struct CreateOnlyRequiredAttributeSchemaBuilder<R: PatternForm = Draft> {
+    attribute: PatternAttributeSchema<R>,
 }
 
 /// Builder for a provider-populated attribute.
-pub struct ProviderPopulatedAttributeSchemaBuilder {
-    attribute: AttributeSchema,
+pub struct ProviderPopulatedAttributeSchemaBuilder<R: PatternForm = Draft> {
+    attribute: PatternAttributeSchema<R>,
 }
 
-impl AttributeSchema {
+impl<R: PatternForm> PatternAttributeSchema<R> {
     fn with_input_mode(
         name: impl Into<String>,
-        attr_type: AttributeType,
+        attr_type: PatternAttributeType<R>,
         input_mode: InputMode,
     ) -> Self {
         Self {
@@ -7854,8 +7917,8 @@ impl AttributeSchema {
 
     pub fn optional(
         name: impl Into<String>,
-        attr_type: AttributeType,
-    ) -> OptionalAttributeSchemaBuilder {
+        attr_type: PatternAttributeType<R>,
+    ) -> OptionalAttributeSchemaBuilder<R> {
         OptionalAttributeSchemaBuilder {
             attribute: Self::with_input_mode(name, attr_type, InputMode::Optional),
         }
@@ -7863,8 +7926,8 @@ impl AttributeSchema {
 
     pub fn required(
         name: impl Into<String>,
-        attr_type: AttributeType,
-    ) -> RequiredAttributeSchemaBuilder {
+        attr_type: PatternAttributeType<R>,
+    ) -> RequiredAttributeSchemaBuilder<R> {
         RequiredAttributeSchemaBuilder {
             attribute: Self::with_input_mode(name, attr_type, InputMode::Required),
         }
@@ -7872,14 +7935,14 @@ impl AttributeSchema {
 
     pub fn provider_populated(
         name: impl Into<String>,
-        attr_type: AttributeType,
-    ) -> ProviderPopulatedAttributeSchemaBuilder {
+        attr_type: PatternAttributeType<R>,
+    ) -> ProviderPopulatedAttributeSchemaBuilder<R> {
         ProviderPopulatedAttributeSchemaBuilder {
             attribute: Self::with_input_mode(name, attr_type, InputMode::ProviderPopulated),
         }
     }
 
-    pub fn parts(&self) -> AttributeSchemaParts<'_> {
+    pub fn parts(&self) -> AttributeSchemaParts<'_, R> {
         AttributeSchemaParts {
             name: &self.name,
             attr_type: &self.attr_type,
@@ -7902,7 +7965,7 @@ impl AttributeSchema {
         &self.name
     }
 
-    pub fn attr_type(&self) -> &AttributeType {
+    pub fn attr_type(&self) -> &PatternAttributeType<R> {
         &self.attr_type
     }
 
@@ -7974,7 +8037,7 @@ impl AttributeSchema {
 
 macro_rules! impl_user_input_attribute_builder {
     ($builder:ident) => {
-        impl $builder {
+        impl<R: PatternForm> $builder<R> {
             pub fn write_only(mut self) -> Self {
                 self.attribute.write_only = true;
                 self
@@ -8005,7 +8068,7 @@ macro_rules! impl_user_input_attribute_builder {
                 self
             }
 
-            pub fn build(self) -> AttributeSchema {
+            pub fn build(self) -> PatternAttributeSchema<R> {
                 self.attribute
             }
         }
@@ -8017,8 +8080,8 @@ impl_user_input_attribute_builder!(RequiredAttributeSchemaBuilder);
 impl_user_input_attribute_builder!(CreateOnlyOptionalAttributeSchemaBuilder);
 impl_user_input_attribute_builder!(CreateOnlyRequiredAttributeSchemaBuilder);
 
-impl OptionalAttributeSchemaBuilder {
-    pub fn create_only(mut self) -> CreateOnlyOptionalAttributeSchemaBuilder {
+impl<R: PatternForm> OptionalAttributeSchemaBuilder<R> {
+    pub fn create_only(mut self) -> CreateOnlyOptionalAttributeSchemaBuilder<R> {
         self.attribute.create_only = true;
         CreateOnlyOptionalAttributeSchemaBuilder {
             attribute: self.attribute,
@@ -8026,8 +8089,8 @@ impl OptionalAttributeSchemaBuilder {
     }
 }
 
-impl RequiredAttributeSchemaBuilder {
-    pub fn create_only(mut self) -> CreateOnlyRequiredAttributeSchemaBuilder {
+impl<R: PatternForm> RequiredAttributeSchemaBuilder<R> {
+    pub fn create_only(mut self) -> CreateOnlyRequiredAttributeSchemaBuilder<R> {
         self.attribute.create_only = true;
         CreateOnlyRequiredAttributeSchemaBuilder {
             attribute: self.attribute,
@@ -8037,7 +8100,7 @@ impl RequiredAttributeSchemaBuilder {
 
 macro_rules! impl_identity_attribute_builder {
     ($builder:ident) => {
-        impl $builder {
+        impl<R: PatternForm> $builder<R> {
             pub fn identity(mut self) -> Self {
                 self.attribute.identity_mode = IdentityMode::Required;
                 self
@@ -8049,14 +8112,14 @@ macro_rules! impl_identity_attribute_builder {
 impl_identity_attribute_builder!(CreateOnlyOptionalAttributeSchemaBuilder);
 impl_identity_attribute_builder!(CreateOnlyRequiredAttributeSchemaBuilder);
 
-impl CreateOnlyOptionalAttributeSchemaBuilder {
+impl<R: PatternForm> CreateOnlyOptionalAttributeSchemaBuilder<R> {
     pub fn identity_when_present(mut self) -> Self {
         self.attribute.identity_mode = IdentityMode::WhenPresent;
         self
     }
 }
 
-impl OptionalAttributeSchemaBuilder {
+impl<R: PatternForm> OptionalAttributeSchemaBuilder<R> {
     pub fn with_default(mut self, value: Value) -> Self {
         self.attribute.default = Some(value);
         self
@@ -8073,7 +8136,7 @@ impl OptionalAttributeSchemaBuilder {
     }
 }
 
-impl CreateOnlyOptionalAttributeSchemaBuilder {
+impl<R: PatternForm> CreateOnlyOptionalAttributeSchemaBuilder<R> {
     pub fn with_default(mut self, value: Value) -> Self {
         self.attribute.default = Some(value);
         self
@@ -8090,7 +8153,7 @@ impl CreateOnlyOptionalAttributeSchemaBuilder {
     }
 }
 
-impl ProviderPopulatedAttributeSchemaBuilder {
+impl<R: PatternForm> ProviderPopulatedAttributeSchemaBuilder<R> {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.attribute.description = Some(description.into());
         self
@@ -8106,7 +8169,7 @@ impl ProviderPopulatedAttributeSchemaBuilder {
         self
     }
 
-    pub fn build(self) -> AttributeSchema {
+    pub fn build(self) -> PatternAttributeSchema<R> {
         self.attribute
     }
 }
@@ -8147,20 +8210,20 @@ pub enum AttributePathTypeError {
     CannotTraverse { path: String, type_name: String },
 }
 
-pub(crate) fn struct_fields_with_defs<'a>(
-    attr_type: &'a AttributeType,
-    defs: &'a std::collections::BTreeMap<String, AttributeType>,
-) -> Option<&'a [StructField]> {
+pub(crate) fn struct_fields_with_defs<'a, R: PatternForm>(
+    attr_type: &'a PatternAttributeType<R>,
+    defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
+) -> Option<&'a [PatternStructField<R>]> {
     match attr_type.resolve_refs_with_defs(defs).as_attr().kind() {
         AttrTypeKind::Struct { fields, .. } => Some(fields.as_slice()),
         _ => None,
     }
 }
 
-pub(crate) fn union_members_with_defs<'a>(
-    attr_type: &'a AttributeType,
-    defs: &'a std::collections::BTreeMap<String, AttributeType>,
-) -> Option<UnionMembers<'a>> {
+pub(crate) fn union_members_with_defs<'a, R: PatternForm>(
+    attr_type: &'a PatternAttributeType<R>,
+    defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
+) -> Option<UnionMembers<'a, R>> {
     let mut visited_refs = Vec::new();
     match attr_type
         .resolve_refs_with_defs_on_path(defs, &mut visited_refs)
@@ -8243,9 +8306,9 @@ pub enum UniqueNameSpec {
 /// );
 /// ```
 #[derive(Debug, Clone)]
-pub struct ResourceSchema {
+pub struct PatternResourceSchema<R: PatternForm = Draft> {
     pub(crate) resource_type: String,
-    pub(crate) attributes: BTreeMap<String, AttributeSchema>,
+    pub(crate) attributes: BTreeMap<String, PatternAttributeSchema<R>>,
     duplicate_attributes: Vec<String>,
     pub(crate) description: Option<String>,
     /// Cross-attribute validation, including its fingerprintable source.
@@ -8281,7 +8344,7 @@ pub struct ResourceSchema {
     /// `Map(String, String)` blobs. Walk-sites that traverse
     /// `AttributeType` (differ, detail_rows, LSP) MUST consult `defs`
     /// to resolve `Ref` variants rather than fall through a wildcard.
-    pub(crate) defs: std::collections::BTreeMap<String, AttributeType>,
+    pub(crate) defs: std::collections::BTreeMap<String, PatternAttributeType<R>>,
 }
 
 /// Exhaustive read-only view of a [`ResourceSchema`].
@@ -8289,9 +8352,9 @@ pub struct ResourceSchema {
 /// This deliberately has no `#[non_exhaustive]`: conversion seams should
 /// destructure every field so additions become compile errors.
 #[derive(Debug, Clone, Copy)]
-pub struct ResourceSchemaParts<'a> {
+pub struct ResourceSchemaParts<'a, R: PatternForm = Draft> {
     pub resource_type: &'a str,
-    pub attributes: &'a BTreeMap<String, AttributeSchema>,
+    pub attributes: &'a BTreeMap<String, PatternAttributeSchema<R>>,
     pub description: Option<&'a str>,
     pub validation: &'a ResourceValidation,
     pub kind: SchemaKind,
@@ -8301,7 +8364,7 @@ pub struct ResourceSchemaParts<'a> {
     pub default_prevent_destroy: bool,
     pub default_wait_timeout: Option<std::time::Duration>,
     pub default_wait_interval: Option<std::time::Duration>,
-    pub defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    pub defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
 }
 
 /// Source of a resource's executable cross-attribute validation.
@@ -8373,6 +8436,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchemaDefinitionIssue {
+    pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
     path: String,
     message: String,
@@ -8384,6 +8448,16 @@ impl fmt::Display for SchemaDefinitionIssue {
     }
 }
 
+fn fmt_schema_issues(issues: &[SchemaDefinitionIssue], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    for (index, issue) in issues.iter().enumerate() {
+        if index != 0 {
+            f.write_str("; ")?;
+        }
+        fmt::Display::fmt(issue, f)?;
+    }
+    Ok(())
+}
+
 /// Error returned when a resource-schema draft fails whole-schema validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceSchemaValidationError {
@@ -8392,6 +8466,17 @@ pub struct ResourceSchemaValidationError {
 }
 
 impl ResourceSchemaValidationError {
+    pub fn pattern_errors(
+        &self,
+    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &PatternCompileError)> {
+        self.issues.iter().filter_map(|issue| {
+            issue
+                .pattern_error
+                .as_ref()
+                .map(|error| (&issue.location, error))
+        })
+    }
+
     /// Return the stable schema path and message for every rejected rule.
     pub fn issues(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
         self.issues
@@ -8412,13 +8497,7 @@ impl ResourceSchemaValidationError {
 impl fmt::Display for ResourceSchemaValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "resource schema `{}` is invalid: ", self.resource_type)?;
-        for (index, issue) in self.issues.iter().enumerate() {
-            if index != 0 {
-                f.write_str("; ")?;
-            }
-            issue.fmt(f)?;
-        }
-        Ok(())
+        fmt_schema_issues(&self.issues, f)
     }
 }
 
@@ -8431,6 +8510,17 @@ pub struct ConfigSchemaValidationError {
 }
 
 impl ConfigSchemaValidationError {
+    pub fn pattern_errors(
+        &self,
+    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &PatternCompileError)> {
+        self.issues.iter().filter_map(|issue| {
+            issue
+                .pattern_error
+                .as_ref()
+                .map(|error| (&issue.location, error))
+        })
+    }
+
     pub fn issues(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
         self.issues
             .iter()
@@ -8450,13 +8540,7 @@ impl ConfigSchemaValidationError {
 impl fmt::Display for ConfigSchemaValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("provider config schema is invalid: ")?;
-        for (index, issue) in self.issues.iter().enumerate() {
-            if index != 0 {
-                f.write_str("; ")?;
-            }
-            issue.fmt(f)?;
-        }
-        Ok(())
+        fmt_schema_issues(&self.issues, f)
     }
 }
 
@@ -8469,8 +8553,8 @@ impl std::error::Error for ConfigSchemaValidationError {}
 /// carries that effective mode into every nested [`EffectiveField`].
 #[derive(Debug, Clone)]
 pub struct EffectiveAttribute<'a> {
-    attribute: &'a AttributeSchema,
-    defs: &'a BTreeMap<String, AttributeType>,
+    attribute: &'a PatternAttributeSchema<Compiled>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     path: Vec<String>,
 }
 
@@ -8483,7 +8567,7 @@ impl<'a> EffectiveAttribute<'a> {
         &self.path
     }
 
-    pub fn field_type(&self) -> &'a AttributeType {
+    pub fn field_type(&self) -> &'a PatternAttributeType<Compiled> {
         &self.attribute.attr_type
     }
 
@@ -8583,8 +8667,8 @@ impl<'a> EffectiveAttribute<'a> {
 /// a nested field mode without first choosing the path that determines it.
 #[derive(Debug, Clone)]
 pub struct EffectiveField<'a> {
-    field: &'a StructField,
-    defs: &'a BTreeMap<String, AttributeType>,
+    field: &'a PatternStructField<Compiled>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     path: Vec<String>,
     ancestry: FieldAncestry,
 }
@@ -8598,7 +8682,7 @@ impl<'a> EffectiveField<'a> {
         &self.path
     }
 
-    pub fn field_type(&self) -> &'a AttributeType {
+    pub fn field_type(&self) -> &'a PatternAttributeType<Compiled> {
         &self.field.field_type
     }
 
@@ -8666,14 +8750,14 @@ impl<'a> EffectiveField<'a> {
 /// the mode context needed when the cursor next reaches a struct field.
 #[derive(Debug, Clone)]
 pub struct EffectiveType<'a> {
-    attr_type: &'a AttributeType,
-    defs: &'a BTreeMap<String, AttributeType>,
+    attr_type: &'a PatternAttributeType<Compiled>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     path: Vec<String>,
     field_ancestry: FieldAncestry,
 }
 
 impl<'a> EffectiveType<'a> {
-    pub fn as_type(&self) -> &'a AttributeType {
+    pub fn as_type(&self) -> &'a PatternAttributeType<Compiled> {
         self.attr_type
     }
 
@@ -8681,7 +8765,7 @@ impl<'a> EffectiveType<'a> {
         &self.path
     }
 
-    pub(crate) fn defs(&self) -> &'a BTreeMap<String, AttributeType> {
+    pub(crate) fn defs(&self) -> &'a BTreeMap<String, PatternAttributeType<Compiled>> {
         self.defs
     }
 
@@ -8689,7 +8773,7 @@ impl<'a> EffectiveType<'a> {
         self.field_ancestry
     }
 
-    pub fn shape(&self) -> Shape<'a> {
+    pub fn shape(&self) -> Shape<'a, Compiled> {
         self.attr_type.shape_with_defs(self.defs)
     }
 
@@ -8808,8 +8892,8 @@ impl<'a> EffectiveType<'a> {
 }
 
 fn type_contains_struct(
-    attr_type: &AttributeType,
-    defs: &BTreeMap<String, AttributeType>,
+    attr_type: &CompiledAttributeType,
+    defs: &BTreeMap<String, CompiledAttributeType>,
     budget: &mut ShapeWalkBudget,
 ) -> bool {
     if !budget.take() {
@@ -8839,8 +8923,8 @@ fn type_contains_struct(
 }
 
 fn collect_effective_field_candidates<'a>(
-    attr_type: &'a AttributeType,
-    defs: &'a BTreeMap<String, AttributeType>,
+    attr_type: &'a PatternAttributeType<Compiled>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     parent_path: &[String],
     ancestry: FieldAncestry,
     budget: &mut ShapeWalkBudget,
@@ -8920,7 +9004,7 @@ impl<'a> EffectiveSchemaNode<'a> {
         }
     }
 
-    pub fn field_type(&self) -> &'a AttributeType {
+    pub fn field_type(&self) -> &'a CompiledAttributeType {
         match self {
             Self::Attribute(attribute) => attribute.field_type(),
             Self::Field(field) => field.field_type(),
@@ -8999,16 +9083,16 @@ impl<'a> EffectiveSchemaNode<'a> {
 /// A resource schema that has passed every whole-schema rule.
 #[derive(Debug, Clone)]
 pub struct ValidatedResourceSchema {
-    schema: ResourceSchema,
+    schema: PatternResourceSchema<Compiled>,
     identity_paths: Vec<IdentityPath>,
 }
 
 impl ValidatedResourceSchema {
-    pub fn as_schema(&self) -> &ResourceSchema {
+    pub fn as_schema(&self) -> &PatternResourceSchema<Compiled> {
         &self.schema
     }
 
-    pub fn parts(&self) -> ResourceSchemaParts<'_> {
+    pub fn parts(&self) -> ResourceSchemaParts<'_, Compiled> {
         self.schema.parts()
     }
 
@@ -9023,7 +9107,7 @@ impl ValidatedResourceSchema {
 
     /// Iterate top-level attributes in canonical-name order.
     ///
-    /// [`ResourceSchema`] stores attributes in a [`BTreeMap`], so every
+    /// [`PatternResourceSchema<Compiled>`] stores attributes in a [`BTreeMap`], so every
     /// declaration, diagnostic, and completion walk gets the same order by
     /// construction.
     pub fn effective_attributes(&self) -> impl Iterator<Item = EffectiveAttribute<'_>> {
@@ -9242,46 +9326,68 @@ impl ValidatedResourceSchema {
     }
 }
 
+fn config_definition_issues(
+    attribute_types: &BTreeMap<String, PatternAttributeType<Draft>>,
+) -> Vec<SchemaDefinitionIssue> {
+    let defs = BTreeMap::new();
+    let mut issues = Vec::new();
+    let mut visited_definitions = HashSet::new();
+    let mut identified_kinds = HashMap::new();
+    for (name, attr_type) in attribute_types {
+        let location = SchemaValidationIssueLocation::Attribute(name.clone());
+        validate_type_definition(
+            attr_type,
+            &defs,
+            location.clone(),
+            Some(false),
+            &mut visited_definitions,
+            &mut issues,
+        );
+        validate_identified_scalar_kind_consistency(
+            attr_type,
+            location,
+            &mut identified_kinds,
+            &mut issues,
+        );
+    }
+    issues
+}
+
 /// Provider-config attribute types that have passed the shared graph validator.
 #[derive(Debug, Clone, Default)]
 pub struct ValidatedConfigSchema {
-    attribute_types: BTreeMap<String, AttributeType>,
+    attribute_types: BTreeMap<String, PatternAttributeType<Compiled>>,
 }
 
 impl ValidatedConfigSchema {
+    /// Admit provider-facing drafts, including an unannotated empty map.
     pub fn validate(
         attribute_types: BTreeMap<String, AttributeType>,
     ) -> Result<Self, ConfigSchemaValidationError> {
-        let defs = BTreeMap::new();
-        let mut issues = Vec::new();
-        let mut visited_definitions = HashSet::new();
-        let mut identified_kinds = HashMap::new();
-        for (name, attr_type) in &attribute_types {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
-            validate_type_definition(
-                attr_type,
-                &defs,
-                location.clone(),
-                Some(false),
-                &mut visited_definitions,
-                &mut issues,
-            );
-            validate_identified_scalar_kind_consistency(
-                attr_type,
-                location,
-                &mut identified_kinds,
-                &mut issues,
-            );
-        }
+        let mut issues = config_definition_issues(&attribute_types);
+        let attribute_types = compile_schema::compile_all(attribute_types, |(name, attr_type)| {
+            attr_type
+                .compile_patterns(
+                    SchemaValidationIssueLocation::Attribute(name.clone()),
+                    &mut issues,
+                )
+                .map(|attr_type| (name, attr_type))
+        });
+        Self::finish_validation(attribute_types, issues)
+    }
+
+    fn finish_validation(
+        attribute_types: Option<BTreeMap<String, CompiledAttributeType>>,
+        mut issues: Vec<SchemaDefinitionIssue>,
+    ) -> Result<Self, ConfigSchemaValidationError> {
         normalize_issues(&mut issues);
-        if issues.is_empty() {
-            Ok(Self { attribute_types })
-        } else {
-            Err(ConfigSchemaValidationError { issues })
+        match attribute_types {
+            Some(attribute_types) if issues.is_empty() => Ok(Self { attribute_types }),
+            _ => Err(ConfigSchemaValidationError { issues }),
         }
     }
 
-    pub fn parts(&self) -> &BTreeMap<String, AttributeType> {
+    pub fn parts(&self) -> &BTreeMap<String, PatternAttributeType<Compiled>> {
         &self.attribute_types
     }
 
@@ -9303,7 +9409,7 @@ impl ValidatedConfigSchema {
     /// standalone value validator/canonicalizer.
     ///
     /// There is deliberately no constructor that accepts an arbitrary
-    /// [`AttributeType`]: a type cloned from an [`EffectiveType`] must not be
+    /// [`PatternAttributeType<Compiled>`]: a type cloned from an [`EffectiveType`] must not be
     /// re-rooted and lose its resource-path ancestry.
     pub fn rootless_type(&self, name: &str) -> Option<RootlessType> {
         self.attribute_types
@@ -9491,13 +9597,13 @@ impl ValidatedProviderSchemaWitness {
         &self.reference_forms
     }
 
-    pub(crate) fn identified_declarations(&self) -> Vec<(TypeIdentity, AttributeType)> {
+    pub(crate) fn identified_declarations(&self) -> Vec<(TypeIdentity, CompiledAttributeType)> {
         identified_declarations_from_witnesses(&self.resources, &self.config)
     }
 }
 
 fn identified_declaration_kind(
-    attribute_type: &AttributeType,
+    attribute_type: &CompiledAttributeType,
 ) -> Option<IdentifiedDeclarationKind> {
     match attribute_type.raw_shape() {
         RawShape::String {
@@ -9562,7 +9668,9 @@ fn identified_declaration_kind(
     }
 }
 
-fn identified_declaration_scalar_kind(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
+fn identified_declaration_scalar_kind(
+    attribute_type: &CompiledAttributeType,
+) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
         RawShape::String {
             identity: Some(_identity),
@@ -9627,8 +9735,8 @@ fn identified_declaration_scalar_kind(attribute_type: &AttributeType) -> Option<
 }
 
 fn visit_identified_declarations(
-    attribute_type: &AttributeType,
-    visitor: &mut dyn FnMut(&TypeIdentity, &AttributeType),
+    attribute_type: &CompiledAttributeType,
+    visitor: &mut dyn FnMut(&TypeIdentity, &CompiledAttributeType),
 ) {
     match attribute_type.raw_shape() {
         RawShape::String {
@@ -9709,9 +9817,9 @@ fn visit_identified_declarations(
 pub(crate) fn identified_declarations_from_witnesses(
     resources: &[ValidatedResourceSchema],
     config: &ValidatedConfigSchema,
-) -> Vec<(TypeIdentity, AttributeType)> {
+) -> Vec<(TypeIdentity, PatternAttributeType<Compiled>)> {
     let mut declarations = Vec::new();
-    let mut collect = |identity: &TypeIdentity, attribute_type: &AttributeType| {
+    let mut collect = |identity: &TypeIdentity, attribute_type: &PatternAttributeType<Compiled>| {
         declarations.push((identity.clone(), attribute_type.clone()));
     };
     for schema in resources {
@@ -9743,6 +9851,7 @@ fn push_schema_issue(
     message: impl Into<String>,
 ) {
     issues.push(SchemaDefinitionIssue {
+        pattern_error: None,
         path: location.to_string(),
         location: location.clone(),
         message: message.into(),
@@ -9750,7 +9859,7 @@ fn push_schema_issue(
 }
 
 fn validate_identified_scalar_kind_consistency(
-    attribute_type: &AttributeType,
+    attribute_type: &PatternAttributeType<Draft>,
     location: SchemaValidationIssueLocation,
     seen: &mut HashMap<TypeIdentity, (RefinedScalarKind, SchemaValidationIssueLocation)>,
     issues: &mut Vec<SchemaDefinitionIssue>,
@@ -9915,7 +10024,9 @@ fn validate_identified_scalar_kind_consistency(
     }
 }
 
-fn scalar_kind_for_schema_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
+fn scalar_kind_for_schema_base<R: PatternForm>(
+    attribute_type: &PatternAttributeType<R>,
+) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
         RawShape::String { .. } => Some(RefinedScalarKind::String),
         RawShape::Int { .. } => Some(RefinedScalarKind::Int),
@@ -9932,7 +10043,7 @@ fn scalar_kind_for_schema_base(attribute_type: &AttributeType) -> Option<Refined
 }
 
 fn validate_attribute_mode(
-    attribute: &AttributeSchema,
+    attribute: &PatternAttributeSchema<Draft>,
     location: &SchemaValidationIssueLocation,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
@@ -10037,7 +10148,7 @@ fn validate_attribute_mode(
 }
 
 fn validate_struct_field_mode(
-    field: &StructField,
+    field: &PatternStructField<Draft>,
     location: &SchemaValidationIssueLocation,
     provider_populated_ancestor: Option<bool>,
     issues: &mut Vec<SchemaDefinitionIssue>,
@@ -10177,8 +10288,8 @@ fn validate_field_group_admission(
 }
 
 fn validate_type_definition(
-    attr_type: &AttributeType,
-    defs: &BTreeMap<String, AttributeType>,
+    attr_type: &PatternAttributeType<Draft>,
+    defs: &BTreeMap<String, PatternAttributeType<Draft>>,
     location: SchemaValidationIssueLocation,
     provider_populated_ancestor: Option<bool>,
     visited_definitions: &mut HashSet<(String, Option<bool>)>,
@@ -10532,7 +10643,9 @@ fn validate_tags_key_value(attributes: &HashMap<String, Value>) -> Result<(), Ve
 ///
 /// Keeping this selection in the schema layer gives state persistence and
 /// provider-value protection one definition of the schema-owned key set.
-pub fn schema_write_only_keys(schema: Option<&ResourceSchema>) -> HashSet<String> {
+pub fn schema_write_only_keys<R: PatternForm>(
+    schema: Option<&PatternResourceSchema<R>>,
+) -> HashSet<String> {
     schema
         .into_iter()
         .flat_map(|schema| schema.attributes.iter())
@@ -10548,9 +10661,9 @@ struct WriteOnlyTypeAnalysis {
     field_mode_conflict: bool,
 }
 
-fn type_write_only_analysis<'schema>(
-    attr_type: &'schema AttributeType,
-    defs: &'schema BTreeMap<String, AttributeType>,
+fn type_write_only_analysis<'schema, R: PatternForm>(
+    attr_type: &'schema PatternAttributeType<R>,
+    defs: &'schema BTreeMap<String, PatternAttributeType<R>>,
     ref_chain: &mut Vec<&'schema str>,
 ) -> WriteOnlyTypeAnalysis {
     match &attr_type.kind {
@@ -10650,9 +10763,9 @@ impl WriteOnlySchemaConflict {
     }
 }
 
-fn first_write_only_conflict_in(
-    attributes: &BTreeMap<String, AttributeSchema>,
-    defs: &BTreeMap<String, AttributeType>,
+fn first_write_only_conflict_in<R: PatternForm>(
+    attributes: &BTreeMap<String, PatternAttributeSchema<R>>,
+    defs: &BTreeMap<String, PatternAttributeType<R>>,
 ) -> Option<WriteOnlySchemaConflict> {
     attributes.iter().find_map(|(name, attribute)| {
         let analysis = type_write_only_analysis(&attribute.attr_type, defs, &mut Vec::new());
@@ -10690,9 +10803,9 @@ impl CreateOnlyTypeAnalysis {
     }
 }
 
-fn type_create_only_analysis<'schema>(
-    attr_type: &'schema AttributeType,
-    defs: &'schema BTreeMap<String, AttributeType>,
+fn type_create_only_analysis<'schema, R: PatternForm>(
+    attr_type: &'schema PatternAttributeType<R>,
+    defs: &'schema BTreeMap<String, PatternAttributeType<R>>,
     ref_chain: &mut Vec<&'schema str>,
 ) -> CreateOnlyTypeAnalysis {
     match &attr_type.kind {
@@ -10749,8 +10862,8 @@ fn type_create_only_analysis<'schema>(
 }
 
 fn validate_keyed_partial_update(
-    attribute: &AttributeSchema,
-    defs: &BTreeMap<String, AttributeType>,
+    attribute: &PatternAttributeSchema<Draft>,
+    defs: &BTreeMap<String, PatternAttributeType<Draft>>,
     location: &SchemaValidationIssueLocation,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
@@ -10758,7 +10871,13 @@ fn validate_keyed_partial_update(
         return;
     };
 
-    let Shape::List { element_type, .. } = attribute.attr_type.shape_with_defs(defs) else {
+    let list = resolve_refs_on_path(&attribute.attr_type, defs, &mut Vec::new());
+    let Some(AttrTypeKind::List {
+        element_type,
+        ordered: _ordered,
+        constraints: _constraints,
+    }) = list.ok().map(|resolved| &resolved.attr.kind)
+    else {
         push_schema_issue(
             issues,
             location,
@@ -10766,7 +10885,13 @@ fn validate_keyed_partial_update(
         );
         return;
     };
-    let Shape::Struct { name: struct_name } = element_type.shape_with_defs(defs) else {
+    let element = resolve_refs_on_path(element_type, defs, &mut Vec::new());
+    let Some(AttrTypeKind::Struct {
+        name: struct_name,
+        fields,
+        ..
+    }) = element.ok().map(|resolved| &resolved.attr.kind)
+    else {
         push_schema_issue(
             issues,
             location,
@@ -10774,8 +10899,6 @@ fn validate_keyed_partial_update(
         );
         return;
     };
-    let fields = struct_fields_with_defs(element_type, defs)
-        .expect("Shape::Struct must expose fields after reference resolution");
     let key_name = keyed.key_field.as_str();
     let Some(field) = fields.iter().find(|field| field.name == key_name) else {
         push_schema_issue(
@@ -10787,7 +10910,8 @@ fn validate_keyed_partial_update(
         );
         return;
     };
-    if !matches!(field.field_type.shape_with_defs(defs), Shape::String { .. }) {
+    let key = resolve_refs_on_path(&field.field_type, defs, &mut Vec::new());
+    if !key.is_ok_and(|resolved| matches!(resolved.attr.kind, AttrTypeKind::String { .. })) {
         push_schema_issue(
             issues,
             location,
@@ -10796,14 +10920,14 @@ fn validate_keyed_partial_update(
     }
 }
 
-fn project_write_only_leaves<'schema>(
-    attr_type: &'schema AttributeType,
+fn project_write_only_leaves<'schema, R: PatternForm>(
+    attr_type: &'schema PatternAttributeType<R>,
     value: &Value,
-    defs: &'schema BTreeMap<String, AttributeType>,
+    defs: &'schema BTreeMap<String, PatternAttributeType<R>>,
     path: &mut Vec<LeafPathSegment>,
     ref_chain: &mut Vec<&'schema str>,
     inherited_secret: bool,
-    leaves: &mut Vec<(LeafPath, Value, &'schema AttributeType)>,
+    leaves: &mut Vec<(LeafPath, Value, &'schema PatternAttributeType<R>)>,
 ) {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         project_write_only_leaves(attr_type, inner, defs, path, ref_chain, true, leaves);
@@ -10921,9 +11045,9 @@ fn project_write_only_leaves<'schema>(
 }
 
 fn strip_write_only_leaves_from_value<'schema>(
-    attr_type: &'schema AttributeType,
+    attr_type: &'schema CompiledAttributeType,
     value: &Value,
-    defs: &'schema BTreeMap<String, AttributeType>,
+    defs: &'schema BTreeMap<String, CompiledAttributeType>,
     ref_chain: &mut Vec<&'schema str>,
 ) -> Value {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
@@ -11074,7 +11198,7 @@ fn run_resource_validator(
     }
 }
 
-impl ResourceSchema {
+impl<R: PatternForm> PatternResourceSchema<R> {
     pub fn new(resource_type: impl Into<String>) -> Self {
         Self {
             resource_type: resource_type.into(),
@@ -11093,166 +11217,7 @@ impl ResourceSchema {
         }
     }
 
-    /// Validate the complete schema graph and produce the only resource
-    /// schema type accepted at admission boundaries.
-    pub fn validate(mut self) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
-        let mut issues = Vec::new();
-        let mut visited_definitions = HashSet::new();
-        let mut identified_kinds = HashMap::new();
-        let mut identity_paths = Vec::new();
-
-        if self.kind == SchemaKind::DataSource && self.default_prevent_destroy {
-            push_schema_issue(
-                &mut issues,
-                &SchemaValidationIssueLocation::DefaultPreventDestroy,
-                "data-source schemas cannot set `default_prevent_destroy`".to_string(),
-            );
-        }
-
-        for name in &self.duplicate_attributes {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
-            push_schema_issue(
-                &mut issues,
-                &location,
-                format!("duplicate top-level attribute name `{name}`"),
-            );
-        }
-
-        for (name, attribute) in &self.attributes {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
-            validate_attribute_mode(attribute, &location, &mut issues);
-            if attribute.identity_mode.is_identity()
-                && identity_leaf_is_scalar_or_enum(
-                    &attribute.attr_type,
-                    &self.defs,
-                    &mut Vec::new(),
-                ) == Some(false)
-            {
-                push_schema_issue(
-                    &mut issues,
-                    &location,
-                    "identity value must have a scalar or enum type",
-                );
-            }
-            validate_keyed_partial_update(attribute, &self.defs, &location, &mut issues);
-            if let Some(default) = &attribute.default {
-                validate_portable_default(default, location.clone(), &mut issues);
-            }
-            validate_type_definition(
-                &attribute.attr_type,
-                &self.defs,
-                location.clone(),
-                Some(attribute.input_mode.is_provider_populated()),
-                &mut visited_definitions,
-                &mut issues,
-            );
-            validate_identified_scalar_kind_consistency(
-                &attribute.attr_type,
-                location.clone(),
-                &mut identified_kinds,
-                &mut issues,
-            );
-            let path = IdentityPath::attribute(name.clone());
-            if attribute.identity_mode.is_identity() {
-                identity_paths.push(path.clone());
-            }
-            let mut identity_path_collection = IdentityPathCollection {
-                ref_stack: Vec::new(),
-                paths: &mut identity_paths,
-                issues: &mut issues,
-            };
-            collect_identity_paths_in_type(
-                &attribute.attr_type,
-                &self.defs,
-                &path,
-                location,
-                true,
-                &mut identity_path_collection,
-            );
-        }
-
-        for (name, definition) in &self.defs {
-            validate_identified_scalar_kind_consistency(
-                definition,
-                SchemaValidationIssueLocation::Definition(name.clone()),
-                &mut identified_kinds,
-                &mut issues,
-            );
-            if !visited_definitions.insert((name.clone(), None)) {
-                continue;
-            }
-            validate_type_definition(
-                definition,
-                &self.defs,
-                SchemaValidationIssueLocation::Definition(name.clone()),
-                None,
-                &mut visited_definitions,
-                &mut issues,
-            );
-        }
-
-        validate_field_group_admission(
-            &self.field_groups,
-            "attribute",
-            SchemaValidationIssueLocation::FieldGroup,
-            |name| {
-                self.attributes
-                    .get(name)
-                    .map(|attribute| FieldGroupMemberAdmission {
-                        input_mode: attribute.input_mode,
-                        has_default: attribute.default.is_some(),
-                    })
-            },
-            &mut issues,
-        );
-
-        if let UniqueNameSpec::Attribute(name) = &self.unique_name
-            && !self.attributes.contains_key(name)
-        {
-            let location = SchemaValidationIssueLocation::UniqueName;
-            push_schema_issue(
-                &mut issues,
-                &location,
-                format!("unique name names unknown attribute `{name}`"),
-            );
-        }
-
-        if let Some(conflict) = self.first_write_only_conflict() {
-            let location =
-                SchemaValidationIssueLocation::Attribute(conflict.attribute().to_string());
-            push_schema_issue(&mut issues, &location, conflict.message());
-        }
-
-        if let Some((name, _)) = self.attributes.iter().find(|(_, attribute)| {
-            type_create_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new())
-                .union_conflict
-        }) {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
-            push_schema_issue(
-                &mut issues,
-                &location,
-                "union members cannot be create-only-bearing",
-            );
-        }
-
-        normalize_issues(&mut issues);
-        if issues.is_empty() {
-            self.duplicate_attributes.clear();
-            identity_paths.sort();
-            identity_paths.dedup();
-            Ok(ValidatedResourceSchema {
-                schema: self,
-                identity_paths,
-            })
-        } else {
-            Err(ResourceSchemaValidationError {
-                resource_type: self.resource_type.clone(),
-                issues,
-            })
-        }
-    }
-
-    pub fn parts(&self) -> ResourceSchemaParts<'_> {
+    pub fn parts(&self) -> ResourceSchemaParts<'_, R> {
         ResourceSchemaParts {
             resource_type: &self.resource_type,
             attributes: &self.attributes,
@@ -11273,7 +11238,7 @@ impl ResourceSchema {
         &self.resource_type
     }
 
-    pub fn attributes(&self) -> &BTreeMap<String, AttributeSchema> {
+    pub fn attributes(&self) -> &BTreeMap<String, PatternAttributeSchema<R>> {
         &self.attributes
     }
 
@@ -11315,7 +11280,7 @@ impl ResourceSchema {
         self.default_wait_interval
     }
 
-    pub fn defs(&self) -> &std::collections::BTreeMap<String, AttributeType> {
+    pub fn defs(&self) -> &std::collections::BTreeMap<String, PatternAttributeType<R>> {
         &self.defs
     }
 
@@ -11325,7 +11290,7 @@ impl ResourceSchema {
     /// (WAFv2 `WebACL.Statement`, AppSync `GraphQLApi`, ...). Each
     /// `Ref(name)` inside this resource's attribute types is resolved
     /// against this map.
-    pub fn with_def(mut self, name: impl Into<String>, ty: AttributeType) -> Self {
+    pub fn with_def(mut self, name: impl Into<String>, ty: PatternAttributeType<R>) -> Self {
         self.defs.insert(name.into(), ty);
         self
     }
@@ -11342,7 +11307,7 @@ impl ResourceSchema {
         self
     }
 
-    pub fn attribute(mut self, schema: AttributeSchema) -> Self {
+    pub fn attribute(mut self, schema: PatternAttributeSchema<R>) -> Self {
         if self.attributes.contains_key(&schema.name) {
             self.duplicate_attributes.push(schema.name.clone());
         } else {
@@ -11363,162 +11328,6 @@ impl ResourceSchema {
             type_write_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new())
                 .contains_write_only
         })
-    }
-
-    /// Project the write-only fields that exist in one desired attribute value.
-    ///
-    /// Paths are derived from the desired value, including concrete list
-    /// indices and map keys. The field type accompanies each value so callers
-    /// can use the normal type-aware and secret-hash comparison path.
-    pub fn write_only_leaf_projection<'schema>(
-        &'schema self,
-        key: &str,
-        value: &Value,
-    ) -> Vec<(LeafPath, Value, &'schema AttributeType)> {
-        let Some(attribute) = self.attributes.get(key) else {
-            return Vec::new();
-        };
-        let mut leaves = Vec::new();
-        project_write_only_leaves(
-            &attribute.attr_type,
-            value,
-            &self.defs,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            false,
-            &mut leaves,
-        );
-        leaves.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
-        leaves
-    }
-
-    pub(crate) fn strip_write_only_leaves(&self, key: &str, value: &Value) -> Value {
-        self.attributes.get(key).map_or_else(
-            || value.clone(),
-            |attribute| {
-                strip_write_only_leaves_from_value(
-                    &attribute.attr_type,
-                    value,
-                    &self.defs,
-                    &mut Vec::new(),
-                )
-            },
-        )
-    }
-
-    /// Pair an attribute or derived subtype with this resource's definitions.
-    ///
-    /// Prefer this over [`AttributeType::in_schema`] whenever the owning
-    /// resource schema is in hand so the attribute cannot accidentally be
-    /// paired with another resource's same-shaped defs map.
-    pub fn type_in_schema<'a>(&'a self, attr: &'a AttributeType) -> TypeInSchema<'a> {
-        attr.in_schema(&self.defs)
-    }
-
-    /// Resolve `ty` against this resource schema's definition map.
-    pub fn resolve_of<'a>(&'a self, ty: &'a AttributeType) -> ResolvedAttrType<'a> {
-        ty.resolve_refs_with_defs(&self.defs)
-    }
-
-    /// Project `ty` onto a [`Shape`] using this resource schema's
-    /// definition map.
-    pub fn shape_of<'a>(&'a self, ty: &'a AttributeType) -> Shape<'a> {
-        ty.shape_with_defs(&self.defs)
-    }
-
-    pub fn struct_fields_with_budget<'a>(
-        &'a self,
-        ty: &'a AttributeType,
-        budget: &mut ShapeWalkBudget,
-    ) -> Option<&'a [StructField]> {
-        if !budget.take() {
-            return None;
-        }
-        struct_fields_with_defs(ty, &self.defs)
-    }
-
-    pub fn union_members_with_budget<'a>(
-        &'a self,
-        ty: &'a AttributeType,
-        budget: &mut ShapeWalkBudget,
-    ) -> Option<UnionMembers<'a>> {
-        if !budget.take() {
-            return None;
-        }
-        union_members_with_defs(ty, &self.defs)
-    }
-
-    /// Return the valid API values for a top-level Enum attribute
-    /// referenced by a namespaced DSL alias.
-    ///
-    /// This intentionally does not walk into `Struct` fields. Enum alias
-    /// resolution already dispatches with the user-visible attribute name:
-    /// list items keep the same name and map values use the map key as the
-    /// next name. Looking up that top-level attribute and peeling only
-    /// transparent wrappers keeps recursive schemas (for example WAFv2
-    /// `Statement`) out of the alias hot path.
-    pub fn enum_valid_values_for_attr_alias(&self, attr_name: &str, input: &str) -> Vec<String> {
-        let Some(attr_schema) = self.attributes.get(attr_name) else {
-            return Vec::new();
-        };
-
-        let mut out = Vec::new();
-        self.append_enum_values_from_top_level_attr_type(&attr_schema.attr_type, input, &mut out);
-        out
-    }
-
-    fn append_enum_values_from_top_level_attr_type(
-        &self,
-        attr_type: &AttributeType,
-        input: &str,
-        out: &mut Vec<String>,
-    ) {
-        match self.shape_of(attr_type) {
-            Shape::Enum {
-                identity, values, ..
-            } => {
-                let identity_matches =
-                    enum_identity_matches_input(input, &identity.kind, Some(identity));
-                for value in values.into_iter().flatten().filter(|_| identity_matches) {
-                    if !out.contains(value) {
-                        out.push(value.clone());
-                    }
-                }
-            }
-            Shape::List {
-                element_type: inner,
-                ..
-            } => {
-                self.append_enum_values_from_top_level_attr_type(inner, input, out);
-            }
-            Shape::Map { value, .. } => {
-                self.append_enum_values_from_top_level_attr_type(value, input, out);
-            }
-            Shape::Union => {
-                if let Some(members) = self.union_members_of(attr_type) {
-                    for member in members.iter().flatten() {
-                        self.append_enum_values_from_top_level_attr_type(
-                            member.as_attr(),
-                            input,
-                            out,
-                        );
-                    }
-                }
-            }
-            Shape::String { .. }
-            | Shape::Int { .. }
-            | Shape::Float { .. }
-            | Shape::Bool
-            | Shape::Duration
-            | Shape::Struct { .. } => {}
-        }
-    }
-
-    pub(crate) fn union_members_of<'a>(
-        &'a self,
-        ty: &'a AttributeType,
-    ) -> Option<UnionMembers<'a>> {
-        union_members_with_defs(ty, &self.defs)
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
@@ -11656,263 +11465,6 @@ impl ResourceSchema {
             .map(|(name, _)| name.as_str())
             .collect()
     }
-
-    /// Validate resource attributes.
-    ///
-    /// This variant does not have origin information for string values, so
-    /// it cannot distinguish a user-typed `target_type = "aaa"` from a
-    /// bare-identifier `target_type = aaa` — both surface as
-    /// `InvalidEnumVariant`. Call `validate_with_origins` when the caller
-    /// knows which attributes were written as quoted string literals
-    /// (see #2094).
-    #[cfg(test)]
-    fn validate_values(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(attributes, &|_attr_name| false, no_lookup())
-    }
-
-    /// Validate resource attributes, reshaping enum-variant errors into
-    /// `StringLiteralExpectedEnum` for attributes whose value was written
-    /// in the source as a quoted string literal.
-    ///
-    /// `is_string_literal` answers "was this top-level attribute on the
-    /// current resource written as `attr = \"...\"`?". A `true` response
-    /// upgrades any `InvalidEnumVariant` for that attribute into
-    /// `StringLiteralExpectedEnum` so the error message describes the
-    /// form mismatch instead of asking the user to match a list of
-    /// variants. Non-enum errors are passed through unchanged.
-    #[cfg(test)]
-    fn validate_values_with_origins(
-        &self,
-        attributes: &HashMap<String, Value>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-    ) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(attributes, is_string_literal, no_lookup())
-    }
-
-    /// As [`validate_with_origins`], but also runs `lookup` on every
-    /// refined primitive identity reached during traversal so
-    /// provider-supplied validators that the schema itself cannot
-    /// carry (WASM plugin path) still get to reject bad values.
-    fn validate_values_with_origins_and_lookup<P: PlaceholderKind, B: BindingAddress>(
-        &self,
-        attributes: &HashMap<String, Value<P, B>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(attributes, is_string_literal, lookup)
-    }
-
-    /// Validate constraints on values that are currently known.
-    ///
-    /// Unlike the full validation entry point, this method
-    /// deliberately omits shape-of-resource checks that were already made
-    /// when the source was expanded: required attributes, unknown
-    /// attributes, provider-populated attributes, and field groups. It is
-    /// intended for a later resolution boundary, where a value
-    /// that was deferred during expansion may have become concrete.
-    ///
-    /// Deferred leaves are ignored while concrete siblings in the same
-    /// collection are still checked. The resource validator is re-run because
-    /// it may express cross-attribute value constraints.
-    fn validate_known_values_with_origins_and_lookup(
-        &self,
-        attributes: &HashMap<String, Value>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        let mut errors = self.validate_value_entries(
-            attributes,
-            is_string_literal,
-            lookup,
-            ValueEntryValidation::KnownWritableOnly,
-            None,
-        );
-
-        if let Some(validator) = self.validator()
-            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
-        {
-            errors.append(&mut validation_errors);
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// Validate only the attributes whose values became known at the current
-    /// resolution boundary.
-    ///
-    /// `attributes` is still the complete authored-value view so a resource
-    /// validator can evaluate cross-attribute rules. Per-attribute schema and
-    /// provider custom-type checks are restricted to `selected`; every other
-    /// value was checked at an earlier boundary and may now be in a normalized
-    /// representation that intentionally differs from the authored form.
-    fn validate_selected_known_values_with_origins_and_lookup(
-        &self,
-        attributes: &HashMap<String, Value>,
-        selected: &HashSet<String>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        let mut errors = self.validate_value_entries(
-            attributes,
-            is_string_literal,
-            lookup,
-            ValueEntryValidation::KnownWritableOnly,
-            Some(selected),
-        );
-
-        if !selected.is_empty()
-            && let Some(validator) = self.validator()
-            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
-        {
-            errors.append(&mut validation_errors);
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    fn validate_inner<P: PlaceholderKind, B: BindingAddress>(
-        &self,
-        attributes: &HashMap<String, Value<P, B>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        let mut errors = Vec::new();
-
-        // Check required attributes
-        for (name, schema) in &self.attributes {
-            if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
-                errors.push(TypeError::MissingRequired { name: name.clone() });
-            }
-        }
-
-        errors.extend(self.validate_value_entries(
-            attributes,
-            is_string_literal,
-            lookup,
-            ValueEntryValidation::FullInput,
-            None,
-        ));
-
-        for group in &self.field_groups {
-            let present = group
-                .fields()
-                .iter()
-                .filter(|name| attributes.contains_key(name.as_str()))
-                .count();
-            if !group.is_satisfied_by_count(present) {
-                errors.push(TypeError::FieldGroupViolation {
-                    path: FieldPath::new(),
-                    group: group.clone(),
-                });
-            }
-        }
-
-        // Run custom validator if present
-        if let Some(validator) = self.validator()
-            && let Some(attributes) = attributes_without_placeholders(attributes)
-            && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
-        {
-            errors.append(&mut validation_errors);
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    fn validate_value_entries<P: PlaceholderKind, B: BindingAddress>(
-        &self,
-        attributes: &HashMap<String, Value<P, B>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-        mode: ValueEntryValidation,
-        selected: Option<&HashSet<String>>,
-    ) -> Vec<TypeError> {
-        let mut errors = Vec::new();
-
-        // Build block_name -> canonical_name map for alias resolution
-        let bn_map = self.block_name_map();
-
-        // Build suggestion candidates (canonical names + block name aliases)
-        let mut known: Vec<&str> = self.attributes.keys().map(|s| s.as_str()).collect();
-        for bn in bn_map.keys() {
-            known.push(bn.as_str());
-        }
-
-        // Type check each attribute and reject unknown ones
-        for (name, value) in attributes {
-            if selected.is_some_and(|selected| !selected.contains(name)) {
-                continue;
-            }
-
-            // Resolve block_name alias to canonical name
-            let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
-
-            if let Some(schema) = self.attributes.get(canonical) {
-                let effective_attribute = EffectiveAttribute {
-                    attribute: schema,
-                    defs: &self.defs,
-                    path: vec![schema.name.clone()],
-                };
-                // `read_only` attributes are provider-populated, so accepting a user
-                // value would silently drop it. Reject before type checking so the
-                // diagnostic reports writability instead of a confusing type error.
-                if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
-                    errors.push(TypeError::ReadOnlyAttribute { name: name.clone() });
-                    continue;
-                }
-
-                if let Err(e) = effective_attribute.validate(value) {
-                    // Tag the error with the attribute name the user actually
-                    // wrote (which may be a block-name alias), so diagnostics
-                    // point back at a token that appears in their source.
-                    let tagged = e.with_attribute(name);
-                    // Other schema shapes may use custom validators that return
-                    // `InvalidEnumVariant`; quoted-form reshaping belongs only
-                    // to an Enum attribute.
-                    let reshaped = if is_string_literal(name.as_str())
-                        && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
-                    {
-                        tagged.into_string_literal_diagnostic()
-                    } else {
-                        tagged
-                    };
-                    errors.push(reshaped);
-                }
-                walk_custom_lookup(
-                    &schema.attr_type,
-                    value,
-                    Some(name),
-                    lookup,
-                    &self.defs,
-                    &mut errors,
-                );
-            } else if mode == ValueEntryValidation::FullInput {
-                let id_attribute = format!("{name}_id");
-                let suggestion = if known.contains(&id_attribute.as_str()) {
-                    Some(id_attribute)
-                } else {
-                    suggest_similar_name(name, &known)
-                };
-                errors.push(TypeError::UnknownAttribute {
-                    name: name.clone(),
-                    suggestion,
-                });
-            }
-        }
-
-        errors
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -11945,8 +11497,8 @@ pub fn collect_all_block_names(registry: &SchemaRegistry) -> HashMap<String, Str
 }
 
 fn collect_block_names_from_type(
-    attr_type: &AttributeType,
-    defs: &BTreeMap<String, AttributeType>,
+    attr_type: &CompiledAttributeType,
+    defs: &BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
     visited_definitions: &mut HashSet<(String, FieldAncestry)>,
     result: &mut HashMap<String, String>,
@@ -12044,7 +11596,7 @@ impl fmt::Display for BlockNameConflict {
 struct BlockFieldRef<'a> {
     name: &'a str,
     block_name: Option<&'a str>,
-    field_type: &'a AttributeType,
+    field_type: &'a CompiledAttributeType,
     child_ancestry: FieldAncestry,
 }
 
@@ -12066,7 +11618,7 @@ fn match_block_field<'a, P: PlaceholderKind, B: BindingAddress>(
     key: &str,
     value: &Value<P, B>,
     fields: &[BlockFieldRef<'a>],
-    defs: &BTreeMap<String, AttributeType>,
+    defs: &BTreeMap<String, CompiledAttributeType>,
 ) -> Option<BlockFieldMatch<'a>> {
     let canonical = fields.iter().copied().find(|field| field.name == key);
     let alias = fields
@@ -12113,7 +11665,7 @@ fn value_for_field<'a, P: PlaceholderKind, B: BindingAddress>(
     map: &'a IndexMap<String, Value<P, B>>,
     field: BlockFieldRef<'_>,
     fields: &[BlockFieldRef<'_>],
-    defs: &BTreeMap<String, AttributeType>,
+    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
 ) -> Option<&'a Value<P, B>> {
     if let Some(value) = map.get(field.name) {
         return Some(value);
@@ -12186,7 +11738,7 @@ fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: Binding
 fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: BindingAddress>(
     value: &mut Value<P, B>,
     authored_value: Option<&Value<P, AB>>,
-    attr_type: &AttributeType,
+    attr_type: &PatternAttributeType<Compiled>,
     ancestry: FieldAncestry,
     context: BlockNameResolutionContext<'_>,
     path: &str,
@@ -12267,11 +11819,11 @@ fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: Bindi
 
 #[derive(Clone, Copy)]
 struct BlockNameResolutionContext<'a> {
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
     resource_id: &'a str,
 }
 
-fn block_fields(schema: &ResourceSchema) -> Vec<BlockFieldRef<'_>> {
+fn block_fields(schema: &CompiledResourceSchema) -> Vec<BlockFieldRef<'_>> {
     schema
         .attributes
         .values()
@@ -12288,7 +11840,7 @@ fn resolve_attribute_block_names<P: PlaceholderKind, B: BindingAddress>(
     resource_id: &ResourceId,
     attributes: &mut IndexMap<String, Value<P, B>>,
     authored_attributes: Option<&IndexMap<String, Value<P, B>>>,
-    schema: &ResourceSchema,
+    schema: &CompiledResourceSchema,
 ) -> Vec<BlockNameConflict> {
     let fields = block_fields(schema);
     let mut conflicts = Vec::new();
@@ -12315,7 +11867,7 @@ fn resolve_attribute_block_names_with_authored<
     resource_id: &ResourceId,
     attributes: &mut IndexMap<String, Value<P, B>>,
     authored_attributes: Option<&IndexMap<String, Value<P, AB>>>,
-    schema: &ResourceSchema,
+    schema: &CompiledResourceSchema,
 ) -> Vec<BlockNameConflict> {
     let fields = block_fields(schema);
     let mut conflicts = Vec::new();
@@ -12337,7 +11889,7 @@ fn resolve_attribute_block_names_with_authored<
 fn find_block_name_alias_in_map<P: PlaceholderKind, B: BindingAddress>(
     map: &IndexMap<String, Value<P, B>>,
     fields: &[BlockFieldRef<'_>],
-    defs: &BTreeMap<String, AttributeType>,
+    defs: &BTreeMap<String, CompiledAttributeType>,
     resource_id: &str,
     parent_path: &str,
 ) -> Option<BlockNameConflict> {
@@ -12372,8 +11924,8 @@ fn find_block_name_alias_in_map<P: PlaceholderKind, B: BindingAddress>(
 
 fn find_block_name_alias_in_value<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
-    attr_type: &AttributeType,
-    defs: &BTreeMap<String, AttributeType>,
+    attr_type: &PatternAttributeType<Compiled>,
+    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     resource_id: &str,
     path: &str,
@@ -12433,7 +11985,7 @@ fn find_block_name_alias_in_value<P: PlaceholderKind, B: BindingAddress>(
 /// normal schema validation.
 pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind, B: BindingAddress>(
     resource: &Resource<S, P, B>,
-    schema: &ResourceSchema,
+    schema: &CompiledResourceSchema,
 ) -> Option<BlockNameConflict> {
     find_block_name_alias_in_map(
         &resource.attributes,
@@ -13894,6 +13446,600 @@ impl SchemaRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.managed.is_empty() && self.data_sources.is_empty()
+    }
+}
+
+impl PatternResourceSchema<Draft> {
+    fn validate_definition(&self, issues: &mut Vec<SchemaDefinitionIssue>) -> Vec<IdentityPath> {
+        let mut visited_definitions = HashSet::new();
+        let mut identified_kinds = HashMap::new();
+        let mut identity_paths = Vec::new();
+
+        if self.kind == SchemaKind::DataSource && self.default_prevent_destroy {
+            push_schema_issue(
+                issues,
+                &SchemaValidationIssueLocation::DefaultPreventDestroy,
+                "data-source schemas cannot set `default_prevent_destroy`".to_string(),
+            );
+        }
+
+        for name in &self.duplicate_attributes {
+            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            push_schema_issue(
+                issues,
+                &location,
+                format!("duplicate top-level attribute name `{name}`"),
+            );
+        }
+
+        for (name, attribute) in &self.attributes {
+            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            validate_attribute_mode(attribute, &location, issues);
+            if attribute.identity_mode.is_identity()
+                && identity_leaf_is_scalar_or_enum(
+                    &attribute.attr_type,
+                    &self.defs,
+                    &mut Vec::new(),
+                ) == Some(false)
+            {
+                push_schema_issue(
+                    issues,
+                    &location,
+                    "identity value must have a scalar or enum type",
+                );
+            }
+            validate_keyed_partial_update(attribute, &self.defs, &location, issues);
+            if let Some(default) = &attribute.default {
+                validate_portable_default(default, location.clone(), issues);
+            }
+            validate_type_definition(
+                &attribute.attr_type,
+                &self.defs,
+                location.clone(),
+                Some(attribute.input_mode.is_provider_populated()),
+                &mut visited_definitions,
+                issues,
+            );
+            validate_identified_scalar_kind_consistency(
+                &attribute.attr_type,
+                location.clone(),
+                &mut identified_kinds,
+                issues,
+            );
+            let path = IdentityPath::attribute(name.clone());
+            if attribute.identity_mode.is_identity() {
+                identity_paths.push(path.clone());
+            }
+            let mut identity_path_collection = IdentityPathCollection {
+                ref_stack: Vec::new(),
+                paths: &mut identity_paths,
+                issues,
+            };
+            collect_identity_paths_in_type(
+                &attribute.attr_type,
+                &self.defs,
+                &path,
+                location,
+                true,
+                &mut identity_path_collection,
+            );
+        }
+
+        for (name, definition) in &self.defs {
+            validate_identified_scalar_kind_consistency(
+                definition,
+                SchemaValidationIssueLocation::Definition(name.clone()),
+                &mut identified_kinds,
+                issues,
+            );
+            if !visited_definitions.insert((name.clone(), None)) {
+                continue;
+            }
+            validate_type_definition(
+                definition,
+                &self.defs,
+                SchemaValidationIssueLocation::Definition(name.clone()),
+                None,
+                &mut visited_definitions,
+                issues,
+            );
+        }
+
+        validate_field_group_admission(
+            &self.field_groups,
+            "attribute",
+            SchemaValidationIssueLocation::FieldGroup,
+            |name| {
+                self.attributes
+                    .get(name)
+                    .map(|attribute| FieldGroupMemberAdmission {
+                        input_mode: attribute.input_mode,
+                        has_default: attribute.default.is_some(),
+                    })
+            },
+            issues,
+        );
+
+        if let UniqueNameSpec::Attribute(name) = &self.unique_name
+            && !self.attributes.contains_key(name)
+        {
+            let location = SchemaValidationIssueLocation::UniqueName;
+            push_schema_issue(
+                issues,
+                &location,
+                format!("unique name names unknown attribute `{name}`"),
+            );
+        }
+
+        if let Some(conflict) = self.first_write_only_conflict() {
+            let location =
+                SchemaValidationIssueLocation::Attribute(conflict.attribute().to_string());
+            push_schema_issue(issues, &location, conflict.message());
+        }
+
+        if let Some((name, _)) = self.attributes.iter().find(|(_, attribute)| {
+            type_create_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new())
+                .union_conflict
+        }) {
+            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            push_schema_issue(
+                issues,
+                &location,
+                "union members cannot be create-only-bearing",
+            );
+        }
+
+        identity_paths.sort();
+        identity_paths.dedup();
+        identity_paths
+    }
+
+    /// Validate the complete draft graph and compile every string pattern.
+    pub fn validate(self) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
+        let mut issues = Vec::new();
+        let identity_paths = self.validate_definition(&mut issues);
+        let resource_type = self.resource_type.clone();
+        let schema = self.compile_patterns(&mut issues);
+        finish_resource_schema_validation(resource_type, schema, identity_paths, issues)
+    }
+}
+
+fn finish_resource_schema_validation(
+    resource_type: String,
+    schema: Option<CompiledResourceSchema>,
+    identity_paths: Vec<IdentityPath>,
+    mut issues: Vec<SchemaDefinitionIssue>,
+) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
+    normalize_issues(&mut issues);
+    match schema {
+        Some(mut schema) if issues.is_empty() => {
+            schema.duplicate_attributes.clear();
+            Ok(ValidatedResourceSchema {
+                schema,
+                identity_paths,
+            })
+        }
+        _ => Err(ResourceSchemaValidationError {
+            resource_type,
+            issues,
+        }),
+    }
+}
+
+impl<R: PatternForm> PatternResourceSchema<R> {
+    /// Project the write-only fields that exist in one desired attribute value.
+    ///
+    /// Paths are derived from the desired value, including concrete list
+    /// indices and map keys. The field type accompanies each value so callers
+    /// can use the normal type-aware and secret-hash comparison path.
+    pub fn write_only_leaf_projection<'schema>(
+        &'schema self,
+        key: &str,
+        value: &Value,
+    ) -> Vec<(LeafPath, Value, &'schema PatternAttributeType<R>)> {
+        let Some(attribute) = self.attributes.get(key) else {
+            return Vec::new();
+        };
+        let mut leaves = Vec::new();
+        project_write_only_leaves(
+            &attribute.attr_type,
+            value,
+            &self.defs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            false,
+            &mut leaves,
+        );
+        leaves.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+        leaves
+    }
+
+    /// Pair an attribute or derived subtype with this resource's definitions.
+    ///
+    /// Prefer this over [`PatternAttributeType::in_schema`] whenever the owning
+    /// resource schema is in hand so the attribute cannot accidentally be
+    /// paired with another resource's same-shaped defs map.
+    pub fn type_in_schema<'a>(&'a self, attr: &'a PatternAttributeType<R>) -> TypeInSchema<'a, R> {
+        attr.in_schema(&self.defs)
+    }
+
+    /// Resolve `ty` against this resource schema's definition map.
+    pub fn resolve_of<'a>(&'a self, ty: &'a PatternAttributeType<R>) -> ResolvedAttrType<'a, R> {
+        ty.resolve_refs_with_defs(&self.defs)
+    }
+
+    /// Project `ty` onto a [`Shape`] using this resource schema's
+    /// definition map.
+    pub fn shape_of<'a>(&'a self, ty: &'a PatternAttributeType<R>) -> Shape<'a, R> {
+        ty.shape_with_defs(&self.defs)
+    }
+
+    pub fn struct_fields_with_budget<'a>(
+        &'a self,
+        ty: &'a PatternAttributeType<R>,
+        budget: &mut ShapeWalkBudget,
+    ) -> Option<&'a [PatternStructField<R>]> {
+        if !budget.take() {
+            return None;
+        }
+        struct_fields_with_defs(ty, &self.defs)
+    }
+
+    pub fn union_members_with_budget<'a>(
+        &'a self,
+        ty: &'a PatternAttributeType<R>,
+        budget: &mut ShapeWalkBudget,
+    ) -> Option<UnionMembers<'a, R>> {
+        if !budget.take() {
+            return None;
+        }
+        union_members_with_defs(ty, &self.defs)
+    }
+
+    /// Return the valid API values for a top-level Enum attribute
+    /// referenced by a namespaced DSL alias.
+    ///
+    /// This intentionally does not walk into `Struct` fields. Enum alias
+    /// resolution already dispatches with the user-visible attribute name:
+    /// list items keep the same name and map values use the map key as the
+    /// next name. Looking up that top-level attribute and peeling only
+    /// transparent wrappers keeps recursive schemas (for example WAFv2
+    /// `Statement`) out of the alias hot path.
+    pub fn enum_valid_values_for_attr_alias(&self, attr_name: &str, input: &str) -> Vec<String> {
+        let Some(attr_schema) = self.attributes.get(attr_name) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        self.append_enum_values_from_top_level_attr_type(&attr_schema.attr_type, input, &mut out);
+        out
+    }
+
+    fn append_enum_values_from_top_level_attr_type(
+        &self,
+        attr_type: &PatternAttributeType<R>,
+        input: &str,
+        out: &mut Vec<String>,
+    ) {
+        match self.shape_of(attr_type) {
+            Shape::Enum {
+                identity, values, ..
+            } => {
+                let identity_matches =
+                    enum_identity_matches_input(input, &identity.kind, Some(identity));
+                for value in values.into_iter().flatten().filter(|_| identity_matches) {
+                    if !out.contains(value) {
+                        out.push(value.clone());
+                    }
+                }
+            }
+            Shape::List {
+                element_type: inner,
+                ..
+            } => {
+                self.append_enum_values_from_top_level_attr_type(inner, input, out);
+            }
+            Shape::Map { value, .. } => {
+                self.append_enum_values_from_top_level_attr_type(value, input, out);
+            }
+            Shape::Union => {
+                if let Some(members) = self.union_members_of(attr_type) {
+                    for member in members.iter().flatten() {
+                        self.append_enum_values_from_top_level_attr_type(
+                            member.as_attr(),
+                            input,
+                            out,
+                        );
+                    }
+                }
+            }
+            Shape::String { .. }
+            | Shape::Int { .. }
+            | Shape::Float { .. }
+            | Shape::Bool
+            | Shape::Duration
+            | Shape::Struct { .. } => {}
+        }
+    }
+
+    pub(crate) fn union_members_of<'a>(
+        &'a self,
+        ty: &'a PatternAttributeType<R>,
+    ) -> Option<UnionMembers<'a, R>> {
+        union_members_with_defs(ty, &self.defs)
+    }
+}
+
+impl PatternResourceSchema<Compiled> {
+    pub(crate) fn strip_write_only_leaves(&self, key: &str, value: &Value) -> Value {
+        self.attributes.get(key).map_or_else(
+            || value.clone(),
+            |attribute| {
+                strip_write_only_leaves_from_value(
+                    &attribute.attr_type,
+                    value,
+                    &self.defs,
+                    &mut Vec::new(),
+                )
+            },
+        )
+    }
+
+    /// Validate resource attributes.
+    ///
+    /// This variant does not have origin information for string values, so
+    /// it cannot distinguish a user-typed `target_type = "aaa"` from a
+    /// bare-identifier `target_type = aaa` — both surface as
+    /// `InvalidEnumVariant`. Call `validate_with_origins` when the caller
+    /// knows which attributes were written as quoted string literals
+    /// (see #2094).
+    #[cfg(test)]
+    fn validate_values(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        self.validate_inner(attributes, &|_attr_name| false, no_lookup())
+    }
+
+    /// Validate resource attributes, reshaping enum-variant errors into
+    /// `StringLiteralExpectedEnum` for attributes whose value was written
+    /// in the source as a quoted string literal.
+    ///
+    /// `is_string_literal` answers "was this top-level attribute on the
+    /// current resource written as `attr = \"...\"`?". A `true` response
+    /// upgrades any `InvalidEnumVariant` for that attribute into
+    /// `StringLiteralExpectedEnum` so the error message describes the
+    /// form mismatch instead of asking the user to match a list of
+    /// variants. Non-enum errors are passed through unchanged.
+    #[cfg(test)]
+    fn validate_values_with_origins(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+    ) -> Result<(), Vec<TypeError>> {
+        self.validate_inner(attributes, is_string_literal, no_lookup())
+    }
+
+    /// As [`validate_with_origins`], but also runs `lookup` on every
+    /// refined primitive identity reached during traversal so
+    /// provider-supplied validators that the schema itself cannot
+    /// carry (WASM plugin path) still get to reject bad values.
+    fn validate_values_with_origins_and_lookup<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        attributes: &HashMap<String, Value<P, B>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        self.validate_inner(attributes, is_string_literal, lookup)
+    }
+
+    /// Validate constraints on values that are currently known.
+    ///
+    /// Unlike the full validation entry point, this method
+    /// deliberately omits shape-of-resource checks that were already made
+    /// when the source was expanded: required attributes, unknown
+    /// attributes, provider-populated attributes, and field groups. It is
+    /// intended for a later resolution boundary, where a value
+    /// that was deferred during expansion may have become concrete.
+    ///
+    /// Deferred leaves are ignored while concrete siblings in the same
+    /// collection are still checked. The resource validator is re-run because
+    /// it may express cross-attribute value constraints.
+    fn validate_known_values_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        let mut errors = self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::KnownWritableOnly,
+            None,
+        );
+
+        if let Some(validator) = self.validator()
+            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
+        {
+            errors.append(&mut validation_errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate only the attributes whose values became known at the current
+    /// resolution boundary.
+    ///
+    /// `attributes` is still the complete authored-value view so a resource
+    /// validator can evaluate cross-attribute rules. Per-attribute schema and
+    /// provider custom-type checks are restricted to `selected`; every other
+    /// value was checked at an earlier boundary and may now be in a normalized
+    /// representation that intentionally differs from the authored form.
+    fn validate_selected_known_values_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        selected: &HashSet<String>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        let mut errors = self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::KnownWritableOnly,
+            Some(selected),
+        );
+
+        if !selected.is_empty()
+            && let Some(validator) = self.validator()
+            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
+        {
+            errors.append(&mut validation_errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn validate_inner<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        attributes: &HashMap<String, Value<P, B>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        let mut errors = Vec::new();
+
+        // Check required attributes
+        for (name, schema) in &self.attributes {
+            if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
+                errors.push(TypeError::MissingRequired { name: name.clone() });
+            }
+        }
+
+        errors.extend(self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::FullInput,
+            None,
+        ));
+
+        for group in &self.field_groups {
+            let present = group
+                .fields()
+                .iter()
+                .filter(|name| attributes.contains_key(name.as_str()))
+                .count();
+            if !group.is_satisfied_by_count(present) {
+                errors.push(TypeError::FieldGroupViolation {
+                    path: FieldPath::new(),
+                    group: group.clone(),
+                });
+            }
+        }
+
+        // Run custom validator if present
+        if let Some(validator) = self.validator()
+            && let Some(attributes) = attributes_without_placeholders(attributes)
+            && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
+        {
+            errors.append(&mut validation_errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn validate_value_entries<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        attributes: &HashMap<String, Value<P, B>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+        mode: ValueEntryValidation,
+        selected: Option<&HashSet<String>>,
+    ) -> Vec<TypeError> {
+        let mut errors = Vec::new();
+
+        // Build block_name -> canonical_name map for alias resolution
+        let bn_map = self.block_name_map();
+
+        // Build suggestion candidates (canonical names + block name aliases)
+        let mut known: Vec<&str> = self.attributes.keys().map(|s| s.as_str()).collect();
+        for bn in bn_map.keys() {
+            known.push(bn.as_str());
+        }
+
+        // Type check each attribute and reject unknown ones
+        for (name, value) in attributes {
+            if selected.is_some_and(|selected| !selected.contains(name)) {
+                continue;
+            }
+
+            // Resolve block_name alias to canonical name
+            let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
+
+            if let Some(schema) = self.attributes.get(canonical) {
+                let effective_attribute = EffectiveAttribute {
+                    attribute: schema,
+                    defs: &self.defs,
+                    path: vec![schema.name.clone()],
+                };
+                // `read_only` attributes are provider-populated, so accepting a user
+                // value would silently drop it. Reject before type checking so the
+                // diagnostic reports writability instead of a confusing type error.
+                if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
+                    errors.push(TypeError::ReadOnlyAttribute { name: name.clone() });
+                    continue;
+                }
+
+                if let Err(e) = effective_attribute.validate(value) {
+                    // Tag the error with the attribute name the user actually
+                    // wrote (which may be a block-name alias), so diagnostics
+                    // point back at a token that appears in their source.
+                    let tagged = e.with_attribute(name);
+                    // Other schema shapes may use custom validators that return
+                    // `InvalidEnumVariant`; quoted-form reshaping belongs only
+                    // to an Enum attribute.
+                    let reshaped = if is_string_literal(name.as_str())
+                        && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
+                    {
+                        tagged.into_string_literal_diagnostic()
+                    } else {
+                        tagged
+                    };
+                    errors.push(reshaped);
+                }
+                walk_custom_lookup(
+                    &schema.attr_type,
+                    value,
+                    Some(name),
+                    lookup,
+                    &self.defs,
+                    &mut errors,
+                );
+            } else if mode == ValueEntryValidation::FullInput {
+                let id_attribute = format!("{name}_id");
+                let suggestion = if known.contains(&id_attribute.as_str()) {
+                    Some(id_attribute)
+                } else {
+                    suggest_similar_name(name, &known)
+                };
+                errors.push(TypeError::UnknownAttribute {
+                    name: name.clone(),
+                    suggestion,
+                });
+            }
+        }
+
+        errors
     }
 }
 
