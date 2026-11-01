@@ -858,6 +858,111 @@ fn scalar_identity_registry() -> SchemaRegistry {
     registry
 }
 
+fn when_present_identity_registry() -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.optional_identity")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .identity_when_present()
+                    .build(),
+            )
+            .validate()
+            .expect("when-present identity schema fixture must be valid"),
+    );
+    registry
+}
+
+#[test]
+fn when_present_identity_absence_has_a_distinct_address_from_every_written_fixture() {
+    let registry = when_present_identity_registry();
+    let absent = Resource::pending_with_provider("mock", "test.optional_identity", None);
+    let mut empty = Resource::pending_with_provider("mock", "test.optional_identity", None);
+    empty.set_attr("name", concrete_string(""));
+    let mut marker_like = Resource::pending_with_provider("mock", "test.optional_identity", None);
+    marker_like.set_attr("name", concrete_string("Absent"));
+    let mut resources = vec![absent, empty, marker_like];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("absence and written values are complete, disjoint identity inputs");
+
+    let identities = resources
+        .iter()
+        .map(|resource| resource.id.identity_str().expect("computed address"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(identities.len(), resources.len());
+}
+
+#[test]
+fn nested_when_present_identity_distinguishes_an_absent_field_from_an_empty_string() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.nested_optional_identity")
+            .attribute(
+                AttributeSchema::required(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("name", AttributeType::string())
+                                .create_only()
+                                .identity_when_present()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("nested when-present identity schema fixture must be valid"),
+    );
+    let mut absent = Resource::pending_with_provider("mock", "test.nested_optional_identity", None);
+    absent.set_attr(
+        "settings",
+        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+    );
+    let mut empty = Resource::pending_with_provider("mock", "test.nested_optional_identity", None);
+    empty.set_attr(
+        "settings",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "name".to_string(),
+            concrete_string(""),
+        )]))),
+    );
+    let mut resources = vec![absent, empty];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("nested absence is a complete identity value");
+
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn written_unknown_when_present_identity_remains_incomplete() {
+    let registry = when_present_identity_registry();
+    let mut resource = Resource::pending_with_provider("mock", "test.optional_identity", None);
+    resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
+            PendingReRead::new(ReReadReason::NotFound),
+        ))),
+    );
+    let mut resources = vec![resource];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("a written unknown is not the same as an absent identity value");
+
+    assert!(matches!(
+        error,
+        AnonymousIdentityError::IncompleteDeclaredIdentity(_)
+    ));
+    assert!(resources[0].id.identity_str().is_none());
+}
+
 fn anonymous_identity_for_value(registry: &SchemaRegistry, value: Value) -> ResourceId {
     let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr("name", value);
@@ -3691,6 +3796,53 @@ fn reconcile_identity_declared_address_migration_matches_nested_state_identity()
     assert_eq!(
         resolved_move_identity_pairs(&moves),
         vec![(old_address.to_string(), destination)],
+    );
+}
+
+#[test]
+fn reconcile_when_present_absence_matches_only_a_state_row_with_the_attribute_absent() {
+    let registry = when_present_identity_registry();
+    let mut desired = vec![Resource::pending_with_provider(
+        "mock",
+        "test.optional_identity",
+        None,
+    )];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("absent when-present identity must produce a destination address");
+    let destination = desired[0].id.identity_str().unwrap().to_string();
+    let absent_row = "mock_test_optional_identity_11111111";
+    let written_row = "mock_test_optional_identity_22222222";
+    let state_entries = vec![
+        anonymous_state_entry(
+            &registry,
+            "mock",
+            "test.optional_identity",
+            absent_row,
+            None,
+            None,
+            std::iter::empty::<(&str, Value)>(),
+        ),
+        anonymous_state_entry(
+            &registry,
+            "mock",
+            "test.optional_identity",
+            written_row,
+            None,
+            None,
+            [("name", concrete_string(""))],
+        ),
+    ];
+
+    let moves = reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    );
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(absent_row.to_string(), destination)],
     );
 }
 

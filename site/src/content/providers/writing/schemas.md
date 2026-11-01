@@ -116,7 +116,7 @@ equal to a bare name.
 What the attributes declare:
 
 - `create_only` means the API cannot change the value in place, so a change replaces the resource.
-- `identity` marks an immutable scalar or enum value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Written values are schema-canonicalized; references and composite expressions over references and literals are hashed by their deterministic authored expressions. Generated-name literal prefixes and authored prefix expressions have separate hash kinds, and prefix expressions are also hashed by their deterministic authored spelling. An absent value or an expression containing an unknown or unavailable leaf requires the user to write it or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
+- `identity` marks an immutable scalar or enum value as part of the real-world object's natural key. `.identity()` uses required identity mode: omission makes identity incomplete even when the schema input is optional. An optional create-only builder also offers `.identity_when_present()`: omission contributes a dedicated absent marker, while a written value follows the same rules as required identity. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Written values are schema-canonicalized; references and composite expressions over references and literals are hashed by their deterministic authored expressions. Generated-name literal prefixes and authored prefix expressions have separate hash kinds, and prefix expressions are also hashed by their deterministic authored spelling. A written unknown, unavailable, placeholder, or secret is incomplete rather than absent and requires the user to write stable identity material or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
 - `with_default` gives the value the host assumes when the configuration leaves the attribute out.
 - `with_description` shows up in the editor and in the generated docs.
 
@@ -130,7 +130,7 @@ Every attribute and every struct field has one input mode, and the constructor p
 | `AttributeSchema::required` | `InputMode::Required` | must set the value |
 | `AttributeSchema::provider_populated` | `InputMode::ProviderPopulated` | cannot set the value; the provider returns it |
 
-The mode is chosen once, when the builder is created, and each constructor returns a different builder type that has only the methods that make sense for its mode. A provider-populated builder has no `create_only`, `identity`, `write_only` or `with_default`, because none of them mean anything for a value the user never writes. A user-input builder exposes `identity` only after `create_only`; this makes the rule that identity cannot change in place a compile-time invariant. Only the optional builder has `with_default`, `removable` and `non_removable`. Invalid combinations therefore do not compile instead of failing at provider load time:
+The mode is chosen once, when the builder is created, and each constructor returns a different builder type that has only the methods that make sense for its mode. A provider-populated builder has no `create_only`, `identity`, `identity_when_present`, `write_only` or `with_default`, because none of them mean anything for a value the user never writes. A user-input builder exposes `identity` only after `create_only`; this makes the rule that identity cannot change in place a compile-time invariant. Required and optional create-only builders both expose `identity`, but only the optional create-only builder exposes `identity_when_present`. Only the optional builder has `with_default`, `removable` and `non_removable`. Invalid combinations therefore do not compile instead of failing at provider load time:
 
 ```rust compile_fail
 use carina_plugin_sdk::core::schema::{AttributeSchema, AttributeType};
@@ -144,6 +144,15 @@ use carina_plugin_sdk::core::schema::{AttributeSchema, AttributeType};
 
 // Identity is unavailable until the field is known to be create-only.
 let _ = AttributeSchema::required("name", AttributeType::string()).identity();
+```
+
+```rust compile_fail
+use carina_plugin_sdk::core::schema::{AttributeSchema, AttributeType};
+
+// When-present identity is available only for optional create-only input.
+let _ = AttributeSchema::required("name", AttributeType::string())
+    .create_only()
+    .identity_when_present();
 ```
 
 Provider-populated attributes can still be marked `deferred_populate` when the API fills them in some time after create returns, such as a certificate's status. A downstream resource that reads such a value must then wait for it with a [wait expression](/reference/dsl/expressions/#wait-expression).
@@ -204,8 +213,9 @@ assert!(tier.is_required());
 ```
 
 `StructField` has the same `create_only` then `identity` typestate sequence as
-a top-level attribute. This is useful when the API's natural key lives inside
-a request object:
+a top-level attribute, including `identity_when_present` only on its optional
+create-only builder. This is useful when the API's natural key lives inside a
+request object:
 
 ```rust
 use carina_plugin_sdk::core::schema::{
@@ -221,7 +231,7 @@ let schema = ResourceSchema::new("budget")
                 vec![
                     StructField::optional("budget_name", AttributeType::string())
                         .create_only()
-                        .identity()
+                        .identity_when_present()
                         .build(),
                     StructField::required("time_unit", AttributeType::string()).build(),
                 ],
@@ -246,7 +256,8 @@ a scalar or enum. Lists, maps, structs, and unions cannot themselves be
 identity leaves, and a path cannot descend through a collection or union: those
 shapes do not select one singular value. Schema admission rejects such a
 declaration, including one received through WASM schema JSON. A
-provider-populated `StructField` exposes neither `create_only` nor `identity`.
+provider-populated `StructField` exposes neither `create_only`, `identity`, nor
+`identity_when_present`.
 
 Every identity component must be declared. For example, a DNS record key needs
 the hosted zone, record name, and record type; marking only the name can make
@@ -261,10 +272,15 @@ expressions whose leaves are authored references and literals. Carina hashes
 references and expressions, including expressions written through
 `<attribute>_prefix`, by their deterministic authored spelling rather than by a
 value that may resolve later. Literal prefixes, prefix expressions, ordinary
-identity expressions, and written values occupy distinct hash kinds. Only an
-absent identity value, an unknown or unavailable value, or an expression
-containing such a leaf cannot address an anonymous resource.
-A concrete module argument can.
+identity expressions, written values, and when-present absence occupy distinct
+hash kinds. An absent required-mode identity cannot address an anonymous
+resource. An absent when-present identity is complete and cannot collide with
+any written value, including `""`. A written unknown, unavailable, placeholder,
+secret, or an expression containing such a leaf remains incomplete rather than
+becoming absent. During address migration, desired when-present absence matches
+only a state row where the same attribute or field is absent; it does not match
+an empty string or another written value. A concrete module argument can supply
+a written identity value.
 
 Enum values in the DSL follow the snake_case convention. When the API spells a value differently, map it with `dsl_aliases` (pairs of API value and DSL spelling) or with a `DslTransform` in `to_dsl`, such as `DslTransform::HyphenToUnderscore` for values like `us-east-1`.
 
@@ -422,7 +438,7 @@ let schema = ResourceSchema::new("organizations.Account")
 Carina then rejects deletion and replacement unless the user writes the
 literal opt-out `directives { prevent_destroy = false }`. Resource schemas are
 unprotected by default, so use this builder only where deletion has unusually
-severe consequences. The required boolean is transported in protocol-v13
+severe consequences. The required boolean is transported in protocol-v14
 schema JSON; an older provider that omits it fails during schema loading.
 
 ## The validated schema
@@ -446,7 +462,7 @@ assert!(messages.iter().any(|message| message.contains("`missing`")));
 assert!(messages.iter().any(|message| message.contains("`also_missing`")));
 ```
 
-Among other things, `validate()` rejects duplicate attribute names, field groups that name unknown, provider-populated, required, or defaulted members at their own resource/struct level, duplicate field-group declarations, missing unique-name attributes, identity without create-only, non-scalar identity leaves, create-only fields below union members, defaults that cannot be sent over the wire, enum shapes the protocol cannot carry, and the write-only placements described above. Struct fields do not have a default API, so the defaulted-member rule currently applies only to resource attributes. Validating the schema while building it means a mistake shows up in the provider's own tests, not when a user loads the provider.
+Among other things, `validate()` rejects duplicate attribute names, field groups that name unknown, provider-populated, required, or defaulted members at their own resource/struct level, duplicate field-group declarations, missing unique-name attributes, identity without create-only, when-present identity on required or provider-populated input, non-scalar identity leaves, identity under collections or unions, create-only fields below union members, defaults that cannot be sent over the wire, enum shapes the protocol cannot carry, and the write-only placements described above. Struct fields do not have a default API, so the defaulted-member rule currently applies only to resource attributes. Validating the schema while building it means a mistake shows up in the provider's own tests, not when a user loads the provider.
 
 When a `Struct` is reached below a provider-populated attribute, that inherited output-only status does not invalidate field groups declared on the `Struct`. This lets one definition be reused at writable and output-only sites. Admission still rejects malformed groups, unknown members, duplicate groups, and members whose own declared mode is provider-populated or required; the host does not enforce the groups against user input on an output-only path because users cannot set that value.
 

@@ -68,7 +68,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-13 JSON.
+/// Failure while projecting validated SDK schemas onto version-14 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -171,7 +171,7 @@ impl ProviderSchemaCache {
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-13
+/// The validated provider schemas determine the scalar kind. The version-14
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
@@ -1671,9 +1671,9 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v13");
+            .expect_err("a validated schema must always be projectable to protocol v14");
 
-        assert!(error.to_string().contains("protocol v13"), "{error}");
+        assert!(error.to_string().contains("protocol v14"), "{error}");
     }
 
     #[test]

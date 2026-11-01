@@ -43,6 +43,18 @@ fn anonymous_loop_engine() -> DiagnosticEngine {
     );
     schemas.insert(
         "mock",
+        ResourceSchema::new("test.optional_identity")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .identity_when_present()
+                    .build(),
+            )
+            .validate()
+            .expect("when-present identity fixture schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
         ResourceSchema::new("test.composite_identity")
             .attribute(
                 AttributeSchema::optional("scope", AttributeType::string())
@@ -270,6 +282,42 @@ fn anonymous_secret_declared_identity_reports_the_shared_incomplete_error() {
             "Anonymous resource of type 'mock.test.identity' cannot derive an address because ",
             "identity value 'name' is not available as a written value or authored expression ",
             "at plan time. Write the identity value or give the resource a name with `let`.",
+        )
+    );
+}
+
+#[test]
+fn anonymous_absent_when_present_identity_matches_validate_and_is_complete() {
+    let diagnostics = analyze_anonymous_loop_source("mock.test.optional_identity {}\n");
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("not available as a written value or authored expression")),
+        "validate accepts absence for when-present identity, so the LSP must too: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn anonymous_written_unknown_when_present_identity_matches_validate_error() {
+    let source = concat!(
+        "mock.test.optional_identity {\n",
+        "  name = secret(\"known only at apply\")\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resource of type 'mock.test.optional_identity' cannot derive an address ",
+            "because identity value 'name' is not available as a written value or authored ",
+            "expression at plan time. Write the identity value or give the resource a name with ",
+            "`let`.",
         )
     );
 }

@@ -26,11 +26,11 @@ use carina_core::resource::{
 #[cfg(test)]
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeSchemaParts as CoreAttributeSchemaParts,
-    AttributeType as CoreAttributeType, InputMode as CoreInputMode,
-    ResourceSchema as CoreResourceSchema, ResourceSchemaParts as CoreResourceSchemaParts,
-    SchemaKind as CoreSchemaKind, SchemaRegistry as CoreSchemaRegistry,
-    StructField as CoreStructField, StructFieldParts as CoreStructFieldParts,
-    UniqueNameSpec as CoreUniqueNameSpec,
+    AttributeType as CoreAttributeType, IdentityMode as CoreIdentityMode,
+    InputMode as CoreInputMode, ResourceSchema as CoreResourceSchema,
+    ResourceSchemaParts as CoreResourceSchemaParts, SchemaKind as CoreSchemaKind,
+    SchemaRegistry as CoreSchemaRegistry, StructField as CoreStructField,
+    StructFieldParts as CoreStructFieldParts, UniqueNameSpec as CoreUniqueNameSpec,
 };
 use carina_core::schema::{
     ValidatedConfigSchema as CoreValidatedConfigSchema,
@@ -2386,7 +2386,7 @@ mod tests {
             block_name: None,
             provider_name: None,
             removable: None,
-            identity: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         }
     }
@@ -2653,7 +2653,7 @@ mod tests {
             read_only: true,
             write_only: false,
             create_only: false,
-            identity: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         };
 
@@ -2681,7 +2681,7 @@ mod tests {
             read_only: true,
             write_only: true,
             create_only: false,
-            identity: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         };
 
@@ -2745,7 +2745,7 @@ mod tests {
                     read_only: false,
                     write_only: false,
                     create_only: false,
-                    identity: false,
+                    identity: proto::IdentityMode::None,
                     deferred_populate: false,
                 }],
             },
@@ -2790,7 +2790,7 @@ mod tests {
                     read_only: false,
                     write_only: true,
                     create_only: false,
-                    identity: false,
+                    identity: proto::IdentityMode::None,
                     deferred_populate: false,
                 }],
             },
@@ -2859,7 +2859,7 @@ mod tests {
             read_only: true,
             write_only: false,
             create_only: false,
-            identity: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         };
         let destination = proto::StructField {
@@ -2876,7 +2876,7 @@ mod tests {
             read_only: false,
             write_only: false,
             create_only: false,
-            identity: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         };
         let metadata = proto_attr(
@@ -2919,7 +2919,7 @@ mod tests {
                     read_only: false,
                     write_only: true,
                     create_only: false,
-                    identity: false,
+                    identity: proto::IdentityMode::None,
                     deferred_populate: false,
                 }],
             },
@@ -2964,7 +2964,7 @@ mod tests {
                         read_only: false,
                         write_only: true,
                         create_only: false,
-                        identity: false,
+                        identity: proto::IdentityMode::None,
                         deferred_populate: false,
                     }],
                 },
@@ -3030,7 +3030,7 @@ mod tests {
                             read_only: false,
                             write_only: true,
                             create_only: false,
-                            identity: false,
+                            identity: proto::IdentityMode::None,
                             deferred_populate: false,
                         }],
                     },
@@ -3084,7 +3084,7 @@ mod tests {
             deferred_populate,
             write_only,
             create_only,
-            identity,
+            identity_mode,
         } = round_tripped_field.parts();
         assert_eq!(name, "provider_id");
         assert!(matches!(
@@ -3100,7 +3100,7 @@ mod tests {
         assert!(deferred_populate);
         assert!(!write_only);
         assert!(!create_only);
-        assert!(!identity);
+        assert_eq!(identity_mode, CoreIdentityMode::None);
 
         let write_only_field =
             CoreStructField::optional("client_secret", CoreAttributeType::string())
@@ -3127,10 +3127,13 @@ mod tests {
             .build();
         let wire = core_struct_field_to_proto_for_schema_round_trip(&identity_field);
         assert!(wire.create_only);
-        assert!(wire.identity);
+        assert_eq!(wire.identity, proto::IdentityMode::Required);
         let round_tripped = proto_struct_field_to_core(&wire).unwrap();
         assert!(round_tripped.parts().create_only);
-        assert!(round_tripped.parts().identity);
+        assert_eq!(
+            round_tripped.parts().identity_mode,
+            CoreIdentityMode::Required
+        );
 
         let required_field = CoreStructField::required("name", CoreAttributeType::string()).build();
         let proto_required = core_struct_field_to_proto_for_schema_round_trip(&required_field);
@@ -3172,7 +3175,7 @@ mod tests {
             block_name,
             write_only,
             keyed_partial_update,
-            identity,
+            identity_mode,
             deferred_populate,
         } = round_tripped_attr.parts();
         assert_eq!(name, "status");
@@ -3196,7 +3199,7 @@ mod tests {
         assert_eq!(block_name, Some("status_block"));
         assert!(write_only);
         assert!(keyed_partial_update.is_none());
-        assert!(identity);
+        assert_eq!(identity_mode, CoreIdentityMode::Required);
         assert!(!deferred_populate);
 
         let provider_populated_attr =
@@ -4590,21 +4593,21 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v13_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 13);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 13);
+    fn test_protocol_version_range_is_v14_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 14);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 14);
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_v12_provider() {
+    fn test_check_protocol_version_rejects_v13_provider() {
         let error = check_protocol_version(
-            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#,
+            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":13}"#,
         )
-        .expect_err("a v13 host must reject a v12 provider");
+        .expect_err("a v14 host must reject a v13 provider before schema decoding");
 
         assert!(error.contains("provider 'old'"));
-        assert!(error.contains("protocol version 12"));
-        assert!(error.contains("requires at least version 13"));
+        assert!(error.contains("protocol version 13"));
+        assert!(error.contains("requires at least version 14"));
     }
 
     #[test]
@@ -4696,10 +4699,17 @@ mod tests {
                     }
                     if object.contains_key("attr_type") {
                         object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
+                        object.insert(
+                            "identity".to_string(),
+                            serde_json::Value::String("none".to_string()),
+                        );
                     }
                     if object.contains_key("field_type") {
                         object.insert("create_only".to_string(), serde_json::Value::Bool(false));
-                        object.insert("identity".to_string(), serde_json::Value::Bool(false));
+                        object.insert(
+                            "identity".to_string(),
+                            serde_json::Value::String("none".to_string()),
+                        );
                     }
                     if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
                         object.insert(
@@ -4738,19 +4748,20 @@ mod tests {
             let error = json_to_schemas(json)
                 .expect_err("released v12 bytes predate required protocol metadata");
             let rendered = render_error_chain(&error);
+            let rejected_legacy_identity_bool =
+                json.contains("\"identity\":false") && rendered.contains("expected value");
             assert!(
                 rendered.contains("missing field `keyed_partial_update`")
                     || rendered.contains("missing field `field_groups`")
                     || rendered.contains("missing field `create_only`")
-                    || rendered.contains("missing field `identity`"),
+                    || rendered.contains("missing field `identity`")
+                    || rejected_legacy_identity_bool,
                 "released fixture {expected_resource_type} crossed the required-field gate: {rendered}",
             );
 
-            // The protocol constant deliberately remains unchanged on this
-            // branch, while the newer metadata fields are deliberately
-            // required. Add them only in-memory so these immutable v12 bytes
-            // still exercise every older conversion rule after the
-            // required-field gate.
+            // Add newer metadata only in-memory so these immutable v12 bytes
+            // still exercise every older conversion rule after the required
+            // protocol-v14 field gate.
             let mut upgraded: serde_json::Value =
                 serde_json::from_str(json).expect("released fixture is valid JSON");
             upgrade_v12_fixture_in_memory(&mut upgraded);
@@ -4819,7 +4830,7 @@ mod tests {
                                     "read_only":false,
                                     "write_only":false,
                                     "create_only":false,
-                                    "identity":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"DomainName"
                                 },{
@@ -4835,7 +4846,7 @@ mod tests {
                                             "read_only":false,
                                             "write_only":false,
                                             "create_only":false,
-                                            "identity":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"RedirectFrom"
                                         },{
@@ -4845,7 +4856,7 @@ mod tests {
                                             "read_only":false,
                                             "write_only":false,
                                             "create_only":false,
-                                            "identity":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"RedirectTo"
                                         }]
@@ -4854,7 +4865,7 @@ mod tests {
                                     "read_only":false,
                                     "write_only":false,
                                     "create_only":false,
-                                    "identity":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"HttpRedirect"
                                 },{
@@ -4870,7 +4881,7 @@ mod tests {
                                             "read_only":false,
                                             "write_only":false,
                                             "create_only":false,
-                                            "identity":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"Name"
                                         },{
@@ -4886,7 +4897,7 @@ mod tests {
                                             "read_only":false,
                                             "write_only":false,
                                             "create_only":false,
-                                            "identity":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"Type"
                                         },{
@@ -4896,7 +4907,7 @@ mod tests {
                                             "read_only":false,
                                             "write_only":false,
                                             "create_only":false,
-                                            "identity":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"Value"
                                         }]
@@ -4905,7 +4916,7 @@ mod tests {
                                     "read_only":false,
                                     "write_only":false,
                                     "create_only":false,
-                                    "identity":false,
+                                    "identity":"none",
                                     "deferred_populate":true,
                                     "provider_name":"ResourceRecord"
                                 },{
@@ -4915,7 +4926,7 @@ mod tests {
                                     "read_only":false,
                                     "write_only":false,
                                     "create_only":false,
-                                    "identity":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"ValidationDomain"
                                 },{
@@ -4929,7 +4940,7 @@ mod tests {
                                     "read_only":false,
                                     "write_only":false,
                                     "create_only":false,
-                                    "identity":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"ValidationEmails"
                                 },{
@@ -4949,7 +4960,7 @@ mod tests {
                                     "read_only":false,
                                     "write_only":false,
                                     "create_only":false,
-                                    "identity":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"ValidationMethod"
                                 },{
@@ -4969,7 +4980,7 @@ mod tests {
                                     "read_only":false,
                                     "write_only":false,
                                     "create_only":false,
-                                    "identity":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"ValidationStatus"
                                 }]
@@ -4980,6 +4991,7 @@ mod tests {
                         "keyed_partial_update":null,
                         "read_only":true,
                         "write_only":false,
+                        "identity":"none",
                         "provider_name":"DomainValidationOptions"
                     }
                 },
@@ -4987,7 +4999,7 @@ mod tests {
                 "default_prevent_destroy":false
             }]"#,
         )
-        .expect("the released ACM semantics must load with required v13 metadata");
+        .expect("the released ACM semantics must load with required v14 metadata");
 
         let validated_schema = &schemas[0];
         let schema = validated_schema.as_schema();
@@ -5082,7 +5094,7 @@ mod tests {
                 "default_prevent_destroy":false
             }]"#,
         )
-        .expect_err("protocol v13 schema JSON must declare nested write_only");
+        .expect_err("protocol v14 schema JSON must declare nested write_only");
 
         let rendered = render_error_chain(&err);
         assert!(rendered.contains("schema JSON parse error"));
@@ -5154,7 +5166,8 @@ mod tests {
                 "description": "Group name",
                 "create_only": true,
                 "read_only": false,
-                "write_only": false
+                "write_only": false,
+                "identity": "none"
               },
               "ingress": {
                 "name": "ingress",
@@ -5174,7 +5187,7 @@ mod tests {
                             "required": true,
                             "write_only": false,
                             "create_only": false,
-                            "identity": false,
+                            "identity": "none",
                             "description": "Start of port range",
                             "block_name": "from_port_block",
                             "provider_name": "FromPort"
@@ -5185,7 +5198,7 @@ mod tests {
                             "required": true,
                             "write_only": false,
                             "create_only": false,
-                            "identity": false,
+                            "identity": "none",
                             "description": null,
                             "block_name": null,
                             "provider_name": null
@@ -5205,7 +5218,8 @@ mod tests {
                 "write_only": false,
                 "block_name": "ingress_block",
                 "provider_name": "IpPermissions",
-                "removable": false
+                "removable": false,
+                "identity": "none"
               },
               "description": {
                 "name": "description",
@@ -5215,7 +5229,8 @@ mod tests {
                 "description": "Group description",
                 "create_only": false,
                 "read_only": false,
-                "write_only": false
+                "write_only": false,
+                "identity": "none"
               },
               "enabled": {
                 "name": "enabled",
@@ -5225,7 +5240,8 @@ mod tests {
                 "description": null,
                 "create_only": false,
                 "read_only": false,
-                "write_only": false
+                "write_only": false,
+                "identity": "none"
               },
               "priority": {
                 "name": "priority",
@@ -5235,7 +5251,8 @@ mod tests {
                 "description": null,
                 "create_only": false,
                 "read_only": false,
-                "write_only": false
+                "write_only": false,
+                "identity": "none"
               }
             }
           }
@@ -5536,7 +5553,7 @@ mod tests {
                     read_only: false,
                     write_only: false,
                     create_only: false,
-                    identity: false,
+                    identity: proto::IdentityMode::None,
                     deferred_populate: false,
                 }],
             },
@@ -6309,7 +6326,8 @@ mod tests {
                             }
                         },
                         "required":false,
-                        "keyed_partial_update":null
+                        "keyed_partial_update":null,
+                        "identity":"none"
                     }
                 }
             }

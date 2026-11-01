@@ -39,7 +39,7 @@ use crate::resource::{
 };
 use crate::schema::{
     AttributeSchema, AttributeSchemaParts, AttributeType, ConfigSchemaValidationError, FieldGroup,
-    FieldGroupKind, InputMode, RawShape, ResourceSchema, ResourceSchemaParts,
+    FieldGroupKind, IdentityMode, InputMode, RawShape, ResourceSchema, ResourceSchemaParts,
     ResourceSchemaValidationError, ResourceValidation, SchemaKind, SchemaValidationIssueLocation,
     StructField, StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
     ValidatedProviderSchemaWitness, ValidatedResourceSchema,
@@ -329,6 +329,10 @@ impl SchemaDecodeError {
         Self::new("identity requires create_only")
     }
 
+    fn when_present_identity_requires_optional() -> Self {
+        Self::new("when-present identity requires optional input")
+    }
+
     fn identity_requires_scalar_or_enum() -> Self {
         Self::new("identity value must have a scalar or enum type")
     }
@@ -473,7 +477,7 @@ impl Error for SchemaDecodeError {
     }
 }
 
-/// Convert a validated resource schema into its version-13 protocol record.
+/// Convert a validated resource schema into its version-14 protocol record.
 pub fn resource_schema_to_protocol(
     schema: &ValidatedResourceSchema,
 ) -> Result<protocol::ResourceSchema, ProtocolConvertError> {
@@ -491,10 +495,10 @@ pub fn resource_schema_to_protocol(
         default_wait_interval,
         defs,
     } = schema.parts();
-    // Protocol v13 has no resource wait-default fields. These are host-side
+    // Protocol v14 has no resource wait-default fields. These are host-side
     // execution policy, not provider metadata; projection intentionally omits
     // them and round-trip tests pin that one-way behavior.
-    let _v13_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
+    let _v14_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
 
     let attributes = attributes
         .iter()
@@ -560,7 +564,7 @@ fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
     TypeIdentity::from_dotted(identity)
 }
 
-/// Project one aggregate provider-schema witness onto the version-13 envelope.
+/// Project one aggregate provider-schema witness onto the version-14 envelope.
 pub fn provider_schema_to_protocol(
     witness: &ValidatedProviderSchemaWitness,
 ) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
@@ -586,7 +590,7 @@ pub fn provider_schema_to_protocol(
     })
 }
 
-/// Decode the version-13 provider-schema envelope and jointly admit resource,
+/// Decode the version-14 provider-schema envelope and jointly admit resource,
 /// config, and reference-form declarations.
 pub fn protocol_to_provider_schema_witness(
     envelope: &protocol::ProviderSchemaEnvelope,
@@ -645,12 +649,12 @@ pub fn attribute_schema_to_protocol(
         block_name,
         write_only,
         keyed_partial_update,
-        identity,
+        identity_mode,
         deferred_populate,
     } = attribute.parts();
-    // Protocol v13 has no completion field. Completions are an in-process
+    // Protocol v14 has no completion field. Completions are an in-process
     // authoring aid, so JSON metadata projection intentionally omits them.
-    let _v13_omits_host_completions = completions;
+    let _v14_omits_host_completions = completions;
     let (required, read_only) = input_mode_to_protocol(declared_input_mode);
     let default = default
         .map(try_core_to_protocol_value)
@@ -670,7 +674,7 @@ pub fn attribute_schema_to_protocol(
         block_name: block_name.map(str::to_owned),
         provider_name: provider_name.map(str::to_owned),
         removable,
-        identity,
+        identity: identity_mode_to_protocol(identity_mode),
         deferred_populate,
     })
 }
@@ -844,7 +848,7 @@ pub fn struct_field_to_protocol(
         deferred_populate,
         write_only,
         create_only,
-        identity,
+        identity_mode,
     } = field.parts();
     let (required, read_only) = input_mode_to_protocol(declared_input_mode);
     Ok(protocol::StructField {
@@ -857,7 +861,7 @@ pub fn struct_field_to_protocol(
         read_only,
         write_only,
         create_only,
-        identity,
+        identity: identity_mode_to_protocol(identity_mode),
         deferred_populate,
     })
 }
@@ -867,6 +871,22 @@ pub fn input_mode_to_protocol(input_mode: InputMode) -> (bool, bool) {
         InputMode::Optional => (false, false),
         InputMode::Required => (true, false),
         InputMode::ProviderPopulated => (false, true),
+    }
+}
+
+fn identity_mode_to_protocol(identity_mode: IdentityMode) -> protocol::IdentityMode {
+    match identity_mode {
+        IdentityMode::None => protocol::IdentityMode::None,
+        IdentityMode::Required => protocol::IdentityMode::Required,
+        IdentityMode::WhenPresent => protocol::IdentityMode::WhenPresent,
+    }
+}
+
+fn protocol_to_identity_mode(identity_mode: protocol::IdentityMode) -> IdentityMode {
+    match identity_mode {
+        protocol::IdentityMode::None => IdentityMode::None,
+        protocol::IdentityMode::Required => IdentityMode::Required,
+        protocol::IdentityMode::WhenPresent => IdentityMode::WhenPresent,
     }
 }
 
@@ -1001,11 +1021,17 @@ pub fn protocol_to_attribute_schema(
         .transpose()
         .map_err(SchemaDecodeError::from_default)
         .map_err(|error| error.prepend_attribute(name))?;
+    let identity_mode = protocol_to_identity_mode(*identity);
 
-    if *identity && !*create_only {
+    if identity_mode.is_identity() && !*create_only {
         return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
     }
-    if *identity && !protocol_identity_leaf_is_scalar_or_enum(&attr_type) {
+    if identity_mode == IdentityMode::WhenPresent && input_mode == InputMode::Required {
+        return Err(
+            SchemaDecodeError::when_present_identity_requires_optional().prepend_attribute(name)
+        );
+    }
+    if identity_mode.is_identity() && !protocol_identity_leaf_is_scalar_or_enum(&attr_type) {
         return Err(SchemaDecodeError::identity_requires_scalar_or_enum().prepend_attribute(name));
     }
 
@@ -1043,10 +1069,12 @@ pub fn protocol_to_attribute_schema(
                 builder = builder.keyed_partial_update(key_field.clone());
             }
             if *create_only {
-                let mut builder = builder.create_only();
-                if *identity {
-                    builder = builder.identity();
-                }
+                let builder = builder.create_only();
+                let builder = match identity_mode {
+                    IdentityMode::None => builder,
+                    IdentityMode::Required => builder.identity(),
+                    IdentityMode::WhenPresent => builder.identity_when_present(),
+                };
                 Ok(builder.build())
             } else {
                 Ok(builder.build())
@@ -1090,10 +1118,15 @@ pub fn protocol_to_attribute_schema(
                 builder = builder.keyed_partial_update(key_field.clone());
             }
             if *create_only {
-                let mut builder = builder.create_only();
-                if *identity {
-                    builder = builder.identity();
-                }
+                let builder = builder.create_only();
+                let builder = match identity_mode {
+                    IdentityMode::None => builder,
+                    IdentityMode::Required => builder.identity(),
+                    IdentityMode::WhenPresent => {
+                        return Err(SchemaDecodeError::when_present_identity_requires_optional()
+                            .prepend_attribute(name));
+                    }
+                };
                 Ok(builder.build())
             } else {
                 Ok(builder.build())
@@ -1106,7 +1139,7 @@ pub fn protocol_to_attribute_schema(
                 (*write_only, "write_only"),
                 (block_name.is_some(), "block_name"),
                 (removable.is_some(), "removable"),
-                (*identity, "identity"),
+                (identity_mode.is_identity(), "identity"),
                 (keyed_partial_update.is_some(), "keyed_partial_update"),
             ] {
                 if present {
@@ -1550,14 +1583,23 @@ pub fn protocol_to_struct_field(
     } = field;
     let input_mode = protocol_to_input_mode(*required, *read_only)
         .map_err(|error| error.prepend_attribute(name))?;
+    let identity_mode = protocol_to_identity_mode(*identity);
     if input_mode == InputMode::ProviderPopulated && *write_only {
         return Err(SchemaDecodeError::conflicting_write_only_mode().prepend_attribute(name));
     }
-    if *identity && !*create_only {
+    if identity_mode.is_identity() && !*create_only {
         return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
     }
+    if identity_mode == IdentityMode::WhenPresent && input_mode == InputMode::Required {
+        return Err(
+            SchemaDecodeError::when_present_identity_requires_optional().prepend_attribute(name)
+        );
+    }
     if input_mode == InputMode::ProviderPopulated {
-        for (present, modifier) in [(*create_only, "create_only"), (*identity, "identity")] {
+        for (present, modifier) in [
+            (*create_only, "create_only"),
+            (identity_mode.is_identity(), "identity"),
+        ] {
             if present {
                 return Err(SchemaDecodeError::incompatible_struct_field_modifier(
                     input_mode, modifier,
@@ -1568,7 +1610,7 @@ pub fn protocol_to_struct_field(
     }
     let field_type =
         protocol_to_attribute_type(field_type).map_err(|error| error.prepend_attribute(name))?;
-    if *identity && !protocol_identity_leaf_is_scalar_or_enum(&field_type) {
+    if identity_mode.is_identity() && !protocol_identity_leaf_is_scalar_or_enum(&field_type) {
         return Err(SchemaDecodeError::identity_requires_scalar_or_enum().prepend_attribute(name));
     }
 
@@ -1591,10 +1633,12 @@ pub fn protocol_to_struct_field(
                 builder = builder.deferred_populate();
             }
             if *create_only {
-                let mut builder = builder.create_only();
-                if *identity {
-                    builder = builder.identity();
-                }
+                let builder = builder.create_only();
+                let builder = match identity_mode {
+                    IdentityMode::None => builder,
+                    IdentityMode::Required => builder.identity(),
+                    IdentityMode::WhenPresent => builder.identity_when_present(),
+                };
                 Ok(builder.build())
             } else {
                 Ok(builder.build())
@@ -1618,10 +1662,15 @@ pub fn protocol_to_struct_field(
                 builder = builder.deferred_populate();
             }
             if *create_only {
-                let mut builder = builder.create_only();
-                if *identity {
-                    builder = builder.identity();
-                }
+                let builder = builder.create_only();
+                let builder = match identity_mode {
+                    IdentityMode::None => builder,
+                    IdentityMode::Required => builder.identity(),
+                    IdentityMode::WhenPresent => {
+                        return Err(SchemaDecodeError::when_present_identity_requires_optional()
+                            .prepend_attribute(name));
+                    }
+                };
                 Ok(builder.build())
             } else {
                 Ok(builder.build())
@@ -2031,7 +2080,7 @@ pub fn protocol_to_core_persisted_value_map(
 }
 
 /// Encode a core resource id. Provider-instance routing is host-local and the
-/// version-13 protocol deliberately has no corresponding field.
+/// version-14 protocol deliberately has no corresponding field.
 pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     let ResourceId {
         provider,
@@ -2050,7 +2099,7 @@ pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     }
 }
 
-/// Decode a version-13 resource id. The wire's empty identity is the pending
+/// Decode a version-14 resource id. The wire's empty identity is the pending
 /// sentinel, and provider-instance routing cannot be reconstructed.
 pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
     let protocol::ResourceId {
@@ -3352,7 +3401,7 @@ mod tests {
                 read_only: false,
                 write_only: false,
                 create_only: false,
-                identity: false,
+                identity: protocol::IdentityMode::None,
                 deferred_populate: false,
             }],
             field_groups: vec![protocol::FieldGroup {
@@ -3376,20 +3425,63 @@ mod tests {
     }
 
     #[test]
-    fn nested_identity_round_trips_only_with_create_only_witness() {
-        let field = StructField::required("budget_name", AttributeType::string())
+    fn identity_modes_round_trip_for_attributes_and_struct_fields() {
+        let required_field = StructField::required("budget_name", AttributeType::string())
             .create_only()
             .identity()
             .build();
 
-        let wire = struct_field_to_protocol(&field).unwrap();
+        let wire = struct_field_to_protocol(&required_field).unwrap();
         assert!(wire.create_only);
-        assert!(wire.identity);
+        assert_eq!(wire.identity, protocol::IdentityMode::Required);
 
         let decoded = protocol_to_struct_field(&wire).unwrap();
         let parts = decoded.parts();
         assert!(parts.create_only);
-        assert!(parts.identity);
+        assert_eq!(parts.identity_mode, IdentityMode::Required);
+
+        let when_present_field = StructField::optional("description", AttributeType::string())
+            .create_only()
+            .identity_when_present()
+            .build();
+        let wire = struct_field_to_protocol(&when_present_field).unwrap();
+        assert_eq!(wire.identity, protocol::IdentityMode::WhenPresent);
+        assert_eq!(
+            protocol_to_struct_field(&wire)
+                .unwrap()
+                .parts()
+                .identity_mode,
+            IdentityMode::WhenPresent,
+        );
+
+        let required_attribute = AttributeSchema::required("name", AttributeType::string())
+            .create_only()
+            .identity()
+            .build();
+        let wire = attribute_schema_to_protocol(&required_attribute).unwrap();
+        assert_eq!(wire.identity, protocol::IdentityMode::Required);
+        assert_eq!(
+            protocol_to_attribute_schema(&wire)
+                .unwrap()
+                .parts()
+                .identity_mode,
+            IdentityMode::Required,
+        );
+
+        let when_present_attribute =
+            AttributeSchema::optional("description", AttributeType::string())
+                .create_only()
+                .identity_when_present()
+                .build();
+        let wire = attribute_schema_to_protocol(&when_present_attribute).unwrap();
+        assert_eq!(wire.identity, protocol::IdentityMode::WhenPresent);
+        assert_eq!(
+            protocol_to_attribute_schema(&wire)
+                .unwrap()
+                .parts()
+                .identity_mode,
+            IdentityMode::WhenPresent,
+        );
     }
 
     #[test]
@@ -3410,7 +3502,7 @@ mod tests {
             read_only: false,
             write_only: false,
             create_only: false,
-            identity: true,
+            identity: protocol::IdentityMode::Required,
             deferred_populate: false,
         };
 
@@ -3420,6 +3512,54 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "attribute 'budget_name': identity requires create_only"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_when_present_identity_without_optional_create_only_input() {
+        let mut attribute = attribute_schema_to_protocol(
+            &AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .identity_when_present()
+                .build(),
+        )
+        .unwrap();
+        attribute.create_only = false;
+        let error = protocol_to_attribute_schema(&attribute)
+            .expect_err("when-present identity must require create_only");
+        assert_eq!(
+            error.to_string(),
+            "attribute 'name': identity requires create_only"
+        );
+
+        let mut required_attribute = attribute_schema_to_protocol(
+            &AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .unwrap();
+        required_attribute.identity = protocol::IdentityMode::WhenPresent;
+        let error = protocol_to_attribute_schema(&required_attribute)
+            .expect_err("when-present identity must reject required input");
+        assert_eq!(
+            error.to_string(),
+            "attribute 'name': when-present identity requires optional input"
+        );
+
+        let mut required_field = struct_field_to_protocol(
+            &StructField::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .unwrap();
+        required_field.identity = protocol::IdentityMode::WhenPresent;
+        let error = protocol_to_struct_field(&required_field)
+            .expect_err("nested when-present identity must reject required input");
+        assert_eq!(
+            error.to_string(),
+            "attribute 'name': when-present identity requires optional input"
         );
     }
 
@@ -3508,7 +3648,7 @@ mod tests {
                     read_only: false,
                     write_only: false,
                     create_only: true,
-                    identity: false,
+                    identity: protocol::IdentityMode::None,
                     deferred_populate: false,
                 }],
                 field_groups: vec![],
@@ -3554,7 +3694,7 @@ mod tests {
                 read_only: false,
                 write_only: false,
                 create_only: true,
-                identity: true,
+                identity: protocol::IdentityMode::Required,
                 deferred_populate: false,
             }],
             field_groups: vec![],
@@ -3720,7 +3860,7 @@ mod tests {
                     block_name: None,
                     provider_name: None,
                     removable: None,
-                    identity: false,
+                    identity: protocol::IdentityMode::None,
                     deferred_populate: false,
                 },
             )]),
@@ -3747,7 +3887,7 @@ mod tests {
     }
 
     #[test]
-    fn v13_json_decode_rejects_an_empty_custom_enum_namespace() {
+    fn v14_json_decode_rejects_an_empty_custom_enum_namespace() {
         let wire = protocol::AttributeType::CustomEnum {
             name: "Mode".to_string(),
             base: Box::new(protocol::AttributeType::String {
@@ -3760,9 +3900,9 @@ mod tests {
             namespace: String::new(),
             dsl_transform: None,
         };
-        let json = serde_json::to_string(&wire).expect("v13 CustomEnum must serialize");
+        let json = serde_json::to_string(&wire).expect("v14 CustomEnum must serialize");
         let decoded_wire: protocol::AttributeType =
-            serde_json::from_str(&json).expect("v13 CustomEnum JSON must decode");
+            serde_json::from_str(&json).expect("v14 CustomEnum JSON must decode");
 
         let error = protocol_to_attribute_type(&decoded_wire)
             .expect_err("an empty namespace cannot identify a provider custom enum");
@@ -3988,7 +4128,7 @@ mod tests {
             }) if identity == "test.IdentifiedList"
         ));
         let decoded = protocol_to_attribute_type(&duplicate_wire)
-            .expect("v13 defines the enclosing Custom refinement as authoritative");
+            .expect("v14 defines the enclosing Custom refinement as authoritative");
         assert!(matches!(
             decoded.raw_shape(),
             RawShape::String {

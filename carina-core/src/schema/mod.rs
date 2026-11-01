@@ -816,6 +816,31 @@ impl InputMode {
     }
 }
 
+/// How a create-only schema value contributes to anonymous resource identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum IdentityMode {
+    /// The value does not participate in anonymous identity.
+    #[default]
+    None,
+    /// The value must have a stable plan-time value or authored expression.
+    /// This mode remains available on optional input for compatibility; an
+    /// omitted optional value makes declared identity incomplete.
+    Required,
+    /// An omitted optional value contributes a dedicated absent marker. A
+    /// written value must still have a stable plan-time representation.
+    WhenPresent,
+}
+
+impl IdentityMode {
+    pub const fn is_identity(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub const fn allows_absence(self) -> bool {
+        matches!(self, Self::WhenPresent)
+    }
+}
+
 /// A field within a Struct type.
 ///
 /// Construction and mutation go through builders so conflicting input modes
@@ -865,6 +890,15 @@ impl InputMode {
 /// let _ = field.is_write_only();
 /// ```
 ///
+/// Only an optional create-only field exposes when-present identity:
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeType, StructField};
+/// let _ = StructField::required("value", AttributeType::string())
+///     .create_only()
+///     .identity_when_present();
+/// ```
+///
 /// The read-only view remains exhaustively destructurable for conversion
 /// seams:
 ///
@@ -882,7 +916,7 @@ impl InputMode {
 ///     deferred_populate,
 ///     write_only,
 ///     create_only,
-///     identity,
+///     identity_mode,
 /// } = field.parts();
 /// let _ = (
 ///     name,
@@ -894,7 +928,7 @@ impl InputMode {
 ///     deferred_populate,
 ///     write_only,
 ///     create_only,
-///     identity,
+///     identity_mode,
 /// );
 /// ```
 #[derive(Debug, Clone)]
@@ -924,8 +958,8 @@ pub struct StructField {
     pub(crate) write_only: bool,
     /// Whether changing this user-input field requires replacement.
     pub(crate) create_only: bool,
-    /// Whether this immutable user-input field contributes to anonymous identity.
-    pub(crate) identity: bool,
+    /// How this immutable user-input field contributes to anonymous identity.
+    pub(crate) identity_mode: IdentityMode,
 }
 
 /// Exhaustive read-only view of a [`StructField`].
@@ -946,7 +980,7 @@ pub struct StructFieldParts<'a> {
     pub deferred_populate: bool,
     pub write_only: bool,
     pub create_only: bool,
-    pub identity: bool,
+    pub identity_mode: IdentityMode,
 }
 
 /// Builder for an optional user-input struct field.
@@ -990,7 +1024,7 @@ impl StructField {
             deferred_populate: false,
             write_only: false,
             create_only: false,
-            identity: false,
+            identity_mode: IdentityMode::None,
         }
     }
 
@@ -1032,7 +1066,7 @@ impl StructField {
             deferred_populate: self.deferred_populate,
             write_only: self.write_only,
             create_only: self.create_only,
-            identity: self.identity,
+            identity_mode: self.identity_mode,
         }
     }
 
@@ -1157,7 +1191,7 @@ macro_rules! impl_identity_struct_field_builder {
     ($builder:ident) => {
         impl $builder {
             pub fn identity(mut self) -> Self {
-                self.field.identity = true;
+                self.field.identity_mode = IdentityMode::Required;
                 self
             }
         }
@@ -1166,6 +1200,13 @@ macro_rules! impl_identity_struct_field_builder {
 
 impl_identity_struct_field_builder!(CreateOnlyOptionalStructFieldBuilder);
 impl_identity_struct_field_builder!(CreateOnlyRequiredStructFieldBuilder);
+
+impl CreateOnlyOptionalStructFieldBuilder {
+    pub fn identity_when_present(mut self) -> Self {
+        self.field.identity_mode = IdentityMode::WhenPresent;
+        self
+    }
+}
 
 impl ProviderPopulatedStructFieldBuilder {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
@@ -7360,6 +7401,15 @@ impl CompletionValue {
 /// attribute.write_only = true;
 /// ```
 ///
+/// Only an optional create-only attribute exposes when-present identity:
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeSchema, AttributeType};
+/// let _ = AttributeSchema::required("name", AttributeType::string())
+///     .create_only()
+///     .identity_when_present();
+/// ```
+///
 /// The read-only view remains exhaustively destructurable for conversion
 /// seams:
 ///
@@ -7380,7 +7430,7 @@ impl CompletionValue {
 ///     block_name,
 ///     write_only,
 ///     keyed_partial_update,
-///     identity,
+///     identity_mode,
 ///     deferred_populate,
 /// } = attribute.parts();
 /// let _ = (
@@ -7396,7 +7446,7 @@ impl CompletionValue {
 ///     block_name,
 ///     write_only,
 ///     keyed_partial_update,
-///     identity,
+///     identity_mode,
 ///     deferred_populate,
 /// );
 /// ```
@@ -7429,10 +7479,10 @@ pub struct AttributeSchema {
     /// Key field for a list-of-structs whose provider API updates only the
     /// entries it receives and leaves omitted keys unchanged.
     pub(crate) keyed_partial_update: Option<KeyedPartialUpdate>,
-    /// Whether this immutable attribute contributes to anonymous resource identity.
+    /// How this immutable attribute contributes to anonymous resource identity.
     /// When any identity path is declared, only identity values enter the anonymous
     /// address hash; other create-only values are deliberately excluded.
-    pub(crate) identity: bool,
+    pub(crate) identity_mode: IdentityMode,
     /// Whether the value of this attribute is populated by the provider
     /// asynchronously *after* the Create call returns. Downstream
     /// resources that read this attribute via a chained access
@@ -7470,7 +7520,7 @@ pub struct AttributeSchemaParts<'a> {
     pub block_name: Option<&'a str>,
     pub write_only: bool,
     pub keyed_partial_update: Option<&'a KeyedPartialUpdate>,
-    pub identity: bool,
+    pub identity_mode: IdentityMode,
     pub deferred_populate: bool,
 }
 
@@ -7518,7 +7568,7 @@ impl AttributeSchema {
             block_name: None,
             write_only: false,
             keyed_partial_update: None,
-            identity: false,
+            identity_mode: IdentityMode::None,
             deferred_populate: false,
         }
     }
@@ -7564,7 +7614,7 @@ impl AttributeSchema {
             block_name: self.block_name.as_deref(),
             write_only: self.write_only,
             keyed_partial_update: self.keyed_partial_update.as_ref(),
-            identity: self.identity,
+            identity_mode: self.identity_mode,
             deferred_populate: self.deferred_populate,
         }
     }
@@ -7614,7 +7664,11 @@ impl AttributeSchema {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.identity
+        self.identity_mode.is_identity()
+    }
+
+    pub fn identity_mode(&self) -> IdentityMode {
+        self.identity_mode
     }
 
     pub fn is_deferred_populate(&self) -> bool {
@@ -7706,7 +7760,7 @@ macro_rules! impl_identity_attribute_builder {
     ($builder:ident) => {
         impl $builder {
             pub fn identity(mut self) -> Self {
-                self.attribute.identity = true;
+                self.attribute.identity_mode = IdentityMode::Required;
                 self
             }
         }
@@ -7715,6 +7769,13 @@ macro_rules! impl_identity_attribute_builder {
 
 impl_identity_attribute_builder!(CreateOnlyOptionalAttributeSchemaBuilder);
 impl_identity_attribute_builder!(CreateOnlyRequiredAttributeSchemaBuilder);
+
+impl CreateOnlyOptionalAttributeSchemaBuilder {
+    pub fn identity_when_present(mut self) -> Self {
+        self.attribute.identity_mode = IdentityMode::WhenPresent;
+        self
+    }
+}
 
 impl OptionalAttributeSchemaBuilder {
     pub fn with_default(mut self, value: Value) -> Self {
@@ -8190,7 +8251,11 @@ impl<'a> EffectiveAttribute<'a> {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.attribute.identity
+        self.attribute.identity_mode.is_identity()
+    }
+
+    pub fn identity_mode(&self) -> IdentityMode {
+        self.attribute.identity_mode
     }
 
     pub fn value_type(&self) -> EffectiveType<'a> {
@@ -8294,7 +8359,11 @@ impl<'a> EffectiveField<'a> {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.field.identity
+        self.field.identity_mode.is_identity()
+    }
+
+    pub fn identity_mode(&self) -> IdentityMode {
+        self.field.identity_mode
     }
 
     pub fn is_deferred_populate(&self) -> bool {
@@ -8618,6 +8687,13 @@ impl<'a> EffectiveSchemaNode<'a> {
         match self {
             Self::Attribute(attribute) => attribute.is_write_only(),
             Self::Field(field) => field.is_write_only(),
+        }
+    }
+
+    pub fn identity_mode(&self) -> IdentityMode {
+        match self {
+            Self::Attribute(attribute) => attribute.identity_mode(),
+            Self::Field(field) => field.identity_mode(),
         }
     }
 
@@ -9427,7 +9503,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has a DSL transform that protocol v13 cannot represent"
+                                "closed enum `{identity}` has a DSL transform that protocol v14 cannot represent"
                             ),
                         );
                     }
@@ -9445,7 +9521,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has base metadata that protocol v13 cannot represent"
+                                "closed enum `{identity}` has base metadata that protocol v14 cannot represent"
                             ),
                         );
                     }
@@ -9456,7 +9532,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "open enum `{identity}` has DSL aliases that protocol v13 cannot represent"
+                                "open enum `{identity}` has DSL aliases that protocol v14 cannot represent"
                             ),
                         );
                     }
@@ -9464,7 +9540,7 @@ fn validate_identified_scalar_kind_consistency(
                         push_schema_issue(
                             issues,
                             &location,
-                            format!("open enum `{identity}` has no namespace for protocol v13"),
+                            format!("open enum `{identity}` has no namespace for protocol v14"),
                         );
                     }
                 }
@@ -9571,8 +9647,17 @@ fn validate_attribute_mode(
     location: &SchemaValidationIssueLocation,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
-    if attribute.identity && !attribute.create_only {
+    if attribute.identity_mode.is_identity() && !attribute.create_only {
         push_schema_issue(issues, location, "identity requires create-only");
+    }
+    if attribute.identity_mode == IdentityMode::WhenPresent
+        && attribute.input_mode == InputMode::Required
+    {
+        push_schema_issue(
+            issues,
+            location,
+            "when-present identity requires optional input",
+        );
     }
 
     match attribute.input_mode {
@@ -9630,7 +9715,7 @@ fn validate_attribute_mode(
                     "provider-populated output cannot be create-only",
                 );
             }
-            if attribute.identity {
+            if attribute.identity_mode.is_identity() {
                 push_schema_issue(
                     issues,
                     location,
@@ -9668,8 +9753,17 @@ fn validate_struct_field_mode(
     provider_populated_ancestor: Option<bool>,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
-    if field.identity && !field.create_only {
+    if field.identity_mode.is_identity() && !field.create_only {
         push_schema_issue(issues, location, "identity requires create-only");
+    }
+    if field.identity_mode == IdentityMode::WhenPresent
+        && field.declared_input_mode == InputMode::Required
+    {
+        push_schema_issue(
+            issues,
+            location,
+            "when-present identity requires optional input",
+        );
     }
 
     if provider_populated_ancestor == Some(true) && field.write_only {
@@ -9706,7 +9800,7 @@ fn validate_struct_field_mode(
                 "create-only field appears below a provider-populated ancestor",
             );
         }
-        if effectively_provider_populated && field.identity {
+        if effectively_provider_populated && field.identity_mode.is_identity() {
             push_schema_issue(
                 issues,
                 location,
@@ -9871,7 +9965,7 @@ fn validate_type_definition(
                     provider_populated_ancestor,
                     issues,
                 );
-                if field.identity
+                if field.identity_mode.is_identity()
                     && identity_leaf_is_scalar_or_enum(&field.field_type, defs, &mut Vec::new())
                         == Some(false)
                 {
@@ -9900,7 +9994,7 @@ fn validate_type_definition(
                     fields.iter().find(|field| field.name == name).map(|field| {
                         FieldGroupMemberAdmission {
                             input_mode: field.declared_input_mode,
-                            // StructField has no default in the core or v13
+                            // StructField has no default in the core or v14
                             // protocol grammar. Keeping this explicit makes a
                             // future addition inherit the shared rejection.
                             has_default: false,
@@ -10001,7 +10095,7 @@ fn collect_identity_paths_in_type(
             for field in fields {
                 let field_path = path.with_struct_field(field.name.clone());
                 let field_location = location.with_suffix(format_args!(".{}", field.name));
-                if field.identity {
+                if field.identity_mode.is_identity() {
                     if singular {
                         collection.paths.push(field_path.clone());
                     } else {
@@ -10763,7 +10857,7 @@ impl ResourceSchema {
         for (name, attribute) in &self.attributes {
             let location = SchemaValidationIssueLocation::Attribute(name.clone());
             validate_attribute_mode(attribute, &location, &mut issues);
-            if attribute.identity
+            if attribute.identity_mode.is_identity()
                 && identity_leaf_is_scalar_or_enum(
                     &attribute.attr_type,
                     &self.defs,
@@ -10795,7 +10889,7 @@ impl ResourceSchema {
                 &mut issues,
             );
             let path = IdentityPath::attribute(name.clone());
-            if attribute.identity {
+            if attribute.identity_mode.is_identity() {
                 identity_paths.push(path.clone());
             }
             let mut identity_path_collection = IdentityPathCollection {

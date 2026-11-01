@@ -1,5 +1,72 @@
 # Provider protocol versions
 
+## Version 14
+
+Protocol v14 makes declared anonymous identity a closed schema mode and changes
+its address semantics. `PROTOCOL_VERSION` and
+`MIN_SUPPORTED_PROTOCOL_VERSION` are both 14. A v14 host therefore rejects a
+v13 provider through the existing version check before attempting to decode
+its schemas. This is required because the v13 top-level `identity` boolean
+meant “add this value to the configured create-only hash inputs” and released
+providers could set it on mutable attributes. Interpreting that boolean with
+v14 semantics would silently change addresses or produce a misleading schema
+decode error.
+
+Every top-level `AttributeSchema` and nested `StructField` schema JSON record
+now carries a required `identity` value from the closed enum `none`, `required`,
+or `when_present`; the field has no serde default. Nested fields also carry the
+required `create_only` boolean introduced with nested identity. The host
+rebuilds decoded records through the same input-mode and create-only builders
+used by native schemas. Both identity modes require create-only scalar or enum
+leaves. Identity is rejected on provider-populated values, on a collection or
+struct value itself, below lists, maps, or unions, and below a
+provider-populated ancestor. `when_present` is additionally valid only for
+optional input. These declarations participate in semantic schema fingerprint
+encoding v7.
+
+For anonymous resources, one or more declared identity paths select the
+identity-only address encoding; other create-only values are excluded. If no
+identity path is declared, the host retains the create-only fallback. Nested
+paths are represented as typed attribute/struct-field segments in the host and
+are never transported as a dotted string. A `required` identity must be
+written, even when its schema input is optional. An omitted `when_present`
+identity instead contributes a dedicated typed absence value. Once written,
+either mode has the same rules: a stable written value or authored expression
+is required at plan time. Written values are schema-canonicalized. References
+and composite expressions whose leaves are references or literals are hashed
+by their deterministic authored spelling, and generated names hash their
+authored prefix as a separate typed value. A written `Unknown` or
+`Unavailable` value, placeholder, secret, or expression containing such a leaf
+is incomplete identity rather than absence; the user can give the resource a
+name with `let` when no stable identity material exists.
+
+The declared-identity hash encoding is typed and length-prefixed. It contains
+the length-prefixed domain `carina-anonymous-identity-v1`; the sorted
+provider-identity entry count and each length-prefixed key and value; then the
+identity-path count. Each path has its segment count followed by segments
+tagged `0` for an attribute or `1` for a struct field and a length-prefixed
+name. Its value then has a kind tag: `0` for `Written`, `1` for
+`ReferenceExpression`, `2` for `Prefix`, `3` for `PrefixExpression`, or `4`
+for `Absent`. Tags 0 through 3 retain their existing spelling payload; tag 4
+has no payload. Counts and lengths are unsigned 64-bit little-endian integers.
+The address suffix is the first 32 bits of the SHA-256 digest, interpreted in
+big-endian byte order. Consequently absence cannot collide with any written
+value, including the empty string.
+
+During anonymous-address reconciliation, an absent desired `when_present`
+identity matches only a candidate state row whose corresponding attribute or
+field is also absent. It does not match an empty string or any other written
+value. This lets migration to the declared-identity address select the same
+real-world object without conflating omission with an unresolved value.
+
+Nested create-only leaves in an unordered list are compared as a multiset,
+independent of element order and mutable sibling fields. Reordering alone is
+not a create-only change. Adding an element with an authored create-only leaf
+is a create-only change and therefore replaces the resource.
+
+The WIT world is unchanged in v14; the incompatible representation is in the
+schema JSON records. Hosts and providers must both use protocol v14.
+
 ## Version 13
 
 Protocol v13 makes initialized reference scope, provider-declared reference
@@ -37,52 +104,7 @@ witness. Every form identity must be declared by that provider as a refined
 String; duplicate records, dangling identities, Int identities, and Enum
 identities are rejected while decoding. The registry retains one table per
 schema owner rather than one global identity table. Owner forms also contribute
-to semantic schema fingerprint encoding v6.
-
-Every nested `StructField` schema JSON record carries required `create_only`
-and `identity` booleans. Neither field has a serde default: a provider built
-against an older JSON record fails to load instead of silently changing
-replacement or anonymous-address semantics. The host rebuilds decoded fields
-through the same input-mode and create-only builders used by native schemas.
-It rejects `identity: true` unless `create_only` is also true, rejects both
-flags on provider-populated fields, and admits identity only on scalar or enum
-leaves reached through attributes, structs, and schema references. Lists, maps,
-struct values, and unions cannot themselves be identity leaves. Create-only
-fields below a union member are also rejected because the active member cannot
-be projected safely. Both flags participate in semantic schema fingerprint
-encoding v6, so a saved plan is invalidated when either declaration changes.
-
-This is a schema-JSON-only extension. The WIT world and protocol version remain
-13. For anonymous resources, one or more declared identity paths select the
-identity-only address encoding; when no identity path is declared, the host
-retains the create-only fallback. Nested paths are represented as typed
-attribute/struct-field segments in the host and are never transported as a
-dotted string. Every declared identity value must be available as either a
-written value or an authored expression at plan time. Written values are
-schema-canonicalized. References and composite expressions whose leaves are
-references or literals are hashed by their deterministic authored expression,
-so their address stays stable when a target later resolves. Generated names
-hash their authored prefix as a separate typed value. An absent value,
-`Unknown`, `Unavailable`, or an expression containing one of those leaves is
-rejected; a `let` binding remains available when no stable identity material
-exists.
-
-The declared-identity hash encoding is deliberately typed and
-length-prefixed. It contains the length-prefixed domain
-`carina-anonymous-identity-v1`; the sorted provider-identity entry count and
-each length-prefixed key and value; then the identity-path count. Each path has
-its segment count followed by segments tagged `0` for an attribute or `1` for
-a struct field and a length-prefixed name. The path value then has a kind tag:
-`0` for `Written`, `1` for `ReferenceExpression`, `2` for `Prefix`, or `3` for
-`PrefixExpression`, followed by its length-prefixed deterministic spelling.
-Counts and lengths are unsigned 64-bit little-endian integers. The address
-suffix is the first 32 bits of the SHA-256 digest, interpreted in big-endian
-byte order.
-
-Nested create-only leaves in an unordered list are compared as a multiset,
-independent of element order and mutable sibling fields. Reordering alone is
-not a create-only change. Adding an element with an authored create-only leaf
-is a create-only change and therefore replaces the resource.
+to semantic schema fingerprint encoding v5.
 
 Every resource schema JSON record also carries the required boolean
 `default_prevent_destroy`. Providers use it for resource kinds whose deletion

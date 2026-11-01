@@ -7360,7 +7360,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v13_wit_surface_compiles() {
+    fn protocol_v14_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::ReferenceScopeValues>();

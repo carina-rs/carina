@@ -21,8 +21,8 @@ use crate::resource::{
     Resource, ResourceId, ResourceIdentity, Value, ValueString,
 };
 use crate::schema::{
-    AttributeType, IdentityPath, IdentityPathSegment, ResourceSchema, SchemaRegistry, Shape,
-    ValidatedResourceSchema,
+    AttributeType, IdentityMode, IdentityPath, IdentityPathSegment, ResourceSchema, SchemaRegistry,
+    Shape, ValidatedResourceSchema,
 };
 use crate::validation::is_string_compatible_type;
 use crate::value::{CanonicalizedProviderConfigs, CanonicalizedResources};
@@ -153,21 +153,25 @@ pub fn generate_random_suffix() -> String {
 /// fields that cannot change in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnonymousIdentityBasis {
-    /// Every declared identity path is set, or (when no identity is declared)
-    /// at least one configured create-only attribute is set, so the normal
-    /// identifier hash is based on immutable input.
+    /// Every declared identity path is complete (including typed
+    /// when-present absence), or (when no identity is declared) at least one
+    /// configured create-only attribute is set, so the normal identifier hash
+    /// is based on immutable input.
     Stable,
     /// No stable schema attribute is set, so the identifier is derived from
     /// mutable user attributes.
     AttributeDerived,
-    /// The schema declares identity paths, but at least one value is absent or
-    /// has no stable value or reference expression at plan time. Anonymous
-    /// resources cannot derive an address from this basis.
+    /// The schema declares identity paths, but at least one required value is
+    /// absent or one written value has no stable value or reference expression
+    /// at plan time. Anonymous resources cannot derive an address from this
+    /// basis.
     IncompleteDeclaredIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum CompleteIdentityValue {
+    /// An optional when-present identity path that was not written at all.
+    Absent,
     /// A user-written value in its schema-canonical spelling.
     Written(String),
     /// An authored expression whose leaves are references or literals. The
@@ -226,13 +230,6 @@ fn top_level_stable_hash_value<S, P: PlaceholderKind>(
             value => format!("Prefix({})", deterministic_value_string(value)),
         })
         .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
-}
-
-fn value_at_identity_path<'a, S, P: PlaceholderKind>(
-    resource: &'a Resource<S, P>,
-    path: &IdentityPath,
-) -> Option<&'a Value<P>> {
-    value_at_identity_path_root(resource.get_attr(path.attribute_name()), path)
 }
 
 fn identity_path_field_names(path: &IdentityPath) -> Vec<String> {
@@ -334,6 +331,11 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind>(value: &Value<P>)
 }
 
 enum IdentityPathInput<'a, P: PlaceholderKind> {
+    /// No value was authored at this path.
+    Absent,
+    /// An ancestor was written, but its plan-time shape is unavailable, so
+    /// the leaf cannot be classified as absent.
+    Unavailable,
     GeneratedPrefix(&'a str),
     AuthoredPrefix(&'a Value<P>),
     Value(&'a Value<P>),
@@ -342,19 +344,44 @@ enum IdentityPathInput<'a, P: PlaceholderKind> {
 fn identity_path_input<'a, S, P: PlaceholderKind>(
     resource: &'a Resource<S, P>,
     path: &IdentityPath,
-) -> Option<IdentityPathInput<'a, P>> {
+) -> IdentityPathInput<'a, P> {
     if path.segments().len() == 1 {
         if let Some(prefix) = resource.prefixes.get(path.attribute_name()) {
-            return Some(IdentityPathInput::GeneratedPrefix(prefix));
+            return IdentityPathInput::GeneratedPrefix(prefix);
         }
         if let Some(prefix) = resource
             .attributes
             .get(&format!("{}_prefix", path.attribute_name()))
         {
-            return Some(IdentityPathInput::AuthoredPrefix(prefix));
+            return IdentityPathInput::AuthoredPrefix(prefix);
         }
     }
-    value_at_identity_path(resource, path).map(IdentityPathInput::Value)
+    let Some(mut value) = resource.get_attr(path.attribute_name()) else {
+        return IdentityPathInput::Absent;
+    };
+    for field in path.struct_fields() {
+        value = match value {
+            Value::Concrete(ConcreteValue::Map(fields)) => {
+                let Some(value) = fields.get(field) else {
+                    return IdentityPathInput::Absent;
+                };
+                value
+            }
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::List(_)
+                | ConcreteValue::StringList(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Duration(_),
+            )
+            | Value::Deferred(_) => return IdentityPathInput::Unavailable,
+        };
+    }
+    IdentityPathInput::Value(value)
 }
 
 fn complete_identity_value<S, P: PlaceholderKind>(
@@ -362,7 +389,13 @@ fn complete_identity_value<S, P: PlaceholderKind>(
     schema: &ValidatedResourceSchema,
     path: &IdentityPath,
 ) -> Option<CompleteIdentityValue> {
-    match identity_path_input(resource, path)? {
+    let names = identity_path_field_names(path);
+    let identity_mode = schema.effective_node_at_path(&names)?.identity_mode();
+    match identity_path_input(resource, path) {
+        IdentityPathInput::Absent if identity_mode.allows_absence() => {
+            Some(CompleteIdentityValue::Absent)
+        }
+        IdentityPathInput::Absent | IdentityPathInput::Unavailable => None,
         IdentityPathInput::GeneratedPrefix(prefix) => {
             Some(CompleteIdentityValue::Prefix(format!("Prefix({prefix:?})")))
         }
@@ -398,7 +431,6 @@ fn complete_identity_value<S, P: PlaceholderKind>(
             ))
         }
         IdentityPathInput::Value(value) if value_has_authored_plan_time_expression(value) => {
-            let names = identity_path_field_names(path);
             let node = schema.effective_node_at_path(&names)?;
             schema_canonical_value_string(value, Some(node.field_type()), schema.as_schema().defs())
                 .map(CompleteIdentityValue::Written)
@@ -494,11 +526,12 @@ fn encode_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
 /// Encoding `v1` is: domain string; provider-entry count followed by sorted
 /// `key,value` UTF-8 strings; identity-path count followed by each path's
 /// segment count, a segment tag (`0` attribute, `1` struct field), its UTF-8
-/// name, a value-kind tag (`0` written, `1` reference expression, `2` literal
-/// prefix, `3` prefix expression), and the deterministic value spelling.
+/// name, and a value-kind tag (`0` written, `1` reference expression, `2`
+/// literal prefix, `3` prefix expression, `4` absent). Kinds `0` through `3`
+/// are followed by the deterministic value spelling; kind `4` has no payload.
 /// Counts and every string's byte length are unsigned 64-bit little-endian
 /// integers. SHA-256 is truncated to its first 32 bits for the existing
-/// eight-hex-character address suffix. Tags `0`, `1`, and `2` are stable and
+/// eight-hex-character address suffix. Tags `0` through `3` are stable and
 /// retain their original encodings.
 fn hash_declared_identity_inputs(
     provider_identity: &BTreeMap<String, String>,
@@ -526,14 +559,25 @@ fn hash_declared_identity_inputs(
                 }
             }
         }
-        let (kind, spelling) = match value {
-            CompleteIdentityValue::Written(value) => (0, value),
-            CompleteIdentityValue::ReferenceExpression(value) => (1, value),
-            CompleteIdentityValue::Prefix(value) => (2, value),
-            CompleteIdentityValue::PrefixExpression(value) => (3, value),
-        };
-        hasher.update([kind]);
-        encode_length_prefixed(&mut hasher, spelling.as_bytes());
+        match value {
+            CompleteIdentityValue::Absent => hasher.update([4]),
+            CompleteIdentityValue::Written(value) => {
+                hasher.update([0]);
+                encode_length_prefixed(&mut hasher, value.as_bytes());
+            }
+            CompleteIdentityValue::ReferenceExpression(value) => {
+                hasher.update([1]);
+                encode_length_prefixed(&mut hasher, value.as_bytes());
+            }
+            CompleteIdentityValue::Prefix(value) => {
+                hasher.update([2]);
+                encode_length_prefixed(&mut hasher, value.as_bytes());
+            }
+            CompleteIdentityValue::PrefixExpression(value) => {
+                hasher.update([3]);
+                encode_length_prefixed(&mut hasher, value.as_bytes());
+            }
+        }
     }
     let digest = hasher.finalize();
     u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 has four bytes"))
@@ -543,8 +587,9 @@ fn hash_declared_identity_inputs(
 ///
 /// Returns `None` when the resource has no schema, so its identity basis is
 /// unknown. Otherwise, the selected policy input values determine whether the
-/// basis is stable. Declared identity is incomplete when any selected value is
-/// absent or has no stable expression at plan time. Authored resource
+/// basis is stable. Declared identity is incomplete when any required selected
+/// value is absent or any written value has no stable expression at plan time.
+/// When-present absence is a complete typed value. Authored resource
 /// references are complete because their expressions, rather than their later
 /// resolved values, enter the hash.
 pub fn classify_anonymous_identity_basis<S, P: PlaceholderKind>(
@@ -2356,7 +2401,9 @@ pub fn compute_anonymous_identifiers_for_test(
 }
 
 /// Compute stable identifiers for anonymous resources (those without ResourceId identity).
-/// Uses create-only properties and provider identity attributes to generate a deterministic hash.
+/// Declared identity paths are the complete resource-side hash input when
+/// present; schemas without them retain the legacy create-only fallback.
+/// Provider identity attributes are included under either rule.
 ///
 /// `identity_attributes_fn` takes a provider name and returns the list of identity attribute names
 /// for that provider (e.g., `["region"]`).
@@ -2985,7 +3032,15 @@ impl DesiredIdentityValues {
         let values = schema
             .identity_paths()
             .iter()
-            .filter_map(|path| match identity_path_input(resource, path)? {
+            .filter_map(|path| match identity_path_input(resource, path) {
+                IdentityPathInput::Absent => {
+                    let names = identity_path_field_names(path);
+                    schema
+                        .effective_node_at_path(&names)
+                        .is_some_and(|node| node.identity_mode() == IdentityMode::WhenPresent)
+                        .then(|| (path.clone(), DesiredCreateOnlyValue::Absent))
+                }
+                IdentityPathInput::Unavailable => None,
                 IdentityPathInput::GeneratedPrefix(prefix) => Some((
                     path.clone(),
                     DesiredCreateOnlyValue::Prefix(prefix.to_string()),
@@ -3066,6 +3121,15 @@ impl DesiredIdentityValues {
                 continue;
             };
             match desired {
+                DesiredCreateOnlyValue::Absent => {
+                    if override_hidden {
+                        override_hidden_attributes.insert(path.attribute_name().to_string());
+                        continue;
+                    }
+                    if state_values.comparable.values.contains_key(path) {
+                        return DeclaredIdentityRowOutcome::Mismatch;
+                    }
+                }
                 DesiredCreateOnlyValue::Unresolved => {
                     desired_unresolved = true;
                     if override_hidden {
@@ -3511,6 +3575,7 @@ impl ResolvedCreateOnlyValue {
 
 /// Whether one configured desired create-only value can be compared yet.
 enum DesiredCreateOnlyValue {
+    Absent,
     Resolved(ResolvedCreateOnlyValue),
     Prefix(String),
     Unresolved,
@@ -3525,6 +3590,7 @@ impl DesiredCreateOnlyValue {
         context: &ComparisonContext<'_>,
     ) -> Option<bool> {
         match self {
+            Self::Absent => Some(false),
             Self::Resolved(desired) => {
                 Some(desired.semantically_equal(state, schema, attribute, context))
             }
@@ -3605,6 +3671,11 @@ fn resolved_subset_match(
     let mut resolved = 0;
     let mut all_match = true;
     for (attribute, desired) in desired_values {
+        if matches!(desired, DesiredCreateOnlyValue::Absent) {
+            resolved += 1;
+            all_match &= !state_values.contains_key(attribute);
+            continue;
+        }
         let Some(matches) = state_values
             .get(attribute)
             .and_then(|state| desired.matches_state(state, schema, attribute, context))
@@ -3654,7 +3725,9 @@ impl DesiredCreateOnlyValues {
         self.values.values().any(|value| {
             matches!(
                 value,
-                DesiredCreateOnlyValue::Resolved(_) | DesiredCreateOnlyValue::Prefix(_)
+                DesiredCreateOnlyValue::Absent
+                    | DesiredCreateOnlyValue::Resolved(_)
+                    | DesiredCreateOnlyValue::Prefix(_)
             )
         })
     }
@@ -3664,7 +3737,9 @@ impl DesiredCreateOnlyValues {
         self.values.values().all(|value| {
             matches!(
                 value,
-                DesiredCreateOnlyValue::Resolved(_) | DesiredCreateOnlyValue::Prefix(_)
+                DesiredCreateOnlyValue::Absent
+                    | DesiredCreateOnlyValue::Resolved(_)
+                    | DesiredCreateOnlyValue::Prefix(_)
             )
         })
     }
@@ -3687,6 +3762,14 @@ impl DesiredCreateOnlyValues {
         let mut matched = 0;
         let mut mismatched = 0;
         for (attribute, desired_value) in &self.values {
+            if matches!(desired_value, DesiredCreateOnlyValue::Absent) {
+                if state_values.values.contains_key(attribute) {
+                    mismatched += 1;
+                } else {
+                    matched += 1;
+                }
+                continue;
+            }
             let Some(state_value) = state_values.values.get(attribute) else {
                 continue;
             };
@@ -3713,6 +3796,9 @@ impl DesiredCreateOnlyValues {
         context: &ComparisonContext<'_>,
     ) -> bool {
         self.values.iter().all(|(attribute, desired)| {
+            if matches!(desired, DesiredCreateOnlyValue::Absent) {
+                return !state_values.values.contains_key(attribute);
+            }
             let Some(state) = state_values.values.get(attribute) else {
                 return false;
             };
@@ -3927,7 +4013,8 @@ pub enum AnonymousIdentifierReconciliationError {
 ///
 /// For schemas with declared identity, this function matches a legacy state
 /// row only when every typed identity-path value recorded in state equals the
-/// desired value. Other create-only values are ignored. For schemas without
+/// desired value. Desired when-present absence matches only absence of that
+/// path in state. Other create-only values are ignored. For schemas without
 /// identity, it retains the historical full/partial create-only matching and
 /// SimHash fallback. Every accepted match returns a resolved move from the old
 /// row to the resource's freshly computed identifier.
