@@ -116,7 +116,7 @@ equal to a bare name.
 What the attributes declare:
 
 - `create_only` means the API cannot change the value in place, so a change replaces the resource.
-- `identity` marks an immutable scalar or enum value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Written values are schema-canonicalized; references and composite expressions over references and literals are hashed by their deterministic authored expressions; generated names hash a separately typed prefix value. An absent value or an expression containing an unknown or unavailable leaf requires the user to write it or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
+- `identity` marks an immutable scalar or enum value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Written values are schema-canonicalized; references and composite expressions over references and literals are hashed by their deterministic authored expressions. Generated-name literal prefixes and authored prefix expressions have separate hash kinds, and prefix expressions are also hashed by their deterministic authored spelling. An absent value or an expression containing an unknown or unavailable leaf requires the user to write it or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
 - `with_default` gives the value the host assumes when the configuration leaves the attribute out.
 - `with_description` shows up in the editor and in the generated docs.
 
@@ -250,15 +250,20 @@ provider-populated `StructField` exposes neither `create_only` nor `identity`.
 
 Every identity component must be declared. For example, a DNS record key needs
 the hosted zone, record name, and record type; marking only the name can make
-two different real-world records collide. Two anonymous resources on the same
-provider route with equal complete identity values are rejected. Give one a
-stable name with `let` when both objects are intentional. Identity declarations
-may be written values, generated-name prefixes, references (including
-references to provider-populated attributes), or composite expressions whose
-leaves are authored references and literals. Carina hashes references and
-expressions by their deterministic authored spelling, not by a value that may
-resolve later. Only an absent identity value, an unknown or unavailable value,
-or an expression containing such a leaf cannot address an anonymous resource.
+two different real-world records collide. Two anonymous resources of the same
+provider resource type with equal complete identity values are rejected, even
+when they use different provider instances, because persisted state keys do not
+include the provider instance. Give one a stable name with `let` when both
+objects are intentional. Identity declarations may be written values,
+generated-name literal prefixes, generated-name prefix expressions, references
+(including references to provider-populated attributes), or composite
+expressions whose leaves are authored references and literals. Carina hashes
+references and expressions, including expressions written through
+`<attribute>_prefix`, by their deterministic authored spelling rather than by a
+value that may resolve later. Literal prefixes, prefix expressions, ordinary
+identity expressions, and written values occupy distinct hash kinds. Only an
+absent identity value, an unknown or unavailable value, or an expression
+containing such a leaf cannot address an anonymous resource.
 A concrete module argument can.
 
 Enum values in the DSL follow the snake_case convention. When the API spells a value differently, map it with `dsl_aliases` (pairs of API value and DSL spelling) or with a `DslTransform` in `to_dsl`, such as `DslTransform::HyphenToUnderscore` for values like `us-east-1`.

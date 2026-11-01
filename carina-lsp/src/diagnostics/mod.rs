@@ -555,7 +555,7 @@ impl DiagnosticEngine {
             ));
             diagnostics.extend(self.loop_anonymous_identity_diagnostics(
                 doc,
-                current_file,
+                merged_current_file.unwrap_or(current_file),
                 merged.unwrap_or(current_file),
                 expanded_identity_graph,
                 base_path,

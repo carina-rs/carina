@@ -4,9 +4,11 @@
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::binding_index::{BindingCompleteness, BindingValueSource, ResolvedBindings};
 use crate::differ::ComparisonContext;
 use crate::effect::ResolvedMove;
 use crate::name_override::NameOverride;
@@ -174,6 +176,10 @@ enum CompleteIdentityValue {
     ReferenceExpression(String),
     /// A generated-name prefix written through `<attribute>_prefix`.
     Prefix(String),
+    /// An authored expression written through `<attribute>_prefix`. Its
+    /// deterministic spelling is hashed independently from an ordinary
+    /// identity expression and from a literal generated-name prefix.
+    PrefixExpression(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -199,12 +205,6 @@ enum AnonymousIdentityInputs {
     DeclaredIdentity(IdentityValues),
     /// The legacy rule, retained byte-for-byte for schemas without identity.
     CreateOnly(BTreeMap<String, String>),
-}
-
-impl AnonymousIdentityInputs {
-    fn is_declared_identity(&self) -> bool {
-        matches!(self, Self::DeclaredIdentity(_))
-    }
 }
 
 fn top_level_stable_hash_value<S, P: PlaceholderKind>(
@@ -332,9 +332,9 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind>(value: &Value<P>)
 }
 
 enum IdentityPathInput<'a, P: PlaceholderKind> {
-    Prefix(&'a str),
+    GeneratedPrefix(&'a str),
+    AuthoredPrefix(&'a Value<P>),
     Value(&'a Value<P>),
-    UnresolvedPrefix,
 }
 
 fn identity_path_input<'a, S, P: PlaceholderKind>(
@@ -343,18 +343,13 @@ fn identity_path_input<'a, S, P: PlaceholderKind>(
 ) -> Option<IdentityPathInput<'a, P>> {
     if path.segments().len() == 1 {
         if let Some(prefix) = resource.prefixes.get(path.attribute_name()) {
-            return Some(IdentityPathInput::Prefix(prefix));
+            return Some(IdentityPathInput::GeneratedPrefix(prefix));
         }
         if let Some(prefix) = resource
             .attributes
             .get(&format!("{}_prefix", path.attribute_name()))
         {
-            return Some(match prefix {
-                Value::Concrete(ConcreteValue::String(prefix)) => {
-                    IdentityPathInput::Prefix(prefix.expose_plaintext())
-                }
-                _ => IdentityPathInput::UnresolvedPrefix,
-            });
+            return Some(IdentityPathInput::AuthoredPrefix(prefix));
         }
     }
     value_at_identity_path(resource, path).map(IdentityPathInput::Value)
@@ -366,9 +361,33 @@ fn complete_identity_value<S, P: PlaceholderKind>(
     path: &IdentityPath,
 ) -> Option<CompleteIdentityValue> {
     match identity_path_input(resource, path)? {
-        IdentityPathInput::Prefix(prefix) => {
+        IdentityPathInput::GeneratedPrefix(prefix) => {
             Some(CompleteIdentityValue::Prefix(format!("Prefix({prefix:?})")))
         }
+        IdentityPathInput::AuthoredPrefix(Value::Concrete(ConcreteValue::String(prefix))) => Some(
+            CompleteIdentityValue::Prefix(format!("Prefix({:?})", prefix.expose_plaintext())),
+        ),
+        IdentityPathInput::AuthoredPrefix(value @ Value::Deferred(_))
+            if value_has_authored_plan_time_expression(value) =>
+        {
+            Some(CompleteIdentityValue::PrefixExpression(
+                deterministic_value_string(value),
+            ))
+        }
+        IdentityPathInput::AuthoredPrefix(
+            Value::Concrete(
+                ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::List(_)
+                | ConcreteValue::Map(_)
+                | ConcreteValue::StringList(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Duration(_),
+            )
+            | Value::Deferred(_),
+        ) => None,
         IdentityPathInput::Value(value @ Value::Deferred(_))
             if value_has_authored_plan_time_expression(value) =>
         {
@@ -382,7 +401,21 @@ fn complete_identity_value<S, P: PlaceholderKind>(
             schema_canonical_value_string(value, Some(node.field_type()), schema.as_schema().defs())
                 .map(CompleteIdentityValue::Written)
         }
-        IdentityPathInput::Value(_) | IdentityPathInput::UnresolvedPrefix => None,
+        IdentityPathInput::Value(
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::List(_)
+                | ConcreteValue::Map(_)
+                | ConcreteValue::StringList(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Duration(_),
+            )
+            | Value::Deferred(_),
+        ) => None,
     }
 }
 
@@ -459,10 +492,12 @@ fn encode_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
 /// Encoding `v1` is: domain string; provider-entry count followed by sorted
 /// `key,value` UTF-8 strings; identity-path count followed by each path's
 /// segment count, a segment tag (`0` attribute, `1` struct field), its UTF-8
-/// name, a value-kind tag (`0` written, `1` reference expression, `2` prefix),
-/// and the deterministic value spelling. Counts and every string's byte length
-/// are unsigned 64-bit little-endian integers. SHA-256 is truncated to its
-/// first 32 bits for the existing eight-hex-character address suffix.
+/// name, a value-kind tag (`0` written, `1` reference expression, `2` literal
+/// prefix, `3` prefix expression), and the deterministic value spelling.
+/// Counts and every string's byte length are unsigned 64-bit little-endian
+/// integers. SHA-256 is truncated to its first 32 bits for the existing
+/// eight-hex-character address suffix. Tags `0`, `1`, and `2` are stable and
+/// retain their original encodings.
 fn hash_declared_identity_inputs(
     provider_identity: &BTreeMap<String, String>,
     identity: &CompleteIdentityValues,
@@ -493,6 +528,7 @@ fn hash_declared_identity_inputs(
             CompleteIdentityValue::Written(value) => (0, value),
             CompleteIdentityValue::ReferenceExpression(value) => (1, value),
             CompleteIdentityValue::Prefix(value) => (2, value),
+            CompleteIdentityValue::PrefixExpression(value) => (3, value),
         };
         hasher.update([kind]);
         encode_length_prefixed(&mut hasher, spelling.as_bytes());
@@ -584,43 +620,98 @@ impl AnonymousResourceKind {
     }
 }
 
+/// Authored source range retained for one anonymous-identity error member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnonymousIdentitySourceLocation {
+    file: PathBuf,
+    span: SourceSpan,
+}
+
+impl AnonymousIdentitySourceLocation {
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    pub fn span(&self) -> SourceSpan {
+        self.span
+    }
+}
+
+/// One concrete declaration represented by a typed anonymous-identity error.
+///
+/// The process-local pending [`ResourceId`] is a system-assigned identity even
+/// before a persistent anonymous address can be computed. Carrying it through
+/// canonicalization lets source-aware callers map the exact declaration
+/// without re-running identity policy on a raw resource shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnonymousIdentityErrorMember {
+    resource_id: ResourceId,
+    source_locations: Vec<AnonymousIdentitySourceLocation>,
+}
+
+impl AnonymousIdentityErrorMember {
+    fn from_resource<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
+        resource: &Resource<S, P>,
+    ) -> Self {
+        let source_locations = if let Some(origin) = resource.loop_provenance.display_origin()
+            && let Some(span) = origin.source_span()
+        {
+            vec![AnonymousIdentitySourceLocation {
+                file: PathBuf::from(origin.file()),
+                span,
+            }]
+        } else {
+            resource
+                .module_source
+                .as_ref()
+                .into_iter()
+                .flat_map(AnonymousIdentityModuleSource::anonymous_authored_locations)
+                .map(|(file, span)| AnonymousIdentitySourceLocation { file, span })
+                .collect()
+        };
+        Self {
+            resource_id: resource.id.clone(),
+            source_locations,
+        }
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn source_locations(&self) -> &[AnonymousIdentitySourceLocation] {
+        &self.source_locations
+    }
+}
+
+fn anonymous_identity_error_members<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
+    resources: &[Resource<S, P>],
+    resource_indices: &[usize],
+) -> Vec<AnonymousIdentityErrorMember> {
+    resource_indices
+        .iter()
+        .map(|&index| AnonymousIdentityErrorMember::from_resource(&resources[index]))
+        .collect()
+}
+
 /// An anonymous resource whose schema-declared identity cannot produce an
 /// address because one or more values have no authored plan-time material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncompleteDeclaredIdentity {
     kind: AnonymousResourceKind,
     missing_paths: Vec<IdentityPath>,
+    members: Vec<AnonymousIdentityErrorMember>,
 }
 
 impl IncompleteDeclaredIdentity {
-    /// Whether this typed failure describes the authored resource. Source-aware
-    /// adapters use this to attach the shared validate/plan message without
-    /// reconstructing identity completeness policy.
-    pub fn includes<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
-        &self,
-        resource: &Resource<S, P>,
-        registry: &SchemaRegistry,
-    ) -> bool {
-        if resource.binding.is_some()
-            || resource.id.identity_str().is_some()
-            || AnonymousResourceKind::of(resource) != self.kind
-        {
-            return false;
-        }
-        let Some(schema) = registry.get_for(resource) else {
-            return false;
-        };
-        matches!(
-            anonymous_identity_inputs(resource, schema.schema()),
-            AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Incomplete {
-                missing_paths
-            }) if missing_paths == self.missing_paths
-        )
-    }
-
     /// Identity paths whose values have no authored plan-time material.
     pub fn missing_paths(&self) -> &[IdentityPath] {
         &self.missing_paths
+    }
+
+    /// Every concrete declaration represented by this grouped failure.
+    pub fn members(&self) -> &[AnonymousIdentityErrorMember] {
+        &self.members
     }
 }
 
@@ -659,7 +750,10 @@ pub fn check_incomplete_declared_identities<
     resources: &[Resource<S, P>],
     registry: &SchemaRegistry,
 ) -> Vec<IncompleteDeclaredIdentity> {
-    let mut failures = BTreeSet::new();
+    let mut failures = BTreeMap::<
+        (AnonymousResourceKind, Vec<IdentityPath>),
+        Vec<AnonymousIdentityErrorMember>,
+    >::new();
     for resource in resources {
         if resource.binding.is_some() || resource.id.identity_str().is_some() {
             continue;
@@ -672,14 +766,20 @@ pub fn check_incomplete_declared_identities<
         else {
             continue;
         };
-        failures.insert((AnonymousResourceKind::of(resource), missing_paths));
+        failures
+            .entry((AnonymousResourceKind::of(resource), missing_paths))
+            .or_default()
+            .push(AnonymousIdentityErrorMember::from_resource(resource));
     }
     failures
         .into_iter()
-        .map(|(kind, missing_paths)| IncompleteDeclaredIdentity {
-            kind,
-            missing_paths,
-        })
+        .map(
+            |((kind, missing_paths), members)| IncompleteDeclaredIdentity {
+                kind,
+                missing_paths,
+                members,
+            },
+        )
         .collect()
 }
 
@@ -828,7 +928,7 @@ pub struct AnonymousResourceIdentifierCollision {
     identifier: String,
     equal_declared_identity: bool,
     same_identifier: bool,
-    origins: Vec<LoopElementOrigin>,
+    members: Vec<AnonymousIdentityErrorMember>,
 }
 
 impl AnonymousResourceIdentifierCollision {
@@ -838,20 +938,30 @@ impl AnonymousResourceIdentifierCollision {
         &self.identifier
     }
 
-    /// Authored loop/module-call origins for generated members of this
-    /// collision. Plain top-level declarations have no loop origin.
-    pub fn origins(&self) -> &[LoopElementOrigin] {
-        &self.origins
+    /// Every concrete declaration participating in this collision.
+    pub fn members(&self) -> &[AnonymousIdentityErrorMember] {
+        &self.members
     }
 }
 
 impl std::fmt::Display for AnonymousResourceIdentifierCollision {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.equal_declared_identity {
+            let first_provider_instance = self
+                .members
+                .first()
+                .and_then(|member| member.resource_id.provider_instance.as_deref());
+            let provider_scope = if self.members.iter().all(|member| {
+                member.resource_id.provider_instance.as_deref() == first_provider_instance
+            }) {
+                "on the same provider route"
+            } else {
+                "across provider instances"
+            };
             if !self.same_identifier {
                 return write!(
                     formatter,
-                    "Anonymous resources of type '{}' on the same provider route have equal \
+                    "Anonymous resources of type '{}' {provider_scope} have equal \
                      declared identity values even though their module-scoped addresses differ. \
                      Give one of them a name with `let`.",
                     self.first_type,
@@ -859,7 +969,7 @@ impl std::fmt::Display for AnonymousResourceIdentifierCollision {
             }
             return write!(
                 formatter,
-                "Anonymous resources of type '{}' on the same provider route have equal declared \
+                "Anonymous resources of type '{}' {provider_scope} have equal declared \
                  identity values and produce address '{}'. Give one of them a name with `let`.",
                 self.first_type, self.identifier,
             );
@@ -2060,23 +2170,7 @@ fn module_name_from_instance_prefix(prefix: &str) -> String {
         .unwrap_or_else(|| "module".to_string())
 }
 
-fn collision_loop_origins<S, P: PlaceholderKind>(
-    resources: &[Resource<S, P>],
-    resource_indices: &[usize],
-) -> Vec<LoopElementOrigin> {
-    let mut origins = Vec::new();
-    for origin in resource_indices
-        .iter()
-        .filter_map(|&index| resources[index].loop_provenance.display_origin().cloned())
-    {
-        if !origins.contains(&origin) {
-            origins.push(origin);
-        }
-    }
-    origins
-}
-
-fn discover_loop_module_prefix_collisions<S, P: PlaceholderKind>(
+fn discover_loop_module_prefix_collisions<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
     resources: &[Resource<S, P>],
 ) -> LoopModuleCollisionDiscovery {
     let mut by_current_prefix = BTreeMap::<String, Vec<(usize, usize)>>::new();
@@ -2140,7 +2234,7 @@ fn discover_loop_module_prefix_collisions<S, P: PlaceholderKind>(
                     identifier: current_prefix.clone(),
                     equal_declared_identity: false,
                     same_identifier: true,
-                    origins: collision_loop_origins(
+                    members: anonymous_identity_error_members(
                         resources,
                         &distinct_origins
                             .iter()
@@ -2424,12 +2518,13 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
         .map(|(index, identity, _)| (*index, identity.clone()))
         .collect::<HashMap<_, _>>();
 
-    // A module-instance prefix is an ownership scope, not part of the
-    // provider's natural key. Detect equal complete declared identities by
-    // type and provider route before grouping ordinary address collisions so
-    // different module-scoped addresses cannot hide the same real-world key.
+    // Neither a module-instance prefix nor a provider-instance route is part
+    // of the persisted state-row key. Detect equal complete declared
+    // identities by provider and resource type before grouping ordinary
+    // address collisions, so different scoped addresses and routes cannot
+    // hide one real-world key that state cannot represent independently.
     let mut declared_identity_groups =
-        BTreeMap::<(String, String, Option<String>, CompleteIdentityValues), Vec<usize>>::new();
+        BTreeMap::<(String, String, CompleteIdentityValues), Vec<usize>>::new();
     for (computed_index, (resource_index, _, inputs)) in computed.iter().enumerate() {
         let AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(values)) = inputs
         else {
@@ -2440,12 +2535,12 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
             .entry((
                 resource.id.provider.clone(),
                 resource.id.resource_type.clone(),
-                resource.id.provider_instance.clone(),
                 values.clone(),
             ))
             .or_default()
             .push(computed_index);
     }
+    let mut reported_declared_identity_groups = Vec::<BTreeSet<usize>>::new();
     for (_, collision_members) in declared_identity_groups {
         if collision_members.len() < 2 {
             continue;
@@ -2470,6 +2565,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
             .iter()
             .any(|&index| resources[index].loop_provenance.direct_origin().is_none());
         if has_direct_member && !has_plain_member {
+            reported_declared_identity_groups
+                .push(collision_members.into_iter().collect::<BTreeSet<_>>());
             continue;
         }
         let first_identifier = &computed[collision_members[0]].1;
@@ -2483,10 +2580,12 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
                 identifier: first_identifier.clone(),
                 equal_declared_identity: true,
                 same_identifier,
-                origins: collision_loop_origins(resources, &resource_indices),
+                members: anonymous_identity_error_members(resources, &resource_indices),
             }
             .into(),
         );
+        reported_declared_identity_groups
+            .push(collision_members.into_iter().collect::<BTreeSet<_>>());
     }
 
     // Detect collisions among identities generated in this pass.
@@ -2499,6 +2598,13 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
     }
     for (identifier, collision_members) in collisions {
         if collision_members.len() < 2 {
+            continue;
+        }
+        if reported_declared_identity_groups.iter().any(|reported| {
+            collision_members
+                .iter()
+                .all(|member| reported.contains(member))
+        }) {
             continue;
         }
         let resource_indices: Vec<usize> = collision_members
@@ -2518,14 +2624,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
             && collision_members
                 .iter()
                 .all(|&computed_index| &computed[computed_index].2 == first_inputs);
-        let equal_declared_identity =
-            identical_stable_inputs && first_inputs.is_declared_identity();
-        if equal_declared_identity {
-            // Complete declared-identity equality was handled above using the
-            // natural key rather than the rendered (possibly module-prefixed)
-            // address.
-            continue;
-        }
         if identical_stable_inputs {
             let mut has_direct_member = false;
             for origin in resource_indices
@@ -2551,9 +2649,9 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
                 first_type: resources[resource_indices[0]].id.display_type(),
                 second_type: resources[resource_indices[1]].id.display_type(),
                 identifier,
-                equal_declared_identity,
+                equal_declared_identity: false,
                 same_identifier: true,
-                origins: collision_loop_origins(resources, &resource_indices),
+                members: anonymous_identity_error_members(resources, &resource_indices),
             }
             .into(),
         );
@@ -2595,7 +2693,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
                 identifier: identity,
                 equal_declared_identity: false,
                 same_identifier: true,
-                origins: collision_loop_origins(resources, &resource_indices),
+                members: anonymous_identity_error_members(resources, &resource_indices),
             }
             .into(),
         );
@@ -2762,8 +2860,20 @@ impl AnonymousIdStateInfo {
 /// different mutable create-only collection from the legacy hash rule. Values
 /// are built only from a complete state row plus its name overrides, which
 /// substitute authored original names for temporary replacement names.
+#[derive(Clone)]
+enum StateRowIdentityValues {
+    Comparable(ComparableStateRowIdentityValues),
+    OverrideOriginUnknown { attributes: BTreeSet<String> },
+}
+
+impl Default for StateRowIdentityValues {
+    fn default() -> Self {
+        Self::Comparable(ComparableStateRowIdentityValues::default())
+    }
+}
+
 #[derive(Clone, Default)]
-pub struct StateRowIdentityValues {
+struct ComparableStateRowIdentityValues {
     values: BTreeMap<IdentityPath, ResolvedCreateOnlyValue>,
 }
 
@@ -2774,14 +2884,32 @@ impl StateRowIdentityValues {
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Self {
         let mut canonical = observed_attributes.clone();
+        let identity_attributes = schema
+            .identity_paths()
+            .iter()
+            .map(|path| path.attribute_name())
+            .collect::<BTreeSet<_>>();
+        let mut unknown_override_origins = BTreeSet::new();
         for (attribute, override_) in name_overrides {
-            let Some(original_value) = &override_.original_value else {
+            if !identity_attributes.contains(attribute.as_str()) {
                 continue;
+            }
+            match &override_.original_value {
+                Some(original_value) => {
+                    canonical.insert(
+                        attribute.clone(),
+                        Value::Concrete(ConcreteValue::String(original_value.clone().into())),
+                    );
+                }
+                None => {
+                    unknown_override_origins.insert(attribute.clone());
+                }
+            }
+        }
+        if !unknown_override_origins.is_empty() {
+            return Self::OverrideOriginUnknown {
+                attributes: unknown_override_origins,
             };
-            canonical.insert(
-                attribute.clone(),
-                Value::Concrete(ConcreteValue::String(original_value.clone().into())),
-            );
         }
         crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
         let values = schema
@@ -2794,7 +2922,7 @@ impl StateRowIdentityValues {
                     .map(|value| (path.clone(), value))
             })
             .collect();
-        Self { values }
+        Self::Comparable(ComparableStateRowIdentityValues { values })
     }
 }
 
@@ -2813,10 +2941,40 @@ impl DesiredIdentityValues {
             .identity_paths()
             .iter()
             .filter_map(|path| match identity_path_input(resource, path)? {
-                IdentityPathInput::Prefix(prefix) => Some((
+                IdentityPathInput::GeneratedPrefix(prefix) => Some((
                     path.clone(),
                     DesiredCreateOnlyValue::Prefix(prefix.to_string()),
                 )),
+                IdentityPathInput::AuthoredPrefix(Value::Concrete(ConcreteValue::String(
+                    prefix,
+                ))) => Some((
+                    path.clone(),
+                    DesiredCreateOnlyValue::Prefix(prefix.expose_plaintext().to_string()),
+                )),
+                IdentityPathInput::AuthoredPrefix(value) => {
+                    let value = resolve_deferred_create_only_value(value, find_state_by_binding)
+                        .and_then(|resolved| match resolved {
+                            Value::Concrete(ConcreteValue::String(prefix)) => {
+                                Some(DesiredCreateOnlyValue::Prefix(
+                                    prefix.expose_plaintext().to_string(),
+                                ))
+                            }
+                            Value::Concrete(
+                                ConcreteValue::Int(_)
+                                | ConcreteValue::Float(_)
+                                | ConcreteValue::Bool(_)
+                                | ConcreteValue::List(_)
+                                | ConcreteValue::Map(_)
+                                | ConcreteValue::StringList(_)
+                                | ConcreteValue::EnumIdentifier(_)
+                                | ConcreteValue::CanonicalEnum(_)
+                                | ConcreteValue::Duration(_),
+                            )
+                            | Value::Deferred(_) => None,
+                        })
+                        .unwrap_or(DesiredCreateOnlyValue::Unresolved);
+                    Some((path.clone(), value))
+                }
                 IdentityPathInput::Value(value) if path.segments().len() == 1 => {
                     let value = canonical_or_resolved_create_only_value(
                         value,
@@ -2836,9 +2994,6 @@ impl DesiredIdentityValues {
                         .unwrap_or(DesiredCreateOnlyValue::Unresolved);
                     Some((path.clone(), value))
                 }
-                IdentityPathInput::UnresolvedPrefix => {
-                    Some((path.clone(), DesiredCreateOnlyValue::Unresolved))
-                }
             })
             .collect();
         Self { values }
@@ -2856,7 +3011,7 @@ impl DesiredIdentityValues {
 
     fn all_match(
         &self,
-        state_values: &StateRowIdentityValues,
+        state_values: &ComparableStateRowIdentityValues,
         schema: &ValidatedResourceSchema,
         context: &ComparisonContext<'_>,
     ) -> bool {
@@ -2886,11 +3041,14 @@ fn legacy_row_stable_identity_matches(
     if !schema.identity_paths().is_empty() {
         let desired_identity =
             DesiredIdentityValues::from_resource(candidate.resource, schema, find_state_by_binding);
-        if !desired_identity.is_complete(schema) || state_entry.identity_values.values.is_empty() {
+        let StateRowIdentityValues::Comparable(state_values) = &state_entry.identity_values else {
+            return Ok(None);
+        };
+        if !desired_identity.is_complete(schema) || state_values.values.is_empty() {
             return Ok(None);
         }
         return Ok(Some(desired_identity.all_match(
-            &state_entry.identity_values,
+            state_values,
             schema,
             comparison.context(),
         )));
@@ -3094,28 +3252,32 @@ fn resolve_deferred_create_only_value(
     value: &Value,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Option<Value> {
-    let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
+    let root_bindings = value.root_bindings();
+    if root_bindings.is_empty() {
         return None;
-    };
-
-    let candidates: Vec<AnonymousIdBindingStateInfo> = find_state_by_binding(path.binding())
-        .into_iter()
-        .filter(|entry| state_entry_matches_binding_scope(path.binding(), &entry.name))
-        .collect();
-    let [entry] = candidates.as_slice() else {
-        return None;
-    };
-    let mut resolved = entry.attribute_values.get(path.attribute()).cloned()?;
-    for segment in path.segments() {
-        resolved = crate::resource::apply_postfix_access(
-            resolved,
-            segment.clone(),
-            0,
-            crate::resource::AccessMissPolicy::Error,
-        )
-        .ok()?;
     }
-    matches!(resolved, Value::Concrete(_)).then_some(resolved)
+    let mut bindings = ResolvedBindings::default();
+    for binding in root_bindings {
+        let candidates = find_state_by_binding(&binding)
+            .into_iter()
+            .filter(|entry| state_entry_matches_binding_scope(&binding, &entry.name))
+            .collect::<Vec<_>>();
+        let [entry] = candidates.as_slice() else {
+            continue;
+        };
+        bindings.set_with_completeness(
+            &binding,
+            entry.attribute_values.clone(),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+    }
+    match crate::resolver::resolve_ref_value_status(value, &bindings).ok()? {
+        crate::resolver::ValueResolution::Present(resolved) => Some(resolved),
+        crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_) => {
+            None
+        }
+    }
 }
 
 fn canonical_or_resolved_create_only_value(
@@ -3559,6 +3721,108 @@ impl std::fmt::Display for AmbiguousDeclaredIdentityMatch {
 
 impl std::error::Error for AmbiguousDeclaredIdentityMatch {}
 
+/// One legacy row whose identity-bearing name override has no recorded
+/// permanent value.
+#[derive(Debug, Clone)]
+pub struct UnknownIdentityOverrideOriginRow {
+    row: ResolvedResourceId,
+    attributes: Vec<String>,
+}
+
+impl UnknownIdentityOverrideOriginRow {
+    pub fn row(&self) -> &ResolvedResourceId {
+        &self.row
+    }
+
+    pub fn attributes(&self) -> &[String] {
+        &self.attributes
+    }
+}
+
+/// Legacy state cannot expose the natural-key value hidden by a temporary
+/// name override, so automatic reconciliation requires operator intent.
+#[derive(Debug, Clone)]
+pub struct UnknownIdentityOverrideOrigin {
+    resource: ResolvedResourceId,
+    candidate_rows: Vec<UnknownIdentityOverrideOriginRow>,
+}
+
+impl UnknownIdentityOverrideOrigin {
+    pub fn resource(&self) -> &ResolvedResourceId {
+        &self.resource
+    }
+
+    pub fn candidate_rows(&self) -> &[UnknownIdentityOverrideOriginRow] {
+        &self.candidate_rows
+    }
+}
+
+impl std::fmt::Display for UnknownIdentityOverrideOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let candidates = self
+            .candidate_rows
+            .iter()
+            .map(|candidate| {
+                let attributes = candidate
+                    .attributes
+                    .iter()
+                    .map(|attribute| format!("`{attribute}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("`{}` ({attributes})", candidate.row)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "Anonymous resource `{}` cannot safely reconcile legacy state because the original \
+             identity value behind a temporary name override was not recorded for {candidates}. \
+             Add a `moved` block to select the intended state row.",
+            self.resource,
+        )
+    }
+}
+
+impl std::error::Error for UnknownIdentityOverrideOrigin {}
+
+/// A complete authored identity expression could not be evaluated from the
+/// available binding state while legacy rows remain eligible for migration.
+#[derive(Debug, Clone)]
+pub struct UnresolvedDeclaredIdentityMigration {
+    resource: ResolvedResourceId,
+    candidate_rows: Vec<ResolvedResourceId>,
+}
+
+impl UnresolvedDeclaredIdentityMigration {
+    pub fn resource(&self) -> &ResolvedResourceId {
+        &self.resource
+    }
+
+    pub fn candidate_rows(&self) -> &[ResolvedResourceId] {
+        &self.candidate_rows
+    }
+}
+
+impl std::fmt::Display for UnresolvedDeclaredIdentityMigration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let candidates = self
+            .candidate_rows
+            .iter()
+            .map(|candidate| format!("`{candidate}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "Anonymous resource `{}` has an authored declared-identity expression that cannot \
+             be evaluated from binding state while unclaimed legacy state rows remain: \
+             {candidates}. Add a `moved` block to select the intended state row.",
+            self.resource,
+        )
+    }
+}
+
+impl std::error::Error for UnresolvedDeclaredIdentityMigration {}
+
 /// Failures that prevent safe anonymous-state reconciliation.
 #[derive(Debug, thiserror::Error)]
 pub enum AnonymousIdentifierReconciliationError {
@@ -3568,6 +3832,12 @@ pub enum AnonymousIdentifierReconciliationError {
     /// More than one legacy row has the same complete declared identity.
     #[error(transparent)]
     AmbiguousDeclaredIdentity(#[from] AmbiguousDeclaredIdentityMatch),
+    /// A candidate row's temporary name override lost its permanent origin.
+    #[error(transparent)]
+    UnknownIdentityOverrideOrigin(#[from] UnknownIdentityOverrideOrigin),
+    /// Authored identity evaluation was impossible while legacy rows remain.
+    #[error(transparent)]
+    UnresolvedDeclaredIdentity(#[from] UnresolvedDeclaredIdentityMigration),
 }
 
 /// Reconcile anonymous resource identifiers with existing state.
@@ -3587,10 +3857,13 @@ pub enum AnonymousIdentifierReconciliationError {
 /// carrying that binding across resource types, for resolving deferred
 /// create-only refs rooted at `binding.attr`, including longer access paths.
 /// Binding resolution is unresolvable when zero state entries match and ambiguous when
-/// multiple state entries with the same binding are visible in scope; both
-/// cases yield no value and are not errors. Dotted bindings are already
-/// module-qualified by their binding string, while bare bindings only resolve
-/// against dot-free root state entry names.
+/// multiple state entries with the same binding are visible in scope. Dotted
+/// bindings are already module-qualified by their binding string, while bare
+/// bindings only resolve against dot-free root state entry names. An
+/// unresolved ordinary create-only value remains eligible for partial-match
+/// reconciliation. An unresolved declared-identity expression instead returns
+/// a typed error when an unclaimed legacy row exists, because silently skipping
+/// that row would turn an address migration into delete plus create.
 /// Binding lookup reads an exact address's attributes; it does not select an
 /// identity to adopt or re-key, so it is not an identity-candidate source.
 /// A configured create-only attribute whose desired value cannot be resolved
@@ -3690,6 +3963,31 @@ pub fn reconcile_anonymous_identifiers(
         };
 
         if !validated_schema.identity_paths().is_empty() {
+            let available_candidates = state_entries
+                .candidates()
+                .filter(|entry| candidate_is_available(entry))
+                .collect::<Vec<_>>();
+            let mut unknown_override_rows = available_candidates
+                .iter()
+                .filter_map(|entry| match &entry.identity_values {
+                    StateRowIdentityValues::Comparable(_) => None,
+                    StateRowIdentityValues::OverrideOriginUnknown { attributes } => {
+                        Some(UnknownIdentityOverrideOriginRow {
+                            row: entry.origin_id().clone(),
+                            attributes: attributes.iter().cloned().collect(),
+                        })
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !unknown_override_rows.is_empty() {
+                unknown_override_rows.sort_by_key(|candidate| candidate.row.to_string());
+                return Err(UnknownIdentityOverrideOrigin {
+                    resource: resolved_resource_id,
+                    candidate_rows: unknown_override_rows,
+                }
+                .into());
+            }
+
             let desired_identity = DesiredIdentityValues::from_resource(
                 resource,
                 validated_schema,
@@ -3697,19 +3995,30 @@ pub fn reconcile_anonymous_identifiers(
             );
 
             if !desired_identity.is_complete(validated_schema) {
+                if !available_candidates.is_empty() {
+                    let mut candidate_rows = available_candidates
+                        .iter()
+                        .map(|entry| entry.origin_id().clone())
+                        .collect::<Vec<_>>();
+                    candidate_rows.sort_by_key(ToString::to_string);
+                    return Err(UnresolvedDeclaredIdentityMigration {
+                        resource: resolved_resource_id,
+                        candidate_rows,
+                    }
+                    .into());
+                }
                 continue;
             }
-            let matches = state_entries
-                .candidates()
-                .filter(|entry| candidate_is_available(entry))
-                .filter(|entry| {
-                    desired_identity.all_match(
-                        &entry.identity_values,
-                        validated_schema,
-                        comparison.context(),
-                    )
-                })
-                .collect::<Vec<_>>();
+            let matches =
+                available_candidates
+                    .iter()
+                    .copied()
+                    .filter(|entry| match &entry.identity_values {
+                        StateRowIdentityValues::Comparable(state_values) => desired_identity
+                            .all_match(state_values, validated_schema, comparison.context()),
+                        StateRowIdentityValues::OverrideOriginUnknown { .. } => false,
+                    })
+                    .collect::<Vec<_>>();
             match matches.as_slice() {
                 [matched_entry] => {
                     moves.push(matched_entry.move_to(resolved_resource_id));

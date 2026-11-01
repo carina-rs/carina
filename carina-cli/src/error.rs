@@ -849,6 +849,16 @@ pub enum AppError {
         #[from] carina_core::identifier::AmbiguousDeclaredIdentityMatch,
     ),
 
+    /// A temporary unique-name override hid the persisted identity origin.
+    #[error(transparent)]
+    UnknownIdentityOverrideOrigin(#[from] carina_core::identifier::UnknownIdentityOverrideOrigin),
+
+    /// A legacy-row migration needs an identity expression that state cannot evaluate.
+    #[error(transparent)]
+    UnresolvedDeclaredIdentityMigration(
+        #[from] carina_core::identifier::UnresolvedDeclaredIdentityMigration,
+    ),
+
     /// A module argument constraint became decidable during an operation.
     #[error(transparent)]
     ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
@@ -1184,6 +1194,12 @@ impl From<carina_core::identifier::AnonymousIdentifierReconciliationError> for A
             carina_core::identifier::AnonymousIdentifierReconciliationError::AmbiguousDeclaredIdentity(
                 error,
             ) => Self::AnonymousIdentifierReconciliation(error),
+            carina_core::identifier::AnonymousIdentifierReconciliationError::UnknownIdentityOverrideOrigin(
+                error,
+            ) => Self::UnknownIdentityOverrideOrigin(error),
+            carina_core::identifier::AnonymousIdentifierReconciliationError::UnresolvedDeclaredIdentity(
+                error,
+            ) => Self::UnresolvedDeclaredIdentityMigration(error),
         }
     }
 }

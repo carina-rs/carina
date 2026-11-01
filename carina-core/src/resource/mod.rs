@@ -8071,6 +8071,8 @@ pub trait AnonymousIdentityModuleSource {
     fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity>;
 
     fn anonymous_scope(&self) -> Option<(String, String)>;
+
+    fn anonymous_authored_locations(&self) -> Vec<(PathBuf, crate::parser::SourceSpan)>;
 }
 
 impl AnonymousIdentityModuleSource for ModuleSource {
@@ -8081,6 +8083,17 @@ impl AnonymousIdentityModuleSource for ModuleSource {
     fn anonymous_scope(&self) -> Option<(String, String)> {
         self.identity_scope()
             .map(|scope| (scope.key().to_string(), scope.description()))
+    }
+
+    fn anonymous_authored_locations(&self) -> Vec<(PathBuf, crate::parser::SourceSpan)> {
+        match self {
+            Self::Root => Vec::new(),
+            Self::Module(module) => module
+                .module_call_path()
+                .calls()
+                .map(|call| (call.id.source_file().to_path_buf(), call.id.call_span()))
+                .collect(),
+        }
     }
 }
 
@@ -8108,6 +8121,10 @@ impl AnonymousIdentityModuleSource for SavedModuleSource {
             )),
         }
     }
+
+    fn anonymous_authored_locations(&self) -> Vec<(PathBuf, crate::parser::SourceSpan)> {
+        Vec::new()
+    }
 }
 
 impl AnonymousIdentityModuleSource for ProviderModuleSource {
@@ -8116,6 +8133,10 @@ impl AnonymousIdentityModuleSource for ProviderModuleSource {
     }
 
     fn anonymous_scope(&self) -> Option<(String, String)> {
+        match *self {}
+    }
+
+    fn anonymous_authored_locations(&self) -> Vec<(PathBuf, crate::parser::SourceSpan)> {
         match *self {}
     }
 }

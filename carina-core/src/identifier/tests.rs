@@ -302,6 +302,21 @@ fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Vec<ResolvedMove> {
+    try_reconcile_anonymous_identifiers(
+        resources,
+        registry,
+        find_state_by_type,
+        find_state_by_binding,
+    )
+    .expect("anonymous reconciliation comparison fixture must resolve")
+}
+
+fn try_reconcile_anonymous_identifiers(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+) -> Result<Vec<ResolvedMove>, AnonymousIdentifierReconciliationError> {
     let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
         registry,
         resources.iter().map(|resource| &resource.id),
@@ -324,7 +339,6 @@ fn reconcile_anonymous_identifiers(
         find_state_by_binding,
         &claims,
     )
-    .expect("anonymous reconciliation comparison fixture must resolve")
 }
 
 fn resolved_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)> {
@@ -854,6 +868,25 @@ fn written_and_prefix_identity_spellings_do_not_collide() {
 }
 
 #[test]
+fn declared_identity_prefix_expression_hashes_by_spelling_with_distinct_kind() {
+    let registry = scalar_identity_registry();
+    let reference = || Value::resource_ref("prefix_source", "value", Vec::new());
+    let mut direct = Resource::pending_with_provider("mock", "test.resource", None);
+    direct.set_attr("name", reference());
+    let mut prefixed = Resource::pending_with_provider("mock", "test.resource", None);
+    prefixed.set_attr("name_prefix", reference());
+    let mut resources = vec![direct, prefixed];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("an authored prefix expression is a complete identity input");
+
+    assert_ne!(
+        resources[0].id, resources[1].id,
+        "an identity value expression and prefix expression need distinct hash tags",
+    );
+}
+
+#[test]
 fn named_resource_is_unaffected_by_missing_declared_identity() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -997,6 +1030,33 @@ fn equal_declared_identity_values_are_a_typed_error_suggesting_let() {
         error
             .to_string()
             .contains("Give one of them a name with `let`"),
+        "{error}",
+    );
+}
+
+#[test]
+fn equal_declared_identity_values_are_rejected_across_provider_instances() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let resource = |provider_instance: Option<&str>| {
+        let mut resource = budget_resource(Some("monthly"), "actual");
+        resource.id.provider_instance = provider_instance.map(str::to_string);
+        resource
+    };
+    let mut resources = vec![resource(None), resource(Some("west"))];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("state-key aliases across provider instances must be rejected");
+
+    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    assert!(
+        error.to_string().contains("equal declared identity values"),
         "{error}",
     );
 }
@@ -2745,9 +2805,87 @@ fn state_row_identity_values_use_the_original_permanent_name_override() {
         )]),
     );
     let context = crate::differ::exact_comparison_context_for_tests();
+    let StateRowIdentityValues::Comparable(without_override) = without_override else {
+        panic!("a row without an override must remain comparable");
+    };
+    let StateRowIdentityValues::Comparable(with_override) = with_override else {
+        panic!("a row with a recorded override origin must remain comparable");
+    };
 
     assert!(!desired_values.all_match(&without_override, &schema, &context));
     assert!(desired_values.all_match(&with_override, &schema, &context));
+}
+
+#[test]
+fn reconcile_unknown_name_override_origin_requires_an_explicit_moved_block() {
+    let schema = ResourceSchema::new("test.unique_identity")
+        .attribute(
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .with_unique_name_attribute("name")
+        .validate()
+        .expect("schema fixture must be valid");
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+
+    let mut desired = Resource::with_provider(
+        "mock",
+        "test.unique_identity",
+        "mock_test_unique_identity_22222222",
+        None,
+    );
+    desired.set_attr("name", concrete_string("role"));
+
+    let origin_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.unique_identity",
+        "mock_test_unique_identity_11111111",
+        None,
+    );
+    let state_entry = AnonymousIdStateInfo::try_from_state_row(
+        origin_id,
+        None,
+        registry
+            .get(
+                "mock",
+                "test.unique_identity",
+                crate::schema::SchemaKind::Resource,
+            )
+            .expect("registered schema")
+            .schema(),
+        &HashMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]),
+        &HashMap::from([(
+            "name".to_string(),
+            crate::name_override::NameOverride {
+                temp_value: "role-a1b2c3d4".to_string(),
+                original_value: None,
+            },
+        )]),
+    )
+    .expect("state fixture is comparable by provider and type");
+
+    let error = try_reconcile_anonymous_identifiers(
+        &[desired],
+        &registry,
+        &|_provider, _resource_type| vec![state_entry.clone()],
+        &|_binding| Vec::new(),
+    )
+    .expect_err("an unknown override origin must not silently become delete plus create");
+
+    let AnonymousIdentifierReconciliationError::UnknownIdentityOverrideOrigin(error) = error else {
+        panic!("expected typed unknown override-origin error, got {error}");
+    };
+    assert_eq!(error.candidate_rows().len(), 1);
+    assert_eq!(error.candidate_rows()[0].attributes(), ["name"]);
+    let message = error.to_string();
+    assert!(
+        message.contains("mock_test_unique_identity_11111111"),
+        "{message}",
+    );
+    assert!(message.contains("moved"), "{message}");
 }
 
 #[test]
@@ -3391,6 +3529,92 @@ fn reconcile_identity_declared_address_migration_matches_nested_state_identity()
         resolved_move_identity_pairs(&moves),
         vec![(old_address.to_string(), destination)],
     );
+}
+
+#[test]
+fn reconcile_declared_identity_migration_evaluates_interpolation_over_state_backed_reference() {
+    let registry = scalar_identity_registry();
+    let mut desired = Resource::pending_with_provider("mock", "test.resource", None);
+    desired.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::resource_ref("zone", "name", Vec::new())),
+            InterpolationPart::Literal("-x".into()),
+        ])),
+    );
+    let mut desired = vec![desired];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("authored interpolation must have an address before migration");
+    let destination = desired[0]
+        .id
+        .identity_str()
+        .expect("computed destination")
+        .to_string();
+    let legacy = "mock_test_resource_11111111";
+    let state_entries = vec![anonymous_state_entry(
+        &registry,
+        "mock",
+        "test.resource",
+        legacy,
+        None,
+        None,
+        [("name", concrete_string("example-x"))],
+    )];
+    let binding_entries = [binding_state_entry("zone", "zone", &[("name", "example")])];
+
+    let moves = reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|binding| binding_state_entries_for(&binding_entries, binding),
+    );
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(legacy.to_string(), destination)],
+    );
+}
+
+#[test]
+fn reconcile_unresolved_declared_identity_with_legacy_candidate_requires_moved() {
+    let registry = scalar_identity_registry();
+    let mut desired = Resource::pending_with_provider("mock", "test.resource", None);
+    desired.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::resource_ref("missing_zone", "name", Vec::new())),
+            InterpolationPart::Literal("-x".into()),
+        ])),
+    );
+    let mut desired = vec![desired];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("authored interpolation must have an address before migration");
+    let legacy = "mock_test_resource_11111111";
+    let state_entries = vec![anonymous_state_entry(
+        &registry,
+        "mock",
+        "test.resource",
+        legacy,
+        None,
+        None,
+        [("name", concrete_string("example-x"))],
+    )];
+
+    let error = try_reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    )
+    .expect_err("an unresolved identity with an unclaimed legacy row needs an explicit move");
+
+    let AnonymousIdentifierReconciliationError::UnresolvedDeclaredIdentity(error) = error else {
+        panic!("expected typed unresolved declared-identity error, got {error}");
+    };
+    assert_eq!(error.candidate_rows().len(), 1);
+    let message = error.to_string();
+    assert!(message.contains(legacy), "{message}");
+    assert!(message.contains("moved"), "{message}");
 }
 
 #[test]
