@@ -7304,13 +7304,22 @@ fn projected_moved_binding_resolves_for_anonymous_to_named_detection() {
     );
     let mut desired = desired_route("nat", projected_binding);
     desired.binding = Some(absolute_binding("nat"));
-    let resources = vec![desired];
+    let mut declared_target = Resource::from_id(target.as_inner().clone());
+    declared_target.binding = Some(absolute_binding(projected_binding));
+    let resources = vec![declared_target, desired];
     let candidates = resources
         .iter()
         .map(|resource| resource.id.clone())
         .collect();
     let state_view =
         AnonymousReconciliationStateView::new(&ctx, &state_file, &[(source, target)], &resources);
+    assert_eq!(
+        state_view
+            .entries_by_binding(&claims, projected_binding)
+            .len(),
+        1,
+        "the declared target must supply the moved row's typed binding",
+    );
 
     let detection = detect_anonymous_to_named_moves_with_ctx(
         &ctx,
@@ -7366,8 +7375,21 @@ fn projected_removed_origin_is_hidden_from_type_candidates_and_binding_resolutio
         .collect(),
         HashSet::new(),
     );
-    let state_view =
-        AnonymousReconciliationStateView::new(&ctx, &state_file, &[(origin, projected)], &[]);
+    let mut declared_target = Resource::from_id(projected.as_inner().clone());
+    declared_target.binding = Some(absolute_binding(projected_binding));
+    let state_view = AnonymousReconciliationStateView::new(
+        &ctx,
+        &state_file,
+        &[(origin, projected)],
+        &[declared_target],
+    );
+    assert_eq!(
+        state_view
+            .entries_by_binding(&StateBlockClaims::default(), projected_binding)
+            .len(),
+        1,
+        "the projected row must be indexed before removal claims hide it",
+    );
 
     assert!(
         state_view

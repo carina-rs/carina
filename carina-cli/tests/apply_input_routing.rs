@@ -289,10 +289,11 @@ fn apply_reports_empty_saved_plan_binding_with_file_path_and_recovery() {
     assert!(!output.status.success(), "corrupted plan must fail");
     assert!(
         stderr.contains("empty-binding.plan.json")
-            && stderr.contains(&expected_location)
-            && stderr.contains("binding address is empty")
+            && stderr.contains(&format!("at JSON location {expected_location}"))
+            && stderr.contains("an absolute binding address cannot be empty")
             && stderr.contains("corrupted or hand-edited")
-            && stderr.contains("regenerate the plan"),
+            && stderr.contains("regenerate the plan")
+            && stderr.contains("plan --out"),
         "saved-plan error must be located and actionable:\n{stderr}",
     );
 }

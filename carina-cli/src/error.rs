@@ -593,15 +593,7 @@ impl std::fmt::Display for PlanFileJsonError {
         } else {
             &self.json_path
         };
-        if self
-            .source
-            .to_string()
-            .contains("binding address cannot be empty")
-        {
-            write!(f, "JSON location {path}: the binding address is empty")
-        } else {
-            write!(f, "JSON location {path}")
-        }
+        write!(f, "{} at JSON location {path}", self.source)
     }
 }
 
@@ -1783,20 +1775,37 @@ mod tests {
     fn corrupt_plan_file_retains_located_serde_source_chain() {
         let source = serde_json::from_value::<Vec<serde_json::Value>>(serde_json::json!({}))
             .expect_err("fixture must not match the expected structure");
+        let source_detail = source.to_string();
+        let located_error = PlanFileJsonError::at_root(source);
+        let located_detail = format!("{source_detail} at JSON location <root>");
+        assert_eq!(located_error.to_string(), located_detail);
+        assert_eq!(located_error.json_path(), ".");
+        assert_eq!(located_error.classify(), serde_json::error::Category::Data);
         let app_err = AppError::corrupt_plan_file(
             PathBuf::from("reviewed-plan"),
             Some("replan command".to_string()),
-            PlanFileJsonError::at_root(source),
+            located_error,
         );
 
         let rendered = format_error_with_source_chain(&app_err);
-        assert_eq!(rendered.matches("invalid type").count(), 1, "{rendered}");
+        // The location wrapper now includes the terminal detail itself, while
+        // retaining serde as its typed source. Render each typed layer once.
+        assert_eq!(
+            rendered,
+            format!("{app_err}\n{located_detail}\n{source_detail}"),
+        );
+        assert!(rendered.contains("reviewed-plan"));
+        assert!(rendered.contains("replan command"));
+        assert!(rendered.contains("regenerate the plan"));
         let located = std::error::Error::source(&app_err)
-            .expect("corrupt plan must retain the located decode error");
-        assert!(located.downcast_ref::<PlanFileJsonError>().is_some());
+            .and_then(|source| source.downcast_ref::<PlanFileJsonError>())
+            .expect("corrupt plan must retain the typed located decode error");
+        let serde_source = std::error::Error::source(located)
+            .and_then(|source| source.downcast_ref::<serde_json::Error>())
+            .expect("serde error must remain typed and chained");
         assert!(
-            located.source().is_some(),
-            "serde error must remain chained"
+            std::ptr::eq(serde_source, located.serde_error()),
+            "the serde accessor must expose the original chained error",
         );
     }
 

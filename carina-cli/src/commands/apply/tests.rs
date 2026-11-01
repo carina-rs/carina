@@ -1773,10 +1773,26 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         )
         .await
         .expect_err("an invalid saved composition path must reject the plan");
+        let rendered = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            rendered.contains(expected_detail)
+                && rendered.contains(&plan_path.display().to_string())
+                && rendered
+                    .contains("JSON location compositions[0].origin_id.root.source_file.path")
+                && rendered.contains("corrupted or hand-edited")
+                && rendered.contains("regenerate the plan")
+                && rendered.contains("plan --out"),
+            "{case}: corrupt-plan diagnostic must be located and actionable: {rendered}",
+        );
         let AppError::CorruptPlanFile(error) = error else {
             panic!("{case}: expected typed corrupt-plan error, got {error:?}");
         };
         let error = error.json_error();
+        assert_eq!(
+            error.json_path(),
+            "compositions[0].origin_id.root.source_file.path",
+            "{case}: path validation must retain its JSON location",
+        );
         assert_eq!(
             error.classify(),
             serde_json::error::Category::Data,
@@ -10513,7 +10529,7 @@ mod saved_plan_version_tests {
         .await;
 
         let error = result.expect_err("malformed current-version plan must be rejected");
-        let message = error.to_string();
+        let message = crate::error::format_error_with_source_chain(&error);
         assert!(
             message.contains("The plan file may be corrupted. Re-run"),
             "current-version structural errors must be reported as corruption: {message}",
@@ -10678,7 +10694,8 @@ mod saved_plan_version_tests {
         )
         .await;
 
-        result.expect_err(expectation).to_string()
+        let error = result.expect_err(expectation);
+        crate::error::format_error_with_source_chain(&error)
     }
 
     fn replace_first_resource_identity(value: &mut serde_json::Value, identity: &str) -> bool {
