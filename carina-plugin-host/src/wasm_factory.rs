@@ -6928,12 +6928,7 @@ impl Provider for WasmProvider {
                 })
                 .await?;
             let results = result.map_err(wasm_convert::wit_to_core_provider_error)?;
-            wasm_convert::decode_reference_results(requests.len(), results).map_err(|error| {
-                ProviderError::invalid_input_caused_by(
-                    "Invalid reference resolution response",
-                    error,
-                )
-            })
+            Ok(wasm_convert::decode_reference_results(results))
         })
     }
 

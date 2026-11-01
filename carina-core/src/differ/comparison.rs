@@ -9,8 +9,8 @@ use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::resource::{
     ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
-    InterpolationPart, ResolvedIgnoreChanges, SavedValueViews, Value, ValueString,
-    merge_with_saved, value_at_leaf,
+    InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews, Value,
+    ValueString, merge_with_saved, value_at_leaf,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, DslTransform,
@@ -33,10 +33,12 @@ pub struct ComparisonSchema<'a> {
 pub struct ComparisonContext<'a, R: ReferenceEquality> {
     schema: ComparisonSchema<'a>,
     references: R,
+    path: &'a str,
 }
 
 pub type PlanningComparison<'a> = ComparisonContext<'a, PlanningEquality<'a>>;
 pub type ObservationComparison<'a> = ComparisonContext<'a, ObservationEquality>;
+pub type AuthoringComparison<'a> = ComparisonContext<'a, AuthoringEquality<'a>>;
 pub(crate) type SavedPlanComparison<'a> = ComparisonContext<'a, DisplayEquality>;
 
 mod sealed {
@@ -46,7 +48,7 @@ mod sealed {
 /// A closed set of policies for shared structural comparison helpers.
 pub trait ReferenceEquality: sealed::Sealed + std::fmt::Debug + Copy {
     #[doc(hidden)]
-    fn equal(&self, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool;
+    fn equal(&self, path: &str, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +58,15 @@ pub struct PlanningEquality<'a>(&'a ReferenceComparisonSession<'a>);
 #[derive(Debug, Clone, Copy)]
 pub struct ObservationEquality;
 
+/// Reuse prepared identities solely for authoring correspondence during state
+/// writeback. Missing evidence stays unequal and never blocks persistence of
+/// a provider operation that has already completed.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthoringEquality<'a> {
+    references: Option<&'a crate::references::ResolvedReferences>,
+    resource: &'a crate::resource::ResourceId,
+}
+
 /// Byte equality for rendering recorded effects. This policy cannot enter a
 /// planning API and never resolves references or changes recorded effects.
 #[derive(Debug, Clone, Copy)]
@@ -63,11 +74,16 @@ pub(crate) struct DisplayEquality;
 
 impl sealed::Sealed for PlanningEquality<'_> {}
 impl sealed::Sealed for ObservationEquality {}
+impl sealed::Sealed for AuthoringEquality<'_> {}
 impl sealed::Sealed for DisplayEquality {}
 
 impl ReferenceEquality for PlanningEquality<'_> {
-    fn equal(&self, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
-        match self.0.references.equal(self.0.resource, identity, a, b) {
+    fn equal(&self, path: &str, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+        match self
+            .0
+            .references
+            .equal(self.0.resource, path, identity, a, b)
+        {
             Ok(equal) => equal,
             Err(error) => {
                 self.0.error.borrow_mut().get_or_insert(error);
@@ -78,13 +94,23 @@ impl ReferenceEquality for PlanningEquality<'_> {
 }
 
 impl ReferenceEquality for ObservationEquality {
-    fn equal(&self, _: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+    fn equal(&self, _: &str, _: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
         a == b
     }
 }
 
+impl ReferenceEquality for AuthoringEquality<'_> {
+    fn equal(&self, path: &str, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+        self.references.map_or(a == b, |references| {
+            references
+                .equal(self.resource, path, identity, a, b)
+                .unwrap_or(false)
+        })
+    }
+}
+
 impl ReferenceEquality for DisplayEquality {
-    fn equal(&self, _: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+    fn equal(&self, _: &str, _: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
         a == b
     }
 }
@@ -124,6 +150,22 @@ impl<'a> ComparisonSchema<'a> {
         ComparisonContext {
             schema: self,
             references: ObservationEquality,
+            path: "",
+        }
+    }
+
+    pub fn authoring<'r>(
+        &'r self,
+        references: Option<&'r crate::references::ResolvedReferences>,
+        resource: &'r crate::resource::ResourceId,
+    ) -> AuthoringComparison<'r> {
+        ComparisonContext {
+            schema: *self,
+            references: AuthoringEquality {
+                references,
+                resource,
+            },
+            path: "",
         }
     }
 
@@ -144,6 +186,7 @@ impl<'a> ComparisonSchema<'a> {
         let context = ComparisonContext {
             schema: *self,
             references: PlanningEquality(&session),
+            path: "",
         };
         let result = compare(&context);
         match session.error.into_inner() {
@@ -159,6 +202,7 @@ impl<'a> ComparisonSchema<'a> {
         compare(ComparisonContext {
             schema: *self,
             references: DisplayEquality,
+            path: "",
         })
     }
 }
@@ -170,7 +214,71 @@ impl<'a> ObservationComparison<'a> {
     }
 }
 
+impl PlanningComparison<'_> {
+    pub(crate) fn prepared_references(&self) -> &crate::references::ResolvedReferences {
+        self.references.0.references
+    }
+}
+
 impl<R: ReferenceEquality> ComparisonContext<'_, R> {
+    pub(crate) fn at_path<'p>(&'p self, path: &'p str) -> ComparisonContext<'p, R> {
+        ComparisonContext {
+            schema: self.schema,
+            references: self.references,
+            path,
+        }
+    }
+
+    pub(crate) fn field_path(&self, field: &str) -> String {
+        if self.path.is_empty() {
+            field.into()
+        } else {
+            format!("{}.{field}", self.path)
+        }
+    }
+
+    pub(crate) fn index_path(&self, index: usize) -> String {
+        format!("{}[{index}]", self.path)
+    }
+
+    pub(crate) fn map_key_path(&self, key: &str) -> String {
+        format!(
+            "{}[{}]",
+            self.path,
+            crate::parser::display_string_literal(key)
+        )
+    }
+
+    pub(crate) fn entry_path(
+        &self,
+        key: &str,
+        ty: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> String {
+        if matches!(
+            ty.map(|ty| ty.shape_with_defs(defs)),
+            Some(crate::schema::Shape::Map { .. })
+        ) {
+            self.map_key_path(key)
+        } else {
+            self.field_path(key)
+        }
+    }
+
+    pub(crate) fn leaf_path(&self, leaf: &LeafPath) -> String {
+        let mut path = self.path.to_string();
+        for segment in leaf.segments() {
+            path = match segment {
+                crate::schema::LeafPathSegment::StructField(name) => format!("{path}.{name}"),
+                crate::schema::LeafPathSegment::MapKey(key) => {
+                    format!("{path}[{}]", crate::parser::display_string_literal(key))
+                }
+                crate::schema::LeafPathSegment::ListIndex(index) => format!("{path}[{index}]"),
+            };
+        }
+        path
+    }
+
     fn reference_form(&self, identity: &TypeIdentity) -> Option<&ReferenceForm> {
         self.schema.reference_forms.get(identity)
     }
@@ -349,7 +457,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                     pattern: _,
                     length: _,
                 },
-            ) => context.references.equal(identity, a, b),
+            ) => context.references.equal(context.path, identity, a, b),
 
             // Lists: ordered or multiset comparison with inner type awareness
             (
@@ -548,9 +656,15 @@ fn type_aware_lists_equal<R: ReferenceEquality>(
     }
     if ordered {
         // Sequential comparison: element order matters
-        a.iter()
-            .zip(b.iter())
-            .all(|(va, vb)| type_aware_equal(va, vb, inner, defs, context))
+        a.iter().enumerate().zip(b.iter()).all(|((index, va), vb)| {
+            type_aware_equal(
+                va,
+                vb,
+                inner,
+                defs,
+                &context.at_path(&context.index_path(index)),
+            )
+        })
     } else {
         // Multiset comparison: order-insensitive
         let (matched_a, mut matched) = crate::resource::match_equal_concrete_items(a, b);
@@ -560,7 +674,15 @@ fn type_aware_lists_equal<R: ReferenceEquality>(
             }
             let mut found = false;
             for (j, item_b) in b.iter().enumerate() {
-                if !matched[j] && type_aware_equal(item_a, item_b, inner, defs, context) {
+                if !matched[j]
+                    && type_aware_equal(
+                        item_a,
+                        item_b,
+                        inner,
+                        defs,
+                        &context.at_path(&context.index_path(i)),
+                    )
+                {
                     matched[j] = true;
                     found = true;
                     break;
@@ -590,7 +712,15 @@ where
     }
     a.iter().all(|(k, va)| {
         b.get(k)
-            .map(|vb| type_aware_equal(va, vb, get_type(k), defs, context))
+            .map(|vb| {
+                type_aware_equal(
+                    va,
+                    vb,
+                    get_type(k),
+                    defs,
+                    &context.at_path(&context.map_key_path(k)),
+                )
+            })
             .unwrap_or(false)
     })
 }
@@ -617,7 +747,13 @@ fn type_aware_struct_equal<R: ReferenceEquality>(
     for (k, va) in a {
         match b.get(k) {
             Some(vb) => {
-                if !type_aware_equal(va, vb, field_types.get(k.as_str()).copied(), defs, context) {
+                if !type_aware_equal(
+                    va,
+                    vb,
+                    field_types.get(k.as_str()).copied(),
+                    defs,
+                    &context.at_path(&context.field_path(k)),
+                ) {
                     return false;
                 }
             }
@@ -914,10 +1050,10 @@ pub(crate) fn key_should_enter_patch_with_ignores<R: ReferenceEquality>(
             leaf_provenance,
             cmp,
             ignore_changes,
-            context,
+            &context.at_path(key),
         );
     }
-    should_patch_attr(cmp, context)
+    should_patch_attr(cmp, &context.at_path(key))
 }
 
 fn nested_write_only_should_enter_patch<R: ReferenceEquality>(
@@ -985,7 +1121,7 @@ fn nested_write_only_should_enter_patch<R: ReferenceEquality>(
                                         &saved,
                                         Some(field_type),
                                         &schema.defs,
-                                        context,
+                                        &context.at_path(&context.leaf_path(path)),
                                     )
                                 })
                         },
@@ -1141,13 +1277,14 @@ pub(super) struct AttributeChanges {
 }
 
 pub(super) struct AttributeValueViews<'a> {
+    masked: &'a MaskedComparisonAttributes,
     desired: &'a CanonicalComparisonAttributes,
     current: &'a CanonicalComparisonAttributes,
-    saved: Option<&'a CanonicalComparisonAttributes>,
     nested_write_only: &'a NestedWriteOnlyRecord,
 }
 
-pub(super) struct AuthoredAttributeViews {
+pub(super) struct AuthoredAttributeViews<'a> {
+    masked: &'a MaskedComparisonAttributes,
     current: CanonicalComparisonAttributes,
     saved: Option<CanonicalComparisonAttributes>,
     removal_evidence: AuthoredRemovalEvidence,
@@ -1160,13 +1297,17 @@ pub(super) enum AuthoredRemovalEvidence {
     Unrecorded,
 }
 
-impl AuthoredAttributeViews {
+impl AuthoredAttributeViews<'_> {
     pub(super) fn current(&self) -> &CanonicalComparisonAttributes {
         &self.current
     }
 
     pub(super) fn removal_evidence(&self) -> AuthoredRemovalEvidence {
         self.removal_evidence
+    }
+
+    pub(super) fn desired(&self) -> &CanonicalComparisonAttributes {
+        self.masked.desired()
     }
 }
 
@@ -1176,14 +1317,14 @@ impl AuthoredAttributeViews {
 /// create-only replacement detection. A provider-populated value that the user
 /// never authored is absent from both projected views, while a previously
 /// authored value remains visible when desired omits it.
-pub(super) fn project_authored_attribute_views<R: ReferenceEquality>(
-    desired: &CanonicalComparisonAttributes,
-    current: &CanonicalComparisonAttributes,
-    saved: Option<&CanonicalComparisonAttributes>,
+pub(super) fn project_authored_attribute_views<'a, R: ReferenceEquality>(
+    masked: &'a MaskedComparisonAttributes,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_, R>,
-) -> AuthoredAttributeViews {
+) -> AuthoredAttributeViews<'a> {
+    let current = masked.current();
+    let saved = masked.saved();
     let (removal_evidence, previously_authored_top_level_attributes) = match prev_explicit {
         Some(ExplicitFields::Struct { children }) => (
             AuthoredRemovalEvidence::Recorded,
@@ -1198,35 +1339,18 @@ pub(super) fn project_authored_attribute_views<R: ReferenceEquality>(
         )
         | None => (AuthoredRemovalEvidence::Unrecorded, Vec::new()),
     };
-    let empty_stored = CanonicalComparisonAttributes::default();
-    let projection = prev_explicit.map(|explicit| {
-        ExplicitProjection::for_desired(
-            saved.unwrap_or(&empty_stored),
-            desired,
-            explicit,
-            schema,
-            context,
-        )
-    });
+    let projection = prev_explicit
+        .map(|explicit| ExplicitProjection::for_desired(masked, explicit, schema, context));
     let current = projection.as_ref().map_or_else(
         || current.clone(),
-        |projection| {
-            projection
-                .project_attributes(current.clone())
-                .into_attributes()
-        },
+        |projection| projection.current().into_attributes(),
     );
-    let saved = saved.map(|saved| {
-        projection.as_ref().map_or_else(
-            || saved.clone(),
-            |projection| {
-                projection
-                    .project_attributes(saved.clone())
-                    .into_attributes()
-            },
-        )
-    });
+    let saved = projection.as_ref().map_or_else(
+        || saved.cloned(),
+        |projection| projection.saved().map(|saved| saved.into_attributes()),
+    );
     AuthoredAttributeViews {
+        masked,
         current,
         saved,
         removal_evidence,
@@ -1236,15 +1360,15 @@ pub(super) fn project_authored_attribute_views<R: ReferenceEquality>(
 
 impl<'a> AttributeValueViews<'a> {
     pub(super) fn new(
+        masked: &'a MaskedComparisonAttributes,
         desired: &'a CanonicalComparisonAttributes,
         current: &'a CanonicalComparisonAttributes,
-        saved: Option<&'a CanonicalComparisonAttributes>,
         nested_write_only: &'a NestedWriteOnlyRecord,
     ) -> Self {
         Self {
+            masked,
             desired,
             current,
-            saved,
             nested_write_only,
         }
     }
@@ -1259,9 +1383,9 @@ pub(super) fn find_changed_attributes_with_ignores(
     observations: &ObservationComparison<'_>,
 ) -> AttributeChanges {
     let AttributeValueViews {
+        masked,
         desired,
         current,
-        saved,
         nested_write_only,
     } = values;
     let mut changed = Vec::new();
@@ -1283,29 +1407,10 @@ pub(super) fn find_changed_attributes_with_ignores(
     // `saved` undergoes the same projection so the saved-merge fallback
     // doesn't smuggle server-only fields back into `effective_desired`
     // (refs awscc#206).
-    let raw_saved = saved;
-    let projected = project_authored_attribute_views(
-        desired,
-        current,
-        raw_saved,
-        prev_explicit,
-        schema,
-        context,
-    );
+    let raw_saved = masked.saved();
+    let projected = project_authored_attribute_views(masked, prev_explicit, schema, context);
     let projected_current = &projected.current;
     let projected_saved = projected.saved.as_ref();
-
-    let observed_for_ignored = raw_saved.map_or_else(
-        || projected_current.clone(),
-        |saved| {
-            projected_current.with_missing_values_from(saved, |key, value| {
-                desired.get(key).is_some_and(contains_secret)
-                    && crate::value::contains_redacted_secret(value)
-            })
-        },
-    );
-    let effective_desired =
-        ignore_changes.mask_comparison_readable_leaves(desired, &observed_for_ignored, schema);
 
     let mut differing_ignored_paths = std::collections::HashSet::new();
     for path in ignore_changes.iter().filter(|path| !path.is_write_only()) {
@@ -1341,7 +1446,7 @@ pub(super) fn find_changed_attributes_with_ignores(
         }
     }
 
-    for (key, desired_value) in &effective_desired {
+    for (key, desired_value) in masked.desired() {
         if ignore_changes.ignores_whole_attribute(key) {
             continue;
         }
@@ -1415,7 +1520,7 @@ pub(super) fn find_changed_attributes_with_ignores(
     // state write can seed the record from desired keys (never provider keys),
     // after which removals of those recorded keys are detectable.
     for key in &projected.previously_authored_top_level_attributes {
-        if desired.contains_key(key) {
+        if masked.desired().contains_key(key) {
             continue;
         }
         if projected_current.contains_key(key) {
@@ -1427,6 +1532,52 @@ pub(super) fn find_changed_attributes_with_ignores(
         changed,
         ignored_readable_differences: differing_ignored_paths.len(),
     }
+}
+
+/// Reconsider only apply-resolved keys excluded by the original plan. The
+/// caller prepares fresh reference evidence against these same masked values.
+pub(crate) fn find_apply_time_changed_attributes<S>(
+    masked: &MaskedComparisonAttributes,
+    authored: &crate::resource::ResolvedResource<S>,
+    schema: &ResourceSchema,
+    ignores: &ResolvedIgnoreChanges,
+    context: &PlanningComparison<'_>,
+) -> crate::provider::ProviderResult<Vec<String>> {
+    let changed = masked
+        .desired()
+        .iter()
+        .filter_map(|(key, desired)| {
+            let type_info = schema.attributes.get(key).map(|attribute| TypedAttr {
+                attr_type: &attribute.attr_type,
+                defs: &schema.defs,
+            });
+            key_should_enter_patch_with_ignores(
+                key,
+                Some(schema),
+                LeafProvenance::DecidedByPlan { key_changed: false },
+                AttrComparison {
+                    from: masked.current().get(key),
+                    to: desired,
+                    saved: None,
+                    type_info,
+                },
+                ignores,
+                &context.at_path(key),
+            )
+            .then(|| key.clone())
+        })
+        .collect::<Vec<_>>();
+    let views = project_authored_attribute_views(masked, None, Some(schema), context);
+    let create_only =
+        super::plan::find_changed_create_only(&changed, authored, &views, schema, context);
+    if !create_only.is_empty() {
+        return Err(crate::provider::ProviderError::invalid_input(format!(
+            "Create-only attributes changed after planning ({}); create a new plan before applying",
+            create_only.join(", "),
+        ))
+        .for_resource(authored.id.clone()));
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -1450,8 +1601,14 @@ pub(super) fn find_changed_attributes(
     let desired = canonicalize(desired.clone());
     let current = canonicalize(current.clone());
     let saved = saved.cloned().map(canonicalize);
+    let masked = ResolvedIgnoreChanges::default().mask_comparison_attributes(
+        &desired,
+        &current,
+        saved.as_ref(),
+        schema,
+    );
     find_changed_attributes_with_ignores(
-        AttributeValueViews::new(&desired, &current, saved.as_ref(), nested_write_only),
+        AttributeValueViews::new(&masked, &desired, &current, nested_write_only),
         prev_explicit,
         schema,
         &ResolvedIgnoreChanges::default(),

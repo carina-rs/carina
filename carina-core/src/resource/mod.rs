@@ -51,6 +51,7 @@ pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
 pub(crate) use enum_value::{enum_value_comparison_key, enum_values_equal};
+pub(crate) use ignore_changes::MaskedComparisonAttributes;
 pub(crate) use ignore_changes::value_at_leaf;
 pub use ignore_changes::{
     IgnoreChangeError, ParsedIgnorePath, ParsedIgnorePathSegment, ResolvedIgnoreChanges,
@@ -7427,7 +7428,7 @@ fn merge_maps<R: ReferenceEquality>(
                         .unwrap_or(&ExplicitFields::Unrecorded),
                     map_entry_subtype(attr_type, key, defs),
                     defs,
-                    context,
+                    &context.at_path(&context.entry_path(key, attr_type, defs)),
                 )
             }
             None => desired_value.clone(),
@@ -7709,6 +7710,8 @@ where
     let mut desired_offsets = Vec::with_capacity(desired.len() + 1);
     desired_offsets.push(0);
     for (desired_index, desired_value) in desired.iter().enumerate() {
+        let path = context.index_path(desired_index);
+        let context = &context.at_path(&path);
         for (saved_index, saved_value) in saved.iter().enumerate() {
             let score = similarity_score(
                 desired_value.borrow(),
@@ -7803,12 +7806,22 @@ where
         for (value_hash, bucket) in value_buckets {
             if bucket.len() != saved.len()
                 || !bucket.iter().copied().eq(0..saved.len())
-                || !saved.iter().all(|saved_value| {
+                || !saved.iter().enumerate().all(|(index, saved_value)| {
                     let Value::Concrete(ConcreteValue::Map(map)) = saved_value.borrow() else {
                         return false;
                     };
                     map.get(*key).is_some_and(|value| {
-                        schema_aware_equal(representative, value, field_type, defs, context)
+                        schema_aware_equal(
+                            representative,
+                            value,
+                            field_type,
+                            defs,
+                            &context.at_path(
+                                &context
+                                    .at_path(&context.index_path(index))
+                                    .entry_path(key, attr_type, defs),
+                            ),
+                        )
                     })
                 })
             {
@@ -7826,13 +7839,13 @@ where
         for (value_hash, bucket) in &value_buckets {
             if bucket.len() == saved.len()
                 && bucket.iter().copied().eq(0..saved.len())
-                && saved.iter().all(|saved_value| {
+                && saved.iter().enumerate().all(|(index, saved_value)| {
                     schema_aware_equal(
                         representative,
                         saved_value.borrow(),
                         attr_type,
                         defs,
-                        context,
+                        &context.at_path(&context.index_path(index)),
                     )
                 })
             {
@@ -7847,6 +7860,8 @@ where
     desired_offsets.push(0);
     let mut possible_saved = Vec::new();
     for (desired_index, desired_value) in desired.iter().enumerate() {
+        let path = context.index_path(desired_index);
+        let context = &context.at_path(&path);
         possible_saved.clear();
         let mut implicit_score = 0;
         match desired_value.borrow() {
@@ -7866,7 +7881,9 @@ where
                                                 representative,
                                                 field_type,
                                                 defs,
-                                                context,
+                                                &context.at_path(
+                                                    &context.entry_path(key, attr_type, defs),
+                                                ),
                                             )
                                         },
                                     )
@@ -8168,7 +8185,7 @@ fn merge_lists<R: ReferenceEquality>(
                         authoring,
                         item_type,
                         defs,
-                        context,
+                        &context.at_path(&context.index_path(desired_index)),
                     )
                 }
                 None => desired[desired_index].clone(),
@@ -8199,7 +8216,7 @@ fn similarity_score<R: ReferenceEquality>(
                             bv,
                             map_entry_subtype(attr_type, k, defs),
                             defs,
-                            context,
+                            &context.at_path(&context.entry_path(k, attr_type, defs)),
                         )
                     })
                     .unwrap_or(false)
@@ -11015,6 +11032,22 @@ impl UnschematizedComparisonAttributes {
 }
 
 impl CanonicalComparisonAttributes {
+    /// Secret-grafted apply views retain the authored hash material even when
+    /// provider normalization changed a secret's structural representation.
+    pub(crate) fn canonicalize_preserving_secret_shapes(
+        mut attributes: HashMap<String, Value>,
+        schema: &crate::schema::CompiledResourceSchema,
+    ) -> Self {
+        let secrets = attributes
+            .iter()
+            .filter(|(_, value)| crate::value::contains_secret(value))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        crate::value::canonicalize_state_attribute_map_with_schema(&mut attributes, schema);
+        attributes.extend(secrets);
+        Self { attributes }
+    }
+
     /// Build the state-style canonical comparison view for one resource.
     pub fn canonicalize(
         mut attributes: HashMap<String, Value>,
@@ -11049,20 +11082,6 @@ impl CanonicalComparisonAttributes {
     pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
         self.attributes.get_mut(key)
     }
-
-    pub(crate) fn with_missing_values_from(
-        &self,
-        fallback: &Self,
-        mut include: impl FnMut(&str, &Value) -> bool,
-    ) -> Self {
-        let mut combined = self.clone();
-        for (key, value) in fallback {
-            if !combined.contains_key(key) && include(key, value) {
-                combined.attributes.insert(key.clone(), value.clone());
-            }
-        }
-        combined
-    }
 }
 
 impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
@@ -11084,6 +11103,34 @@ impl IntoIterator for CanonicalComparisonAttributes {
 }
 
 impl<'a> PlanInputDesired<'a> {
+    /// Reuse preparation's mask verbatim. Focused callers without prepared
+    /// inputs still cross the same sole ignore-mask constructor.
+    pub(crate) fn masked_comparison<'r>(
+        &self,
+        current: &CanonicalComparisonAttributes,
+        saved: Option<&CanonicalComparisonAttributes>,
+        schema: Option<&crate::schema::CompiledResourceSchema>,
+        references: &'r crate::references::ResolvedReferences,
+    ) -> std::borrow::Cow<'r, MaskedComparisonAttributes> {
+        references
+            .comparison_attributes(
+                &self.authored.id,
+                &self.comparison_attributes,
+                current,
+                saved,
+                self.authored.ignore_changes(),
+            )
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| {
+                std::borrow::Cow::Owned(self.authored.ignore_changes().mask_comparison_attributes(
+                    &self.comparison_attributes,
+                    current,
+                    saved,
+                    schema,
+                ))
+            })
+    }
+
     pub fn authored(&self) -> &'a ResolvedResource {
         self.authored
     }

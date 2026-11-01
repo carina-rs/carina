@@ -2377,13 +2377,21 @@ async fn run_apply_locked_owned(
             // (carina#3060). They must stay the same object.
             let observer = observer_factory(&plan, project_dir);
             let provider = Arc::new(provider);
-            let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
-                resolved_resources.clone(),
-                plan.clone(),
-                ctx.schemas().clone(),
-                None,
-                provider.as_ref(),
-            )?);
+            let state_save_inputs = Arc::new(
+                ApplyStateSaveInputs::new(
+                    resolved_resources.clone(),
+                    plan.clone(),
+                    ctx.schemas().clone(),
+                    None,
+                    provider.as_ref(),
+                )?
+                .with_reference_evidence(match &references {
+                    crate::wiring::PlanReferenceEvidence::Prepared(references) => {
+                        Some(references.clone())
+                    }
+                    crate::wiring::PlanReferenceEvidence::Diagnostics => None,
+                }),
+            );
             let saver =
                 start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
             let publisher = saver.publisher();

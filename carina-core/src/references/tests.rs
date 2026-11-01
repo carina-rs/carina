@@ -12,6 +12,8 @@ struct TableProvider {
     table: HashMap<String, TableResult>,
     calls: Arc<Mutex<Vec<Vec<ReferenceRequest>>>>,
     barrier: Option<Arc<tokio::sync::Barrier>>,
+    result_count: Option<usize>,
+    updates: Arc<Mutex<Vec<UpdateRequest>>>,
 }
 impl Provider for TableProvider {
     fn name(&self) -> &str {
@@ -28,6 +30,8 @@ impl Provider for TableProvider {
             }
             Ok(requests
                 .iter()
+                .cycle()
+                .take(self.result_count.unwrap_or(requests.len()))
                 .map(|request| {
                     match self.table.get(&request.value).cloned().unwrap_or_else(|| {
                         Ok(wire::ReferenceOutcome::Resolved(request.value.clone()))
@@ -77,11 +81,24 @@ impl Provider for TableProvider {
     }
     fn update(
         &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: UpdateRequest,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-        unimplemented!()
+        let mut attributes = request.from().attributes.clone();
+        for op in &request.patch().ops {
+            match op.sent_value() {
+                Some(value) => {
+                    attributes.insert(op.key().into(), value.clone());
+                }
+                None => {
+                    attributes.remove(op.key());
+                }
+            }
+        }
+        let state = AppliedState::from_identifier(id.clone(), identifier.clone(), attributes);
+        self.updates.lock().unwrap().push(request);
+        Box::pin(async move { Ok(UpdateOutcome::success(state)) })
     }
     fn delete(
         &self,
@@ -145,6 +162,7 @@ struct Fixture {
     saved: LiftedSavedAttrs,
     router: ProviderRouter,
     calls: Arc<Mutex<Vec<Vec<ReferenceRequest>>>>,
+    updates: Arc<Mutex<Vec<UpdateRequest>>>,
 }
 impl Fixture {
     fn new(
@@ -154,6 +172,7 @@ impl Fixture {
         create_only: bool,
     ) -> Self {
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let updates = Arc::new(Mutex::new(Vec::new()));
         let mut router = ProviderRouter::new();
         router.add_provider(
             "test".into(),
@@ -161,6 +180,8 @@ impl Fixture {
                 table,
                 calls: calls.clone(),
                 barrier: None,
+                result_count: None,
+                updates: updates.clone(),
             })),
         );
         let mut registry = SchemaRegistry::new();
@@ -191,6 +212,7 @@ impl Fixture {
             saved,
             router,
             calls,
+            updates,
         }
     }
     async fn prepare(&self) -> Result<ResolvedReferences, Box<ReferencePlanError>> {
@@ -208,6 +230,13 @@ impl Fixture {
         &self,
         references: &ResolvedReferences,
     ) -> crate::differ::PlanComparisonResult<crate::plan::Plan> {
+        self.plan_with_explicit(references, &HashMap::new())
+    }
+    fn plan_with_explicit(
+        &self,
+        references: &ResolvedReferences,
+        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    ) -> crate::differ::PlanComparisonResult<crate::plan::Plan> {
         crate::differ::create_plan(
             &self.desired,
             &[],
@@ -216,7 +245,7 @@ impl Fixture {
             &HashMap::new(),
             &self.registry,
             &self.saved,
-            &HashMap::new(),
+            explicit,
             &[],
             references,
         )
@@ -454,7 +483,8 @@ async fn missing_needed_witness_entry_is_typed_error_in_plan_and_binding_stabili
         panic!("expected typed reference error")
     };
     assert!(matches!(source.source, ReferenceFailure::MissingWitness));
-    assert_eq!(source.path, identity().to_string());
+    assert_eq!(source.path, "key");
+    assert!(source.to_string().contains("attribute key,"));
     let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
         panic!("present fixture")
     };
@@ -531,6 +561,8 @@ async fn resolution_cache_is_per_run_and_includes_type_and_provider_instance() {
             table: HashMap::from([("alias/live".into(), resolved("key/b"))]),
             calls: fixture.calls.clone(),
             barrier: None,
+            result_count: None,
+            updates: fixture.updates.clone(),
         })),
     );
     let mut other = fixture.desired[0].as_resource().clone();
@@ -561,6 +593,7 @@ async fn resolution_cache_is_per_run_and_includes_type_and_provider_instance() {
         !witness
             .equal(
                 &other[0].id,
+                "key",
                 &identity(),
                 &"alias/live".into(),
                 &"key/a".into()
@@ -898,6 +931,552 @@ fn reset_values(fixture: &mut Fixture, desired: Value, current: Value, saved: Va
     .lift(&fixture.registry);
 }
 
+fn encryption_fixture(desired_key: Value, ignored: bool) -> Fixture {
+    use crate::resource::{ParsedIgnorePath, ParsedIgnorePathSegment};
+    use crate::schema::{AttributeType, StructField};
+    let mut fixture = Fixture::new(string("unused"), string("unused"), HashMap::new(), false);
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "encryption",
+                    AttributeType::struct_(
+                        "Encryption",
+                        vec![
+                            StructField::optional(
+                                "kms_key_id",
+                                AttributeType::reference(identity(), None, None),
+                            )
+                            .create_only()
+                            .build(),
+                            StructField::optional("mode", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let config = |key, mode| {
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+            ("kms_key_id".into(), key),
+            ("mode".into(), string(mode)),
+        ])))
+    };
+    let mut resource = fixture.desired[0].as_resource().clone();
+    resource.attributes =
+        indexmap::IndexMap::from([("encryption".into(), config(desired_key, "new"))]);
+    if ignored {
+        resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+            ParsedIgnorePathSegment::Attribute("encryption".into()),
+            ParsedIgnorePathSegment::Attribute("kms_key_id".into()),
+        ])];
+    }
+    fixture.desired =
+        ResolvedResource::collect_resolved_with_schemas([resource.clone()], &fixture.registry)
+            .unwrap();
+    let attributes = HashMap::from([("encryption".into(), config(string("key/a"), "old"))]);
+    fixture.current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(
+            resource.id.clone(),
+            Current::from_state(
+                State::existing(resource.id.clone(), attributes.clone())
+                    .with_identifier("resource-123"),
+            ),
+        )]),
+        &fixture.registry,
+        &[resource.clone()],
+    );
+    fixture.saved =
+        RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(resource.id, attributes)]))
+            .lift(&fixture.registry);
+    fixture
+}
+
+#[tokio::test]
+async fn round3_ignored_nested_create_only_reference_with_sibling_change_is_an_update() {
+    let fixture = encryption_fixture(string("alias/ignored"), true);
+    let witness = fixture.prepare().await.unwrap();
+    assert!(fixture.calls.lock().unwrap().is_empty());
+    let plan = fixture.plan(&witness).unwrap();
+    assert!(plan.errors().is_empty(), "{:?}", plan.errors());
+    assert!(
+        matches!(plan.effects(), [crate::effect::Effect::Update { changed_attributes, .. }]
+        if changed_attributes == &["encryption"])
+    );
+    let stability = crate::differ::managed_binding_stability(
+        &fixture.desired,
+        &fixture.current,
+        &fixture.registry,
+        &fixture.saved,
+        &HashMap::new(),
+        &fixture.router,
+        &witness,
+    )
+    .unwrap();
+    assert!(matches!(
+        stability[&fixture.desired[0].id],
+        crate::binding_index::ManagedBindingStability::Updating { .. }
+    ));
+}
+
+#[tokio::test]
+async fn round3_unordered_list_index_ignore_precedes_projection_pairing_and_saved_merge() {
+    use crate::resource::{
+        ParsedIgnorePath, ParsedIgnorePathSegment as Segment, ResolvedIgnoreChanges,
+    };
+    use crate::schema::{AttributeType, LeafPath, LeafPathSegment, StructField};
+    let mut fixture = Fixture::new(
+        string("unused"),
+        string("unused"),
+        HashMap::from([
+            ("alias/live".into(), resolved("key/b")),
+            ("alias/saved".into(), resolved("key/b")),
+        ]),
+        false,
+    );
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Rule",
+                        vec![
+                            StructField::optional("id", AttributeType::string()).build(),
+                            StructField::optional(
+                                "reference",
+                                AttributeType::reference(identity(), None, None),
+                            )
+                            .create_only()
+                            .build(),
+                            StructField::optional("mode", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let list = |ignored: &str, live: &str, mode: &str| {
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                ("id".into(), string("ignored")),
+                ("reference".into(), string(ignored)),
+                ("mode".into(), string(mode)),
+            ]))),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                ("id".into(), string("live")),
+                ("reference".into(), string(live)),
+                ("mode".into(), string("stable")),
+            ]))),
+        ]))
+    };
+    reset_values(
+        &mut fixture,
+        list("alias/ignored-desired", "alias/live", "new"),
+        list("alias/ignored-read", "key/b", "old"),
+        list("alias/ignored-saved", "alias/saved", "old"),
+    );
+    let mut resource = fixture.desired[0].as_resource().clone();
+    let path = ParsedIgnorePath::new(vec![
+        Segment::Attribute("key".into()),
+        Segment::ListIndex(0),
+        Segment::Attribute("reference".into()),
+    ]);
+    resource.directives.ignore_changes = vec![path.clone()];
+    resource.resolved_ignore_changes = ResolvedIgnoreChanges::indexed_for_test(
+        "key",
+        LeafPath::from_segments(vec![
+            LeafPathSegment::ListIndex(0),
+            LeafPathSegment::StructField("reference".into()),
+        ]),
+        path,
+    );
+    fixture.desired = vec![ResolvedResource::new(resource)];
+    let explicit = HashMap::from([(
+        fixture.desired[0].id.clone(),
+        crate::explicit::build_from_resource(fixture.desired[0].as_resource()),
+    )]);
+    let references = fixture.prepare().await.unwrap();
+    let plan = fixture.plan_with_explicit(&references, &explicit).unwrap();
+    assert!(plan.errors().is_empty(), "{:?}", plan.errors());
+    assert!(
+        matches!(plan.effects(), [crate::effect::Effect::Update { changed_attributes, .. }] if changed_attributes == &["key"])
+    );
+    let persisted = PersistedAttributes::from_persisted_values(
+        fixture
+            .saved
+            .get(&fixture.desired[0].id)
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    crate::value::PersistedValue::encode_provider_value(value, None).unwrap(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
+        unreachable!()
+    };
+    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    historical.set_update_from_provider_and_persisted(
+        fixture.desired[0].id.clone(),
+        &current.state().attributes,
+        Some(&persisted),
+    );
+    crate::detail_rows::build_detail_rows_by_instance(
+        &plan.effects()[0],
+        Some(&fixture.registry),
+        crate::detail_rows::DetailLevel::Full,
+        &historical,
+        Some(&explicit),
+        &fixture.router,
+        crate::detail_rows::DetailComparisons::Planning(&references),
+    )
+    .expect("detail pairing must use the prepared ignore mask too");
+    let calls = fixture.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]
+            .iter()
+            .map(|r| r.value.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["alias/live", "alias/saved", "key/b"])
+    );
+}
+
+#[test]
+fn round3_comparator_reference_errors_render_the_nested_attribute_path() {
+    for sensitive in [false, true] {
+        let raw = if sensitive {
+            Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
+                "alias/private",
+            )))
+        } else {
+            string("alias/unprepared")
+        };
+        let fixture = encryption_fixture(raw, false);
+        let error = fixture.plan(&prepare_empty_for_tests()).unwrap_err();
+        let crate::differ::PlanComparisonError::Reference(error) = error else {
+            panic!("expected a reference comparison error")
+        };
+        assert!(matches!(
+            (&error.source, sensitive),
+            (ReferenceFailure::MissingWitness, false)
+                | (
+                    ReferenceFailure::Resolution(ReferenceError::InvalidReference(_)),
+                    true
+                )
+        ));
+        assert_eq!(error.path, "encryption.kms_key_id");
+        assert!(
+            error
+                .to_string()
+                .contains("attribute encryption.kms_key_id,")
+        );
+        if sensitive {
+            assert!(!error.to_string().contains("alias/private"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn round3_native_reference_batches_reject_short_and_long_results() {
+    for count in [0, 1, 3] {
+        let mut fixture =
+            Fixture::new(string("alias/live"), string("key/a"), HashMap::new(), false);
+        fixture.router.add_provider(
+            "test".into(),
+            InitializedProvider::unavailable(Box::new(TableProvider {
+                table: HashMap::new(),
+                calls: fixture.calls.clone(),
+                barrier: None,
+                result_count: Some(count),
+                updates: fixture.updates.clone(),
+            })),
+        );
+        let error = fixture
+            .prepare()
+            .await
+            .expect_err("batch length must be checked before zip");
+        assert!(
+            matches!(
+                error.source,
+                ReferenceFailure::Resolution(ReferenceError::InvalidReference(_))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.path, "key");
+    }
+}
+
+#[tokio::test]
+async fn round3_apply_concrete_plan_reference_reresolves_without_widening_equivalent_patch() {
+    use crate::binding_index::{BindingValueSource, ResolvedBindings};
+    use crate::executor::{LiveExecutionInput, ProviderCheckInputs, UnresolvedResource};
+    use crate::schema::AttributeType;
+    for (create_only, target_key) in [
+        (false, "key/a"),
+        (true, "key/a"),
+        (false, "key/b"),
+        (true, "key/b"),
+    ] {
+        let mut fixture = Fixture::new(
+            string("key/a"),
+            string("key/a"),
+            HashMap::from([("alias/live".into(), resolved(target_key))]),
+            create_only,
+        );
+        let mut declaration = crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build());
+        let key =
+            AttributeSchema::optional("key", AttributeType::reference(identity(), None, None));
+        declaration = declaration.attribute(if create_only {
+            key.create_only().build()
+        } else {
+            key.build()
+        });
+        fixture
+            .registry
+            .insert("test", declaration.validate().unwrap());
+        let mut target = fixture.desired[0].as_resource().clone();
+        target
+            .attributes
+            .insert("description".into(), string("new"));
+        let from = State::existing(
+            target.id.clone(),
+            HashMap::from([
+                ("key".into(), string("key/a")),
+                ("description".into(), string("old")),
+            ]),
+        )
+        .with_identifier("resource-123");
+        fixture.current = crate::resource::into_plan_input_current_map(
+            HashMap::from([(target.id.clone(), Current::from_state(from))]),
+            &fixture.registry,
+            &[target.clone()],
+        );
+        fixture.desired =
+            ResolvedResource::collect_resolved_with_schemas([target.clone()], &fixture.registry)
+                .unwrap();
+        let references = fixture.prepare().await.unwrap();
+        let plan = fixture.plan(&references).unwrap();
+        assert!(
+            matches!(plan.effects(), [crate::effect::Effect::Update { changed_attributes, .. }]
+            if changed_attributes == &["description"])
+        );
+        assert!(
+            fixture.calls.lock().unwrap().is_empty(),
+            "the reference is concrete and byte equal at plan"
+        );
+        let mut origin = target.clone();
+        origin.attributes.insert(
+            "key".into(),
+            Value::root_resource_ref("dependency", "key", vec![]),
+        );
+        let origins = HashMap::from([(
+            target.id.clone(),
+            UnresolvedResource::from_pre_resolve(origin),
+        )]);
+        let mut bindings = ResolvedBindings::default();
+        bindings.set(
+            "dependency",
+            HashMap::from([("key".into(), string("alias/live"))]),
+            BindingValueSource::Local,
+        );
+        let outcome = crate::executor::execute_live_plan(
+            &fixture.router,
+            LiveExecutionInput {
+                plan: &plan,
+                provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                    resource_origins: &origins,
+                    data_source_origins: &[],
+                },
+                compositions: &[],
+                bindings,
+                managed_current: HashMap::new(),
+                data_source_values: crate::data_source_value::ExecutableDataSourceValues::empty(),
+                normalizer: &NoopNormalizer,
+                provider_configs: &[],
+                factories: &[],
+                schemas: &fixture.registry,
+                parallelism: std::num::NonZeroUsize::new(1).unwrap(),
+                precompleted_success_count: 0,
+                checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+            },
+            &crate::executor::NoopExecutionObserver,
+            crate::shutdown::ShutdownToken::running(),
+        )
+        .await;
+        let crate::executor::ExecutionOutcome::Completed(result) = outcome else {
+            panic!("execution cancelled")
+        };
+        if create_only && target_key == "key/b" {
+            assert_eq!(
+                result.failure_count(),
+                1,
+                "a newly changed create-only identity requires replanning"
+            );
+            assert!(fixture.updates.lock().unwrap().is_empty());
+            assert!(
+                format!("{:?}", result.failures())
+                    .to_ascii_lowercase()
+                    .contains("create-only")
+            );
+            continue;
+        }
+        assert_eq!(result.success_count, 1, "{:?}", result.failures());
+        let updates = fixture.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        let keys = updates[0]
+            .patch()
+            .ops
+            .iter()
+            .map(PatchOp::key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            if target_key == "key/a" {
+                vec!["description"]
+            } else {
+                vec!["description", "key"]
+            }
+        );
+        if target_key == "key/b" {
+            assert_eq!(
+                updates[0]
+                    .patch()
+                    .ops
+                    .iter()
+                    .find(|op| op.key() == "key")
+                    .unwrap()
+                    .sent_value(),
+                Some(&string("alias/live"))
+            );
+        }
+        assert_eq!(
+            fixture.calls.lock().unwrap().len(),
+            1,
+            "apply must prepare fresh evidence"
+        );
+    }
+}
+
+#[tokio::test]
+async fn round3_reference_list_writeback_preserves_authored_fields_across_alias_and_arn() {
+    use crate::explicit::ExplicitFields;
+    use crate::schema::{AttributeType, StructField};
+    let mut fixture = Fixture::new(
+        string("unused"),
+        string("unused"),
+        HashMap::from([("alias/live".into(), resolved("key/a"))]),
+        false,
+    );
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Rule",
+                        vec![
+                            StructField::optional(
+                                "reference",
+                                AttributeType::reference(identity(), None, None),
+                            )
+                            .build(),
+                            StructField::optional("provider_default", AttributeType::string())
+                                .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let list = |raw: &str, default: bool| {
+        let mut fields = indexmap::IndexMap::from([("reference".into(), string(raw))]);
+        if default {
+            fields.insert("provider_default".into(), string("generated"));
+        }
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(fields),
+        )]))
+    };
+    reset_values(
+        &mut fixture,
+        list("alias/live", false),
+        list("key/a", true),
+        list("alias/live", false),
+    );
+    let prior = crate::explicit::build_from_resource(fixture.desired[0].as_resource());
+    let references = fixture.prepare().await.unwrap();
+    let comparison = fixture
+        .router
+        .comparison_for(&fixture.registry, &fixture.desired[0].id)
+        .unwrap();
+    let carried = crate::explicit::build_carried_from_resource_for_stored_values(
+        fixture.desired[0].as_resource(),
+        fixture.saved.get(&fixture.desired[0].id).unwrap(),
+        &prior,
+        &match fixture.current[&fixture.desired[0].id].current() {
+            Current::Present(current) => current.state().attributes.clone(),
+            _ => unreachable!(),
+        },
+        Some(comparison.owner_schema().schema().as_schema()),
+        &comparison
+            .context()
+            .authoring(Some(&references), &fixture.desired[0].id),
+    );
+    let ExplicitFields::Struct { children } = carried else {
+        panic!("resource authoring")
+    };
+    let ExplicitFields::ListElements { elements } = &children["key"] else {
+        panic!("list authoring")
+    };
+    assert!(
+        matches!(&elements[0], ExplicitFields::Struct { children }
+        if children.contains_key("reference") && !children.contains_key("provider_default")),
+        "{elements:?}"
+    );
+    let calls_before = fixture.calls.lock().unwrap().len();
+    let fallback = crate::explicit::build_carried_from_resource_for_stored_values(
+        fixture.desired[0].as_resource(),
+        fixture.saved.get(&fixture.desired[0].id).unwrap(),
+        &prior,
+        &match fixture.current[&fixture.desired[0].id].current() {
+            Current::Present(current) => current.state().attributes.clone(),
+            _ => unreachable!(),
+        },
+        Some(comparison.owner_schema().schema().as_schema()),
+        &comparison.context().authoring(None, &fixture.desired[0].id),
+    );
+    let ExplicitFields::Struct { children } = fallback else {
+        panic!("resource authoring")
+    };
+    let ExplicitFields::List { element } = &children["key"] else {
+        panic!("missing evidence requires field union")
+    };
+    assert!(
+        matches!(element.as_ref(), ExplicitFields::Struct { children } if children.contains_key("reference") && !children.contains_key("provider_default"))
+    );
+    assert_eq!(
+        fixture.calls.lock().unwrap().len(),
+        calls_before,
+        "writeback must not call the resolver"
+    );
+}
+
 #[tokio::test]
 async fn round2_s3_lists_collect_desired_read_and_saved_references() {
     use crate::schema::{AttributeType, StructField};
@@ -1184,6 +1763,8 @@ async fn round2_provider_instance_batches_run_concurrently() {
                 table: HashMap::from([("alias/live".into(), resolved("key/a"))]),
                 calls: fixture.calls.clone(),
                 barrier: Some(barrier.clone()),
+                result_count: None,
+                updates: fixture.updates.clone(),
             })),
         );
     }
@@ -1218,6 +1799,7 @@ fn reference_plan_errors_preserve_secret_redaction_without_preparation() {
     let error = prepare_empty_for_tests()
         .equal(
             &ResourceId::with_identity("keys.Resource", "example"),
+            "key",
             &identity(),
             &value,
             &"key/a".into(),

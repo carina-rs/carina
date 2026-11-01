@@ -970,29 +970,27 @@ fn build_update_rows<S, R: ReferenceEquality>(
             crate::resource::UnschematizedComparisonAttributes::new(to.resolved_attributes()),
         ),
     };
-    let comparison_attributes = to.resolved_ignore_changes.mask_comparison_readable_leaves(
+    let masked = to.resolved_ignore_changes.mask_comparison_attributes(
         &comparison_attributes,
         &from_attributes,
+        stored_attributes.as_ref(),
         schema,
     );
+    let fully_masked_attributes =
+        masked.fully_masked_attribute_count(&comparison_attributes, &from_attributes);
+    let comparison_attributes = masked.desired();
+    let from_attributes = masked.current();
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let projected = project_from_attrs(
-        &from_attributes,
-        stored_attributes.as_ref(),
-        &comparison_attributes,
-        explicit,
-        schema,
-        comparison,
-    );
+    let projected = project_from_attrs(&masked, explicit, schema, comparison);
     let from_attrs_projected = projected.attributes();
 
     let attr_rows = build_attribute_diff_rows(
         to,
-        &comparison_attributes,
+        comparison_attributes,
         AttributeDiffContext::for_update(
-            &from_attributes,
+            from_attributes,
             from_attrs_projected,
             schema,
             defs,
@@ -1028,11 +1026,12 @@ fn build_update_rows<S, R: ReferenceEquality>(
     if detail == DetailLevel::Full {
         let unchanged_count = compute_unchanged_count(
             from_attrs_projected,
-            &comparison_attributes,
+            comparison_attributes,
             None,
             schema,
             &comparison,
-        ) + attr_rows.effectively_unchanged;
+        ) + attr_rows.effectively_unchanged
+            + fully_masked_attributes;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,
@@ -1260,50 +1259,17 @@ fn is_whole_value(explicit: Option<&ProjectedAuthoring>) -> bool {
 }
 
 fn project_from_attrs<R: ReferenceEquality>(
-    from_attributes: &CanonicalComparisonAttributes,
-    stored_attributes: Option<&CanonicalComparisonAttributes>,
-    desired_attributes: &CanonicalComparisonAttributes,
+    masked: &crate::resource::MaskedComparisonAttributes,
     explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     comparison: ComparisonContext<'_, R>,
 ) -> crate::explicit::ProjectedAttributes {
-    // Project `from.attributes` through the user-authoring tree so
-    // server-side default fields the user never wrote don't inflate
-    // the unchanged-count summary (refs awscc#206). Stored values anchor
-    // per-element list records when present; otherwise the projection uses
-    // the legacy union fallback.
-    let empty_stored = CanonicalComparisonAttributes::default();
     match explicit {
-        Some(explicit) => ExplicitProjection::for_desired(
-            stored_attributes.unwrap_or(&empty_stored),
-            desired_attributes,
-            explicit,
-            schema,
-            &comparison,
-        )
-        .project_attributes(from_attributes.clone()),
-        None => crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None),
+        Some(explicit) => {
+            ExplicitProjection::for_desired(masked, explicit, schema, &comparison).current()
+        }
+        None => crate::explicit::ProjectedAttributes::unprojected(masked.current().clone(), None),
     }
-}
-
-fn project_previous_attrs<R: ReferenceEquality>(
-    previous_attributes: &CanonicalComparisonAttributes,
-    stored_attributes: Option<&CanonicalComparisonAttributes>,
-    desired_attributes: &CanonicalComparisonAttributes,
-    explicit: Option<&crate::explicit::ExplicitFields>,
-    schema: Option<&ResourceSchema>,
-    comparison: ComparisonContext<'_, R>,
-) -> crate::explicit::ProjectedAttributes {
-    // Same projection as `project_from_attrs`, but sourced from
-    // replacement-display metadata instead of a replace effect state.
-    project_from_attrs(
-        previous_attributes,
-        stored_attributes,
-        desired_attributes,
-        explicit,
-        schema,
-        comparison,
-    )
 }
 
 fn build_attribute_diff_rows<S, R: ReferenceEquality>(
@@ -1675,14 +1641,17 @@ fn build_replace_rows_from_attributes<S, R: ReferenceEquality>(
             crate::resource::UnschematizedComparisonAttributes::new(attributes),
         ),
     });
-    let projected = project_previous_attrs(
+    let masked = to.resolved_ignore_changes.mask_comparison_attributes(
+        comparison_attributes,
         &previous_attributes,
         stored_attributes.as_ref(),
-        comparison_attributes,
-        explicit,
         schema,
-        comparison,
     );
+    let fully_masked_attributes =
+        masked.fully_masked_attribute_count(comparison_attributes, &previous_attributes);
+    let comparison_attributes = masked.desired();
+    let previous_attributes = masked.current();
+    let projected = project_from_attrs(&masked, explicit, schema, comparison);
     let from_attrs_projected = projected.attributes();
     let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 
@@ -1690,7 +1659,7 @@ fn build_replace_rows_from_attributes<S, R: ReferenceEquality>(
         to,
         comparison_attributes,
         AttributeDiffContext::for_replace(
-            &previous_attributes,
+            previous_attributes,
             from_attrs_projected,
             schema,
             defs,
@@ -1758,7 +1727,8 @@ fn build_replace_rows_from_attributes<S, R: ReferenceEquality>(
             Some(&force_keys),
             schema,
             &comparison,
-        ) + attr_rows.effectively_unchanged;
+        ) + attr_rows.effectively_unchanged
+            + fully_masked_attributes;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,

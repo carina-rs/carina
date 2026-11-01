@@ -219,7 +219,6 @@ fn main() -> ExitCode {
             detail,
             &historical_display,
             &provider,
-            fp.references.for_display(),
         ) {
             Ok(output) => output,
             Err(error) => {

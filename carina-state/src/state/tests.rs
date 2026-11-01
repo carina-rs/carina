@@ -24,6 +24,118 @@ fn exact_comparison_context() -> carina_core::differ::ObservationComparison<'sta
     carina_core::differ::exact_comparison_context_for_tests()
 }
 
+#[test]
+fn round3_carried_reference_list_keeps_removal_provenance_across_alias_and_arn() {
+    use carina_core::explicit::ExplicitFields;
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+    };
+    let schema = ResourceSchema::new("keys.Resource")
+        .attribute(
+            AttributeSchema::optional(
+                "rules",
+                AttributeType::unordered_list(AttributeType::struct_(
+                    "Rule",
+                    vec![
+                        StructField::optional(
+                            "key",
+                            AttributeType::reference(
+                                TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
+                                None,
+                                None,
+                            ),
+                        )
+                        .build(),
+                        StructField::optional("removed", AttributeType::string()).build(),
+                    ],
+                )),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let rules = |key: &str, removed: bool| {
+        let mut fields = IndexMap::from([(
+            "key".into(),
+            Value::Concrete(ConcreteValue::String(key.into())),
+        )]);
+        if removed {
+            fields.insert(
+                "removed".into(),
+                Value::Concrete(ConcreteValue::String("keep retrying".into())),
+            );
+        }
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(fields),
+        )]))
+    };
+    let old = Resource::with_provider("test", "keys.Resource", "example", None)
+        .with_attribute("rules", rules("alias/old", true));
+    let before =
+        State::existing(old.id.clone(), old.resolved_attributes()).with_identifier("id-123");
+    let prior = resource_state_from_provider_state_for_resource_and_schema_for_test(
+        &resolved(&old),
+        &before,
+        None,
+        Some(schema.as_schema()),
+        RowBasis::Imported,
+        None,
+    )
+    .unwrap();
+    for (desired_key, drifted) in [
+        ("alias/old", false),
+        ("alias/new", false),
+        ("alias/old", true),
+        ("alias/new", true),
+    ] {
+        let desired = Resource::with_provider("test", "keys.Resource", "example", None)
+            .with_attribute("rules", rules(desired_key, false));
+        let mut fresh = State::existing(
+            old.id.clone(),
+            HashMap::from([("rules".into(), rules("key/a", true))]),
+        )
+        .with_identifier("id-123");
+        if drifted {
+            let Value::Concrete(ConcreteValue::List(items)) =
+                fresh.attributes.get_mut("rules").unwrap()
+            else {
+                unreachable!()
+            };
+            let Value::Concrete(ConcreteValue::Map(fields)) = &mut items[0] else {
+                unreachable!()
+            };
+            fields.insert(
+                "removed".into(),
+                Value::Concrete(ConcreteValue::String("changed outside the plan".into())),
+            );
+        }
+        let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
+            &resolved(&desired),
+            &fresh,
+            Some(&prior),
+            Some(schema.as_schema()),
+            RowBasis::Carried,
+            None,
+        )
+        .unwrap();
+        let ExplicitFields::Struct { children } = &row.explicit else {
+            panic!("resource authoring")
+        };
+        match &children["rules"] {
+            ExplicitFields::WholeValue { pending } => assert_eq!(
+                serde_json::to_value(pending).unwrap(),
+                serde_json::json!([["removed"]])
+            ),
+            ExplicitFields::ListElements { elements } => assert!(
+                matches!(&elements[0],
+                ExplicitFields::Struct { children } if children.contains_key("removed")),
+                "{elements:?}"
+            ),
+            other => panic!("removal evidence lost for {desired_key}: {other:?}"),
+        }
+    }
+}
+
 fn resource_state_from_provider_state_for_resource_and_schema_for_test<S: Clone>(
     resource: &carina_core::resource::ResolvedResource<S>,
     state: &State,

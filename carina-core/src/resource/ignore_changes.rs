@@ -92,7 +92,113 @@ impl ResolvedIgnorePath {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedIgnoreChanges(Vec<ResolvedIgnorePath>);
 
+/// All operands for one resource comparison, after its ignore mask.
+///
+/// Ignored leaves are absent on every side, including the saved side used by
+/// authoring projection and list pairing. No comparator can observe a leaf
+/// which reference preparation did not see. Provider payloads and observation
+/// diagnostics continue to use the original values.
+#[derive(Debug, Clone)]
+pub(crate) struct MaskedComparisonAttributes {
+    desired: CanonicalComparisonAttributes,
+    current: CanonicalComparisonAttributes,
+    saved: Option<CanonicalComparisonAttributes>,
+}
+
+impl MaskedComparisonAttributes {
+    /// Display-only accounting for whole attributes removed by the mask. This
+    /// uses key presence, never reference equality on the ignored values.
+    pub(crate) fn fully_masked_attribute_count(
+        &self,
+        desired: &CanonicalComparisonAttributes,
+        current: &CanonicalComparisonAttributes,
+    ) -> usize {
+        desired
+            .keys()
+            .filter(|key| {
+                current.contains_key(key)
+                    && !self.desired.contains_key(key)
+                    && !self.current.contains_key(key)
+            })
+            .count()
+    }
+
+    pub(crate) fn desired(&self) -> &CanonicalComparisonAttributes {
+        &self.desired
+    }
+    pub(crate) fn current(&self) -> &CanonicalComparisonAttributes {
+        &self.current
+    }
+    pub(crate) fn saved(&self) -> Option<&CanonicalComparisonAttributes> {
+        self.saved.as_ref()
+    }
+
+    pub(crate) fn retain_observed_list_elements(
+        &mut self,
+        attribute: &str,
+        mut keep: impl FnMut(&Value) -> bool,
+    ) {
+        for attributes in std::iter::once(&mut self.current).chain(self.saved.iter_mut()) {
+            if let Some(Value::Concrete(ConcreteValue::List(items))) = attributes.get_mut(attribute)
+            {
+                items.retain(&mut keep);
+            }
+        }
+    }
+}
+
 impl ResolvedIgnoreChanges {
+    /// Exercise internal indexed masks without extending the authored DSL,
+    /// whose resolver deliberately rejects explicit list indices.
+    #[cfg(test)]
+    pub(crate) fn indexed_for_test(
+        attribute: &str,
+        leaf: LeafPath,
+        authored: ParsedIgnorePath,
+    ) -> Self {
+        Self(vec![ResolvedIgnorePath {
+            attribute: attribute.into(),
+            leaf,
+            authored,
+            write_only: false,
+        }])
+    }
+
+    /// The sole constructor for planning operands. Apply this before any
+    /// authoring projection, merge, similarity scoring or reference collection.
+    pub(crate) fn mask_comparison_attributes(
+        &self,
+        desired: &CanonicalComparisonAttributes,
+        current: &CanonicalComparisonAttributes,
+        saved: Option<&CanonicalComparisonAttributes>,
+        schema: Option<&ResourceSchema>,
+    ) -> MaskedComparisonAttributes {
+        let mask = |attributes: &CanonicalComparisonAttributes| {
+            let mut attributes = attributes.attributes.clone();
+            for path in self.iter() {
+                if path.leaf.segments().is_empty() {
+                    attributes.remove(&path.attribute);
+                } else if let Some(value) = attributes.get_mut(&path.attribute) {
+                    set_leaf(value, path.leaf.segments(), None);
+                }
+            }
+            match schema {
+                Some(schema) => {
+                    CanonicalComparisonAttributes::canonicalize_preserving_secret_shapes(
+                        attributes, schema,
+                    )
+                }
+                None => CanonicalComparisonAttributes::from_unschematized(
+                    super::UnschematizedComparisonAttributes::new(attributes),
+                ),
+            }
+        };
+        MaskedComparisonAttributes {
+            desired: mask(desired),
+            current: mask(current),
+            saved: saved.map(mask),
+        }
+    }
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &ResolvedIgnorePath> {
         self.0.iter()
     }
@@ -139,52 +245,6 @@ impl ResolvedIgnoreChanges {
             set_leaf(&mut value, path.leaf.segments(), observed_leaf.cloned());
         }
         value
-    }
-
-    /// Apply readable ignore masks and restore the canonical comparison form.
-    pub(crate) fn mask_comparison_readable_leaves(
-        &self,
-        desired: &CanonicalComparisonAttributes,
-        observed: &CanonicalComparisonAttributes,
-        schema: Option<&ResourceSchema>,
-    ) -> CanonicalComparisonAttributes {
-        if self.is_empty() {
-            return desired.clone();
-        }
-        let mut masked = desired.attributes.clone();
-        let attributes = self
-            .iter()
-            .filter(|path| !path.write_only)
-            .map(|path| path.attribute.clone())
-            .collect::<HashSet<_>>();
-        for attribute in attributes {
-            if self
-                .for_attribute(&attribute)
-                .any(|path| !path.write_only && path.leaf.segments().is_empty())
-            {
-                match observed.get(&attribute) {
-                    Some(value) => {
-                        masked.insert(attribute, value.clone());
-                    }
-                    None => {
-                        masked.remove(&attribute);
-                    }
-                }
-                continue;
-            }
-            let Some(value) = masked.get(&attribute).cloned() else {
-                continue;
-            };
-            let value =
-                self.with_observed_readable_leaves(&attribute, &value, observed.get(&attribute));
-            masked.insert(attribute, value);
-        }
-        match schema {
-            Some(schema) => CanonicalComparisonAttributes::canonicalize(masked, schema),
-            None => CanonicalComparisonAttributes::from_unschematized(
-                super::UnschematizedComparisonAttributes::new(masked),
-            ),
-        }
     }
 
     /// Make an historical comparison baseline agree with a fresh observation

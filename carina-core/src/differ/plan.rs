@@ -17,9 +17,9 @@ use crate::plan::{
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
 use crate::resource::{
-    AbsoluteBindingAddress, CanonicalComparisonAttributes, ConcreteValue, Current, DataSource,
-    Directives, PlanInputCurrent, PlanInputDesired, PlanInputDesiredResources, ResolvedDataSource,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, Directives, PlanInputCurrent,
+    PlanInputDesired, PlanInputDesiredResources, ResolvedDataSource, ResolvedResource,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
     plan_input_desired_resources,
 };
 use crate::schema::{
@@ -32,7 +32,8 @@ use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
 use super::{
     ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates, PlannedListKeyRelease,
-    PlanningComparison, PresentDiff, comparison::AuthoredRemovalEvidence,
+    PlanningComparison, PresentDiff,
+    comparison::{AuthoredAttributeViews, AuthoredRemovalEvidence},
     diff_present_with_releases, type_aware_equal,
 };
 
@@ -267,7 +268,7 @@ fn contains_authored_create_only_value_on_path<'schema>(
 }
 
 struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
-    desired_items: &'items [&'items Value],
+    desired_items: &'items [(usize, &'items Value)],
     current_items: &'items [Value],
     element_type: &'schema AttributeType,
     schema: &'schema ResourceSchema,
@@ -283,9 +284,11 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
                 || !create_only_values_compatible(
                     self.element_type,
                     &self.current_items[current_index],
-                    self.desired_items[desired_index],
+                    self.desired_items[desired_index].1,
                     self.schema,
-                    self.context,
+                    &self
+                        .context
+                        .at_path(&self.context.index_path(self.desired_items[desired_index].0)),
                     self.removal_evidence,
                 )
             {
@@ -393,14 +396,17 @@ fn create_only_values_compatible_on_path<'schema>(
                         current_items.get(index),
                         desired,
                         schema,
-                        context,
+                        &context.at_path(&context.index_path(index)),
                         removal_evidence,
                     )
                 })
             } else {
                 let desired_items = desired_items
                     .iter()
-                    .filter(|item| contains_authored_create_only_value(element_type, item, schema))
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        contains_authored_create_only_value(element_type, item, schema)
+                    })
                     .collect::<Vec<_>>();
                 let mut current_matches = vec![None; current_items.len()];
                 let mut matcher = UnorderedCreateOnlyMatcher {
@@ -434,7 +440,7 @@ fn create_only_values_compatible_on_path<'schema>(
                     current_entries.get(key),
                     desired,
                     schema,
-                    context,
+                    &context.at_path(&context.map_key_path(key)),
                     removal_evidence,
                 )
             })
@@ -469,7 +475,7 @@ fn create_only_values_compatible_on_path<'schema>(
                             desired,
                             Some(&field.field_type),
                             &schema.defs,
-                            context,
+                            &context.at_path(&context.field_path(&field.name)),
                         )
                     });
                 }
@@ -478,7 +484,7 @@ fn create_only_values_compatible_on_path<'schema>(
                     current_fields.get(&field.name),
                     desired,
                     schema,
-                    context,
+                    &context.at_path(&context.field_path(&field.name)),
                     removal_evidence,
                 )
             })
@@ -496,14 +502,15 @@ fn create_only_values_compatible_on_path<'schema>(
     }
 }
 
-pub(super) fn find_changed_create_only(
+pub(super) fn find_changed_create_only<S>(
     changed_attributes: &[String],
-    current_attributes: &CanonicalComparisonAttributes,
-    removal_evidence: AuthoredRemovalEvidence,
-    desired: &PlanInputDesired<'_>,
+    desired: &ResolvedResource<S>,
+    views: &AuthoredAttributeViews<'_>,
     schema: &ResourceSchema,
     context: &PlanningComparison<'_>,
 ) -> Vec<String> {
+    let current_attributes = views.current();
+    let removal_evidence = views.removal_evidence();
     let top_level = schema.create_only_attributes();
     changed_attributes
         .iter()
@@ -515,17 +522,13 @@ pub(super) fn find_changed_create_only(
             let Some(attribute_schema) = schema.attributes().get(attribute.as_str()) else {
                 return false;
             };
-            let Some(desired_value) = desired.comparison_attributes().get(attribute.as_str())
-            else {
+            let Some(desired_value) = views.desired().get(attribute.as_str()) else {
                 // An authored empty struct canonicalizes to absence, but it
                 // still removes any previously authored create-only leaves.
                 // Keep comparison absence from inventing additions of empty
                 // nested create-only structs during unrelated updates.
                 return removal_evidence == AuthoredRemovalEvidence::Recorded
-                    && desired
-                        .authored()
-                        .attributes
-                        .contains_key(attribute.as_str())
+                    && desired.attributes.contains_key(attribute.as_str())
                     && current_attributes
                         .get(attribute.as_str())
                         .is_some_and(|current| {
@@ -548,7 +551,7 @@ pub(super) fn find_changed_create_only(
                 current,
                 desired_value,
                 schema,
-                context,
+                &context.at_path(attribute),
                 removal_evidence,
             )
         })
@@ -1161,11 +1164,18 @@ fn create_plan_parts(
                 let context = resolved_comparison.context();
                 let validated_schema = owner_schema.schema();
                 let schema = validated_schema.as_schema();
+                let masked = comparison_desired.masked_comparison(
+                    current_attributes,
+                    saved,
+                    Some(schema),
+                    references,
+                );
                 let result = context.with_references(references, &resource.id, |context| {
                     diff_present_with_releases(
                         comparison_desired,
                         present,
                         ExistingComparisonInputs {
+                            masked: &masked,
                             current_attributes,
                             saved,
                             nested_write_only: saved_attrs.nested_write_only(&resource.id),
@@ -1223,18 +1233,15 @@ fn create_plan_parts(
                             context.with_references(references, &resource.id, |context| {
                                 let authored_views =
                                     super::comparison::project_authored_attribute_views(
-                                        comparison_desired.comparison_attributes(),
-                                        current_attributes,
-                                        saved,
+                                        &masked,
                                         prev_explicit_for_resource,
                                         Some(schema),
                                         context,
                                     );
                                 find_changed_create_only(
                                     &changed_attributes,
-                                    authored_views.current(),
-                                    authored_views.removal_evidence(),
-                                    comparison_desired,
+                                    comparison_desired.authored(),
+                                    &authored_views,
                                     schema,
                                     context,
                                 )
@@ -1939,15 +1946,26 @@ fn promote_pending_replaces_for_dependents(
             let owner_schema = resolved_comparison.owner_schema();
             let schema = owner_schema.schema().as_schema();
             let desired = PlanInputDesired::with_resource_schema(resource, Some(schema));
+            let masked = desired.masked_comparison(
+                current.comparison_attributes(),
+                None,
+                Some(schema),
+                references,
+            );
             let create_only_refs = resolved_comparison.context().with_references(
                 references,
                 &resource.id,
                 |context| {
+                    let views = super::comparison::project_authored_attribute_views(
+                        &masked,
+                        None,
+                        Some(schema),
+                        context,
+                    );
                     find_changed_create_only(
                         &ref_attr_names,
-                        current.comparison_attributes(),
-                        AuthoredRemovalEvidence::Unrecorded,
-                        &desired,
+                        desired.authored(),
+                        &views,
                         schema,
                         context,
                     )

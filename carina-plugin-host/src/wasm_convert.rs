@@ -1846,22 +1846,12 @@ pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProvide
 }
 
 pub(crate) fn decode_reference_results(
-    expected: usize,
     results: Vec<Result<wit::ReferenceOutcome, wit::ReferenceError>>,
-) -> Result<
-    Vec<Result<carina_core::references::ReferenceOutcome, carina_core::references::ReferenceError>>,
-    carina_core::references::ReferenceError,
-> {
+) -> Vec<Result<carina_core::references::ReferenceOutcome, carina_core::references::ReferenceError>>
+{
     use carina_core::references::{ReferenceError, ReferenceOutcome};
-    if results.len() != expected {
-        return Err(ReferenceError::InvalidReference(
-            CoreProviderError::invalid_input(format!(
-                "reference result length mismatch: expected {expected}, got {}",
-                results.len()
-            )),
-        ));
-    }
-    Ok(results
+    // Core preparation validates the positional contract for every provider.
+    results
         .into_iter()
         .map(|result| match result {
             Ok(wit::ReferenceOutcome::Resolved(value)) => {
@@ -1880,7 +1870,7 @@ pub(crate) fn decode_reference_results(
                 ReferenceError::InvalidReference(wit_to_core_provider_error(error)),
             ),
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1889,31 +1879,25 @@ mod reference_tests {
     use carina_core::references::{ReferenceError, ReferenceOutcome};
 
     #[test]
-    fn reference_result_length_mismatch_is_invalid_reference() {
-        for (expected, actual) in [(2, 0), (2, 3), (0, 1)] {
+    fn reference_decode_preserves_positional_results_for_core_validation() {
+        for actual in [0, 1, 3] {
             let mut results = Vec::with_capacity(actual);
             for _ in 0..actual {
                 results.push(Ok(wit::ReferenceOutcome::Resolved("key/one".into())));
             }
-            assert!(matches!(
-                decode_reference_results(expected, results),
-                Err(ReferenceError::InvalidReference(_))
-            ));
+            assert_eq!(decode_reference_results(results).len(), actual);
         }
     }
 
     #[test]
     fn reference_success_is_nonempty_and_format_is_guest_owned() {
-        let results = decode_reference_results(
-            2,
-            vec![
-                Ok(wit::ReferenceOutcome::Resolved(String::new())),
-                Ok(wit::ReferenceOutcome::Resolved(
-                    "generic-provider-key".into(),
-                )),
-            ],
-        );
-        let mut results = results.unwrap().into_iter();
+        let results = decode_reference_results(vec![
+            Ok(wit::ReferenceOutcome::Resolved(String::new())),
+            Ok(wit::ReferenceOutcome::Resolved(
+                "generic-provider-key".into(),
+            )),
+        ]);
+        let mut results = results.into_iter();
         assert!(matches!(
             results.next().unwrap(),
             Err(ReferenceError::InvalidReference(_))

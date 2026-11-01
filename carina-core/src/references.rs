@@ -136,9 +136,42 @@ pub struct ResolvedReferences {
     desired: HashMap<CacheKey, DesiredSide>,
     current: HashMap<CacheKey, CurrentSide>,
     dangling: HashMap<ResourceId, BTreeSet<String>>,
+    comparisons: HashMap<ResourceId, PreparedComparison>,
+}
+
+/// Keep the exact masked view used by the collector for the planning walkers.
+/// Originals are only a reuse guard: binding-stability passes may change a
+/// resource's concrete inputs without changing its routed identity.
+#[derive(Debug, Clone)]
+struct PreparedComparison {
+    desired: crate::resource::CanonicalComparisonAttributes,
+    current: crate::resource::CanonicalComparisonAttributes,
+    saved: Option<crate::resource::CanonicalComparisonAttributes>,
+    ignores: crate::resource::ResolvedIgnoreChanges,
+    masked: crate::resource::MaskedComparisonAttributes,
+}
+
+struct ReferenceInputs {
+    occurrences: Vec<Occurrence>,
+    comparisons: HashMap<ResourceId, PreparedComparison>,
 }
 
 impl ResolvedReferences {
+    pub(crate) fn comparison_attributes(
+        &self,
+        resource: &ResourceId,
+        desired: &crate::resource::CanonicalComparisonAttributes,
+        current: &crate::resource::CanonicalComparisonAttributes,
+        saved: Option<&crate::resource::CanonicalComparisonAttributes>,
+        ignores: &crate::resource::ResolvedIgnoreChanges,
+    ) -> Option<&crate::resource::MaskedComparisonAttributes> {
+        let prepared = self.comparisons.get(resource)?;
+        (prepared.desired == *desired
+            && prepared.current == *current
+            && prepared.saved.as_ref() == saved
+            && prepared.ignores == *ignores)
+            .then_some(&prepared.masked)
+    }
     pub fn dangling_paths(&self, resource: &ResourceId) -> impl Iterator<Item = &str> {
         self.dangling
             .get(resource)
@@ -167,6 +200,7 @@ impl ResolvedReferences {
     pub(crate) fn equal(
         &self,
         resource: &ResourceId,
+        path: &str,
         ty: &TypeIdentity,
         a: &ValueString,
         b: &ValueString,
@@ -175,7 +209,7 @@ impl ResolvedReferences {
             return Err(Box::new(ReferencePlanError {
                 instance: ProviderInstanceKey::from(resource),
                 resource: resource.clone(),
-                path: ty.to_string(),
+                path: path.into(),
                 raw: raw.clone(),
                 source: ReferenceError::InvalidReference(ProviderError::invalid_input(
                     "secret values cannot be used as references",
@@ -199,7 +233,7 @@ impl ResolvedReferences {
                 Err(Box::new(ReferencePlanError {
                     instance,
                     resource: resource.clone(),
-                    path: ty.to_string(),
+                    path: path.into(),
                     raw: raw.into(),
                     source: ReferenceFailure::MissingWitness,
                 }))
@@ -224,15 +258,45 @@ enum CachedOutcome {
 impl ReferencePreparation {
     /// Prepare comparison evidence after references and provider normalization.
     /// Repeated passes in the same run only resolve newly concrete pairs.
-    pub async fn prepare(
+    pub async fn prepare<S>(
         &mut self,
-        desired: &[ResolvedResource],
+        desired: &[ResolvedResource<S>],
         current: &HashMap<ResourceId, PlanInputCurrent>,
         registry: &SchemaRegistry,
         saved: &LiftedSavedAttrs,
         provider: &ProviderRouter,
     ) -> Result<ResolvedReferences, Box<ReferencePlanError>> {
-        let occurrences = collect(desired, current, registry, saved)?;
+        let inputs = collect(desired, current, registry, saved)?;
+        let mut references = self
+            .prepare_occurrences(inputs.occurrences, provider)
+            .await?;
+        references.comparisons = inputs.comparisons;
+        Ok(references)
+    }
+
+    /// Apply-time decisions use exactly the same masked operands for
+    /// preparation and comparison, without sharing the plan's stale cache.
+    pub(crate) async fn prepare_masked_resource(
+        &mut self,
+        resource: &ResourceId,
+        masked: &crate::resource::MaskedComparisonAttributes,
+        schema: &crate::schema::ValidatedResourceSchema,
+        provider: &ProviderRouter,
+    ) -> Result<ResolvedReferences, Box<ReferencePlanError>> {
+        let mut collector = ReferenceCollector {
+            resource,
+            paths: HashMap::new(),
+        };
+        collector.collect(masked, schema)?;
+        self.prepare_occurrences(collector.needed_occurrences(), provider)
+            .await
+    }
+
+    async fn prepare_occurrences(
+        &mut self,
+        occurrences: Vec<Occurrence>,
+        provider: &ProviderRouter,
+    ) -> Result<ResolvedReferences, Box<ReferencePlanError>> {
         let mut batches: BTreeMap<ProviderInstanceKey, Vec<&Occurrence>> = BTreeMap::new();
         let mut seen = HashSet::new();
         for occurrence in &occurrences {
@@ -255,6 +319,16 @@ impl ReferencePreparation {
                     .resolve_references_for(&first.resource, &requests)
                     .await
                     .map_err(|error| first.error(ReferenceFailure::Call(error)))?;
+                if outcomes.len() != requests.len() {
+                    return Err(first.error(
+                        ReferenceError::InvalidReference(ProviderError::invalid_input(format!(
+                            "reference result length mismatch: expected {}, got {}",
+                            requests.len(),
+                            outcomes.len(),
+                        )))
+                        .into(),
+                    ));
+                }
                 Ok::<_, Box<ReferencePlanError>>(
                     occurrences.into_iter().zip(outcomes).collect::<Vec<_>>(),
                 )
@@ -273,6 +347,7 @@ impl ReferencePreparation {
             desired: HashMap::new(),
             current: HashMap::new(),
             dangling: HashMap::new(),
+            comparisons: HashMap::new(),
         };
         for occurrence in occurrences {
             let key = occurrence.key();
@@ -311,13 +386,14 @@ impl ReferencePreparation {
     }
 }
 
-fn collect(
-    desired: &[ResolvedResource],
+fn collect<S>(
+    desired: &[ResolvedResource<S>],
     current: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     saved: &LiftedSavedAttrs,
-) -> Result<Vec<Occurrence>, Box<ReferencePlanError>> {
+) -> Result<ReferenceInputs, Box<ReferencePlanError>> {
     let mut out = Vec::new();
+    let mut comparisons = HashMap::new();
     for resource in desired {
         let Some(schema) = registry.get_for(resource.as_resource()) else {
             continue;
@@ -331,59 +407,87 @@ fn collect(
             resource.resolved_attributes(),
             schema.schema().as_schema(),
         );
-        let comparison_desired = resource.ignore_changes().mask_comparison_readable_leaves(
+        let comparison_saved = saved.get(&resource.id).map(|values| {
+            crate::resource::CanonicalComparisonAttributes::canonicalize(
+                values.clone(),
+                schema.schema().as_schema(),
+            )
+        });
+        let masked = resource.ignore_changes().mask_comparison_attributes(
             &comparison_desired,
             current_attributes,
+            comparison_saved.as_ref(),
             Some(schema.schema().as_schema()),
         );
         let mut collector = ReferenceCollector {
-            resource,
+            resource: &resource.id,
             paths: HashMap::new(),
         };
-        for attribute in schema.schema().effective_attributes() {
-            let name = attribute.name();
-            if resource.ignore_changes().ignores_whole_attribute(name) {
-                continue;
-            }
-            for (value, desired) in [
-                (comparison_desired.get(name), true),
-                (current.and_then(|_| current_attributes.get(name)), false),
-                (
-                    saved.get(&resource.id).and_then(|values| values.get(name)),
-                    false,
-                ),
-            ] {
-                if let Some(value) = value {
-                    collector.walk(value, attribute.value_type(), name, name, desired, false, 0)?;
-                }
-            }
-        }
+        collector.collect(&masked, schema.schema())?;
+        comparisons.insert(
+            resource.id.clone(),
+            PreparedComparison {
+                desired: comparison_desired,
+                current: current_attributes.clone(),
+                saved: comparison_saved,
+                ignores: resource.ignore_changes().clone(),
+                masked,
+            },
+        );
         // Creates have no prior comparison. Walking their desired values still
         // rejects secrets before any provider batch can be dispatched.
         if current.is_some() {
-            for occurrences in collector.paths.into_values() {
-                let values = occurrences
-                    .iter()
-                    .map(|occurrence| &occurrence.request.value)
-                    .collect::<HashSet<_>>();
-                if values.len() > 1 {
-                    out.extend(occurrences);
-                }
-            }
+            out.extend(collector.needed_occurrences());
         }
     }
-    Ok(out)
+    Ok(ReferenceInputs {
+        occurrences: out,
+        comparisons,
+    })
 }
 
 /// Gather all operands a structural comparison can pair. List matching and
 /// similarity scoring can compare any elements, including desired vs saved;
 /// element indices therefore belong to diagnostics, not the schema path key.
 struct ReferenceCollector<'a> {
-    resource: &'a ResolvedResource,
+    resource: &'a ResourceId,
     paths: HashMap<(String, TypeIdentity), Vec<Occurrence>>,
 }
 
 impl ReferenceCollector<'_> {
+    fn needed_occurrences(self) -> Vec<Occurrence> {
+        self.paths
+            .into_values()
+            .filter(|occurrences| {
+                occurrences
+                    .iter()
+                    .map(|occurrence| &occurrence.request.value)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    > 1
+            })
+            .flatten()
+            .collect()
+    }
+    fn collect(
+        &mut self,
+        masked: &crate::resource::MaskedComparisonAttributes,
+        schema: &crate::schema::ValidatedResourceSchema,
+    ) -> Result<(), Box<ReferencePlanError>> {
+        for attribute in schema.effective_attributes() {
+            let name = attribute.name();
+            for (value, desired) in [
+                (masked.desired().get(name), true),
+                (masked.current().get(name), false),
+                (masked.saved().and_then(|values| values.get(name)), false),
+            ] {
+                if let Some(value) = value {
+                    self.walk(value, attribute.value_type(), name, name, desired, false, 0)?;
+                }
+            }
+        }
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
@@ -395,13 +499,7 @@ impl ReferenceCollector<'_> {
         secret: bool,
         depth: usize,
     ) -> Result<(), Box<ReferencePlanError>> {
-        if depth >= 64
-            || self
-                .resource
-                .ignore_changes()
-                .iter()
-                .any(|ignored| reference_path(ignored) == path)
-        {
+        if depth >= 64 {
             return Ok(());
         }
         if let Value::Deferred(crate::resource::DeferredValue::Secret(inner)) = value {
@@ -414,8 +512,8 @@ impl ReferenceCollector<'_> {
                     || matches!(value, Value::Concrete(ConcreteValue::String(raw)) if raw.is_diagnostic_sensitive())
                 {
                     return Err(Box::new(ReferencePlanError {
-                        instance: ProviderInstanceKey::from(&self.resource.id),
-                        resource: self.resource.id.clone(),
+                        instance: ProviderInstanceKey::from(self.resource),
+                        resource: self.resource.clone(),
                         path: path.into(),
                         raw: ValueString::diagnostic_sensitive("<redacted>"),
                         source: ReferenceError::InvalidReference(ProviderError::invalid_input(
@@ -429,7 +527,7 @@ impl ReferenceCollector<'_> {
                         .entry((schema_path.into(), identity.clone()))
                         .or_default()
                         .push(Occurrence {
-                            resource: self.resource.id.clone(),
+                            resource: self.resource.clone(),
                             path: path.into(),
                             desired,
                             request: ReferenceRequest {
@@ -503,25 +601,6 @@ impl ReferenceCollector<'_> {
     }
 }
 
-fn reference_path(path: &crate::resource::ResolvedIgnorePath) -> String {
-    let mut rendered = path.attribute().to_string();
-    for segment in path.leaf().segments() {
-        match segment {
-            crate::schema::LeafPathSegment::StructField(name) => {
-                rendered.push('.');
-                rendered.push_str(name);
-            }
-            crate::schema::LeafPathSegment::ListIndex(index) => {
-                rendered.push_str(&format!("[{index}]"))
-            }
-            crate::schema::LeafPathSegment::MapKey(key) => {
-                rendered.push_str(&format!("[{}]", crate::parser::display_string_literal(key)))
-            }
-        }
-    }
-    rendered
-}
-
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn prepare_empty_for_tests() -> ResolvedReferences {
@@ -529,6 +608,7 @@ pub fn prepare_empty_for_tests() -> ResolvedReferences {
         desired: HashMap::new(),
         current: HashMap::new(),
         dangling: HashMap::new(),
+        comparisons: HashMap::new(),
     }
 }
 

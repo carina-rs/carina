@@ -11,8 +11,8 @@ use crate::diff_helpers::{list_element_type, map_entry_subtype};
 use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::provider::SentDesiredAttributes;
 use crate::resource::{
-    CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, Resource, Value,
-    pair_list_elements, pair_list_elements_with_uniqueness,
+    CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, MaskedComparisonAttributes,
+    Resource, Value, pair_list_elements, pair_list_elements_with_uniqueness,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
@@ -686,6 +686,25 @@ fn carry_list<R: ReferenceEquality>(
         context.defs,
         &context.comparison,
     );
+    if has_unmatched_fresh
+        && prior_to_fresh.iter().any(Option::is_none)
+        && item_type.is_some_and(|ty| type_contains_reference(ty, context.defs, 0))
+    {
+        // Saved plans and newly returned references may have no prepared
+        // identity evidence. Byte inequality cannot establish a new element
+        // or discard its prior field provenance. Keep the authored field union
+        // until identity can be established; never promote provider defaults
+        // to whole-element Leaf authoring merely because alias bytes changed.
+        let prior = ExplicitFields::List {
+            element: Box::new(union_elements(prior_elements.iter().cloned())),
+        };
+        return carried_list_without_alignment(
+            &candidate_paths,
+            merge(prior, build_legacy_list(desired_items)),
+            has_pending_paths,
+            has_unmatched_fresh,
+        );
+    }
     // The normal builder deliberately retains only the stable stored-index
     // authoring vector (including deterministic choices for duplicates). It
     // does not retain the desired index or uniqueness evidence, so transfer
@@ -759,6 +778,38 @@ fn carry_list<R: ReferenceEquality>(
             elements: rebuilt_elements,
         },
         pending_removal,
+    }
+}
+
+fn type_contains_reference(
+    ty: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    depth: usize,
+) -> bool {
+    if depth >= 64 {
+        return true;
+    }
+    use crate::schema::AttrTypeKind;
+    match &ty.kind {
+        AttrTypeKind::Reference { .. } => true,
+        AttrTypeKind::Ref(name) => defs
+            .get(name)
+            .is_some_and(|ty| type_contains_reference(ty, defs, depth + 1)),
+        AttrTypeKind::List { element_type, .. } => {
+            type_contains_reference(element_type, defs, depth + 1)
+        }
+        AttrTypeKind::Map { value, .. } => type_contains_reference(value, defs, depth + 1),
+        AttrTypeKind::Struct { fields, .. } => fields
+            .iter()
+            .any(|field| type_contains_reference(&field.field_type, defs, depth + 1)),
+        AttrTypeKind::Union(_) => {
+            crate::schema::union_members_with_defs(ty, defs).is_some_and(|members| {
+                members.any_on_path(&mut Vec::new(), |member, _| {
+                    type_contains_reference(member.as_attr(), defs, depth + 1)
+                })
+            })
+        }
+        _ => false,
     }
 }
 
@@ -1225,11 +1276,29 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// stored lists use the legacy union projection. Schema-aware list pairing
 /// uses the same equality as state writeback.
 pub struct ExplicitProjection<'a, R: ReferenceEquality> {
-    stored_attributes: &'a CanonicalComparisonAttributes,
+    stored_attributes: Option<&'a CanonicalComparisonAttributes>,
     desired: ProjectionDesired<'a>,
     explicit: &'a ExplicitFields,
     schema: Option<&'a ResourceSchema>,
     comparison: ComparisonContext<'a, R>,
+}
+
+/// The planning projection cannot accept independent, unmasked operands.
+pub(crate) struct MaskedExplicitProjection<'a, R: ReferenceEquality> {
+    projection: ExplicitProjection<'a, R>,
+    masked: &'a MaskedComparisonAttributes,
+}
+
+impl<R: ReferenceEquality> MaskedExplicitProjection<'_, R> {
+    pub(crate) fn current(&self) -> ProjectedAttributes {
+        self.projection
+            .project_attributes(self.masked.current().clone())
+    }
+    pub(crate) fn saved(&self) -> Option<ProjectedAttributes> {
+        self.masked
+            .saved()
+            .map(|saved| self.projection.project_attributes(saved.clone()))
+    }
 }
 
 enum ProjectionDesired<'a> {
@@ -1260,24 +1329,27 @@ impl ProjectionDesiredValue<'_> {
 impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
     /// Build a projection whose server-added classification is checked against
     /// the resource's desired attributes.
-    pub fn for_desired(
-        stored_attributes: &'a CanonicalComparisonAttributes,
-        desired_attributes: &'a CanonicalComparisonAttributes,
+    pub(crate) fn for_desired(
+        masked: &'a MaskedComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
         comparison: &ComparisonContext<'a, R>,
-    ) -> Self {
-        Self {
-            stored_attributes,
-            desired: ProjectionDesired::Attributes(
-                desired_attributes
-                    .into_iter()
-                    .map(|(key, value)| (key.as_str(), value))
-                    .collect(),
-            ),
-            explicit,
-            schema,
-            comparison: *comparison,
+    ) -> MaskedExplicitProjection<'a, R> {
+        MaskedExplicitProjection {
+            masked,
+            projection: Self {
+                stored_attributes: masked.saved(),
+                desired: ProjectionDesired::Attributes(
+                    masked
+                        .desired()
+                        .into_iter()
+                        .map(|(key, value)| (key.as_str(), value))
+                        .collect(),
+                ),
+                explicit,
+                schema,
+                comparison: *comparison,
+            },
         }
     }
 
@@ -1292,7 +1364,7 @@ impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
         comparison: &ComparisonContext<'a, R>,
     ) -> Self {
         Self {
-            stored_attributes,
+            stored_attributes: Some(stored_attributes),
             desired: ProjectionDesired::Conservative,
             explicit,
             schema,
@@ -1340,12 +1412,13 @@ impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
             };
             let projected = project_value(
                 value,
-                self.stored_attributes.get(&key),
+                self.stored_attributes
+                    .and_then(|attributes| attributes.get(&key)),
                 desired,
                 explicit,
                 attr_type,
                 defs,
-                &self.comparison,
+                &self.comparison.at_path(&key),
             );
             projected_attributes.insert(key.clone(), projected.value);
             projected_children.insert(key, projected.authoring);
@@ -1489,7 +1562,7 @@ fn project_value<R: ReferenceEquality>(
                     child,
                     map_entry_subtype(attr_type, &key, defs),
                     defs,
-                    comparison,
+                    &comparison.at_path(&comparison.entry_path(&key, attr_type, defs)),
                 );
                 projected_fields.insert(key.clone(), projected.value);
                 projected_children.insert(key, projected.authoring);
@@ -1581,11 +1654,14 @@ fn project_value<R: ReferenceEquality>(
             };
             let mut projected_items = Vec::with_capacity(items.len());
             let mut projected_elements = Vec::with_capacity(items.len());
-            for ((item, stored_pairing), desired) in items
+            for (index, ((item, stored_pairing), desired)) in items
                 .into_iter()
                 .zip(stored_pairings)
                 .zip(desired_by_current)
+                .enumerate()
             {
+                let path = comparison.index_path(index);
+                let comparison = &comparison.at_path(&path);
                 let paired_stored = match stored_pairing {
                     ListElementPairing::Unique(stored_index) => Some(&stored_items[stored_index]),
                     ListElementPairing::Ambiguous | ListElementPairing::Unmatched => None,
@@ -1770,14 +1846,19 @@ mod tests {
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
-        ExplicitProjection::for_desired(
-            &stored_attributes,
+        let masked = crate::resource::ResolvedIgnoreChanges::default().mask_comparison_attributes(
             &desired_attributes,
+            &current_attributes,
+            Some(&stored_attributes),
+            None,
+        );
+        ExplicitProjection::for_desired(
+            &masked,
             &root,
             None,
             &crate::differ::exact_comparison_context_for_tests(),
         )
-        .project_attributes(current_attributes)
+        .current()
         .into_attributes()
         .into_iter()
         .collect::<HashMap<_, _>>()
@@ -1827,14 +1908,19 @@ mod tests {
         let attributes = CanonicalComparisonAttributes::from_unschematized(
             crate::resource::UnschematizedComparisonAttributes::new(attributes),
         );
+        let masked = crate::resource::ResolvedIgnoreChanges::default().mask_comparison_attributes(
+            &attributes,
+            &attributes,
+            Some(&attributes),
+            None,
+        );
         ExplicitProjection::for_desired(
-            &attributes,
-            &attributes,
+            &masked,
             explicit,
             None,
             &crate::differ::exact_comparison_context_for_tests(),
         )
-        .project_attributes(attributes.clone())
+        .current()
         .into_attributes()
         .into_iter()
         .collect()
