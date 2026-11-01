@@ -206,15 +206,13 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         pair: &pest::iterators::Pair<'_, super::Rule>,
     ) -> DiagnosticSourceSpan {
         let AuthoredDiagnosticSource { path, file } = &self.diagnostic_source;
-        let span = pair.as_span();
-        let start = file.original_position(span.start());
-        let end = file.original_position(span.end().saturating_sub(1));
+        let span = SourceSpan::from_pest(pair, file);
         DiagnosticSourceSpan::authored(
             path.clone(),
-            start.line(),
-            start.column(),
-            end.line(),
-            end.column() + 1,
+            span.start_line(),
+            span.start_column(),
+            span.end_line(),
+            span.end_column(),
         )
     }
 }

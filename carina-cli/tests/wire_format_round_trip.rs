@@ -40,6 +40,11 @@ fn assert_module_prefixed_addresses(addresses: BTreeSet<String>) {
 
 #[test]
 fn pre_change_state_binding_addresses_keep_the_existing_wire_shape() {
+    assert_eq!(
+        StateFile::CURRENT_VERSION,
+        20,
+        "directive resolution must not change state format"
+    );
     let fixture = include_str!("fixtures/module_binding_wire_compat/carina.state.json");
     let original: Value = serde_json::from_str(fixture).expect("fixture must contain valid JSON");
     let decoded: StateFile = check_and_migrate(fixture)
@@ -61,6 +66,45 @@ fn pre_change_state_binding_addresses_keep_the_existing_wire_shape() {
 
     assert_eq!(reserialized, original);
     assert_module_prefixed_addresses(addresses);
+}
+
+#[test]
+fn v38_plans_accept_legacy_resolved_scalar_template_directives() {
+    use carina_core::resource::LoopDirective;
+
+    assert_eq!(PlanFile::CURRENT_VERSION, 38);
+    for fixture in [
+        include_str!("fixtures/module_binding_wire_compat/carina.plan.json"),
+        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.plan.json"),
+    ] {
+        // Retain the old scalar template payload inside a current-version plan.
+        // Applying the original v37 file is independently rejected at its header.
+        let mut wire: Value = serde_json::from_str(fixture).unwrap();
+        wire["version"] = serde_json::json!(PlanFile::CURRENT_VERSION);
+        let plan: PlanFile = serde_json::from_value(wire.clone()).unwrap();
+        let mut templates = 0;
+        for effect in plan.plan.effects() {
+            let template = match effect {
+                UnresolvedSavedEffect::DeferredCreate(payload) => &payload.template,
+                UnresolvedSavedEffect::DeferredReplace(payload) => &payload.template,
+                _ => continue,
+            };
+            templates += 1;
+            assert!(matches!(
+                template.template_resource().directives().force_delete,
+                LoopDirective::Resolved(_)
+            ));
+            assert!(matches!(
+                template
+                    .template_resource()
+                    .directives()
+                    .create_before_destroy,
+                LoopDirective::Resolved(_)
+            ));
+        }
+        assert_eq!(templates, 2);
+        assert_eq!(serde_json::to_value(plan).unwrap(), wire);
+    }
 }
 
 #[test]

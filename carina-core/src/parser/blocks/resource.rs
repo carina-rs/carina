@@ -9,10 +9,7 @@ use crate::eval_value::{EvalValue, ParsedSinkValue, StructuralHandleKind};
 use crate::parser::context::{
     ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
 };
-use crate::parser::error::{
-    NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE, ParseError, ParseWarning, ParseWarningSpan,
-    WarningKind,
-};
+use crate::parser::error::ParseError;
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{BoundDeferredTarget, Rule};
 use crate::parser::{
@@ -21,8 +18,9 @@ use crate::parser::{
 use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
     AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
-    AuthoredDirectives as Directives, DiagnosticSourceLocations, LoopElementOrigin, LoopProvenance,
-    ParsedIgnorePath, ParsedIgnorePathSegment, RelativeBindingName, ResourceId, ResourceIdentity,
+    AuthoredDirectives as Directives, DiagnosticSourceLocations, DirectiveExpr, LifecycleDirective,
+    LoopElementOrigin, LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment,
+    RelativeBindingName, ResourceId, ResourceIdentity,
 };
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -471,6 +469,13 @@ fn parse_directives(
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives block")?;
         let line = value_pair.line_col().0;
 
+        if let Some(directive) = LifecycleDirective::from_name(&key) {
+            let source = ctx.diagnostic_source_span(&value_pair);
+            let value = parse_expression(value_pair, ctx)?;
+            directives.set(directive, DirectiveExpr::new(value, source));
+            continue;
+        }
+
         match key.as_str() {
             "ignore_changes" => {
                 let primary =
@@ -538,58 +543,6 @@ fn parse_directives(
                     line,
                     BindingNameUse::Provider,
                 )?);
-            }
-            "force_delete" => {
-                directives.force_delete = matches!(
-                    parse_expression(value_pair, ctx)?,
-                    Value::Concrete(ConcreteValue::Bool(true))
-                );
-            }
-            "create_before_destroy" => {
-                directives.create_before_destroy = matches!(
-                    parse_expression(value_pair, ctx)?,
-                    Value::Concrete(ConcreteValue::Bool(true))
-                );
-            }
-            "prevent_destroy" => {
-                let literal = crate::parser::util::unwrap_to_primary(value_pair.clone())
-                    .and_then(|primary| primary.into_inner().next())
-                    .and_then(|value| match value.as_rule() {
-                        Rule::boolean => match value.as_str() {
-                            "true" => Some(true),
-                            "false" => Some(false),
-                            _ => None,
-                        },
-                        _ => None,
-                    });
-                let warning_span = {
-                    let span = value_pair.as_span();
-                    let (start_line, start_column) = span.start_pos().line_col();
-                    let (end_line, end_column) = span.end_pos().line_col();
-                    ParseWarningSpan {
-                        start_line,
-                        start_column,
-                        end_line,
-                        end_column,
-                    }
-                };
-                let parsed = parse_expression(value_pair, ctx)?;
-                match literal {
-                    Some(value) => directives.set_prevent_destroy(value),
-                    None => {
-                        if matches!(parsed, Value::Concrete(ConcreteValue::Bool(true))) {
-                            directives.set_prevent_destroy(true);
-                        } else {
-                            ctx.push_warning(ParseWarning {
-                                file: None,
-                                line,
-                                kind: WarningKind::NonLiteralPreventDestroy,
-                                span: Some(warning_span),
-                                message: NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE.to_string(),
-                            });
-                        }
-                    }
-                }
             }
             _ => {}
         }

@@ -350,7 +350,7 @@ mod tests {
             std::path::Path::new("."),
         )
         .expect("deferred fixture crosses the module-resolution seam")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = parsed.deferred_for_expressions()[0].clone();
         let scheduler_key = template.target().scheduler_key().to_string();

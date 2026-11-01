@@ -572,7 +572,7 @@ pub enum ResolveFileError {
     #[error(transparent)]
     BindingUse(#[from] BindingUseReport),
     #[error(transparent)]
-    LeftoverPlaceholders(#[from] crate::resource::LeftoverPlaceholders),
+    Expansion(#[from] crate::resource::ExpansionError),
 }
 
 impl BindingUseReport {
@@ -1429,7 +1429,7 @@ pub fn resolve_bare_binding_uses<
     }
 
     Ok(ResolvedFile {
-        inner: file.into_expanded()?,
+        inner: file.into_expanded(schemas)?,
     })
 }
 
@@ -7550,9 +7550,7 @@ where
         for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
         }
-        // `LiveComposition` has no directives — `directives()` is `None`
-        // for that arm, so the depends_on walk is simply skipped.
-        for dep in rref.directives().into_iter().flat_map(|d| &d.depends_on) {
+        for dep in rref.directive_dependencies() {
             referenced.insert(dep.clone());
         }
     }

@@ -6815,7 +6815,31 @@ mod tests {
         }
     }
 
-    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {}
+    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {
+        type DirectiveBool<B: crate::resource::BindingAddress> = bool;
+        type DirectivePreventDestroy<B: crate::resource::BindingAddress> =
+            crate::resource::PreventDestroy;
+        fn rebind_directives<
+            B: crate::resource::BindingAddress,
+            C: crate::resource::BindingAddress,
+        >(
+            directives: crate::resource::Directives<B, Self>,
+            resolve: &mut impl FnMut(B) -> C,
+        ) -> crate::resource::Directives<C, Self> {
+            crate::resource::directive_expr::rebind_resolved_directives(directives, resolve)
+        }
+
+        fn map_absolute_directive_values(
+            _directives: &mut crate::resource::Directives<
+                crate::resource::AbsoluteBindingAddress,
+                Self,
+            >,
+            _map: &mut impl FnMut(
+                &crate::resource::AbsoluteBindingAddress,
+            ) -> crate::resource::AbsoluteBindingAddress,
+        ) {
+        }
+    }
 
     #[test]
     fn placeholder_secret_material_uses_structured_serde_not_display_wording() {

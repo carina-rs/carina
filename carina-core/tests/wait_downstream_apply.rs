@@ -287,7 +287,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
 
     let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("expanded module fixture contains no parser placeholders");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
@@ -489,7 +489,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
 
     let parsed = resolve_modules(parsed, &root).expect("nested module resolution should succeed");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("expanded nested module fixture contains no parser placeholders");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
@@ -672,7 +672,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         .expect("parse_directory should succeed");
     let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("expanded module fixture contains no parser placeholders");
 
     let sorted_resources =

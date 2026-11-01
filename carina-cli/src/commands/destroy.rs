@@ -2513,7 +2513,7 @@ mod tests {
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("test fixture crosses module resolution")
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();

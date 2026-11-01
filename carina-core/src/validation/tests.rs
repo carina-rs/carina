@@ -6170,7 +6170,7 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
                 Value::Concrete(ConcreteValue::String(identifier.into())),
             )
             .resolve_root(&RootScope::new())
-            .into_expanded()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
             .expect("resource fixture contains no parser placeholder");
         ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[resource],

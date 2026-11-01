@@ -468,10 +468,8 @@ impl<'a> DependencyAnalyzer<'a> {
                 self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
             }
         }
-        if let Some(directives) = resource.directives() {
-            for binding in &directives.depends_on {
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
-            }
+        for binding in resource.directive_dependencies() {
+            self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
         }
     }
 
