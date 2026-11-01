@@ -787,7 +787,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         .attributes
         .insert("name".to_string(), empty());
     let target = DeferredForTarget::bound("items").expect("fixture binding is valid");
-    let body = DeferredForBody::resource(&target, template_resource);
+    let body = DeferredForBody::resource(template_resource);
     file.parsed_deferred_for_expressions_mut()
         .push(ParsedDeferredForExpression::new(
             Some("loops.crn".to_string()),
@@ -863,7 +863,7 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
         .insert("name".to_string(), empty_interpolation_placeholder());
     let mut file = ParsedFile::default();
     let target = DeferredForTarget::bound("items").expect("fixture binding is valid");
-    let body = DeferredForBody::resource(&target, template_resource);
+    let body = DeferredForBody::resource(template_resource);
     file.parsed_deferred_for_expressions_mut()
         .push(ParsedDeferredForExpression::new(
             Some("loops.crn".to_string()),

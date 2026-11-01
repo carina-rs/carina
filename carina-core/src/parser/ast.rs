@@ -13,6 +13,7 @@ use super::error::{
 };
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
+use super::grammar::ParserBindingName;
 use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandleMetadata};
@@ -85,14 +86,27 @@ impl BoundDeferredTarget {
         if final_segment.contains('[') || final_segment.ends_with(']') {
             return Err(BoundDeferredTargetError::TrailingIndex);
         }
-        let template_address = DeferredForTemplateAddress(ResourceIdentity::try_from(format!(
-            "{}[?]",
-            binding.as_str()
-        ))?);
-        Ok(Self {
+        Ok(Self::from_unindexed_binding(binding))
+    }
+
+    fn from_unindexed_binding(binding: ResourceIdentity) -> Self {
+        let final_segment = binding.as_str().rsplit('.').next().unwrap_or_default();
+        debug_assert!(!final_segment.contains('[') && !final_segment.ends_with(']'));
+        let template_address =
+            DeferredForTemplateAddress(ResourceIdentity::new(format!("{}[?]", binding.as_str())));
+        Self {
             binding,
             template_address,
-        })
+        }
+    }
+
+    pub(super) fn from_parser_binding(binding: &ParserBindingName) -> Self {
+        Self::from_unindexed_binding(ResourceIdentity::new(binding.as_str()))
+    }
+
+    pub(crate) fn with_instance_prefix(&self, prefix: &str) -> Self {
+        let binding = ResourceIdentity::new(format!("{prefix}.{}", self.binding()));
+        Self::from_unindexed_binding(binding)
     }
 
     pub fn binding(&self) -> &str {
@@ -243,12 +257,7 @@ pub struct DeferredForTemplateResource<S = ModuleSource, P: PlaceholderKind = Lo
 }
 
 impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
-    pub(crate) fn new(target: &DeferredForTarget, mut resource: Resource<S, P>) -> Self {
-        materialize_template_address(target, &mut resource);
-        Self::from_materialized(resource)
-    }
-
-    fn from_materialized(resource: Resource<S, P>) -> Self {
+    pub(crate) fn new(resource: Resource<S, P>) -> Self {
         let display_type = resource.id.display_type();
         Self {
             resource,
@@ -314,14 +323,14 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
         self,
         map: impl FnOnce(Resource<S, P>) -> Resource<S2, P2>,
     ) -> DeferredForTemplateResource<S2, P2> {
-        DeferredForTemplateResource::from_materialized(map(self.resource))
+        DeferredForTemplateResource::new(map(self.resource))
     }
 
     fn try_map_resource<S2, P2: PlaceholderKind, E>(
         self,
         map: impl FnOnce(Resource<S, P>) -> Result<Resource<S2, P2>, E>,
     ) -> Result<DeferredForTemplateResource<S2, P2>, E> {
-        map(self.resource).map(DeferredForTemplateResource::from_materialized)
+        map(self.resource).map(DeferredForTemplateResource::new)
     }
 
     pub(crate) fn attributes_mut(&mut self) -> &mut IndexMap<String, Value<P>> {
@@ -431,7 +440,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         binding: ForBinding,
         template_resource: Resource<S, T>,
     ) -> Self {
-        let template_resource = DeferredForTemplateResource::new(&target, template_resource);
+        let template_resource = DeferredForTemplateResource::new(template_resource);
         Self::from_template_resource(
             file,
             line,
@@ -535,11 +544,8 @@ pub enum DeferredForBody<P: PlaceholderKind = ParserPlaceholder> {
 }
 
 impl<P: PlaceholderKind> DeferredForBody<P> {
-    pub(crate) fn resource(
-        target: &DeferredForTarget,
-        resource: Resource<ModuleSource, P>,
-    ) -> Self {
-        Self::Resource(Box::new(DeferredForTemplateResource::new(target, resource)))
+    pub(crate) fn resource(resource: Resource<ModuleSource, P>) -> Self {
+        Self::Resource(Box::new(DeferredForTemplateResource::new(resource)))
     }
 
     fn into_materialized_for_target(self, target: &DeferredForTarget) -> Self {
@@ -1094,7 +1100,7 @@ where
             }
         }
 
-        let template_resource = DeferredForTemplateResource::new(&wire.target, template_resource);
+        let template_resource = DeferredForTemplateResource::new(template_resource);
         Ok(Self::from_template_resource(
             None,
             0,
@@ -6964,9 +6970,7 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn deferred_template_resource_equality_covers_the_whole_resource() {
-        let target = DeferredForTarget::bound("children").expect("valid target");
         let left = DeferredForTemplateResource::new(
-            &target,
             Resource::<ModuleSource, LoopSlot>::pending_with_provider(
                 "mock",
                 "test.resource",
@@ -6984,16 +6988,15 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn parsed_deferred_for_rederives_template_identity_from_its_target() {
-        let body_target = DeferredForTarget::bound("wrong").expect("valid body target");
         let owning_target = DeferredForTarget::bound("right").expect("valid owning target");
-        let body = DeferredForBody::resource(
-            &body_target,
-            Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
-                "mock",
-                "test.resource",
-                None,
-            ),
+        let mut resource = Resource::<ModuleSource, ParserPlaceholder>::with_provider(
+            "mock",
+            "test.resource",
+            "wrong[?]",
+            None,
         );
+        resource.binding = Some("wrong[?]".to_string());
+        let body = DeferredForBody::resource(resource);
 
         let parsed = ParsedDeferredForExpression::new(
             None,
@@ -7027,7 +7030,6 @@ mod substitute_placeholder_tests {
     fn parsed_deferred_for_conversion_rederives_template_identity_from_its_target() {
         let target = DeferredForTarget::bound("right").expect("valid target");
         let body = DeferredForBody::resource(
-            &target,
             Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
                 "mock",
                 "test.resource",
@@ -7078,7 +7080,6 @@ mod substitute_placeholder_tests {
             ),
         };
         let template = DeferredForTemplateResource::new(
-            &target,
             Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
                 "mock",
                 "test.resource",

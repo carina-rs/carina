@@ -739,14 +739,14 @@ fn node_from_effect(
             None,
         ),
         Effect::DeferredCreate(payload) => (
-            deferred_label(&payload.template, payload.id()),
+            deferred_label(&payload.template),
             payload.id().display_type(),
             EffectKind::DeferredCreate,
             Vec::new(),
             deferred_after_note(&payload.template),
         ),
         Effect::DeferredReplace(payload) => (
-            deferred_label(&payload.template, payload.id()),
+            deferred_label(&payload.template),
             payload.id().display_type(),
             EffectKind::DeferredReplace,
             Vec::new(),
@@ -826,16 +826,13 @@ fn resource_label(binding: Option<&str>, id: &ResourceId, module_label: Option<&
         .unwrap_or_else(|| short_type.to_string())
 }
 
-fn deferred_label<S>(
-    template: &carina_core::parser::DeferredForExpression<S>,
-    id: &ResolvedResourceId,
-) -> String {
+fn deferred_label<S>(template: &carina_core::parser::DeferredForExpression<S>) -> String {
     match template.target() {
         carina_core::parser::DeferredForTarget::Bound(target) => target.binding().to_string(),
         carina_core::parser::DeferredForTarget::Unbound { .. } => {
             format!(
                 "{}.<pending> (deferred for at {})",
-                id.display_type(),
+                template.deferred_effect_id().display_type(),
                 template.target().display_name(),
             )
         }
@@ -1386,7 +1383,7 @@ mod tests {
         let json = serde_json::to_string(&saved).expect("serialize saved deferred template");
         let round_tripped: carina_core::parser::SavedDeferredForExpression =
             serde_json::from_str(&json).expect("deserialize saved deferred template for display");
-        let label = deferred_label(&round_tripped, round_tripped.deferred_effect_id());
+        let label = deferred_label(&round_tripped);
 
         assert!(
             label.contains("deferred for at main.crn:2"),

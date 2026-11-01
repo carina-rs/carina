@@ -9,6 +9,7 @@
 
 use crate::eval_value::{EvalValue, StructuralHandleMetadata};
 use crate::parser::expressions::primary::parse_postfix_eval;
+use crate::parser::grammar::ParserBindingName;
 use crate::parser::{
     DeferredForBody, DeferredForTarget, ModuleCall, ParseContext, ParseError, ParseWarning,
     ParsedDeferredForExpression, ParsedDeferredForIterableState, PreprocessedFile,
@@ -136,9 +137,7 @@ fn parse_deferred_for_body_template(
         Err(error) => return Err(error),
     };
     Ok(DeferredForBodyTemplateParse::Parsed(match result {
-        ForBodyResult::Resource(resource) => {
-            DeferredForBody::resource(&target.deferred_target(), *resource)
-        }
+        ForBodyResult::Resource(resource) => DeferredForBody::resource(*resource),
         ForBodyResult::DataSource(data_source) => DeferredForBody::Read(data_source),
         ForBodyResult::ModuleCall(call) => DeferredForBody::ModuleCall(call),
     }))
@@ -213,10 +212,10 @@ fn record_deferred_for_expression(
 }
 
 impl LoopParseTarget {
-    pub(crate) fn bound(
-        binding: impl Into<String>,
-    ) -> Result<Self, crate::parser::BoundDeferredTargetError> {
-        crate::parser::BoundDeferredTarget::new(binding).map(Self::Bound)
+    pub(crate) fn bound(binding: &ParserBindingName) -> Self {
+        Self::Bound(crate::parser::BoundDeferredTarget::from_parser_binding(
+            binding,
+        ))
     }
 
     pub(crate) fn unbound(source: LoopSource, legacy_base: LegacyLoopAddress) -> Self {

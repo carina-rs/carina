@@ -565,7 +565,7 @@ mod tests {
         let mut parsed = parsed_with_unsynchronized_chained_ref();
         let record = parsed.resources.pop().expect("record resource"); // allow: direct — fixture test inspection
         let target = DeferredForTarget::bound("records").expect("fixture binding is valid");
-        let body = DeferredForBody::resource(&target, record);
+        let body = DeferredForBody::resource(record);
         parsed
             .parsed_deferred_for_expressions_mut()
             .push(ParsedDeferredForExpression::new(

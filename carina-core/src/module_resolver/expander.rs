@@ -2249,16 +2249,7 @@ pub(super) fn prefix_parsed_deferred_for_expression(
         .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
     let target = match deferred.target() {
         crate::parser::DeferredForTarget::Bound(target) => {
-            let target = crate::parser::BoundDeferredTarget::new(apply_instance_prefix(
-                instance_prefix,
-                target.binding(),
-            ))
-            .map_err(|error| ArgumentSubstitutionError {
-                source_file: deferred.file.clone().map(std::path::PathBuf::from),
-                line: deferred.line,
-                message: error.to_string(),
-                parse_error: None,
-            })?;
+            let target = target.with_instance_prefix(instance_prefix);
             crate::parser::DeferredForTarget::Bound(target)
         }
         crate::parser::DeferredForTarget::Unbound { template } => {
@@ -2298,9 +2289,7 @@ pub(super) fn prefix_parsed_deferred_for_expression(
             intra_module_bindings,
             arguments,
         )
-        .map(|expanded| {
-            expanded.map(|resource| rebuild(DeferredForBody::resource(&target, resource)))
-        }),
+        .map(|expanded| expanded.map(|resource| rebuild(DeferredForBody::resource(resource)))),
         DeferredForBody::Read(data_source) => prefix_module_data_source(
             TemplateValueCarrier::new(data_source, template_dependency_values),
             instance_prefix,
@@ -3363,6 +3352,23 @@ fn rewrite_ref_prefixes<P: PlaceholderKind>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_deferred_target_prefix_matches_instance_prefix_spelling() {
+        let target =
+            crate::parser::BoundDeferredTarget::new("children").expect("fixture target is valid");
+
+        for prefix in ["root", "root.branch[0].leaf"] {
+            let prefixed = target.with_instance_prefix(prefix);
+            let expected = apply_instance_prefix(prefix, target.binding());
+
+            assert_eq!(prefixed.binding(), expected);
+            assert_eq!(
+                prefixed.template_address().to_string(),
+                format!("{expected}[?]")
+            );
+        }
+    }
 
     fn publish<T>(expanded: ExpandedValueCarrier<T>) -> T {
         expanded.into_value(&mut crate::parser::ParserBindingMetadata::default())

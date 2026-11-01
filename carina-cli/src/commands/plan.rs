@@ -2360,11 +2360,8 @@ impl PlanFile {
                     require_identity(from, &format!("{location}.from"))?;
                     require_identity(to, &format!("{location}.to"))?;
                 }
-                UnresolvedSavedEffect::DeferredCreate(payload) => {
-                    require_identity(payload.id(), &location)?;
-                }
+                UnresolvedSavedEffect::DeferredCreate(_) => {}
                 UnresolvedSavedEffect::DeferredReplace(payload) => {
-                    require_identity(payload.id(), &location)?;
                     for (delete_index, delete) in payload.deletes.iter().enumerate() {
                         require_identity(
                             &delete.id,
