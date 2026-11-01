@@ -1,8 +1,8 @@
 # Provider protocol versions
 
-## Version 15
+## Version 14
 
-Protocol v15 adds the `carina-provider-aws` world for AWS-kind providers. It
+Protocol v14 adds the `carina-provider-aws` world for AWS-kind providers. It
 imports both `wasi:http/outgoing-handler` and the new `aws-credentials`
 interface, then exports the same provider interface as the existing worlds.
 
@@ -27,8 +27,8 @@ guest access to ECS or EC2 metadata credentials. The host may still use those
 environment variables, profiles, SSO, ECS, or EC2 metadata as part of its own
 AWS SDK credential chain.
 
-Hosts and providers must both use protocol v15. The minimum supported protocol
-version is 15.
+Hosts and providers must both use protocol v14. The minimum supported protocol
+version is 14.
 
 ## Version 13
 

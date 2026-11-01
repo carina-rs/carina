@@ -276,9 +276,10 @@ today. Sharing it with this source is outside this issue.
 
 ### D6. Protocol
 
-This is a WIT change. The protocol moves to the version after #4168's
-(planned v14 → this is v15), and `MIN_SUPPORTED_PROTOCOL_VERSION` moves
-with it. There is no compatibility shim, per project policy. The order is
+This is a WIT change. Several PRs (#4162, #4168, this one) bump the
+protocol at about the same time, so the number is not fixed in advance:
+it is main's version plus one at the time this PR merges, and
+`MIN_SUPPORTED_PROTOCOL_VERSION` moves with it. There is no compatibility shim, per project policy. The order is
 plugin-wit → carina → aws → awscc, coordinated with the orchestrator,
 together with the egress declarations already in flight.
 
