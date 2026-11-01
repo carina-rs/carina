@@ -5279,6 +5279,7 @@ fn is_string_or_list_of_strings(
             return false;
         };
         match &member.as_attr().kind {
+            AttrTypeKind::UnloadedSchemaType(_) => return false,
             AttrTypeKind::String { .. } => has_string = true,
             AttrTypeKind::List {
                 element_type: inner,
@@ -6015,6 +6016,7 @@ fn type_contains_enum(
             return false;
         }
         let contains = match &resolved.kind {
+            AttrTypeKind::UnloadedSchemaType(_) => false,
             AttrTypeKind::Enum { .. } => true,
             AttrTypeKind::List { element_type, .. } => walk(element_type, defs, visited),
             AttrTypeKind::Map { key, value } => {
@@ -6144,6 +6146,11 @@ fn canonicalize_without_fit<
     }
 
     match (value, shape) {
+        (value, crate::schema::Shape::UnloadedSchemaType(_)) => error_policy
+            .canonicalization_failed(
+                value,
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into(),
+            ),
         (
             Value::Concrete(ConcreteValue::List(items)),
             crate::schema::Shape::List {
@@ -7002,6 +7009,9 @@ mod tests {
     }
 
     impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {
+        fn inference_type_authority(&self) -> crate::resource::PlaceholderTypeAuthority<'_> {
+            crate::resource::PlaceholderTypeAuthority::AwaitingSubstitution
+        }
         type DirectiveBool<B: crate::resource::BindingAddress> = bool;
         type DirectivePreventDestroy<B: crate::resource::BindingAddress> =
             crate::resource::PreventDestroy;
@@ -9652,12 +9662,28 @@ mod tests {
 
             canonicalize_resources_with_schemas(&mut resources, &registry)
                 .expect("a deferred expression owns evaluation of its enum-shaped arguments");
-            let deferred_result =
-                crate::resolver::resolve_ref_value(&resources[0].attributes["value"], &bindings)
-                    .expect("runtime expression must resolve");
-            let static_result =
-                crate::resolver::resolve_ref_value(&static_value, &ResolvedBindings::default())
-                    .expect("static expression must evaluate");
+            let deferred_result = crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| {
+                    crate::resolver::resolve_ref_value(
+                        &resources[0].attributes["value"],
+                        &bindings,
+                        session,
+                    )
+                },
+            )
+            .expect("runtime expression must resolve");
+            let static_result = crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| {
+                    crate::resolver::resolve_ref_value(
+                        &static_value,
+                        &ResolvedBindings::default(),
+                        session,
+                    )
+                },
+            )
+            .expect("static expression must evaluate");
 
             assert_eq!(deferred_result, static_result);
         }

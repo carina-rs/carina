@@ -5993,6 +5993,14 @@ impl std::fmt::Display for ParserPlaceholder {
     }
 }
 
+/// The authority that can establish a parser/template placeholder's type.
+#[doc(hidden)]
+pub enum PlaceholderTypeAuthority<'a> {
+    Binding(&'a str),
+    AwaitingSubstitution,
+    MissingExpression,
+}
+
 /// Internal behavior shared by the three stage marker types.
 #[doc(hidden)]
 pub trait PlaceholderKind:
@@ -6021,10 +6029,7 @@ pub trait PlaceholderKind:
         None
     }
 
-    /// Lexical binding whose declared type can prove this parser slot's type.
-    fn inference_binding_name(&self) -> Option<&str> {
-        self.module_argument_name()
-    }
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_>;
 
     fn loop_slot(&self) -> Option<LoopSlot> {
         None
@@ -6052,6 +6057,9 @@ pub trait PlaceholderKind:
 }
 
 impl PlaceholderKind for NoPlaceholder {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
+        match *self {}
+    }
     type DirectiveBool<B: BindingAddress> = bool;
     type DirectivePreventDestroy<B: BindingAddress> = PreventDestroy;
     fn rebind_directives<B: BindingAddress, C: BindingAddress>(
@@ -6085,6 +6093,9 @@ impl fmt::Display for LoopSlot {
 }
 
 impl PlaceholderKind for LoopSlot {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
+        PlaceholderTypeAuthority::AwaitingSubstitution
+    }
     type DirectiveBool<B: BindingAddress> = LoopDirective<bool, B>;
     type DirectivePreventDestroy<B: BindingAddress> = LoopDirective<PreventDestroy, B>;
     fn rebind_directives<B: BindingAddress, C: BindingAddress>(
@@ -6143,12 +6154,13 @@ impl PlaceholderKind for ParserPlaceholder {
         }
     }
 
-    fn inference_binding_name(&self) -> Option<&str> {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
         match self {
             Self::FnParam { name } | Self::FnLocal { name } | Self::ModuleArgument { name, .. } => {
-                Some(name)
+                PlaceholderTypeAuthority::Binding(name)
             }
-            Self::Loop(_) | Self::EmptyInterpolation { .. } => None,
+            Self::Loop(_) => PlaceholderTypeAuthority::AwaitingSubstitution,
+            Self::EmptyInterpolation { .. } => PlaceholderTypeAuthority::MissingExpression,
         }
     }
 
@@ -8756,6 +8768,7 @@ fn append_schema_pairing_hashes<R: ReferenceEquality>(
         return;
     }
     match attr_type.shape_with_defs(defs) {
+        Shape::UnloadedSchemaType(_) => {}
         Shape::Reference { .. } => {
             // Resolved equality must also be considered by multiset pairing.
             hashes.push(pairing_component_hash(0x09, &0_u8));

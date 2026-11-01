@@ -264,6 +264,10 @@ fn encode_attribute_schema(encoder: &mut CanonicalEncoder, schema: &AttributeSch
 fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &AttributeType) {
     let AttributeType { kind } = attribute_type;
     match kind {
+        AttrTypeKind::UnloadedSchemaType(unloaded) => {
+            encoder.tag(13);
+            encode_type_identity(encoder, unloaded.identity());
+        }
         AttrTypeKind::Reference {
             identity,
             pattern,

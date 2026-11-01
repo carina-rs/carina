@@ -371,6 +371,7 @@ pub(crate) fn evaluate_static_value(
                 functions,
                 &evaluated_args,
                 config,
+                None,
                 line,
             )
         }

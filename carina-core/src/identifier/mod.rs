@@ -3445,7 +3445,7 @@ fn resolve_deferred_create_only_value(
             BindingCompleteness::Complete,
         );
     }
-    match crate::resolver::resolve_ref_value_status(value, &bindings).ok()? {
+    match crate::resolver::project_ref_value_status(value, &bindings).ok()? {
         crate::resolver::ValueResolution::Present(resolved) => Some(resolved),
         crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_) => {
             None

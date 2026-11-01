@@ -1049,11 +1049,17 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("unbound loop parses");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_providerless(
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect("root bindings resolve")
+        },
     )
-    .expect("root bindings resolve")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("loop slots finalize");
     let deferred = parsed

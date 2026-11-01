@@ -2165,6 +2165,9 @@ async fn round3_apply_concrete_plan_reference_reresolves_without_widening_equiva
         let outcome = crate::executor::execute_live_plan(
             &fixture.router,
             LiveExecutionInput {
+                provider_context: crate::parser::ProviderContext::clone(
+                    &crate::parser::LoadedProviderContext::empty_for_test(),
+                ),
                 plan: &plan,
                 provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                     resource_origins: &origins,
@@ -2605,7 +2608,8 @@ fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
     let schemas = factory.schemas();
     let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
     let custom_types = provider_custom_types_from_factories(factories);
-    let owned = OwnedTypeIdentity::provider("test", identity());
+    let owned =
+        OwnedTypeIdentity::provider("test", identity(), crate::schema::RefinedScalarKind::String);
     custom_types
         .validate(
             CustomTypeValidationTarget::Annotation(&owned),

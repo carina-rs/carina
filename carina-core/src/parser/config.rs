@@ -6,7 +6,9 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::resource::Value;
-use crate::schema::{CompiledAttributeType as AttributeType, SchemaRegistry, TypeIdentity};
+use crate::schema::{
+    CompiledAttributeType as AttributeType, RefinedScalarKind, SchemaRegistry, TypeIdentity,
+};
 
 /// Schema provenance for an identified refined type.
 ///
@@ -67,29 +69,180 @@ impl<'de> serde::Deserialize<'de> for NonEmptySchemaTypeOwners {
     }
 }
 
-/// The routing key for an identified refined type.
+/// The routing key and scalar declaration for an identified refined type.
 ///
-/// A bare [`TypeIdentity`] is descriptive metadata, not routing authority.
-/// Pairing it with its schema owner prevents two factories that expose the
-/// same identity from competing in an identity-only map.
+/// Production construction derives the scalar kind from an admitted schema
+/// declaration. Merging catalog owners retains that same declaration evidence.
+/// Decoding also requires the scalar declaration; independent identity/kind
+/// metadata cannot manufacture a resolved type.
+///
+/// ```compile_fail
+/// use carina_core::parser::OwnedTypeIdentity;
+/// use carina_core::schema::{RefinedScalarKind, TypeIdentity};
+/// let _ = OwnedTypeIdentity::provider("test", TypeIdentity::bare("Count"), RefinedScalarKind::String);
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::parser::{NonEmptySchemaTypeOwners, OwnedTypeIdentity, SchemaTypeOwner};
+/// use carina_core::schema::{RefinedScalarKind, TypeIdentity};
+/// let owners = NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider("test".into()));
+/// let _ = OwnedTypeIdentity::with_owners(TypeIdentity::bare("Count"), owners, RefinedScalarKind::String);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnedTypeIdentity {
+    owners: NonEmptySchemaTypeOwners,
+    declaration: IdentifiedScalarDeclaration,
+}
+
+/// A scalar shape and its identity are one declaration, including on the wire.
+/// The redundant wire metadata is checked against this declaration on decode.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
-pub struct OwnedTypeIdentity {
-    owners: NonEmptySchemaTypeOwners,
-    identity: TypeIdentity,
+enum IdentifiedScalarDeclaration {
+    String(TypeIdentity),
+    Int(TypeIdentity),
+    Float(TypeIdentity),
 }
 
-impl OwnedTypeIdentity {
-    pub fn provider(owner: impl Into<String>, identity: TypeIdentity) -> Self {
-        Self {
-            owners: NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider(owner.into())),
-            identity,
+impl IdentifiedScalarDeclaration {
+    fn identity(&self) -> &TypeIdentity {
+        match self {
+            Self::String(identity) | Self::Int(identity) | Self::Float(identity) => identity,
         }
     }
 
-    pub fn with_owners(identity: TypeIdentity, owners: NonEmptySchemaTypeOwners) -> Self {
-        Self { owners, identity }
+    fn scalar_kind(&self) -> RefinedScalarKind {
+        match self {
+            Self::String(_) => RefinedScalarKind::String,
+            Self::Int(_) => RefinedScalarKind::Int,
+            Self::Float(_) => RefinedScalarKind::Float,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OwnedTypeIdentityWire {
+    owners: NonEmptySchemaTypeOwners,
+    identity: TypeIdentity,
+    scalar_kind: RefinedScalarKind,
+    declaration: IdentifiedScalarDeclaration,
+}
+
+impl serde::Serialize for OwnedTypeIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        OwnedTypeIdentityWire {
+            owners: self.owners.clone(),
+            identity: self.identity().clone(),
+            scalar_kind: self.scalar_kind(),
+            declaration: self.declaration.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OwnedTypeIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = OwnedTypeIdentityWire::deserialize(deserializer)?;
+        if wire.identity != *wire.declaration.identity()
+            || wire.scalar_kind != wire.declaration.scalar_kind()
+        {
+            return Err(serde::de::Error::custom(
+                "schema type identity and scalar kind must match their declaration",
+            ));
+        }
+        let declared_type = wire
+            .declaration
+            .scalar_kind()
+            .identified_type(wire.declaration.identity().clone());
+        let declaration = IdentifiedCustomTypeDeclaration::new(&declared_type)
+            .ok_or_else(|| serde::de::Error::custom("expected an identified scalar declaration"))?;
+        Ok(Self::from_declaration_with_owners(wire.owners, declaration))
+    }
+}
+
+impl OwnedTypeIdentity {
+    /// Reference annotations retain string shape and owner identity, while
+    /// their declaration remains offline-only in the factory's schema index.
+    pub(crate) fn from_schema_declaration(
+        owner: impl Into<String>,
+        declaration: &AttributeType,
+    ) -> Option<Self> {
+        if let crate::schema::RawShape::Reference { identity, .. } = declaration.raw_shape() {
+            return Some(Self {
+                owners: NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider(
+                    owner.into(),
+                )),
+                declaration: IdentifiedScalarDeclaration::String(identity.clone()),
+            });
+        }
+        IdentifiedCustomTypeDeclaration::new(declaration)
+            .map(|declaration| Self::from_declaration(owner, declaration))
+    }
+    pub(crate) fn from_declaration(
+        owner: impl Into<String>,
+        declaration: IdentifiedCustomTypeDeclaration<'_>,
+    ) -> Self {
+        Self::from_declaration_with_owners(
+            NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider(owner.into())),
+            declaration,
+        )
+    }
+
+    fn from_declaration_with_owners(
+        owners: NonEmptySchemaTypeOwners,
+        declaration: IdentifiedCustomTypeDeclaration<'_>,
+    ) -> Self {
+        let identity = declaration.identity().clone();
+        let kind = declaration.scalar_kind();
+        let declaration = match kind {
+            RefinedScalarKind::String => IdentifiedScalarDeclaration::String(identity),
+            RefinedScalarKind::Int => IdentifiedScalarDeclaration::Int(identity),
+            RefinedScalarKind::Float => IdentifiedScalarDeclaration::Float(identity),
+        };
+        Self {
+            owners,
+            declaration,
+        }
+    }
+
+    pub(crate) fn with_merged_owners(&self, owners: NonEmptySchemaTypeOwners) -> Self {
+        Self {
+            owners,
+            declaration: self.declaration.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider(
+        owner: impl Into<String>,
+        identity: TypeIdentity,
+        scalar_kind: RefinedScalarKind,
+    ) -> Self {
+        let declared_type = scalar_kind.identified_type(identity);
+        Self::from_declaration(
+            owner,
+            IdentifiedCustomTypeDeclaration::new(&declared_type).unwrap(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_owners(
+        identity: TypeIdentity,
+        owners: NonEmptySchemaTypeOwners,
+        scalar_kind: RefinedScalarKind,
+    ) -> Self {
+        let declared_type = scalar_kind.identified_type(identity);
+        Self::from_declaration_with_owners(
+            owners,
+            IdentifiedCustomTypeDeclaration::new(&declared_type).unwrap(),
+        )
     }
 
     pub fn owners(&self) -> &NonEmptySchemaTypeOwners {
@@ -103,7 +256,11 @@ impl OwnedTypeIdentity {
     }
 
     pub fn identity(&self) -> &TypeIdentity {
-        &self.identity
+        self.declaration.identity()
+    }
+
+    pub fn scalar_kind(&self) -> RefinedScalarKind {
+        self.declaration.scalar_kind()
     }
 
     /// Render the type's authored semantic name.
@@ -112,7 +269,7 @@ impl OwnedTypeIdentity {
     /// AWSCC-owned `aws.*` identity is still authored as `aws.*`; rendering
     /// the owner here would silently change the public type name.
     pub fn authored_name(&self) -> String {
-        self.identity.to_string()
+        self.identity().to_string()
     }
 
     /// Return whether this key's semantic identity is named by an authored
@@ -123,9 +280,9 @@ impl OwnedTypeIdentity {
         segments: &[String],
         kind: &str,
     ) -> bool {
-        self.identity.provider.as_deref() == Some(semantic_provider)
-            && self.identity.segments == segments
-            && self.identity.kind == kind
+        self.identity().provider.as_deref() == Some(semantic_provider)
+            && self.identity().segments == segments
+            && self.identity().kind == kind
     }
 }
 
@@ -138,14 +295,18 @@ impl OwnedTypeIdentity {
 pub struct IdentifiedCustomTypeDeclaration<'a> {
     declared_type: &'a AttributeType,
     identity: &'a TypeIdentity,
+    scalar_kind: RefinedScalarKind,
 }
 
 impl<'a> IdentifiedCustomTypeDeclaration<'a> {
     pub fn new(declared_type: &'a AttributeType) -> Option<Self> {
+        let scalar_kind =
+            crate::provider::identified_custom_type_scalar_kind(declared_type).ok()??;
         let identity = crate::provider::identified_custom_type_identity(declared_type)?;
         Some(Self {
             declared_type,
             identity,
+            scalar_kind,
         })
     }
 
@@ -155,6 +316,10 @@ impl<'a> IdentifiedCustomTypeDeclaration<'a> {
 
     pub fn identity(self) -> &'a TypeIdentity {
         self.identity
+    }
+
+    pub fn scalar_kind(self) -> RefinedScalarKind {
+        self.scalar_kind
     }
 }
 
@@ -576,6 +741,10 @@ pub struct ProviderCustomTypes {
 
 enum ProviderCustomTypeState {
     Unloaded,
+    Partial {
+        loaded: ProviderCustomTypes,
+        failed_providers: BTreeSet<String>,
+    },
     Loaded {
         known: BTreeSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
@@ -621,6 +790,36 @@ impl ProviderCustomTypes {
         }
     }
 
+    /// Mark an otherwise loaded snapshot as non-authoritative for these owners.
+    pub fn with_failed_providers(&self, failed_providers: BTreeSet<String>) -> Self {
+        if failed_providers.is_empty() {
+            return self.clone();
+        }
+        Self {
+            state: std::sync::Arc::new(ProviderCustomTypeState::Partial {
+                loaded: self.clone(),
+                failed_providers,
+            }),
+        }
+    }
+
+    pub fn is_partial(&self) -> bool {
+        matches!(self.state.as_ref(), ProviderCustomTypeState::Partial { .. })
+    }
+
+    /// Whether a missing identity may belong to an unavailable provider.
+    pub fn may_defer(&self, provider: Option<&str>) -> bool {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Unloaded => true,
+            ProviderCustomTypeState::Loaded { .. } => false,
+            ProviderCustomTypeState::Partial {
+                failed_providers, ..
+            } => provider.map_or(!failed_providers.is_empty(), |owner| {
+                failed_providers.contains(owner)
+            }),
+        }
+    }
+
     pub fn is_loaded(&self) -> bool {
         matches!(
             self.state.as_ref(),
@@ -634,6 +833,7 @@ impl ProviderCustomTypes {
 
     pub fn known(&self) -> &BTreeSet<OwnedTypeIdentity> {
         match self.state.as_ref() {
+            ProviderCustomTypeState::Partial { loaded, .. } => loaded.known(),
             ProviderCustomTypeState::Unloaded => {
                 static EMPTY: std::sync::LazyLock<BTreeSet<OwnedTypeIdentity>> =
                     std::sync::LazyLock::new(BTreeSet::new);
@@ -655,6 +855,24 @@ impl CustomTypeResolver for ProviderCustomTypes {
         value: &'a Value,
     ) -> Result<(), CustomTypeValidationError> {
         match self.state.as_ref() {
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                let unavailable = match target {
+                    CustomTypeValidationTarget::Annotation(owned) => owned
+                        .provider_names()
+                        .any(|owner| failed_providers.contains(owner)),
+                    CustomTypeValidationTarget::Declaration { owner, .. } => {
+                        failed_providers.contains(owner)
+                    }
+                };
+                if unavailable {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.validate(target, value)
+                }
+            }
             ProviderCustomTypeState::Loaded {
                 known: _known,
                 resolver,
@@ -669,6 +887,19 @@ impl CustomTypeResolver for ProviderCustomTypes {
         owned: &OwnedTypeIdentity,
     ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
         match self.state.as_ref() {
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                if owned
+                    .provider_names()
+                    .any(|owner| failed_providers.contains(owner))
+                {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.enum_declaration(owned)
+                }
+            }
             ProviderCustomTypeState::Loaded {
                 known: _known,
                 resolver: _resolver,
@@ -682,21 +913,21 @@ impl CustomTypeResolver for ProviderCustomTypes {
 /// Signature for a decryptor function.
 ///
 /// Takes `(ciphertext, optional_key)` and returns the decrypted plaintext or an error.
-pub type DecryptorFn = Box<dyn Fn(&str, Option<&str>) -> Result<String, String> + Send + Sync>;
+pub type DecryptorFn =
+    std::sync::Arc<dyn Fn(&str, Option<&str>) -> Result<String, String> + Send + Sync>;
 
 /// Configuration for the parser, allowing providers to inject behavior.
 ///
 /// This replaces the global `Mutex`-based decryptor registration and enables
 /// provider-specific validators (e.g., ARN, availability_zone) to be injected
 /// from provider crates while being callable during parsing.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderContext {
     /// Optional decryptor for the `decrypt()` built-in function.
     pub decryptor: Option<DecryptorFn>,
-    /// Provider custom types are either unavailable or loaded together with
-    /// both their owner-qualified recognition keys and resolver. When loaded,
-    /// unknown PascalCase type names are rejected; the default unloaded state
-    /// preserves bootstrap parsing before provider registration.
+    /// The catalog is unloaded, fully loaded, or partial with explicit failed owners.
+    /// Recognition and validation share one snapshot. Missing names defer only
+    /// when they may belong to an unavailable owner.
     pub custom_types: ProviderCustomTypes,
     /// Resource kinds loaded from provider schemas, keyed by `(provider,
     /// resource_type)` such as `("aws", "iam.Role")`.
@@ -773,6 +1004,13 @@ impl LoadedProviderContext {
         &self.0
     }
 
+    /// Retain catalog authority with the caller's immutable runtime hooks.
+    pub fn with_runtime(&self, runtime: &ProviderContext) -> Self {
+        let mut catalog = self.as_provider_context().clone();
+        catalog.decryptor = runtime.decryptor.clone();
+        Self::new(catalog)
+    }
+
     /// Test-only constructor for fixtures that deliberately inject a loaded
     /// custom-type resolver without a provider factory.
     #[cfg(any(test, feature = "test-utils"))]
@@ -839,6 +1077,14 @@ impl std::fmt::Debug for ProviderCustomTypes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.state.as_ref() {
             ProviderCustomTypeState::Unloaded => formatter.write_str("Unloaded"),
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => formatter
+                .debug_struct("Partial")
+                .field("loaded", loaded)
+                .field("failed_providers", failed_providers)
+                .finish(),
             ProviderCustomTypeState::Loaded {
                 known,
                 resolver: _resolver,
@@ -850,4 +1096,25 @@ impl std::fmt::Debug for ProviderCustomTypes {
                 .finish(),
         }
     }
+}
+
+/// Provider kinds whose declarations request unavailable factory authority.
+/// A workspace error outside these declarations cannot make this directory's
+/// otherwise complete catalog partial. Named instances do not request plugins.
+pub fn unavailable_provider_kinds<
+    P: crate::resource::PlaceholderKind,
+    B: crate::resource::BindingAddress,
+>(
+    providers: &[super::ProviderConfig<P, B>],
+    loaded: &std::collections::HashSet<String>,
+    load_errors: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeSet<String> {
+    providers
+        .iter()
+        .filter(|provider| {
+            provider.is_default()
+                && (!loaded.contains(&provider.name) || load_errors.contains_key(&provider.name))
+        })
+        .map(|provider| provider.name.clone())
+        .collect()
 }

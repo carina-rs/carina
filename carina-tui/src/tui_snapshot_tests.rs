@@ -274,11 +274,17 @@ fn build_anonymous_deferred_for_plan() -> Plan {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("parse anonymous deferred-for target");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect("resolve anonymous deferred-for target");
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_providerless(
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect("resolve anonymous deferred-for target")
+        },
+    );
     let target = parsed
         .deferred_for_expressions()
         .iter()
@@ -419,11 +425,17 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("parse anonymous-loop fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_providerless(
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect("resolve anonymous-loop fixture")
+        },
     )
-    .expect("resolve anonymous-loop fixture")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("anonymous-loop fixture must not retain parser placeholders");
     let mut resource = parsed

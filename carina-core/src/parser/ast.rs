@@ -2139,8 +2139,13 @@ pub enum TypeExpr {
     /// Time duration. Surface form: `<integer><unit>` literal (`75min`,
     /// `1h`, `30s`); internal form: `Value::Concrete(ConcreteValue::Duration(std::time::Duration))`.
     Duration,
-    /// Schema type identified by name (e.g., "ipv4_cidr", "ipv4_address", "arn")
-    Simple(std::string::String),
+    /// A built-in refinement admitted by the core declaration registry.
+    Simple(super::BuiltinTypeName),
+    /// Nominal identity with no scalar-kind evidence because provider schemas
+    /// are not loaded. Only provider type resolution can construct its payload.
+    /// Identified types still use the directional identity relation; checks
+    /// requiring a scalar kind defer with `ProvidersNotLoaded`.
+    UnloadedSchemaType(super::UnloadedSchemaType),
     List(Box<TypeExpr>),
     Map(Box<TypeExpr>),
     /// Reference to a resource type (e.g., aws.vpc)
@@ -2151,9 +2156,9 @@ pub enum TypeExpr {
     DottedUnresolved(ResourceTypePath),
     /// Provider-defined schema type (e.g., awscc.ec2.VpcId, awscc.ec2.SubnetId).
     ///
-    /// The owner and semantic identity travel as one key because they are not
-    /// interchangeable: AWSCC can own a type in the shared `aws` identity
-    /// namespace.
+    /// The scalar kind is fixed during resolution. Owners and semantic
+    /// identity remain distinct: AWSCC can own a type in the shared `aws`
+    /// identity namespace.
     SchemaType {
         owned: super::OwnedTypeIdentity,
     },
@@ -2183,23 +2188,33 @@ pub enum TypeExpr {
 }
 
 impl TypeExpr {
-    /// True when this `TypeExpr` represents a string-shaped value at
-    /// runtime: bare `String`, a `Simple` named identity (typically a
-    /// string-base custom like `AwsAccountId`), or a `SchemaType`
-    /// (provider-defined string-typed identifier like
-    /// `awscc.ec2.VpcId`). Callers use this to accept these in any
-    /// string-compatible receiver position; the symmetric strictness
-    /// in the opposite direction (`String → Custom{Specific}`) is
-    /// enforced by `attr_type_demands_specific_custom` in the
-    /// validation crate.
+    /// Whether a resolved declaration proves a string scalar shape.
+    /// Unloaded nominal evidence never supplies a scalar-kind proof.
     pub fn is_string_shaped(&self) -> bool {
-        matches!(
-            self,
-            TypeExpr::String
-                | TypeExpr::Simple(_)
-                | TypeExpr::DottedUnresolved(_)
-                | TypeExpr::SchemaType { .. }
-        )
+        match self {
+            Self::String | Self::DottedUnresolved(_) => true,
+            Self::Simple(name) => {
+                let declaration = name.declaration();
+                matches!(
+                    declaration.raw_shape(),
+                    crate::schema::RawShape::String { .. }
+                )
+            }
+            Self::SchemaType { owned } => {
+                owned.scalar_kind() == crate::schema::RefinedScalarKind::String
+            }
+            Self::UnloadedSchemaType(_) => false,
+            Self::Bool
+            | Self::Int
+            | Self::Float
+            | Self::Duration
+            | Self::List(_)
+            | Self::Map(_)
+            | Self::Ref(_)
+            | Self::Struct { .. }
+            | Self::StringLiteral(_)
+            | Self::Union(_) => false,
+        }
     }
 }
 
@@ -2212,6 +2227,7 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::Float => write!(f, "Float"),
             TypeExpr::Duration => write!(f, "Duration"),
             TypeExpr::Simple(name) => write!(f, "{}", snake_to_pascal(name)),
+            TypeExpr::UnloadedSchemaType(unloaded) => write!(f, "{}", unloaded.identity()),
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
             TypeExpr::Ref(path) => write!(f, "{}", path),
@@ -2985,6 +3001,10 @@ pub trait ExportParamLike<
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
     fn inference_failed(&self) -> bool;
+    /// Authored export location retained across parser and inference phases.
+    fn source_location(&self) -> Option<(&std::path::Path, SourceSpan)> {
+        None
+    }
 }
 
 impl<P: PlaceholderKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
@@ -3016,6 +3036,9 @@ impl<P: PlaceholderKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     }
     fn inference_failed(&self) -> bool {
         false
+    }
+    fn source_location(&self) -> Option<(&std::path::Path, SourceSpan)> {
+        Some((&self.source.file, self.source.span))
     }
 }
 
@@ -3429,6 +3452,7 @@ impl UseStatement {
 pub struct FnParam<B: BindingAddress = RelativeBindingName> {
     pub name: String,
     pub param_type: Option<TypeExpr>,
+    pub type_span: Option<SourceSpan>,
     pub default: Option<Value<ParserPlaceholder, B>>,
 }
 
@@ -3449,6 +3473,9 @@ pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
     pub params: Vec<FnParam<B>>,
     /// Optional return type annotation
     pub return_type: Option<TypeExpr>,
+    pub return_type_span: Option<SourceSpan>,
+    /// Authored owner of parameter and return annotations, including orphan documents.
+    pub annotation_source_file: Option<PathBuf>,
     /// Local let bindings inside the function body (name, expression)
     pub local_lets: Vec<(String, Value<ParserPlaceholder, B>, usize)>,
     /// The body of the function
@@ -3468,10 +3495,13 @@ impl<B: BindingAddress> UserFunction<B> {
                 .map(|param| FnParam {
                     name: param.name,
                     param_type: param.param_type,
+                    type_span: param.type_span,
                     default: param.default.map(|value| value.map_bindings(map)),
                 })
                 .collect(),
             return_type: self.return_type,
+            return_type_span: self.return_type_span,
+            annotation_source_file: self.annotation_source_file,
             local_lets: self
                 .local_lets
                 .into_iter()
@@ -4751,7 +4781,95 @@ pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
     resource_source_files: HashMap<ResourceId, PathBuf>,
     template_dependency_values: HashMap<ResourceId, IndexMap<String, Value<ParserPlaceholder, B>>>,
     argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
+    export_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck<B>>,
+}
+
+/// Only lexical seed data participates in the directory fixed point.
+/// Pending checks belong to the final pass's file, never to a seed snapshot.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct ParserSeedMetadata {
+    structural_handles:
+        IndexMap<RelativeBindingName, UnexpandedStructuralHandle<RelativeBindingName>>,
+    structural_aliases:
+        IndexMap<RelativeBindingName, UnexpandedStructuralHandle<RelativeBindingName>>,
+    value_structural_handles:
+        IndexMap<RelativeBindingName, UnexpandedStructuralHandleMetadata<RelativeBindingName>>,
+}
+
+pub(crate) trait BindingSeedMetadata {
+    fn structural_handles(
+        &self,
+    ) -> &IndexMap<RelativeBindingName, UnexpandedStructuralHandle<RelativeBindingName>>;
+    fn structural_aliases(
+        &self,
+    ) -> &IndexMap<RelativeBindingName, UnexpandedStructuralHandle<RelativeBindingName>>;
+    fn value_structural_handles_by_name(
+        &self,
+        name: &str,
+    ) -> Option<&UnexpandedStructuralHandleMetadata<RelativeBindingName>>;
+}
+
+impl BindingSeedMetadata for ParserBindingMetadata {
+    fn structural_handles(
+        &self,
+    ) -> &IndexMap<RelativeBindingName, UnexpandedStructuralHandle<RelativeBindingName>> {
+        &self.structural_handles
+    }
+    fn structural_aliases(
+        &self,
+    ) -> &IndexMap<RelativeBindingName, UnexpandedStructuralHandle<RelativeBindingName>> {
+        &self.structural_aliases
+    }
+    fn value_structural_handles_by_name(
+        &self,
+        name: &str,
+    ) -> Option<&UnexpandedStructuralHandleMetadata<RelativeBindingName>> {
+        self.value_structural_handles.get(name)
+    }
+}
+
+impl BindingSeedMetadata for ParserSeedMetadata {
+    fn structural_handles(
+        &self,
+    ) -> &IndexMap<RelativeBindingName, UnexpandedStructuralHandle<RelativeBindingName>> {
+        &self.structural_handles
+    }
+    fn structural_aliases(
+        &self,
+    ) -> &IndexMap<RelativeBindingName, UnexpandedStructuralHandle<RelativeBindingName>> {
+        &self.structural_aliases
+    }
+    fn value_structural_handles_by_name(
+        &self,
+        name: &str,
+    ) -> Option<&UnexpandedStructuralHandleMetadata<RelativeBindingName>> {
+        self.value_structural_handles.get(name)
+    }
+}
+
+impl ParserSeedMetadata {
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&RelativeBindingName) -> bool) {
+        self.structural_handles.retain(|name, _| keep(name));
+        self.structural_aliases.retain(|name, _| keep(name));
+        self.value_structural_handles.retain(|name, _| keep(name));
+    }
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.structural_handles.extend(other.structural_handles);
+        self.structural_aliases.extend(other.structural_aliases);
+        self.value_structural_handles
+            .extend(other.value_structural_handles);
+    }
+}
+
+impl ParserBindingMetadata {
+    pub(crate) fn binding_seed_snapshot(&self) -> ParserSeedMetadata {
+        ParserSeedMetadata {
+            structural_handles: self.structural_handles.clone(),
+            structural_aliases: self.structural_aliases.clone(),
+            value_structural_handles: self.value_structural_handles.clone(),
+        }
+    }
 }
 
 impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
@@ -4764,6 +4882,7 @@ impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
             resource_source_files: HashMap::new(),
             template_dependency_values: HashMap::new(),
             argument_type_sources: IndexMap::new(),
+            export_type_sources: IndexMap::new(),
             pending_function_type_checks: Vec::new(),
         }
     }
@@ -4778,16 +4897,13 @@ pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingNa
     pub(crate) function_name: String,
     pub(crate) arguments: Vec<FunctionArgument<ParserPlaceholder, B>>,
     pub(crate) source_line: usize,
+    pub(crate) source_column: Option<usize>,
     pub(crate) source_file: Option<PathBuf>,
 }
 
 impl<B: BindingAddress> ParserBindingMetadata<B> {
     pub(crate) fn structural_handles(&self) -> &IndexMap<B, UnexpandedStructuralHandle<B>> {
         &self.structural_handles
-    }
-
-    pub(crate) fn structural_aliases(&self) -> &IndexMap<B, UnexpandedStructuralHandle<B>> {
-        &self.structural_aliases
     }
 
     pub(crate) fn insert_resource_source_file(&mut self, id: ResourceId, path: PathBuf) {
@@ -4829,10 +4945,38 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
             .map(|(source_file, span)| (source_file, *span))
     }
 
+    pub(crate) fn insert_export_type_source(
+        &mut self,
+        name: String,
+        file: PathBuf,
+        span: SourceSpan,
+    ) {
+        self.export_type_sources
+            .insert(name, (SourceFileId::new(file), span));
+    }
+
+    pub(crate) fn export_type_source(&self, name: &str) -> Option<(&SourceFileId, SourceSpan)> {
+        self.export_type_sources
+            .get(name)
+            .map(|(file, span)| (file, *span))
+    }
+
     pub(crate) fn insert_pending_function_type_check(
         &mut self,
         check: PendingFunctionTypeCheck<B>,
     ) {
+        // Evaluation may rediscover a parser-authored call without its column.
+        // Retain the precise site, including distinct calls on the same line.
+        if check.source_column.is_none()
+            && self.pending_function_type_checks.iter().any(|existing| {
+                existing.source_column.is_some()
+                    && existing.function_name == check.function_name
+                    && existing.source_line == check.source_line
+                    && existing.source_file == check.source_file
+            })
+        {
+            return;
+        }
         if !self.pending_function_type_checks.contains(&check) {
             self.pending_function_type_checks.push(check);
         }
@@ -4854,6 +4998,7 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
             resource_source_files: _resource_source_files,
             template_dependency_values,
             argument_type_sources: _argument_type_sources,
+            export_type_sources: _export_type_sources,
             pending_function_type_checks,
         } = self;
         let _structural_outputs = unexpanded_composition_attributes;
@@ -4879,10 +5024,6 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
         }
     }
 
-    pub(crate) fn clear_pending_function_type_checks(&mut self) {
-        self.pending_function_type_checks.clear();
-    }
-
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&B) -> bool) {
         self.structural_handles.retain(|name, _| keep(name));
         self.structural_aliases.retain(|name, _| keep(name));
@@ -4902,6 +5043,7 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
             .extend(other.template_dependency_values);
         self.argument_type_sources
             .extend(other.argument_type_sources);
+        self.export_type_sources.extend(other.export_type_sources);
         for check in other.pending_function_type_checks {
             self.insert_pending_function_type_check(check);
         }
@@ -4927,13 +5069,6 @@ impl ParserBindingMetadata<RelativeBindingName> {
             .insert(RelativeBindingName::new(name), handle);
     }
 
-    pub(crate) fn value_structural_handles_by_name(
-        &self,
-        name: &str,
-    ) -> Option<&UnexpandedStructuralHandleMetadata<RelativeBindingName>> {
-        self.value_structural_handles.get(name)
-    }
-
     pub(crate) fn insert_value_structural_handles(
         &mut self,
         name: String,
@@ -4955,6 +5090,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
             resource_source_files,
             template_dependency_values,
             argument_type_sources,
+            export_type_sources,
             pending_function_type_checks,
         } = self;
         ParserBindingMetadata {
@@ -4988,6 +5124,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                 })
                 .collect(),
             argument_type_sources,
+            export_type_sources,
             pending_function_type_checks: pending_function_type_checks
                 .into_iter()
                 .map(|check| {
@@ -4995,6 +5132,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                         function_name,
                         arguments,
                         source_line,
+                        source_column,
                         source_file,
                     } = check;
                     PendingFunctionTypeCheck {
@@ -5004,6 +5142,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                             .map(|argument| argument.resolve_bindings(resolve))
                             .collect(),
                         source_line,
+                        source_column,
                         source_file,
                     }
                 })
@@ -5025,6 +5164,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
             resource_source_files: _resource_source_files,
             template_dependency_values,
             argument_type_sources: _argument_type_sources,
+            export_type_sources: _export_type_sources,
             pending_function_type_checks,
         } = self;
 
@@ -5066,6 +5206,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
                 function_name: _function_name,
                 arguments,
                 source_line: _source_line,
+                source_column: _source_column,
                 source_file: _source_file,
             } = check;
             for argument in arguments {
@@ -8036,6 +8177,7 @@ impl<E> ExpandedFile<E> {
     pub fn expand_deferred_for_expressions(
         &mut self,
         bindings: &IterableBindings<'_>,
+        type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), DeferredForExpansionError> {
         let mut expanded_resources = Vec::new();
         let mut resolved_indices = Vec::new();
@@ -8068,6 +8210,7 @@ impl<E> ExpandedFile<E> {
                         deferred,
                         &iterable_value,
                         miss_policy,
+                        type_checks,
                     )?);
                     resolved_indices.push(idx);
                 }
@@ -8077,6 +8220,7 @@ impl<E> ExpandedFile<E> {
                         deferred,
                         &iterable_value,
                         miss_policy,
+                        type_checks,
                     )?);
                     resolved_indices.push(idx);
                 }
@@ -8086,6 +8230,7 @@ impl<E> ExpandedFile<E> {
                         deferred,
                         &iterable_value,
                         miss_policy,
+                        type_checks,
                     )?);
                     resolved_indices.push(idx);
                 }
@@ -8171,6 +8316,7 @@ pub fn expand_deferred_children<
     deferred: &DeferredForExpression<S, NoPlaceholder, LoopSlot, AbsoluteBindingAddress, D>,
     iterable_value: &Value,
     miss_policy: crate::resource::AccessMissPolicy,
+    type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Vec<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>>, DeferredForExpansionError> {
     match (&deferred.binding, iterable_value) {
         (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => items
@@ -8184,6 +8330,7 @@ pub fn expand_deferred_children<
                     None,
                     item,
                     miss_policy,
+                    type_checks,
                 )
             })
             .collect(),
@@ -8198,6 +8345,7 @@ pub fn expand_deferred_children<
                     None,
                     item,
                     miss_policy,
+                    type_checks,
                 )
             })
             .collect(),
@@ -8213,6 +8361,7 @@ pub fn expand_deferred_children<
                         Some(key),
                         &map[key],
                         miss_policy,
+                        type_checks,
                     )
                 })
                 .collect()
@@ -8268,6 +8417,7 @@ fn build_expanded_child<
     key: Option<&str>,
     item: &Value,
     miss_policy: crate::resource::AccessMissPolicy,
+    type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>, DeferredForExpansionError> {
     let mut resource = match deferred.target() {
         DeferredForTarget::Bound(target) => {
@@ -8301,8 +8451,16 @@ fn build_expanded_child<
         &mut resource.dependencies,
         deferred.root_bindings(),
     );
-    let resource = substitute_attrs(resource, index, key, item, miss_policy, deferred.location())
-        .map_err(|error| match error {
+    let resource = substitute_attrs(
+        resource,
+        index,
+        key,
+        item,
+        miss_policy,
+        deferred.location(),
+        type_checks,
+    )
+    .map_err(|error| match error {
         ChildSubstitutionError::Directives(errors) => DeferredForExpansionError::Directives(errors),
         ChildSubstitutionError::Attribute(attribute, error) => {
             DeferredForExpansionError::ValueAccess {
@@ -8333,6 +8491,7 @@ fn substitute_attrs<S, D>(
     value: &Value,
     miss_policy: crate::resource::AccessMissPolicy,
     location: &DiagnosticLocation,
+    type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<
     crate::resource::Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
     ChildSubstitutionError,
@@ -8359,7 +8518,16 @@ fn substitute_attrs<S, D>(
                 .source_file()
                 .or_else(|| location.display_file().map(Path::new))
                 .unwrap_or_else(|| Path::new("<deferred for>")),
-            |expression| resolve_loop_directive_value(expression, index, key, value, miss_policy),
+            |expression| {
+                resolve_loop_directive_value(
+                    expression,
+                    index,
+                    key,
+                    value,
+                    miss_policy,
+                    Some(type_checks),
+                )
+            },
         )
         .map_err(ChildSubstitutionError::Directives)?;
     let mut expanded_attributes = IndexMap::with_capacity(attributes.len());
@@ -8390,14 +8558,26 @@ pub(crate) fn resolve_loop_directive_value<B: BindingAddress>(
     key: Option<&str>,
     value: &Value<NoPlaceholder, B>,
     miss_policy: crate::resource::AccessMissPolicy,
+    type_checks: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
 ) -> Result<Value<NoPlaceholder, B>, PlaceholderAccessError> {
     let expression =
         substitute_placeholder_with_policy(expression, index, key, value, miss_policy)?
             .canonicalize();
-    crate::resolver::resolve_ref_value(
-        &expression,
-        &crate::binding_index::ResolvedBindings::default(),
-    )
+    let bindings = crate::binding_index::ResolvedBindings::default();
+    match type_checks {
+        Some(type_checks) => {
+            crate::resolver::resolve_ref_value(&expression, &bindings, type_checks)
+        }
+        // A syntax preview cannot evaluate annotated calls. The real expansion
+        // borrows its run session and checks them before returning children.
+        None => crate::resolver::project_ref_value_status(&expression, &bindings).map(|value| {
+            match value {
+                crate::resolver::ValueResolution::Present(value)
+                | crate::resolver::ValueResolution::Unknown(value) => value,
+                crate::resolver::ValueResolution::Absent => expression,
+            }
+        }),
+    }
     .map_err(|message| PlaceholderAccessError {
         line: 0,
         message,
@@ -8851,6 +9031,8 @@ mod substitute_placeholder_tests {
                 name: "function_name".to_string(),
                 params: Vec::new(),
                 return_type: None,
+                return_type_span: None,
+                annotation_source_file: None,
                 local_lets: Vec::new(),
                 body: UserFunctionBody {
                     value: Value::Concrete(ConcreteValue::Int(1)),
@@ -8953,10 +9135,16 @@ mod substitute_placeholder_tests {
             template_resource,
         );
 
-        let err = expand_deferred_children(
-            &deferred,
-            &Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-            crate::resource::AccessMissPolicy::Error,
+        let err = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                expand_deferred_children(
+                    &deferred,
+                    &Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
         )
         .expect_err("simple for-binding over a map must be a shape mismatch");
 
@@ -8987,12 +9175,18 @@ mod substitute_placeholder_tests {
             template_resource,
         );
 
-        let children = expand_deferred_children(
-            &deferred,
-            &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("alpha".into()),
-            )])),
-            crate::resource::AccessMissPolicy::Error,
+        let children = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                expand_deferred_children(
+                    &deferred,
+                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("alpha".into()),
+                    )])),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
         )
         .expect("the loop slot must be consumed while the child is materialized");
 
@@ -9047,12 +9241,18 @@ mod substitute_placeholder_tests {
         let saved = SavedDeferredForExpression::from(deferred.into_compiled());
         let encoded = serde_json::to_value(&saved).unwrap();
         let restored: SavedDeferredForExpression = serde_json::from_value(encoded).unwrap();
-        let error = expand_deferred_children(
-            &restored,
-            &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("bad".into()),
-            )])),
-            crate::resource::AccessMissPolicy::Error,
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                expand_deferred_children(
+                    &restored,
+                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("bad".into()),
+                    )])),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
         )
         .expect_err("saved loop directives must still be checked per element");
         let message = error.to_string();
@@ -9086,13 +9286,19 @@ mod substitute_placeholder_tests {
             "index".to_string(),
             "child".to_string(),
         ));
-        let list_children = expand_deferred_children(
-            &list_deferred,
-            &Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("alpha".into())),
-                Value::Concrete(ConcreteValue::String("beta".into())),
-            ])),
-            crate::resource::AccessMissPolicy::Error,
+        let list_children = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                expand_deferred_children(
+                    &list_deferred,
+                    &Value::Concrete(ConcreteValue::List(vec![
+                        Value::Concrete(ConcreteValue::String("alpha".into())),
+                        Value::Concrete(ConcreteValue::String("beta".into())),
+                    ])),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
         )
         .unwrap();
         assert_eq!(
@@ -9104,19 +9310,25 @@ mod substitute_placeholder_tests {
         assert_ne!(list_children[0].id, list_children[1].id);
 
         let map_deferred = deferred(ForBinding::Map("key".to_string(), "child".to_string()));
-        let map_children = expand_deferred_children(
-            &map_deferred,
-            &Value::Concrete(ConcreteValue::Map(IndexMap::from([
-                (
-                    "alpha".to_string(),
-                    Value::Concrete(ConcreteValue::String("one".into())),
-                ),
-                (
-                    "beta".to_string(),
-                    Value::Concrete(ConcreteValue::String("two".into())),
-                ),
-            ]))),
-            crate::resource::AccessMissPolicy::Error,
+        let map_children = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                expand_deferred_children(
+                    &map_deferred,
+                    &Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                        (
+                            "alpha".to_string(),
+                            Value::Concrete(ConcreteValue::String("one".into())),
+                        ),
+                        (
+                            "beta".to_string(),
+                            Value::Concrete(ConcreteValue::String("two".into())),
+                        ),
+                    ]))),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
         )
         .unwrap();
         assert_eq!(
@@ -9138,21 +9350,33 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed = crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+        let parsed = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("deferred fixture crosses the module-resolution seam")
+            },
         )
-        .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("template must expand");
         let deferred = &parsed.deferred_for_expressions()[0];
-        let children = expand_deferred_children(
-            deferred,
-            &Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("alpha".into())),
-                Value::Concrete(ConcreteValue::String("beta".into())),
-            ])),
-            crate::resource::AccessMissPolicy::Error,
+        let children = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                expand_deferred_children(
+                    deferred,
+                    &Value::Concrete(ConcreteValue::List(vec![
+                        Value::Concrete(ConcreteValue::String("alpha".into())),
+                        Value::Concrete(ConcreteValue::String("beta".into())),
+                    ])),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
         )
         .expect("deferred children expand");
 
@@ -9834,11 +10058,17 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed = crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
-        )
-        .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("deferred fixture crosses the module-resolution seam")
+            },
+        );
         let target = parsed.deferred_for_expressions()[0].target();
         let mut json = serde_json::to_value(target).expect("serialize deferred target");
         json["template"]["source"]

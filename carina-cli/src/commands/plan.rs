@@ -514,10 +514,15 @@ mod provider_scope_evidence_tests {
         ];
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs.clone();
-        let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let resolved = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .expect("provider configs resolve");
         let wiring = ValidatedConfig::from_factories_for_test_with_provider_phase(
@@ -2915,10 +2920,15 @@ mod schema_fingerprint_tests {
     ) -> SavedProviderConfigs {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
-        let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let resolved = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .expect("test provider configs must resolve");
         SavedProviderConfigs::from(&resolved)
@@ -6049,56 +6059,66 @@ pub(crate) fn check_exports_pre_apply<D>(
     >,
     String,
 > {
-    // carina#3248: build the unified pre-apply bindings view so an
-    // export referencing `<module_instance>.<attr>` chains through the
-    // composition to the managed sibling literal (carina#3246).
-    let mut secret_aware_current = input.managed_current.clone();
-    if let Some(state_file) = input.state_file {
-        let moved_origins = MovedOrigins::from_plan(input.plan);
-        for (id, current) in &mut secret_aware_current {
-            let Some(persisted) = moved_origins.find_persisted_row(state_file, id) else {
-                continue;
-            };
-            let persisted_attributes = persisted.persisted_attributes();
-            if let (Some(persisted_attributes), Some(attributes)) =
-                (persisted_attributes, current.attributes_mut())
-            {
-                for (key, value) in attributes {
-                    *value = carina_core::value::mask_plaintext_using_persisted_attribute(
-                        value,
-                        persisted_attributes,
-                        key,
-                    );
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run(
+            input.provider_context,
+            |session| {
+                // carina#3248: build the unified pre-apply bindings view so an
+                // export referencing `<module_instance>.<attr>` chains through the
+                // composition to the managed sibling literal (carina#3246).
+                let mut secret_aware_current = input.managed_current.clone();
+                if let Some(state_file) = input.state_file {
+                    let moved_origins = MovedOrigins::from_plan(input.plan);
+                    for (id, current) in &mut secret_aware_current {
+                        let Some(persisted) = moved_origins.find_persisted_row(state_file, id)
+                        else {
+                            continue;
+                        };
+                        let persisted_attributes = persisted.persisted_attributes();
+                        if let (Some(persisted_attributes), Some(attributes)) =
+                            (persisted_attributes, current.attributes_mut())
+                        {
+                            for (key, value) in attributes {
+                                *value =
+                                    carina_core::value::mask_plaintext_using_persisted_attribute(
+                                        value,
+                                        persisted_attributes,
+                                        key,
+                                    );
+                            }
+                        }
+                    }
                 }
-            }
-        }
-    }
-    let plan_input_current = carina_core::resource::into_plan_input_current_map(
-        secret_aware_current,
-        input.schemas,
-        input.resources,
-    );
-    let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
-        carina_core::binding_index::LivePreApplyInputs {
-            managed: input.resources,
-            compositions: input.compositions,
-            managed_current: &plan_input_current,
-            data_source_values: input.data_source_values,
-            remote_bindings: &HashMap::new(),
-            wait_aliases: input.wait_aliases,
-        },
-    );
-    bindings.apply_plan_stability(
-        input.resources,
-        &plan_input_current,
-        input.plan,
-        input.schemas,
-    );
+                let plan_input_current = carina_core::resource::into_plan_input_current_map(
+                    secret_aware_current,
+                    input.schemas,
+                    input.resources,
+                );
+                let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+                    carina_core::binding_index::LivePreApplyInputs {
+                        managed: input.resources,
+                        compositions: input.compositions,
+                        managed_current: &plan_input_current,
+                        data_source_values: input.data_source_values,
+                        remote_bindings: &HashMap::new(),
+                        wait_aliases: input.wait_aliases,
+                    },
+                );
+                bindings.apply_plan_stability(
+                    input.resources,
+                    &plan_input_current,
+                    input.plan,
+                    input.schemas,
+                );
 
-    carina_core::validation::check_export_values_pre_apply(
-        input.export_params,
-        &bindings,
-        input.provider_context,
+                carina_core::validation::check_export_values_pre_apply(
+                    input.export_params,
+                    &bindings,
+                    session,
+                )
+            },
+        ),
+        |message| message,
     )
 }
 
@@ -6256,48 +6276,57 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
     policy: UpstreamMissingStatePolicy,
     scope: ProviderUpstreamScope,
 ) -> Result<ResolvedProviderInputs, AppError> {
-    let mut cycle_guard = seed_cycle_guard(base_dir);
-    let remote_bindings = match scope {
-        ProviderUpstreamScope::All => {
-            load_upstream_states(
-                runtime,
-                &parsed.upstream_states,
-                base_dir,
-                provider_context,
-                &mut cycle_guard,
-                policy,
-            )
-            .await?
-        }
-        ProviderUpstreamScope::ProviderReferences => {
-            load_provider_referenced_upstream_states(
-                runtime,
-                parsed,
-                base_dir,
-                provider_context,
-                &mut cycle_guard,
-                policy,
-            )
-            .await?
-        }
-    };
-    let configs = carina_core::parser::resolve_provider_attributes_with_remote(
-        parsed,
-        &remote_bindings,
-        provider_context,
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run_async(
+            provider_context,
+            async |session| {
+                let mut cycle_guard = seed_cycle_guard(base_dir);
+                let remote_bindings = match scope {
+                    ProviderUpstreamScope::All => {
+                        load_upstream_states(
+                            runtime,
+                            &parsed.upstream_states,
+                            base_dir,
+                            provider_context,
+                            &mut cycle_guard,
+                            policy,
+                        )
+                        .await?
+                    }
+                    ProviderUpstreamScope::ProviderReferences => {
+                        load_provider_referenced_upstream_states(
+                            runtime,
+                            parsed,
+                            base_dir,
+                            provider_context,
+                            &mut cycle_guard,
+                            policy,
+                        )
+                        .await?
+                    }
+                };
+                let configs = carina_core::parser::resolve_provider_attributes_with_remote(
+                    parsed,
+                    &remote_bindings,
+                    session,
+                )
+                .map_err(|error| match error {
+                    carina_core::parser::ProviderConfigResolutionError::Parse(source) => {
+                        AppError::ProviderAttributeResolution(Box::new(source))
+                    }
+                    carina_core::parser::ProviderConfigResolutionError::Invariant(source) => {
+                        AppError::ProviderConfigInvariant(Box::new(source))
+                    }
+                })?;
+                Ok(ResolvedProviderInputs {
+                    configs,
+                    remote_bindings,
+                })
+            },
+        )
+        .await,
+        AppError::Validation,
     )
-    .map_err(|error| match error {
-        carina_core::parser::ProviderConfigResolutionError::Parse(source) => {
-            AppError::ProviderAttributeResolution(Box::new(source))
-        }
-        carina_core::parser::ProviderConfigResolutionError::Invariant(source) => {
-            AppError::ProviderConfigInvariant(Box::new(source))
-        }
-    })?;
-    Ok(ResolvedProviderInputs {
-        configs,
-        remote_bindings,
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7444,10 +7473,15 @@ exports { region: String = "ap-northeast-1" }"#,
                 wait_aliases: &[],
             },
         );
-        let checked_exports = carina_core::validation::check_export_values_pre_apply(
-            &parsed.export_params,
-            &export_bindings,
+        let checked_exports = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::validation::check_export_values_pre_apply(
+                    &parsed.export_params,
+                    &export_bindings,
+                    session,
+                )
+            },
         )
         .expect("downstream export resolves from upstream state");
         let export_changes = compute_export_diffs(&checked_exports, &HashMap::new());
@@ -7722,10 +7756,15 @@ mod run_plan_out_tests {
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
-        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .unwrap();
 
@@ -8118,10 +8157,15 @@ mod run_plan_out_tests {
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
 
-        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .unwrap();
         let plan_file = build_plan_file_from_parts(
@@ -8213,10 +8257,15 @@ mod run_plan_out_tests {
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
 
-        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .unwrap();
         let plan_file = build_plan_file_from_parts(
@@ -8278,10 +8327,15 @@ mod run_plan_out_tests {
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
-        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .unwrap();
 
@@ -8325,10 +8379,15 @@ mod run_plan_out_tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = vec![configured.clone()];
         let parsed = resolve_file_for_test(parsed, tmp.path());
-        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .unwrap();
         let ctx = crate::wiring::PlanContext {
@@ -8431,10 +8490,15 @@ mod export_diff_tests {
     fn checked(
         params: Vec<InferredExportParam>,
     ) -> carina_core::validation::ExportsCheckedPreApply<InferredExportParam> {
-        carina_core::validation::check_export_values_pre_apply(
-            &params,
-            &carina_core::binding_index::ResolvedBindings::default(),
+        carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::validation::check_export_values_pre_apply(
+                    &params,
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                    session,
+                )
+            },
         )
         .expect("test exports must pass the secret boundary")
     }
@@ -8523,10 +8587,11 @@ mod export_diff_tests {
         let value = Value::Concrete(ConcreteValue::String("vpc.vpc_id".into()));
 
         let params = vec![param("literal", value.clone())];
-        let resolved = carina_core::validation::check_export_values_pre_apply(
-            &params,
-            &bindings,
+        let resolved = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::validation::check_export_values_pre_apply(&params, &bindings, session)
+            },
         )
         .expect("plain dotted string is a valid export");
         assert_eq!(resolved.display_values()[0].value.as_ref(), Some(&value));
@@ -8553,10 +8618,11 @@ mod export_diff_tests {
             },
         );
         let params = vec![param("password", root_resource_ref("vpc", "password"))];
-        let error = carina_core::validation::check_export_values_pre_apply(
-            &params,
-            &bindings,
+        let error = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::validation::check_export_values_pre_apply(&params, &bindings, session)
+            },
         )
         .expect_err("resolved secret reference must be rejected before display");
         assert_eq!(error, "export 'password' cannot hold a secret value");

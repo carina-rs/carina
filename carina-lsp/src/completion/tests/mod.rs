@@ -11,6 +11,17 @@ use carina_core::schema::{
 mod basic;
 mod extended;
 
+impl CompletionProvider {
+    fn complete_for_test(
+        &self,
+        doc: &Document,
+        position: Position,
+        base_path: Option<&std::path::Path>,
+    ) -> Vec<CompletionItem> {
+        self.complete(doc, position, base_path, doc.provider_context())
+    }
+}
+
 pub(super) fn create_document(content: &str) -> Document {
     Document::new(content.to_string(), Arc::new(ProviderContext::default()))
 }

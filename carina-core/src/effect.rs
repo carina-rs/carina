@@ -917,10 +917,16 @@ impl ResolvedMovePairs {
     /// let project = tempfile::tempdir().unwrap();
     /// std::fs::write(project.path().join("main.crn"), "").unwrap();
     /// let parsed = parse_directory(project.path(), &ProviderContext::default()).unwrap();
-    /// let configuration = resolve_modules_providerless(parsed, project.path())
-    ///     .unwrap()
-    ///     .into_expanded(&SchemaRegistry::new())
-    ///     .unwrap();
+    /// let checks = carina_core::validation::deferred_types::TypeCheckSession::run(
+    ///     &ProviderContext::default(),
+    ///     |session| resolve_modules_providerless(parsed, project.path(), session)
+    ///         .unwrap()
+    ///         .into_expanded(&SchemaRegistry::new())
+    ///         .unwrap(),
+    /// );
+    /// let mut diagnostics = Vec::new();
+    /// let configuration = checks.publish(&mut diagnostics);
+    /// assert!(diagnostics.is_empty());
     /// let addressed = AddressedMoves::preserve_addresses(&configuration.state_blocks);
     /// let pairs = ResolvedMovePairs::from_addressed_moves(addressed);
     /// assert!(pairs.is_empty());

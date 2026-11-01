@@ -12,6 +12,187 @@ use super::expressions::string_literal::parse_string_literal;
 use super::util::{pascal_to_snake, snake_to_pascal};
 use super::{ProviderContext, Rule, first_inner, next_pair};
 
+/// A core refinement name admitted by the built-in declaration registry.
+/// Arbitrary provider names cannot enter `TypeExpr::Simple`, including via serde.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String", into = "String")]
+pub struct BuiltinTypeName(String);
+
+impl BuiltinTypeName {
+    pub fn lookup(snake: &str) -> Option<Self> {
+        builtin_bare_custom_types()
+            .contains_key(snake)
+            .then(|| Self(snake.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn declaration(&self) -> &'static crate::schema::CompiledAttributeType {
+        &builtin_bare_custom_types()[self.as_str()]
+    }
+}
+
+impl std::ops::Deref for BuiltinTypeName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for BuiltinTypeName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl TryFrom<String> for BuiltinTypeName {
+    type Error = String;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::lookup(&name).ok_or_else(|| format!("unknown built-in type `{name}`"))
+    }
+}
+
+impl From<BuiltinTypeName> for String {
+    fn from(name: BuiltinTypeName) -> Self {
+        name.0
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn bare_type_for_test(name: String) -> TypeExpr {
+    resolve_known_bare_custom_type(&name, &ProviderContext::default())
+        .expect("bootstrap resolution has no conflicting declarations")
+        .expect("bootstrap resolution preserves authored names")
+}
+
+/// Nominal evidence retained while provider schemas are unavailable.
+///
+/// The private identity can only be constructed by the resolution seam below,
+/// after checking the provider catalog. It carries no scalar-kind claim.
+/// Assignment to another identified type uses the shared directional identity
+/// relation; identity-free scalar and literal checks require the missing schema.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "TypeIdentity", into = "TypeIdentity")]
+pub struct UnloadedSchemaType(TypeIdentity, Vec<super::OwnedTypeIdentity>);
+
+impl UnloadedSchemaType {
+    pub fn identity(&self) -> &TypeIdentity {
+        &self.0
+    }
+
+    /// Candidates from loaded providers, retained without claiming that the
+    /// incomplete catalog has found every owner of this bare name.
+    pub fn loaded_candidates(&self) -> &[super::OwnedTypeIdentity] {
+        &self.1
+    }
+}
+
+impl TryFrom<TypeIdentity> for UnloadedSchemaType {
+    type Error = String;
+    fn try_from(identity: TypeIdentity) -> Result<Self, Self::Error> {
+        match resolve_custom_type_identity(&identity, &ProviderContext::default()) {
+            Ok(Some(TypeExpr::UnloadedSchemaType(unloaded))) => Ok(unloaded),
+            Ok(_) => Err(format!(
+                "built-in type `{identity}` cannot be an unloaded provider type"
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+impl From<UnloadedSchemaType> for TypeIdentity {
+    fn from(unloaded: UnloadedSchemaType) -> Self {
+        unloaded.0
+    }
+}
+
+/// Resolve an identity using the catalog, retaining only nominal evidence
+/// when that catalog is not loaded. This is the sole constructor of
+/// `UnloadedSchemaType`, including for deserialized annotations.
+pub(crate) fn resolve_custom_type_identity(
+    identity: &TypeIdentity,
+    config: &ProviderContext,
+) -> Result<Option<TypeExpr>, StaticTypeResolutionError> {
+    let snake = pascal_to_snake(&identity.kind);
+    if crate::schema::builtin_type_registry().contains_key(identity) {
+        return Ok(Some(TypeExpr::Simple(
+            BuiltinTypeName::lookup(&snake).expect("registry built-in name"),
+        )));
+    }
+    let matches = config
+        .known_custom_types()
+        .iter()
+        .filter(|owned| owned.identity() == identity)
+        .collect::<Vec<_>>();
+    if config.custom_types.may_defer(identity.provider.as_deref()) {
+        return Ok(Some(TypeExpr::UnloadedSchemaType(UnloadedSchemaType(
+            identity.clone(),
+            matches.iter().map(|owned| (*owned).clone()).collect(),
+        ))));
+    }
+    if let Some(resolved) = merge_custom_type_candidates(&matches)? {
+        return Ok(Some(resolved));
+    }
+    Ok(None)
+}
+
+/// Resolve annotations against resource declarations and the actual provider
+/// catalog. Only an unloaded catalog may retain unresolved nominal evidence.
+pub fn resolve_type_expr_from_schemas(
+    ty: &TypeExpr,
+    schemas: &crate::schema::SchemaRegistry,
+    config: &ProviderContext,
+) -> Result<TypeExpr, StaticTypeResolutionError> {
+    let identity = match ty {
+        TypeExpr::UnloadedSchemaType(unloaded) => unloaded.identity().clone(),
+        TypeExpr::List(inner) => {
+            return resolve_type_expr_from_schemas(inner, schemas, config)
+                .map(|inner| TypeExpr::List(Box::new(inner)));
+        }
+        TypeExpr::Map(inner) => {
+            return resolve_type_expr_from_schemas(inner, schemas, config)
+                .map(|inner| TypeExpr::Map(Box::new(inner)));
+        }
+        TypeExpr::Struct { fields } => {
+            return fields
+                .iter()
+                .map(|(name, field)| {
+                    resolve_type_expr_from_schemas(field, schemas, config)
+                        .map(|field| (name.clone(), field))
+                })
+                .collect::<Result<_, _>>()
+                .map(|fields| TypeExpr::Struct { fields });
+        }
+        TypeExpr::Union(members) => {
+            return members
+                .iter()
+                .map(|member| resolve_type_expr_from_schemas(member, schemas, config))
+                .collect::<Result<_, _>>()
+                .map(TypeExpr::Union);
+        }
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Simple(_)
+        | TypeExpr::SchemaType { .. }
+        | TypeExpr::Ref(_)
+        | TypeExpr::DottedUnresolved(_)
+        | TypeExpr::StringLiteral(_) => return Ok(ty.clone()),
+    };
+    let candidates = schemas.known_custom_type_declarations(&identity);
+    if let Some(resolved) = merge_custom_type_candidates(&candidates.iter().collect::<Vec<_>>())? {
+        return Ok(resolved);
+    }
+    resolve_custom_type_identity(&identity, config)?
+        .ok_or_else(|| unknown_custom_type_error(&identity.to_string(), config))
+}
+
 /// Parse a standalone type-expression text snippet (e.g. `"String"`,
 /// `"List(Int)"`, `"'dev' | 'prod'"`) into a [`TypeExpr`].
 ///
@@ -72,23 +253,24 @@ pub(super) fn parse_type_expr(
     }
 }
 
-/// The set of bare PascalCase custom types built into the DSL itself.
-/// These are accepted in a type position regardless of which providers
-/// (if any) have registered, because their validators live in
-/// `carina-core` rather than in any provider — see the matching arms in
-/// [`crate::parser::functions::validate_custom_type`].
-pub const BUILTIN_BARE_CUSTOM_TYPES: &[&str] = &[
-    "ipv4_cidr",
-    "ipv4_address",
-    "ipv6_cidr",
-    "ipv6_address",
-    "http_response_status_code",
-    "redirect_host",
-    "redirect_path",
-    "redirect_port",
-    "redirect_protocol",
-    "redirect_query",
-];
+/// Constructor-backed bare custom types built into the DSL, keyed by
+/// snake-case name and sorted for deterministic tooling output. Keeping each
+/// declaration preserves its scalar kind for static type lifting.
+///
+/// Derived from [`crate::schema::builtin_type_registry`], the same source used
+/// for provider admission and validator reconstruction.
+pub fn builtin_bare_custom_types()
+-> &'static std::collections::BTreeMap<String, crate::schema::CompiledAttributeType> {
+    static TYPES: std::sync::OnceLock<
+        std::collections::BTreeMap<String, crate::schema::CompiledAttributeType>,
+    > = std::sync::OnceLock::new();
+    TYPES.get_or_init(|| {
+        crate::schema::builtin_type_registry()
+            .iter()
+            .map(|(identity, declaration)| (pascal_to_snake(&identity.kind), declaration.clone()))
+            .collect()
+    })
+}
 
 /// Resolve a snake-cased bare custom-type annotation without discarding its
 /// schema owner.
@@ -101,29 +283,34 @@ pub const BUILTIN_BARE_CUSTOM_TYPES: &[&str] = &[
 pub(crate) fn resolve_known_bare_custom_type(
     snake: &str,
     config: &ProviderContext,
-) -> Option<TypeExpr> {
-    if BUILTIN_BARE_CUSTOM_TYPES.contains(&snake) {
-        return Some(TypeExpr::Simple(snake.to_string()));
+) -> Result<Option<TypeExpr>, StaticTypeResolutionError> {
+    if let Some(name) = BuiltinTypeName::lookup(snake) {
+        return Ok(Some(TypeExpr::Simple(name)));
     }
-    let pascal = snake_to_pascal(snake);
-    let matches = config
-        .known_custom_types()
-        .iter()
-        .filter(|owned| {
-            owned.identity().provider.is_none()
-                && owned.identity().segments.is_empty()
-                && owned.identity().kind == pascal
-        })
-        .collect::<Vec<_>>();
-    let first = matches.first()?;
-    let owners = matches
-        .iter()
-        .skip(1)
-        .fold(first.owners().clone(), |owners, owned| {
-            owners.union(owned.owners())
-        });
-    let owned = crate::parser::OwnedTypeIdentity::with_owners(first.identity().clone(), owners);
-    Some(TypeExpr::SchemaType { owned })
+    resolve_custom_type_identity(&TypeIdentity::bare(snake_to_pascal(snake)), config)
+}
+
+/// Join owners only after their declarations agree on the scalar kind.
+pub(crate) fn merge_custom_type_candidates(
+    matches: &[&super::OwnedTypeIdentity],
+) -> Result<Option<TypeExpr>, StaticTypeResolutionError> {
+    let Some(first) = matches.first() else {
+        return Ok(None);
+    };
+    let mut owners = first.owners().clone();
+    for owned in &matches[1..] {
+        if owned.scalar_kind() != first.scalar_kind() {
+            return Err(StaticTypeResolutionError::ConflictingScalarKinds {
+                name: first.authored_name(),
+                first_kind: first.scalar_kind(),
+                second_kind: owned.scalar_kind(),
+            });
+        }
+        owners = owners.union(owned.owners());
+    }
+    Ok(Some(TypeExpr::SchemaType {
+        owned: first.with_merged_owners(owners),
+    }))
 }
 
 fn custom_type_suggestion_key(id: &TypeIdentity) -> String {
@@ -201,7 +388,6 @@ fn parse_type_expr_atom(
     warnings: &mut Vec<ParseWarning>,
     preprocessed_file: Option<&super::PreprocessedFile>,
 ) -> Result<TypeExpr, ParseError> {
-    let _ = warnings;
     let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
         Rule::type_string_literal => {
@@ -233,25 +419,21 @@ fn parse_type_expr_atom(
                 }),
                 other if other.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
                     let snake = pascal_to_snake(other);
-                    // carina#3239: when the provider-registration phase
-                    // has populated `config`, an unknown bare custom-type
-                    // name in a type position is a parse error. Before
-                    // this gate, any PascalCase identifier became
-                    // `TypeExpr::Simple(snake)` and downstream `validate`
-                    // silently treated unknowns as untyped strings — so
-                    // typos and renamed-then-removed types went unnoticed.
-                    if config.custom_types_loaded() {
-                        return match resolve_known_bare_custom_type(&snake, config) {
-                            Some(resolved) => Ok(resolved),
-                            None => Err(ParseError::unresolved_declaration_type(
-                                other,
-                                type_span,
-                                unknown_custom_type_message(other, config),
-                            )),
-                        };
+                    match resolve_known_bare_custom_type(&snake, config) {
+                        Ok(Some(resolved)) => Ok(resolved),
+                        Ok(None) => Err(ParseError::unresolved_declaration_type(
+                            other,
+                            type_span,
+                            unknown_custom_type_message(other, config),
+                        )),
+                        Err(error) => Err(ParseError::unresolved_declaration_type(
+                            other,
+                            type_span,
+                            error.to_string(),
+                        )),
                     }
-                    Ok(TypeExpr::Simple(snake))
                 }
+
                 other => Err(ParseError::InvalidExpression {
                     line,
                     message: match suggest_registered_dotted_custom_type(other, config) {
@@ -401,12 +583,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_type_expr_str_pascal_simple() {
+    fn simple_type_construction_and_decoding_reject_provider_names() {
+        assert!(BuiltinTypeName::lookup("count").is_none());
+        assert!(serde_json::from_str::<TypeExpr>(r#"{"Simple":"count"}"#).is_err());
+        let builtin = TypeExpr::Simple(BuiltinTypeName::lookup("positive_int").unwrap());
+        assert_eq!(
+            serde_json::from_str::<TypeExpr>(&serde_json::to_string(&builtin).unwrap()).unwrap(),
+            builtin
+        );
+    }
+
+    #[test]
+    fn unloaded_bare_annotation_retains_nominal_identity_at_parse_time() {
+        let parsed = parse_type_expr_str("Count", &ProviderContext::default()).unwrap();
+        assert!(matches!(parsed, TypeExpr::UnloadedSchemaType(ref unloaded)
+            if unloaded.identity() == &TypeIdentity::bare("Count")));
+    }
+
+    #[test]
+    fn loaded_catalog_rejects_bootstrap_typo_with_resource_schemas() {
+        let parsed = parse_type_expr_str("Typo", &ProviderContext::default()).unwrap();
+        let context = loaded_context(Default::default());
+        assert!(matches!(
+            crate::validation::resolve_type_expr(&parsed, &context),
+            Err(StaticTypeResolutionError::UnknownCustomType { .. })
+        ));
+        assert!(matches!(
+            resolve_type_expr_from_schemas(
+                &parsed,
+                &crate::schema::SchemaRegistry::new(),
+                &context
+            ),
+            Err(StaticTypeResolutionError::UnknownCustomType { .. })
+        ));
+        let file = crate::parser::ParsedFile::default();
+        let schemas = crate::schema::SchemaRegistry::new();
+        let bindings = crate::binding_index::BindingIndex::from_parsed(&file, &schemas, &context);
+        assert!(matches!(
+            bindings.resolve_declared_type(&parsed),
+            Err(StaticTypeResolutionError::UnknownCustomType { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_type_expr_str_pascal_provider_name_is_unloaded() {
         let ctx = ProviderContext::default();
-        // PascalCase identifier → TypeExpr::Simple(snake_case)
+        // An unloaded provider annotation retains nominal evidence immediately.
         assert!(matches!(
             parse_type_expr_str("IamOidcProviderArn", &ctx),
-            Some(TypeExpr::Simple(ref s)) if s == "iam_oidc_provider_arn"
+            Some(TypeExpr::UnloadedSchemaType(ref unloaded))
+                if unloaded.identity() == &TypeIdentity::bare("IamOidcProviderArn")
         ));
     }
 
@@ -418,18 +644,15 @@ mod tests {
         assert_eq!(parse_type_expr_str("", &ctx), None);
     }
 
-    /// Default `ProviderContext` (no provider phase has run yet, so custom
-    /// types are `Unloaded`) keeps the legacy lax behavior: any
-    /// PascalCase identifier becomes `TypeExpr::Simple(snake_case)`. This
-    /// preserves the LSP early-parse path that runs before schemas are
-    /// loaded — without it, every mid-edit buffer would lose all
-    /// `Simple`-shaped type completions.
+    /// Bootstrap parsing preserves an unknown provider name without claiming
+    /// a scalar kind. A loaded catalog must subsequently resolve or reject it.
     #[test]
     fn parse_type_expr_str_accepts_unknown_when_custom_types_are_unloaded() {
         let ctx = ProviderContext::default();
         assert!(matches!(
             parse_type_expr_str("TotallyMadeUpType", &ctx),
-            Some(TypeExpr::Simple(ref s)) if s == "totally_made_up_type"
+            Some(TypeExpr::UnloadedSchemaType(ref unloaded))
+                if unloaded.identity() == &TypeIdentity::bare("TotallyMadeUpType")
         ));
     }
 
@@ -441,25 +664,24 @@ mod tests {
     #[test]
     fn parse_type_expr_str_rejects_unknown_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());
-        // No validators registered → only the BUILTIN_BARE_CUSTOM_TYPES
-        // set is valid. A clearly-fake name is rejected.
+        // No provider validators registered → only core built-ins are valid.
+        // A clearly-fake name is rejected.
         assert_eq!(parse_type_expr_str("TotallyMadeUpType", &ctx), None);
         // A historical-but-removed name is rejected the same way — the
         // bug-headline example from carina#3239.
         assert_eq!(parse_type_expr_str("IamOidcProviderArn", &ctx), None);
     }
 
-    /// Built-in DSL custom types (the `BUILTIN_BARE_CUSTOM_TYPES` set)
-    /// are always accepted, even when no provider has registered any
-    /// validators — they are part of `carina-core` itself.
     #[test]
-    fn parse_type_expr_str_accepts_builtins_when_custom_types_are_loaded() {
+    fn parse_type_expr_str_accepts_every_builtin_validator_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());
-        for snake in BUILTIN_BARE_CUSTOM_TYPES {
-            let name = snake_to_pascal(snake);
-            assert!(
-                matches!(parse_type_expr_str(&name, &ctx), Some(TypeExpr::Simple(_))),
-                "built-in custom type '{name}' must parse with loaded custom types"
+        for identity in crate::schema::builtin_type_registry().keys() {
+            assert!(identity.provider.is_none() && identity.segments.is_empty());
+            let name = &identity.kind;
+            assert_eq!(
+                parse_type_expr_str(name, &ctx),
+                Some(crate::parser::bare_type_for_test(pascal_to_snake(name))),
+                "registered built-in {name} must be accepted without a provider"
             );
         }
     }
@@ -475,7 +697,11 @@ mod tests {
         use crate::schema::TypeIdentity;
 
         let ctx = loaded_context(std::collections::HashSet::from([
-            crate::parser::OwnedTypeIdentity::provider("test", TypeIdentity::bare("EmailAddress")),
+            crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                TypeIdentity::bare("EmailAddress"),
+                crate::schema::RefinedScalarKind::String,
+            ),
         ]));
         assert!(matches!(
             parse_type_expr_str("EmailAddress", &ctx),

@@ -395,7 +395,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 default_line: call_line,
                 caller_source_file: call_source_file,
                 binding_index,
-                config: self.config(),
+                config: self.session,
             };
             for arg in &module.arguments {
                 // Call-site expressions are evaluated in the caller's scope,
@@ -492,7 +492,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             default_line: call_line,
             caller_source_file: call_source_file,
             binding_index,
-            config: self.config(),
+            config: self.session,
         };
         let argument_values: HashMap<String, ModuleResolvedValue> = resolved_arguments
             .iter()
@@ -583,7 +583,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 }
             }
             let resolved_type = resolved_parameter.as_type_expr();
-            self.provider_context
+            self.typecheck_context()
                 .check(
                     &resolved_type,
                     value,
@@ -751,7 +751,15 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .map_err(contextualize_access_error)?;
         let selected = &selected_module_ifs.contribution;
 
-        let nested_binding_index = BindingIndex::from_parsed(module, self.schemas);
+        let nested_signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let nested_binding_index =
+            BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                module,
+                self.schemas,
+                None,
+                &nested_signatures,
+                self.session,
+            );
         let mut nested_contributions = Vec::new();
         for nested_call in module.module_calls.iter().chain(&selected.module_calls) {
             let local_prefix = instance_prefix_for_call(nested_call);
@@ -851,7 +859,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     composition,
                     &expanded_call,
                     &module_scope_resolver,
-                    self.provider_context,
+                    self.typecheck_context(),
                 )
             })
             .collect::<Result<_, _>>()
@@ -1822,7 +1830,7 @@ struct ArgumentSubstitutions<'a, B: BindingAddress = AbsoluteBindingAddress> {
     default_line: usize,
     caller_source_file: &'a std::path::Path,
     binding_index: Option<&'a BindingIndex<'a>>,
-    config: &'a crate::parser::ProviderContext,
+    config: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 }
 
 impl<B: BindingAddress> Copy for ArgumentSubstitutions<'_, B> {}
@@ -2400,7 +2408,7 @@ fn resolve_module_binding_uses<P: TypeResolutionPolicy>(
                     // dotted types still need consumer-side resolution before
                     // they can describe the module body's lexical source.
                     .and_then(|declaration| {
-                        P::resolve_static_type(declaration, resolver.arguments.config)
+                        P::resolve_static_type(declaration, resolver.arguments.config.catalog())
                             .known()
                             .cloned()
                             .map(std::sync::Arc::new)
@@ -2564,7 +2572,8 @@ fn bind_constraint_expression(
                 })?;
         }
         if let Some(bindings) = resolved_bindings
-            && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
+            && let Ok(resolved) =
+                crate::resolver::resolve_ref_value(&value, bindings, arguments.config)
         {
             value = resolved;
         }
@@ -3030,7 +3039,7 @@ fn select_expanded_module_ifs(
 
 fn evaluate_expanded_module_functions(
     value: &ModuleResolvedValue,
-    config: &crate::parser::ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
@@ -3116,20 +3125,24 @@ fn evaluate_expanded_module_functions(
                     .iter()
                     .map(crate::parser::function_argument_as_eval)
                     .collect::<Vec<_>>();
-                crate::builtins::evaluate_builtin_with_config(name.as_str(), &eval_args, config)
-                    .map_err(|message| ArgumentSubstitutionError {
-                        source_file: None,
-                        line: source_line.get().unwrap_or(0),
-                        message,
-                        parse_error: None,
-                    })?
-                    .into_value()
-                    .map_err(|error| ArgumentSubstitutionError {
-                        source_file: None,
-                        line: source_line.get().unwrap_or(0),
-                        message: error.to_string(),
-                        parse_error: None,
-                    })?
+                crate::builtins::evaluate_builtin_with_config(
+                    name.as_str(),
+                    &eval_args,
+                    config.catalog(),
+                )
+                .map_err(|message| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: source_line.get().unwrap_or(0),
+                    message,
+                    parse_error: None,
+                })?
+                .into_value()
+                .map_err(|error| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: source_line.get().unwrap_or(0),
+                    message: error.to_string(),
+                    parse_error: None,
+                })?
             } else {
                 Value::Deferred(DeferredValue::FunctionCall {
                     name: *name,
@@ -4058,52 +4071,55 @@ pub(super) fn substitute_arguments(
     value: &Value,
     arguments: &HashMap<String, Value>,
 ) -> Result<Value, ArgumentSubstitutionError> {
-    let config = crate::parser::ProviderContext::default();
-    let arguments = arguments
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.clone(),
-                ResolvedArgument {
-                    argument: ModuleArgument::new(value.clone()),
-                    origin: ArgumentOrigin::Defaulted,
-                    caller_reference: None,
-                    forwarded_from_enclosing_parameter: false,
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |config| {
+            let arguments = arguments
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        ResolvedArgument {
+                            argument: ModuleArgument::new(value.clone()),
+                            origin: ArgumentOrigin::Defaulted,
+                            caller_reference: None,
+                            forwarded_from_enclosing_parameter: false,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let substituted = substitute_arguments_with_position(
+                value,
+                ArgumentSubstitutions {
+                    arguments: &arguments,
+                    default_line: 1,
+                    caller_source_file: std::path::Path::new("test.crn"),
+                    binding_index: None,
+                    config,
                 },
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let substituted = substitute_arguments_with_position(
-        value,
-        ArgumentSubstitutions {
-            arguments: &arguments,
-            default_line: 1,
-            caller_source_file: std::path::Path::new("test.crn"),
-            binding_index: None,
-            config: &config,
+                ArgumentSubstitutionPosition::Value,
+            )?;
+            select_authored_module_ifs_for_test(&substituted, config)
         },
-        ArgumentSubstitutionPosition::Value,
-    )?;
-    select_authored_module_ifs_for_test(&substituted, &config)
+    )
 }
 
 #[cfg(test)]
 fn select_authored_module_ifs_for_test(
     value: &Value,
-    config: &crate::parser::ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Value, ArgumentSubstitutionError> {
     use crate::resource::{ConcreteValue, DeferredValue, Value};
 
     Ok(match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            match crate::parser::decide_if_condition(deferred.condition().value(), config).map_err(
-                |error| ArgumentSubstitutionError {
+            match crate::parser::decide_if_condition(deferred.condition().value(), config.catalog())
+                .map_err(|error| ArgumentSubstitutionError {
                     source_file: Some(deferred.condition().source_file().to_path_buf()),
                     line: deferred.condition().source_line(),
                     message: error.to_string(),
                     parse_error: None,
-                },
-            )? {
+                })? {
                 Some(true) => select_authored_module_ifs_for_test(deferred.then_value(), config)?,
                 Some(false) => select_authored_module_ifs_for_test(deferred.else_value(), config)?,
                 None => value.clone(),
@@ -5100,59 +5116,64 @@ mod tests {
 
     #[test]
     fn default_iterable_origin_is_retained_by_loop_module_call_arguments() {
-        let config = crate::parser::ProviderContext::default();
-        let module = crate::parser::parse_file(
-            "arguments { flags: list(Bool) = [false] }\nlet inner = use { source = '../inner' }\nlet children = for flag in flags { inner { protect = flag literal = false } }\n",
-            std::path::Path::new("outer/main.crn"),
-            &config,
-        ).unwrap();
-        let caller = crate::parser::parse_file(
-            "let instance = outer {}\n",
-            std::path::Path::new("call.crn"),
-            &config,
-        )
-        .unwrap();
-        let call = &caller.module_calls[0];
-        let expanded_call = call
-            .clone()
-            .resolve_bindings(&mut |binding| crate::resource::RootScope::new().resolve(binding));
-        let mut resolver = ModuleResolver::new(std::path::Path::new("."));
-        resolver
-            .imported_modules
-            .insert("outer".to_string(), module);
-        resolver
-            .module_paths
-            .insert("outer".to_string(), "./outer".to_string());
-        // Inspect the typed contribution before finalization rejects replaying
-        // a deferred ModuleCall body. Its argument must already retain origin.
-        let expanded = resolver
-            .expand_module_call_inner(
-                call,
-                &expanded_call,
-                "instance",
-                None,
-                None,
-                ModuleExpansionSource::imported(),
-            )
-            .unwrap();
-        let DeferredForBody::ModuleCall(call) =
-            expanded.parsed_deferred_for_expressions()[0].body()
-        else {
-            panic!("expected module-call loop body");
-        };
-        assert!(
-            matches!(
-                call.argument("protect").unwrap().value_origin,
-                crate::resource::ArgumentValueOrigin::Defaulted(_)
-            ),
-            "loop argument must retain the iterable default"
-        );
-        assert!(
-            matches!(
-                call.argument("literal").unwrap().value_origin,
-                crate::resource::ArgumentValueOrigin::Explicit
-            ),
-            "a literal argument must not inherit the iterable origin"
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                let config = crate::parser::ProviderContext::default();
+                let module = crate::parser::parse_file(
+                    "arguments { flags: list(Bool) = [false] }\nlet inner = use { source = '../inner' }\nlet children = for flag in flags { inner { protect = flag literal = false } }\n",
+                    std::path::Path::new("outer/main.crn"),
+                    &config,
+                ).unwrap();
+                let caller = crate::parser::parse_file(
+                    "let instance = outer {}\n",
+                    std::path::Path::new("call.crn"),
+                    &config,
+                )
+                .unwrap();
+                let call = &caller.module_calls[0];
+                let expanded_call = call.clone().resolve_bindings(&mut |binding| {
+                    crate::resource::RootScope::new().resolve(binding)
+                });
+                let mut resolver = ModuleResolver::new(std::path::Path::new("."), session);
+                resolver
+                    .imported_modules
+                    .insert("outer".to_string(), module);
+                resolver
+                    .module_paths
+                    .insert("outer".to_string(), "./outer".to_string());
+                // Inspect the typed contribution before finalization rejects replaying
+                // a deferred ModuleCall body. Its argument must already retain origin.
+                let expanded = resolver
+                    .expand_module_call_inner(
+                        call,
+                        &expanded_call,
+                        "instance",
+                        None,
+                        None,
+                        ModuleExpansionSource::imported(),
+                    )
+                    .unwrap();
+                let DeferredForBody::ModuleCall(call) =
+                    expanded.parsed_deferred_for_expressions()[0].body()
+                else {
+                    panic!("expected module-call loop body");
+                };
+                assert!(
+                    matches!(
+                        call.argument("protect").unwrap().value_origin,
+                        crate::resource::ArgumentValueOrigin::Defaulted(_)
+                    ),
+                    "loop argument must retain the iterable default"
+                );
+                assert!(
+                    matches!(
+                        call.argument("literal").unwrap().value_origin,
+                        crate::resource::ArgumentValueOrigin::Explicit
+                    ),
+                    "a literal argument must not inherit the iterable origin"
+                );
+            },
         );
     }
 
@@ -5303,55 +5324,63 @@ mod tests {
         );
     }
     fn dependency_scope_fixture<T>(run: impl FnOnce(&ModuleScopeResolver<'_>) -> T) -> T {
-        use crate::resource::{CompositionCall, CompositionCallPath, RootScope};
-        let scope =
-            ModuleInstanceScope::for_call("registry", Some("registry_publish"), "registry_publish");
-        let local_bindings = ["consumer", "target", "roles", "caller"]
-            .into_iter()
-            .map(RelativeBindingName::new)
-            .collect();
-        let root = RootScope::new();
-        let arguments = ["module_argument", "outer_binding"]
-            .into_iter()
-            .map(|name| {
-                (
-                    name.to_owned(),
-                    ResolvedArgument {
-                        argument: ModuleArgument::new(
-                            Value::resource_ref(name, "id", vec![]).resolve_root(&root),
-                        ),
-                        origin: ArgumentOrigin::Defaulted,
-                        caller_reference: None,
-                        forwarded_from_enclosing_parameter: false,
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                use crate::resource::{CompositionCall, CompositionCallPath, RootScope};
+                let scope = ModuleInstanceScope::for_call(
+                    "registry",
+                    Some("registry_publish"),
+                    "registry_publish",
+                );
+                let local_bindings = ["consumer", "target", "roles", "caller"]
+                    .into_iter()
+                    .map(RelativeBindingName::new)
+                    .collect();
+                let root = RootScope::new();
+                let arguments = ["module_argument", "outer_binding"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            name.to_owned(),
+                            ResolvedArgument {
+                                argument: ModuleArgument::new(
+                                    Value::resource_ref(name, "id", vec![]).resolve_root(&root),
+                                ),
+                                origin: ArgumentOrigin::Defaulted,
+                                caller_reference: None,
+                                forwarded_from_enclosing_parameter: false,
+                            },
+                        )
+                    })
+                    .collect();
+
+                let call = CompositionCall {
+                    id: crate::parser::ModuleCallId::test_dummy_in("test.crn"),
+                    module_name: "registry".to_owned(),
+                    binding: Some(root.resolve(RelativeBindingName::new("registry_publish"))),
+                    instance: "registry_publish".to_owned(),
+                    module_source: Some("./registry".to_owned()),
+                    module_directory: None,
+                    loop_origin: None,
+                };
+                let path = CompositionCallPath::direct(call);
+                let resolver = ModuleScopeResolver {
+                    scope: &scope,
+                    local_bindings: &local_bindings,
+                    arguments: ArgumentSubstitutions {
+                        arguments: &arguments,
+                        default_line: 1,
+                        caller_source_file: std::path::Path::new("test.crn"),
+                        binding_index: None,
+                        config: session,
                     },
-                )
-            })
-            .collect();
-        let config = crate::parser::ProviderContext::default();
-        let call = CompositionCall {
-            id: crate::parser::ModuleCallId::test_dummy_in("test.crn"),
-            module_name: "registry".to_owned(),
-            binding: Some(root.resolve(RelativeBindingName::new("registry_publish"))),
-            instance: "registry_publish".to_owned(),
-            module_source: Some("./registry".to_owned()),
-            module_directory: None,
-            loop_origin: None,
-        };
-        let path = CompositionCallPath::direct(call);
-        let resolver = ModuleScopeResolver {
-            scope: &scope,
-            local_bindings: &local_bindings,
-            arguments: ArgumentSubstitutions {
-                arguments: &arguments,
-                default_line: 1,
-                caller_source_file: std::path::Path::new("test.crn"),
-                binding_index: None,
-                config: &config,
+                    call_path: &path,
+                    argument_placeholders: HashMap::new(),
+                };
+                run(&resolver)
             },
-            call_path: &path,
-            argument_placeholders: HashMap::new(),
-        };
-        run(&resolver)
+        )
     }
 
     #[test]

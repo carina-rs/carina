@@ -135,11 +135,17 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
         &crate::parser::ProviderContext::default(),
     )
     .expect("valid loop fixture");
-    crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        Path::new("."),
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                Path::new("."),
+                session,
+            )
+            .expect("loop fixture crosses the module-resolution seam")
+        },
     )
-    .expect("loop fixture crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("loop fixture contains no parser placeholders")
     .resources
@@ -1669,11 +1675,17 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("the parser must preserve the authored use for typed validation");
-    let parsed = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect("the fixture crosses module resolution before readiness validation");
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect("the fixture crosses module resolution before readiness validation")
+        },
+    );
     let error = crate::validation::resolve_bare_binding_uses(
         parsed,
         &SchemaRegistry::new(),
@@ -9152,10 +9164,15 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("directory parses");
-    let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
-        .expect("directory fixture crosses the module-resolution seam")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
-        .expect("directory fixture contains no parser placeholders");
+    let mut parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(parsed, fixture.path(), session)
+                .expect("directory fixture crosses the module-resolution seam")
+        },
+    )
+    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =

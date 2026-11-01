@@ -3,6 +3,7 @@
 //! Convert DSL to AST using pest
 
 mod ast;
+pub(crate) use ast::ParserSeedMetadata;
 mod blocks;
 mod config;
 mod context;
@@ -88,7 +89,7 @@ pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
     CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, LoadedProviderContext,
     NonEmptySchemaTypeOwners, OwnedTypeIdentity, ProviderContext, ProviderCustomTypes,
-    SchemaTypeOwner,
+    SchemaTypeOwner, unavailable_provider_kinds,
 };
 #[cfg(test)]
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
@@ -96,7 +97,8 @@ pub use deferred_if::{DeferredIfBody, DeferredIfCondition, DeferredStructuralIf,
 pub use entry::{
     AnonymousResourceSourceSpan, AttributeValueSourceSpans, LetBindingSourceSpans, SourceSpanIndex,
     TopLevelBlockSourceSpan, attribute_value_source_span, attribute_value_source_spans, parse_file,
-    parse_file_and_resolve, top_level_anonymous_resource_spans, top_level_backend_block_spans,
+    parse_file_and_resolve, parse_provider_factory_declarations,
+    top_level_anonymous_resource_spans, top_level_backend_block_spans,
     top_level_exports_block_spans, top_level_let_binding_spans, top_level_state_block_spans,
     top_level_upstream_state_spans,
 };
@@ -125,7 +127,7 @@ pub use functions::{
 };
 pub(crate) use functions::{
     contains_module_argument_matching, custom_type_lookup_for_schema, function_argument_as_eval,
-    substitute_fn_params, validate_schema_custom_type_with_context,
+    substitute_fn_params, validate_builtin_custom_type, validate_schema_custom_type_with_context,
 };
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
@@ -133,7 +135,7 @@ pub use resolve::{
     check_provider_instance_routing, collect_known_bindings_merged, finalize_provider_configs,
     resolve_expanded_provider_unresolved_attributes, resolve_provider_attributes_with_remote,
     resolve_provider_unresolved_attributes, resolve_resource_refs,
-    resolve_resource_refs_with_config,
+    resolve_resource_refs_in_session, resolve_resource_refs_with_config,
 };
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
@@ -141,9 +143,13 @@ pub(crate) use resolve::{
     resolve_snapshot_function_calls_with_config,
 };
 pub use static_eval::evaluate_static_value_for_validation;
-pub use types::BUILTIN_BARE_CUSTOM_TYPES;
-pub use types::parse_type_expr_str;
-pub(crate) use types::{resolve_known_bare_custom_type, unknown_custom_type_error};
+pub use types::{
+    BuiltinTypeName, UnloadedSchemaType, builtin_bare_custom_types, parse_type_expr_str,
+    resolve_type_expr_from_schemas,
+};
+pub(crate) use types::{
+    merge_custom_type_candidates, resolve_custom_type_identity, unknown_custom_type_error,
+};
 pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
 
@@ -167,3 +173,5 @@ pub(crate) use static_eval::{
 mod tests;
 
 pub(crate) use ast::resolve_loop_directive_value;
+#[cfg(test)]
+pub(crate) use types::bare_type_for_test;

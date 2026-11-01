@@ -247,6 +247,7 @@ fn contains_authored_create_only_value_on_path<'schema>(
     ref_chain: &mut Vec<&'schema str>,
 ) -> bool {
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => false,
         AttrTypeKind::Ref(name) => {
             if ref_chain.contains(&name.as_str()) {
                 return false;
@@ -398,6 +399,7 @@ fn create_only_values_compatible_on_path<'schema>(
     ref_chain: &mut Vec<&'schema str>,
 ) -> bool {
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => true,
         AttrTypeKind::Ref(name) => {
             if ref_chain.contains(&name.as_str()) {
                 return true;

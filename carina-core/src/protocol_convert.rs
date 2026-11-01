@@ -709,6 +709,9 @@ pub fn attribute_type_to_protocol(
     attribute_type: &AttributeType,
 ) -> Result<protocol::AttributeType, ProtocolConvertError> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => Err(ProtocolConvertError::NonWireAttributeType {
+            kind: "UnloadedSchemaType",
+        }),
         RawShape::Reference {
             identity,
             pattern,
@@ -3440,6 +3443,8 @@ mod tests {
             name: "fixture".to_string(),
             params: Vec::new(),
             return_type: None,
+            return_type_span: None,
+            annotation_source_file: None,
             local_lets: Vec::new(),
             body: crate::parser::UserFunctionBody {
                 value: Value::Concrete(ConcreteValue::Int(1)),
@@ -4278,6 +4283,9 @@ mod tests {
             let decoded_wire: protocol::AttributeType = serde_json::from_str(&json).unwrap();
             let decoded = protocol_to_attribute_type(&decoded_wire).unwrap();
             let (decoded_identity, has_callback) = match decoded.raw_shape() {
+                RawShape::UnloadedSchemaType(_) => {
+                    panic!("builtin wire type must have a loaded declaration")
+                }
                 RawShape::Reference {
                     identity,
                     pattern: _pattern,
