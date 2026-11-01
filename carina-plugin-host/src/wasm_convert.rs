@@ -4,25 +4,23 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
-#[cfg(test)]
-use carina_core::provider::ProviderDirectiveSchema;
 use carina_core::provider::{
     AppliedState as CoreAppliedState, CreateRequest as CoreCreateRequest,
     DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
-    PartialReadDiagnostic as CorePartialReadDiagnostic, PatchOp as CorePatchOp,
-    PendingCreate as CorePendingCreate, ProviderDirectives as CoreProviderDirectives,
-    ProviderError as CoreProviderError, ReadOutcome as CoreReadOutcome,
-    ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
-    UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
-    UpdateRequest as CoreUpdateRequest,
+    PartialReadDiagnostic as CorePartialReadDiagnostic, PendingCreate as CorePendingCreate,
+    ProviderDirectives as CoreProviderDirectives, ProviderError as CoreProviderError,
+    ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
+    UpdateOutcome as CoreUpdateOutcome, UpdateRequest as CoreUpdateRequest, WireAttributes,
+    WirePatchOp, WireValue,
 };
 #[cfg(test)]
-use carina_core::resource::Directives;
+use carina_core::provider::{PatchOp as CorePatchOp, ProviderDirectiveSchema};
 use carina_core::resource::{
-    ConcreteValue, DataSource as CoreDataSource, DeferredValue, RedactedSecretHash,
-    Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentityState,
-    State as CoreState, Value as CoreValue,
+    ConcreteValue, DeferredValue, RedactedSecretHash, ResourceId as CoreResourceId,
+    ResourceIdentityState, State as CoreState, Value as CoreValue,
 };
+#[cfg(test)]
+use carina_core::resource::{Directives, Resource as CoreResource};
 #[cfg(test)]
 use carina_core::schema::{
     AttributeSchemaParts as CoreAttributeSchemaParts,
@@ -924,17 +922,6 @@ fn persisted_json_to_core_value(
 
 // -- Value map helpers --
 
-pub(crate) fn core_to_wit_value_map<'a, M>(
-    map: M,
-) -> Result<Vec<(String, wit::Value)>, SerializationError>
-where
-    M: IntoIterator<Item = (&'a String, &'a CoreValue)>,
-{
-    map.into_iter()
-        .map(|(k, v)| core_to_wit_value(v).map(|wv| (k.clone(), wv)))
-        .collect()
-}
-
 fn core_to_wit_persisted_value_map<'a, M>(
     map: M,
 ) -> Result<Vec<(String, wit::PersistedValue)>, SerializationError>
@@ -1747,28 +1734,64 @@ pub(crate) fn wit_to_core_delete_outcome(outcome: wit::DeleteOutcome) -> WasmDel
 
 // -- Resource --
 
-pub(crate) fn core_to_wit_resource<S>(
-    resource: &CoreResource<S>,
-) -> Result<wit::ResourceDef, SerializationError> {
-    Ok(wit::ResourceDef {
-        id: core_to_wit_resource_id(&resource.id),
-        attributes: core_to_wit_value_map(&resource.resolved_attributes())?,
-    })
-}
-
-/// Convert a [`CoreDataSource`] to the WIT `ResourceDef` carried over the
+/// Convert a checked data source to the WIT `ResourceDef` carried over the
 /// plugin boundary. The WIT contract has a single `ResourceDef` record,
 /// so a data source maps to the same `{ id, attributes }` shape as a
 /// managed resource (carina#3181).
-pub(crate) fn core_data_source_to_wit_resource<S>(
-    data_source: &CoreDataSource<S>,
-) -> Result<wit::ResourceDef, SerializationError> {
-    Ok(wit::ResourceDef {
+pub(crate) fn core_data_source_to_wit_resource(
+    data_source: &carina_core::provider::ProviderReadyDataSource,
+) -> wit::ResourceDef {
+    wit::ResourceDef {
         id: core_to_wit_resource_id(&data_source.id),
-        attributes: core_to_wit_value_map(&carina_core::resource::attrs_to_hashmap(
-            &data_source.attributes,
-        ))?,
-    })
+        attributes: checked_attributes_to_wit(data_source.wire_attributes()),
+    }
+}
+
+/// Adapt already checked protocol values; this layer has no rejection policy.
+pub(crate) fn checked_attributes_to_wit(attributes: &WireAttributes) -> Vec<(String, wit::Value)> {
+    attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), checked_value_to_wit(value)))
+        .collect()
+}
+
+fn checked_value_to_wit(value: &WireValue) -> wit::Value {
+    let json =
+        || serde_json::to_string(value.value()).expect("checked protocol values serialize to JSON");
+    if value.is_secret() {
+        return wit::Value::SecretVal(json());
+    }
+    match value.value() {
+        proto::Value::String(value) => wit::Value::StrVal(value.clone()),
+        proto::Value::Int(value) => wit::Value::IntVal(*value),
+        proto::Value::Float(value) => wit::Value::FloatVal(*value),
+        proto::Value::Bool(value) => wit::Value::BoolVal(*value),
+        proto::Value::List(_) => wit::Value::ListVal(json()),
+        proto::Value::StringList(_) => wit::Value::StringListVal(json()),
+        proto::Value::Map(_) => wit::Value::MapVal(json()),
+    }
+}
+
+fn checked_patch_to_wit(operations: &[WirePatchOp]) -> wit::UpdatePatch {
+    let patch_value = |key: &String, value: &WireValue| wit::PatchValue {
+        key: key.clone(),
+        value: checked_value_to_wit(value),
+    };
+    wit::UpdatePatch {
+        ops: operations
+            .iter()
+            .map(|op| match op {
+                WirePatchOp::Add { key, value } => wit::PatchOp::Add(patch_value(key, value)),
+                WirePatchOp::Replace { key, value } => {
+                    wit::PatchOp::Replace(patch_value(key, value))
+                }
+                WirePatchOp::Reassert { key, value } => {
+                    wit::PatchOp::Reassert(patch_value(key, value))
+                }
+                WirePatchOp::Remove { key } => wit::PatchOp::Remove(key.clone()),
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1930,18 +1953,19 @@ pub(crate) fn core_to_wit_update_request(
 ) -> Result<wit::UpdateRequest, SerializationError> {
     Ok(wit::UpdateRequest {
         current: core_to_wit_persisted_state(request.from())?,
-        patch: core_to_wit_update_patch(request.patch())?,
+        patch: checked_patch_to_wit(request.wire_patch()),
     })
 }
 
 /// Build a [`wit::CreateRequest`] from the host-side core
 /// [`CoreCreateRequest`].
-pub(crate) fn core_to_wit_create_request(
-    request: &CoreCreateRequest,
-) -> Result<wit::CreateRequest, SerializationError> {
-    Ok(wit::CreateRequest {
-        res: core_to_wit_resource(request.resource().as_resource())?,
-    })
+pub(crate) fn core_to_wit_create_request(request: &CoreCreateRequest) -> wit::CreateRequest {
+    wit::CreateRequest {
+        res: wit::ResourceDef {
+            id: core_to_wit_resource_id(&request.resource().id),
+            attributes: checked_attributes_to_wit(request.resource().wire_attributes()),
+        },
+    }
 }
 
 /// Build a [`wit::ReadRequest`].
@@ -1970,38 +1994,6 @@ pub(crate) fn core_to_wit_directives(directives: &CoreProviderDirectives) -> wit
         create_before_destroy: directives.create_before_destroy(),
         prevent_destroy: directives.prevent_destroy(),
     }
-}
-
-/// Convert a host-side [`CoreUpdatePatch`] to a [`wit::UpdatePatch`].
-/// Op order is preserved.
-pub(crate) fn core_to_wit_update_patch(
-    patch: &CoreUpdatePatch,
-) -> Result<wit::UpdatePatch, SerializationError> {
-    let ops = patch
-        .ops
-        .iter()
-        .map(core_to_wit_patch_op)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(wit::UpdatePatch { ops })
-}
-
-/// Convert a host-side [`CorePatchOp`] to a [`wit::PatchOp`].
-pub(crate) fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, SerializationError> {
-    Ok(match op {
-        CorePatchOp::Add { key, value } => wit::PatchOp::Add(wit::PatchValue {
-            key: key.clone(),
-            value: core_to_wit_value(value)?,
-        }),
-        CorePatchOp::Replace { key, value } => wit::PatchOp::Replace(wit::PatchValue {
-            key: key.clone(),
-            value: core_to_wit_value(value)?,
-        }),
-        CorePatchOp::Reassert { key, value } => wit::PatchOp::Reassert(wit::PatchValue {
-            key: key.clone(),
-            value: core_to_wit_value(value)?,
-        }),
-        CorePatchOp::Remove { key } => wit::PatchOp::Remove(key.clone()),
-    })
 }
 
 /// Convert a [`wit::PatchOp`] to a host-side [`CorePatchOp`].
@@ -2164,6 +2156,23 @@ mod tests {
     };
 
     use super::*;
+
+    async fn prepare_conversion_request(
+        resource: CoreResource,
+    ) -> Result<CoreCreateRequest, carina_core::executor::ProviderPreparationError> {
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = CoreSchemaRegistry::new();
+        let context = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &carina_core::provider::NoopNormalizer,
+            &[],
+            &schemas,
+        );
+        carina_core::executor::prepare_create_request(resource, &context).await
+    }
 
     fn root_resource_ref(binding: &str, attribute: &str) -> CoreValue {
         carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
@@ -4341,8 +4350,8 @@ mod tests {
 
     // -- State roundtrip --
 
-    #[test]
-    fn test_state_roundtrip() {
+    #[tokio::test]
+    async fn test_state_roundtrip() {
         let id = CoreResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
         let mut attrs: HashMap<String, CoreValue> = HashMap::new();
         attrs.insert(
@@ -4355,9 +4364,12 @@ mod tests {
         );
         let core = CoreState::existing(id.clone(), attrs);
 
+        let mut resource = CoreResource::from_id(id.clone());
+        resource.attributes = core.attributes.clone().into_iter().collect();
+        let request = prepare_conversion_request(resource).await.unwrap();
         let wit = wit::State {
             identifier: core.identifier.clone(),
-            attributes: core_to_wit_value_map(&core.attributes).unwrap(),
+            attributes: checked_attributes_to_wit(request.resource().wire_attributes()),
             exists: core.exists,
         };
         let back = wit_to_core_state(&wit, &id).unwrap();
@@ -4380,8 +4392,8 @@ mod tests {
         assert!(wire.directives.prevent_destroy);
     }
 
-    #[test]
-    fn test_state_with_identifier_roundtrip() {
+    #[tokio::test]
+    async fn test_state_with_identifier_roundtrip() {
         let id = CoreResourceId::with_provider_identity("aws", "ec2.Vpc", "main", None);
         let attrs = HashMap::from([(
             "cidr".into(),
@@ -4389,9 +4401,12 @@ mod tests {
         )]);
         let core = CoreState::existing(id.clone(), attrs).with_identifier("vpc-12345");
 
+        let mut resource = CoreResource::from_id(id.clone());
+        resource.attributes = core.attributes.clone().into_iter().collect();
+        let request = prepare_conversion_request(resource).await.unwrap();
         let wit = wit::State {
             identifier: core.identifier.clone(),
-            attributes: core_to_wit_value_map(&core.attributes).unwrap(),
+            attributes: checked_attributes_to_wit(request.resource().wire_attributes()),
             exists: core.exists,
         };
         assert_eq!(wit.identifier, Some("vpc-12345".into()));
@@ -4429,17 +4444,21 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn desired_resource_rejects_redacted_secret_placeholder() {
+    #[tokio::test]
+    async fn desired_resource_rejects_redacted_secret_placeholder() {
         let (redacted, _) = redacted_secret_and_digest("desired-secret");
         let resource = CoreResource::with_provider("aws", "test.Resource", "example", None)
             .with_attribute("token", redacted);
 
         assert!(matches!(
-            core_to_wit_resource(&resource),
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary
-            })
+            prepare_conversion_request(resource).await,
+            Err(
+                carina_core::executor::ProviderPreparationError::Serialization(
+                    SerializationError::RedactedSecretNotAllowed {
+                        context: SerializationContext::WasmBoundary
+                    }
+                )
+            )
         ));
     }
 
@@ -4609,8 +4628,8 @@ mod tests {
 
     // -- Value map helpers --
 
-    #[test]
-    fn test_value_map_roundtrip() {
+    #[tokio::test]
+    async fn test_value_map_roundtrip() {
         let map: HashMap<String, CoreValue> = vec![
             (
                 "a".into(),
@@ -4621,15 +4640,18 @@ mod tests {
         .into_iter()
         .collect();
 
-        let wit = core_to_wit_value_map(&map).unwrap();
+        let mut resource = CoreResource::new("test", "value-map");
+        resource.attributes = map.clone().into_iter().collect();
+        let request = prepare_conversion_request(resource).await.unwrap();
+        let wit = checked_attributes_to_wit(request.resource().wire_attributes());
         let back = wit_to_core_value_map(&wit).unwrap();
         assert_eq!(map, back);
     }
 
     // -- Resource roundtrip --
 
-    #[test]
-    fn test_resource_roundtrip() {
+    #[tokio::test]
+    async fn test_resource_roundtrip() {
         let mut resource = CoreResource::with_provider("aws", "s3.Bucket", "my-bucket", None);
         resource.attributes = indexmap::IndexMap::from([
             (
@@ -4642,7 +4664,8 @@ mod tests {
             ),
         ]);
 
-        let wit = core_to_wit_resource(&resource).unwrap();
+        let request = prepare_conversion_request(resource.clone()).await.unwrap();
+        let wit = core_to_wit_create_request(&request).res;
         assert_eq!(wit.id.provider, "aws");
         assert_eq!(wit.id.resource_type, "s3.Bucket");
         assert_eq!(wit.id.identity, "my-bucket");
@@ -4789,44 +4812,116 @@ mod tests {
         assert_eq!(id.provider_instance, None);
     }
 
-    #[test]
-    fn create_and_update_wire_values_keep_plaintext_secrets() {
-        let secret = |text: &str| {
-            CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-                ConcreteValue::String(text.to_string().into()),
-            ))))
-        };
-        let top = secret("top-plaintext");
-        let nested = CoreValue::Concrete(ConcreteValue::Map(
-            [(
-                "items".to_string(),
-                CoreValue::Concrete(ConcreteValue::List(vec![secret("nested-plaintext")])),
-            )]
-            .into_iter()
-            .collect(),
-        ));
-        let resource = CoreResource::new("test", "secret-boundaries")
-            .with_attribute("top", top.clone())
-            .with_attribute("nested", nested.clone());
-        // These are the value encoders called by the create/update request encoders.
-        let create = core_to_wit_resource(&resource).unwrap();
-        let update = core_to_wit_update_patch(&CoreUpdatePatch {
-            ops: vec![
-                CorePatchOp::Add {
-                    key: "top".into(),
-                    value: top.clone(),
-                },
-                CorePatchOp::Replace {
-                    key: "nested".into(),
-                    value: nested,
-                },
-                CorePatchOp::Reassert {
-                    key: "top".into(),
-                    value: top,
-                },
-            ],
-        })
+    #[tokio::test]
+    async fn create_and_update_wire_values_keep_plaintext_secrets() {
+        struct LateSecrets;
+        impl carina_core::provider::ProviderNormalizer for LateSecrets {
+            fn normalize_desired<'a>(
+                &'a self,
+                resources: &'a mut [carina_core::resource::ProviderResource],
+            ) -> carina_core::provider::BoxFuture<'a, carina_core::provider::ProviderResult<()>>
+            {
+                Box::pin(async move {
+                    let secret = |text: &str| {
+                        CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+                            ConcreteValue::String(text.into()),
+                        ))))
+                    };
+                    for resource in resources {
+                        resource.set_attr("top", secret("top-plaintext"));
+                        resource.set_attr("reasserted", secret("top-plaintext"));
+                        resource.set_attr(
+                            "nested",
+                            CoreValue::Concrete(ConcreteValue::Map(
+                                [(
+                                    "items".into(),
+                                    CoreValue::Concrete(ConcreteValue::List(vec![secret(
+                                        "nested-plaintext",
+                                    )])),
+                                )]
+                                .into_iter()
+                                .collect(),
+                            )),
+                        );
+                    }
+                    Ok(())
+                })
+            }
+            fn normalize_state<'a>(
+                &'a self,
+                _: &'a mut carina_core::provider::StateTransformMap,
+            ) -> carina_core::provider::BoxFuture<'a, carina_core::provider::ProviderResult<()>>
+            {
+                carina_core::provider::ready_noop()
+            }
+            fn hydrate_read_state<'a>(
+                &'a self,
+                _: &'a mut carina_core::provider::StateTransformMap,
+                _: &'a carina_core::provider::SavedAttrs,
+            ) -> carina_core::provider::BoxFuture<'a, carina_core::provider::ProviderResult<()>>
+            {
+                carina_core::provider::ready_noop()
+            }
+        }
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let mut schemas = CoreSchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test")
+                .attribute(
+                    PatternAttributeSchema::optional("top", PatternAttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("reasserted", PatternAttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &LateSecrets,
+            &[],
+            &schemas,
+        );
+        let resource = CoreResource::new("test", "secret-boundaries");
+        let create = carina_core::executor::prepare_create_request(resource.clone(), &context)
+            .await
+            .unwrap();
+        let create = core_to_wit_create_request(&create).res;
+        let from = CoreState::existing(
+            resource.id.clone(),
+            HashMap::from([
+                (
+                    "nested".into(),
+                    CoreValue::Concrete(ConcreteValue::Map(Default::default())),
+                ),
+                (
+                    "reasserted".into(),
+                    CoreValue::Concrete(ConcreteValue::String("old".into())),
+                ),
+            ]),
+        );
+        let update = carina_core::executor::prepare_update_request(
+            resource,
+            from,
+            &["top".into(), "nested".into()],
+            &context,
+        )
+        .await
         .unwrap();
+        let update = core_to_wit_update_request(&update).unwrap().patch;
+        assert!(matches!(&update.ops[0], wit::PatchOp::Add(value) if value.key == "top"));
+        assert!(matches!(&update.ops[1], wit::PatchOp::Replace(value) if value.key == "nested"));
+        assert!(
+            matches!(&update.ops[2], wit::PatchOp::Reassert(value) if value.key == "reasserted")
+        );
         let update_values: Vec<_> = update
             .ops
             .iter()
@@ -4837,12 +4932,12 @@ mod tests {
                 wit::PatchOp::Remove(_) => panic!("the secret patch contains only values"),
             })
             .collect();
-        assert_eq!(create.attributes.len(), 2);
+        assert_eq!(create.attributes.len(), 3);
         assert_eq!(update_values.len(), 3);
         for attributes in [&create.attributes, &update_values] {
             for (name, value) in attributes {
                 match (name.as_str(), value) {
-                    ("top", wit::Value::SecretVal(json)) => {
+                    ("top" | "reasserted", wit::Value::SecretVal(json)) => {
                         assert_eq!(
                             serde_json::from_str::<serde_json::Value>(json).unwrap(),
                             serde_json::json!("top-plaintext")

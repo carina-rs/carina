@@ -445,6 +445,9 @@ impl ResourceProviderPreparationError {
 
 impl std::fmt::Display for ResourceProviderPreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let carina_core::executor::ProviderPreparationError::Wire(_) = self.source.as_ref() {
+            return self.source.fmt(f);
+        }
         write!(
             f,
             "[{}.{}] {}",
@@ -1441,6 +1444,71 @@ impl From<carina_core::value::SerializationError> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wire_preparation_errors_render_the_typed_reason_once_at_cli_boundaries() {
+        use carina_core::executor::{
+            ModuleConstraintGate, ProviderPreparationContext, ProviderPreparationError,
+            prepare_create_request,
+        };
+        use carina_core::resource::{ConcreteValue, Resource, Value};
+        for state_bucket in [false, true] {
+            let resource = Resource::with_provider("mock", "sqs.Queue", "queue", None)
+                .with_attribute(
+                    "tags",
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                        "unrelated".into(),
+                        Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                            u64::MAX,
+                        ))),
+                    )]))),
+                );
+            let id = resource.id.clone();
+            let bindings = carina_core::binding_index::ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = carina_core::schema::SchemaRegistry::new();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &schemas,
+            );
+            let error = prepare_create_request(resource, &context)
+                .await
+                .unwrap_err();
+            let error = if state_bucket {
+                AppError::from_state_bucket_preparation(error)
+            } else {
+                AppError::from_resource_preparation(id.clone(), error)
+            };
+            let typed = match &error {
+                AppError::ProviderPreparation(error) => error.preparation_error(),
+                AppError::StateBucketPreparation(error) => error.preparation_error(),
+                _ => panic!("expected a typed preparation diagnostic"),
+            };
+            let ProviderPreparationError::Wire(wire) = typed else {
+                panic!("expected a wire diagnostic")
+            };
+            assert!(matches!(
+                wire.conversion_error(),
+                carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
+            ));
+            let rendered = format_error_with_source_chain(&error);
+            assert!(rendered.contains(&id.to_string()), "{rendered}");
+            let resource_label = format!("{}.{}", id.resource_type, id.identity_display());
+            assert_eq!(rendered.matches(&resource_label).count(), 1, "{rendered}");
+            assert!(rendered.contains("tags.unrelated"), "{rendered}");
+            assert_eq!(
+                rendered.matches("duration in seconds does not fit").count(),
+                1,
+                "{rendered}"
+            );
+            assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
+            assert!(std::error::Error::source(&error).is_none());
+        }
+    }
 
     fn dependency_analysis_failure() -> carina_core::effect::deps::DependencyAnalysisFailure {
         use std::collections::{HashMap, HashSet};

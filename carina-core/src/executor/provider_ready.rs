@@ -21,7 +21,8 @@ use crate::module_resolver::{
 };
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
-    CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, UpdateRequest,
+    CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, ProviderWireError,
+    ProviderWireTarget, ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
 };
 #[cfg(test)]
 use crate::resource::NoPlaceholder;
@@ -50,25 +51,46 @@ use crate::value::SerializationError;
 /// let resolved = ResolvedResource::new(Resource::new("test", "example"));
 /// let _ready = ProviderReady { value: resolved }; // private fields
 /// ```
+///
+/// ```compile_fail
+/// use carina_core::provider::ProviderReadyResource;
+/// use carina_core::resource::{ProviderModuleSource, ResolvedResource};
+/// fn bypass(raw: ResolvedResource<ProviderModuleSource>) -> ProviderReadyResource {
+///     raw.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::provider::ProviderReadyResource;
+/// use carina_core::resource::Value;
+/// fn mutate(ready: &mut ProviderReadyResource, value: Value) {
+///     ready.as_resource().attributes.insert("unchecked".into(), value);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProviderReady<T> {
-    value: T,
+pub struct ProviderReady<T: ResourceWirePayload> {
+    value: WireReady<T>,
     directives: ProviderDirectives,
 }
 
-impl<T> ProviderReady<T> {
+impl<T: ResourceWirePayload> ProviderReady<T> {
     /// Borrow the checked payload.
     pub fn as_inner(&self) -> &T {
-        &self.value
+        self.value.as_inner()
     }
 
     /// Borrow the schema-resolved directives paired with this payload.
     pub fn directives(&self) -> &ProviderDirectives {
         &self.directives
     }
+
+    /// The complete projection checked before native or WASM dispatch.
+    pub fn wire_attributes(&self) -> &WireAttributes {
+        self.value.wire()
+    }
 }
 
-impl<T> Deref for ProviderReady<T> {
+impl<T: ResourceWirePayload> Deref for ProviderReady<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -90,12 +112,16 @@ pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource<ProviderModu
 /// checks and provider semantic validation before returning the value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalProviderConfigAttributes {
-    attributes: IndexMap<String, Value>,
+    attributes: WireReady<IndexMap<String, Value>>,
 }
 
 impl CanonicalProviderConfigAttributes {
     pub fn attributes(&self) -> &IndexMap<String, Value> {
-        &self.attributes
+        self.attributes.as_inner()
+    }
+
+    pub fn wire_attributes(&self) -> &WireAttributes {
+        self.attributes.wire()
     }
 }
 
@@ -142,6 +168,10 @@ impl ProviderReadyConfig {
     /// Borrow the checked provider configuration attributes.
     pub fn attributes(&self) -> &IndexMap<String, Value> {
         self.attributes.attributes()
+    }
+
+    pub fn wire_attributes(&self) -> &WireAttributes {
+        self.attributes.wire_attributes()
     }
 
     /// Borrow the resolved region when the provider config schema declares it.
@@ -401,20 +431,23 @@ impl ModuleConstraintGate {
 impl ProviderReadyResource {
     /// Borrow the provider-facing resource payload.
     pub fn as_resource(&self) -> &ProviderResource {
-        self.value.as_resource()
+        self.as_inner().as_resource()
     }
 }
 
 impl ProviderReadyDataSource {
     /// Borrow the provider-facing data-source payload.
     pub fn as_data_source(&self) -> &ProviderDataSource {
-        self.value.as_inner()
+        self.as_inner().as_inner()
     }
 }
 
 /// Failure while preparing a provider-facing resource.
 #[derive(Debug, Error)]
 pub enum ProviderPreparationError {
+    /// The complete provider input has no wire representation.
+    #[error("{0}")]
+    Wire(ProviderWireError),
     /// An unresolved deferred value survived apply-time reference resolution.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
@@ -441,6 +474,12 @@ pub enum ProviderPreparationError {
     /// Provider-specific normalization failed before dispatch.
     #[error("{0}")]
     Provider(crate::provider::ProviderError),
+}
+
+impl From<ProviderWireError> for ProviderPreparationError {
+    fn from(error: ProviderWireError) -> Self {
+        Self::Wire(error)
+    }
 }
 
 impl From<crate::provider::ProviderError> for ProviderPreparationError {
@@ -474,6 +513,9 @@ impl ProviderConfigValidationError {
 /// Failure while preparing configuration for provider construction.
 #[derive(Debug, Error)]
 pub enum ProviderConfigPreparationError {
+    /// Provider semantic validation and initialization require wire values.
+    #[error("{0}")]
+    Wire(ProviderWireError),
     /// A concrete attribute violates its host-side type schema.
     #[error("provider {provider}: {attribute}: {error}")]
     InvalidAttribute {
@@ -489,10 +531,17 @@ pub enum ProviderConfigPreparationError {
     },
 }
 
+impl From<ProviderWireError> for ProviderConfigPreparationError {
+    fn from(error: ProviderWireError) -> Self {
+        Self::Wire(error)
+    }
+}
+
 impl ProviderConfigPreparationError {
     /// Attribute responsible for a host-side type/canonicalization failure.
     pub fn attribute(&self) -> Option<&str> {
         match self {
+            Self::Wire(error) => Some(error.attribute()),
             Self::InvalidAttribute { attribute, .. } => Some(attribute),
             Self::ProviderValidation { .. } => None,
         }
@@ -501,6 +550,7 @@ impl ProviderConfigPreparationError {
     /// Typed provider failure when provider-specific validation was reached.
     pub fn provider_error(&self) -> Option<&crate::provider::ProviderError> {
         match self {
+            Self::Wire(_) => None,
             Self::InvalidAttribute { .. } => None,
             Self::ProviderValidation { error, .. } => Some(error.provider_error()),
         }
@@ -533,6 +583,12 @@ fn validate_canonical_provider_config(
     provider_name: &str,
     attributes: IndexMap<String, Value>,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+    let attributes = WireReady::try_new(
+        attributes,
+        ProviderWireTarget::Configuration {
+            provider: provider_name.to_string(),
+        },
+    )?;
     let canonical = CanonicalProviderConfigAttributes { attributes };
     factory.validate_config(&canonical).map_err(|error| {
         let error = if canonical.values().any(crate::value::contains_secret) {
@@ -794,8 +850,9 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
         SchemaKind::Resource,
         &resource.as_resource().directives,
     );
+    let target = ProviderWireTarget::Resource(resource.as_resource().id.clone());
     Ok(ProviderReady {
-        value: resource,
+        value: WireReady::try_new(resource, target)?,
         directives,
     })
 }
@@ -869,7 +926,11 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
         SchemaKind::DataSource,
         &value.as_inner().directives,
     );
-    Ok(ProviderReady { value, directives })
+    let target = ProviderWireTarget::Resource(value.as_inner().id.clone());
+    Ok(ProviderReady {
+        value: WireReady::try_new(value, target)?,
+        directives,
+    })
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
@@ -903,12 +964,7 @@ pub async fn prepare_update_request(
 ) -> Result<UpdateRequest, ProviderPreparationError> {
     let resource = prepare_provider_ready_resource(resource, context).await?;
     let schema = managed_update_schema(context.schemas, resource.as_resource())?;
-    Ok(UpdateRequest::checked(
-        from,
-        changed_attributes,
-        &resource,
-        schema,
-    )?)
+    UpdateRequest::checked(from, changed_attributes, &resource, schema)
 }
 
 fn validate_known_provider_values(

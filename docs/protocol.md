@@ -50,6 +50,29 @@ unchanged. Create/update still receive actual secret values: top-level secrets
 use ordinary `secret-val`, and nested secrets use their operational JSON values.
 The ordinary protocol value type cannot contain a normalization handle.
 
+Core checks complete provider inputs after desired normalization, default-tag
+merging and other host rewrites. `WireReady<T>` owns the input and its checked
+wire projection; resources, data sources, final update patches and provider
+configuration all use this constructor. Every attribute is checked, including
+attributes a provider validator does not read. Durations must fit signed
+64-bit integer seconds and floats must be finite. Update patches are checked
+after substituting observed `ignore_changes` leaves. Current state continues
+to use the separate persisted-state codec.
+
+Native and WASM providers receive the same checked inputs. The WASM host adapts
+the cached projection to WIT without another desired-value rejection policy.
+Configuration is checked before provider semantic validation and initialization.
+Wire failures are terminal diagnostics containing the resource or configuration,
+attribute, nested path and conversion reason exactly once, without the value.
+`ProviderWireError::conversion_error()` retains the typed conversion reason.
+
+Native create/update validators use the infallible
+`DesiredInputs::from_provider_ready(request.resource())`.
+Update requests retain the checked desired resource for cross-field checks; writes
+continue to come exclusively from the checked patch. Normalization callers
+query `DesiredView::inputs()` or `NativeDesiredNormalization::inputs()`; there is
+no public raw-resource `DesiredInputs` constructor.
+
 The host validates and decodes the entire result before writing any changes.
 It restores original deferred values at their returned positions and preserves
 resource identity and host metadata. Unchanged known leaves keep their original

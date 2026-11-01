@@ -571,6 +571,16 @@ A struct type represents a nested object with typed fields.
   (carina#3981, carina#3984). Accepted write-only values, including nested
   leaves, are recorded in state (since state v18; secrets as hashes) so plans
   converge.
+- **Provider input wire checks**: `WireReady<T>::try_new` is the sole admission
+  constructor for complete desired resources, data sources, final update
+  patches and provider configuration. It caches the checked projection after
+  host rewrites, including default tags and observed ignored patch leaves.
+  Native and WASM dispatch share this proof; WASM only adapts the cached wire
+  values to WIT. Native validators use infallible
+  `DesiredInputs::from_provider_ready`; raw normalization queries belong to
+  `DesiredView` or `NativeDesiredNormalization`. Keep `ProviderWireError`
+  terminal: render its typed conversion reason once, without input values,
+  and access the typed reason through `conversion_error()`.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export. The
   sole typed core/protocol boundary is `carina_core::protocol_convert`: the SDK

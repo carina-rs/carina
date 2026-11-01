@@ -356,10 +356,9 @@ fn nat_and_sqs_validation_distinguishes_known_absent_and_deferred() {
     ] {
         let original =
             Resource::with_provider("aws", kind, "example", None).with_attribute(name, value);
-        assert_eq!(
-            validate(DesiredInputs::from_core(&original).unwrap()),
-            expected
-        );
+        let mut native = original.clone();
+        let normalization = NativeDesiredNormalization::from_core(&mut native).unwrap();
+        assert_eq!(validate(normalization.inputs()), expected);
         both(original, |view| {
             assert_eq!(validate(view.inputs()), expected)
         });
@@ -551,7 +550,9 @@ fn enum_and_duration_have_identical_wire_scalar_kinds_on_both_routes() {
     let host = DesiredResource::from_wire(batch.resources()[0].clone())
         .into_normalization()
         .unwrap();
-    let native = DesiredInputs::from_core(&resource).unwrap();
+    let mut native_resource = resource.clone();
+    let native_normalization = NativeDesiredNormalization::from_core(&mut native_resource).unwrap();
+    let native = native_normalization.inputs();
     for (name, expected) in [("mode", "string:regional"), ("timeout", "int:42")] {
         let describe = |value: Option<&DesiredValue>| match value {
             Some(DesiredValue::Known(DesiredScalar::String(value))) => {
@@ -584,7 +585,12 @@ fn deferred_reordering_is_allowed_but_dropping_or_foreign_movement_is_atomic() {
     for foreign in [false, true] {
         let snapshot = original.clone();
         let mut owner = NativeDesiredNormalization::from_core(&mut original).unwrap();
-        let node = owner.inner.attributes.entries.remove("items").unwrap();
+        let node = owner
+            .inner
+            .attributes
+            .entries
+            .shift_remove("items")
+            .unwrap();
         if foreign {
             owner.inner.attributes.entries.insert("other".into(), node);
         }
@@ -853,7 +859,7 @@ fn native_question_mark_errors_keep_the_original_provider_instance() {
     use carina_core::provider::ProviderResult;
     fn normalize(resource: &mut Resource, stage: u8) -> ProviderResult<()> {
         if stage == 3 {
-            DesiredInputs::from_core(resource)?;
+            NativeDesiredNormalization::from_core(resource)?.inputs();
             return Ok(());
         }
         let mut owner = NativeDesiredNormalization::from_core(resource)?;
@@ -905,9 +911,267 @@ fn native_question_mark_errors_keep_the_original_provider_instance() {
 fn native_queries_preserve_pending_identity_and_provider_instance() {
     let id = ResourceId::pending_with_provider("aws", "ec2.NatGateway", Some("west".into()));
     let mut resource: Resource = Resource::from_id(id.clone());
-    assert_eq!(DesiredInputs::from_core(&resource).unwrap().id(), &id);
     let mut owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
+    assert_eq!(owner.inputs().id(), &id);
     assert_eq!(owner.view().id(), &id);
     owner.finish().unwrap();
     assert_eq!(resource.id, id);
+}
+
+#[tokio::test]
+async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_secret_views() {
+    use carina_core::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+        prepare_provider_ready_data_source,
+    };
+    use carina_core::provider::NoopNormalizer;
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, SchemaRegistry,
+    };
+    let mut schemas = SchemaRegistry::new();
+    let schema = PatternResourceSchema::new("sqs.Queue")
+        .attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    schemas.insert_provider_witness("test", &witness).unwrap();
+    let config = carina_core::parser::ExpandedProviderConfig {
+        name: "test".into(),
+        attributes: Default::default(),
+        default_tags: [("unread_secret".into(), secret("private-late-tag"))]
+            .into_iter()
+            .collect(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: Default::default(),
+        binding: None,
+    };
+    let configs = [config];
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    let context =
+        ProviderPreparationContext::new(&bindings, &gate, &configs, &NoopNormalizer, &[], &schemas);
+    let resource = Resource::with_provider("test", "sqs.Queue", "queue", None).with_attribute(
+        "unread",
+        list(vec![Value::Concrete(ConcreteValue::Duration(
+            std::time::Duration::from_secs(i64::MAX as u64),
+        ))]),
+    );
+    let request = prepare_create_request(resource, &context).await.unwrap();
+    let inputs = DesiredInputs::from_provider_ready(request.resource());
+    assert_eq!(inputs.id(), &request.resource().id);
+    let Some(DesiredValue::List(values)) = inputs.attribute("unread") else {
+        panic!()
+    };
+    assert!(matches!(
+        values.iter().next(),
+        Some(DesiredValue::Known(DesiredScalar::Int(i64::MAX)))
+    ));
+    let Some(DesiredValue::Map(tags)) = inputs.attribute("tags") else {
+        panic!()
+    };
+    assert!(matches!(
+        tags.get("unread_secret"),
+        Some(DesiredValue::Deferred(_))
+    ));
+
+    let mut data =
+        carina_core::resource::DataSource::with_provider("test", "lookup", "lookup", None);
+    data.attributes.insert(
+        "unread".into(),
+        Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+            i64::MAX as u64,
+        ))),
+    );
+    let ready = prepare_provider_ready_data_source(data, &context).unwrap();
+    let inputs = DesiredInputs::from_provider_ready(&ready);
+    assert!(matches!(
+        inputs.attribute("unread"),
+        Some(DesiredValue::Known(DesiredScalar::Int(i64::MAX)))
+    ));
+}
+
+#[tokio::test]
+async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
+    use carina_core::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+    };
+    let sensitive =
+        carina_core::builtins::evaluate_builtin_to_value("env", &[string("PATH")]).unwrap();
+    let Value::Concrete(ConcreteValue::String(text)) = &sensitive else {
+        panic!("env returns a string")
+    };
+    assert!(text.diagnostic_literal().is_none());
+    let mut resource = Resource::with_provider("test", "test.Resource", "sensitive", None)
+        .with_attribute("token", sensitive.clone())
+        .with_attribute("nested", map([("token", sensitive.clone())]))
+        .with_attribute("list", list(vec![sensitive.clone()]))
+        .with_attribute(
+            "string_list",
+            Value::Concrete(ConcreteValue::StringList(vec![text.clone()])),
+        );
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let context = ProviderPreparationContext::new(
+        &bindings,
+        &gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    let request = prepare_create_request(resource.clone(), &context)
+        .await
+        .unwrap();
+    let ready = DesiredInputs::from_provider_ready(request.resource());
+    let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
+    for inputs in [ready, owner.inputs()] {
+        let Some(DesiredValue::Known(DesiredScalar::String(text))) = inputs.attribute("token")
+        else {
+            panic!("known string")
+        };
+        assert!(text.diagnostic_literal().is_none());
+        let Some(DesiredValue::Map(nested)) = inputs.attribute("nested") else {
+            panic!()
+        };
+        let Some(DesiredValue::Known(DesiredScalar::String(text))) = nested.get("token") else {
+            panic!()
+        };
+        assert!(text.diagnostic_literal().is_none());
+        for name in ["list", "string_list"] {
+            let Some(DesiredValue::List(values)) = inputs.attribute(name) else {
+                panic!()
+            };
+            let Some(DesiredValue::Known(DesiredScalar::String(text))) = values.iter().next()
+            else {
+                panic!()
+            };
+            assert!(text.diagnostic_literal().is_none(), "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_ready_inputs_preserve_authored_map_order_like_native_inputs() {
+    use carina_core::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+    };
+    let mut resource = Resource::with_provider("test", "test.Resource", "ordered", None)
+        .with_attribute("z", map([("z", string("last")), ("a", string("first"))]))
+        .with_attribute("a", string("first"));
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let context = ProviderPreparationContext::new(
+        &bindings,
+        &gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    let request = prepare_create_request(resource.clone(), &context)
+        .await
+        .unwrap();
+    let ready = DesiredInputs::from_provider_ready(request.resource());
+    let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
+    for inputs in [ready, owner.inputs()] {
+        let tree = match &inputs.tree {
+            InputsTree::Owned(tree) => tree,
+            InputsTree::Borrowed(tree) => tree,
+        };
+        assert_eq!(
+            tree.entries.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+        let Some(DesiredValue::Map(map)) = tree.get("z") else {
+            panic!()
+        };
+        assert_eq!(
+            map.entries.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_validators_read_the_complete_checked_desired_resource() {
+    use carina_core::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_update_request,
+    };
+    use carina_core::schema::{
+        PatternResourceSchema, SchemaRegistry, ValidatedConfigSchema,
+        ValidatedProviderSchemaWitness,
+    };
+    let witness = ValidatedProviderSchemaWitness::new(
+        ["ec2.NatGateway", "sqs.Queue"]
+            .into_iter()
+            .map(|name| PatternResourceSchema::new(name).validate().unwrap())
+            .collect(),
+        ValidatedConfigSchema::validate(Default::default()).unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert_provider_witness("aws", &witness).unwrap();
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    let context = ProviderPreparationContext::new(
+        &bindings,
+        &gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    let cases = [
+        (
+            Resource::with_provider("aws", "ec2.NatGateway", "nat", None)
+                .with_attribute("availability_mode", string("regional"))
+                .with_attribute("subnet_id", string("subnet-unchanged")),
+            "availability_mode",
+            "subnet_id",
+        ),
+        (
+            Resource::with_provider("aws", "sqs.Queue", "queue", None)
+                .with_attribute("fifo_queue", Value::Concrete(ConcreteValue::Bool(false)))
+                .with_attribute(
+                    "content_based_deduplication",
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                ),
+            "fifo_queue",
+            "content_based_deduplication",
+        ),
+    ];
+    for (resource, changed, unchanged) in cases {
+        let desired = resource.attributes.clone();
+        let from = carina_core::resource::State::existing(
+            resource.id.clone(),
+            desired.clone().into_iter().collect(),
+        );
+        let request = prepare_update_request(resource, from, &[changed.into()], &context)
+            .await
+            .unwrap();
+        assert!(request.patch().ops.iter().all(|op| op.key() != unchanged));
+        assert_eq!(request.resource().as_resource().attributes, desired);
+        let inputs = DesiredInputs::from_provider_ready(request.resource());
+        assert!(inputs.attribute(unchanged).is_some());
+        assert!(
+            !validate(inputs),
+            "the validator needs desired values outside the update patch"
+        );
+    }
 }

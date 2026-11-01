@@ -75,6 +75,13 @@ fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, S
     })
 }
 
+/// A key or index locating a nested value in a provider input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WirePathSegment {
+    Key(String),
+    Index(usize),
+}
+
 /// A core value or type cannot be represented by the provider protocol.
 #[derive(Debug)]
 pub enum ProtocolConvertError {
@@ -118,6 +125,10 @@ pub enum ProtocolConvertError {
     Context {
         context: String,
         source: Box<ProtocolConvertError>,
+    },
+    ValuePath {
+        segment: WirePathSegment,
+        error: Box<ProtocolConvertError>,
     },
 }
 
@@ -186,6 +197,10 @@ impl fmt::Display for ProtocolConvertError {
                 context,
                 source: _source,
             } => formatter.write_str(context),
+            Self::ValuePath { segment, .. } => match segment {
+                WirePathSegment::Key(key) => write!(formatter, "map key `{key}`"),
+                WirePathSegment::Index(index) => write!(formatter, "list index {index}"),
+            },
         }
     }
 }
@@ -197,6 +212,7 @@ impl Error for ProtocolConvertError {
                 context: _context,
                 source,
             } => Some(source.as_ref()),
+            Self::ValuePath { error, .. } => Some(error.as_ref()),
             Self::NonFiniteFloat => None,
             Self::DurationOutOfRange => None,
             Self::InvalidRedactedSecretDigest => None,
@@ -231,6 +247,28 @@ impl Error for ProtocolConvertError {
 }
 
 impl ProtocolConvertError {
+    /// Structured container path, in outermost-to-innermost order.
+    pub fn value_path(&self) -> Vec<WirePathSegment> {
+        match self {
+            Self::ValuePath { segment, error } => {
+                let mut path = vec![segment.clone()];
+                path.extend(error.value_path());
+                path
+            }
+            Self::Context { source, .. } => source.value_path(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The typed conversion reason beneath contextual wrappers.
+    pub fn leaf_error(&self) -> &Self {
+        match self {
+            Self::ValuePath { error, .. } => error.leaf_error(),
+            Self::Context { source, .. } => source.leaf_error(),
+            error => error,
+        }
+    }
+
     fn context(self, context: impl Into<String>) -> Self {
         Self::Context {
             context: context.into(),
@@ -1817,8 +1855,12 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
                 .iter()
                 .enumerate()
                 .map(|(index, value)| {
-                    try_core_to_protocol_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                    try_core_to_protocol_value(value).map_err(|error| {
+                        ProtocolConvertError::ValuePath {
+                            segment: WirePathSegment::Index(index),
+                            error: Box::new(error),
+                        }
+                    })
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -1834,7 +1876,10 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
                 .map(|(key, value)| {
                     try_core_to_protocol_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| ProtocolConvertError::ValuePath {
+                            segment: WirePathSegment::Key(key.clone()),
+                            error: Box::new(error),
+                        })
                 })
                 .collect::<Result<_, _>>()?,
         )),

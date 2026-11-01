@@ -583,7 +583,7 @@ Desired normalization uses the same `DesiredView` on both routes. Each route sta
 
 `DesiredView::attribute` returns `None` for an absent attribute. A present `DesiredValue` is a `Known` scalar, a structural `List` or `Map`, or an opaque `Deferred(DeferredLeaf)`. References, unknowns and secrets are deferred leaves; known siblings inside the same container remain editable. Providers cannot construct, clone or inspect deferred leaves. Every received leaf must survive exactly once in its original resource and top-level attribute. Reordering within that attribute is allowed; dropping, duplicating or moving a leaf across that boundary fails at finish. Use `DesiredView::insert_absent` for top-level defaults and `DesiredMap::insert_absent` for nested defaults; an existing deferred leaf is occupied, not absent.
 
-Use `DesiredInputs` for shared cross-field checks. Call this validator with `view.inputs()` during normalization or `DesiredInputs::from_core(resource)?` during native create/update validation:
+Use `DesiredInputs` for shared cross-field checks. Call this validator with `view.inputs()` during normalization or the infallible `DesiredInputs::from_provider_ready(request.resource())` during native create/update validation. The checked resource includes every host-added default and tag; no raw-resource `DesiredInputs` constructor is public:
 
 ```rust
 use carina_plugin_sdk::{DesiredInputs, DesiredValue};
@@ -594,7 +594,7 @@ fn required_together(inputs: DesiredInputs<'_>) -> bool {
 }
 ```
 
-Secrets, references and unknowns appear as `Deferred` in this read-only projection. It does not change the CRUD request: create/update bodies still receive actual secret values. A validator can defer checks that need an opaque value instead of treating it as absent.
+Secrets, references and unknowns appear as `Deferred` in the normalization projection. Provider-ready inputs have resolved references and known values; any remaining secret annotation stays opaque in the read-only view. The projection does not change the CRUD request: create/update bodies still receive actual secret values. A validator can defer checks that need an opaque value instead of treating it as absent.
 
 `remove` returns the node, so it can be moved with `insert_absent` inside the same top-level attribute. `move_within` reorders a list element, including a whole map with deferred descendants:
 

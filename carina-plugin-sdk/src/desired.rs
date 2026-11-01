@@ -1,14 +1,18 @@
 //! One structural desired-value view for native and WASM normalizers.
 
+use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use carina_core::desired::NormalizationBatch;
 use carina_core::protocol_convert::{ProtocolConvertError, protocol_to_resource_id};
 use carina_core::provider::{
-    ProviderError as NativeProviderError, ProviderResult as NativeProviderResult,
+    ProviderError as NativeProviderError, ProviderReady, ProviderResult as NativeProviderResult,
+    ResourceWirePayload,
 };
-use carina_core::resource::{Resource, ResourceId, ValueString};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, Resource, ResourceId, Value, ValueString,
+};
 use carina_provider_protocol::normalization::{
     NormalizationErrorKind as Kind, NormalizationPathSegment as Segment, NormalizationResource,
     NormalizationValue as Wire,
@@ -113,7 +117,7 @@ impl std::error::Error for DesiredEditError {}
 /// the map; any deferred leaves dropped that way cause `MissingHandle` at finish.
 #[derive(Debug, Default)]
 pub struct DesiredMap {
-    entries: BTreeMap<String, DesiredValue>,
+    entries: IndexMap<String, DesiredValue>,
 }
 impl DesiredMap {
     /// Construct a map of known defaults using [`Self::insert_absent`].
@@ -129,7 +133,7 @@ impl DesiredMap {
     /// Return the removed value so deferred leaves can be moved within the attribute.
     /// Dropping a removed deferred leaf causes `MissingHandle` at finish.
     pub fn remove(&mut self, key: &str) -> Option<DesiredValue> {
-        self.entries.remove(key)
+        self.entries.shift_remove(key)
     }
     pub fn insert_absent(
         &mut self,
@@ -137,15 +141,13 @@ impl DesiredMap {
         value: DesiredValue,
     ) -> Result<(), DesiredEditError> {
         match self.entries.entry(name.into()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
+            indexmap::map::Entry::Vacant(entry) => {
                 entry.insert(value);
                 Ok(())
             }
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                Err(DesiredEditError::Occupied {
-                    name: entry.key().clone(),
-                })
-            }
+            indexmap::map::Entry::Occupied(entry) => Err(DesiredEditError::Occupied {
+                name: entry.key().clone(),
+            }),
         }
     }
 }
@@ -205,12 +207,32 @@ enum InputsTree<'a> {
     Owned(DesiredMap),
 }
 impl DesiredInputs<'_> {
-    pub fn from_core<S>(resource: &Resource<S>) -> NativeProviderResult<Self> {
-        let (_, inner) = decode_native(resource)?;
-        Ok(Self {
-            id: std::borrow::Cow::Owned(inner.id),
-            tree: InputsTree::Owned(inner.attributes),
-        })
+    /// Project a resource that already passed the complete provider wire gate.
+    ///
+    /// Normalizers obtain their view from their normalization owner instead.
+    /// Raw resources cannot bypass provider preparation:
+    ///
+    /// ```compile_fail
+    /// use carina_plugin_sdk::{DesiredInputs, core::resource::Resource};
+    /// fn bypass(raw: &Resource) { let _ = DesiredInputs::from_provider_ready(raw); }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use carina_plugin_sdk::{DesiredInputs, core::resource::Resource};
+    /// fn bypass(raw: &Resource) { let _ = DesiredInputs::from_core(raw); }
+    /// ```
+    pub fn from_provider_ready<T: ResourceWirePayload>(resource: &ProviderReady<T>) -> Self {
+        let owner = Arc::new(());
+        let entries = resource
+            .as_inner()
+            .attributes()
+            .iter()
+            .map(|(name, value)| (name.clone(), checked_value(value, &owner)))
+            .collect();
+        Self {
+            id: std::borrow::Cow::Owned(resource.as_inner().resource_id().clone()),
+            tree: InputsTree::Owned(DesiredMap { entries }),
+        }
     }
     pub fn id(&self) -> &ResourceId {
         &self.id
@@ -223,6 +245,55 @@ impl DesiredInputs<'_> {
             InputsTree::Borrowed(tree) => tree.get(name),
             InputsTree::Owned(tree) => tree.get(name),
         }
+    }
+}
+
+// The ProviderReady witness proves representability. Read the original tree so
+// diagnostic provenance and authored map order survive this read-only view.
+fn checked_value(original: &Value, owner: &Arc<()>) -> DesiredValue {
+    match original {
+        Value::Deferred(DeferredValue::Secret(_)) => DesiredValue::Deferred(DeferredLeaf {
+            slot: 0,
+            owner: Arc::clone(owner),
+        }),
+        Value::Concrete(ConcreteValue::Bool(value)) => {
+            DesiredValue::Known(DesiredScalar::Bool(*value))
+        }
+        Value::Concrete(ConcreteValue::Int(value)) => {
+            DesiredValue::Known(DesiredScalar::Int(*value))
+        }
+        Value::Concrete(ConcreteValue::Float(value)) => {
+            DesiredValue::Known(DesiredScalar::Float(*value))
+        }
+        Value::Concrete(ConcreteValue::String(value)) => {
+            DesiredValue::Known(DesiredScalar::String(value.clone()))
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+            DesiredValue::Known(DesiredScalar::String(value.api_value().into()))
+        }
+        Value::Concrete(ConcreteValue::Duration(value)) => {
+            // The sole wire check already established that seconds fit i64.
+            DesiredValue::Known(DesiredScalar::Int(value.as_secs() as i64))
+        }
+        Value::Concrete(ConcreteValue::StringList(values)) => DesiredValue::List(DesiredList {
+            values: values
+                .iter()
+                .map(|value| DesiredValue::Known(DesiredScalar::String(value.clone())))
+                .collect(),
+        }),
+        Value::Concrete(ConcreteValue::List(values)) => DesiredValue::List(DesiredList {
+            values: values
+                .iter()
+                .map(|value| checked_value(value, owner))
+                .collect(),
+        }),
+        Value::Concrete(ConcreteValue::Map(values)) => DesiredValue::Map(DesiredMap {
+            entries: values
+                .iter()
+                .map(|(name, value)| (name.clone(), checked_value(value, owner)))
+                .collect(),
+        }),
+        _ => unreachable!("the wire witness excludes other desired values"),
     }
 }
 
@@ -384,7 +455,7 @@ impl Decoder<'_> {
                     .collect(),
             }),
             Wire::Map(values) => {
-                let mut entries = BTreeMap::new();
+                let mut entries = IndexMap::new();
                 for (key, value) in values {
                     path.push(Segment::Key(key.clone()));
                     entries.insert(key.clone(), self.value(value, attribute, path)?);
@@ -415,7 +486,7 @@ impl DesiredNormalization {
             owner: owner.clone(),
             expected: BTreeMap::new(),
         };
-        let mut entries = BTreeMap::new();
+        let mut entries = IndexMap::new();
         for (name, value) in resource.attributes {
             entries.insert(name.clone(), decoder.value(value, &name, &mut Vec::new())?);
         }
@@ -549,6 +620,13 @@ impl<'a, S> NativeDesiredNormalization<'a, S> {
     pub fn view(&mut self) -> DesiredView<'_> {
         self.inner.view()
     }
+    /// Query the staged normalization input, including its opaque leaves.
+    pub fn inputs(&self) -> DesiredInputs<'_> {
+        DesiredInputs {
+            id: std::borrow::Cow::Borrowed(&self.inner.id),
+            tree: InputsTree::Borrowed(&self.inner.attributes),
+        }
+    }
     pub fn finish(self) -> NativeProviderResult<()> {
         let id = self.target.id.clone();
         let into_error = |error| NativeProviderError::from(error).for_resource(id.clone());
@@ -570,7 +648,49 @@ fn decode_native<S>(
     let mut inner =
         DesiredNormalization::decode(batch.resources()[0].clone()).map_err(into_error)?;
     inner.id = resource.id.clone();
+    retain_native_map_metadata(&mut inner.attributes, &resource.attributes);
     Ok((batch, inner))
+}
+
+// The normalization wire deliberately carries only plaintext and sorted maps.
+// On the native route, keep the original diagnostic provenance and map order
+// while retaining the decoder's move-only deferred handles.
+fn retain_native_map_metadata(tree: &mut DesiredMap, originals: &IndexMap<String, Value>) {
+    let mut entries = std::mem::take(&mut tree.entries);
+    for (name, original) in originals {
+        let mut value = entries
+            .shift_remove(name)
+            .expect("decoded original attribute");
+        retain_native_value_metadata(&mut value, original);
+        tree.entries.insert(name.clone(), value);
+    }
+}
+
+fn retain_native_value_metadata(tree: &mut DesiredValue, original: &Value) {
+    match (tree, original) {
+        (
+            DesiredValue::Known(DesiredScalar::String(value)),
+            Value::Concrete(ConcreteValue::String(original)),
+        ) => {
+            *value = original.clone();
+        }
+        (DesiredValue::List(list), Value::Concrete(ConcreteValue::StringList(originals))) => {
+            for (value, original) in list.values.iter_mut().zip(originals) {
+                if let DesiredValue::Known(DesiredScalar::String(value)) = value {
+                    *value = original.clone();
+                }
+            }
+        }
+        (DesiredValue::List(list), Value::Concrete(ConcreteValue::List(originals))) => {
+            for (value, original) in list.values.iter_mut().zip(originals) {
+                retain_native_value_metadata(value, original);
+            }
+        }
+        (DesiredValue::Map(map), Value::Concrete(ConcreteValue::Map(originals))) => {
+            retain_native_map_metadata(map, originals);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

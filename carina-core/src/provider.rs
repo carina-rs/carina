@@ -54,6 +54,10 @@ pub use crate::executor::provider_ready::{
     CanonicalProviderConfigAttributes, ProviderReady, ProviderReadyConfig, ProviderReadyDataSource,
     ProviderReadyResource,
 };
+pub use crate::provider_wire::{
+    ProviderWireError, ProviderWirePayload, ProviderWireTarget, ResourceWirePayload,
+    WireAttributes, WirePatchOp, WireReady, WireValue,
+};
 
 /// Construct a validated provider identifier for fixtures shared by workspace
 /// crates.
@@ -795,9 +799,8 @@ pub struct ReadRequest;
 /// provider-side state; `patch` carries the user's intended changes plus any
 /// desired, updatable write-only values that must be reasserted alongside an
 /// update. The patch is the sole source of truth for what the provider should
-/// write — there is no separate `to: Resource` because exposing the full
-/// desired resource invites providers to touch fields the user never specified
-/// (the root cause of `carina-rs/carina#2559`).
+/// write. The checked desired resource is available for cross-field validation;
+/// providers MUST derive writes exclusively from the patch (see #2559).
 ///
 /// External callers cannot assemble an update request from raw state and
 /// patch data; the private witness is supplied only by the checked provider
@@ -829,9 +832,9 @@ pub struct UpdateRequest {
     from: State,
     /// Structured description of the user's intended change and any write-only
     /// values reasserted alongside it.
-    patch: UpdatePatch,
-    /// Effective directives resolved from the desired resource's schema.
-    directives: ProviderDirectives,
+    patch: WireReady<UpdatePatch>,
+    /// Complete desired inputs for cross-field validation, never for deriving writes.
+    resource: ProviderReadyResource,
 }
 
 impl UpdateRequest {
@@ -840,12 +843,13 @@ impl UpdateRequest {
         changed_attributes: &[String],
         resource: &ProviderReadyResource,
         schema: &ResourceSchema,
-    ) -> Result<Self, IgnoredWriteOnlyValueError> {
+    ) -> Result<Self, crate::executor::ProviderPreparationError> {
         let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
+        let patch = WireReady::try_new(patch, ProviderWireTarget::Resource(resource.id.clone()))?;
         Ok(Self {
             from,
             patch,
-            directives: *resource.directives(),
+            resource: resource.clone(),
         })
     }
 
@@ -856,13 +860,24 @@ impl UpdateRequest {
 
     /// Patch derived from the checked desired resource.
     pub fn patch(&self) -> &UpdatePatch {
-        &self.patch
+        self.patch.as_inner()
+    }
+
+    /// The checked projection consumed by provider transport adapters.
+    pub fn wire_patch(&self) -> &[WirePatchOp] {
+        self.patch.wire()
+    }
+
+    /// Complete checked desired inputs for cross-field validation.
+    /// Derive provider writes exclusively from [`Self::patch`].
+    pub fn resource(&self) -> &ProviderReadyResource {
+        &self.resource
     }
 
     /// Effective directives resolved while the desired resource crossed the
     /// provider preparation boundary.
     pub fn directives(&self) -> &ProviderDirectives {
-        &self.directives
+        self.resource.directives()
     }
 }
 

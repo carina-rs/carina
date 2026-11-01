@@ -18,6 +18,8 @@ pub mod normalized;
 mod normalized_tests;
 mod parallel;
 pub mod provider_ready;
+#[cfg(test)]
+mod provider_wire_tests;
 mod replace;
 pub(super) mod scheduler;
 pub(crate) mod wait;
