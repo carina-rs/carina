@@ -652,6 +652,143 @@ impl ResolvedMove {
     }
 }
 
+/// Origin-to-destination pairs produced by resolved address reconciliation.
+///
+/// The private representation prevents migration callers from substituting a
+/// loose tuple slice. Even the no-move case must come from either the
+/// addressed move resolver or a complete saved plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMovePairs(Vec<(ResolvedResourceId, ResolvedResourceId)>);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "resolved move {from} -> {to} conflicts with existing move {existing_from} -> {existing_to}"
+)]
+pub struct ResolvedMovePairConflict {
+    from: Box<ResolvedResourceId>,
+    to: Box<ResolvedResourceId>,
+    existing_from: Box<ResolvedResourceId>,
+    existing_to: Box<ResolvedResourceId>,
+}
+
+impl ResolvedMovePairConflict {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ResolvedResourceId,
+        ResolvedResourceId,
+        ResolvedResourceId,
+        ResolvedResourceId,
+    ) {
+        (*self.from, *self.to, *self.existing_from, *self.existing_to)
+    }
+}
+
+impl ResolvedMovePairs {
+    /// Consume the resolved moves emitted by address reconciliation.
+    pub fn from_addressed_moves(moves: Vec<ResolvedMove>) -> Self {
+        Self(moves.into_iter().map(ResolvedMove::into_parts).collect())
+    }
+
+    /// Recover the move scope recorded by a complete saved plan.
+    pub fn from_saved_plan<S>(plan: &crate::plan::Plan<S>) -> Self {
+        Self(
+            plan.effects()
+                .iter()
+                .filter_map(|effect| match effect {
+                    EffectWithSource::Move { from, to, .. } => Some((from.clone(), to.clone())),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    pub fn as_slice(&self) -> &[(ResolvedResourceId, ResolvedResourceId)] {
+        &self.0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(ResolvedResourceId, ResolvedResourceId)> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn conflicting_move(
+        &self,
+        resolved_move: &ResolvedMove,
+        compose_forward: bool,
+    ) -> Option<&(ResolvedResourceId, ResolvedResourceId)> {
+        self.0.iter().find(|(existing_from, existing_to)| {
+            let continues_forward = existing_to == resolved_move.projected_from()
+                && existing_from == resolved_move.from()
+                && existing_from != resolved_move.to()
+                && resolved_move.projected_from() != resolved_move.to();
+            let overlaps = existing_from == resolved_move.from()
+                || existing_from == resolved_move.projected_from()
+                || existing_from == resolved_move.to()
+                || existing_to == resolved_move.from()
+                || existing_to == resolved_move.projected_from()
+                || existing_to == resolved_move.to();
+            overlaps && !(compose_forward && continues_forward)
+        })
+    }
+
+    fn conflict(
+        &self,
+        resolved_move: &ResolvedMove,
+        compose_forward: bool,
+    ) -> Option<ResolvedMovePairConflict> {
+        self.conflicting_move(resolved_move, compose_forward)
+            .map(|(existing_from, existing_to)| ResolvedMovePairConflict {
+                from: Box::new(resolved_move.from().clone()),
+                to: Box::new(resolved_move.to().clone()),
+                existing_from: Box::new(existing_from.clone()),
+                existing_to: Box::new(existing_to.clone()),
+            })
+    }
+
+    /// Compose a detected continuation onto its persisted origin, or append
+    /// an independent resolved move.
+    pub fn compose_forward(
+        &mut self,
+        resolved_move: ResolvedMove,
+    ) -> Result<(), ResolvedMovePairConflict> {
+        if let Some(conflict) = self.conflict(&resolved_move, true) {
+            return Err(conflict);
+        }
+        if let Some((_origin, prior_target)) = self.0.iter_mut().find(|(origin, prior_target)| {
+            prior_target == resolved_move.projected_from() && origin == resolved_move.from()
+        }) {
+            *prior_target = resolved_move.to().clone();
+        } else {
+            self.0.push(resolved_move.into_parts());
+        }
+        Ok(())
+    }
+
+    /// Append one independent resolved move, rejecting every address overlap.
+    pub fn append_rejecting_overlap(
+        &mut self,
+        resolved_move: ResolvedMove,
+    ) -> Result<(), ResolvedMovePairConflict> {
+        if let Some(conflict) = self.conflict(&resolved_move, false) {
+            return Err(conflict);
+        }
+        self.0.push(resolved_move.into_parts());
+        Ok(())
+    }
+}
+
+impl Deref for ResolvedMovePairs {
+    type Target = [(ResolvedResourceId, ResolvedResourceId)];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 /// Effect representing an operation on a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
@@ -1469,17 +1606,23 @@ impl EffectWithSource<ModuleSource> {
         effect_cases![
             (
                 Effect::Read {
-                    resource: ResolvedDataSource::new(DataSource::new("test", "x")),
+                    resource: ResolvedDataSource::new(
+                        DataSource::new("test", "x").with_dependency_phase(()),
+                    ),
                 },
                 Effect::Read { .. }
             ),
             (
-                Effect::Create(ResolvedResource::new(Resource::new("test", "x"))),
+                Effect::Create(ResolvedResource::new(
+                    Resource::new("test", "x").with_dependency_phase(()),
+                )),
                 Effect::Create(_)
             ),
             (
                 Effect::ResumeCreate {
-                    resource: ResolvedResource::new(Resource::new("test", "x")),
+                    resource: ResolvedResource::new(
+                        Resource::new("test", "x").with_dependency_phase(()),
+                    ),
                     started_at: crate::provider::Timestamp::try_from("2026-10-23T08:00:00Z")
                         .expect("valid timestamp"),
                 },
@@ -1491,7 +1634,7 @@ impl EffectWithSource<ModuleSource> {
                         State::existing(id.clone(), Default::default()).with_identifier("x-1"),
                     ),
                     identifier: fixture_applied_identifier("x-1"),
-                    to: ResolvedResource::new(Resource::new("test", "x")),
+                    to: ResolvedResource::new(Resource::new("test", "x").with_dependency_phase(()),),
                     changed_attributes: vec![],
                 },
                 Effect::Update { .. }
@@ -1887,7 +2030,10 @@ impl<S> EffectWithSource<S> {
     /// type match the variant directly; this helper covers the
     /// shared id/attributes/binding/dependency_bindings accessors
     /// through the borrowing `ResourceRef` enum.
-    pub fn as_resource_ref(&self) -> Option<crate::parser::ResourceRef<'_, S>> {
+    pub fn as_resource_ref(
+        &self,
+    ) -> Option<crate::parser::ResourceRef<'_, S, crate::parser::ResolvedDeferredForPhase, ()>>
+    {
         match self {
             Effect::Create(resource) => Some(crate::parser::ResourceRef::Resource(resource)),
             Effect::ResumeCreate { resource, .. } => {
@@ -2407,17 +2553,23 @@ mod tests {
             (
                 "Read",
                 Effect::Read {
-                    resource: ResolvedDataSource::new(DataSource::new("test", "x")),
+                    resource: ResolvedDataSource::new(
+                        DataSource::new("test", "x").with_dependency_phase(()),
+                    ),
                 },
             ),
             (
                 "Create",
-                Effect::Create(ResolvedResource::new(Resource::new("test", "x"))),
+                Effect::Create(ResolvedResource::new(
+                    Resource::new("test", "x").with_dependency_phase(()),
+                )),
             ),
             (
                 "ResumeCreate",
                 Effect::ResumeCreate {
-                    resource: ResolvedResource::new(Resource::new("test", "x")),
+                    resource: ResolvedResource::new(
+                        Resource::new("test", "x").with_dependency_phase(()),
+                    ),
                     started_at: crate::provider::Timestamp::try_from("2026-10-30T00:00:00Z")
                         .expect("valid timestamp"),
                 },
@@ -2429,7 +2581,7 @@ mod tests {
                         State::existing(rid.clone(), Default::default()).with_identifier("x-1"),
                     ),
                     identifier: fixture_applied_identifier("x-1"),
-                    to: ResolvedResource::new(Resource::new("test", "x")),
+                    to: ResolvedResource::new(Resource::new("test", "x").with_dependency_phase(())),
                     changed_attributes: vec![],
                 },
             ),
@@ -2806,7 +2958,7 @@ mod tests {
     fn read_is_not_mutating() {
         let resource = DataSource::new("test", "example");
         let effect = Effect::Read {
-            resource: ResolvedDataSource::new(resource),
+            resource: ResolvedDataSource::new(resource.with_dependency_phase(())),
         };
         assert!(!effect.is_mutating());
     }
@@ -2838,7 +2990,7 @@ mod tests {
     #[test]
     fn create_is_mutating() {
         let resource = Resource::new("s3.Bucket", "my-bucket");
-        let effect = Effect::Create(ResolvedResource::new(resource));
+        let effect = Effect::Create(ResolvedResource::new(resource.with_dependency_phase(())));
         assert!(effect.is_mutating());
     }
 
@@ -2846,7 +2998,7 @@ mod tests {
     fn resource_id_returns_correct_id() {
         let resource = DataSource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Read {
-            resource: ResolvedDataSource::new(resource.clone()),
+            resource: ResolvedDataSource::new(resource.clone().with_dependency_phase(())),
         };
         assert_eq!(effect.resource_id(), &resource.id);
     }
@@ -2854,7 +3006,9 @@ mod tests {
     #[test]
     fn resource_returns_some_for_create() {
         let resource = Resource::new("s3.Bucket", "my-bucket");
-        let effect = Effect::Create(ResolvedResource::new(resource.clone()));
+        let effect = Effect::Create(ResolvedResource::new(
+            resource.clone().with_dependency_phase(()),
+        ));
         assert_eq!(effect.as_resource_ref().unwrap().id(), &resource.id);
     }
 
@@ -2876,7 +3030,7 @@ mod tests {
     #[test]
     fn binding_name_returns_binding() {
         let resource = Resource::new("test", "my_binding").with_binding("my_binding");
-        let effect = Effect::Create(ResolvedResource::new(resource));
+        let effect = Effect::Create(ResolvedResource::new(resource.with_dependency_phase(())));
         assert_eq!(effect.binding_name(), Some("my_binding".to_string()));
     }
 
@@ -2887,7 +3041,7 @@ mod tests {
             "name",
             Value::Concrete(ConcreteValue::String("test".into())),
         );
-        let effect = Effect::Create(ResolvedResource::new(resource));
+        let effect = Effect::Create(ResolvedResource::new(resource.with_dependency_phase(())));
         assert_eq!(effect.binding_name(), None);
     }
 
@@ -2897,12 +3051,13 @@ mod tests {
         use std::collections::HashMap;
 
         let effects = vec![
-            Effect::Create(ResolvedResource::new(Resource::new(
-                "s3.Bucket",
-                "my-bucket",
-            ))),
+            Effect::Create(ResolvedResource::new(
+                Resource::new("s3.Bucket", "my-bucket").with_dependency_phase(()),
+            )),
             Effect::Read {
-                resource: ResolvedDataSource::new(DataSource::new("s3.Bucket", "existing")),
+                resource: ResolvedDataSource::new(
+                    DataSource::new("s3.Bucket", "existing").with_dependency_phase(()),
+                ),
             },
             Effect::Update {
                 from: Box::new(
@@ -2916,10 +3071,14 @@ mod tests {
                     .with_identifier("my-bucket"),
                 ),
                 identifier: fixture_applied_identifier("my-bucket"),
-                to: ResolvedResource::new(Resource::new("s3.Bucket", "my-bucket").with_attribute(
-                    "versioning",
-                    Value::Concrete(ConcreteValue::String("Enabled".into())),
-                )),
+                to: ResolvedResource::new(
+                    Resource::new("s3.Bucket", "my-bucket")
+                        .with_attribute(
+                            "versioning",
+                            Value::Concrete(ConcreteValue::String("Enabled".into())),
+                        )
+                        .with_dependency_phase(()),
+                ),
                 changed_attributes: vec!["versioning".to_string()],
             },
             Effect::Delete {
@@ -2972,7 +3131,7 @@ mod tests {
     fn explicit_dependencies_are_carried_by_resolved_resource() {
         let bucket = Resource::new("s3.Bucket", "b");
         let create = Effect::Create(ResolvedResource::from_resolved_parts(
-            bucket,
+            bucket.with_dependency_phase(()),
             ResolvedDependencies::default(),
             test_dependencies(&["role", "kms"]),
         ));
@@ -3157,7 +3316,9 @@ mod tests {
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
-        let target = ResolvedResource::new(Resource::new("acm.Certificate", "cert"));
+        let target = ResolvedResource::new(
+            Resource::new("acm.Certificate", "cert").with_dependency_phase(()),
+        );
         let original = Effect::Wait {
             id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: ManagedWaitTarget::new(&target),
@@ -3204,7 +3365,9 @@ mod tests {
         let rid = ResourceId::with_identity("test", "x");
 
         // Basic variants must narrow.
-        let create = Effect::Create(ResolvedResource::new(Resource::new("test", "x")));
+        let create = Effect::Create(ResolvedResource::new(
+            Resource::new("test", "x").with_dependency_phase(()),
+        ));
         assert!(matches!(
             create.as_basic(),
             Some(BasicEffect::Create { .. })
@@ -3215,7 +3378,7 @@ mod tests {
                 ResState::existing(rid.clone(), Default::default()).with_identifier("x-1"),
             ),
             identifier: fixture_applied_identifier("x-1"),
-            to: ResolvedResource::new(Resource::new("test", "x")),
+            to: ResolvedResource::new(Resource::new("test", "x").with_dependency_phase(())),
             changed_attributes: vec![],
         };
         assert!(matches!(
@@ -3243,7 +3406,9 @@ mod tests {
         // inside `as_basic` is what catches it at compile time; this
         // test catches misclassification of an existing variant.
         let read = Effect::Read {
-            resource: ResolvedDataSource::new(DataSource::new("test", "x")),
+            resource: ResolvedDataSource::new(
+                DataSource::new("test", "x").with_dependency_phase(()),
+            ),
         };
         let import = Effect::Import {
             id: crate::resource::ResolvedResourceId::new(rid.clone()),

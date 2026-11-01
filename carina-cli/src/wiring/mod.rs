@@ -98,7 +98,7 @@ use carina_core::differ::{
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, MoveAuthority,
-    NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedMove,
+    NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedMove, ResolvedMovePairs,
 };
 use carina_core::executor::normalized::{
     apply_desired_normalization_slice, is_value_fully_concrete_for_expansion,
@@ -127,6 +127,8 @@ use carina_core::provider::{
     ResourceComparisonResolver,
 };
 use carina_core::provider_source::ProviderSource;
+#[cfg(test)]
+use carina_core::resource::ResolvedDataSource;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, LiveComposition, ModuleSource,
     PartialReadMarker, PersistedDirectives, ResolvedDependencies, ResolvedResource,
@@ -153,7 +155,12 @@ use crate::commands::split_validation_message;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 
+mod legacy_migration;
 mod override_aware;
+
+pub(crate) use legacy_migration::{
+    MaterializedConfiguration, classify_legacy_state, report_legacy_migration,
+};
 
 pub use override_aware::{
     CanonicalResourceIdentityError, CanonicalResourcePair, DeferredForExpansionChoice,
@@ -266,10 +273,9 @@ pub struct PlanContext {
     pub provider: ProviderRouter,
     /// Evaluated desired resources after the identity-resolution boundary.
     pub sorted_resources: Vec<ResolvedResource>,
-    /// Legacy-name classifier projected from the same expanded graph that
-    /// produced `sorted_resources`. Saved plans retain it so applying a plan
-    /// can finish a pending v20 state migration without reloading source.
-    pub legacy_dependency_projections: carina_core::resolved_graph::LegacyDependencyProjectionIndex,
+    /// Exact classification of the plan-time v20 state. Saved plans retain it
+    /// so apply can replay the same move- and scope-aware result.
+    pub legacy_dependency_classification: Option<carina_state::LegacyDependencyClassification>,
     /// Graph-classified in-memory view of pre-v21 state. Read-only plan
     /// consumers use this for summaries and saved-plan capture, but never
     /// write it back without the lock-held apply/state-migration path.
@@ -1801,61 +1807,35 @@ impl MigrationCheckConfig {
     /// graph/configuration/move input consumed by the plan path.
     pub(crate) fn migrate_legacy_dependencies_from_copied_state(
         mut self,
-        state: &mut StateFile,
-    ) -> Result<carina_state::LegacyDependencyMigrationReport, AppError> {
+        mut state: StateFile,
+    ) -> Result<carina_state::UnreportedMigratedState, AppError> {
         let state_view = Some(state.clone());
-        let state_block_claims = self.prepare_from_copied_state(&state_view)?;
+        self.prepare_from_copied_state(&state_view)?;
         state.remove_legacy_data_source_rows(&self.resources.data_sources);
 
-        let mut suppress_warning = |_: String| {};
-        let resolved_moves = resolve_explicit_moved_blocks(
-            &self.resources.state_blocks,
+        let moved_pairs = resolve_moved_pairs(
+            &self.context,
+            &self.resources,
+            &self.resources.resources,
+            &self.resources.data_sources,
             &state_view,
-            |to| {
-                find_desired_id(
-                    to,
-                    self.resources.resources.iter().map(|resource| &resource.id),
-                )
-            },
-            &mut suppress_warning,
         )?;
-        let mut moved_pairs = resolved_moves
-            .into_iter()
-            .map(|resolved| resolved.resolved_move.into_parts())
-            .collect::<Vec<_>>();
-        let comparison = MetadataComparisonResolver::new(
-            self.resources.resources.iter().map(|resource| &resource.id),
-        );
-        let persisted_state = state_view
-            .as_ref()
-            .expect("copied-state migration always has state");
-        let automatic_moves = detect_late_anonymous_moves(LateAnonymousMoveDetectionInputs {
-            ctx: &self.context,
-            comparison: &comparison,
-            resources: &self.resources.resources,
-            data_sources: &self.resources.data_sources,
-            state_file: Some(persisted_state),
-            state_block_claims: &state_block_claims,
-            providers: &self.resources.providers,
-            initial_moved_pairs: &moved_pairs,
-        })?;
-        for resolved_move in automatic_moves {
-            let update = ResolvedMovePairUpdate::prepare(
-                &moved_pairs,
-                &resolved_move,
-                MoveOverlapPolicy::ComposeForward,
-            )?;
-            update.apply(&mut moved_pairs);
-        }
         let configured = self.resources.resources.clone();
         let data_sources = self.resources.data_sources.clone();
-        let input = build_legacy_dependency_migration_input(
+        let residual_loops = self.resources.deferred_for_expressions().clone();
+        let classification = classify_legacy_state(
             &mut self.resources,
-            &configured,
-            &data_sources,
+            MaterializedConfiguration::Offline {
+                resources: &configured,
+                data_sources: &data_sources,
+                residual_loops: residual_loops.as_slice(),
+            },
             &moved_pairs,
+            &state,
         )?;
-        input.migrate(state)
+        state
+            .with_legacy_classification(classification)
+            .map_err(|error| AppError::Backend(error.into()))
     }
 
     fn canonicalize_and_compute_identifiers(&mut self) -> Result<(), AppError> {
@@ -4634,7 +4614,7 @@ pub(crate) struct AddressedState {
     orphans: Orphans,
     saved_attrs: LiftedSavedAttrs,
     prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    moved_pairs: Vec<(ResolvedResourceId, ResolvedResourceId)>,
+    moved_pairs: ResolvedMovePairs,
 }
 
 pub(crate) struct AddressedStateParts {
@@ -4646,7 +4626,7 @@ pub(crate) struct AddressedStateParts {
 impl AddressedState {
     #[cfg(test)]
     pub(crate) fn moved_pairs(&self) -> &[(ResolvedResourceId, ResolvedResourceId)] {
-        &self.moved_pairs
+        self.moved_pairs.as_slice()
     }
 
     pub(crate) fn projected_state<'state>(
@@ -4867,78 +4847,26 @@ enum MoveOverlapPolicy {
     RejectOverlap,
 }
 
-fn conflicting_move<'a>(
-    moved_pairs: &'a [(ResolvedResourceId, ResolvedResourceId)],
+fn updated_move_pairs(
+    moved_pairs: &ResolvedMovePairs,
     resolved_move: &ResolvedMove,
     policy: MoveOverlapPolicy,
-) -> Option<&'a (ResolvedResourceId, ResolvedResourceId)> {
-    moved_pairs.iter().find(|(existing_from, existing_to)| {
-        let continues_forward = existing_to == resolved_move.projected_from()
-            && existing_from == resolved_move.from()
-            && existing_from != resolved_move.to()
-            && resolved_move.projected_from() != resolved_move.to();
-        let overlaps = existing_from == resolved_move.from()
-            || existing_from == resolved_move.projected_from()
-            || existing_from == resolved_move.to()
-            || existing_to == resolved_move.from()
-            || existing_to == resolved_move.projected_from()
-            || existing_to == resolved_move.to();
-        let composition_is_allowed = match policy {
-            MoveOverlapPolicy::ComposeForward => continues_forward,
-            MoveOverlapPolicy::RejectOverlap => false,
-        };
-        overlaps && !composition_is_allowed
-    })
-}
-
-enum ResolvedMovePairUpdate {
-    Compose {
-        index: usize,
-        to: ResolvedResourceId,
-    },
-    Append {
-        from: ResolvedResourceId,
-        to: ResolvedResourceId,
-    },
-}
-
-impl ResolvedMovePairUpdate {
-    fn prepare(
-        moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
-        resolved_move: &ResolvedMove,
-        overlap_policy: MoveOverlapPolicy,
-    ) -> Result<Self, AppError> {
-        if let Some((existing_from, existing_to)) =
-            conflicting_move(moved_pairs, resolved_move, overlap_policy)
-        {
-            return Err(AppError::DetectedMoveConflict {
-                from: Box::new(resolved_move.from().clone()),
-                to: Box::new(resolved_move.to().clone()),
-                existing_from: Box::new(existing_from.clone()),
-                existing_to: Box::new(existing_to.clone()),
-            });
+) -> Result<ResolvedMovePairs, AppError> {
+    let mut updated = moved_pairs.clone();
+    let result = match policy {
+        MoveOverlapPolicy::ComposeForward => updated.compose_forward(resolved_move.clone()),
+        MoveOverlapPolicy::RejectOverlap => updated.append_rejecting_overlap(resolved_move.clone()),
+    };
+    result.map_err(|error| {
+        let (from, to, existing_from, existing_to) = error.into_parts();
+        AppError::DetectedMoveConflict {
+            from: Box::new(from),
+            to: Box::new(to),
+            existing_from: Box::new(existing_from),
+            existing_to: Box::new(existing_to),
         }
-        if let Some(index) = moved_pairs.iter().position(|(origin, prior_target)| {
-            prior_target == resolved_move.projected_from() && origin == resolved_move.from()
-        }) {
-            Ok(Self::Compose {
-                index,
-                to: resolved_move.to().clone(),
-            })
-        } else {
-            Ok(Self::Append {
-                from: resolved_move.from().clone(),
-                to: resolved_move.to().clone(),
-            })
-        }
-    }
-
-    fn apply(self, moved_pairs: &mut Vec<(ResolvedResourceId, ResolvedResourceId)>) {
-        match self {
-            Self::Compose { index, to } => moved_pairs[index].1 = to,
-            Self::Append { from, to } => moved_pairs.push((from, to)),
-        }
-    }
+    })?;
+    Ok(updated)
 }
 
 fn apply_detected_resource_moves(
@@ -4948,11 +4876,8 @@ fn apply_detected_resource_moves(
     overlap_policy: MoveOverlapPolicy,
 ) -> Result<(), AppError> {
     for resolved_move in moves {
-        let pair_update = ResolvedMovePairUpdate::prepare(
-            &addressed.moved_pairs,
-            &resolved_move,
-            overlap_policy,
-        )?;
+        let updated_pairs =
+            updated_move_pairs(&addressed.moved_pairs, &resolved_move, overlap_policy)?;
         let authority = resolved_move.authority();
         let transfer = promote_orphan_or_move_current_state(
             &mut addressed.managed_current,
@@ -4975,7 +4900,7 @@ fn apply_detected_resource_moves(
         addressed
             .saved_attrs
             .remap_resource_id(authority.from(), authority.to().clone());
-        pair_update.apply(&mut addressed.moved_pairs);
+        addressed.moved_pairs = updated_pairs;
     }
     Ok(())
 }
@@ -5262,7 +5187,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
                 orphans: inputs.orphans,
                 saved_attrs: self.saved_attrs,
                 prev_explicit: self.prev_explicit,
-                moved_pairs: Vec::new(),
+                moved_pairs: ResolvedMovePairs::from_addressed_moves(Vec::new()),
             },
         })
     }
@@ -5312,17 +5237,21 @@ impl<'state> DetectedDeferredForExpansionPrelude<'state> {
         state_file.build_orphans(&desired_ids)
     }
 
-    pub(crate) fn into_destroy_resources(self) -> Vec<Resource> {
+    pub(crate) fn into_destroy_resources(self, moved_pairs: &ResolvedMovePairs) -> Vec<Resource> {
         let Self {
             prelude,
-            automatic_moves,
+            automatic_moves: _,
         } = self;
-        let projection = automatic_moves.state_read_projection(prelude.state_file.as_ref());
         prelude
             .sorted_resources
             .into_iter()
             .map(|mut resource| {
-                resource.id = projection.source_for(&resource.id).clone();
+                if let Some((source, _)) = moved_pairs
+                    .iter()
+                    .find(|(_, target)| target.as_inner() == &resource.id)
+                {
+                    resource.id = source.as_inner().clone();
+                }
                 resource
             })
             .collect()
@@ -5749,18 +5678,8 @@ impl<E> ExpandedCanonicalResources<E> {
         &self.resources
     }
 
-    fn legacy_dependency_migration_input<'a>(
-        &mut self,
-        configured: &'a [Resource],
-        data_sources: &[DataSource],
-        moved_pairs: &'a [(ResolvedResourceId, ResolvedResourceId)],
-    ) -> Result<LegacyDependencyMigrationInput<'a>, AppError> {
-        build_legacy_dependency_migration_input(
-            self.resources.parsed_mut(),
-            configured,
-            data_sources,
-            moved_pairs,
-        )
+    fn parsed_mut(&mut self) -> &mut carina_core::parser::ModuleResolvedFile<E> {
+        self.resources.parsed_mut()
     }
 
     async fn prepare_desired_side_for_plan(
@@ -5994,7 +5913,6 @@ pub(crate) struct PostExpansionResourceInputs<'a> {
     unresolved_override_aware: &'a OverrideAwareResources,
     resolved: Vec<ResolvedResource>,
     paired_unresolved: Vec<Resource>,
-    resolved_unresolved: Vec<ResolvedResource>,
 }
 
 /// Consumer-specific semantics for the shared post-expansion seam.
@@ -6089,62 +6007,6 @@ pub(crate) struct PostExpansionApplyResources {
     pub bindings: ResolvedBindings,
 }
 
-/// The complete, post-identity input for the v20 → v21 dependency
-/// transition. Both planning and `state migrate --check` obtain this value
-/// through [`build_legacy_dependency_migration_input`], so graph construction
-/// cannot be detached from the configured IDs and move projection used to
-/// classify rows.
-struct LegacyDependencyMigrationInput<'a> {
-    graph: carina_core::resolved_graph::ExpandedBindingIndex,
-    configured: &'a [Resource],
-    moved_pairs: &'a [(ResolvedResourceId, ResolvedResourceId)],
-}
-
-impl LegacyDependencyMigrationInput<'_> {
-    fn migrate(
-        &self,
-        state: &mut StateFile,
-    ) -> Result<carina_state::LegacyDependencyMigrationReport, AppError> {
-        state
-            .migrate_legacy_dependencies(&self.graph, self.configured, self.moved_pairs)
-            .map_err(|error| AppError::Backend(error.into()))
-    }
-
-    fn graph(&self) -> &carina_core::resolved_graph::ExpandedBindingIndex {
-        &self.graph
-    }
-
-    fn into_graph(self) -> carina_core::resolved_graph::ExpandedBindingIndex {
-        self.graph
-    }
-}
-
-fn build_legacy_dependency_migration_input<'a, E>(
-    parsed: &mut carina_core::parser::ModuleResolvedFile<E>,
-    configured: &'a [Resource],
-    data_sources: &[DataSource],
-    moved_pairs: &'a [(ResolvedResourceId, ResolvedResourceId)],
-) -> Result<LegacyDependencyMigrationInput<'a>, AppError> {
-    let graph =
-        carina_core::resolved_graph::resolve_expanded_graph(parsed, configured, data_sources)?;
-    Ok(LegacyDependencyMigrationInput {
-        graph,
-        configured,
-        moved_pairs,
-    })
-}
-
-fn legacy_dependency_projections_for_state<E>(
-    state_file: Option<&StateFile>,
-    build: impl FnOnce() -> Result<carina_core::resolved_graph::LegacyDependencyProjectionIndex, E>,
-) -> Result<carina_core::resolved_graph::LegacyDependencyProjectionIndex, E> {
-    if state_file.is_some_and(StateFile::has_legacy_dependency_names) {
-        build()
-    } else {
-        Ok(Default::default())
-    }
-}
-
 impl PostExpansionMode for PlanMode {
     type Resources = PostExpansionResolvedResources;
 
@@ -6171,9 +6033,8 @@ impl PostExpansionMode for PlanMode {
 
     fn build_resources(inputs: PostExpansionResourceInputs<'_>) -> Self::Resources {
         let unresolved = inputs
-            .resolved_unresolved
+            .paired_unresolved
             .into_iter()
-            .map(ResolvedResource::into_inner)
             .map(UnresolvedResource::from_pre_resolve)
             .collect();
         PostExpansionResolvedResources {
@@ -6231,11 +6092,10 @@ pub(crate) struct PostExpansionArtifacts<R> {
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     pub wait_aliases: Vec<WaitAliasSpec>,
-    pub legacy_dependency_projections: carina_core::resolved_graph::LegacyDependencyProjectionIndex,
+    pub legacy_dependency_classification: Option<carina_state::LegacyDependencyClassification>,
     /// Graph-classified replacement for a pre-v21 state. Apply/refresh owners
     /// install this value before any write; read-only plan simply drops it.
     pub migrated_legacy_state: Option<StateFile>,
-    pub legacy_dependency_migration: carina_state::LegacyDependencyMigrationReport,
 }
 
 impl<R> PostExpansionArtifacts<R> {
@@ -6251,9 +6111,8 @@ impl<R> PostExpansionArtifacts<R> {
             moved_origins,
             prev_explicit,
             wait_aliases,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             migrated_legacy_state,
-            legacy_dependency_migration,
         } = self;
         PostExpansionArtifacts {
             expanded_resources: map(expanded_resources),
@@ -6266,9 +6125,8 @@ impl<R> PostExpansionArtifacts<R> {
             moved_origins,
             prev_explicit,
             wait_aliases,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             migrated_legacy_state,
-            legacy_dependency_migration,
         }
     }
 }
@@ -6364,10 +6222,6 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     // `into_plan_input_current_map`, so lift them explicitly at this seam.
     lift_data_source_value_enum_leaves(&mut data_source_values, data_sources, context.schemas());
     let upstream_binding_names = expanded_resources.parsed().upstream_binding_names();
-    let deferred_upstream_bindings = upstream_binding_names
-        .iter()
-        .map(|binding| (*binding).to_string())
-        .collect::<HashSet<_>>();
     let managed_stability = derive_managed_binding_stability(
         expanded_resources.parsed(),
         &sorted_resources,
@@ -6462,9 +6316,8 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             moved_origins,
             prev_explicit: addressed.prev_explicit,
             wait_aliases,
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: None,
             migrated_legacy_state: None,
-            legacy_dependency_migration: Default::default(),
         };
         return Ok(PostExpansionOutcome::Diagnostics(
             PostExpansionDiagnostics::new(artifacts, errors),
@@ -6493,33 +6346,33 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         state_file,
     )?;
 
-    // This is the only transition from parser/pre-expansion dependency
-    // operands to complete scheduler addresses. It deliberately runs after
-    // late anonymous identity reconciliation and before any differ input is
-    // constructed.
-    let migration_input = expanded_resources.legacy_dependency_migration_input(
-        override_aware_resources.resources(),
-        &data_sources_for_plan,
-        &addressed.moved_pairs,
-    )?;
-    let legacy_dependency_projections =
-        legacy_dependency_projections_for_state(state_file.as_ref(), || {
-            migration_input.graph().legacy_dependency_projection_index()
-        })?;
-    let (migrated_legacy_state, legacy_dependency_migration) = if state_file
+    let legacy_dependency_classification = if let Some(state) = state_file
         .as_ref()
-        .is_some_and(StateFile::requires_legacy_dependency_migration)
+        .filter(|state| state.requires_legacy_dependency_migration())
     {
-        let mut migrated = state_file
+        Some(classify_legacy_state(
+            expanded_resources.parsed_mut(),
+            MaterializedConfiguration::Planned {
+                resources: override_aware_resources.resources(),
+                data_sources: &data_sources_for_plan,
+            },
+            &addressed.moved_pairs,
+            state,
+        )?)
+    } else {
+        None
+    };
+    let migrated_legacy_state = if let Some(classification) = &legacy_dependency_classification {
+        let migrated = state_file
             .as_ref()
             .expect("checked legacy state presence")
-            .clone();
-        let report = migration_input.migrate(&mut migrated)?;
-        (Some(migrated), report)
+            .clone()
+            .with_legacy_classification(classification.clone())
+            .map_err(|error| AppError::Backend(error.into()))?;
+        Some(report_legacy_migration(migrated))
     } else {
-        (None, Default::default())
+        None
     };
-    let expanded_graph = migration_input.into_graph();
     if let Some(migrated) = migrated_legacy_state.as_ref() {
         addressed.refresh_destroy_metadata_from_state(migrated);
     }
@@ -6528,10 +6381,14 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     } else {
         state_file
     };
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
+        expanded_resources.parsed_mut(),
+        override_aware_resources.resources(),
+        &data_sources_for_plan,
+    )?;
     compositions = expanded_resources.parsed().compositions.clone();
     for target in &mut deferred_create_targets {
-        target.dependencies = expanded_graph
-            .resolve_deferred_for_dependencies(&target.template, &deferred_upstream_bindings)?;
+        target.dependencies = expanded_graph.resolve_deferred_for_dependencies(&target.template)?;
     }
 
     let reconciled_provider_states = provider_states_for(
@@ -6627,36 +6484,6 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         &outcome_unknown_import_replacements,
     )?;
     add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
-    for warning in legacy_dependency_migration.warnings() {
-        let id = addressed
-            .moved_pairs
-            .iter()
-            .find_map(|(from, to)| (from == &warning.row).then(|| to.clone()))
-            .unwrap_or_else(|| warning.row.clone());
-        let generation = warning
-            .generation
-            .as_ref()
-            .map_or(carina_core::effect::EffectGeneration::Current, |key| {
-                carina_core::effect::EffectGeneration::Deposed(key.clone())
-            });
-        let has_delete = plan.effects().iter().any(|effect| {
-            matches!(
-                effect,
-                Effect::Delete {
-                    id: delete_id,
-                    generation: delete_generation,
-                    ..
-                } if delete_id == &id && delete_generation == &generation
-            )
-        });
-        if has_delete {
-            plan.record_partially_unknown_destroy_ordering(
-                id,
-                generation,
-                warning.legacy_names.clone(),
-            );
-        }
-    }
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
     override_aware_resources.apply_plan_stability(&plan_input_current, &plan, context.schemas());
 
@@ -6700,7 +6527,6 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         unresolved_override_aware: &unresolved_override_aware_resources,
         resolved: resolved_resources,
         paired_unresolved: paired_unresolved_resources,
-        resolved_unresolved: resolved_unresolved_resources,
     });
 
     Ok(PostExpansionOutcome::Planned(PostExpansionPlan {
@@ -6715,9 +6541,8 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             moved_origins,
             prev_explicit,
             wait_aliases,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             migrated_legacy_state,
-            legacy_dependency_migration,
         },
         resources,
     }))
@@ -7294,13 +7119,16 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
             schemas,
             sorted_resources.iter().map(|resource| &resource.id),
         );
-    let moved_pairs = moved_targets
-        .iter()
-        .map(|target| {
-            let target = ResolvedResourceId::new(target.clone());
-            (target.clone(), target)
-        })
-        .collect();
+    let mut move_plan: Plan = Plan::default();
+    for target in moved_targets {
+        let target = ResolvedResourceId::new(target.clone());
+        move_plan.add(Effect::Move {
+            from: target.clone(),
+            to: target,
+            origin: None,
+        });
+    }
+    let moved_pairs = ResolvedMovePairs::from_saved_plan(&move_plan);
     let prepared = PreparedAddressPreservingDeferredForExpansion(DeferredForExpansionInputs {
         addressed: AddressedDeferredForExpansionInputs {
             sorted_resources: sorted_resources.to_vec(),
@@ -8028,9 +7856,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         moved_origins,
         prev_explicit,
         wait_aliases: _,
-        legacy_dependency_projections,
+        legacy_dependency_classification,
         migrated_legacy_state,
-        legacy_dependency_migration: _,
     } = artifacts;
     let expansion_trace = expanded_resources.parsed().expansion_trace.clone();
     Ok(ExpandedPlanContext::new(
@@ -8045,7 +7872,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             // resources have no binding and kept this evaluated view, producing
             // the bound/anonymous saved-plan divergence.
             sorted_resources,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             migrated_legacy_state,
             unresolved_resources,
             compositions,
@@ -8136,6 +7963,52 @@ fn resolve_explicit_moved_blocks(
     Ok(resolved)
 }
 
+/// Resolve every explicit and late anonymous move against one materialized
+/// configuration. Migration callers receive the opaque pair set rather than
+/// constructing tuple slices at individual command sites.
+pub(crate) fn resolve_moved_pairs<E>(
+    ctx: &WiringContext,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    resources: &[Resource],
+    data_sources: &[DataSource],
+    state_file: &Option<StateFile>,
+) -> Result<ResolvedMovePairs, AppError> {
+    let mut suppress_warning = |_: String| {};
+    let explicit = resolve_explicit_moved_blocks(
+        &parsed.state_blocks,
+        state_file,
+        |to| find_desired_id(to, resources.iter().map(|resource| &resource.id)),
+        &mut suppress_warning,
+    )?;
+    let mut moved_pairs = ResolvedMovePairs::from_addressed_moves(
+        explicit
+            .into_iter()
+            .map(|resolved| resolved.resolved_move)
+            .collect(),
+    );
+    let state_block_claims =
+        resolve_state_block_claims(&parsed.state_blocks, state_file, resources, ctx.schemas());
+    let comparison = MetadataComparisonResolver::new(resources.iter().map(|resource| &resource.id));
+    let automatic = detect_late_anonymous_moves(LateAnonymousMoveDetectionInputs {
+        ctx,
+        comparison: &comparison,
+        resources,
+        data_sources,
+        state_file: state_file.as_ref(),
+        state_block_claims: &state_block_claims,
+        providers: &parsed.providers,
+        initial_moved_pairs: moved_pairs.as_slice(),
+    })?;
+    for resolved_move in automatic {
+        moved_pairs = updated_move_pairs(
+            &moved_pairs,
+            &resolved_move,
+            MoveOverlapPolicy::ComposeForward,
+        )?;
+    }
+    Ok(moved_pairs)
+}
+
 /// Pre-process moved blocks by transferring the typed orphan/current state,
 /// `prev_explicit`, and `saved_attrs` from the old resource name to the new
 /// name.
@@ -8158,7 +8031,7 @@ fn materialize_moved_states(
     saved_attrs: &mut LiftedSavedAttrs,
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
-) -> Result<Vec<(ResolvedResourceId, ResolvedResourceId)>, AppError> {
+) -> Result<ResolvedMovePairs, AppError> {
     materialize_moved_states_with_warning_sink(
         managed_current,
         orphans,
@@ -8178,8 +8051,8 @@ fn materialize_moved_states_with_warning_sink(
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     warn_missing: &mut dyn FnMut(String),
-) -> Result<Vec<(ResolvedResourceId, ResolvedResourceId)>, AppError> {
-    let mut moved_pairs = Vec::new();
+) -> Result<ResolvedMovePairs, AppError> {
+    let mut addressed_moves = Vec::new();
     let resolved_moves = resolve_explicit_moved_blocks(
         state_blocks,
         state_file,
@@ -8229,10 +8102,10 @@ fn materialize_moved_states_with_warning_sink(
         // attributes under the new resource name.
         saved_attrs.remap_resource_id(authority.from(), authority.to().clone());
 
-        moved_pairs.push(resolved_move.into_parts());
+        addressed_moves.push(resolved_move);
     }
 
-    Ok(moved_pairs)
+    Ok(ResolvedMovePairs::from_addressed_moves(addressed_moves))
 }
 
 fn promote_orphan_or_move_current_state(
@@ -8519,12 +8392,12 @@ fn state_block_import(
 /// This function also removes Delete effects for resources covered by
 /// `removed` blocks, since those operations manage state without
 /// destroying infrastructure.
-pub fn add_state_block_effects(
+pub fn add_state_block_effects<D>(
     plan: &mut Plan,
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
-    desired_resources: &[Resource],
+    desired_resources: &[Resource<ModuleSource, D>],
     // carina#3329: resolved bindings + the set of upstream-state
     // binding names whose surviving refs are stamped as
     // `Value::Deferred(DeferredValue::Unknown(UpstreamExport { … }))`.
@@ -8905,9 +8778,9 @@ pub(crate) fn deposed_delete_effects_for_row(
 /// 1. Exact `(provider, resource_type, name)` against the prepared desired
 ///    resources, inheriting its routed provider instance.
 /// 2. The routing-agnostic address from the state block.
-pub(crate) fn resolve_import_target(
+pub(crate) fn resolve_import_target<D>(
     to: &StateBlockAddress,
-    desired: &[Resource],
+    desired: &[Resource<ModuleSource, D>],
 ) -> ResolvedResourceId {
     to.find_resource(desired)
         .map(|resource| ResolvedResourceId::new(resource.id.clone()))
@@ -9811,8 +9684,8 @@ fn data_source_refresh_bindings_from_refs(
 /// is keyed by data-source id; an empty input-details vector is valid when
 /// parsing folded the value but retained `dependency_bindings`.
 #[cfg(test)]
-pub(crate) fn classify_apply_time_data_source_read_inputs(
-    data_sources: &[DataSource],
+pub(crate) fn classify_apply_time_data_source_read_inputs<S>(
+    data_sources: &[DataSource<S>],
     managed: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
 ) -> HashMap<ResourceId, Vec<UnresolvedDataSourceInput>> {
@@ -9824,8 +9697,8 @@ pub(crate) fn classify_apply_time_data_source_read_inputs(
     )
 }
 
-fn classify_apply_time_data_source_read_inputs_from_refs(
-    data_sources: &[DataSource],
+fn classify_apply_time_data_source_read_inputs_from_refs<S>(
+    data_sources: &[DataSource<S>],
     managed: &[&Resource],
     managed_current: ManagedCurrentView<'_>,
 ) -> HashMap<ResourceId, Vec<UnresolvedDataSourceInput>> {
@@ -9835,8 +9708,8 @@ fn classify_apply_time_data_source_read_inputs_from_refs(
     deferred
 }
 
-fn classify_apply_time_data_source_reads(
-    data_sources: &[DataSource],
+fn classify_apply_time_data_source_reads<S>(
+    data_sources: &[DataSource<S>],
     managed: &[&Resource],
     managed_current: ManagedCurrentView<'_>,
 ) -> HashMap<ResourceId, Vec<UnresolvedDataSourceInput>> {
@@ -9853,50 +9726,134 @@ fn classify_apply_time_data_source_reads(
     data_sources
         .iter()
         .filter_map(|resource| {
-            let input_refs = unresolved_data_source_inputs(resource);
-            let path_requires_defer =
-                input_refs
-                    .iter()
-                    .flat_map(|input| &input.paths)
-                    .any(|path| {
-                        managed_by_binding
-                            .get(path.binding())
-                            .is_some_and(|target| {
-                                managed_resource_is_missing_from_state(target, managed_current)
-                            })
-                    });
-            let binding_requires_defer =
-                input_refs
-                    .iter()
-                    .flat_map(|input| &input.bindings)
-                    .any(|binding| {
-                        managed_by_binding
-                            .get(binding.as_str())
-                            .is_some_and(|target| {
-                                managed_resource_is_missing_from_state(target, managed_current)
-                            })
-                    });
             // Directory reference resolution can fold an input such as
             // `"^${target.name}$"` to a concrete string. The structural
-            // dependency is deliberately retained in `dependency_bindings`;
+            // dependency is deliberately retained in `dependencies.value_bindings`;
             // consult it so using the expanded parse does not turn an
             // apply-time read into a premature refresh-time read.
             let recorded_dependency_requires_defer =
-                resource.dependency_bindings.iter().any(|binding| {
+                resource.dependencies.value_bindings.iter().any(|binding| {
                     managed_by_binding
                         .get(binding.as_str())
                         .is_some_and(|target| {
                             managed_resource_is_missing_from_state(target, managed_current)
                         })
                 });
-            let has_unknown = input_refs.iter().any(|input| !input.unknowns.is_empty());
-            let must_defer = path_requires_defer
-                || binding_requires_defer
-                || recorded_dependency_requires_defer
-                || has_unknown;
-            must_defer.then(|| (resource.id.clone(), input_refs))
+            deferred_data_source_inputs(
+                resource,
+                &managed_by_binding,
+                managed_current,
+                recorded_dependency_requires_defer,
+            )
+            .map(|inputs| (resource.id.clone(), inputs))
         })
         .collect()
+}
+
+fn deferred_data_source_inputs<S, D>(
+    resource: &DataSource<S, D>,
+    managed_by_binding: &HashMap<&str, &Resource>,
+    managed_current: ManagedCurrentView<'_>,
+    recorded_dependency_requires_defer: bool,
+) -> Option<Vec<UnresolvedDataSourceInput>> {
+    let input_refs = unresolved_data_source_inputs(resource);
+    let path_requires_defer = input_refs
+        .iter()
+        .flat_map(|input| &input.paths)
+        .any(|path| {
+            managed_by_binding
+                .get(path.binding())
+                .is_some_and(|target| {
+                    managed_resource_is_missing_from_state(target, managed_current)
+                })
+        });
+    let binding_requires_defer =
+        input_refs
+            .iter()
+            .flat_map(|input| &input.bindings)
+            .any(|binding| {
+                managed_by_binding
+                    .get(binding.as_str())
+                    .is_some_and(|target| {
+                        managed_resource_is_missing_from_state(target, managed_current)
+                    })
+            });
+    let has_unknown = input_refs.iter().any(|input| !input.unknowns.is_empty());
+    (path_requires_defer
+        || binding_requires_defer
+        || recorded_dependency_requires_defer
+        || has_unknown)
+        .then_some(input_refs)
+}
+
+/// Test adapter for the saved-plan representation. Resolved data sources no
+/// longer expose parser-phase binding snapshots, so this path must consume the
+/// graph-resolved dependency addresses serialized beside the resource.
+#[cfg(test)]
+pub(crate) fn classify_apply_time_resolved_data_source_read_inputs<S>(
+    data_sources: &[ResolvedDataSource<S>],
+    managed: &[Resource],
+    managed_current: &HashMap<ResourceId, Current>,
+) -> HashMap<ResourceId, Vec<UnresolvedDataSourceInput>> {
+    let managed_refs = managed.iter().collect::<Vec<_>>();
+    let managed_by_binding = managed_refs
+        .iter()
+        .filter_map(|resource| {
+            resource
+                .binding
+                .as_deref()
+                .map(|binding| (binding, *resource))
+        })
+        .collect::<HashMap<_, _>>();
+    let managed_by_id = managed
+        .iter()
+        .map(|resource| (&resource.id, resource))
+        .collect::<HashMap<_, _>>();
+    let managed_current = ManagedCurrentView::base(managed_current);
+    let mut deferred = data_sources
+        .iter()
+        .filter_map(|resource| {
+            let recorded_dependency_requires_defer =
+                resource.value_dependencies().iter().any(|dependency| {
+                    managed_by_id
+                        .get(dependency.as_inner())
+                        .is_some_and(|target| {
+                            managed_resource_is_missing_from_state(target, managed_current)
+                        })
+                });
+            deferred_data_source_inputs(
+                resource.as_inner(),
+                &managed_by_binding,
+                managed_current,
+                recorded_dependency_requires_defer,
+            )
+            .map(|inputs| (resource.id.clone(), inputs))
+        })
+        .collect::<HashMap<_, _>>();
+
+    loop {
+        let mut changed = false;
+        for resource in data_sources {
+            if deferred.contains_key(&resource.id) {
+                continue;
+            }
+            if resource
+                .value_dependencies()
+                .iter()
+                .any(|dependency| deferred.contains_key(dependency.as_inner()))
+            {
+                deferred.insert(
+                    resource.id.clone(),
+                    unresolved_data_source_inputs(resource.as_inner()),
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    deferred
 }
 
 /// Data-source refresh classification is intentionally based on existence,
@@ -9923,8 +9880,8 @@ fn managed_resource_is_missing_from_state(
     }
 }
 
-fn propagate_deferred_data_source_chains(
-    data_sources: &[DataSource],
+fn propagate_deferred_data_source_chains<S>(
+    data_sources: &[DataSource<S>],
     deferred: &mut HashMap<ResourceId, Vec<UnresolvedDataSourceInput>>,
 ) {
     let data_source_id_by_binding: HashMap<&str, &ResourceId> = data_sources
@@ -9963,7 +9920,7 @@ fn propagate_deferred_data_source_chains(
                         .is_some_and(|id| deferred.contains_key(*id))
                 });
             let recorded_dependency_depends_on_deferred_read =
-                resource.dependency_bindings.iter().any(|binding| {
+                resource.dependencies.value_bindings.iter().any(|binding| {
                     data_source_id_by_binding
                         .get(binding.as_str())
                         .is_some_and(|id| deferred.contains_key(*id))

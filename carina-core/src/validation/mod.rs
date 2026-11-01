@@ -4136,9 +4136,54 @@ fn check_attribute_param_ref(
 pub fn validate_export_param_ref_types_with_bindings(
     export_params: &[crate::parser::InferredExportParam],
     bindings: &BindingIndex<'_>,
-) -> Result<(), String> {
-    validate_export_param_ref_types_inner(export_params, bindings, UnknownReferencePolicy::Report)
+) -> Result<(), Vec<ExportBoundaryError>> {
+    let errors = export_params
+        .iter()
+        .flat_map(|param| {
+            collect_export_param_ref_type_errors(param, bindings, UnknownReferencePolicy::Report)
+                .into_iter()
+                .map(|message| ExportBoundaryError::new(param, message))
+        })
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
+
+#[derive(Debug, Clone)]
+pub struct ExportBoundaryError {
+    pub name: String,
+    source: crate::parser::DeclarationSource,
+    message: String,
+}
+
+impl ExportBoundaryError {
+    fn new(param: &crate::parser::InferredExportParam, message: String) -> Self {
+        Self {
+            name: param.name.clone(),
+            source: param.declaration_source(),
+            message,
+        }
+    }
+
+    pub fn source_file(&self) -> &std::path::Path {
+        &self.source.file
+    }
+
+    pub fn source_span(&self) -> crate::parser::SourceSpan {
+        self.source.span
+    }
+}
+
+impl std::fmt::Display for ExportBoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExportBoundaryError {}
 
 /// Reject resource handles at the state export boundary after inference has
 /// retained whether the effective type was declared or inferred.
@@ -4149,7 +4194,7 @@ pub fn validate_export_param_ref_types_with_bindings(
 /// operand when [`crate::parser::InferredExportParam`] becomes value-only.
 pub fn validate_export_handle_boundaries(
     export_params: &[crate::parser::InferredExportParam],
-) -> Result<(), String> {
+) -> Result<(), Vec<ExportBoundaryError>> {
     let mut errors = Vec::new();
 
     for param in export_params {
@@ -4191,16 +4236,19 @@ pub fn validate_export_handle_boundaries(
             | ExportStaticType::Inferred(StaticType::Unchecked(_)) => continue,
         };
 
-        errors.push(format!(
-            "export '{}': {provenance}resource handle {resource_type} cannot cross a state boundary; export an identity value such as {resource_type}.Id instead",
-            param.name,
+        errors.push(ExportBoundaryError::new(
+            param,
+            format!(
+                "export '{}': {provenance}resource handle {resource_type} cannot cross a state boundary; export an identity value such as {resource_type}.Id instead",
+                param.name,
+            ),
         ));
     }
 
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("\n"))
+        Err(errors)
     }
 }
 
@@ -4212,24 +4260,11 @@ fn validate_export_param_ref_types_inner<E: crate::parser::ExportParamLike>(
     let mut errors = Vec::new();
 
     for param in export_params {
-        let Some(value) = param.value() else {
-            continue;
-        };
-        if param.inference_failed() {
-            continue;
-        }
-        let sink = param.type_expr_opt().map(RefSink::TypeExpr);
-        visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
-            check_export_ref(
-                param.name(),
-                sink.and_then(RefSink::as_type_expr),
-                path,
-                bindings,
-                unknown_policy,
-                usage,
-                &mut errors,
-            );
-        });
+        errors.extend(collect_export_param_ref_type_errors(
+            param,
+            bindings,
+            unknown_policy,
+        ));
     }
 
     if errors.is_empty() {
@@ -4237,6 +4272,33 @@ fn validate_export_param_ref_types_inner<E: crate::parser::ExportParamLike>(
     } else {
         Err(errors.join("\n"))
     }
+}
+
+fn collect_export_param_ref_type_errors<E: crate::parser::ExportParamLike>(
+    param: &E,
+    bindings: &BindingIndex<'_>,
+    unknown_policy: UnknownReferencePolicy,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Some(value) = param.value() else {
+        return errors;
+    };
+    if param.inference_failed() {
+        return errors;
+    }
+    let sink = param.type_expr_opt().map(RefSink::TypeExpr);
+    visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
+        check_export_ref(
+            param.name(),
+            sink.and_then(RefSink::as_type_expr),
+            path,
+            bindings,
+            unknown_policy,
+            usage,
+            &mut errors,
+        );
+    });
+    errors
 }
 
 fn check_export_ref(
@@ -7614,9 +7676,9 @@ fn check_unused_bindings_in_file_parts<'a, D: crate::parser::DeferredForPhaseTra
         for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
         }
-        // `LiveComposition` has no directives — `directives()` is `None`
-        // for that arm, so the depends_on walk is simply skipped.
-        for dep in rref.directives().into_iter().flat_map(|d| &d.depends_on) {
+        // `LiveComposition` has no explicit dependencies, so this walk is
+        // skipped for that arm.
+        for dep in rref.explicit_dependencies().into_iter().flatten() {
             referenced.insert(dep.diagnostic_reference());
         }
     }

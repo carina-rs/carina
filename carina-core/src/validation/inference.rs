@@ -1157,17 +1157,14 @@ pub fn infer_export_params<D>(
                     }
                 },
             };
-            crate::parser::InferredExportParam {
-                name: parameter.name.clone(),
-                static_type,
-                value: parameter
-                    .value
-                    .as_ref()
-                    .and_then(|expression| match expression {
-                        crate::parser::BoundaryExpression::Value(value) => Some(value.clone()),
-                        crate::parser::BoundaryExpression::Handle(_handle) => None,
-                    }),
-            }
+            let value = parameter
+                .value
+                .as_ref()
+                .and_then(|expression| match expression {
+                    crate::parser::BoundaryExpression::Value(value) => Some(value.clone()),
+                    crate::parser::BoundaryExpression::Handle(_handle) => None,
+                });
+            crate::parser::InferredExportParam::from_parsed(parameter, static_type, value)
         })
         .collect();
     SchemaCheckedExportParams { parameters }
@@ -2309,10 +2306,14 @@ exports {
             "a handle RHS must not disappear behind a value annotation",
         );
 
-        let error = crate::validation::validate_export_handle_boundaries(&inferred.export_params)
+        let errors = crate::validation::validate_export_handle_boundaries(&inferred.export_params)
             .expect_err("resource handles cannot cross state boundaries");
         assert_eq!(
-            error,
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
             "export 'inferred': inferred resource handle mock.test.Record cannot cross a state boundary; export an identity value such as mock.test.Record.Id instead\n\
 export 'declared': resource handle mock.test.Record cannot cross a state boundary; export an identity value such as mock.test.Record.Id instead\n\
 export 'annotated_value': inferred resource handle mock.test.Record cannot cross a state boundary; export an identity value such as mock.test.Record.Id instead",

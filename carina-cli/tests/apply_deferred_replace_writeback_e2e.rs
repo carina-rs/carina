@@ -23,7 +23,9 @@ use indexmap::IndexMap;
 use tempfile::TempDir;
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
@@ -203,7 +205,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
                 ConcreteValue::String("new-validation-token".into()),
             )])),
         );
-    cert.dependency_bindings.clear();
+    cert.dependencies.value_bindings.clear();
 
     let lb = mock_resource("load_balancer", "lb")
         .with_attribute("name", Value::Concrete(ConcreteValue::String("lb".into())));
@@ -278,10 +280,14 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             attribute_spans: Default::default(),
         }),
         plan,
-        sorted_resources: sorted_resources.clone(),
+        sorted_resources: sorted_resources
+            .iter()
+            .cloned()
+            .map(|resource| resolved(resource).into_inner())
+            .collect(),
         sorted_value_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
         sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
-        legacy_dependency_projections: Default::default(),
+        legacy_dependency_classification: None,
         unresolved_resources: sorted_resources,
         compositions: vec![],
         data_sources: vec![],
@@ -404,7 +410,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         sorted_resources: vec![],
         sorted_value_destroy_dependencies: vec![],
         sorted_explicit_destroy_dependencies: vec![],
-        legacy_dependency_projections: Default::default(),
+        legacy_dependency_classification: None,
         unresolved_resources: vec![],
         compositions: vec![],
         data_sources: vec![],

@@ -571,7 +571,9 @@ fn changed_provider_instance_rejects_resume() {
     );
 }
 
-fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
+fn provider_ready<S: Clone, D: Clone + Default>(
+    resource: Resource<S, D>,
+) -> crate::provider::ProviderReadyResource {
     let bindings = crate::binding_index::ResolvedBindings::default();
     let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = crate::schema::SchemaRegistry::new();
@@ -3625,7 +3627,8 @@ fn wait_binding_lowers_to_wait_effect() {
     // emitted only when it gates a real downstream change.
     let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert("cert_issued".to_string());
     let resources = vec![cert, consumer];
 
@@ -3705,7 +3708,10 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
 
     let job = Resource::new("job.Job", "job").with_binding("job");
     let mut consumer = Resource::new("job.Consumer", "consumer").with_binding("consumer");
-    consumer.dependency_bindings.insert("job_ready".to_string());
+    consumer
+        .dependencies
+        .value_bindings
+        .insert("job_ready".to_string());
     let wait = WaitBinding {
         binding: "job_ready".into(),
         target: "job".into(),
@@ -3764,7 +3770,8 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
     let mut consumer =
         Resource::with_provider("aws", "consumer.Thing", "consumer", None).with_binding("consumer");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert("cert_renewed".to_string());
     let wait = WaitBinding {
         binding: "cert_renewed".into(),
@@ -3855,7 +3862,10 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
     let job = Resource::with_provider("test", "job.Job", "job", None).with_binding("job");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
         .with_binding("consumer");
-    consumer.dependency_bindings.insert("job_ready".to_string());
+    consumer
+        .dependencies
+        .value_bindings
+        .insert("job_ready".to_string());
     let wait = WaitBinding {
         binding: "job_ready".into(),
         target: "job".into(),
@@ -3923,7 +3933,10 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
     let job = Resource::with_provider("test", "job.Job", "job", None).with_binding("job");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
         .with_binding("consumer");
-    consumer.dependency_bindings.insert("job_ready".to_string());
+    consumer
+        .dependencies
+        .value_bindings
+        .insert("job_ready".to_string());
     let wait = WaitBinding {
         binding: "job_ready".into(),
         target: "job".into(),
@@ -4030,7 +4043,10 @@ let renewed = wait cert {
     let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert");
     let mut consumer =
         Resource::with_provider("aws", "consumer.Thing", "consumer", None).with_binding("consumer");
-    consumer.dependency_bindings.insert("renewed".to_string());
+    consumer
+        .dependencies
+        .value_bindings
+        .insert("renewed".to_string());
     let wait = WaitBinding {
         binding: "renewed".into(),
         target: "cert".into(),
@@ -4093,7 +4109,8 @@ fn data_source_wait_is_rejected_at_the_expanded_graph_boundary() {
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
         .with_binding("consumer");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert("lookup_found".to_string());
     let wait = WaitBinding {
         binding: "lookup_found".into(),
@@ -4138,7 +4155,8 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
     // create_plan legitimately skips emitting or lowering the wait.
     let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert("cert_issued".to_string());
     let resources = vec![cert, consumer];
 
@@ -4266,7 +4284,8 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
     let dependency_id = dependency.id.clone();
     let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert("cert_issued".to_string());
     let resources = vec![cert, dependency, consumer];
     let wait = WaitBinding {
@@ -4327,7 +4346,8 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     // something (carina#3101).
     let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert("cert_issued".to_string());
     let resources = vec![cert, consumer];
 
@@ -4430,7 +4450,9 @@ fn wait_omitted_when_all_consumers_unchanged() {
 
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    dist.dependencies
+        .value_bindings
+        .insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
     // Both resources already exist with identical state → NoChange,
@@ -4501,7 +4523,9 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
     // `dist` is new (absent from managed current state) → Create → mutating.
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    dist.dependencies
+        .value_bindings
+        .insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
     let wait = WaitBinding {
@@ -4565,7 +4589,9 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     // dist is new (absent from managed current state) → Create → mutating.
     // It references the wait binding, so the wait "gates a pending change".
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    dist.dependencies
+        .value_bindings
+        .insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
     let mut cert_state_attrs = HashMap::new();
@@ -4660,7 +4686,9 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     // post-apply.
     let cert = Resource::new("acm.Certificate", "cert").with_binding("cert");
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    dist.dependencies
+        .value_bindings
+        .insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
     let wait = WaitBinding {
@@ -4722,7 +4750,9 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
             Value::Concrete(ConcreteValue::String("new.example.com".into())),
         );
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_binding("dist");
-    dist.dependency_bindings.insert("cert_issued".to_string());
+    dist.dependencies
+        .value_bindings
+        .insert("cert_issued".to_string());
     let resources = vec![cert, dist];
 
     let mut cert_state_attrs = HashMap::new();

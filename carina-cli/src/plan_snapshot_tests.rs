@@ -72,11 +72,15 @@ fn format_destroy_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
 }
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-    ResolvedDataSource::new(resource)
+    ResolvedDataSource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 /// Strip ANSI escape codes from a string for snapshot readability.

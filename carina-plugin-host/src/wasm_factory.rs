@@ -6498,10 +6498,11 @@ impl Provider for WasmProvider {
         &self,
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        let wit_resource = match wasm_convert::core_data_source_to_wit_resource(resource) {
-            Ok(v) => v,
-            Err(e) => return early_provider_err("read_data_source", e),
-        };
+        let wit_resource =
+            match wasm_convert::core_data_source_to_wit_resource(resource.as_inner().as_inner()) {
+                Ok(v) => v,
+                Err(e) => return early_provider_err("read_data_source", e),
+            };
         let id = resource.id.clone();
         Box::pin(async move {
             let locked = self.instance.acquire("read_data_source").await?;
@@ -6841,7 +6842,9 @@ impl StrippedAttributes {
 
 /// Strip every resource attribute that the WASM provider boundary refuses to
 /// serialize, retaining the original `IndexMap` positions for restoration.
-fn strip_provider_boundary_attributes<S>(resources: &mut [Resource<S>]) -> StrippedAttributes {
+fn strip_provider_boundary_attributes<S, D>(
+    resources: &mut [Resource<S, D>],
+) -> StrippedAttributes {
     let mut out = Vec::with_capacity(resources.len());
     for resource in resources.iter_mut() {
         let mut stripped = Vec::new();
@@ -6871,7 +6874,10 @@ fn strip_provider_boundary_attributes<S>(resources: &mut [Resource<S>]) -> Strip
 
 /// Reinsert attributes removed by [`strip_provider_boundary_attributes`] at
 /// their original positions.
-fn restore_stripped_attributes<S>(resources: &mut [Resource<S>], stripped: StrippedAttributes) {
+fn restore_stripped_attributes<S, D>(
+    resources: &mut [Resource<S, D>],
+    stripped: StrippedAttributes,
+) {
     for (resource, entries) in resources.iter_mut().zip(stripped.0) {
         for entry in entries {
             let target = entry.insert_index.min(resource.attributes.len());
@@ -6888,13 +6894,13 @@ fn restore_stripped_attributes<S>(resources: &mut [Resource<S>], stripped: Strip
 /// The callback receives the names derived from the same stripping result that
 /// retains the values. Attributes are restored before returning on both
 /// success and error.
-async fn with_wasm_serializable_resources<S, F>(
-    resources: &mut [Resource<S>],
+async fn with_wasm_serializable_resources<S, D, F>(
+    resources: &mut [Resource<S, D>],
     operation: F,
 ) -> ProviderResult<()>
 where
     F: for<'a> FnOnce(
-        &'a mut [Resource<S>],
+        &'a mut [Resource<S, D>],
         &'a [Vec<String>],
     ) -> BoxFuture<'a, ProviderResult<()>>,
 {

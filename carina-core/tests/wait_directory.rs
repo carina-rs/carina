@@ -36,10 +36,11 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
         "cert.status == aws.acm.Certificate.Status.Issued"
     );
     assert_eq!(wait.timeout_secs, Some(75 * 60));
-    assert_eq!(
-        wait.depends_on.diagnostic_references(),
-        vec!["validation_record"]
-    );
+    assert!(matches!(
+        wait.depends_on.as_slice(),
+        [carina_core::parser::UnexpandedDependencyOperand::BareBinding(binding)]
+            if binding == "validation_record"
+    ));
     assert_eq!(wait.until_predicate.lhs_segments, vec!["cert", "status"]);
     assert_eq!(
         wait.until_predicate.rhs,

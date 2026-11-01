@@ -632,9 +632,8 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
-                legacy_dependency_projections: _,
+                legacy_dependency_classification: _,
                 migrated_legacy_state,
-                legacy_dependency_migration: _,
             } = diagnostics.into_artifacts();
             if let Some(migrated) = migrated_legacy_state {
                 state_file = Some(migrated);
@@ -685,9 +684,8 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
-                legacy_dependency_projections: _,
+                legacy_dependency_classification: _,
                 migrated_legacy_state,
-                legacy_dependency_migration: _,
             } = artifacts;
             if let Some(migrated) = migrated_legacy_state {
                 state_file = Some(migrated);

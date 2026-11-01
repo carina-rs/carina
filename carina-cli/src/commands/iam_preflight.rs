@@ -7,7 +7,7 @@ use aws_sdk_iam::types::PolicyEvaluationDecisionType;
 use carina_core::effect::{Effect, PlanOp};
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
-use carina_core::resource::{ResolvedResource, ResolvedResourceError, ResourceId};
+use carina_core::resource::{ResolvedResourceError, ResolvedResourceId, ResourceId};
 use carina_core::schema::SchemaRegistry;
 use colored::Colorize;
 use serde_json::Value as JsonValue;
@@ -295,7 +295,7 @@ pub(crate) fn collect_required_actions(
 
 fn effect_required_ops(
     effect: &Effect,
-    schemas: &SchemaRegistry,
+    _schemas: &SchemaRegistry,
 ) -> Result<Vec<(ResourceId, PlanOp)>, ResolvedResourceError> {
     let ops = match effect {
         Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
@@ -305,11 +305,10 @@ fn effect_required_ops(
         Effect::Delete { id, .. } => vec![(id.clone().into_inner(), PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id.clone().into_inner(), PlanOp::Read)],
         Effect::DeferredCreate { template, .. } => {
-            let resource = ResolvedResource::resolve_with_schemas(
-                template.template_resource.clone(),
-                schemas,
-            )?;
-            vec![(resource.id.clone(), PlanOp::Create)]
+            let id = template.template_resource.id.clone();
+            let id = ResolvedResourceId::try_from(id.clone())
+                .map_err(|_| carina_core::resource::PendingResourceIdentityError::new(id))?;
+            vec![(id.into_inner(), PlanOp::Create)]
         }
         Effect::DeferredReplace(payload) => {
             let mut ops: Vec<_> = payload
@@ -317,11 +316,10 @@ fn effect_required_ops(
                 .iter()
                 .map(|delete| (delete.id.clone().into_inner(), PlanOp::Delete))
                 .collect();
-            let resource = ResolvedResource::resolve_with_schemas(
-                payload.template.template_resource.clone(),
-                schemas,
-            )?;
-            ops.push((resource.id.clone(), PlanOp::Create));
+            let id = payload.template.template_resource.id.clone();
+            let id = ResolvedResourceId::try_from(id.clone())
+                .map_err(|_| carina_core::resource::PendingResourceIdentityError::new(id))?;
+            ops.push((id.into_inner(), PlanOp::Create));
             ops
         }
         Effect::Remove { .. }
@@ -779,11 +777,15 @@ mod tests {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-        ResolvedDataSource::new(resource)
+        ResolvedDataSource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     struct PermissionProvider {

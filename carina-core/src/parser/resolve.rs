@@ -458,13 +458,13 @@ impl PreApplyResourceMut for Resource {
         &self.attributes
     }
     fn dependency_bindings(&self) -> &BTreeSet<String> {
-        &self.dependency_bindings
+        &self.dependencies.value_bindings
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String> {
-        &mut self.dependency_bindings
+        &mut self.dependencies.value_bindings
     }
 }
 
@@ -476,13 +476,13 @@ impl PreApplyResourceMut for DataSource {
         &self.attributes
     }
     fn dependency_bindings(&self) -> &BTreeSet<String> {
-        &self.dependency_bindings
+        &self.dependencies.value_bindings
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<String> {
-        &mut self.dependency_bindings
+        &mut self.dependencies.value_bindings
     }
 }
 

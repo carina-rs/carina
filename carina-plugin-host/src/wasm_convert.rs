@@ -1656,8 +1656,8 @@ pub(crate) fn wit_to_core_delete_outcome(outcome: wit::DeleteOutcome) -> WasmDel
 
 // -- Resource --
 
-pub(crate) fn core_to_wit_resource<S>(
-    resource: &CoreResource<S>,
+pub(crate) fn core_to_wit_resource<S, D>(
+    resource: &CoreResource<S, D>,
 ) -> Result<wit::ResourceDef, SerializationError> {
     Ok(wit::ResourceDef {
         id: core_to_wit_resource_id(&resource.id),
@@ -1669,8 +1669,8 @@ pub(crate) fn core_to_wit_resource<S>(
 /// plugin boundary. The WIT contract has a single `ResourceDef` record,
 /// so a data source maps to the same `{ id, attributes }` shape as a
 /// managed resource (carina#3181).
-pub(crate) fn core_data_source_to_wit_resource<S>(
-    data_source: &CoreDataSource<S>,
+pub(crate) fn core_data_source_to_wit_resource<S, D>(
+    data_source: &CoreDataSource<S, D>,
 ) -> Result<wit::ResourceDef, SerializationError> {
     Ok(wit::ResourceDef {
         id: core_to_wit_resource_id(&data_source.id),

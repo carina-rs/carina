@@ -98,8 +98,8 @@ pub fn pre_graph_managed_binding_stability(
     }))
 }
 
-fn managed_binding_stability_for_resources<'a>(
-    managed: impl IntoIterator<Item = &'a Resource>,
+fn managed_binding_stability_for_resources<'a, D: 'a + Clone>(
+    managed: impl IntoIterator<Item = &'a Resource<crate::resource::ModuleSource, D>>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
@@ -307,7 +307,7 @@ impl Orphan {
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
-                    dependency_bindings: Default::default(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -322,7 +322,7 @@ impl Orphan {
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
-                    dependency_bindings: Default::default(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -341,7 +341,7 @@ impl Orphan {
             resolved_ignore_changes: Default::default(),
             prefixes: Default::default(),
             binding: self.binding.clone(),
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -619,7 +619,7 @@ impl<'a> PlanPriorStates<'a> {
         managed: &[ResolvedResource],
         registry: &crate::schema::SchemaRegistry,
     ) -> HashMap<ResourceId, PlanInputCurrent> {
-        let resources: Vec<Resource> = managed
+        let resources: Vec<Resource<crate::resource::ModuleSource, ()>> = managed
             .iter()
             .map(|resource| resource.as_resource().clone())
             .collect();
@@ -638,9 +638,9 @@ impl<'a> PlanPriorStates<'a> {
     }
 }
 
-fn managed_orphan_provider_states(
+fn managed_orphan_provider_states<D>(
     orphans: &Orphans,
-    managed: &[Resource],
+    managed: &[Resource<crate::resource::ModuleSource, D>],
 ) -> HashMap<ResourceId, Current> {
     managed
         .iter()
@@ -977,12 +977,12 @@ pub fn binding_matches_deferred_template(
 #[derive(Debug, Clone, PartialEq)]
 pub enum Diff {
     /// Resource does not exist -> needs creation
-    Create(Resource),
+    Create(Resource<crate::resource::ModuleSource, ()>),
     /// Resource exists with differences -> needs update
     Update {
         id: ResourceId,
         from: Box<State>,
-        to: Resource,
+        to: Resource<crate::resource::ModuleSource, ()>,
         changed_attributes: Vec<String>,
     },
     /// Resource exists with no differences -> no action needed
@@ -998,11 +998,11 @@ impl Diff {
     }
 }
 
-enum PresentDiff {
+enum PresentDiff<D> {
     Update {
         id: ResourceId,
         from: Box<State>,
-        to: Box<Resource>,
+        to: Box<Resource<crate::resource::ModuleSource, D>>,
         changed_attributes: Vec<String>,
         ignored_readable_differences: usize,
     },
@@ -1018,8 +1018,8 @@ pub(super) struct PlannedListKeyRelease {
     pub(super) keys: ReleasedListKeys,
 }
 
-struct PresentDiffResult {
-    diff: PresentDiff,
+struct PresentDiffResult<D> {
+    diff: PresentDiff<D>,
     releases: Vec<PlannedListKeyRelease>,
 }
 
@@ -1216,15 +1216,15 @@ fn filter_explicit_list_elements(
     });
 }
 
-fn diff_present_with_releases(
-    desired: &Resource,
+fn diff_present_with_releases<D: Clone>(
+    desired: &Resource<crate::resource::ModuleSource, D>,
     current: &PresentResourceState,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: &ValidatedResourceSchema,
     context: &ComparisonContext<'_>,
-) -> PresentDiffResult {
+) -> PresentDiffResult<D> {
     let releases = find_keyed_partial_update_releases(
         &desired.resolved_attributes(),
         &current.state().attributes,
@@ -1299,15 +1299,15 @@ fn diff_present_with_releases(
     PresentDiffResult { diff, releases }
 }
 
-fn diff_present_resource(
-    desired: &Resource,
+fn diff_present_resource<D: Clone>(
+    desired: &Resource<crate::resource::ModuleSource, D>,
     current: &PresentResourceState,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
-) -> PresentDiff {
+) -> PresentDiff<D> {
     diff_existing_resource(
         desired,
         current.state(),
@@ -1327,7 +1327,7 @@ fn diff_existing_state(
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
-) -> PresentDiff {
+) -> PresentDiff<()> {
     diff_existing_resource(
         desired.as_resource(),
         current,
@@ -1339,15 +1339,15 @@ fn diff_existing_state(
     )
 }
 
-fn diff_existing_resource(
-    desired: &Resource,
+fn diff_existing_resource<D: Clone>(
+    desired: &Resource<crate::resource::ModuleSource, D>,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
-) -> PresentDiff {
+) -> PresentDiff<D> {
     let changes = comparison::find_changed_attributes_with_ignores(
         comparison::AttributeValueViews::new(
             &desired.resolved_attributes(),
@@ -1482,7 +1482,7 @@ pub(crate) fn diff_test(
     context: &ComparisonContext<'_>,
 ) -> Diff {
     diff_with_saved_parts(
-        &ResolvedResource::new(desired.clone()),
+        &ResolvedResource::new(desired.clone().with_dependency_phase(())),
         current,
         saved,
         &NestedWriteOnlyRecord::new(),

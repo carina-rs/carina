@@ -111,6 +111,23 @@ impl ModuleResolutionFixture {
             caller_file.parent().expect("caller file has a directory"),
         )
     }
+
+    fn resolve_upstream_caller(
+        &self,
+        caller_relative: impl AsRef<Path>,
+    ) -> Result<ModuleResolvedParsedFile, ModuleError> {
+        let caller_file = self.root.join(caller_relative);
+        let caller = fs::read_to_string(&caller_file).expect("read fixture caller");
+        let config = ProviderContext::default();
+        let parsed = crate::parser::parse_file(&caller, &caller_file, &config)
+            .expect("fixture caller parses");
+        resolve_upstream_modules_with_providerless_config(
+            parsed,
+            caller_file.parent().expect("caller file has a directory"),
+            &config,
+            &crate::schema::SchemaRegistry::new(),
+        )
+    }
 }
 
 #[test]
@@ -260,7 +277,7 @@ let disabled = choice { flag = false }
         Some(&Value::Concrete(ConcreteValue::String("seed".into()))),
     );
     assert_eq!(
-        enabled.template_resource.dependency_bindings,
+        enabled.template_resource.dependencies.value_bindings,
         BTreeSet::from(["enabled.seed".to_string()]),
         "dependency metadata must be derived from the selected value",
     );
@@ -277,9 +294,13 @@ let disabled = choice { flag = false }
         disabled.template_resource.get_attr("name"),
     );
     assert!(
-        disabled.template_resource.dependency_bindings.is_empty(),
+        disabled
+            .template_resource
+            .dependencies
+            .value_bindings
+            .is_empty(),
         "the unselected seed reference must not leave a dependency edge: {:?}",
-        disabled.template_resource.dependency_bindings,
+        disabled.template_resource.dependencies.value_bindings,
     );
 }
 
@@ -1596,7 +1617,7 @@ fn create_test_module() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -1831,7 +1852,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2022,7 +2043,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".to_string()),
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2123,7 +2144,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix)),
-        dependency_bindings: Default::default(),
+        dependencies: Default::default(),
         module_source: Some(crate::resource::ModuleSource::expanded_module(
             "thing",
             current_prefix.clone(),
@@ -2184,7 +2205,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
-                dependency_bindings: Default::default(),
+                dependencies: Default::default(),
                 module_source: None,
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
@@ -2204,7 +2225,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".to_string()),
-                dependency_bindings: Default::default(),
+                dependencies: Default::default(),
                 module_source: None,
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
@@ -2350,7 +2371,7 @@ fn create_module_with_attributes() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".to_string()),
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -3726,7 +3747,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("distribution".to_string()),
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -4033,7 +4054,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".to_string()),
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -6211,7 +6232,7 @@ let child = imported { peer = source }
         .find(|resource| resource.binding.as_deref() == Some("child.consumer"))
         .expect("expanded consumer");
     assert_eq!(
-        consumer.directives.depends_on.diagnostic_references(),
+        consumer.dependencies.depends_on.diagnostic_references(),
         vec!["source"]
     );
     let dependencies = crate::deps::get_resource_dependencies(consumer);
@@ -7657,7 +7678,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".to_string()),
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -7697,7 +7718,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     resolved_ignore_changes: Default::default(),
                     prefixes: HashMap::new(),
                     binding: None,
-                    dependency_bindings: BTreeSet::new(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -7881,7 +7902,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                     resolved_ignore_changes: Default::default(),
                     prefixes: HashMap::new(),
                     binding: None,
-                    dependency_bindings: BTreeSet::new(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -8218,17 +8239,19 @@ let registry_publish = registry {
         .expect("expanded module consumer must exist");
     assert!(
         consumer
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .contains("registry_publish.target"),
         "module resource dependency must be populated and prefixed: {:?}",
-        consumer.dependency_bindings,
+        consumer.dependencies.value_bindings,
     );
     assert!(
         !consumer
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .contains("registry_publish.label"),
         "module arguments must not be mistaken for intra-module resources: {:?}",
-        consumer.dependency_bindings,
+        consumer.dependencies.value_bindings,
     );
     assert_eq!(
         consumer.attributes.get("description"),
@@ -8244,7 +8267,7 @@ let registry_publish = registry {
         .find(|resource| resource.binding.as_deref() == Some("registry_publish.roles"))
         .expect("expanded module data source must exist");
     assert_eq!(
-        roles.dependency_bindings,
+        roles.dependencies.value_bindings,
         BTreeSet::from(["registry_publish.target".to_string()]),
         "module data-source dependency must be populated and prefixed"
     );
@@ -8371,7 +8394,7 @@ let outer = outer_module {}
         .find(|resource| resource.binding.as_deref() == Some("outer.inner.consumer"))
         .expect("twice-expanded consumer must exist");
     assert_eq!(
-        consumer.dependency_bindings,
+        consumer.dependencies.value_bindings,
         BTreeSet::from(["outer.inner.target".to_string()]),
         "the outer pass must prefix the inner dependency once, matching the final target binding"
     );
@@ -8382,7 +8405,7 @@ let outer = outer_module {}
         .find(|resource| resource.binding.as_deref() == Some("outer.inner.roles"))
         .expect("twice-expanded data source must exist");
     assert_eq!(
-        roles.dependency_bindings,
+        roles.dependencies.value_bindings,
         BTreeSet::from(["outer.inner.target".to_string()]),
         "nested data-source dependency metadata must match the twice-expanded target binding"
     );
@@ -9137,7 +9160,7 @@ let consumer = mock.test.Consumer {
         .expect("consumer resource")
         .clone();
     assert_eq!(
-        consumer.directives.depends_on.diagnostic_references(),
+        consumer.dependencies.depends_on.diagnostic_references(),
         ["relayed.r"]
     );
 
@@ -9226,7 +9249,7 @@ let consumer = mock.test.Consumer {
         .cloned()
         .expect("consumer resource");
     assert_eq!(
-        consumer.directives.depends_on.diagnostic_references(),
+        consumer.dependencies.depends_on.diagnostic_references(),
         ["local", "child.r"],
     );
     let expected = parsed
@@ -9275,6 +9298,65 @@ fn module_wait_handle_argument_resolves_to_the_callers_resource() {
         r#"let ready = wait target {
   until      = target.status == "ready"
   depends_on = [peer]
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let source = mock.test.Record { name = "source" }
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = source }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let mut parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module wait expands");
+
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding == "child.ready")
+        .expect("expanded wait")
+        .clone();
+    assert_eq!(wait.depends_on.diagnostic_references(), ["source"]);
+    assert!(
+        wait.depends_on
+            .diagnostic_references()
+            .iter()
+            .all(|dependency| dependency != "child.peer"),
+        "a module parameter spelling is not a resource address: {wait:?}",
+    );
+
+    let expected = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("source"))
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .expect("caller source has a resolved identity");
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index =
+        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
+            .expect("expanded graph resolves the caller-supplied wait dependency");
+    let resolved_wait = index
+        .resolve_wait_binding(&wait)
+        .expect("module-internal wait resolves structurally");
+    assert_eq!(
+        resolved_wait
+            .explicit_dependencies
+            .iter()
+            .collect::<Vec<_>>(),
+        [&expected],
+        "the wait must depend on the caller resource, never child.peer",
+    );
 }
 
 #[test]
@@ -9338,9 +9420,59 @@ let child = consumer_module { peer = source }
 
     assert_eq!(resolved.target_id.id(), &expected);
     assert_eq!(
-        resolved.until_predicate.lhs_segments.first().map(String::as_str),
+        resolved
+            .until_predicate
+            .lhs_segments
+            .first()
+            .map(String::as_str),
         Some("source"),
         "the predicate root must use the same caller resource as the wait target",
+    );
+}
+
+#[test]
+fn module_wait_on_value_argument_is_rejected() {
+    let tmp = tempfile::tempdir().expect("temporary wait-value fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  peer: String\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait peer {
+  until = peer.name == "source"
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = "source" }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let error = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("a value argument cannot be used as a wait target");
+
+    assert!(
+        error
+            .to_string()
+            .contains("wait 'peer': expected resource handle"),
+        "unexpected diagnostic: {error}",
     );
 }
 
@@ -9363,7 +9495,7 @@ let child = imported { peer = source }
     fixture.write("root/main.crn", caller);
 
     let parsed = fixture
-        .resolve_caller("root/main.crn")
+        .resolve_upstream_caller("root/main.crn")
         .expect("providerless module resolution retains the provisional handle argument");
     let consumer = parsed
         .resources
@@ -9372,68 +9504,9 @@ let child = imported { peer = source }
         .expect("expanded consumer");
 
     assert_eq!(
-        consumer.directives.depends_on.diagnostic_references(),
+        consumer.dependencies.depends_on.diagnostic_references(),
         ["source"],
         "a DottedUnresolved argument must substitute the caller handle before prefixing",
-    );
-}
-"#,
-    )
-    .expect("write module wait");
-
-    let root_source = r#"
-let source = mock.test.Record { name = "source" }
-let consumer_module = use { source = "../consumer" }
-let child = consumer_module { peer = source }
-"#;
-    fs::write(root.join("main.crn"), root_source).expect("write root source");
-
-    let context = handle_output_provider_context();
-    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
-    let mut parsed = resolve_modules_with_config(
-        parsed,
-        &root,
-        &context,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect("module wait expands");
-
-    let wait = parsed
-        .wait_bindings
-        .iter()
-        .find(|wait| wait.binding == "child.ready")
-        .expect("expanded wait")
-        .clone();
-    assert_eq!(wait.depends_on.diagnostic_references(), ["source"]);
-    assert!(
-        wait.depends_on
-            .diagnostic_references()
-            .iter()
-            .all(|dependency| dependency != "child.peer"),
-        "a module parameter spelling is not a resource address: {wait:?}",
-    );
-
-    let expected = parsed
-        .resources
-        .iter()
-        .find(|resource| resource.binding.as_deref() == Some("source"))
-        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
-        .expect("caller source has a resolved identity");
-    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
-    let data_sources = parsed.data_sources.clone();
-    let index =
-        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
-            .expect("expanded graph resolves the caller-supplied wait dependency");
-    let resolved_wait = index
-        .resolve_wait_binding(&wait)
-        .expect("module-internal wait resolves structurally");
-    assert_eq!(
-        resolved_wait
-            .explicit_dependencies
-            .iter()
-            .collect::<Vec<_>>(),
-        [&expected],
-        "the wait must depend on the caller resource, never child.peer",
     );
 }
 
@@ -9526,14 +9599,6 @@ let child = consumer_module {}
         .expect("the v20 collection spelling projects through the live graph")
         .into_dependencies();
     assert_eq!(live_projection.to_resolved_dependencies(), expected);
-    let saved_projection = index
-        .legacy_dependency_projection_index()
-        .expect("saved plans retain every legacy-addressable projection");
-    let saved_projection = saved_projection
-        .project_legacy_dependency("child.records", "saved legacy loop-group fixture")
-        .expect("the collection spelling survives the saved-plan boundary")
-        .into_dependencies();
-    assert_eq!(saved_projection.to_resolved_dependencies(), expected);
 }
 
 #[test]

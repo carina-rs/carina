@@ -94,7 +94,7 @@ fn resolve_refs_inner(
             crate::parser::ResourceRef::Resource(resource),
         );
         if !deps.is_empty() {
-            resource.dependency_bindings = deps.into_iter().collect();
+            resource.dependencies.value_bindings = deps.into_iter().collect();
         }
     }
 
@@ -182,7 +182,7 @@ fn resolve_data_source_refs_inner(
             crate::parser::ResourceRef::DataSource(data_source),
         );
         if !deps.is_empty() {
-            data_source.dependency_bindings = deps.into_iter().collect();
+            data_source.dependencies.value_bindings = deps.into_iter().collect();
         }
     }
     let mark_unresolved_upstream = !unresolved_upstream_bindings.is_empty();
@@ -1429,14 +1429,17 @@ mod tests {
             &crate::schema::SchemaRegistry::new(),
             &resources,
         );
-        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-            managed: &resources,
-            compositions: &[],
-            managed_current: &current,
-            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
-            wait_aliases: &[],
-        });
+        let bindings =
+            ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+                crate::resource::UnexpandedDependencyFields,
+            > {
+                managed: &resources,
+                compositions: &[],
+                managed_current: &current,
+                data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            });
         let fallback = Value::Concrete(ConcreteValue::String("d".into()));
         let expression = coalesce(
             Value::resource_ref("producer", "comment", vec![]),
@@ -3512,7 +3515,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            resources[0].dependency_bindings.contains("network"),
+            resources[0].dependencies.value_bindings.contains("network"),
             "dependency_bindings must record the upstream binding even after stamping"
         );
     }
@@ -3596,7 +3599,7 @@ mod tests {
     #[test]
     fn resolve_ref_value_wait_binding_absent_target_left_intact() {
         let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),

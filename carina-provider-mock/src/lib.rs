@@ -1026,10 +1026,10 @@ impl MockProvider {
         })
     }
 
-    async fn create_resource<S>(
+    async fn create_resource<S, D>(
         &self,
         id: ResourceId,
-        resource: Resource<S>,
+        resource: Resource<S, D>,
         attempt: CreateAttempt,
     ) -> Result<CreateOutcome, CreateFailure> {
         let mode = env::var("CARINA_MOCK_CREATE_MODE").unwrap_or_else(|_| "success".to_string());
@@ -1155,10 +1155,10 @@ impl MockProvider {
         Ok(issued.succeeded(state_attrs))
     }
 
-    fn persist_resumed_resource<S>(
+    fn persist_resumed_resource<S, D>(
         &self,
         id: &ResourceId,
-        resource: &Resource<S>,
+        resource: &Resource<S, D>,
     ) -> ProviderResult<HashMap<String, Value>> {
         let _state_guard = Self::lock_state_file()?;
         let mut states = self.load_states_for_operation()?;

@@ -284,7 +284,9 @@ mod tests {
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     fn dummy_create_effect() -> Effect {

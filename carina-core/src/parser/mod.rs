@@ -38,7 +38,7 @@ pub use ast::{
     ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub(crate) use ast::{
-    BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
+    BareBindingSource, DeclarationSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
     ParsedDeferredForIterableState,
 };
 pub(crate) use config::ProviderCustomTypeSource;

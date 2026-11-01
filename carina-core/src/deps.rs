@@ -26,10 +26,10 @@ pub fn get_resource_dependencies<S>(resource: &Resource<S>) -> HashSet<String> {
     // transit_gateway_id is itself `tgw.id`. In this case, collect_dependencies
     // finds "tgw" but misses "tgw_attach". The typed dependency_bindings field
     // (saved before resolution) correctly records the original direct dependency.
-    for name in &resource.dependency_bindings {
+    for name in &resource.dependencies.value_bindings {
         deps.insert(name.clone());
     }
-    for name in &resource.directives.depends_on {
+    for name in &resource.dependencies.depends_on {
         deps.insert(name.diagnostic_reference());
     }
     deps
@@ -75,10 +75,10 @@ pub fn get_data_source_dependencies<S>(
     for value in data_source.attributes.values() {
         collect_dependencies(value, &mut deps);
     }
-    for name in &data_source.dependency_bindings {
+    for name in &data_source.dependencies.value_bindings {
         deps.insert(name.clone());
     }
-    for name in &data_source.directives.depends_on {
+    for name in &data_source.dependencies.depends_on {
         deps.insert(name.diagnostic_reference());
     }
     deps
@@ -240,7 +240,9 @@ mod tests {
         Effect::Wait {
             id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: crate::wait::ManagedWaitTarget::new(
-                &crate::resource::ResolvedResource::new(Resource::new("acm.Certificate", "cert")),
+                &crate::resource::ResolvedResource::new(
+                    Resource::new("acm.Certificate", "cert").with_dependency_phase(()),
+                ),
             ),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -406,7 +408,7 @@ mod tests {
             Value::resource_ref("rt", "route_table_id", vec![]),
         );
         // dependency_bindings was saved before resolution with the CORRECT deps
-        resource.dependency_bindings =
+        resource.dependencies.value_bindings =
             std::collections::BTreeSet::from(["rt".to_string(), "tgw_attach".to_string()]);
 
         let deps = get_resource_dependencies(&resource);
@@ -658,7 +660,7 @@ mod tests {
     #[test]
     fn directives_depends_on_is_unioned_into_resource_dependencies() {
         let mut bucket = Resource::new("s3.Bucket", "bucket");
-        bucket.directives.depends_on =
+        bucket.dependencies.depends_on =
             UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::BareBinding(
                 BindingName::from("role"),
             )]);
@@ -678,7 +680,7 @@ mod tests {
             "encryption_key".to_string(),
             Value::resource_ref("key", "arn", vec![]),
         );
-        bucket.directives.depends_on =
+        bucket.dependencies.depends_on =
             UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::BareBinding(
                 BindingName::from("role"),
             )]);

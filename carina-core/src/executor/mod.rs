@@ -378,9 +378,9 @@ impl AcceptedRequest {
     /// accepted request. Production executor paths retain resolved values;
     /// provider-ready bootstrap and test paths may use the supplied resource
     /// as their already-resolved fallback.
-    pub fn sent_desired_attributes<'a, S>(
+    pub fn sent_desired_attributes<'a, S, D>(
         &'a self,
-        fallback_resource: &'a Resource<S>,
+        fallback_resource: &'a Resource<S, D>,
     ) -> SentDesiredAttributes<'a> {
         match self.resolved_desired_attributes.as_ref() {
             Some(attributes) => {
@@ -643,9 +643,9 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
 
     pub(in crate::executor) fn resource_input(
         &self,
-        resolved: &Resource<S>,
+        resolved: &Resource<S, ()>,
         runtime_authored: bool,
-    ) -> Result<provider_ready::CheckInput<Resource<S>>, String> {
+    ) -> Result<provider_ready::CheckInput<Resource<S, ()>, Resource<S>>, String> {
         if runtime_authored || matches!(self, Self::Authored) {
             return Ok(provider_ready::CheckInput::Authored(resolved.clone()));
         }
@@ -669,8 +669,8 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
 
     pub(in crate::executor) fn data_source_input(
         &self,
-        resolved: &DataSource<S>,
-    ) -> Result<provider_ready::CheckInput<DataSource<S>>, String> {
+        resolved: &DataSource<S, ()>,
+    ) -> Result<provider_ready::CheckInput<DataSource<S, ()>, DataSource<S>>, String> {
         match self {
             Self::Authored => Ok(provider_ready::CheckInput::Authored(resolved.clone())),
             Self::PlanNormalized {
@@ -747,8 +747,8 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
     }
 }
 
-pub fn unresolved_data_source_inputs<S>(
-    resource: &DataSource<S>,
+pub fn unresolved_data_source_inputs<S, D>(
+    resource: &DataSource<S, D>,
 ) -> Vec<UnresolvedDataSourceInput> {
     resource
         .attributes

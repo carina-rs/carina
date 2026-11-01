@@ -648,10 +648,6 @@ impl Ord for ResolvedResourceId {
 pub struct ResolvedDependencies(BTreeSet<ResolvedResourceId>);
 
 impl ResolvedDependencies {
-    pub fn new(dependencies: BTreeSet<ResolvedResourceId>) -> Self {
-        Self(dependencies)
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &ResolvedResourceId> {
         self.0.iter()
     }
@@ -668,10 +664,6 @@ impl ResolvedDependencies {
         self.0.contains(dependency)
     }
 
-    pub fn as_set(&self) -> &BTreeSet<ResolvedResourceId> {
-        &self.0
-    }
-
     pub fn insert(&mut self, dependency: ResolvedResourceId) -> bool {
         self.0.insert(dependency)
     }
@@ -679,6 +671,20 @@ impl ResolvedDependencies {
     pub fn extend(&mut self, dependencies: impl IntoIterator<Item = ResolvedResourceId>) {
         self.0.extend(dependencies);
     }
+}
+
+/// Parser-phase dependency fields that must be consumed by graph resolution.
+///
+/// The dependency phase is a type parameter on [`Resource`] and
+/// [`DataSource`]. Resolved wrappers hold the same payload with `D = ()`, so
+/// parser spellings cannot survive into post-resolution code as silently empty
+/// collections.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnexpandedDependencyFields {
+    /// Binding snapshots retained while value evaluation folds expressions.
+    pub value_bindings: BTreeSet<String>,
+    /// Explicit `directives.depends_on` operands in parser form.
+    pub depends_on: crate::parser::UnexpandedDependencies,
 }
 
 impl FromIterator<ResolvedResourceId> for ResolvedDependencies {
@@ -696,22 +702,46 @@ impl IntoIterator for ResolvedDependencies {
     }
 }
 
+pub(crate) const SYNTHETIC_TYPE_PREFIX: &str = "__";
+
 /// Managed-resource rows that may be persisted as destroy-ordering edges.
 ///
 /// Unlike [`ResolvedDependencies`], this set can never contain plan-scoped
 /// nodes such as data sources or waits. Non-empty values are minted only by
-/// the expanded-graph projection in [`crate::resolved_graph`]. State loading
-/// may deserialize the already-projected wire representation, but no public
-/// insertion or `FromIterator` route exists.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// the expanded-graph projection in [`crate::resolved_graph`]. Persisted data
+/// must cross [`Self::decode_persisted`]; no public insertion, direct
+/// deserialization, or `FromIterator` route exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct PersistedDestroyDependencies(BTreeSet<ResolvedResourceId>);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("dependency `{0}` is not a managed state row")]
+pub struct NotAManagedRow(pub ResolvedResourceId);
 
 impl PersistedDestroyDependencies {
     pub(crate) fn from_graph_projection(
         dependencies: impl IntoIterator<Item = ResolvedResourceId>,
     ) -> Self {
         Self(dependencies.into_iter().collect())
+    }
+
+    /// Decode the persisted set after proving every address has managed-row
+    /// shape. Data-source exclusion remains a writer-side graph invariant;
+    /// unlike scheduler nodes, a dangling data-source address is not
+    /// distinguishable from a managed row that left the configuration.
+    pub fn decode_persisted(
+        dependencies: BTreeSet<ResolvedResourceId>,
+    ) -> Result<Self, NotAManagedRow> {
+        if let Some(dependency) = dependencies.iter().find(|dependency| {
+            dependency.provider().is_empty()
+                || dependency
+                    .resource_type()
+                    .starts_with(SYNTHETIC_TYPE_PREFIX)
+        }) {
+            return Err(NotAManagedRow(dependency.clone()));
+        }
+        Ok(Self(dependencies))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &ResolvedResourceId> {
@@ -764,6 +794,16 @@ impl PersistedDestroyDependencies {
     }
 }
 
+fn deserialize_persisted_destroy_dependencies<'de, D>(
+    deserializer: D,
+) -> Result<PersistedDestroyDependencies, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let dependencies = BTreeSet::<ResolvedResourceId>::deserialize(deserializer)?;
+    PersistedDestroyDependencies::decode_persisted(dependencies).map_err(serde::de::Error::custom)
+}
+
 /// Exhaustive result of projecting one expanded graph source to state rows.
 ///
 /// External/upstream values and literal module arguments deliberately produce
@@ -772,11 +812,15 @@ impl PersistedDestroyDependencies {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistedDestroyDependencyProjection {
-    Managed(PersistedDestroyDependencies),
+    Managed(
+        #[serde(deserialize_with = "deserialize_persisted_destroy_dependencies")]
+        PersistedDestroyDependencies,
+    ),
     NoLocalDestroyEdge,
 }
 
 impl PersistedDestroyDependencyProjection {
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn into_dependencies(self) -> PersistedDestroyDependencies {
         match self {
             Self::Managed(dependencies) => dependencies,
@@ -1059,6 +1103,22 @@ impl Borrow<ResourceId> for ResolvedResourceId {
 /// let resource = Resource::pending("test");
 /// let _: ResolvedResource = resource.into();
 /// ```
+///
+/// Resolved resources do not expose parser-phase dependency fields:
+///
+/// ```compile_fail,E0609
+/// use carina_core::resource::ResolvedResource;
+///
+/// let resource: &ResolvedResource = unimplemented!();
+/// let _ = &resource.as_inner().dependency_bindings;
+/// ```
+///
+/// ```compile_fail,E0609
+/// use carina_core::resource::ResolvedResource;
+///
+/// let resource: &ResolvedResource = unimplemented!();
+/// let _ = &resource.as_inner().dependencies.value_bindings;
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "S: Serialize + Clone",
@@ -1066,7 +1126,7 @@ impl Borrow<ResourceId> for ResolvedResourceId {
 ))]
 #[serde(try_from = "ResolvedResourceWire<S>", into = "ResolvedResourceWire<S>")]
 pub struct ResolvedResource<S = ModuleSource> {
-    resource: Resource<S>,
+    resource: Resource<S, ()>,
     value_dependencies: ResolvedDependencies,
     explicit_dependencies: ResolvedDependencies,
     persisted_value_destroy_dependencies: PersistedDestroyDependencies,
@@ -1078,19 +1138,21 @@ pub struct ResolvedResource<S = ModuleSource> {
 #[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
 struct ResolvedResourceWire<S> {
     #[serde(flatten)]
-    resource: Resource<S>,
+    resource: Resource<S, ()>,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
     value_dependencies: ResolvedDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
     explicit_dependencies: ResolvedDependencies,
     #[serde(
         default,
-        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
     )]
     persisted_value_destroy_dependencies: PersistedDestroyDependencies,
     #[serde(
         default,
-        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
     )]
     persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
@@ -1103,19 +1165,21 @@ struct ResolvedResourceWire<S> {
 #[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
 pub struct SchemaUnresolvedResource<S = SavedModuleSource> {
     #[serde(flatten)]
-    resource: Resource<S>,
+    resource: Resource<S, ()>,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
     value_dependencies: ResolvedDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
     explicit_dependencies: ResolvedDependencies,
     #[serde(
         default,
-        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
     )]
     persisted_value_destroy_dependencies: PersistedDestroyDependencies,
     #[serde(
         default,
-        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
     )]
     persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
@@ -1150,7 +1214,7 @@ impl<S> SchemaUnresolvedResource<S> {
 
     /// Borrow the saved-plan payload without weakening the fact that its
     /// dependency addresses are already resolved.
-    pub fn as_resource(&self) -> &Resource<S> {
+    pub fn as_resource(&self) -> &Resource<S, ()> {
         &self.resource
     }
 
@@ -1165,8 +1229,6 @@ impl<S> SchemaUnresolvedResource<S> {
             return Err(PendingResourceIdentityError::new(self.resource.id.clone()).into());
         }
         resolve_resource_ignore_changes(&mut self.resource, registry)?;
-        self.resource.dependency_bindings.clear();
-        self.resource.directives.depends_on = Default::default();
         Ok(ResolvedResource::from_resolved_parts_with_reads(
             self.resource,
             self.value_dependencies,
@@ -1223,9 +1285,6 @@ impl PendingResourceIdentityError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedResourceError {
     PendingIdentity(PendingResourceIdentityError),
-    UnresolvedDependencies {
-        id: ResourceId,
-    },
     MissingSchema {
         id: ResourceId,
     },
@@ -1239,10 +1298,6 @@ impl Display for ResolvedResourceError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::PendingIdentity(error) => Display::fmt(error, formatter),
-            Self::UnresolvedDependencies { id } => write!(
-                formatter,
-                "resource '{id}' reached the resolved boundary with unexpanded dependencies"
-            ),
             Self::MissingSchema { id } => write!(
                 formatter,
                 "resource '{id}' has ignore_changes paths but no managed resource schema"
@@ -1265,9 +1320,7 @@ impl std::error::Error for ResolvedResourceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PendingIdentity(error) => Some(error),
-            Self::UnresolvedDependencies { .. }
-            | Self::MissingSchema { .. }
-            | Self::InvalidIgnoreChanges { .. } => None,
+            Self::MissingSchema { .. } | Self::InvalidIgnoreChanges { .. } => None,
         }
     }
 }
@@ -1285,8 +1338,8 @@ impl From<PendingResourceIdentityError> for ResolvedResourceError {
 /// against the fingerprint-validated schemas before apply; identity validation
 /// remains the responsibility of [`ResolvedResource::resolve_with_schemas`]
 /// after the template has been materialized.
-pub(crate) fn resolve_resource_ignore_changes<S>(
-    resource: &mut Resource<S>,
+pub(crate) fn resolve_resource_ignore_changes<S, D>(
+    resource: &mut Resource<S, D>,
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), ResolvedResourceError> {
     let ignore_changes = if resource.directives.ignore_changes.is_empty() {
@@ -1312,7 +1365,7 @@ pub(crate) fn resolve_resource_ignore_changes<S>(
 impl ResolvedResource {
     /// Construct a resource from an already-resolved id.
     pub fn from_id(id: ResolvedResourceId) -> Self {
-        Self::new(Resource::from_id(id.into_inner()))
+        Self::new(Resource::from_id(id.into_inner()).with_dependency_phase(()))
     }
 }
 
@@ -1322,7 +1375,7 @@ impl<S> ResolvedResource<S> {
     /// Panics if identity is pending or authored `ignore_changes` paths do not
     /// match the attached resolved metadata. Raw DSL and saved-plan resources
     /// must enter through [`Self::resolve_with_schemas`] instead.
-    pub fn new(resource: Resource<S>) -> Self {
+    pub fn new(resource: Resource<S, ()>) -> Self {
         assert!(
             matches!(
                 resource.id.identity_state(),
@@ -1333,10 +1386,6 @@ impl<S> ResolvedResource<S> {
         assert!(
             resolved_ignore_changes_match(&resource),
             "ResolvedResource with ignore_changes requires schema resolution"
-        );
-        assert!(
-            resource.directives.depends_on.is_empty() && resource.dependency_bindings.is_empty(),
-            "ResolvedResource requires dependencies to be resolved"
         );
         Self {
             resource,
@@ -1351,7 +1400,7 @@ impl<S> ResolvedResource<S> {
     /// Construct the post-expansion form after every dependency operand has
     /// been resolved to a complete resource address.
     pub fn from_resolved_parts(
-        resource: Resource<S>,
+        resource: Resource<S, ()>,
         value_dependencies: ResolvedDependencies,
         explicit_dependencies: ResolvedDependencies,
     ) -> Self {
@@ -1365,7 +1414,7 @@ impl<S> ResolvedResource<S> {
     }
 
     pub(crate) fn from_resolved_parts_with_reads(
-        resource: Resource<S>,
+        resource: Resource<S, ()>,
         value_dependencies: ResolvedDependencies,
         explicit_dependencies: ResolvedDependencies,
         value_dependency_reads: ResolvedDependencyReads,
@@ -1380,10 +1429,6 @@ impl<S> ResolvedResource<S> {
         assert!(
             resolved_ignore_changes_match(&resource),
             "ResolvedResource with ignore_changes requires schema resolution"
-        );
-        assert!(
-            resource.directives.depends_on.is_empty() && resource.dependency_bindings.is_empty(),
-            "ResolvedResource cannot retain unexpanded dependencies"
         );
         Self {
             resource,
@@ -1418,7 +1463,7 @@ impl<S> ResolvedResource<S> {
     }
 
     /// Try to construct; returns `None` if identity is pending.
-    pub fn try_new(resource: Resource<S>) -> Option<Self> {
+    pub fn try_new(resource: Resource<S, ()>) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
             ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
@@ -1427,6 +1472,7 @@ impl<S> ResolvedResource<S> {
 
     /// Convert a whole resource collection at the pipeline boundary where
     /// identity assignment is complete.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn collect_resolved(
         resources: impl IntoIterator<Item = Resource<S>>,
     ) -> Result<Vec<Self>, PendingResourceIdentityError> {
@@ -1436,7 +1482,9 @@ impl<S> ResolvedResource<S> {
                 ResourceIdentityState::Pending(_) => {
                     Err(PendingResourceIdentityError { id: resource.id })
                 }
-                ResourceIdentityState::Resolved(_) => Ok(Self::new(resource)),
+                ResourceIdentityState::Resolved(_) => {
+                    Ok(Self::new(resource.with_dependency_phase(())))
+                }
             })
             .collect()
     }
@@ -1444,7 +1492,7 @@ impl<S> ResolvedResource<S> {
     /// Convert resources at the planning boundary and resolve every authored
     /// ignore path against its managed resource schema.
     pub fn collect_resolved_with_schemas(
-        resources: impl IntoIterator<Item = Resource<S>>,
+        resources: impl IntoIterator<Item = Resource<S, ()>>,
         registry: &crate::schema::SchemaRegistry,
     ) -> Result<Vec<Self>, ResolvedResourceError> {
         resources
@@ -1454,7 +1502,7 @@ impl<S> ResolvedResource<S> {
     }
 
     pub fn resolve_with_schemas(
-        mut resource: Resource<S>,
+        mut resource: Resource<S, ()>,
         registry: &crate::schema::SchemaRegistry,
     ) -> Result<Self, ResolvedResourceError> {
         if matches!(
@@ -1467,33 +1515,28 @@ impl<S> ResolvedResource<S> {
             .into());
         }
         resolve_resource_ignore_changes(&mut resource, registry)?;
-        if !resource.directives.depends_on.is_empty() || !resource.dependency_bindings.is_empty() {
-            return Err(ResolvedResourceError::UnresolvedDependencies {
-                id: resource.id.clone(),
-            });
-        }
         Ok(Self::new(resource))
     }
 
     /// Borrow the inner [`Resource`].
-    pub fn as_inner(&self) -> &Resource<S> {
+    pub fn as_inner(&self) -> &Resource<S, ()> {
         &self.resource
     }
 
     /// Borrow the underlying resource for provider-boundary consumers.
-    pub fn as_resource(&self) -> &Resource<S> {
+    pub fn as_resource(&self) -> &Resource<S, ()> {
         self.as_inner()
     }
 
     /// Consume and return the inner [`Resource`].
-    pub fn into_inner(self) -> Resource<S> {
+    pub fn into_inner(self) -> Resource<S, ()> {
         self.resource
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
-        Resource<S>,
+        Resource<S, ()>,
         ResolvedDependencies,
         ResolvedDependencies,
         PersistedDestroyDependencies,
@@ -1513,7 +1556,7 @@ impl<S> ResolvedResource<S> {
     /// Replace only the value-bearing resource payload while preserving the
     /// already-resolved graph metadata. Used by redaction and rehydration,
     /// which may rewrite attributes but must not discard dependency edges.
-    pub fn replace_inner(&self, resource: Resource<S>) -> Self {
+    pub fn replace_inner(&self, resource: Resource<S, ()>) -> Self {
         assert_eq!(
             resource.id, self.resource.id,
             "replacing a resolved resource cannot change its address"
@@ -1546,6 +1589,7 @@ impl<S> ResolvedResource<S> {
         &self.persisted_explicit_destroy_dependencies
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn persisted_destroy_dependencies(&self) -> PersistedDestroyDependencies {
         let mut dependencies = self.persisted_value_destroy_dependencies.clone();
         dependencies.extend_projected(&self.persisted_explicit_destroy_dependencies);
@@ -1596,23 +1640,23 @@ impl<S> ResolvedResource<S> {
 }
 
 impl<S> Deref for ResolvedResource<S> {
-    type Target = Resource<S>;
+    type Target = Resource<S, ()>;
 
     fn deref(&self) -> &Self::Target {
         &self.resource
     }
 }
 
-impl<S> From<ResolvedResource<S>> for Resource<S> {
+impl<S> From<ResolvedResource<S>> for Resource<S, ()> {
     fn from(resource: ResolvedResource<S>) -> Self {
         resource.resource
     }
 }
 
-impl<S> TryFrom<Resource<S>> for ResolvedResource<S> {
+impl<S> TryFrom<Resource<S, ()>> for ResolvedResource<S> {
     type Error = String;
 
-    fn try_from(resource: Resource<S>) -> Result<Self, Self::Error> {
+    fn try_from(resource: Resource<S, ()>) -> Result<Self, Self::Error> {
         if !resolved_ignore_changes_match(&resource) {
             return Err("ignore_changes requires schema resolution".to_string());
         }
@@ -1632,11 +1676,6 @@ impl<S> TryFrom<ResolvedResourceWire<S>> for ResolvedResource<S> {
             ResourceIdentityState::Pending(_)
         ) {
             return Err("identity is required".to_string());
-        }
-        if !wire.resource.directives.depends_on.is_empty()
-            || !wire.resource.dependency_bindings.is_empty()
-        {
-            return Err("resolved resource contains unexpanded dependencies".to_string());
         }
         Ok(Self {
             resource: wire.resource,
@@ -1663,7 +1702,7 @@ impl<S> From<ResolvedResource<S>> for ResolvedResourceWire<S> {
     }
 }
 
-fn resolved_ignore_changes_match<S>(resource: &Resource<S>) -> bool {
+fn resolved_ignore_changes_match<S, D>(resource: &Resource<S, D>) -> bool {
     let authored = resource
         .directives
         .ignore_changes
@@ -1680,8 +1719,8 @@ fn resolved_ignore_changes_match<S>(resource: &Resource<S>) -> bool {
     authored == resolved
 }
 
-impl<S> AsRef<Resource<S>> for ResolvedResource<S> {
-    fn as_ref(&self) -> &Resource<S> {
+impl<S> AsRef<Resource<S, ()>> for ResolvedResource<S> {
+    fn as_ref(&self) -> &Resource<S, ()> {
         self.as_inner()
     }
 }
@@ -6876,12 +6915,6 @@ pub struct Directives {
     /// can only be obtained through [`PreventDestroy::resolve`].
     #[serde(default)]
     prevent_destroy: PreventDestroy,
-    /// Explicit ordering edges declared by the user. Each element is the
-    /// binding name of a sibling `let` (resource / wait / module).
-    /// Set semantics (deduplicated, order-insensitive); represented as
-    /// Vec to preserve source order for `carina fmt` round-tripping.
-    #[serde(skip)]
-    pub depends_on: crate::parser::UnexpandedDependencies,
     /// Authored attribute paths whose external changes Carina must preserve.
     /// These remain syntax-only until resolved against the resource schema.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -6909,7 +6942,8 @@ pub struct PersistedDirectives {
     prevent_destroy: PreventDestroy,
     #[serde(
         default,
-        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
     )]
     pub depends_on: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6957,7 +6991,10 @@ impl Display for PersistedDirectiveField {
 enum PersistedDirectiveFieldValue {
     Boolean(bool),
     PreventDestroy(PreventDestroy),
-    DependsOn(PersistedDestroyDependencies),
+    DependsOn(
+        #[serde(deserialize_with = "deserialize_persisted_destroy_dependencies")]
+        PersistedDestroyDependencies,
+    ),
     ProviderInstance(Option<String>),
 }
 
@@ -7004,11 +7041,6 @@ impl Directives {
 
     pub fn with_create_before_destroy(mut self, value: bool) -> Self {
         self.create_before_destroy = value;
-        self
-    }
-
-    pub fn with_depends_on(mut self, depends_on: crate::parser::UnexpandedDependencies) -> Self {
-        self.depends_on = depends_on;
         self
     }
 
@@ -7172,7 +7204,6 @@ impl PersistedDirectives {
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on: _unexpanded_dependencies,
             ignore_changes: _ignore_changes,
             provider_instance,
         } = directives;
@@ -7192,17 +7223,13 @@ impl From<&PersistedDirectives> for Directives {
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on,
+            depends_on: _depends_on,
             provider_instance,
         } = directives;
         Self {
             force_delete: *force_delete,
             create_before_destroy: *create_before_destroy,
             prevent_destroy: *prevent_destroy,
-            depends_on: {
-                let _persisted_dependencies = depends_on;
-                crate::parser::UnexpandedDependencies::default()
-            },
             ignore_changes: Vec::new(),
             provider_instance: provider_instance.clone(),
         }
@@ -7597,8 +7624,11 @@ impl DefaultTagKeys {
 /// let _: Resource = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
-pub struct Resource<S = ModuleSource> {
+#[serde(bound(
+    serialize = "S: Serialize",
+    deserialize = "S: Deserialize<'de>, D: Default"
+))]
+pub struct Resource<S = ModuleSource, D = UnexpandedDependencyFields> {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     ///
@@ -7624,14 +7654,9 @@ pub struct Resource<S = ModuleSource> {
     /// Binding name from `let` bindings in DSL (e.g., `let vpc = ...`)
     #[serde(default)]
     pub binding: Option<String>,
-    /// Binding names of resources this resource depends on (via ResourceRef).
-    ///
-    /// Set semantics (BTreeSet): the same binding referenced multiple times
-    /// in the resource's attributes contributes a single entry, and
-    /// iteration is alphabetically sorted so consumers (plan display,
-    /// state files) see a deterministic order. See #2228.
-    #[serde(default, skip)]
-    pub dependency_bindings: BTreeSet<String>,
+    /// Dependency fields for the current graph-resolution phase.
+    #[serde(skip)]
+    pub dependencies: D,
     /// Module source info for resources that belong to a module
     #[serde(default)]
     pub module_source: Option<S>,
@@ -7675,7 +7700,7 @@ pub type SavedResource = Resource<SavedModuleSource>;
 
 /// Source-neutral resource payload exposed to provider normalizers and CRUD
 /// request construction.
-pub type ProviderResource = Resource<ProviderModuleSource>;
+pub type ProviderResource = Resource<ProviderModuleSource, ()>;
 
 impl From<Resource> for ProviderResource {
     fn from(resource: Resource) -> Self {
@@ -7683,8 +7708,8 @@ impl From<Resource> for ProviderResource {
     }
 }
 
-impl From<Resource> for SavedResource {
-    fn from(resource: Resource) -> Self {
+impl<D> From<Resource<ModuleSource, D>> for Resource<SavedModuleSource, D> {
+    fn from(resource: Resource<ModuleSource, D>) -> Self {
         let Resource {
             id,
             attributes,
@@ -7692,7 +7717,7 @@ impl From<Resource> for SavedResource {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys,
             loop_provenance,
@@ -7705,7 +7730,7 @@ impl From<Resource> for SavedResource {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
             default_tag_keys,
             loop_provenance,
@@ -7723,7 +7748,7 @@ impl Resource {
             resolved_ignore_changes: ResolvedIgnoreChanges::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: DefaultTagKeys::default(),
             loop_provenance: LoopProvenance::default(),
@@ -7776,7 +7801,7 @@ impl Resource {
     }
 }
 
-impl<S: Clone> Resource<S> {
+impl<S: Clone, D: Clone> Resource<S, D> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut resource = self.clone();
         resource.id = self.id.instantiate_pending();
@@ -7790,7 +7815,7 @@ impl<S: Clone> Resource<S> {
     }
 }
 
-impl<S> Resource<S> {
+impl<S, D> Resource<S, D> {
     /// Whether any value-bearing field contains a saved-plan secret marker.
     ///
     /// The exhaustive destructure keeps this security boundary compiler-checked
@@ -7803,7 +7828,7 @@ impl<S> Resource<S> {
             resolved_ignore_changes: _resolved_ignore_changes,
             prefixes: _prefixes,
             binding: _binding,
-            dependency_bindings: _dependency_bindings,
+            dependencies: _dependencies,
             module_source: _module_source,
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
@@ -7819,17 +7844,16 @@ impl<S> Resource<S> {
         let Resource {
             id,
             attributes,
-            mut directives,
+            directives,
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings: _,
+            dependencies: _,
             module_source: _,
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
         } = self;
-        directives.depends_on = Default::default();
         ProviderResource {
             id,
             attributes,
@@ -7837,7 +7861,7 @@ impl<S> Resource<S> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings: Default::default(),
+            dependencies: (),
             module_source: None,
             default_tag_keys,
             loop_provenance: LoopProvenance::default(),
@@ -7847,33 +7871,26 @@ impl<S> Resource<S> {
 
     /// Apply provider-normalized fields while retaining the exact live or
     /// saved host metadata already attached to this resource.
-    pub(crate) fn apply_provider_resource(&mut self, provider: ProviderResource) {
+    pub(crate) fn apply_provider_resource(&mut self, provider: ProviderResource)
+    where
+        D: Default,
+    {
         let module_source = self.module_source.take();
         let loop_provenance = std::mem::take(&mut self.loop_provenance);
-        let dependency_bindings = std::mem::take(&mut self.dependency_bindings);
-        let authored_depends_on = std::mem::take(&mut self.directives.depends_on);
+        let dependencies = std::mem::take(&mut self.dependencies);
         let Resource {
             id,
             attributes,
-            mut directives,
+            directives,
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings: provider_dependency_bindings,
+            dependencies: (),
             module_source: _,
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
         } = provider;
-        assert!(
-            provider_dependency_bindings.is_empty(),
-            "provider normalizer returned host-only dependency bindings for {id}",
-        );
-        assert!(
-            directives.depends_on.is_empty(),
-            "provider normalizer returned host-only depends_on operands for {id}",
-        );
-        directives.depends_on = authored_depends_on;
         *self = Self {
             id,
             attributes,
@@ -7881,7 +7898,7 @@ impl<S> Resource<S> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys,
             loop_provenance,
@@ -7983,10 +8000,80 @@ impl<S> Resource<S> {
         self.binding = Some(binding.into());
         self
     }
+}
 
+impl<S> Resource<S> {
     pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
-        self.dependency_bindings = deps;
+        self.dependencies.value_bindings = deps;
         self
+    }
+
+    pub(crate) fn with_dependency_phase<D2>(self, dependencies: D2) -> Resource<S, D2> {
+        let Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependencies: _,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        } = self;
+        Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependencies,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        }
+    }
+
+    /// Test-only adapter for malformed saved-plan fixtures that deliberately
+    /// exercise validation after graph dependency resolution.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn into_resolved_dependency_phase_for_test(self) -> Resource<S, ()> {
+        self.with_dependency_phase(())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl<S> Resource<S, ()> {
+    pub(crate) fn into_unexpanded_for_test(self) -> Resource<S> {
+        let Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependencies: (),
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        } = self;
+        Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependencies: UnexpandedDependencyFields::default(),
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        }
     }
 }
 
@@ -8781,8 +8868,8 @@ mod enum_attr_tests {
 
 /// Check that a resource's attribute tree is free of any
 /// [`Value::Deferred`] placeholder before provider dispatch.
-pub(crate) fn assert_resource_fully_resolved<S>(
-    resource: &Resource<S>,
+pub(crate) fn assert_resource_fully_resolved<S, D>(
+    resource: &Resource<S, D>,
 ) -> Result<(), crate::value::SerializationError> {
     for value in resource.attributes.values() {
         assert_value_fully_resolved(value)?;
@@ -9216,10 +9303,10 @@ impl PlanInputCurrent {
     }
 }
 
-pub fn into_plan_input_current_map<S>(
+pub fn into_plan_input_current_map<S, D>(
     mut current: HashMap<ResourceId, Current>,
     schemas: &crate::schema::SchemaRegistry,
-    resources: &[Resource<S>],
+    resources: &[Resource<S, D>],
 ) -> HashMap<ResourceId, PlanInputCurrent> {
     crate::value::canonicalize_states_with_schemas(&mut current, schemas);
     crate::utils::lift_current_state_enum_leaves(&mut current, resources, schemas);
@@ -9232,10 +9319,10 @@ pub fn into_plan_input_current_map<S>(
 /// Borrowing counterpart used when a caller layers configured and orphan
 /// state. Each current value is cloned once into the canonicalized plan-input
 /// map; the source maps and resource graph are never deep-cloned first.
-pub fn plan_input_current_map_from_refs<'a, S: 'a>(
+pub fn plan_input_current_map_from_refs<'a, S: 'a, D: 'a>(
     current: impl IntoIterator<Item = (&'a ResourceId, &'a Current)>,
     schemas: &crate::schema::SchemaRegistry,
-    resources: impl IntoIterator<Item = &'a Resource<S>>,
+    resources: impl IntoIterator<Item = &'a Resource<S, D>>,
 ) -> HashMap<ResourceId, PlanInputCurrent> {
     let mut current = current
         .into_iter()

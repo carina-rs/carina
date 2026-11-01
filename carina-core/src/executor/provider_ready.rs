@@ -189,9 +189,9 @@ impl<'a> ProviderPreparationContext<'a> {
 /// Whether a provider-bound value is still in its authored form or came from
 /// the plan after normalization. The latter always carries the authored
 /// snapshot; omitting it is not representable at the preparation seam.
-pub(super) enum CheckInput<T> {
+pub(super) enum CheckInput<T, A = T> {
     Authored(T),
-    PlanNormalized { resolved: T, authored: T },
+    PlanNormalized { resolved: T, authored: A },
 }
 
 /// A resolved provider payload paired with the only valid schema-check scope.
@@ -659,8 +659,8 @@ impl std::error::Error for ProviderValueConstraintErrors {}
 /// secrets for the provider, validates every newly known schema value
 /// (including provider custom types), re-runs the complete desired-side
 /// normalization pipeline, and finally proves no deferred placeholder remains.
-pub async fn prepare_provider_ready_resource(
-    resource: Resource,
+pub async fn prepare_provider_ready_resource<S: Clone, D: Clone + Default>(
+    resource: Resource<S, D>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(
@@ -678,8 +678,11 @@ pub async fn prepare_provider_ready_resource(
 /// effect. This prevents provider normalization performed during planning
 /// from being mistaken for user input while still rerunning cross-attribute
 /// validators when at least one input became known now.
-pub(super) async fn prepare_provider_ready_resource_after_resolution<S: Clone>(
-    input: ResolvedCheckInput<Resource<S>>,
+pub(super) async fn prepare_provider_ready_resource_after_resolution<
+    S: Clone,
+    D: Clone + Default,
+>(
+    input: ResolvedCheckInput<Resource<S, D>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(input, context).await
@@ -693,8 +696,8 @@ enum ResourceValueCheck {
     },
 }
 
-async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
-    input: ResolvedCheckInput<Resource<S>>,
+async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + Default>(
+    input: ResolvedCheckInput<Resource<S, D>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -771,8 +774,8 @@ pub fn prepare_provider_ready_data_source(
 /// authored inputs and derived which attributes became known during apply.
 /// Plan-normalized literal attributes are deliberately outside that check
 /// scope because they already passed the plan-time authored-value gate.
-pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
-    input: ResolvedCheckInput<DataSource<S>>,
+pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
+    input: ResolvedCheckInput<DataSource<S, D>>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -831,9 +834,9 @@ pub async fn prepare_create_request(
 }
 
 /// Look up the schema required to construct an update request.
-pub(super) fn managed_update_schema<'a, S>(
+pub(super) fn managed_update_schema<'a, S, D>(
     schemas: &'a SchemaRegistry,
-    resource: &Resource<S>,
+    resource: &Resource<S, D>,
 ) -> Result<&'a ResourceSchema, ProviderPreparationError> {
     schemas
         .get_for(resource)

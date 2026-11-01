@@ -150,18 +150,18 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     };
     let inferred = ParsedFile::default().map_export_params(|_exports| {
         vec![
-            InferredExportParam {
-                name: "inferred_export".to_string(),
-                static_type: ExportStaticType::Inferred(StaticType::Known(unknown.clone())),
-                value: None,
-            },
-            InferredExportParam {
-                name: "failed_export".to_string(),
-                static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+            InferredExportParam::for_test(
+                "inferred_export",
+                ExportStaticType::Inferred(StaticType::Known(unknown.clone())),
+                None,
+            ),
+            InferredExportParam::for_test(
+                "failed_export",
+                ExportStaticType::Inferred(StaticType::Unchecked(
                     InferredUncheckedReason::InferenceFailed(failure.clone()),
                 )),
-                value: None,
-            },
+                None,
+            ),
         ]
     });
 
@@ -4611,11 +4611,11 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
     )
     .expect("attribute parameter must validate");
 
-    let exports = [InferredExportParam {
-        name: "mode".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(schema_type)),
-        value: Some(authored()),
-    }];
+    let exports = [InferredExportParam::for_test(
+        "mode",
+        crate::static_type::ExportStaticType::Declared(local_type(schema_type)),
+        Some(authored()),
+    )];
     check_export_values_pre_apply(&exports, &ResolvedBindings::default(), &config)
         .expect("export must validate");
 
@@ -5718,11 +5718,11 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     use crate::binding_index::ResolvedBindings;
     use crate::parser::InferredExportParam;
 
-    let builtin = InferredExportParam {
-        name: "flag".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::Bool),
-        value: Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
-    };
+    let builtin = InferredExportParam::for_test(
+        "flag",
+        crate::static_type::ExportStaticType::Declared(TypeExpr::Bool),
+        Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
+    );
     let error = check_export_values_pre_apply_providerless(
         std::slice::from_ref(&builtin),
         &ResolvedBindings::default(),
@@ -5732,9 +5732,9 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     .to_string();
     assert!(error.contains("expected Bool, got string"), "error={error}");
 
-    let custom = InferredExportParam {
-        name: "identifiers".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::List(Box::new(
+    let custom = InferredExportParam::for_test(
+        "identifiers",
+        crate::static_type::ExportStaticType::Declared(TypeExpr::List(Box::new(
             TypeExpr::SchemaType {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "mock",
@@ -5742,10 +5742,10 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
                 ),
             },
         ))),
-        value: Some(Value::Concrete(ConcreteValue::StringList(vec![
+        Some(Value::Concrete(ConcreteValue::StringList(vec![
             "identifier".to_string().into(),
         ]))),
-    };
+    );
     check_export_values_pre_apply_providerless(
         std::slice::from_ref(&custom),
         &ResolvedBindings::default(),
@@ -5753,15 +5753,13 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     )
     .expect("providerless export checks must skip only the custom-type leaf");
 
-    let builtin_custom = InferredExportParam {
-        name: "cidr".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::Simple(
-            "ipv4_cidr".to_string(),
-        )),
-        value: Some(Value::Concrete(ConcreteValue::String(
+    let builtin_custom = InferredExportParam::for_test(
+        "cidr",
+        crate::static_type::ExportStaticType::Declared(TypeExpr::Simple("ipv4_cidr".to_string())),
+        Some(Value::Concrete(ConcreteValue::String(
             "10.0.0.0/16".to_string().into(),
         ))),
-    };
+    );
     check_export_values_pre_apply_providerless(
         std::slice::from_ref(&builtin_custom),
         &ResolvedBindings::default(),
@@ -5775,13 +5773,11 @@ fn validate_export_params_rejects_invalid_custom_type() {
     use crate::parser::InferredExportParam;
 
     let config = context_with_iam_policy_arn_validator();
-    let exports = vec![InferredExportParam {
-        name: "policy".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(
-            iam_policy_arn_type_expr(),
-        )),
-        value: Some(Value::Concrete(ConcreteValue::String("not-an-arn".into()))),
-    }];
+    let exports = vec![InferredExportParam::for_test(
+        "policy",
+        crate::static_type::ExportStaticType::Declared(local_type(iam_policy_arn_type_expr())),
+        Some(Value::Concrete(ConcreteValue::String("not-an-arn".into()))),
+    )];
     let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -5794,18 +5790,18 @@ fn validate_export_params_rejects_invalid_list_element() {
     use crate::parser::InferredExportParam;
 
     let config = context_with_iam_policy_arn_validator();
-    let exports = vec![InferredExportParam {
-        name: "policies".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::List(
-            Box::new(iam_policy_arn_type_expr()),
-        ))),
-        value: Some(Value::Concrete(ConcreteValue::List(vec![
+    let exports = vec![InferredExportParam::for_test(
+        "policies",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::List(Box::new(
+            iam_policy_arn_type_expr(),
+        )))),
+        Some(Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String(
                 "arn:aws:iam::123456789012:policy/valid".into(),
             )),
             Value::Concrete(ConcreteValue::String("garbage".into())),
         ]))),
-    }];
+    )];
     let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -5818,15 +5814,13 @@ fn validate_export_params_accepts_valid_values() {
     use crate::parser::InferredExportParam;
 
     let config = context_with_iam_policy_arn_validator();
-    let exports = vec![InferredExportParam {
-        name: "policy".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(
-            iam_policy_arn_type_expr(),
-        )),
-        value: Some(Value::Concrete(ConcreteValue::String(
+    let exports = vec![InferredExportParam::for_test(
+        "policy",
+        crate::static_type::ExportStaticType::Declared(local_type(iam_policy_arn_type_expr())),
+        Some(Value::Concrete(ConcreteValue::String(
             "arn:aws:iam::123456789012:policy/admin".into(),
         ))),
-    }];
+    )];
     let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_ok());
 }
@@ -5840,13 +5834,13 @@ fn validate_export_params_skips_unchecked_inference() {
 
     // Unchecked exports do not invent a real type for value validation.
     let config = loaded_context_for_test(ProviderContext::default());
-    let exports = vec![InferredExportParam {
-        name: "raw".to_string(),
-        static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+    let exports = vec![InferredExportParam::for_test(
+        "raw",
+        ExportStaticType::Inferred(StaticType::Unchecked(
             InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
         )),
-        value: Some(Value::Concrete(ConcreteValue::String("anything".into()))),
-    }];
+        Some(Value::Concrete(ConcreteValue::String("anything".into()))),
+    )];
     let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_ok());
 }
@@ -5856,11 +5850,11 @@ fn validate_export_params_rejects_type_mismatch() {
     use crate::parser::InferredExportParam;
 
     let config = loaded_context_for_test(ProviderContext::default());
-    let exports = vec![InferredExportParam {
-        name: "flag".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
-        value: Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
-    }];
+    let exports = vec![InferredExportParam::for_test(
+        "flag",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
+        Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
+    )];
     let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -5883,11 +5877,11 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
         &config,
     )
     .expect("test decryptor");
-    let exports = vec![InferredExportParam {
-        name: "count".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Int)),
-        value: Some(value),
-    }];
+    let exports = vec![InferredExportParam::for_test(
+        "count",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Int)),
+        Some(value),
+    )];
 
     let error = resolve_and_validate_export_params(&exports, &config)
         .expect_err("secret cannot be exported");
@@ -5923,54 +5917,46 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
     )
     .expect("test decryptor");
     let exports = vec![
-        InferredExportParam {
-            name: "direct".into(),
-            static_type: crate::static_type::ExportStaticType::Declared(local_type(
-                TypeExpr::String,
-            )),
-            value: Some(secret_string()),
-        },
-        InferredExportParam {
-            name: "builtin".into(),
-            static_type: crate::static_type::ExportStaticType::Declared(local_type(
-                TypeExpr::String,
-            )),
-            value: Some(builtin),
-        },
-        InferredExportParam {
-            name: "interpolated".into(),
-            static_type: crate::static_type::ExportStaticType::Declared(local_type(
-                TypeExpr::String,
-            )),
-            value: Some(Value::Deferred(DeferredValue::Interpolation(vec![
+        InferredExportParam::for_test(
+            "direct",
+            crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+            Some(secret_string()),
+        ),
+        InferredExportParam::for_test(
+            "builtin",
+            crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+            Some(builtin),
+        ),
+        InferredExportParam::for_test(
+            "interpolated",
+            crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+            Some(Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("prefix-".into()),
                 InterpolationPart::Expr(secret_string()),
             ]))),
-        },
-        InferredExportParam {
-            name: "nested_list".into(),
-            static_type: crate::static_type::ExportStaticType::Declared(local_type(
-                TypeExpr::List(Box::new(TypeExpr::String)),
-            )),
-            value: Some(Value::Concrete(ConcreteValue::List(vec![secret_string()]))),
-        },
-        InferredExportParam {
-            name: "nested_map".into(),
-            static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Map(
-                Box::new(TypeExpr::String),
-            ))),
-            value: Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        ),
+        InferredExportParam::for_test(
+            "nested_list",
+            crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::List(Box::new(
+                TypeExpr::String,
+            )))),
+            Some(Value::Concrete(ConcreteValue::List(vec![secret_string()]))),
+        ),
+        InferredExportParam::for_test(
+            "nested_map",
+            crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Map(Box::new(
+                TypeExpr::String,
+            )))),
+            Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "key".into(),
                 secret_string(),
             )])))),
-        },
-        InferredExportParam {
-            name: "decrypted".into(),
-            static_type: crate::static_type::ExportStaticType::Declared(local_type(
-                TypeExpr::String,
-            )),
-            value: Some(decrypt),
-        },
+        ),
+        InferredExportParam::for_test(
+            "decrypted",
+            crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+            Some(decrypt),
+        ),
     ];
 
     let error = resolve_and_validate_export_params(&exports, &config)
@@ -6015,11 +6001,11 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
         })
     }
 
-    let exports = [InferredExportParam {
-        name: "id".into(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
-        value: Some(Value::resource_ref("r", "identifier", vec![])),
-    }];
+    let exports = [InferredExportParam::for_test(
+        "id",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+        Some(Value::resource_ref("r", "identifier", vec![])),
+    )];
     let provider_context = loaded_context_for_test(ProviderContext::default());
     let pre_apply =
         check_export_values_pre_apply(&exports, &bindings("alpha-id"), &provider_context)
@@ -6333,14 +6319,14 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
         ),
     );
 
-    let exports = vec![InferredExportParam {
-        name: "accounts".to_string(),
+    let exports = vec![InferredExportParam::for_test(
+        "accounts",
         // declared as map(string), and values are String-typed — should pass
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Map(
-            Box::new(TypeExpr::String),
-        ))),
-        value: Some(Value::Concrete(ConcreteValue::Map(map_value))),
-    }];
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Map(Box::new(
+            TypeExpr::String,
+        )))),
+        Some(Value::Concrete(ConcreteValue::Map(map_value))),
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
@@ -6385,14 +6371,14 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         ),
     );
 
-    let exports = vec![InferredExportParam {
-        name: "accounts".to_string(),
+    let exports = vec![InferredExportParam::for_test(
+        "accounts",
         // declared as map(bool) — values should be rejected as they are strings
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Map(
-            Box::new(TypeExpr::Bool),
-        ))),
-        value: Some(Value::Concrete(ConcreteValue::Map(map_value))),
-    }];
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Map(Box::new(
+            TypeExpr::Bool,
+        )))),
+        Some(Value::Concrete(ConcreteValue::Map(map_value))),
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
@@ -6402,7 +6388,12 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         result.is_err(),
         "map(Bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
     );
-    let err = result.unwrap_err();
+    let err = result
+        .unwrap_err()
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         err.contains("accounts") && err.contains("type mismatch"),
         "error should mention the export name and type mismatch, got: {err}"
@@ -6433,21 +6424,25 @@ fn export_param_ref_type_mismatch_displays_resolved_nested_ref_names() {
     let source = Resource::with_provider("test", "source.Item", "source", None)
         .with_binding("source")
         .with_attribute("values", Value::Concrete(ConcreteValue::List(Vec::new())));
-    let exports = vec![InferredExportParam {
-        name: "values".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
-        value: Some(Value::resource_ref(
+    let exports = vec![InferredExportParam::for_test(
+        "values",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
+        Some(Value::resource_ref(
             "source".to_string(),
             "values".to_string(),
             vec![],
         )),
-    }];
+    )];
     let mut parsed = empty_parsed();
     parsed.resources.push(source); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
     let error = validate_export_param_ref_types_with_bindings(&exports, &bindings)
-        .expect_err("List<String> must not satisfy Bool");
+        .expect_err("List<String> must not satisfy Bool")
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         error.contains("expected Bool, got List<String>"),
         "nested Ref names should be resolved in export errors: {error}",
@@ -6477,20 +6472,25 @@ fn export_param_ref_types_flags_unknown_attribute() {
             Value::Concrete(ConcreteValue::String("vpc-123".into())),
         );
 
-    let exports = vec![InferredExportParam {
-        name: "x".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
-        value: Some(Value::resource_ref(
+    let exports = vec![InferredExportParam::for_test(
+        "x",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+        Some(Value::resource_ref(
             "vpc".to_string(),
             "bad_attr".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings)
+        .unwrap_err()
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         err.contains("export 'x': unknown attribute 'bad_attr' on 'vpc' in reference vpc.bad_attr"),
         "expected export unknown attribute error, got: {err}",
@@ -6502,24 +6502,24 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
     use crate::parser::InferredExportParam;
 
     let exports = vec![
-        InferredExportParam {
-            name: "valid".to_string(),
-            static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
-            value: Some(Value::resource_ref(
+        InferredExportParam::for_test(
+            "valid",
+            crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
+            Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_arn".to_string(),
                 vec!["runtime_field".to_string()],
             )),
-        },
-        InferredExportParam {
-            name: "invalid".to_string(),
-            static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
-            value: Some(Value::resource_ref(
+        ),
+        InferredExportParam::for_test(
+            "invalid",
+            crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
+            Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_ar".to_string(),
                 vec![],
             )),
-        },
+        ),
     ];
     let mut parsed = empty_parsed();
     parsed
@@ -6528,7 +6528,12 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings)
+        .unwrap_err()
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert_eq!(
         err.lines().count(),
@@ -6561,32 +6566,32 @@ fn unchecked_export_checks_existence_and_attached_failure_skips_duplicate_walk()
         .expect("schema fixture must be valid"),
     );
     let exports = vec![
-        InferredExportParam {
-            name: "composition_bad".to_string(),
-            static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+        InferredExportParam::for_test(
+            "composition_bad",
+            ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::NotInferable(NotInferableReason::NonInferableBinding {
                     binding: "instance".to_string(),
                 }),
             )),
-            value: Some(Value::resource_ref(
+            Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_ar".to_string(),
                 vec![],
             )),
-        },
-        InferredExportParam {
-            name: "schema_bad".to_string(),
-            static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+        ),
+        InferredExportParam::for_test(
+            "schema_bad",
+            ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::NotInferable(NotInferableReason::NonInferableBinding {
                     binding: "tg".to_string(),
                 }),
             )),
-            value: Some(Value::resource_ref(
+            Some(Value::resource_ref(
                 "tg".to_string(),
                 "target_group_ar".to_string(),
                 vec![],
             )),
-        },
+        ),
     ];
     let mut parsed = empty_parsed();
     parsed.resources.push(schema_resource); // allow: direct — fixture test inspection
@@ -6595,8 +6600,12 @@ fn unchecked_export_checks_existence_and_attached_failure_skips_duplicate_walk()
         .push(make_composition("instance", &["target_group_arn"]));
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
-    let all_errors =
-        validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    let all_errors = validate_export_param_ref_types_with_bindings(&exports, &bindings)
+        .unwrap_err()
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_eq!(
         all_errors.lines().count(),
         2,
@@ -6612,7 +6621,11 @@ fn unchecked_export_checks_existence_and_attached_failure_skips_duplicate_walk()
         }),
     ));
     let err = validate_export_param_ref_types_with_bindings(&exports_with_failure, &bindings)
-        .unwrap_err();
+        .unwrap_err()
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert_eq!(
         err.lines().count(),
@@ -6654,15 +6667,15 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
             Value::Concrete(ConcreteValue::String("pending".into())),
         );
 
-    let exports = vec![InferredExportParam {
-        name: "x".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
-        value: Some(Value::resource_ref(
+    let exports = vec![InferredExportParam::for_test(
+        "x",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+        Some(Value::resource_ref(
             "cert_issued".to_string(),
             "bad_attr".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
@@ -6680,7 +6693,12 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     });
 
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings)
+        .unwrap_err()
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         err.contains(
             "export 'x': unknown attribute 'bad_attr' on 'cert_issued' in reference cert_issued.bad_attr"
@@ -6718,20 +6736,25 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
         );
 
-    let exports = vec![InferredExportParam {
-        name: "x".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
-        value: Some(Value::resource_ref(
+    let exports = vec![InferredExportParam::for_test(
+        "x",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+        Some(Value::resource_ref(
             "vpc".to_string(),
             "config".to_string(),
             vec!["bad_field".to_string()],
         )),
-    }];
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings)
+        .unwrap_err()
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         err.contains(
             "export 'x': unknown field 'bad_field' on struct 'VpcConfig' in reference vpc.config.bad_field"
@@ -6756,19 +6779,19 @@ fn validate_export_param_ref_types_skips_attached_inference_failure() {
             .validate()
             .expect("schema fixture must be valid"),
     );
-    let exports = vec![InferredExportParam {
-        name: "zone_id".to_string(),
-        static_type: ExportStaticType::Inferred(StaticType::Unchecked(
+    let exports = vec![InferredExportParam::for_test(
+        "zone_id",
+        ExportStaticType::Inferred(StaticType::Unchecked(
             InferredUncheckedReason::InferenceFailed(InferenceError::UnknownType {
                 reason: "already reported".to_string(),
             }),
         )),
-        value: Some(Value::resource_ref(
+        Some(Value::resource_ref(
             "vpc".to_string(),
             "bad_attr".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(schema_resource); // allow: direct — fixture test inspection
@@ -6806,15 +6829,15 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
         .expect("schema fixture must be valid"),
     );
 
-    let exports = vec![InferredExportParam {
-        name: "id".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
-        value: Some(Value::resource_ref(
+    let exports = vec![InferredExportParam::for_test(
+        "id",
+        crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
+        Some(Value::resource_ref(
             "registry_prod".to_string(),
             "account_id".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let _: &[UpstreamState] = &[]; // signature no longer takes upstream_states; doc only.
     let mut parsed = empty_parsed();

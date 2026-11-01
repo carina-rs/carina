@@ -142,8 +142,8 @@ pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
 /// not evidence that the provider added them. Use
 /// [`build_from_resource_for_stored_values_after_send`] only when typed send
 /// evidence is available.
-pub fn build_from_read_resource_for_stored_values<S>(
-    resource: &Resource<S>,
+pub fn build_from_read_resource_for_stored_values<S, D>(
+    resource: &Resource<S, D>,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
     comparison: &ComparisonContext<'_>,
@@ -174,8 +174,8 @@ pub fn build_from_read_resource_for_stored_values<S>(
 /// lists without a concrete stored-list counterpart use the legacy union
 /// [`ExplicitFields::List`] representation rather than recording unjustified
 /// indices.
-pub fn build_from_resource_for_stored_values_after_send<S>(
-    resource: &Resource<S>,
+pub fn build_from_resource_for_stored_values_after_send<S, D>(
+    resource: &Resource<S, D>,
     prior_stored_authoring: Option<(&HashMap<String, Value>, &ExplicitFields)>,
     stored_attributes: &HashMap<String, Value>,
     sent_desired: &SentDesiredAttributes<'_>,
@@ -249,8 +249,8 @@ impl StoredValueAuthoringBasis {
     }
 }
 
-fn build_for_stored_values<S>(
-    resource: &Resource<S>,
+fn build_for_stored_values<S, D>(
+    resource: &Resource<S, D>,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
     basis: StoredValueAuthoringBasis,
@@ -291,8 +291,8 @@ fn build_for_stored_values<S>(
 /// removal crosses an ambiguous list identity, the list becomes
 /// [`ExplicitFields::WholeValue`]. That keeps the removal visible without assigning
 /// it to a guessed element.
-pub fn build_carried_from_resource_for_stored_values<S>(
-    resource: &Resource<S>,
+pub fn build_carried_from_resource_for_stored_values<S, D>(
+    resource: &Resource<S, D>,
     prior_stored_attributes: &HashMap<String, Value>,
     prior_explicit: &ExplicitFields,
     fresh_stored_attributes: &HashMap<String, Value>,
@@ -1690,8 +1690,8 @@ mod tests {
     use crate::resource::{DeferredValue, UnknownReason};
     use indexmap::IndexMap;
 
-    fn build_carried_from_resource_for_stored_values<S>(
-        resource: &Resource<S>,
+    fn build_carried_from_resource_for_stored_values<S, D>(
+        resource: &Resource<S, D>,
         prior_stored_attributes: &HashMap<String, Value>,
         prior_explicit: &ExplicitFields,
         fresh_stored_attributes: &HashMap<String, Value>,

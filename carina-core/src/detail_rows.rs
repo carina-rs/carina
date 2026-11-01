@@ -876,9 +876,9 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
         .then(|| "# default_tags".to_string())
 }
 
-fn build_update_rows<S>(
+fn build_update_rows<S, D>(
     historical: &HistoricalUpdateAttributes,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<S, D>,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
@@ -1207,8 +1207,8 @@ fn project_previous_attrs(
     )
 }
 
-fn build_attribute_diff_rows<S>(
-    to: &crate::resource::Resource<S>,
+fn build_attribute_diff_rows<S, D>(
+    to: &crate::resource::Resource<S, D>,
     to_attributes: &IndexMap<String, Value>,
     ctx: AttributeDiffContext<'_>,
 ) -> AttributeDiffRows {
@@ -1406,9 +1406,9 @@ fn build_attribute_diff_rows<S>(
 /// effect. This helper owns the delete-index lookup so every renderer consumes
 /// the same masked historical view rather than reconstructing that lookup.
 #[allow(clippy::too_many_arguments)]
-pub fn build_replace_detail_rows_from_display<S>(
+pub fn build_replace_detail_rows_from_display<S, D>(
     plan: &Plan<S>,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<S, D>,
     replacement: ReplaceDisplayInfo<'_>,
     historical_display: &HistoricalDisplayAttributes,
     registry: Option<&SchemaRegistry>,
@@ -1452,11 +1452,11 @@ pub fn build_replace_detail_rows_from_display<S>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_replace_rows_from_attributes<S>(
+fn build_replace_rows_from_attributes<S, D>(
     previous_attributes: &HashMap<String, Value>,
     stored_attributes: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<S, D>,
     changed_create_only: &[String],
     temporary_name: Option<&crate::effect::TemporaryName>,
     cascade_ref_hints: &[(String, String)],
@@ -2483,9 +2483,9 @@ mod tests {
     use crate::parser::ProviderConfig;
     use crate::plan::{ReplaceDisplayMetadata, SavedPlan};
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
-    fn build_replace_detail_rows_from_display<S>(
+    fn build_replace_detail_rows_from_display<S, D>(
         plan: &Plan<S>,
-        to: &crate::resource::Resource<S>,
+        to: &crate::resource::Resource<S, D>,
         replacement: ReplaceDisplayInfo<'_>,
         historical_display: &HistoricalDisplayAttributes,
         registry: Option<&SchemaRegistry>,
@@ -2548,7 +2548,7 @@ mod tests {
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new(resource.with_dependency_phase(()))
     }
 
     fn rendered_key(key: &str) -> RenderedKey {

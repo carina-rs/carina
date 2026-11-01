@@ -3,7 +3,7 @@
 //! A Plan is an ordered list of Effects to be executed.
 //! No side effects occur until the Plan is applied.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -610,7 +610,6 @@ pub struct IgnoredChangeSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DestroyOrdering {
     Known,
-    PartiallyUnknown { legacy_names: BTreeSet<String> },
     UnresolvedPersistedDependencies { dependencies: ResolvedDependencies },
 }
 
@@ -899,22 +898,6 @@ impl<S> Plan<S> {
 
     pub fn ignored_change_summaries(&self) -> &[IgnoredChangeSummary] {
         &self.ignored_change_summaries
-    }
-
-    pub fn record_partially_unknown_destroy_ordering(
-        &mut self,
-        id: ResolvedResourceId,
-        generation: EffectGeneration,
-        legacy_names: BTreeSet<String>,
-    ) {
-        if legacy_names.is_empty() {
-            return;
-        }
-        self.destroy_ordering_notices.push(DestroyOrderingNotice {
-            id,
-            generation,
-            ordering: DestroyOrdering::PartiallyUnknown { legacy_names },
-        });
     }
 
     pub fn record_unresolvable_destroy_dependencies(
@@ -1406,11 +1389,11 @@ mod tests {
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new(resource.with_dependency_phase(()))
     }
 
     fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-        ResolvedDataSource::new(resource)
+        ResolvedDataSource::new(resource.with_dependency_phase(()))
     }
 
     fn deserialize_plan(json: &str) -> SavedPlan {

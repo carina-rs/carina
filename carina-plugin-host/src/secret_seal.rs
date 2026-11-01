@@ -136,7 +136,7 @@ struct RestoredResource {
 }
 
 impl RestoredDesired {
-    pub(crate) fn apply_to<S>(self, resources: &mut [Resource<S>]) {
+    pub(crate) fn apply_to<S, D>(self, resources: &mut [Resource<S, D>]) {
         for (resource, restored) in resources.iter_mut().zip(self.resources) {
             for key in restored.skipped_attributes {
                 log::error!(
@@ -151,8 +151,8 @@ impl RestoredDesired {
     }
 }
 
-pub(crate) fn seal_with_deferred<S: Clone>(
-    resources: &[Resource<S>],
+pub(crate) fn seal_with_deferred<S: Clone, D: Clone>(
+    resources: &[Resource<S, D>],
     deferred: &[Vec<String>],
 ) -> Result<(SealedDesired, Unsealer), SealError> {
     if resources.len() != deferred.len() {
@@ -203,7 +203,9 @@ pub(crate) fn seal_with_deferred<S: Clone>(
 }
 
 #[cfg(test)]
-fn seal<S: Clone>(resources: &[Resource<S>]) -> Result<(SealedDesired, Unsealer), SealError> {
+fn seal<S: Clone, D: Clone>(
+    resources: &[Resource<S, D>],
+) -> Result<(SealedDesired, Unsealer), SealError> {
     seal_with_deferred(resources, &vec![Vec::new(); resources.len()])
 }
 

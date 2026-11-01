@@ -605,10 +605,14 @@ pub(crate) fn validate_and_resolve_errors_inner(
     }
     extend_module_call_errors(&mut errors, root_type_resolution_findings);
     if !skip_resource_validation
-        && let Err(message) =
+        && let Err(boundary_errors) =
             carina_core::validation::validate_export_handle_boundaries(&parsed.export_params)
     {
-        errors.extend(split_validation_message(&message));
+        errors.extend(
+            boundary_errors
+                .into_iter()
+                .map(|error| AppError::Validation(error.to_string())),
+        );
     }
     if let Err(error) =
         carina_core::parser::resolve_resource_refs_with_config(&mut parsed, enriched_context)
@@ -910,11 +914,17 @@ pub(crate) fn validate_and_resolve_errors_inner(
         if let Err(msg) = checked_export_values {
             errors.extend(split_validation_message(&msg));
         }
-        if let Err(msg) = carina_core::validation::validate_export_param_ref_types_with_bindings(
-            &parsed.export_params,
-            &bindings,
-        ) {
-            errors.extend(split_validation_message(&msg));
+        if let Err(ref_errors) =
+            carina_core::validation::validate_export_param_ref_types_with_bindings(
+                &parsed.export_params,
+                &bindings,
+            )
+        {
+            errors.extend(
+                ref_errors
+                    .into_iter()
+                    .map(|error| AppError::Validation(error.to_string())),
+            );
         }
         if !errors.is_empty() {
             return Err(non_empty_validation_failure(errors));

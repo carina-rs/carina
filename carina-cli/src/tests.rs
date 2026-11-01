@@ -21,7 +21,7 @@ use carina_core::provider::{
     ReadOutcome, UpdateOutcome,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, Directives, ParsedIgnorePath,
+    ConcreteValue, Current, DataSource, DeferredValue, Directives, ModuleSource, ParsedIgnorePath,
     ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
 use carina_core::schema::{
@@ -58,7 +58,13 @@ use carina_core::provider::{Provider, ProviderFactory};
 use std::sync::Mutex;
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
+}
+
+fn resolved_inner(resource: Resource) -> Resource<ModuleSource, ()> {
+    resolved(resource).into_inner()
 }
 
 fn loaded_provider_context() -> LoadedProviderContext {
@@ -239,7 +245,9 @@ fn complete_update(state: State, sent: &[&str], removed: &[&str]) -> Applied {
 }
 
 fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-    ResolvedDataSource::new(resource)
+    ResolvedDataSource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 fn checked_exports(
@@ -436,10 +444,12 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
         resource
     };
 
-    let created = ResolvedResource::resolve_with_schemas(resource("before"), &schemas)
-        .expect("create resource resolves ignore_changes");
-    let updated = ResolvedResource::resolve_with_schemas(resource("after"), &schemas)
-        .expect("update resource resolves ignore_changes");
+    let created =
+        ResolvedResource::resolve_with_schemas(resolved_inner(resource("before")), &schemas)
+            .expect("create resource resolves ignore_changes");
+    let updated =
+        ResolvedResource::resolve_with_schemas(resolved_inner(resource("after")), &schemas)
+            .expect("update resource resolves ignore_changes");
     let id = updated.id.clone();
     let schema = schemas
         .get_for(updated.as_resource())
@@ -876,10 +886,14 @@ fn plan_file_serde_round_trip() {
                 attribute_spans: HashMap::new(),
             }),
             plan,
-            sorted_resources: sorted_resources.clone(),
+            sorted_resources: sorted_resources
+                .iter()
+                .cloned()
+                .map(resolved_inner)
+                .collect(),
             sorted_value_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
             sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: None,
             unresolved_resources: sorted_resources,
             current_states,
             compositions: vec![],
@@ -1603,7 +1617,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     .with_identifier("my-app-abcd1234");
 
     let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-        &ResolvedResource::new(resources_run1[0].clone()),
+        &resolved(resources_run1[0].clone()),
         &applied_state,
         None,
         None,
@@ -1735,7 +1749,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     .with_identifier(run1_role_name.expose_plaintext());
 
     let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-        &ResolvedResource::new(resources_run1[0].clone()),
+        &resolved(resources_run1[0].clone()),
         &applied_state,
         None,
         None,
@@ -1937,7 +1951,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     );
 
     let result = crate::commands::apply::detect_drift(
-        &[resource],
+        &[resolved_inner(resource)],
         &[ReloadedCurrentStateEntry::managed(id, planned)],
         &MovedOrigins::from_plan(&Plan::new()),
         &provider,
@@ -2163,7 +2177,7 @@ fn orphaned_state_resource_produces_delete_effect() {
             &crate::plan_input_current_from_states(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
-                &[],
+                &[] as &[Resource],
             ),
             &orphans,
         ),
@@ -2875,13 +2889,13 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
-    let export_params = vec![InferredExportParam {
-        name: "answer".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(Value::Deferred(DeferredValue::ResourceRef {
+    let export_params = vec![InferredExportParam::for_test(
+        "answer",
+        fixture_unchecked_export_static_type(),
+        Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("lookup", "answer"),
         })),
-    }];
+    )];
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
         DataSourceValue::read(result.data_source_states[&data_source.id].clone())
     });
@@ -3020,7 +3034,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
             &crate::plan_input_current_from_states(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
-                &[],
+                &[] as &[Resource],
             ),
             &orphans,
         ),
@@ -3124,10 +3138,11 @@ fn refresh_false_uses_cached_state_from_state_file() {
         carina_core::differ::PlanPriorStates::new(
             &carina_core::resource::into_plan_input_current_map::<
                 carina_core::resource::ModuleSource,
+                carina_core::resource::UnexpandedDependencyFields,
             >(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
-                &[],
+                &[] as &[Resource],
             ),
             &carina_core::differ::Orphans::new(),
         ),
@@ -3189,7 +3204,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
             &crate::plan_input_current_from_states(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
-                &[],
+                &[] as &[Resource],
             ),
             &orphans,
         ),
@@ -3243,7 +3258,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
             &crate::plan_input_current_from_states(
                 current_states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
-                &[],
+                &[] as &[Resource],
             ),
             &carina_core::differ::Orphans::new(),
         ),
@@ -3701,10 +3716,12 @@ fn plan_file_serialization_redacts_secrets() {
             )]),
             backend_config: None,
             plan: redact_secrets_in_plan(&plan).unwrap(),
-            sorted_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
+            sorted_resources: vec![resolved_inner(
+                redact_secrets_in_resource(&resource_with_secret).unwrap(),
+            )],
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: None,
             unresolved_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
             compositions: vec![],
             data_sources: vec![],
@@ -3762,14 +3779,13 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
             )]),
             backend_config: None,
             plan: Plan::new(),
-            sorted_resources: vec![Resource::pending_with_provider(
-                "mock",
-                "test.resource",
-                None,
-            )],
+            sorted_resources: vec![
+                Resource::pending_with_provider("mock", "test.resource", None)
+                    .into_resolved_dependency_phase_for_test(),
+            ],
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -3807,15 +3823,15 @@ fn plan_file_validation_rejects_missing_resource_identity() {
             )]),
             backend_config: None,
             plan: Plan::new(),
-            sorted_resources: vec![Resource::with_provider(
+            sorted_resources: vec![resolved_inner(Resource::with_provider(
                 "mock",
                 "test.resource",
                 "alpha",
                 None,
-            )],
+            ))],
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -3889,7 +3905,7 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -3974,7 +3990,7 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -4039,7 +4055,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         sorted_resources: vec![managed_target.into_inner()],
         sorted_value_destroy_dependencies: vec![Default::default()],
         sorted_explicit_destroy_dependencies: vec![Default::default()],
-        legacy_dependency_projections: Default::default(),
+        legacy_dependency_classification: None,
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -4164,7 +4180,7 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: vec![data_source.clone()],
@@ -4404,7 +4420,7 @@ fn recorded_builtin_only_plan_round_trips_with_current_top_level_keys() {
         "data_source_origins",
         "data_source_values",
         "data_sources",
-        "legacy_dependency_projections",
+        "legacy_dependency_classification",
         "plan",
         "persisted_directive_changes",
         "provider_artifacts",
@@ -4467,7 +4483,7 @@ fn recorded_builtin_only_plan_round_trips_with_current_top_level_keys() {
             "sorted_resources",
             "sorted_value_destroy_dependencies",
             "sorted_explicit_destroy_dependencies",
-            "legacy_dependency_projections",
+            "legacy_dependency_classification",
             "unresolved_resources",
             "compositions",
             "data_sources",
@@ -4710,13 +4726,13 @@ async fn persist_exports_only_writes_state_with_new_exports() {
     };
     let lock = LockInfo::for_test("apply");
 
-    let export_params = vec![InferredExportParam {
-        name: "account_id".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(Value::Concrete(ConcreteValue::String(
+    let export_params = vec![InferredExportParam::for_test(
+        "account_id",
+        fixture_unchecked_export_static_type(),
+        Some(Value::Concrete(ConcreteValue::String(
             "123456789012".into(),
         ))),
-    }];
+    )];
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
@@ -4759,13 +4775,13 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
     let lock = LockInfo::for_test("apply");
     let mut state_in = StateFile::new();
     state_in.insert_export_json_for_test("role_arn", serde_json::json!("prior-arn"));
-    let export_params = vec![InferredExportParam {
-        name: "role_arn".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(Value::Deferred(DeferredValue::ResourceRef {
+    let export_params = vec![InferredExportParam::for_test(
+        "role_arn",
+        fixture_unchecked_export_static_type(),
+        Some(Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("role", "web_acl_arn"),
         })),
-    }];
+    )];
 
     let result = crate::commands::apply::persist_exports_only(
         &backend,
@@ -4990,20 +5006,20 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     };
 
     let export_params = vec![
-        InferredExportParam {
-            name: "ax".to_string(),
-            static_type: fixture_unchecked_export_static_type(),
-            value: Some(Value::Deferred(DeferredValue::ResourceRef {
+        InferredExportParam::for_test(
+            "ax",
+            fixture_unchecked_export_static_type(),
+            Some(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("a", "id"),
             })),
-        },
-        InferredExportParam {
-            name: "bx".to_string(),
-            static_type: fixture_unchecked_export_static_type(),
-            value: Some(Value::Deferred(DeferredValue::ResourceRef {
+        ),
+        InferredExportParam::for_test(
+            "bx",
+            fixture_unchecked_export_static_type(),
+            Some(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("b", "id"),
             })),
-        },
+        ),
     ];
 
     let op_result = finalize_apply(
@@ -5080,7 +5096,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     let mut resource = Resource::with_provider("mock", "test.resource", "created", None);
     resource.binding = Some("created".to_string());
     let sorted_resources = vec![resolved(resource.clone())];
-    let export_resources = vec![resource.clone()];
+    let export_resources = vec![resolved_inner(resource.clone())];
     let resource_id = resource.id.clone();
     let state = State::existing(
         resource_id.clone(),
@@ -5106,13 +5122,13 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         failed_refreshes: HashSet::new(),
     };
-    let export_params = vec![InferredExportParam {
-        name: "broken".to_string(),
-        static_type: carina_core::static_type::ExportStaticType::Inferred(
+    let export_params = vec![InferredExportParam::for_test(
+        "broken",
+        carina_core::static_type::ExportStaticType::Inferred(
             carina_core::static_type::StaticType::Known(TypeExpr::Float),
         ),
-        value: Some(Value::Concrete(ConcreteValue::Float(f64::NAN))),
-    }];
+        Some(Value::Concrete(ConcreteValue::Float(f64::NAN))),
+    )];
 
     let error = finalize_apply(
         FinalizeApplyInput {

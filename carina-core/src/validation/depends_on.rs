@@ -75,14 +75,14 @@ impl DependsOnDiagnostic {
 
 /// The `directives.depends_on` list of a resource, or an empty slice.
 ///
-/// `LiveComposition` carries no directives — [`ResourceRef::directives`]
-/// is `None` for that arm, treated here as an empty `depends_on` list.
+/// `LiveComposition` carries no explicit dependencies and is treated as an
+/// empty `depends_on` list.
 fn depends_on_of<'a, D: crate::parser::DeferredForPhaseTraversal>(
     rref: ResourceRef<'a, crate::resource::ModuleSource, D>,
 ) -> &'a UnexpandedDependencies {
     static EMPTY: std::sync::LazyLock<UnexpandedDependencies> =
         std::sync::LazyLock::new(UnexpandedDependencies::default);
-    rref.directives().map_or(&EMPTY, |d| &d.depends_on)
+    rref.explicit_dependencies().unwrap_or(&EMPTY)
 }
 
 /// Run all depends_on checks against a parsed file. Returns the full

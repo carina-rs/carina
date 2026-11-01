@@ -1158,12 +1158,16 @@ mod tests {
     fn unresolved(resources: &[ResolvedResource]) -> Vec<UnresolvedResource> {
         resources
             .iter()
-            .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
+            .map(|resource| UnresolvedResource::from_resolved_for_test(resource.as_inner().clone()))
             .collect()
     }
 
     fn resolved(resources: impl IntoIterator<Item = Resource>) -> Vec<ResolvedResource> {
         ResolvedResource::collect_resolved(resources).expect("test resources have resolved ids")
+    }
+
+    fn resolved_one(resource: Resource) -> ResolvedResource {
+        resolved([resource]).remove(0)
     }
 
     fn resolved_with_graph(resources: impl IntoIterator<Item = Resource>) -> Vec<ResolvedResource> {
@@ -1203,8 +1207,9 @@ mod tests {
                 .validate()
                 .expect("valid graph-model schema"),
         );
-        let resource = ResolvedResource::resolve_with_schemas(resource, &schemas)
-            .expect("ignore_changes path resolves");
+        let resource =
+            ResolvedResource::resolve_with_schemas(resolved_one(resource).into_inner(), &schemas)
+                .expect("ignore_changes path resolves");
 
         let effect = dependency_only_create(&resource);
         let Effect::Create(shell) = effect else {
@@ -1267,8 +1272,8 @@ mod tests {
         );
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(first.clone())));
-        plan.add(Effect::Create(ResolvedResource::new(second.clone())));
+        plan.add(Effect::Create(resolved_one(first.clone())));
+        plan.add(Effect::Create(resolved_one(second.clone())));
         let desired = resolved([first, second]);
         let unresolved = unresolved(&desired);
 
@@ -1298,7 +1303,7 @@ mod tests {
             None,
         );
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(resource.clone())));
+        plan.add(Effect::Create(resolved_one(resource.clone())));
 
         let desired = resolved([resource]);
         let unresolved = unresolved(&desired);
@@ -1330,7 +1335,7 @@ mod tests {
         );
         resource.binding = Some("production_security_group".to_string());
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(resource.clone())));
+        plan.add(Effect::Create(resolved_one(resource.clone())));
 
         let desired = resolved([resource]);
         let unresolved = unresolved(&desired);
@@ -1469,7 +1474,7 @@ mod tests {
         plan.add(Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new("service-id").unwrap(),
-            to: ResolvedResource::new(resource.clone()),
+            to: resolved_one(resource.clone()),
             changed_attributes: vec!["password".to_string(), "description".to_string()],
         });
 
@@ -1599,7 +1604,7 @@ mod tests {
             None,
         ));
         plan.add(Effect::Create(ResolvedResource::from_resolved_parts(
-            consumer,
+            resolved_one(consumer).into_inner(),
             std::iter::once(alpha).collect(),
             Default::default(),
         )));

@@ -20,11 +20,11 @@ use crate::resource::{
 use super::error::ModuleError;
 use super::expander::{
     ArgumentSubstitutionError, ArgumentSubstitutionPosition, ArgumentSubstitutions,
-    ParserMetadataOverlay, TemplateValueCarrier, apply_instance_prefix, build_expansion_trace,
+    ParserMetadataOverlay, TemplateValueCarrier, build_expansion_trace,
     parsed_deferred_for_body_id, prefix_attr_value, prefix_module_composition,
-    prefix_module_data_source, prefix_module_resource, prefix_parsed_deferred_for_expression,
-    prefix_wait_binding, settle_prefixed_composition_constraints,
-    substitute_arguments_with_position,
+    prefix_module_data_source, prefix_module_owned_binding, prefix_module_resource,
+    prefix_parsed_deferred_for_expression, prefix_wait_binding,
+    settle_prefixed_composition_constraints, substitute_arguments_with_position,
 };
 use super::resolver::{ModuleResolver, TypeResolutionPolicy};
 
@@ -338,7 +338,7 @@ pub(super) fn reject_dropped_references(
         .iter()
         .map(|(binding, origin)| {
             (
-                apply_instance_prefix(instance_prefix, binding),
+                prefix_module_owned_binding(instance_prefix, binding),
                 (binding, origin),
             )
         })

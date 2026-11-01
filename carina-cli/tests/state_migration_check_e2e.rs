@@ -250,14 +250,14 @@ fn migration_check_reports_rows_that_require_data_source_reads_as_offline_unclas
         .expect("write built-in provider declaration");
     fs::write(
         project.join("source.crn"),
-        r#"let source = read mock.test.deferred_source { name = "source" }
+        r#"let roles = read mock.iam.Roles { name_regex = "x" }
 "#,
     )
     .expect("write data source");
     fs::write(
         project.join("children.crn"),
-        r#"let children = for rule in source.generated_rules {
-  mock.test.resource { name = rule.action }
+        r#"let children = for name in roles.names {
+  mock.test.resource { name = name }
 }
 "#,
     )

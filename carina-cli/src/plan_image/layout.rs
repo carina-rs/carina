@@ -1776,6 +1776,10 @@ mod tests {
                 ResolvedResourceId::new(ResourceId::with_identity("test.Widget", identity))
             })
             .collect();
+        let resource = ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
+            .into_inner();
         ResolvedResource::from_resolved_parts(resource, dependencies, Default::default())
     }
 
@@ -1786,7 +1790,7 @@ mod tests {
     ) -> GraphModel {
         let unresolved: Vec<_> = desired
             .iter()
-            .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
+            .map(|resource| UnresolvedResource::from_resolved_for_test(resource.as_inner().clone()))
             .collect();
         let summary = crate::plan_summary::PlanChangeSummary::new(
             plan,

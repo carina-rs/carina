@@ -302,13 +302,12 @@ pub(super) fn materialize_deferred_create<
             debug_assert!(
                 template
                     .root_bindings()
-                    .is_subset(&resource.dependency_bindings),
+                    .is_subset(&resource.dependencies.value_bindings),
                 "apply-time deferred-for child must retain iterable dependencies"
             );
-            resource.dependency_bindings.clear();
-            resource.directives.depends_on = Default::default();
             resolve_resource_ignore_changes(&mut resource, identity_inputs.schemas)
                 .map_err(|error| DeferredCreateFailure::ResolveResource { error })?;
+            let resource = resource.with_dependency_phase(());
             Ok(Effect::Create(ResolvedResource::from_resolved_parts(
                 resource,
                 dependencies.clone(),

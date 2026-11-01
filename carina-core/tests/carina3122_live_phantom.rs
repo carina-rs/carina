@@ -52,6 +52,19 @@ use carina_core::schema::{
     ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
 };
 
+fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedResource {
+    let mut parsed = carina_core::parser::ParsedFile::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut parsed,
+        std::slice::from_ref(&resource),
+        &[],
+    )
+    .expect("carina3122 fixture graph must resolve");
+    graph
+        .resolve_resource(resource, registry)
+        .expect("carina3122 fixture resource must resolve")
+}
+
 fn load_dc(name: &str) -> Value {
     let path = format!(
         "{}/tests/fixtures/carina3122/{name}",
@@ -134,8 +147,9 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
         )
         .expect("comparison provider route is initialized");
 
+    let desired = resolve_resource(desired, &schemas);
     let result = diff(
-        &ResolvedResource::new(desired),
+        &desired,
         &current,
         &saved,
         Some(&prev_explicit),

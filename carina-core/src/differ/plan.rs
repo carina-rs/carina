@@ -2,8 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::deps::get_resource_dependencies;
-
 use crate::effect::{ChangedCreateOnly, Effect, OutcomeUnknownImportReplacement, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::plan::{
@@ -105,10 +103,10 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
 /// A "removal" is an attribute that appears in `changed_attributes` but not in `to`.
 /// Only attributes marked as `removable` in the schema should be kept as removals.
 /// Non-removal changes (attribute present in `to`) are always kept.
-pub(super) fn filter_non_removable_removals(
+pub(super) fn filter_non_removable_removals<S, D>(
     provider: &str,
     resource_type: &str,
-    to: &Resource,
+    to: &Resource<S, D>,
     changed_attributes: Vec<String>,
     registry: &SchemaRegistry,
 ) -> Vec<String> {
@@ -140,8 +138,8 @@ pub(super) fn filter_non_removable_removals(
 /// resource has no server-side create-first conflict, a `name_prefix` already
 /// produces a non-conflicting cloud name, and a direct change to the
 /// unique-name value is already distinct from the old resource.
-pub fn generate_temporary_name(
-    resource: &Resource,
+pub fn generate_temporary_name<S, D>(
+    resource: &Resource<S, D>,
     from: &State,
     schema: &ResourceSchema,
 ) -> Result<Option<TemporaryName>, CreateBeforeDestroyError> {
@@ -964,8 +962,8 @@ fn pending_replace_from_parts(
     })
 }
 
-pub(super) fn temporary_name_for_cbd(
-    resource: &Resource,
+pub(super) fn temporary_name_for_cbd<S, D>(
+    resource: &Resource<S, D>,
     from: &State,
     registry: &SchemaRegistry,
 ) -> Result<Option<TemporaryName>, CreateBeforeDestroyError> {
@@ -985,10 +983,10 @@ pub(super) fn temporary_name_for_cbd(
     generate_temporary_name(resource, from, schema.as_schema())
 }
 
-fn apply_temporary_name(
-    mut resource: Resource,
+fn apply_temporary_name<S, D>(
+    mut resource: Resource<S, D>,
     temporary_name: Option<&TemporaryName>,
-) -> Resource {
+) -> Resource<S, D> {
     if let Some(temp) = temporary_name {
         resource.set_attr(
             temp.attribute.clone(),
@@ -1088,22 +1086,21 @@ fn promote_referenced_replaces_to_cbd(
     unresolved_managed: &[ResolvedResource],
     registry: &SchemaRegistry,
 ) {
-    let ref_targets = pending_reference_targets(pending_replaces, false);
     let mut promote = Vec::new();
 
     for resource in unresolved_managed {
-        let deps = get_resource_dependencies(resource);
-        for dep in &deps {
-            let Some(replaced_identity) = ref_targets.get(dep) else {
-                continue;
-            };
-            let Some(pending) = pending_replaces.get(replaced_identity) else {
+        for dependency in resource
+            .value_dependencies()
+            .iter()
+            .chain(resource.explicit_dependencies().iter())
+        {
+            let Some(pending) = pending_replaces.get(dependency) else {
                 continue;
             };
             if pending.create_before_destroy || pending.create.id == resource.id {
                 continue;
             }
-            promote.push(replaced_identity.clone());
+            promote.push(dependency.clone());
         }
     }
 
@@ -1170,22 +1167,28 @@ fn promote_pending_replaces_for_dependents(
     registry: &SchemaRegistry,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> bool {
-    let ref_targets = pending_reference_targets(pending_replaces, true);
     let mut promoted = false;
 
     for resource in unresolved_managed {
         let consumer_identity = resource.resolved_id();
-        let deps = get_resource_dependencies(resource);
-
-        for dep in &deps {
-            let Some(replaced_identity) = ref_targets.get(dep).cloned() else {
+        for dependency in resource.value_dependencies().iter() {
+            let Some(pending) = pending_replaces.get(dependency) else {
                 continue;
             };
+            let replaced_identity = dependency.clone();
             if consumer_identity == replaced_identity {
                 continue;
             }
 
-            let ref_attrs = cascade_ref_attrs(&resource.attributes, dep);
+            if !pending.create_before_destroy {
+                continue;
+            }
+            let dependency_binding = pending
+                .create
+                .binding
+                .as_deref()
+                .unwrap_or_else(|| dependency.identity_str());
+            let ref_attrs = cascade_ref_attrs(&resource.attributes, dependency_binding);
             if ref_attrs.is_empty() {
                 continue;
             }
@@ -1264,23 +1267,6 @@ fn promote_pending_replaces_for_dependents(
     }
 
     promoted
-}
-
-fn pending_reference_targets(
-    pending_replaces: &HashMap<ResolvedResourceId, PendingReplace>,
-    create_before_destroy_only: bool,
-) -> HashMap<String, ResolvedResourceId> {
-    let mut targets = HashMap::new();
-    for (identity, pending) in pending_replaces {
-        if create_before_destroy_only && !pending.create_before_destroy {
-            continue;
-        }
-        targets.insert(identity.identity_str().to_string(), identity.clone());
-        if let Some(binding) = &pending.create.binding {
-            targets.insert(binding.clone(), identity.clone());
-        }
-    }
-    targets
 }
 
 fn merge_pending_create_only(
@@ -1469,7 +1455,7 @@ mod typed_current_identifier_tests {
     #[test]
     fn ensure_consumer_update_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Resource", "consumer", None);
-        let resolved = ResolvedResource::new(resource.clone());
+        let resolved = ResolvedResource::new(resource.clone().with_dependency_phase(()));
         let current = current_with_authoritative_identifier(&resource);
         let mut plan = Plan::new();
 
@@ -1500,7 +1486,7 @@ mod typed_current_identifier_tests {
     #[test]
     fn pending_replace_promotion_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Resource", "consumer", None);
-        let resolved = ResolvedResource::new(resource.clone());
+        let resolved = ResolvedResource::new(resource.clone().with_dependency_phase(()));
         let current = current_with_authoritative_identifier(&resource);
         let mut plan = Plan::new();
 

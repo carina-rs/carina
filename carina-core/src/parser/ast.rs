@@ -461,7 +461,7 @@ mod deferred_template_resource_serde {
             directives: &resource.directives,
             prefixes: &resource.prefixes,
             binding: &resource.binding,
-            dependency_bindings: &resource.dependency_bindings,
+            dependency_bindings: &resource.dependencies.value_bindings,
             module_source: &resource.module_source,
             default_tag_keys: &resource.default_tag_keys,
             loop_provenance: &resource.loop_provenance,
@@ -507,7 +507,10 @@ mod deferred_template_resource_serde {
             resolved_ignore_changes: Default::default(),
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies: crate::resource::UnexpandedDependencyFields {
+                value_bindings: dependency_bindings,
+                depends_on: Default::default(),
+            },
             module_source,
             default_tag_keys,
             loop_provenance,
@@ -638,13 +641,14 @@ pub enum ResourceRef<
     'a,
     S: 'a = ModuleSource,
     D: DeferredForPhaseTraversal = ResolvedDeferredForPhase,
+    P = crate::resource::UnexpandedDependencyFields,
 > {
     /// A top-level resource.
-    Resource(&'a Resource<S>),
+    Resource(&'a Resource<S, P>),
     /// A top-level composition (module-expansion synthetic node).
     LiveComposition(&'a LiveComposition),
     /// A top-level data source (`read`-keyword resource).
-    DataSource(&'a DataSource<S>),
+    DataSource(&'a DataSource<S, P>),
     /// The managed-resource body of a deferred `for` expression. The
     /// `deferred` field's type is selected by `D`, so a resolved file cannot
     /// name or yield a parser-side loop body.
@@ -676,15 +680,15 @@ impl<'a, S: 'a, D: DeferredForPhaseTraversal> Clone for ResourceContext<'a, S, D
     }
 }
 
-impl<'a, S: 'a, D: DeferredForPhaseTraversal> Copy for ResourceRef<'a, S, D> {}
+impl<'a, S: 'a, D: DeferredForPhaseTraversal, P> Copy for ResourceRef<'a, S, D, P> {}
 
-impl<'a, S: 'a, D: DeferredForPhaseTraversal> Clone for ResourceRef<'a, S, D> {
+impl<'a, S: 'a, D: DeferredForPhaseTraversal, P> Clone for ResourceRef<'a, S, D, P> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, S: 'a, D: DeferredForPhaseTraversal> ResourceRef<'a, S, D> {
+impl<'a, S: 'a, D: DeferredForPhaseTraversal, P> ResourceRef<'a, S, D, P> {
     /// Stable identifier of this resource.
     pub fn id(&self) -> &'a ResourceId {
         match self {
@@ -738,24 +742,6 @@ impl<'a, S: 'a, D: DeferredForPhaseTraversal> ResourceRef<'a, S, D> {
         }
     }
 
-    /// Binding names this resource depends on (via `ResourceRef` /
-    /// `BindingRef` values in its attribute tree).
-    ///
-    /// Mirrors the field formerly exposed by
-    /// `ResourceLike::dependency_bindings`; #3308 lifts this accessor
-    /// onto `ResourceRef` so the trait can retire.
-    pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<String> {
-        match self {
-            ResourceRef::Resource(r) => &r.dependency_bindings,
-            ResourceRef::LiveComposition(v) => &v.dependency_bindings,
-            ResourceRef::DataSource(d) => &d.dependency_bindings,
-            ResourceRef::Deferred {
-                resource,
-                deferred: _deferred,
-            } => &resource.dependency_bindings,
-        }
-    }
-
     /// `directives` meta-argument block. [`LiveComposition`] drops the
     /// field (no `prevent_destroy` on a synthetic node) — returns `None`
     /// for the `Virtual` arm.
@@ -802,6 +788,37 @@ impl<'a, S: 'a, D: DeferredForPhaseTraversal> ResourceRef<'a, S, D> {
     /// lookup-shaped view consumed by schema validation.
     pub fn resolved_attributes(&self) -> HashMap<String, Value> {
         crate::resource::attrs_to_hashmap(&self.attributes())
+    }
+}
+
+impl<'a, S: 'a, D: DeferredForPhaseTraversal>
+    ResourceRef<'a, S, D, crate::resource::UnexpandedDependencyFields>
+{
+    /// Binding names this resource depends on (via `ResourceRef` /
+    /// `BindingRef` values in its attribute tree).
+    pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<String> {
+        match self {
+            ResourceRef::Resource(resource) => &resource.dependencies.value_bindings,
+            ResourceRef::LiveComposition(composition) => &composition.dependency_bindings,
+            ResourceRef::DataSource(data_source) => &data_source.dependencies.value_bindings,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.dependencies.value_bindings,
+        }
+    }
+
+    /// Explicit dependency operands for managed resources and data sources.
+    pub fn explicit_dependencies(&self) -> Option<&'a UnexpandedDependencies> {
+        match self {
+            ResourceRef::Resource(resource) => Some(&resource.dependencies.depends_on),
+            ResourceRef::LiveComposition(_) => None,
+            ResourceRef::DataSource(data_source) => Some(&data_source.dependencies.depends_on),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => Some(&resource.dependencies.depends_on),
+        }
     }
 }
 
@@ -1497,10 +1514,10 @@ impl StateBlockAddress {
     }
 
     /// Find the configured resource identified by this address.
-    pub fn find_resource<'a>(
+    pub fn find_resource<'a, S: 'a, D: 'a>(
         &self,
-        resources: impl IntoIterator<Item = &'a crate::resource::Resource>,
-    ) -> Option<&'a crate::resource::Resource> {
+        resources: impl IntoIterator<Item = &'a crate::resource::Resource<S, D>>,
+    ) -> Option<&'a crate::resource::Resource<S, D>> {
         resources
             .into_iter()
             .find(|resource| self.matches_resource_id(&resource.id))
@@ -2419,9 +2436,9 @@ struct ModuleCallSite {
 }
 
 #[derive(Debug, Clone)]
-struct DeclarationSource {
-    file: PathBuf,
-    span: SourceSpan,
+pub(crate) struct DeclarationSource {
+    pub(crate) file: PathBuf,
+    pub(crate) span: SourceSpan,
 }
 
 impl DeclarationSource {
@@ -2547,7 +2564,7 @@ impl SourceSpan {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) const fn dummy() -> Self {
         Self {
             start_byte: 0,
@@ -3052,6 +3069,7 @@ impl UnexpandedDependencies {
 
     /// Authored/pre-expansion spellings for diagnostics and parser tests.
     /// This projection is deliberately unavailable on `ResolvedDependencies`.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn diagnostic_references(&self) -> Vec<String> {
         self.0
             .iter()
@@ -3113,11 +3131,62 @@ pub struct WaitBinding {
 ///
 /// `static_type` retains whether the effective type came from an annotation or
 /// rhs inference, plus any typed reason why checking is unavailable.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct InferredExportParam {
     pub name: String,
     pub static_type: ExportStaticType,
     pub value: Option<Value>,
+    source: DeclarationSource,
+}
+
+impl InferredExportParam {
+    pub(crate) fn from_parsed(
+        parsed: &ParsedExportParam,
+        static_type: ExportStaticType,
+        value: Option<Value>,
+    ) -> Self {
+        Self {
+            name: parsed.name.clone(),
+            static_type,
+            value,
+            source: parsed.source.clone(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn for_test(
+        name: impl Into<String>,
+        static_type: ExportStaticType,
+        value: Option<Value>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            static_type,
+            value,
+            source: DeclarationSource::authored(SourceSpan::dummy(), PathBuf::from("test.crn")),
+        }
+    }
+
+    pub fn source_span(&self) -> SourceSpan {
+        self.source.span
+    }
+
+    pub fn source_file(&self) -> &std::path::Path {
+        &self.source.file
+    }
+
+    pub(crate) fn declaration_source(&self) -> DeclarationSource {
+        self.source.clone()
+    }
+}
+
+impl PartialEq for InferredExportParam {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.static_type == other.static_type
+            && self.value == other.value
+    }
 }
 
 impl ExportParamLike for InferredExportParam {
@@ -4515,7 +4584,8 @@ fn build_expanded_child<S: Clone>(
         }
     };
     resource
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .extend(deferred.root_bindings());
     if let Err((attribute, error)) = substitute_attrs(&mut resource, index, key, item, miss_policy)
     {

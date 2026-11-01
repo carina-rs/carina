@@ -1437,12 +1437,12 @@ fn lift_module_attribute_handles<E>(
     for resource in parsed.iter_all_resources_mut() {
         match resource {
             crate::parser::ResourceMut::Resource(resource) => {
-                for operand in resource.directives.depends_on.iter_mut() {
+                for operand in resource.dependencies.depends_on.iter_mut() {
                     lift_dependency(operand);
                 }
             }
             crate::parser::ResourceMut::DataSource(data_source) => {
-                for operand in data_source.directives.depends_on.iter_mut() {
+                for operand in data_source.dependencies.depends_on.iter_mut() {
                     lift_dependency(operand);
                 }
             }
@@ -1450,7 +1450,7 @@ fn lift_module_attribute_handles<E>(
                 resource,
                 attributes: (),
             } => {
-                for operand in resource.directives.depends_on.iter_mut() {
+                for operand in resource.dependencies.depends_on.iter_mut() {
                     lift_dependency(operand);
                 }
             }
@@ -1907,7 +1907,7 @@ fn audit_expanded_module_contribution<
             resolved_ignore_changes: _resolved_ignore_changes,
             prefixes: _prefixes,
             binding: _binding,
-            dependency_bindings: _dependency_bindings,
+            dependencies: _dependencies,
             module_source: _module_source,
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
@@ -1924,7 +1924,7 @@ fn audit_expanded_module_contribution<
             attributes,
             directives: _directives,
             binding: _binding,
-            dependency_bindings: _dependency_bindings,
+            dependencies: _dependencies,
             module_source: _module_source,
             quoted_string_attrs: _quoted_string_attrs,
         } = data_source;

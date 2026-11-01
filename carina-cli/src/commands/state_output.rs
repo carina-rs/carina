@@ -352,6 +352,12 @@ mod tests {
         serde_json::from_value(json!(raw)).expect("test deposed key must be valid")
     }
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
+    }
+
     fn with_nested_write_only(row: ResourceState) -> ResourceState {
         let mut encoded = serde_json::to_value(row).expect("fixture row must serialize");
         encoded["current"]["nested_write_only"] = json!({
@@ -424,7 +430,7 @@ mod tests {
 
         let pending_id =
             ResourceId::with_provider_identity("mock", "test.resource", "pending-resource", None);
-        let pending_resource = ResolvedResource::new(Resource::from_id(pending_id.clone()));
+        let pending_resource = resolved(Resource::from_id(pending_id.clone()));
         let pending = crate::fixture_in_flight_create(
             &pending_id,
             "resume-token",
@@ -444,7 +450,7 @@ mod tests {
 
         let unknown_id =
             ResourceId::with_provider_identity("mock", "test.resource", "unknown-resource", None);
-        let unknown_resource = ResolvedResource::new(Resource::from_id(unknown_id.clone()));
+        let unknown_resource = resolved(Resource::from_id(unknown_id.clone()));
         let failure = CreateAttempt::for_test(unknown_id).outcome_unknown(
             EgressSent::for_test(),
             ProviderError::api_error("guest trapped"),

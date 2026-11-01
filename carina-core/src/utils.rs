@@ -629,12 +629,12 @@ pub(crate) fn lift_saved_state_enum_leaves(
 ///
 /// Resources whose schema is not in `registry` (or that have no state)
 /// are skipped.
-pub fn lift_current_state_enum_leaves<S>(
+pub fn lift_current_state_enum_leaves<S, D>(
     current_states: &mut std::collections::HashMap<
         crate::resource::ResourceId,
         crate::resource::Current,
     >,
-    resources: &[crate::resource::Resource<S>],
+    resources: &[crate::resource::Resource<S, D>],
     registry: &crate::schema::SchemaRegistry,
 ) {
     for resource in resources {

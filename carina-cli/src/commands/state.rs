@@ -102,7 +102,7 @@ fn format_deferred_state_refresh_warning(
         })
         .collect::<Vec<_>>();
     if refs.is_empty() {
-        refs.extend(resource.dependency_bindings.iter().cloned());
+        refs.extend(resource.dependencies.value_bindings.iter().cloned());
     }
     let refs = if refs.is_empty() {
         "unknown input dependency".to_string()
@@ -422,7 +422,7 @@ async fn run_state_migration_check(
     provider_schema_args: &[String],
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let mut state =
+    let state =
         require_state_file(load_state_file(None, Some(state_url), provider_context).await?)?;
     if !state.requires_legacy_dependency_migration() {
         println!(
@@ -483,20 +483,13 @@ async fn run_state_migration_check(
     // The owner performs parser-aware cleanup, late identity preparation,
     // moved-address projection, and graph construction as one transition.
     // Historical identifier-less read rows are removed only from this copy.
-    let report = validated.migrate_legacy_dependencies_from_copied_state(&mut state)?;
-
-    for warning in report.warnings() {
-        for legacy_name in &warning.legacy_names {
-            eprintln!(
-                "Warning: destroy ordering for {} is partially unknown: legacy dependency {:?} no longer resolves.",
-                warning.row, legacy_name
-            );
-        }
-    }
+    let migration = validated.migrate_legacy_dependencies_from_copied_state(state)?;
+    let migrated_rows = migration.migrated_rows();
+    let warning_count = migration.warnings().len();
+    let _migrated_state = crate::wiring::report_legacy_migration(migration);
     println!(
         "State dependency migration check passed: {} row(s) classified, {} orphan/deposed warning(s); no state was written.",
-        report.migrated_rows(),
-        report.warnings().len()
+        migrated_rows, warning_count
     );
     Ok(())
 }
@@ -1234,30 +1227,25 @@ async fn run_state_lookup(
 fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
     for rs in state.resources() {
-        let identity = rs.identity.clone();
-        // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
-        let mut resource = carina_core::resource::DataSource::with_provider(
+        let id = ResolvedResourceId::with_provider_identity(
             &rs.provider,
             &rs.resource_type,
-            identity,
+            rs.identity.clone(),
             rs.directives.provider_instance.clone(),
         );
-        resource.directives = rs.directives.clone().into();
-
-        // Set typed metadata fields from state
-        resource.binding = rs.binding.clone();
-        // Convert persisted JSON attributes through the state-only decoder.
-        for (key, value) in rs
+        let attributes = rs
             .persisted_attributes()
             .map(PersistedAttributes::to_values)
             .unwrap_or_default()
-        {
-            resource.set_attr(key, value);
-        }
+            .into_iter()
+            .collect();
 
         plan.add(Effect::Read {
-            resource: ResolvedDataSource::from_resolved_parts(
-                resource,
+            resource: ResolvedDataSource::from_persisted_parts(
+                id,
+                attributes,
+                rs.directives.clone().into(),
+                rs.binding.clone(),
                 rs.dependency_bindings.to_resolved_dependencies(),
                 rs.directives.depends_on.to_resolved_dependencies(),
             ),
@@ -1876,7 +1864,6 @@ pub(crate) async fn run_state_refresh_locked(
         mut managed_current,
         orphans,
         saved_attrs: saved_attrs_for_expansion,
-        ..
     } = addressed.into_parts();
     data_source_values = crate::wiring::read_expanded_data_sources_phase2(
         data_source_values,
@@ -1960,7 +1947,6 @@ pub(crate) async fn run_state_refresh_locked(
     // the refreshed resource set through the one graph-address transition;
     // converting each raw resource independently would either reject its
     // authored snapshots or silently discard ordering metadata.
-    let mut dependency_graph = parsed.clone();
     let state_for_graph = state_file
         .as_ref()
         .expect("non-empty state refresh retains its state file");
@@ -1971,20 +1957,33 @@ pub(crate) async fn run_state_refresh_locked(
             crate::commands::shared::state_writeback::build_orphan_resource(state_for_graph, id)
         }))
         .collect::<Vec<_>>();
-    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
-        &mut dependency_graph,
+    let moved_pairs = crate::wiring::resolve_moved_pairs(
+        ctx,
+        parsed,
         &graph_managed,
         &parsed.data_sources,
+        &state_file,
     )?;
     if state_file
         .as_ref()
         .is_some_and(StateFile::requires_legacy_dependency_migration)
     {
+        let mut classification_file = parsed.clone();
+        let classification = crate::wiring::classify_legacy_state(
+            &mut classification_file,
+            crate::wiring::MaterializedConfiguration::Planned {
+                resources: &graph_managed,
+                data_sources: &parsed.data_sources,
+            },
+            &moved_pairs,
+            state_file.as_ref().expect("checked legacy state presence"),
+        )?;
         let migration = state_file
-            .as_mut()
+            .take()
             .expect("checked legacy state presence")
-            .migrate_legacy_dependencies(&expanded_graph, &sorted_resources, &[])
+            .with_legacy_classification(classification)
             .map_err(|error| AppError::Backend(error.into()))?;
+        state_file = Some(crate::wiring::report_legacy_migration(migration));
         if let Some(state) = state_file.as_ref() {
             for (id, current) in &mut managed_current {
                 if let Some(row) = state.find_resource_for_id(id) {
@@ -1994,19 +1993,13 @@ pub(crate) async fn run_state_refresh_locked(
                 }
             }
         }
-        for warning in migration.warnings() {
-            for legacy_name in &warning.legacy_names {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "Warning: destroy ordering for {} is partially unknown: legacy dependency {:?} no longer resolves.",
-                        warning.row, legacy_name
-                    )
-                    .yellow()
-                );
-            }
-        }
     }
+    let mut dependency_graph = parsed.clone();
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut dependency_graph,
+        &graph_managed,
+        &parsed.data_sources,
+    )?;
     let resolved_resources = sorted_resources
         .iter()
         .cloned()
@@ -2924,7 +2917,9 @@ mod tests {
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
@@ -5179,7 +5174,7 @@ mod tests {
     fn lookup_json_in_flight_resource_returns_public_row_and_rejects_attributes() {
         let id =
             ResourceId::with_provider_identity("mock", "test.resource", "pending-resource", None);
-        let resource = ResolvedResource::new(Resource::from_id(id.clone()));
+        let resource = resolved(Resource::from_id(id.clone()));
         let pending = crate::fixture_in_flight_create(
             &id,
             "resume-token",
@@ -7323,7 +7318,8 @@ mod tests {
     fn deferred_data_source_state_refresh_warning_names_recorded_dependency() {
         let mut resource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
         resource
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .insert("registry_publish.target".to_string());
 
         let warning = format_deferred_state_refresh_warning(&resource, &[]);

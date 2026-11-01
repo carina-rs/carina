@@ -10,7 +10,8 @@ use crate::eval_value::{BareStructuralHandle, UnexpandedStructuralHandleKind};
 use crate::identifier::SimHash;
 use crate::parser::{
     ArgumentOrigin, BindingName, BoundaryExpression, DeferredForBody, DeferredValueIf,
-    ModuleArgument, ModuleCall, ParseError, ParsedDeferredForExpression, ParsedFile, WaitBinding,
+    ModuleArgument, ModuleCall, ParseError, ParsedDeferredForExpression, ParsedFile,
+    ResourceTypePath, WaitBinding,
 };
 use crate::resource::{
     AccessMissPolicy, CompositionCall, CompositionCallPath, ConcreteValue, DataSource,
@@ -1225,8 +1226,89 @@ pub(crate) fn build_expansion_trace(
 /// drift between binding kinds (the carina#3061 class of bug was a binding
 /// kind that was *not* prefixed at all; keeping one spelling makes "is this
 /// kind prefixed?" a single, greppable call site per kind).
-pub(super) fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
+fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
     format!("{instance_prefix}.{name}")
+}
+
+/// Prefix a binding known to be declared by the module being expanded.
+pub(super) fn prefix_module_owned_binding(instance_prefix: &str, binding: &str) -> String {
+    apply_instance_prefix(instance_prefix, binding)
+}
+
+enum SubstitutedRoot {
+    Argument(String),
+    IntraModule(String),
+    Outer(String),
+}
+
+impl SubstitutedRoot {
+    fn into_string(self) -> String {
+        match self {
+            Self::Argument(root) | Self::IntraModule(root) | Self::Outer(root) => root,
+        }
+    }
+}
+
+impl ArgumentSubstitutions<'_> {
+    fn substitute_root(
+        self,
+        root: &str,
+        instance_prefix: &str,
+        intra_module_bindings: &HashSet<String>,
+        boundary: &str,
+        expected: Option<&ResourceTypePath>,
+    ) -> Result<SubstitutedRoot, ArgumentSubstitutionError> {
+        if let Some(argument) = self.arguments.get(root) {
+            let expected = || {
+                expected.map_or_else(
+                    || "resource handle".to_string(),
+                    |resource_type| format!("resource handle {resource_type}"),
+                )
+            };
+            return match argument.value_ref() {
+                StructuralOperandRef::Handle { handle: actual, .. } => {
+                    let actual =
+                        actual
+                            .resource_handle()
+                            .ok_or_else(|| ArgumentSubstitutionError {
+                                source_file: Some(self.caller_source_file.to_path_buf()),
+                                line: argument.source_line(self.default_line),
+                                message: format!(
+                                    "{boundary} '{root}': expected {}; got {}",
+                                    expected(),
+                                    actual.kind().description(),
+                                ),
+                                parse_error: None,
+                            })?;
+                    Ok(SubstitutedRoot::Argument(
+                        actual.canonical_binding_name().to_string(),
+                    ))
+                }
+                StructuralOperandRef::Parameter { name, .. } => {
+                    Ok(SubstitutedRoot::Argument(name.to_string()))
+                }
+                StructuralOperandRef::Value(value) => Err(ArgumentSubstitutionError {
+                    source_file: Some(self.caller_source_file.to_path_buf()),
+                    line: argument.source_line(self.default_line),
+                    message: format!(
+                        "{boundary} '{root}': expected {}; got {}",
+                        expected(),
+                        crate::validation::typecheck::value_kind_name(value),
+                    ),
+                    parse_error: None,
+                }),
+            };
+        }
+
+        if intra_module_bindings.contains(root) {
+            Ok(SubstitutedRoot::IntraModule(apply_instance_prefix(
+                instance_prefix,
+                root,
+            )))
+        } else {
+            Ok(SubstitutedRoot::Outer(root.to_string()))
+        }
+    }
 }
 
 fn prefix_resource_handle(
@@ -1237,52 +1319,25 @@ fn prefix_resource_handle(
     boundary: &str,
 ) -> Result<crate::parser::UnexpandedResourceHandle, ArgumentSubstitutionError> {
     let binding = handle.canonical_binding_name();
-    if let Some(argument) = arguments.arguments.get(binding.as_ref()) {
-        return match argument.value_ref() {
-            StructuralOperandRef::Handle { handle: actual, .. } => actual
-                .resource_handle()
-                .ok_or_else(|| ArgumentSubstitutionError {
-                    source_file: Some(arguments.caller_source_file.to_path_buf()),
-                    line: argument.source_line(arguments.default_line),
-                    message: format!(
-                        "{boundary} '{}': expected resource handle {}; got {}",
-                        binding,
-                        handle.resource_type(),
-                        actual.kind().description(),
-                    ),
-                    parse_error: None,
-                }),
-            StructuralOperandRef::Parameter { name, .. } => {
-                Ok(handle.clone().with_canonical_binding(name.to_string()))
-            }
-            StructuralOperandRef::Value(value) => Err(ArgumentSubstitutionError {
-                source_file: Some(arguments.caller_source_file.to_path_buf()),
-                line: argument.source_line(arguments.default_line),
-                message: format!(
-                    "{boundary} '{}': expected resource handle {}; got {}",
-                    binding,
-                    handle.resource_type(),
-                    crate::validation::typecheck::value_kind_name(value),
-                ),
-                parse_error: None,
-            }),
-        };
-    }
-
     let (root, suffix) = binding
         .as_ref()
         .split_once('.')
         .map_or((binding.as_ref(), None), |(root, suffix)| {
             (root, Some(suffix))
         });
-    if intra_module_bindings.contains(root) {
-        let prefixed_root = apply_instance_prefix(instance_prefix, root);
-        let binding = suffix.map_or(prefixed_root.clone(), |suffix| {
-            format!("{prefixed_root}.{suffix}")
-        });
-        return Ok(handle.clone().with_canonical_binding(binding));
-    }
-    Ok(handle.clone())
+    let substituted_root = arguments
+        .substitute_root(
+            root,
+            instance_prefix,
+            intra_module_bindings,
+            boundary,
+            Some(handle.resource_type()),
+        )?
+        .into_string();
+    let binding = suffix.map_or(substituted_root.clone(), |suffix| {
+        format!("{substituted_root}.{suffix}")
+    });
+    Ok(handle.clone().with_canonical_binding(binding))
 }
 
 /// Prefix dependency metadata that names bindings owned by this module.
@@ -1316,12 +1371,17 @@ fn prefix_explicit_dependencies(
                 let (root, suffix) = binding
                     .split_once('.')
                     .map_or((binding, None), |(root, suffix)| (root, Some(suffix)));
-                let binding = if intra_module_bindings.contains(root) {
-                    let prefixed = apply_instance_prefix(instance_prefix, root);
-                    suffix.map_or(prefixed.clone(), |suffix| format!("{prefixed}.{suffix}"))
-                } else {
-                    binding.to_string()
-                };
+                let root = arguments
+                    .substitute_root(
+                        root,
+                        instance_prefix,
+                        intra_module_bindings,
+                        boundary,
+                        None,
+                    )?
+                    .into_string();
+                let binding =
+                    suffix.map_or(root.clone(), |suffix| format!("{root}.{suffix}"));
                 Ok(crate::parser::UnexpandedDependencyOperand::BareBinding(
                     binding.into(),
                 ))
@@ -1352,22 +1412,37 @@ fn prefix_dependency_bindings(
     for binding in dependency_bindings {
         if let Some(argument) = arguments.arguments.get(binding) {
             match argument.value_ref() {
-                StructuralOperandRef::Handle { handle, .. } => {
-                    rewritten.insert(handle.canonical_binding_name().to_string());
-                }
                 StructuralOperandRef::Value(value) => {
                     let mut dependencies = HashSet::new();
                     crate::deps::collect_dependencies(value, &mut dependencies);
                     rewritten.extend(dependencies);
                 }
-                StructuralOperandRef::Parameter { name, .. } => {
-                    rewritten.insert(name.to_string());
+                StructuralOperandRef::Handle { .. } | StructuralOperandRef::Parameter { .. } => {
+                    rewritten.insert(
+                        arguments
+                            .substitute_root(
+                                binding,
+                                instance_prefix,
+                                intra_module_bindings,
+                                "dependency",
+                                None,
+                            )?
+                            .into_string(),
+                    );
                 }
             }
-        } else if intra_module_bindings.contains(binding) {
-            rewritten.insert(apply_instance_prefix(instance_prefix, binding));
         } else {
-            rewritten.insert(binding.clone());
+            rewritten.insert(
+                arguments
+                    .substitute_root(
+                        binding,
+                        instance_prefix,
+                        intra_module_bindings,
+                        "dependency",
+                        None,
+                    )?
+                    .into_string(),
+            );
         }
     }
     Ok(rewritten)
@@ -1415,18 +1490,24 @@ pub(super) fn prefix_wait_binding(
     } = wb;
     let prefixed_name = |n: &BindingName| prefix_binding_name(instance_prefix, n);
 
+    let target = arguments
+        .substitute_root(
+            target.as_str(),
+            instance_prefix,
+            intra_module_bindings,
+            "wait",
+            None,
+        )?
+        .into_string();
+
     let mut until_predicate = until_predicate.clone();
-    // `lhs_segments[0]` is the (string) target-binding segment of a
-    // mixed path `[target, attr, ...]`; only that head is a binding
-    // name, so it takes the string-level prefix spelling, not the
-    // `BindingName` wrapper (the rest are attribute path segments).
     if let Some(root) = until_predicate.lhs_segments.first_mut() {
-        *root = apply_instance_prefix(instance_prefix, root);
+        *root = target.clone();
     }
 
     Ok(WaitBinding {
         binding: prefixed_name(binding),
-        target: prefixed_name(target),
+        target: BindingName::new(target),
         until_raw: until_raw.clone(),
         until_predicate,
         timeout_secs: *timeout_secs,
@@ -2133,8 +2214,8 @@ fn prefix_module_resource_with_identity(
     if let Some(ref binding) = new_resource.binding {
         new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
-    new_resource.directives.depends_on = prefix_explicit_dependencies(
-        &new_resource.directives.depends_on,
+    new_resource.dependencies.depends_on = prefix_explicit_dependencies(
+        &new_resource.dependencies.depends_on,
         instance_prefix,
         intra_module_bindings,
         arguments,
@@ -2164,13 +2245,13 @@ fn prefix_module_resource_with_identity(
     let expanded_values = expand_resource_values(
         &new_resource.attributes,
         template_dependency_values,
-        &new_resource.dependency_bindings,
+        &new_resource.dependencies.value_bindings,
         instance_prefix,
         intra_module_bindings,
         arguments,
     )?;
     new_resource.attributes = expanded_values.attributes;
-    new_resource.dependency_bindings = expanded_values.dependency_bindings;
+    new_resource.dependencies.value_bindings = expanded_values.dependency_bindings;
     let id = new_resource.id.clone();
 
     Ok(ExpandedValueCarrier::new(
@@ -2208,8 +2289,8 @@ pub(super) fn prefix_module_data_source(
     if let Some(ref binding) = new_data_source.binding {
         new_data_source.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
-    new_data_source.directives.depends_on = prefix_explicit_dependencies(
-        &new_data_source.directives.depends_on,
+    new_data_source.dependencies.depends_on = prefix_explicit_dependencies(
+        &new_data_source.dependencies.depends_on,
         instance_prefix,
         intra_module_bindings,
         arguments,
@@ -2239,13 +2320,13 @@ pub(super) fn prefix_module_data_source(
     let expanded_values = expand_resource_values(
         &new_data_source.attributes,
         template_dependency_values,
-        &new_data_source.dependency_bindings,
+        &new_data_source.dependencies.value_bindings,
         instance_prefix,
         intra_module_bindings,
         arguments,
     )?;
     new_data_source.attributes = expanded_values.attributes;
-    new_data_source.dependency_bindings = expanded_values.dependency_bindings;
+    new_data_source.dependencies.value_bindings = expanded_values.dependency_bindings;
     let id = new_data_source.id.clone();
 
     Ok(ExpandedValueCarrier::new(
@@ -3710,7 +3791,8 @@ mod tests {
             DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None)
                 .with_binding("caller");
         data_source
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .extend(["target".to_string(), "module_argument".to_string()]);
 
         let arguments = HashMap::new();
@@ -3745,7 +3827,7 @@ mod tests {
         );
         assert_eq!(prefixed.binding.as_deref(), Some("registry_publish.caller"));
         assert_eq!(
-            prefixed.dependency_bindings,
+            prefixed.dependencies.value_bindings,
             BTreeSet::from([
                 "module_argument".to_string(),
                 "registry_publish.target".to_string(),
@@ -3757,7 +3839,7 @@ mod tests {
     fn prefix_module_resource_prefixes_only_intra_module_dependency_bindings() {
         let mut resource =
             Resource::with_provider("aws", "iam.Role", "consumer", None).with_binding("consumer");
-        resource.dependency_bindings.extend([
+        resource.dependencies.value_bindings.extend([
             "target".to_string(),
             "module_argument".to_string(),
             "outer_binding".to_string(),
@@ -3790,7 +3872,7 @@ mod tests {
         );
 
         assert_eq!(
-            prefixed.dependency_bindings,
+            prefixed.dependencies.value_bindings,
             BTreeSet::from([
                 "module_argument".to_string(),
                 "outer_binding".to_string(),
@@ -3975,7 +4057,10 @@ mod tests {
     fn prefix_module_data_source_prefixes_managed_dependency_binding() {
         let mut roles =
             DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
-        roles.dependency_bindings.insert("target".to_string());
+        roles
+            .dependencies
+            .value_bindings
+            .insert("target".to_string());
 
         let expanded_call = test_expanded_call();
 
@@ -4007,7 +4092,7 @@ mod tests {
         );
 
         assert_eq!(
-            roles.dependency_bindings,
+            roles.dependencies.value_bindings,
             BTreeSet::from(["registry_publish.target".to_string()]),
         );
         assert_eq!(

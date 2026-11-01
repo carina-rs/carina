@@ -18,7 +18,7 @@ pub(super) enum SingleEffectResult<'a, S> {
     /// downstream effects are scheduled.
     Read {
         started: StartedEffect<'a, S>,
-        resource: Box<DataSource<S>>,
+        resource: Box<DataSource<S, ()>>,
         outcome: Result<(SecretPreservingAttributes, State), String>,
         duration: Duration,
     },

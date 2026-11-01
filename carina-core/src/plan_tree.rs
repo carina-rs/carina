@@ -190,7 +190,7 @@ where
         }
 
         let (resource, mut deps): (
-            Option<crate::parser::ResourceRef<'_, S>>,
+            Option<crate::parser::ResourceRef<'_, S, crate::parser::ResolvedDeferredForPhase, ()>>,
             ResolvedDependencies,
         ) = match effect {
             // carina#3181 PR D / #3308: `Create`/`Update`/`Read`
@@ -525,8 +525,8 @@ pub fn build_single_parent_tree<S>(
 ///
 /// `parent_binding` is the binding name of the parent resource in the tree, used to
 /// skip ResourceRef attributes that redundantly reference the parent.
-pub fn extract_compact_hint<S>(
-    resource: crate::parser::ResourceRef<'_, S>,
+pub fn extract_compact_hint<S, D: crate::parser::DeferredForPhaseTraversal, P>(
+    resource: crate::parser::ResourceRef<'_, S, D, P>,
     parent_binding: Option<&str>,
 ) -> Option<String> {
     let attrs = resource.attributes();
@@ -617,7 +617,7 @@ mod tests {
     use std::time::Duration;
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new(resource.with_dependency_phase(()))
     }
 
     #[test]
@@ -754,7 +754,14 @@ mod tests {
         );
 
         assert_eq!(
-            extract_compact_hint(crate::parser::ResourceRef::Resource(&resource), None),
+            extract_compact_hint(
+                crate::parser::ResourceRef::<
+                    _,
+                    crate::parser::ResolvedDeferredForPhase,
+                    _,
+                >::Resource(&resource),
+                None,
+            ),
             Some("name: A.json".to_string())
         );
     }
@@ -765,7 +772,7 @@ mod tests {
         let role_id = ResolvedResourceId::new(role.id.clone());
         let bucket = Resource::new("s3.Bucket", "bucket").with_binding("bucket".to_string());
         let bucket = ResolvedResource::from_resolved_parts(
-            bucket,
+            bucket.with_dependency_phase(()),
             Default::default(),
             std::iter::once(role_id.clone()).collect(),
         );
@@ -875,7 +882,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier("subnet"),
             from: Box::new(State::existing(subnet.id.clone(), HashMap::new())),
             to: ResolvedResource::from_resolved_parts(
-                subnet,
+                subnet.with_dependency_phase(()),
                 std::iter::once(crate::resource::ResolvedResourceId::with_identity(
                     "ec2.Vpc", "main",
                 ))
@@ -1049,10 +1056,10 @@ mod tests {
                 "wait_validation_record_0",
             ),
             target_id: crate::wait::ManagedWaitTarget::new(
-                &crate::resource::ResolvedResource::new(Resource::new(
-                    "route53.Record",
-                    "validation_records[0]",
-                )),
+                &crate::resource::ResolvedResource::new(
+                    Resource::new("route53.Record", "validation_records[0]")
+                        .with_dependency_phase(()),
+                ),
             ),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),

@@ -794,7 +794,7 @@ fn module_handle_dependency_does_not_change_anonymous_identity_hash() {
     };
     let mut without_dependency = vec![resource()];
     let mut with_dependency = vec![resource()];
-    with_dependency[0].directives.depends_on = crate::parser::UnexpandedDependencies::new(vec![
+    with_dependency[0].dependencies.depends_on = crate::parser::UnexpandedDependencies::new(vec![
         crate::parser::UnexpandedDependencyOperand::AttributeSelection {
             binding: crate::parser::BindingName::from("producer"),
             attribute: "validation_record".to_string(),

@@ -8,7 +8,7 @@
 //! `provider_instance` are still meaningful when ordering reads
 //! against other resources.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::ops::Deref;
 
 use indexmap::IndexMap;
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Directives, ModuleSource, ProviderModuleSource, ResolvedDependencies, ResolvedDependencyReads,
     ResolvedResourceId, ResourceId, ResourceIdentity, ResourceIdentityState, SavedModuleSource,
-    Value,
+    UnexpandedDependencyFields, Value,
 };
 
 /// A read-only resource (data source).
@@ -54,8 +54,11 @@ use super::{
 /// let _: DataSource = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
-pub struct DataSource<S = ModuleSource> {
+#[serde(bound(
+    serialize = "S: Serialize",
+    deserialize = "S: Deserialize<'de>, D: Default"
+))]
+pub struct DataSource<S = ModuleSource, D = UnexpandedDependencyFields> {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     pub attributes: IndexMap<String, Value>,
@@ -66,9 +69,9 @@ pub struct DataSource<S = ModuleSource> {
     /// Binding name from `let` bindings in DSL.
     #[serde(default)]
     pub binding: Option<String>,
-    /// Binding names this data source depends on.
-    #[serde(default, skip)]
-    pub dependency_bindings: BTreeSet<String>,
+    /// Dependency fields for the current graph-resolution phase.
+    #[serde(skip)]
+    pub dependencies: D,
     /// Module source info for data sources from modules.
     #[serde(default)]
     pub module_source: Option<S>,
@@ -83,16 +86,16 @@ pub struct DataSource<S = ModuleSource> {
 pub type SavedDataSource = DataSource<SavedModuleSource>;
 
 /// Source-neutral data-source payload exposed to providers.
-pub type ProviderDataSource = DataSource<ProviderModuleSource>;
+pub type ProviderDataSource = DataSource<ProviderModuleSource, ()>;
 
-impl From<DataSource> for SavedDataSource {
-    fn from(data_source: DataSource) -> Self {
+impl<D> From<DataSource<ModuleSource, D>> for DataSource<SavedModuleSource, D> {
+    fn from(data_source: DataSource<ModuleSource, D>) -> Self {
         let DataSource {
             id,
             attributes,
             directives,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             quoted_string_attrs,
         } = data_source;
@@ -101,7 +104,7 @@ impl From<DataSource> for SavedDataSource {
             attributes,
             directives,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
             quoted_string_attrs,
         }
@@ -116,7 +119,7 @@ impl DataSource {
             attributes: IndexMap::new(),
             directives: Directives::default(),
             binding: None,
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
         }
@@ -129,7 +132,7 @@ impl DataSource {
             attributes: IndexMap::new(),
             directives: Directives::default(),
             binding: None,
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
         }
@@ -161,7 +164,7 @@ impl DataSource {
             attributes: IndexMap::new(),
             directives: Directives::default(),
             binding: None,
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
         }
@@ -178,14 +181,14 @@ impl DataSource {
             attributes: IndexMap::new(),
             directives: Directives::default(),
             binding: None,
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
         }
     }
 }
 
-impl<S: Clone> DataSource<S> {
+impl<S: Clone, D: Clone> DataSource<S, D> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_pending();
@@ -199,25 +202,24 @@ impl<S: Clone> DataSource<S> {
     }
 }
 
-impl<S> DataSource<S> {
+impl<S, D> DataSource<S, D> {
     /// Remove module provenance while crossing into provider-owned code.
     pub(crate) fn into_provider_data_source(self) -> ProviderDataSource {
         let DataSource {
             id,
             attributes,
-            mut directives,
+            directives,
             binding,
-            dependency_bindings: _,
+            dependencies: _,
             module_source: _,
             quoted_string_attrs,
         } = self;
-        directives.depends_on = Default::default();
         ProviderDataSource {
             id,
             attributes,
             directives,
             binding,
-            dependency_bindings: Default::default(),
+            dependencies: (),
             module_source: None,
             quoted_string_attrs,
         }
@@ -241,6 +243,29 @@ impl<S> DataSource<S> {
     pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
         self.binding = Some(binding.into());
         self
+    }
+}
+
+impl<S> DataSource<S> {
+    pub(crate) fn with_dependency_phase<D2>(self, dependencies: D2) -> DataSource<S, D2> {
+        let DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependencies: _,
+            module_source,
+            quoted_string_attrs,
+        } = self;
+        DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependencies,
+            module_source,
+            quoted_string_attrs,
+        }
     }
 }
 
@@ -272,7 +297,7 @@ impl<S> DataSource<S> {
     into = "ResolvedDataSourceWire<S>"
 )]
 pub struct ResolvedDataSource<S = ModuleSource> {
-    resource: DataSource<S>,
+    resource: DataSource<S, ()>,
     value_dependencies: ResolvedDependencies,
     explicit_dependencies: ResolvedDependencies,
     value_dependency_reads: ResolvedDependencyReads,
@@ -282,7 +307,7 @@ pub struct ResolvedDataSource<S = ModuleSource> {
 #[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
 struct ResolvedDataSourceWire<S> {
     #[serde(flatten)]
-    resource: DataSource<S>,
+    resource: DataSource<S, ()>,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
     value_dependencies: ResolvedDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
@@ -308,17 +333,13 @@ impl From<ResolvedDataSource> for SavedResolvedDataSource {
 
 impl<S> ResolvedDataSource<S> {
     /// Construct from a [`DataSource`], panicking if identity is pending.
-    pub fn new(resource: DataSource<S>) -> Self {
+    pub fn new(resource: DataSource<S, ()>) -> Self {
         assert!(
             matches!(
                 resource.id.identity_state(),
                 ResourceIdentityState::Resolved(_)
             ),
             "ResolvedDataSource requires identity"
-        );
-        assert!(
-            resource.directives.depends_on.is_empty() && resource.dependency_bindings.is_empty(),
-            "ResolvedDataSource requires dependencies to be resolved"
         );
         Self {
             resource,
@@ -329,7 +350,7 @@ impl<S> ResolvedDataSource<S> {
     }
 
     pub fn from_resolved_parts(
-        resource: DataSource<S>,
+        resource: DataSource<S, ()>,
         value_dependencies: ResolvedDependencies,
         explicit_dependencies: ResolvedDependencies,
     ) -> Self {
@@ -342,8 +363,37 @@ impl<S> ResolvedDataSource<S> {
         )
     }
 
+    /// Rebuild a graph-resolved data-source row from persisted typed parts.
+    ///
+    /// Persisted state has no parser dependency fields to expand: both edge
+    /// sets have already crossed the resolved-address boundary. Accepting the
+    /// typed id and dependency sets directly keeps that distinction explicit
+    /// without exposing the dependency-phase transition on `DataSource`.
+    pub fn from_persisted_parts(
+        id: ResolvedResourceId,
+        attributes: IndexMap<String, Value>,
+        directives: Directives,
+        binding: Option<String>,
+        value_dependencies: ResolvedDependencies,
+        explicit_dependencies: ResolvedDependencies,
+    ) -> Self {
+        Self::from_resolved_parts(
+            DataSource {
+                id: id.into(),
+                attributes,
+                directives,
+                binding,
+                dependencies: (),
+                module_source: None,
+                quoted_string_attrs: HashSet::new(),
+            },
+            value_dependencies,
+            explicit_dependencies,
+        )
+    }
+
     pub(crate) fn from_resolved_parts_with_reads(
-        resource: DataSource<S>,
+        resource: DataSource<S, ()>,
         value_dependencies: ResolvedDependencies,
         explicit_dependencies: ResolvedDependencies,
         value_dependency_reads: ResolvedDependencyReads,
@@ -355,10 +405,6 @@ impl<S> ResolvedDataSource<S> {
             ),
             "ResolvedDataSource requires identity"
         );
-        assert!(
-            resource.directives.depends_on.is_empty() && resource.dependency_bindings.is_empty(),
-            "ResolvedDataSource cannot retain unexpanded dependencies"
-        );
         Self {
             resource,
             value_dependencies,
@@ -368,27 +414,47 @@ impl<S> ResolvedDataSource<S> {
     }
 
     /// Try to construct; returns `None` if identity is pending.
-    pub fn try_new(resource: DataSource<S>) -> Option<Self> {
+    pub fn try_new(resource: DataSource<S, ()>) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
             ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
         }
     }
 
+    /// Convert data-source fixtures at a boundary where identity assignment is
+    /// known to be complete. Production paths obtain this witness from the
+    /// expanded graph instead.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn collect_resolved(
+        resources: impl IntoIterator<Item = DataSource<S>>,
+    ) -> Result<Vec<Self>, super::PendingResourceIdentityError> {
+        resources
+            .into_iter()
+            .map(|resource| match resource.id.identity_state() {
+                ResourceIdentityState::Pending(_) => {
+                    Err(super::PendingResourceIdentityError::new(resource.id))
+                }
+                ResourceIdentityState::Resolved(_) => {
+                    Ok(Self::new(resource.with_dependency_phase(())))
+                }
+            })
+            .collect()
+    }
+
     /// Borrow the inner [`DataSource`].
-    pub fn as_inner(&self) -> &DataSource<S> {
+    pub fn as_inner(&self) -> &DataSource<S, ()> {
         &self.resource
     }
 
     /// Consume and return the inner [`DataSource`].
-    pub fn into_inner(self) -> DataSource<S> {
+    pub fn into_inner(self) -> DataSource<S, ()> {
         self.resource
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
-        DataSource<S>,
+        DataSource<S, ()>,
         ResolvedDependencies,
         ResolvedDependencies,
         ResolvedDependencyReads,
@@ -403,7 +469,7 @@ impl<S> ResolvedDataSource<S> {
 
     /// Replace only the value-bearing data-source payload while preserving
     /// the already-resolved graph metadata.
-    pub(crate) fn replace_inner(&self, resource: DataSource<S>) -> Self {
+    pub(crate) fn replace_inner(&self, resource: DataSource<S, ()>) -> Self {
         assert_eq!(
             resource.id, self.resource.id,
             "replacing a resolved data source cannot change its address"
@@ -445,23 +511,23 @@ impl<S> ResolvedDataSource<S> {
 }
 
 impl<S> Deref for ResolvedDataSource<S> {
-    type Target = DataSource<S>;
+    type Target = DataSource<S, ()>;
 
     fn deref(&self) -> &Self::Target {
         &self.resource
     }
 }
 
-impl<S> From<ResolvedDataSource<S>> for DataSource<S> {
+impl<S> From<ResolvedDataSource<S>> for DataSource<S, ()> {
     fn from(resource: ResolvedDataSource<S>) -> Self {
         resource.resource
     }
 }
 
-impl<S> TryFrom<DataSource<S>> for ResolvedDataSource<S> {
+impl<S> TryFrom<DataSource<S, ()>> for ResolvedDataSource<S> {
     type Error = String;
 
-    fn try_from(resource: DataSource<S>) -> Result<Self, Self::Error> {
+    fn try_from(resource: DataSource<S, ()>) -> Result<Self, Self::Error> {
         Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
     }
 }
@@ -475,11 +541,6 @@ impl<S> TryFrom<ResolvedDataSourceWire<S>> for ResolvedDataSource<S> {
             ResourceIdentityState::Pending(_)
         ) {
             return Err("identity is required".to_string());
-        }
-        if !wire.resource.directives.depends_on.is_empty()
-            || !wire.resource.dependency_bindings.is_empty()
-        {
-            return Err("resolved data source contains unexpanded dependencies".to_string());
         }
         Ok(Self {
             resource: wire.resource,
@@ -501,8 +562,8 @@ impl<S> From<ResolvedDataSource<S>> for ResolvedDataSourceWire<S> {
     }
 }
 
-impl<S> AsRef<DataSource<S>> for ResolvedDataSource<S> {
-    fn as_ref(&self) -> &DataSource<S> {
+impl<S> AsRef<DataSource<S, ()>> for ResolvedDataSource<S> {
+    fn as_ref(&self) -> &DataSource<S, ()> {
         self.as_inner()
     }
 }

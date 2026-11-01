@@ -339,10 +339,11 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         wb.until_predicate.lhs_segments
     );
     assert!(
-        wb.depends_on
-            .diagnostic_references()
-            .iter()
-            .any(|d| d == "r.validation_record"),
+        wb.depends_on.iter().any(|operand| matches!(
+            operand,
+            carina_core::parser::UnexpandedDependencyOperand::BareBinding(binding)
+                if binding == "r.validation_record"
+        )),
         "depends_on entries must be instance-prefixed; got {:?}",
         wb.depends_on
     );

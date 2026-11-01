@@ -2015,8 +2015,8 @@ fn protocol_to_directives(directives: &protocol::Directives) -> ProviderDirectiv
 }
 
 /// Encode a managed resource for the ordinary provider boundary.
-pub fn try_resource_to_protocol<S>(
-    resource: &Resource<S>,
+pub fn try_resource_to_protocol<S, D>(
+    resource: &Resource<S, D>,
     directives: &ProviderDirectives,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let Resource {
@@ -2028,7 +2028,7 @@ pub fn try_resource_to_protocol<S>(
         resolved_ignore_changes: _resolved_ignore_changes,
         prefixes: _prefixes,
         binding: _binding,
-        dependency_bindings: _dependency_bindings,
+        dependencies: _dependencies,
         module_source: _module_source,
         default_tag_keys: _default_tag_keys,
         loop_provenance: _loop_provenance,
@@ -2050,8 +2050,8 @@ pub fn try_resource_to_protocol<S>(
 }
 
 /// Encode a data source using the protocol's shared Resource record.
-pub fn try_data_source_to_protocol(
-    data_source: &DataSource,
+pub fn try_data_source_to_protocol<S, D>(
+    data_source: &DataSource<S, D>,
     provider_directives: &ProviderDirectives,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let DataSource {
@@ -2059,7 +2059,7 @@ pub fn try_data_source_to_protocol(
         attributes,
         directives: _authored_directives,
         binding: _binding,
-        dependency_bindings: _dependency_bindings,
+        dependencies: _dependencies,
         module_source: _module_source,
         quoted_string_attrs: _quoted_string_attrs,
     } = data_source;

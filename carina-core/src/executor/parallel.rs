@@ -1268,13 +1268,13 @@ mod tests {
                 reads.insert_unknown(id);
             });
         }
-        for binding in &resource.dependency_bindings {
+        for binding in &resource.dependencies.value_bindings {
             let id = fixture_id(binding);
             value_dependencies.insert(id.clone());
             reads.ensure_unknown(id);
         }
         let explicit_dependencies = resource
-            .directives
+            .dependencies
             .depends_on
             .iter()
             .map(|operand| match operand {
@@ -1290,10 +1290,10 @@ mod tests {
                 } => fixture_id(&format!("{binding}.{attribute}")),
             })
             .collect();
-        resource.dependency_bindings.clear();
-        resource.directives.depends_on = Default::default();
+        resource.dependencies.value_bindings.clear();
+        resource.dependencies.depends_on = Default::default();
         ResolvedResource::from_resolved_parts_with_reads(
-            resource,
+            resource.with_dependency_phase(()),
             value_dependencies,
             explicit_dependencies,
             reads,
@@ -1307,6 +1307,17 @@ mod tests {
     }
 
     fn update_effect(binding: &'static str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
+        let to = update_resource(binding, reads);
+        let id = to.id.clone();
+        Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("id"),
+            from: Box::new(state_for(&id)),
+            to: resolved(to),
+            changed_attributes: writes.iter().map(|attr| (*attr).to_string()).collect(),
+        }
+    }
+
+    fn update_resource(binding: &'static str, reads: &[(&str, &str)]) -> Resource {
         let id = ResourceId::with_identity("test", binding);
         let mut to = Resource::new("test", binding);
         to.binding = Some(binding.to_string());
@@ -1316,12 +1327,8 @@ mod tests {
                 Value::resource_ref(*dep, *attr, vec![]),
             );
         }
-        Effect::Update {
-            identifier: crate::effect::fixture_applied_identifier("id"),
-            from: Box::new(state_for(&id)),
-            to: resolved(to),
-            changed_attributes: writes.iter().map(|attr| (*attr).to_string()).collect(),
-        }
+        debug_assert_eq!(to.id, id);
+        to
     }
 
     struct TerminalWaitProvider {
@@ -1496,7 +1503,7 @@ mod tests {
             .filter_map(|effect| match effect {
                 Effect::Create(resource) | Effect::Update { to: resource, .. } => Some((
                     resource.resolved_id(),
-                    UnresolvedResource::from_pre_resolve(resource.as_inner().clone()),
+                    UnresolvedResource::from_pre_resolve(Resource::from_id(resource.id.clone())),
                 )),
                 Effect::DeferredReplace(_) => None,
                 _ => None,
@@ -1631,7 +1638,7 @@ mod tests {
             Value::resource_ref("cert_issued", "arn", vec![]),
         );
         let listener_origin = listener.clone();
-        listener.dependency_bindings.clear();
+        listener.dependencies.value_bindings.clear();
         let alb_dependency = fixture_id("alb");
         let wait_dependency =
             crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued");
@@ -1639,7 +1646,7 @@ mod tests {
         listener_reads.insert_known(alb_dependency.clone(), "load_balancer_arn");
         listener_reads.insert_known(wait_dependency.clone(), "arn");
         let listener = ResolvedResource::from_resolved_parts_with_reads(
-            listener,
+            listener.with_dependency_phase(()),
             [alb_dependency, wait_dependency].into_iter().collect(),
             Default::default(),
             listener_reads,
@@ -1793,10 +1800,7 @@ mod tests {
     #[test]
     fn keep_update_update_edge_for_bare_binding_unknown_read() {
         let parent = update_effect("parent", &[], &["cidr_block"]);
-        let mut child = match update_effect("child", &[], &["name"]) {
-            Effect::Update { to, .. } => to.into_inner(),
-            _ => unreachable!(),
-        };
+        let mut child = update_resource("child", &[]);
         child.set_attr(
             "whole_parent",
             Value::Deferred(crate::resource::DeferredValue::BindingRef {
@@ -1817,16 +1821,10 @@ mod tests {
     #[test]
     fn keep_update_update_edge_when_known_read_also_has_depends_on_unknown() {
         let parent = update_effect("parent", &[], &["tags"]);
-        let mut child = match update_effect("child", &[("parent", "id")], &["name"]) {
-            Effect::Update { to, .. } => to.into_inner(),
-            _ => unreachable!(),
-        };
-        child
-            .directives
-            .depends_on
-            .push(crate::parser::UnexpandedDependencyOperand::BareBinding(
-                "parent".into(),
-            ));
+        let mut child = update_resource("child", &[("parent", "id")]);
+        child.dependencies.depends_on.push(
+            crate::parser::UnexpandedDependencyOperand::BareBinding("parent".into()),
+        );
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new(state_for(&child.id)),
@@ -1844,11 +1842,11 @@ mod tests {
     #[test]
     fn dependency_bindings_only_path_escalates_to_unknown() {
         let parent = update_effect("parent", &[], &["tags"]);
-        let mut child = match update_effect("child", &[], &["name"]) {
-            Effect::Update { to, .. } => to.into_inner(),
-            _ => unreachable!(),
-        };
-        child.dependency_bindings.insert("parent".to_string());
+        let mut child = update_resource("child", &[]);
+        child
+            .dependencies
+            .value_bindings
+            .insert("parent".to_string());
         let child_id = child.id.clone();
         let effects = vec![
             parent,
@@ -1862,10 +1860,9 @@ mod tests {
         let unresolved = HashMap::from([
             (
                 ResolvedResourceId::new(effects[0].resource_id().clone()),
-                UnresolvedResource::from_pre_resolve(match &effects[0] {
-                    Effect::Update { to, .. } => to.as_inner().clone(),
-                    _ => unreachable!(),
-                }),
+                UnresolvedResource::from_pre_resolve(Resource::from_id(
+                    effects[0].resource_id().clone(),
+                )),
             ),
             (
                 ResolvedResourceId::new(child_id),
@@ -1908,10 +1905,7 @@ mod tests {
     #[test]
     fn keep_update_update_edge_for_flattened_composition_unknown_read() {
         let parent = update_effect("parent", &[], &["tags"]);
-        let mut child = match update_effect("child", &[], &["name"]) {
-            Effect::Update { to, .. } => to.into_inner(),
-            _ => unreachable!(),
-        };
+        let mut child = update_resource("child", &[]);
         child.set_attr(
             "forwarded",
             Value::resource_ref("module", "parent_id", vec![]),
@@ -1924,7 +1918,7 @@ mod tests {
                 identifier: crate::effect::fixture_applied_identifier("id"),
                 from: Box::new(state_for(&child_id)),
                 to: ResolvedResource::from_resolved_parts(
-                    child.clone(),
+                    child.clone().with_dependency_phase(()),
                     std::iter::once(fixture_id("parent")).collect(),
                     Default::default(),
                 ),
@@ -1934,10 +1928,9 @@ mod tests {
         let unresolved = HashMap::from([
             (
                 ResolvedResourceId::new(effects[0].resource_id().clone()),
-                UnresolvedResource::from_pre_resolve(match &effects[0] {
-                    Effect::Update { to, .. } => to.as_inner().clone(),
-                    _ => unreachable!(),
-                }),
+                UnresolvedResource::from_pre_resolve(Resource::from_id(
+                    effects[0].resource_id().clone(),
+                )),
             ),
             (
                 ResolvedResourceId::new(child_id),

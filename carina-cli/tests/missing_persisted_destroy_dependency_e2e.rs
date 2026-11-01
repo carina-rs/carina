@@ -41,7 +41,9 @@ let orphan = mock.test.resource {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_carina"))
+        Command::new("sh")
+            .args(["-c", "exec \"$0\" \"$@\" 2>&1"])
+            .arg(env!("CARGO_BIN_EXE_carina"))
             .current_dir(&self.project)
             .env("NO_COLOR", "1")
             .env_remove("CLICOLOR_FORCE")
@@ -78,9 +80,7 @@ let orphan = mock.test.resource {
             serde_json::from_slice(&fs::read(&state_path).expect("read current state"))
                 .expect("parse current state");
         state["version"] = Value::from(20);
-        let resources = state["resources"]
-            .as_array_mut()
-            .expect("state resources");
+        let resources = state["resources"].as_array_mut().expect("state resources");
         resources.retain(|row| row["identity"] == "orphan");
         let orphan = resources.first_mut().expect("orphan state row");
         orphan["dependency_bindings"] = serde_json::json!(["gone-current"]);
@@ -154,12 +154,21 @@ fn plan_and_apply_warn_but_delete_when_persisted_dependency_left_state_and_confi
 
 fn assert_legacy_current_and_deposed_warnings(output: &Output) {
     let text = output_text(output);
+    let warning_position = text
+        .find("destroy ordering for mock.test.resource.orphan is partially unknown")
+        .unwrap_or_else(|| panic!("missing current-generation migration warning:\n{text}"));
     assert!(
-        text.contains("destroy ordering for mock.test.resource.orphan is partially unknown")
-            && text.contains("gone-current")
-            && text.contains("gone-deposed"),
+        text.contains("gone-current") && text.contains("gone-deposed"),
         "migration must emit every row-scoped warning even without a Delete effect:\n{text}",
     );
+    for marker in ["Persisting", "Destroying"] {
+        if let Some(action_position) = text.find(marker) {
+            assert!(
+                warning_position < action_position,
+                "migration warnings must be reported before {marker}:\n{text}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -196,4 +205,45 @@ fn destroy_emits_legacy_warnings_when_refresh_filters_every_delete() {
     let destroy = scenario.run(&["destroy", "--auto-approve", "--lock=false", "."]);
     assert_success("empty destroy after migration", &destroy);
     assert_legacy_current_and_deposed_warnings(&destroy);
+}
+
+#[test]
+fn destroy_reports_legacy_warning_when_wait_resolution_fails_after_migration() {
+    let scenario = Scenario::new();
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "seed apply",
+        &scenario.run(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.prepare_v20_orphan_that_refreshes_absent_with_current_and_deposed_warnings();
+    fs::write(
+        scenario.project.join("resources.crn"),
+        r#"let waited = wait missing {
+  until = missing.name == "ready"
+}
+"#,
+    )
+    .expect("write invalid wait fixture");
+
+    let destroy = scenario.run(&["destroy", "--auto-approve", "--lock=false", "."]);
+    let text = output_text(&destroy);
+    assert!(
+        !destroy.status.success(),
+        "missing wait target must fail:\n{text}"
+    );
+    assert!(
+        text.contains("wait 'waited': dependency target 'missing' does not exist"),
+        "destroy must reach terminal wait resolution after migration:\n{text}",
+    );
+    assert_legacy_current_and_deposed_warnings(&destroy);
+
+    let state: Value = serde_json::from_slice(
+        &fs::read(scenario.project.join("carina.state.json")).expect("read migrated state"),
+    )
+    .expect("parse migrated state");
+    assert_eq!(
+        state["version"],
+        Value::from(21),
+        "the writable v21 state must become available only after warnings are reported",
+    );
 }

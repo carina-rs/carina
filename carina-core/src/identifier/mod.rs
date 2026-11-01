@@ -2586,8 +2586,8 @@ pub struct DesiredCreateOnlyValues {
     values: HashMap<String, DesiredCreateOnlyValue>,
 }
 
-fn desired_comparable_values<'attribute, S>(
-    resource: &Resource<S>,
+fn desired_comparable_values<'attribute, S, D>(
+    resource: &Resource<S, D>,
     schema: &ResourceSchema,
     attributes: impl IntoIterator<Item = &'attribute str>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
@@ -2660,8 +2660,8 @@ fn resolved_subset_match(
 impl DesiredCreateOnlyValues {
     /// Extract create-only values configured on a resource, resolving simple
     /// state-backed binding references through `find_state_by_binding`.
-    pub fn from_resource<S>(
-        resource: &Resource<S>,
+    pub fn from_resource<S, D>(
+        resource: &Resource<S, D>,
         schema: &ResourceSchema,
         find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     ) -> Self {
@@ -2677,7 +2677,10 @@ impl DesiredCreateOnlyValues {
 
     /// Extract desired values when binding resolution is intentionally not
     /// available, such as post-diff moved-block hinting.
-    pub fn without_binding_resolution<S>(resource: &Resource<S>, schema: &ResourceSchema) -> Self {
+    pub fn without_binding_resolution<S, D>(
+        resource: &Resource<S, D>,
+        schema: &ResourceSchema,
+    ) -> Self {
         Self::from_resource(resource, schema, &|_binding| Vec::new())
     }
 

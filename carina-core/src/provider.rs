@@ -655,7 +655,7 @@ pub struct SentAttributes {
 }
 
 impl SentAttributes {
-    pub(crate) fn from_resource<S>(resource: &Resource<S>) -> Self {
+    pub(crate) fn from_resource<S, D>(resource: &Resource<S, D>) -> Self {
         Self::only(resource.attributes.keys().cloned().collect())
     }
 
@@ -685,7 +685,7 @@ impl SentAttributes {
         )
     }
 
-    fn from_create_sent<S>(sent: &Sent, resource: &Resource<S>) -> Self {
+    fn from_create_sent<S, D>(sent: &Sent, resource: &Resource<S, D>) -> Self {
         match sent {
             Sent::AllRequestAttributes => Self::from_resource(resource),
             Sent::Only(attributes) => Self::only(attributes.clone()),
@@ -2223,9 +2223,9 @@ impl FreshPendingCreate {
     }
 
     /// Desired values and send evidence retained by this fresh continuation.
-    pub fn sent_desired_attributes_for<'a, S>(
+    pub fn sent_desired_attributes_for<'a, S, D>(
         &self,
-        resource: &'a Resource<S>,
+        resource: &'a Resource<S, D>,
     ) -> SentDesiredAttributes<'a> {
         SentDesiredAttributes::new(
             resource.attributes.iter(),
@@ -2527,7 +2527,7 @@ impl SentRecord {
     /// Recover attribute send evidence while it is still retained in request
     /// form. Persisted continuations intentionally omit ordinary observable
     /// attribute names, so they cannot claim a sent desired basis.
-    fn sent_attributes_for<S>(&self, resource: &Resource<S>) -> Option<SentAttributes> {
+    fn sent_attributes_for<S, D>(&self, resource: &Resource<S, D>) -> Option<SentAttributes> {
         match self {
             Self::Request(sent) => Some(SentAttributes::from_create_sent(sent, resource)),
             Self::Persisted(_envelope) => None,
@@ -2637,9 +2637,9 @@ impl ObservedCreate {
 
     /// Resolved desired values and send evidence retained by the accepted
     /// create observation.
-    pub fn sent_desired_attributes_for<'a, S>(
+    pub fn sent_desired_attributes_for<'a, S, D>(
         &'a self,
-        fallback_resource: &'a Resource<S>,
+        fallback_resource: &'a Resource<S, D>,
     ) -> Option<SentDesiredAttributes<'a>> {
         let sent = self.sent.sent_attributes_for(fallback_resource)?;
         Some(match self.resolved_desired_attributes.as_ref() {
@@ -5043,9 +5043,9 @@ impl std::error::Error for DefaultTagEncodingError {}
 ///
 /// Records which tag keys came from defaults as host-owned provenance on the
 /// resource, separate from provider-facing attributes.
-pub fn merge_default_tags<S>(
+pub fn merge_default_tags<S, D>(
     config: &ProviderConfig,
-    resources: &mut [Resource<S>],
+    resources: &mut [Resource<S, D>],
     registry: &SchemaRegistry,
 ) -> ProviderResult<()> {
     if config.default_tags.is_empty() {

@@ -16,6 +16,13 @@ impl<S> UnresolvedResource<S> {
         Self(resource)
     }
 
+    /// Test adapter for display/executor fixtures whose authored dependency
+    /// snapshot is intentionally empty.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_resolved_for_test(resource: Resource<S, ()>) -> Self {
+        Self(resource.into_unexpanded_for_test())
+    }
+
     pub fn as_resource(&self) -> &Resource<S> {
         &self.0
     }
@@ -580,21 +587,10 @@ pub fn build_effect_dependency_analysis<'a, S, E>(
 where
     E: AsRef<Effect<S>>,
 {
-    build_effect_dependency_analysis_resolved(
-        effects,
-        unresolved_resource_ids.into_iter().cloned().collect(),
-        inputs,
-    )
-}
-
-fn build_effect_dependency_analysis_resolved<E, S>(
-    effects: &[E],
-    mut known_graph_ids: HashSet<ResolvedResourceId>,
-    inputs: ScheduleInputs<'_>,
-) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
-where
-    E: AsRef<Effect<S>>,
-{
+    let mut known_graph_ids = unresolved_resource_ids
+        .into_iter()
+        .cloned()
+        .collect::<HashSet<_>>();
     let mut instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
@@ -788,7 +784,7 @@ mod tests {
             ),
             from: Box::new(state_for(&resource.id)),
             to: ResolvedResource::from_resolved_parts_with_reads(
-                resource,
+                resource.with_dependency_phase(()),
                 dependencies,
                 ResolvedDependencies::default(),
                 reads,
@@ -800,7 +796,7 @@ mod tests {
     fn create_effect(binding: &'static str) -> Effect {
         let mut resource = Resource::new("test", binding);
         resource.binding = Some(binding.to_string());
-        Effect::Create(ResolvedResource::new(resource))
+        Effect::Create(ResolvedResource::new(resource.with_dependency_phase(())))
     }
 
     fn delete_effect(
@@ -857,7 +853,7 @@ mod tests {
     fn effect_identity_returns_let_binding_for_named_effect() {
         let mut resource = Resource::new("test", "named");
         resource.binding = Some("named".to_string());
-        let effect = Effect::Create(ResolvedResource::new(resource));
+        let effect = Effect::Create(ResolvedResource::new(resource.with_dependency_phase(())));
 
         assert_eq!(effect.identity(), ResourceIdentity::new("named"));
     }
@@ -876,7 +872,9 @@ mod tests {
         };
         let mut named_resource = Resource::new("test", "named");
         named_resource.binding = Some("named".to_string());
-        let named = Effect::Create(ResolvedResource::new(named_resource));
+        let named = Effect::Create(ResolvedResource::new(
+            named_resource.with_dependency_phase(()),
+        ));
 
         assert_eq!(anonymous.identity(), ResourceIdentity::new("anon_1234"));
         assert_ne!(anonymous.identity(), named.identity());
@@ -992,7 +990,7 @@ mod tests {
         };
         let origins = HashMap::from([(
             resource.resolved_id(),
-            UnresolvedResource::from_pre_resolve(resource.as_inner().clone()),
+            UnresolvedResource::from_pre_resolve(Resource::from_id(resource.id.clone())),
         )]);
 
         build_effect_dependency_analysis(&[effect], origins.keys(), ScheduleInputs::Apply)
@@ -1118,7 +1116,9 @@ mod tests {
         };
         let mut blocker_resource = Resource::new("test", "blocker");
         blocker_resource.binding = Some("blocker".to_string());
-        let blocker = Effect::Create(ResolvedResource::new(blocker_resource));
+        let blocker = Effect::Create(ResolvedResource::new(
+            blocker_resource.with_dependency_phase(()),
+        ));
         let effects = vec![delete, blocker];
         let mut foo_targets = IdentityTargets::default();
         foo_targets.insert_delete(0);
@@ -1156,7 +1156,7 @@ mod tests {
         let mut consumer_resource = Resource::new("test", "consumer");
         consumer_resource.binding = Some("consumer".to_string());
         let consumer = Effect::Create(ResolvedResource::from_resolved_parts(
-            consumer_resource,
+            consumer_resource.with_dependency_phase(()),
             resolved_dependencies(&["foo"]),
             ResolvedDependencies::default(),
         ));
@@ -1463,7 +1463,7 @@ mod tests {
             .filter_map(|effect| match effect {
                 Effect::Update { to, .. } => Some((
                     to.resolved_id(),
-                    UnresolvedResource::from_pre_resolve(to.as_inner().clone()),
+                    UnresolvedResource::from_pre_resolve(Resource::from_id(to.id.clone())),
                 )),
                 Effect::Read { .. }
                 | Effect::Create(_)
@@ -1505,7 +1505,7 @@ mod tests {
             .filter_map(|effect| match effect {
                 Effect::Update { to, .. } => Some((
                     to.resolved_id(),
-                    UnresolvedResource::from_pre_resolve(to.as_inner().clone()),
+                    UnresolvedResource::from_pre_resolve(Resource::from_id(to.id.clone())),
                 )),
                 _ => None,
             })

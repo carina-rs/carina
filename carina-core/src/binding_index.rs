@@ -46,8 +46,8 @@ use crate::data_source_value::{DataSourceValue, DataSourceValues};
 use crate::parser::{BindingName, DeferredIfBody, ResourceRef};
 use crate::resource::composition::CompositionRuntimeRef;
 use crate::resource::{
-    AccessPath, LiveComposition, PathSegment, PlanInputCurrent, ReferencePathRef, Resource,
-    ResourceId, SavedComposition, SavedModuleSource, SavedResource, State, Subscript, Value,
+    AccessPath, LiveComposition, ModuleSource, PathSegment, PlanInputCurrent, ReferencePathRef,
+    Resource, ResourceId, SavedComposition, SavedModuleSource, State, Subscript, Value,
 };
 use crate::schema::{
     AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, Shape, TypeInSchema,
@@ -1746,8 +1746,8 @@ pub struct ResolvedBindings {
 /// Slices and maps are borrowed: the constructor reads them once and
 /// stores owned copies internally, so the caller retains ownership
 /// without forcing a clone at the API boundary.
-pub struct LivePreApplyInputs<'a> {
-    pub managed: &'a [Resource],
+pub struct LivePreApplyInputs<'a, D = crate::resource::UnexpandedDependencyFields> {
+    pub managed: &'a [Resource<ModuleSource, D>],
     pub compositions: &'a [LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues,
@@ -1758,7 +1758,7 @@ pub struct LivePreApplyInputs<'a> {
 /// Saved-plan counterpart of [`LivePreApplyInputs`]. The distinct type keeps
 /// value-only saved compositions out of validation and live-expansion seams.
 pub struct SavedPreApplyInputs<'a> {
-    pub managed: &'a [SavedResource],
+    pub managed: &'a [Resource<SavedModuleSource, ()>],
     pub compositions: &'a [SavedComposition],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues<SavedModuleSource>,
@@ -1890,7 +1890,7 @@ impl ResolvedBindings {
     /// cross-file collisions by the directory loader's duplicate-
     /// declaration validation, so the order is observable only in test
     /// code that constructs colliding inputs by hand.
-    pub fn pre_apply_live(inputs: LivePreApplyInputs<'_>) -> Self {
+    pub fn pre_apply_live<D>(inputs: LivePreApplyInputs<'_, D>) -> Self {
         Self::pre_apply_live_with_stability(inputs, &HashMap::new())
     }
 
@@ -1913,8 +1913,8 @@ impl ResolvedBindings {
     /// successfully refreshed resource. Callers which already have a plan (or
     /// the differ's pre-expansion projection) pass every mutating resource in
     /// `managed_stability`.
-    pub fn pre_apply_live_with_stability(
-        inputs: LivePreApplyInputs<'_>,
+    pub fn pre_apply_live_with_stability<D>(
+        inputs: LivePreApplyInputs<'_, D>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
     ) -> Self {
         let mut bindings = Self::build_managed_core(
@@ -1934,8 +1934,8 @@ impl ResolvedBindings {
     /// migration window. Wait-aliases are layered separately by the
     /// caller after data sources / compositions so a wait whose target is
     /// a data source or composition still snapshots the resolved attrs.
-    fn build_managed_core<S>(
-        managed: &[Resource<S>],
+    fn build_managed_core<S, D>(
+        managed: &[Resource<S, D>],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
@@ -1948,8 +1948,8 @@ impl ResolvedBindings {
         )
     }
 
-    fn build_managed_core_from_iter<'a, S: 'a>(
-        managed: impl IntoIterator<Item = &'a Resource<S>>,
+    fn build_managed_core_from_iter<'a, S: 'a, D: 'a>(
+        managed: impl IntoIterator<Item = &'a Resource<S, D>>,
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
@@ -2329,9 +2329,9 @@ impl ResolvedBindings {
     /// view. This is the authoritative post-diff refinement used by export
     /// checks and apply scheduling; it also includes cascade-generated updates
     /// that a pre-expansion differ projection cannot know about.
-    pub fn apply_plan_stability<S>(
+    pub fn apply_plan_stability<S, D>(
         &mut self,
-        managed: &[Resource<S>],
+        managed: &[Resource<S, D>],
         managed_current: &HashMap<ResourceId, PlanInputCurrent>,
         plan: &crate::plan::Plan<S>,
         schemas: &crate::schema::SchemaRegistry,
@@ -2529,8 +2529,8 @@ impl ResolvedBindings {
     }
 }
 
-pub fn managed_binding_stability_from_plan<S>(
-    managed: &[Resource<S>],
+pub fn managed_binding_stability_from_plan<S, D>(
+    managed: &[Resource<S, D>],
     plan: &crate::plan::Plan<S>,
     schemas: &crate::schema::SchemaRegistry,
 ) -> HashMap<ResourceId, ManagedBindingStability> {
@@ -4168,7 +4168,7 @@ mod resolved_bindings_tests {
     #[test]
     fn wait_alias_absent_target_creates_no_entry() {
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
@@ -4194,7 +4194,7 @@ mod resolved_bindings_tests {
         );
         remote.insert("up".to_string(), attrs);
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
@@ -4347,7 +4347,7 @@ mod resolved_bindings_tests {
         );
 
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &test_data_source_values(&[ds], &states),
@@ -4391,7 +4391,7 @@ mod resolved_bindings_tests {
         let states = HashMap::from([(id.clone(), State::not_found(id))]);
 
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &test_data_source_values(&[data_source], &states),
@@ -4432,10 +4432,11 @@ mod resolved_bindings_tests {
         )]);
 
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &crate::resource::into_plan_input_current_map::<
                 crate::resource::ModuleSource,
+                crate::resource::UnexpandedDependencyFields,
             >(
                 HashMap::new(), &crate::schema::SchemaRegistry::new(), &[]
             ),
@@ -4492,7 +4493,7 @@ mod resolved_bindings_tests {
         );
 
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &test_data_source_values(&[ds], &states),
@@ -4543,7 +4544,7 @@ mod resolved_bindings_tests {
         );
 
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &test_data_source_values(&[ds], &states),

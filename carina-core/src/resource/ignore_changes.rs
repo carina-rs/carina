@@ -328,8 +328,8 @@ struct ValueCursor<'a> {
 
 /// Resolve authored ignore paths against the effective schema and the values
 /// written in the same resource block.
-pub fn resolve_ignore_changes<S>(
-    resource: &Resource<S>,
+pub fn resolve_ignore_changes<S, D>(
+    resource: &Resource<S, D>,
     schema: &ValidatedResourceSchema,
 ) -> Result<ResolvedIgnoreChanges, Vec<IgnoreChangeError>> {
     let mut errors = Vec::new();
@@ -357,8 +357,8 @@ pub fn resolve_ignore_changes<S>(
     }
 }
 
-fn resolve_one_ignore_change<S>(
-    resource: &Resource<S>,
+fn resolve_one_ignore_change<S, D>(
+    resource: &Resource<S, D>,
     schema: &ValidatedResourceSchema,
     path: &ParsedIgnorePath,
 ) -> Result<Vec<ResolvedIgnorePath>, IgnoreChangeError> {

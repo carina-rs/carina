@@ -18,7 +18,8 @@ use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, LoopElementOrigin, LoopProvenance,
-    ParsedIgnorePath, ParsedIgnorePathSegment, Resource, ResourceId, ResourceIdentity, Value,
+    ParsedIgnorePath, ParsedIgnorePathSegment, Resource, ResourceId, ResourceIdentity,
+    UnexpandedDependencyFields, Value,
 };
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -90,7 +91,10 @@ pub(crate) fn parse_resource_for_target(
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
     let attributes = parsed_contents.attributes;
-    let directives = parsed_contents.directives.unwrap_or_default();
+    let ParsedDirectives {
+        directives,
+        depends_on,
+    } = parsed_contents.directives.unwrap_or_default();
 
     let (id, binding, loop_provenance) = match target {
         ResourceParseTarget::Pending { origin } => (
@@ -122,7 +126,10 @@ pub(crate) fn parse_resource_for_target(
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding,
-        dependency_bindings: Default::default(),
+        dependencies: UnexpandedDependencyFields {
+            value_bindings: Default::default(),
+            depends_on,
+        },
         module_source: None,
         default_tag_keys: Default::default(),
         loop_provenance,
@@ -147,8 +154,14 @@ pub(crate) fn parse_block_contents_with_mode(
 
 struct ParsedBlockContents {
     attributes: IndexMap<String, Value>,
-    directives: Option<Directives>,
+    directives: Option<ParsedDirectives>,
     pending: bool,
+}
+
+#[derive(Default)]
+struct ParsedDirectives {
+    directives: Directives,
+    depends_on: crate::parser::UnexpandedDependencies,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,7 +412,10 @@ pub(crate) fn parse_read_resource_expr(
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
     let attributes = parsed_contents.attributes;
-    let directives = parsed_contents.directives.unwrap_or_default();
+    let ParsedDirectives {
+        directives,
+        depends_on,
+    } = parsed_contents.directives.unwrap_or_default();
 
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
@@ -417,7 +433,10 @@ pub(crate) fn parse_read_resource_expr(
         attributes: attributes.into_iter().collect(),
         directives,
         binding: Some(binding_name.to_string()),
-        dependency_bindings: Default::default(),
+        dependencies: UnexpandedDependencyFields {
+            value_bindings: Default::default(),
+            depends_on,
+        },
         module_source: None,
         quoted_string_attrs,
     })
@@ -426,8 +445,8 @@ pub(crate) fn parse_read_resource_expr(
 fn parse_directives(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
-) -> Result<Directives, ParseError> {
-    let mut directives = Directives::default();
+) -> Result<ParsedDirectives, ParseError> {
+    let mut parsed_directives = ParsedDirectives::default();
 
     for content_pair in pairs {
         let attr = match content_pair.as_rule() {
@@ -468,7 +487,7 @@ fn parse_directives(
                                 .to_string(),
                     });
                 }
-                directives.ignore_changes = list
+                parsed_directives.directives.ignore_changes = list
                     .into_inner()
                     .map(|element| parse_ignore_change_path(element, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -500,11 +519,11 @@ fn parse_directives(
                         )?,
                     );
                 }
-                directives.depends_on = crate::parser::UnexpandedDependencies::new(operands);
+                parsed_directives.depends_on = crate::parser::UnexpandedDependencies::new(operands);
             }
             "provider" => {
                 let eval = parse_expression_eval(value_pair, ctx)?;
-                directives.provider_instance = Some(eval_as_binding_name(
+                parsed_directives.directives.provider_instance = Some(eval_as_binding_name(
                     eval,
                     "provider: value",
                     line,
@@ -512,13 +531,13 @@ fn parse_directives(
                 )?);
             }
             "force_delete" => {
-                directives.force_delete = matches!(
+                parsed_directives.directives.force_delete = matches!(
                     parse_expression(value_pair, ctx)?,
                     Value::Concrete(ConcreteValue::Bool(true))
                 );
             }
             "create_before_destroy" => {
-                directives.create_before_destroy = matches!(
+                parsed_directives.directives.create_before_destroy = matches!(
                     parse_expression(value_pair, ctx)?,
                     Value::Concrete(ConcreteValue::Bool(true))
                 );
@@ -547,10 +566,10 @@ fn parse_directives(
                 };
                 let parsed = parse_expression(value_pair, ctx)?;
                 match literal {
-                    Some(value) => directives.set_prevent_destroy(value),
+                    Some(value) => parsed_directives.directives.set_prevent_destroy(value),
                     None => {
                         if matches!(parsed, Value::Concrete(ConcreteValue::Bool(true))) {
-                            directives.set_prevent_destroy(true);
+                            parsed_directives.directives.set_prevent_destroy(true);
                         } else {
                             ctx.push_warning(ParseWarning {
                                 file: None,
@@ -567,7 +586,7 @@ fn parse_directives(
         }
     }
 
-    Ok(directives)
+    Ok(parsed_directives)
 }
 
 fn parse_ignore_change_path(

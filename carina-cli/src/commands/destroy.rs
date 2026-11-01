@@ -314,7 +314,7 @@ async fn run_destroy_locked_owned(
 
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
-    let mut all_resources = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
+    let detected_resources = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
         parsed,
         &state_file,
         ctx.schemas(),
@@ -325,8 +325,16 @@ async fn run_destroy_locked_owned(
         &parsed.data_sources,
         provider_inputs.configs().as_provider_configs(),
         &state_block_claims,
-    )?
-    .into_destroy_resources();
+    )?;
+    let moved_pairs = crate::wiring::resolve_moved_pairs(
+        ctx,
+        parsed,
+        detected_resources.sorted_resources(),
+        &parsed.data_sources,
+        &state_file,
+    )?;
+    let mut classification_resources = detected_resources.sorted_resources().to_vec();
+    let mut all_resources = detected_resources.into_destroy_resources(&moved_pairs);
 
     if !refresh {
         eprintln!(
@@ -544,6 +552,7 @@ async fn run_destroy_locked_owned(
                     && let Some(resolved_id) = ResolvedResourceId::try_new(id.clone())
                 {
                     let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                    classification_resources.push(orphan_resource.clone());
                     all_resources.push(orphan_resource);
                 }
                 managed_current.insert(id, current);
@@ -566,27 +575,35 @@ async fn run_destroy_locked_owned(
             let current = loaded.into_current();
             if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
                 let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                classification_resources.push(orphan_resource.clone());
                 all_resources.push(orphan_resource);
             }
             managed_current.insert(id, current);
         }
     }
 
-    let mut destroy_graph_file = parsed.clone();
-    let destroy_graph = carina_core::resolved_graph::resolve_expanded_graph(
-        &mut destroy_graph_file,
-        &all_resources,
-        &parsed.data_sources,
-    )?;
-    let legacy_dependency_migration = if state_file
+    if state_file
         .as_ref()
         .is_some_and(StateFile::requires_legacy_dependency_migration)
     {
-        let report = state_file
-            .as_mut()
+        let mut classification_file = parsed.clone();
+        let classification = crate::wiring::classify_legacy_state(
+            &mut classification_file,
+            crate::wiring::MaterializedConfiguration::Planned {
+                resources: &classification_resources,
+                data_sources: &parsed.data_sources,
+            },
+            &moved_pairs,
+            state_file
+                .as_ref()
+                .expect("checked legacy state presence"),
+        )?;
+        let migration = state_file
+            .take()
             .expect("checked legacy state presence")
-            .migrate_legacy_dependencies(&destroy_graph, &parsed.resources, &[])
+            .with_legacy_classification(classification)
             .map_err(|error| AppError::Backend(error.into()))?;
+        state_file = Some(crate::wiring::report_legacy_migration(migration));
         if let Some(state) = state_file.as_ref() {
             for (id, current) in &mut managed_current {
                 if let Some(row) = state.find_resource_for_id(id) {
@@ -603,10 +620,13 @@ async fn run_destroy_locked_owned(
                     .expect("legacy migration retains the state file"),
             )
             .await?;
-        report
-    } else {
-        Default::default()
-    };
+    }
+    let mut destroy_graph_file = parsed.clone();
+    let destroy_graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut destroy_graph_file,
+        &all_resources,
+        &parsed.data_sources,
+    )?;
     let resolved_wait_bindings = destroy_graph_file
         .wait_bindings
         .iter()
@@ -759,29 +779,6 @@ async fn run_destroy_locked_owned(
         destroy_plan.add(delete_effects[*idx].clone());
     }
     destroy_plan.record_unresolved_delete_ordering_analysis(&dependency_analysis);
-    for warning in legacy_dependency_migration.warnings() {
-        let generation = warning.generation.as_ref().map_or(
-            EffectGeneration::Current,
-            |key| EffectGeneration::Deposed(key.clone()),
-        );
-        if destroy_plan.effects().iter().any(|effect| {
-            matches!(
-                effect,
-                Effect::Delete {
-                    id,
-                    generation: effect_generation,
-                    ..
-                } if id == &warning.row && effect_generation == &generation
-            )
-        }) {
-            destroy_plan.record_partially_unknown_destroy_ordering(
-                warning.row.clone(),
-                generation,
-                warning.legacy_names.clone(),
-            );
-        }
-    }
-
     let historical_display =
         collect_historical_display_attributes(&destroy_plan, &managed_current, state_file.as_ref());
 
@@ -2160,6 +2157,12 @@ mod tests {
 
     use cancellation_fixture::DestroyCancellationFixture;
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
+    }
+
     #[derive(Clone, Default)]
     struct SharedProgressWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -2950,7 +2953,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let resolved_resource = ResolvedResource::new(resource.clone());
+        let resolved_resource = resolved(resource.clone());
         let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
             &[resolved_resource],
             &current_states,
@@ -2999,7 +3002,7 @@ mod tests {
             carina_core::resource::fixture_present_current(state, identifier),
         )]);
 
-        let resolved_resource = ResolvedResource::new(resource.clone());
+        let resolved_resource = resolved(resource.clone());
         let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
             &[resolved_resource],
             &current_states,
@@ -3062,7 +3065,7 @@ mod tests {
         assert!(matches!(&loaded, Current::MissingIdentifier(_state)));
         let current_states = HashMap::from([(resource.id.clone(), loaded)]);
 
-        let resolved_resource = ResolvedResource::new(resource.clone());
+        let resolved_resource = resolved(resource.clone());
         let (effects, errors) = build_destroy_delete_effects(
             &[resolved_resource],
             &current_states,
@@ -3109,10 +3112,7 @@ mod tests {
             (second.id.clone(), Current::create_in_flight(second_pending)),
         ]);
 
-        let resolved_resources = [
-            ResolvedResource::new(first.clone()),
-            ResolvedResource::new(second.clone()),
-        ];
+        let resolved_resources = [resolved(first.clone()), resolved(second.clone())];
         let (effects, errors) = build_destroy_delete_effects(
             &resolved_resources,
             &current_states,
@@ -3138,7 +3138,7 @@ mod tests {
 
     #[test]
     fn destroy_rejects_create_outcome_unknown_with_resolution_hint() {
-        let resource = ResolvedResource::new(Resource::with_provider(
+        let resource = resolved(Resource::with_provider(
             "mock",
             "test.Widget",
             "unknown",
@@ -3201,7 +3201,7 @@ mod tests {
         let mut resources = orphan_entries
             .iter()
             .map(|(id, _loaded)| {
-                ResolvedResource::new(build_orphan_resource(
+                resolved(build_orphan_resource(
                     &state_file,
                     &ResolvedResourceId::try_new(id.clone())
                         .expect("test orphan id must be resolved"),

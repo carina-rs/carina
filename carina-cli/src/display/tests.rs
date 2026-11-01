@@ -61,7 +61,9 @@ trait IntoResolvedTestResource {
 
 impl IntoResolvedTestResource for Resource {
     fn into_resolved_test_resource(self) -> ResolvedResource {
-        ResolvedResource::new(self)
+        ResolvedResource::collect_resolved([self])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 }
 
@@ -73,6 +75,12 @@ impl IntoResolvedTestResource for ResolvedResource {
 
 fn resolved(resource: impl IntoResolvedTestResource) -> ResolvedResource {
     resource.into_resolved_test_resource()
+}
+
+fn test_resource_ref(
+    resource: &Resource,
+) -> carina_core::parser::ResourceRef<'_, carina_core::resource::ModuleSource> {
+    carina_core::parser::ResourceRef::Resource(resource)
 }
 
 fn make_resource(
@@ -91,7 +99,7 @@ fn make_resource(
         );
     }
     ResolvedResource::from_resolved_parts(
-        r,
+        resolved(r).into_inner(),
         deps.iter()
             .map(|dependency| dependency.resolved_id())
             .collect(),
@@ -535,7 +543,7 @@ fn test_extract_compact_hint_resource_ref() {
         Value::resource_ref("public_subnet_1a".to_string(), "id".to_string(), vec![]),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     // Should return only the first ResourceRef alphabetically, with _id suffix stripped
     assert_eq!(hint, Some("route_table: public_rt".to_string()));
 }
@@ -554,10 +562,7 @@ fn test_extract_compact_hint_skips_parent_ref() {
     );
 
     // When parent is database_rt, should skip route_table_id and show only subnet_id
-    let hint = extract_compact_hint(
-        carina_core::parser::ResourceRef::Resource(&r),
-        Some("database_rt"),
-    );
+    let hint = extract_compact_hint(test_resource_ref(&r), Some("database_rt"));
     assert_eq!(hint, Some("subnet: database_subnet_1a".to_string()));
 }
 
@@ -570,7 +575,7 @@ fn test_extract_compact_hint_string_fallback() {
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(hint, Some("destination_cidr_block: 0.0.0.0/0".to_string()));
 }
 
@@ -578,7 +583,7 @@ fn test_extract_compact_hint_string_fallback() {
 #[test]
 fn test_extract_compact_hint_none() {
     let r = Resource::new("ec2.route", "hash789");
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(hint, None);
 }
 
@@ -595,7 +600,7 @@ fn test_extract_compact_hint_prefers_string_over_resource_ref() {
         Value::resource_ref("igw".to_string(), "id".to_string(), vec![]),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     // String takes priority over ResourceRef
     assert_eq!(hint, Some("destination: 10.0.0.0/8".to_string()));
 }
@@ -611,7 +616,7 @@ fn test_extract_compact_hint_service_name_shortening() {
         )),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 
     // Single service component
@@ -623,7 +628,7 @@ fn test_extract_compact_hint_service_name_shortening() {
         )),
     );
 
-    let hint2 = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r2), None);
+    let hint2 = extract_compact_hint(test_resource_ref(&r2), None);
     assert_eq!(hint2, Some("service: s3".to_string()));
 }
 
@@ -641,10 +646,7 @@ fn test_extract_compact_hint_all_refs_match_parent() {
     );
 
     // When parent is endpoint_sg, should skip group_id and use description
-    let hint = extract_compact_hint(
-        carina_core::parser::ResourceRef::Resource(&r),
-        Some("endpoint_sg"),
-    );
+    let hint = extract_compact_hint(test_resource_ref(&r), Some("endpoint_sg"));
     assert_eq!(hint, Some("description: Allow HTTPS from VPC".to_string()));
 }
 
@@ -672,7 +674,7 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
     );
 
     // String attribute (service_name) takes priority over ResourceRef
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), Some("vpc"));
+    let hint = extract_compact_hint(test_resource_ref(&r), Some("vpc"));
     assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 }
 
@@ -681,14 +683,10 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
 fn test_has_binding() {
     let mut bound = Resource::new("ec2.Vpc", "vpc");
     bound.binding = Some("vpc".to_string());
-    assert!(has_binding(carina_core::parser::ResourceRef::Resource(
-        &bound
-    )));
+    assert!(has_binding(test_resource_ref(&bound)));
 
     let anonymous = Resource::new("ec2.Vpc", "hash123");
-    assert!(!has_binding(carina_core::parser::ResourceRef::Resource(
-        &anonymous
-    )));
+    assert!(!has_binding(test_resource_ref(&anonymous)));
 }
 
 /// Test that format_compact_name shows plain identifiers for bound resources and
@@ -698,7 +696,7 @@ fn test_format_compact_name_bound_resource() {
     let mut r = Resource::new("ec2.Vpc", "vpc");
     r.binding = Some("vpc".to_string());
     // For bound resources, should show name as plain identifier (no quotes)
-    let result = format_compact_name(carina_core::parser::ResourceRef::Resource(&r), "vpc", None);
+    let result = format_compact_name(test_resource_ref(&r), "vpc", None);
     assert!(
         !result.contains('"'),
         "Bound resource name should not be quoted"
@@ -713,11 +711,7 @@ fn test_format_compact_name_anonymous_with_hint() {
         "subnet_id".to_string(),
         Value::resource_ref("database_subnet_1a".to_string(), "id".to_string(), vec![]),
     );
-    let result = format_compact_name(
-        carina_core::parser::ResourceRef::Resource(&r),
-        "hash123",
-        None,
-    );
+    let result = format_compact_name(test_resource_ref(&r), "hash123", None);
     assert!(
         result.contains('(') && result.contains(')'),
         "Anonymous resource should show hint in parentheses, got: {}",
@@ -812,7 +806,7 @@ fn test_extract_compact_hint_list_containing_resource_ref() {
         )])),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(
         hint,
         Some("security_group: endpoint_sg".to_string()),
@@ -833,10 +827,7 @@ fn test_extract_compact_hint_list_ref_skips_parent() {
         )])),
     );
 
-    let hint = extract_compact_hint(
-        carina_core::parser::ResourceRef::Resource(&r),
-        Some("endpoint_sg"),
-    );
+    let hint = extract_compact_hint(test_resource_ref(&r), Some("endpoint_sg"));
     assert_eq!(
         hint, None,
         "Should skip List<ResourceRef> when ref matches parent"
@@ -865,7 +856,7 @@ fn test_extract_compact_hint_preserves_namespaced_string() {
         )),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(
         hint,
         Some("availability_zone: awscc.AvailabilityZone.ap_northeast_1a".to_string()),
@@ -884,7 +875,7 @@ fn test_extract_compact_hint_considers_all_resource_attributes() {
         Value::Concrete(ConcreteValue::String("abc123".into())),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(hint, Some("_hash: abc123".to_string()));
 }
 
@@ -1092,7 +1083,7 @@ fn test_deferred_replace_renders_dependent_children() {
     let mut plan = Plan::new();
     plan.add(deferred_replace_validation_records_effect());
     plan.add(Effect::Create(ResolvedResource::from_resolved_parts(
-        dependent,
+        resolved(dependent).into_inner(),
         ResolvedDependencies::from_iter([ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
             "validation_records",
@@ -1215,7 +1206,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     // The dependency address is retained as typed graph metadata after the
     // ResourceRef value resolves to a string.
     let sg = ResolvedResource::from_resolved_parts(
-        sg,
+        resolved(sg).into_inner(),
         [vpc_to.resolved_id()].into_iter().collect(),
         ResolvedDependencies::default(),
     );

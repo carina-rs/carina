@@ -319,13 +319,17 @@ fn resolve_upstream_exports_with_context(
                     // as value-shaped upstream exports.
                     let inferred =
                         crate::validation::inference::infer_export_params(&parsed, &empty_schemas);
-                    if let Err(reason) =
+                    if let Err(boundary_errors) =
                         crate::validation::validate_export_handle_boundaries(inferred.parameters())
                     {
                         errors.push(UpstreamResolveError {
                             binding: us.binding.clone(),
                             source: us.source.clone(),
-                            reason,
+                            reason: boundary_errors
+                                .into_iter()
+                                .map(|error| error.to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
                         });
                         continue;
                     }
@@ -333,13 +337,19 @@ fn resolve_upstream_exports_with_context(
                 let entries: UpstreamExportEntries = match schemas {
                     Some(s) => {
                         let inferred = crate::validation::inference::apply_inference(parsed, s);
-                        if let Err(reason) = crate::validation::validate_export_handle_boundaries(
-                            &inferred.export_params,
-                        ) {
+                        if let Err(boundary_errors) =
+                            crate::validation::validate_export_handle_boundaries(
+                                &inferred.export_params,
+                            )
+                        {
                             errors.push(UpstreamResolveError {
                                 binding: us.binding.clone(),
                                 source: us.source.clone(),
-                                reason,
+                                reason: boundary_errors
+                                    .into_iter()
+                                    .map(|error| error.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
                             });
                             continue;
                         }

@@ -213,7 +213,7 @@ pub(super) async fn refresh_pending_states<S: Clone>(
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource<S: Clone>(
-    input: Result<CheckInput<Resource<S>>, String>,
+    input: Result<CheckInput<Resource<S, ()>, Resource<S>>, String>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<(ProviderReadyResource, SecretPreservingAttributes), String> {
     let bindings = context.bindings();
@@ -311,9 +311,9 @@ fn needs_apply_resolution(value: &Value) -> bool {
 }
 
 pub(super) fn resolve_data_source<S: Clone>(
-    input: Result<CheckInput<DataSource<S>>, String>,
+    input: Result<CheckInput<DataSource<S, ()>, DataSource<S>>, String>,
     bindings: &ResolvedBindings,
-) -> Result<ResolvedCheckInput<DataSource<S>>, String> {
+) -> Result<ResolvedCheckInput<DataSource<S, ()>>, String> {
     let checked = match input? {
         CheckInput::Authored(source) => {
             let mut resolved = source.clone();
@@ -372,7 +372,9 @@ pub(super) fn resolved_resource(
     resource: Resource,
 ) -> Result<crate::resource::ResolvedResource, SerializationError> {
     crate::resource::assert_resource_fully_resolved(&resource)?;
-    Ok(crate::resource::ResolvedResource::new(resource))
+    Ok(crate::resource::ResolvedResource::new(
+        resource.with_dependency_phase(()),
+    ))
 }
 
 /// Reject a resolved attribute value that still carries an unresolved
@@ -1043,14 +1045,16 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(to.as_inner(), ctx.runtime_authored);
-            let resolve_source = check_input
+            let resolve_source_attributes = check_input
                 .as_ref()
                 .ok()
                 .and_then(|input| match input {
                     CheckInput::Authored(_) => None,
-                    CheckInput::PlanNormalized { authored, .. } => Some(authored.clone()),
+                    CheckInput::PlanNormalized { authored, .. } => {
+                        Some(authored.attributes.clone())
+                    }
                 })
-                .unwrap_or_else(|| to.as_inner().clone());
+                .unwrap_or_else(|| to.attributes.clone());
             let (resolved_to, resolved_desired_attributes) =
                 match resolve_resource(check_input, preparation).await {
                     Ok(r) => r,
@@ -1120,7 +1124,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 // its desired value at apply time; otherwise raw provider
                 // defaults could turn an unrelated saved-plan update into a
                 // wider patch than the plan authorized.
-                if resolve_source.attributes.get(key) == Some(new_value) {
+                if resolve_source_attributes.get(key) == Some(new_value) {
                     continue;
                 }
                 let type_info = schema.attributes.get(key).map(|attr| TypedAttr {
@@ -1128,7 +1132,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     defs: &schema.defs,
                 });
                 let Some(comparison_value) =
-                    secret_grafted_comparison_view(new_value, resolve_source.attributes.get(key))
+                    secret_grafted_comparison_view(new_value, resolve_source_attributes.get(key))
                 else {
                     continue;
                 };

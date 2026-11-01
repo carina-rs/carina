@@ -19,13 +19,12 @@ use carina_core::parser::{
 use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
 use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
 use carina_core::provider_source::ProviderSource;
-use carina_core::resolved_graph::LegacyDependencyProjectionIndex;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
     CompositionSourceIdentityResolver, ConcreteValue, Current, LiveComposition, ModuleSource,
-    PersistedDestroyDependencies, Resource, ResourceId, SavedComposition, SavedCompositionOriginId,
-    SavedDataSource, SavedModuleSource, SavedResource, State, Value,
+    PersistedDestroyDependencies, ResolvedResourceId, Resource, ResourceId, SavedComposition,
+    SavedCompositionOriginId, SavedDataSource, SavedModuleSource, SavedResource, State, Value,
 };
 use carina_core::schema::SchemaKind;
 #[cfg(test)]
@@ -36,7 +35,7 @@ use carina_core::value::{
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
-use carina_state::{ResolvedReadBackend, ResourceState, StateFile};
+use carina_state::{LegacyDependencyClassification, ResolvedReadBackend, ResourceState, StateFile};
 
 use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
@@ -52,6 +51,7 @@ use crate::plan_image::PlanImageError;
 use crate::plan_image::{
     ImageTheme, InlineImageProtocol, PlanImageTarget, Theme, resolve_plan_image_options,
 };
+
 use crate::plan_image::{
     InlineImageRequest, PlanImageInput, RenderedInlineImage, ResolvedPlanImageTarget,
     StateMetadata, render_plan_outputs, write_inline_image, write_plan_image,
@@ -62,6 +62,19 @@ use crate::wiring::{
     create_plan_from_parsed_with_upstream_with_ctx, provider_factory_source,
 };
 use carina_core::hint::ProjectCommand;
+
+fn deserialize_persisted_destroy_dependency_vec<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PersistedDestroyDependencies>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<BTreeSet<ResolvedResourceId>>::deserialize(deserializer)?
+        .into_iter()
+        .map(PersistedDestroyDependencies::decode_persisted)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(serde::de::Error::custom)
+}
 
 fn schema_kind_label(kind: SchemaKind) -> &'static str {
     match kind {
@@ -459,7 +472,7 @@ mod provider_scope_evidence_tests {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -651,8 +664,9 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 36 stores resolved dependency addresses and graph-projected
-    /// destroy-dependency metadata.
+    /// Plan format 37 stores the exact legacy-dependency classification used
+    /// by planning. Format 36 added resolved dependency addresses and
+    /// graph-projected destroy-dependency metadata.
     ///
     /// Plan format 35 stores the tri-state `prevent_destroy` directive so an
     /// explicit `false` remains distinct from an unspecified value, and
@@ -706,9 +720,9 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     pub backend_config: Option<BackendConfig>,
     /// The plan (effects)
     pub plan: P,
-    /// Pre-resolution resources sorted by dependencies and keyed with their
-    /// paired resolved IDs (for post-apply state saving).
-    pub sorted_resources: Vec<Resource<S>>,
+    /// Dependency-resolved resources sorted by dependencies and keyed with
+    /// their paired resolved IDs (for post-apply state saving).
+    pub sorted_resources: Vec<Resource<S, ()>>,
     /// Graph-projected managed-row value edges paired by index with
     /// `sorted_resources`. Saved-plan apply reattaches these opaque values
     /// before state writeback so waits and data sources never leak into state.
@@ -716,9 +730,10 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// Graph-projected managed-row explicit edges paired by index with
     /// `sorted_resources`.
     pub sorted_explicit_destroy_dependencies: Vec<PersistedDestroyDependencies>,
-    /// Complete legacy-name projection from the expanded typed graph.
-    /// Required by saved-plan apply when the locked state is still v20.
-    pub legacy_dependency_projections: LegacyDependencyProjectionIndex,
+    /// Exact classification of the plan-time v20 state, if migration was
+    /// pending. Saved-plan apply replays this only against the same lineage
+    /// and source names.
+    pub legacy_dependency_classification: Option<LegacyDependencyClassification>,
     /// Pre-resolution resources captured before ResourceRef substitution and
     /// stored in the same order as `sorted_resources`.
     ///
@@ -807,6 +822,7 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
 
 pub(crate) type UnresolvedPlanFileContents =
     PlanFileContents<SavedModuleSource, UnresolvedSavedPlan>;
+pub(crate) type SavedPlanResource = Resource<SavedModuleSource, ()>;
 
 impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
     fn from(contents: PlanFileContents) -> Self {
@@ -823,7 +839,7 @@ impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -846,11 +862,11 @@ impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
             plan: plan.into(),
             sorted_resources: sorted_resources
                 .into_iter()
-                .map(SavedResource::from)
+                .map(Resource::<SavedModuleSource, ()>::from)
                 .collect(),
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources: unresolved_resources
                 .into_iter()
                 .map(SavedResource::from)
@@ -888,7 +904,7 @@ impl From<PlanFileContents<SavedModuleSource>> for UnresolvedPlanFileContents {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -912,7 +928,7 @@ impl From<PlanFileContents<SavedModuleSource>> for UnresolvedPlanFileContents {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -951,7 +967,7 @@ struct ProviderEvidence {
 /// keys to match the providers implied by the saved provider configurations.
 ///
 /// Format 36 stores resolved dependency addresses, graph-projected destroy
-/// dependencies, and the classified legacy-name projection used by saved-plan
+/// dependencies, and the classified legacy-name result used by saved-plan
 /// apply.
 ///
 /// Format 35 stores the tri-state `prevent_destroy` directive so an explicit
@@ -982,7 +998,8 @@ pub struct PlanFile {
 ///
 /// Existing field order remains identical to the historical `PlanFile`
 /// serialization order. The mandatory directive-change and provider-evidence
-/// fields introduced by format 35 remain mandatory in format 36 and are never
+/// fields introduced by format 35 remain mandatory. Format 37's optional
+/// classification field is mandatory in the wire shape and is never
 /// defaulted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
@@ -995,10 +1012,12 @@ struct PlanFileWire {
     provider_configs: SavedProviderConfigs,
     backend_config: Option<BackendConfig>,
     plan: UnresolvedSavedPlan,
-    sorted_resources: Vec<SavedResource>,
+    sorted_resources: Vec<Resource<SavedModuleSource, ()>>,
+    #[serde(deserialize_with = "deserialize_persisted_destroy_dependency_vec")]
     sorted_value_destroy_dependencies: Vec<PersistedDestroyDependencies>,
+    #[serde(deserialize_with = "deserialize_persisted_destroy_dependency_vec")]
     sorted_explicit_destroy_dependencies: Vec<PersistedDestroyDependencies>,
-    legacy_dependency_projections: LegacyDependencyProjectionIndex,
+    legacy_dependency_classification: Option<LegacyDependencyClassification>,
     unresolved_resources: Vec<SavedResource>,
     compositions: Vec<SavedComposition>,
     #[serde(default)]
@@ -1381,7 +1400,7 @@ impl From<PlanFile> for PlanFileWire {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1410,7 +1429,7 @@ impl From<PlanFile> for PlanFileWire {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1445,7 +1464,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1473,7 +1492,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1789,11 +1808,10 @@ impl<S> PlanFileContents<S> {
                 }
             }
         }
-        for resource in self
-            .sorted_resources
-            .iter()
-            .chain(&self.unresolved_resources)
-        {
+        for resource in &self.sorted_resources {
+            insert(&mut instances, &resource.id);
+        }
+        for resource in &self.unresolved_resources {
             insert(&mut instances, &resource.id);
         }
         for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
@@ -1970,11 +1988,10 @@ impl UnresolvedPlanFileContents {
                 }
             }
         }
-        for resource in self
-            .sorted_resources
-            .iter()
-            .chain(&self.unresolved_resources)
-        {
+        for resource in &self.sorted_resources {
+            insert(&mut instances, &resource.id);
+        }
+        for resource in &self.unresolved_resources {
             insert(&mut instances, &resource.id);
         }
         for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
@@ -1999,7 +2016,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 36;
+    pub const CURRENT_VERSION: u32 = 37;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -2184,17 +2201,17 @@ impl PlanFile {
     pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
         use carina_core::resource::{DataSource, SavedComposition};
 
-        fn resource_contains<S>(resource: &Resource<S>) -> bool {
+        fn resource_contains<S, D>(resource: &Resource<S, D>) -> bool {
             resource.contains_redacted_secret_placeholders()
         }
 
-        fn data_source_contains<S>(data_source: &DataSource<S>) -> bool {
+        fn data_source_contains<S, D>(data_source: &DataSource<S, D>) -> bool {
             let DataSource {
                 id: _id,
                 attributes,
                 directives: _directives,
                 binding: _binding,
-                dependency_bindings: _dependency_bindings,
+                dependencies: _dependencies,
                 module_source: _module_source,
                 quoted_string_attrs: _quoted_string_attrs,
             } = data_source;
@@ -2242,7 +2259,7 @@ impl PlanFile {
             sorted_resources,
             sorted_value_destroy_dependencies: _sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies: _sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections: _legacy_dependency_projections,
+            legacy_dependency_classification: _legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -2357,11 +2374,15 @@ impl PlanFile {
                 }
             }
         }
-        for dependency in self.legacy_dependency_projections.managed_dependencies() {
-            if !configured_managed_ids.contains(dependency.as_inner()) {
-                return Err(format!(
-                    "Invalid saved plan: legacy dependency projection contains non-managed dependency `{dependency}`"
-                ));
+        if let Some(classification) = &self.legacy_dependency_classification {
+            let source_row_ids = classification.source_row_ids().collect::<HashSet<_>>();
+            for row in classification.row_ids() {
+                if !configured_managed_ids.contains(row.as_inner()) && !source_row_ids.contains(row)
+                {
+                    return Err(format!(
+                        "Invalid saved plan: legacy dependency classification contains unknown row `{row}`"
+                    ));
+                }
             }
         }
         for (index, resource) in self.unresolved_resources.iter().enumerate() {
@@ -3100,6 +3121,12 @@ mod historical_display_tests {
     use carina_core::resource::{DeferredValue, ResolvedResource};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
+    }
+
     #[test]
     fn production_historical_display_combines_desired_and_persisted_secret_shapes() {
         const PLAINTEXT: &str = "hunter2";
@@ -3112,7 +3139,7 @@ mod historical_display_tests {
             )]),
         )
         .with_identifier("masked-update");
-        let to = ResolvedResource::new(
+        let to = resolved(
             Resource::new("mock.test.resource", "masked-update").with_attribute(
                 "comment",
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -3254,12 +3281,10 @@ pub(crate) enum ReloadedCompositionRehydrationError {
 }
 
 impl UnresolvedReloadedPlanFile {
-    pub(crate) fn sorted_resources(&self) -> &[SavedResource] {
-        &self.contents.sorted_resources
-    }
-
-    pub(crate) fn legacy_dependency_projections(&self) -> &LegacyDependencyProjectionIndex {
-        &self.contents.legacy_dependency_projections
+    pub(crate) fn legacy_dependency_classification(
+        &self,
+    ) -> Option<&LegacyDependencyClassification> {
+        self.contents.legacy_dependency_classification.as_ref()
     }
 
     pub(crate) fn verify_schema_fingerprints(
@@ -3304,7 +3329,7 @@ impl UnresolvedReloadedPlanFile {
             sorted_resources,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
+            legacy_dependency_classification,
             unresolved_resources,
             compositions,
             data_sources,
@@ -3315,7 +3340,7 @@ impl UnresolvedReloadedPlanFile {
             upstream_sources,
             wait_bindings,
         } = contents;
-        let resolve_resources = |resources: Vec<SavedResource>| {
+        let resolve_resources = |resources: Vec<Resource<SavedModuleSource, ()>>| {
             resources
                 .into_iter()
                 .map(|resource| {
@@ -3337,8 +3362,8 @@ impl UnresolvedReloadedPlanFile {
             sorted_resources: resolve_resources(sorted_resources)?,
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
-            legacy_dependency_projections,
-            unresolved_resources: resolve_resources(unresolved_resources)?,
+            legacy_dependency_classification,
+            unresolved_resources,
             compositions,
             data_sources,
             data_source_origins,
@@ -3389,7 +3414,7 @@ impl ReloadedPlanFile {
         &mut self.contents.plan
     }
 
-    pub(crate) fn sorted_resources(&self) -> &[SavedResource] {
+    pub(crate) fn sorted_resources(&self) -> &[Resource<SavedModuleSource, ()>] {
         &self.contents.sorted_resources
     }
 
@@ -3401,7 +3426,7 @@ impl ReloadedPlanFile {
         &self.contents.sorted_explicit_destroy_dependencies
     }
 
-    pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<SavedResource> {
+    pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<Resource<SavedModuleSource, ()>> {
         &mut self.contents.sorted_resources
     }
 
@@ -3744,6 +3769,12 @@ mod managed_current_serde_tests {
     };
     use carina_state::{ResourceState, StateFile};
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
+    }
+
     fn reload_error_text(
         error: &crate::error::LockedStateReloadError,
         project_dir: &std::path::Path,
@@ -3766,7 +3797,7 @@ mod managed_current_serde_tests {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -3797,7 +3828,7 @@ mod managed_current_serde_tests {
 
     #[test]
     fn saved_plan_unknown_marker_round_trips_and_rejects_status_changes() {
-        let resource = ResolvedResource::new(Resource::with_provider(
+        let resource = resolved(Resource::with_provider(
             "mock",
             "test.Resource",
             "unknown",
@@ -3933,7 +3964,7 @@ mod managed_current_serde_tests {
 
     #[test]
     fn saved_plan_rejects_in_flight_status_change_in_both_directions() {
-        let resource = ResolvedResource::new(Resource::with_provider(
+        let resource = resolved(Resource::with_provider(
             "mock",
             "test.Resource",
             "pending",
@@ -3986,7 +4017,7 @@ mod managed_current_serde_tests {
     fn saved_plan_rejects_new_in_flight_address_missing_from_snapshot() {
         let planned_id =
             ResourceId::with_provider_identity("mock", "test.Resource", "planned", None);
-        let unexpected_resource = ResolvedResource::new(Resource::with_provider(
+        let unexpected_resource = resolved(Resource::with_provider(
             "mock",
             "test.Resource",
             "unexpected",
@@ -4032,7 +4063,7 @@ mod managed_current_serde_tests {
         let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
         let destination =
             ResourceId::with_provider_identity("mock", "test.Resource", "destination", None);
-        let source_resource = ResolvedResource::new(Resource::from_id(source.clone()));
+        let source_resource = resolved(Resource::from_id(source.clone()));
         let pending = crate::fixture_in_flight_create(
             &source,
             "state-owned-token",
@@ -4094,7 +4125,7 @@ mod managed_current_serde_tests {
         let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
         let destination =
             ResourceId::with_provider_identity("mock", "test.Resource", "destination", None);
-        let source_resource = ResolvedResource::new(Resource::from_id(source.clone()));
+        let source_resource = resolved(Resource::from_id(source.clone()));
         let unknown = unknown_outcome(source.clone());
         let started_at = unknown.started_at().clone();
         let row = ResourceState::from_unknown_create_outcome(
@@ -4272,7 +4303,7 @@ fn build_plan_file_contents<E>(
     let mut composition_source_identities =
         CompositionSourceIdentityResolver::new(get_base_dir(path))?;
 
-    let desired_resources: HashMap<ResourceId, Resource> = ctx
+    let desired_resources: HashMap<ResourceId, Resource<ModuleSource, ()>> = ctx
         .sorted_resources
         .iter()
         .map(|resource| (resource.id.clone(), resource.as_inner().clone()))
@@ -4378,10 +4409,11 @@ fn build_plan_file_contents<E>(
             }
         })
         .collect::<Result<Vec<_>, carina_core::value::SerializationError>>()?;
-    let redacted_desired_resources: HashMap<ResourceId, Resource> = redacted_sorted_resources
-        .iter()
-        .map(|resource| (resource.id.clone(), resource.clone()))
-        .collect();
+    let redacted_desired_resources: HashMap<ResourceId, Resource<ModuleSource, ()>> =
+        redacted_sorted_resources
+            .iter()
+            .map(|resource| (resource.id.clone(), resource.clone()))
+            .collect();
 
     let contents = PlanFileContents {
         // carina#3803: bumped 35→36 — saved plans retain resolved dependency
@@ -4513,7 +4545,7 @@ fn build_plan_file_contents<E>(
             .iter()
             .map(|resource| resource.persisted_explicit_destroy_dependencies().clone())
             .collect(),
-        legacy_dependency_projections: ctx.legacy_dependency_projections.clone(),
+        legacy_dependency_classification: ctx.legacy_dependency_classification.clone(),
         unresolved_resources: ctx
             .unresolved_resources
             .iter()
@@ -5017,7 +5049,7 @@ pub async fn run_plan(
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    let resources_for_exports: Vec<Resource> = ctx
+    let resources_for_exports: Vec<Resource<ModuleSource, ()>> = ctx
         .sorted_resources
         .iter()
         .map(|resource| resource.as_inner().clone())
@@ -5275,9 +5307,12 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
 ///
 /// Every field is mandatory so plan and apply cannot accidentally omit a
 /// binding layer or the provider-aware builtin context.
-pub(crate) struct CheckExportsPreApplyInput<'a> {
+pub(crate) struct CheckExportsPreApplyInput<
+    'a,
+    D = carina_core::resource::UnexpandedDependencyFields,
+> {
     pub export_params: &'a [carina_core::parser::InferredExportParam],
-    pub resources: &'a [Resource],
+    pub resources: &'a [Resource<ModuleSource, D>],
     pub compositions: &'a [carina_core::resource::LiveComposition],
     pub managed_current: &'a HashMap<ResourceId, Current>,
     pub data_source_values: &'a carina_core::data_source_value::DataSourceValues,
@@ -5294,8 +5329,8 @@ pub(crate) struct CheckExportsPreApplyInput<'a> {
 
 /// Check export expressions against the pre-apply binding view while retaining
 /// their original unresolved form for a later post-apply resolution.
-pub(crate) fn check_exports_pre_apply(
-    input: CheckExportsPreApplyInput<'_>,
+pub(crate) fn check_exports_pre_apply<D>(
+    input: CheckExportsPreApplyInput<'_, D>,
 ) -> Result<
     carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>,
     String,
@@ -6704,6 +6739,12 @@ mod run_plan_out_tests {
     };
     use std::fs;
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
+    }
+
     fn resolved_image_target(path: PathBuf, theme: ImageTheme) -> ResolvedPlanImageTarget {
         let target = PlanImageTarget::try_from(path).unwrap();
         resolve_plan_image_options(Some(&target), false, Some(theme), |_| None, false)
@@ -6867,15 +6908,13 @@ mod run_plan_out_tests {
             )
             .expect("persisted update row");
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(created_effect),
-        ));
+        plan.add(Effect::Create(resolved(created_effect)));
         plan.add(Effect::Update {
             identifier: crate::fixture_applied_identifier("updated-id"),
             from: Box::new(
                 State::existing(updated.id.clone(), HashMap::new()).with_identifier("updated-id"),
             ),
-            to: carina_core::resource::ResolvedResource::new(updated_effect),
+            to: resolved(updated_effect),
             changed_attributes: vec!["comment".to_string(), "web_acl_arn".to_string()],
         });
         let parsed = resolve_file_for_test(carina_core::parser::ParsedFile::default(), tmp.path());
@@ -6887,7 +6926,7 @@ mod run_plan_out_tests {
                 updated.clone(),
             ])
             .unwrap(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: Default::default(),
             migrated_legacy_state: None,
             unresolved_resources: [created, updated]
                 .into_iter()
@@ -7116,7 +7155,7 @@ mod run_plan_out_tests {
             let identity =
                 carina_core::resource::ResourceIdentity::try_from(format!("resource_{index:04}"))
                     .unwrap();
-            plan.add(Effect::Create(ResolvedResource::new(Resource::new(
+            plan.add(Effect::Create(resolved(Resource::new(
                 "test.Resource",
                 identity,
             ))));
@@ -7171,7 +7210,7 @@ mod run_plan_out_tests {
             let identity =
                 carina_core::resource::ResourceIdentity::try_from(format!("resource_{index:04}"))
                     .unwrap();
-            plan.add(Effect::Create(ResolvedResource::new(Resource::new(
+            plan.add(Effect::Create(resolved(Resource::new(
                 "test.Resource",
                 identity,
             ))));
@@ -7266,7 +7305,7 @@ mod run_plan_out_tests {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: Default::default(),
             migrated_legacy_state: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
@@ -7353,7 +7392,7 @@ mod run_plan_out_tests {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: Default::default(),
             migrated_legacy_state: None,
             unresolved_resources: Vec::new(),
             compositions: vec![prepared],
@@ -7408,7 +7447,7 @@ mod run_plan_out_tests {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: Default::default(),
             migrated_legacy_state: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
@@ -7476,7 +7515,7 @@ mod run_plan_out_tests {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
-            legacy_dependency_projections: Default::default(),
+            legacy_dependency_classification: Default::default(),
             migrated_legacy_state: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
@@ -7546,9 +7585,9 @@ mod export_diff_tests {
     }
 
     fn param(name: &str, value: Value) -> InferredExportParam {
-        InferredExportParam {
-            name: name.to_string(),
-            static_type: carina_core::static_type::ExportStaticType::Inferred(
+        InferredExportParam::for_test(
+            name,
+            carina_core::static_type::ExportStaticType::Inferred(
                 carina_core::static_type::StaticType::Unchecked(
                     carina_core::static_type::InferredUncheckedReason::NotInferable(
                         carina_core::static_type::NotInferableReason::SchemaUnavailable {
@@ -7557,8 +7596,8 @@ mod export_diff_tests {
                     ),
                 ),
             ),
-            value: Some(value),
-        }
+            Some(value),
+        )
     }
 
     fn checked(

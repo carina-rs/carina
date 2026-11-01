@@ -11969,10 +11969,10 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
     assert_eq!(parsed.resources.len(), 3); // allow: direct — fixture test inspection
     for resource in &parsed.resources {
         assert!(
-            resource.dependency_bindings.contains("orgs"),
+            resource.dependencies.value_bindings.contains("orgs"),
             "expanded deferred-for child {} should depend on iterable binding `orgs`, got {:?}",
             resource.id,
-            resource.dependency_bindings
+            resource.dependencies.value_bindings
         );
     }
 }
@@ -12036,9 +12036,9 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
 
     let child = &parsed.resources[0];
     assert!(
-        child.dependency_bindings.contains("orgs"),
+        child.dependencies.value_bindings.contains("orgs"),
         "resolve_refs_for_plan must preserve deferred-for iterable dependency binding, got {:?}",
-        child.dependency_bindings
+        child.dependencies.value_bindings
     );
 }
 
@@ -13123,11 +13123,11 @@ fn parsed_file_is_file_of_parsed_export_param() {
 
 #[test]
 fn inferred_file_holds_inferred_export_param() {
-    let one = InferredExportParam {
-        name: "vpc_id".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::String),
-        value: None,
-    };
+    let one = InferredExportParam::for_test(
+        "vpc_id",
+        crate::static_type::ExportStaticType::Declared(TypeExpr::String),
+        None,
+    );
     let f: InferredFile = InferredFile {
         export_params: vec![one],
         ..Default::default()
@@ -14404,7 +14404,7 @@ fn extract_directives_reads_depends_on_list() {
         .find(|r| r.id.identity_str().expect("resolved identity") == "bucket")
         .expect("bucket binding");
     assert_eq!(
-        bucket.directives.depends_on.diagnostic_references(),
+        bucket.dependencies.depends_on.diagnostic_references(),
         vec!["role".to_string(), "key".to_string()]
     );
 }
@@ -14703,9 +14703,9 @@ fn extract_directives_accepts_empty_depends_on_list() {
         .find(|r| r.id.identity_str().expect("resolved identity") == "bucket")
         .expect("bucket binding");
     assert!(
-        bucket.directives.depends_on.is_empty(),
+        bucket.dependencies.depends_on.is_empty(),
         "empty depends_on list should produce an empty Vec, got {:?}",
-        bucket.directives.depends_on
+        bucket.dependencies.depends_on
     );
 }
 
@@ -14741,7 +14741,7 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         panic!("deferred fixture body must be a resource")
     };
     assert_eq!(
-        template.directives.depends_on.diagnostic_references(),
+        template.dependencies.depends_on.diagnostic_references(),
         vec!["role".to_string()],
         "for-body resource template should carry directives.depends_on"
     );
@@ -16880,7 +16880,7 @@ let us = provider mock {}
         .find(|resource| resource.binding.as_deref() == Some("consumer"))
         .expect("consumer");
     assert_eq!(
-        consumer.directives.depends_on.diagnostic_references(),
+        consumer.dependencies.depends_on.diagnostic_references(),
         vec!["dependency"]
     );
     assert_eq!(consumer.directives.provider_instance.as_deref(), Some("us"));

@@ -2646,16 +2646,20 @@ impl DiagnosticEngine {
         if let Err(handle_errors) =
             carina_core::validation::validate_export_handle_boundaries(&boundary_export_params)
         {
-            for error_msg in handle_errors.split('\n') {
-                if let Some((line, col)) = self.find_ref_error_position(doc, error_msg) {
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        col,
-                        col + 1,
-                        DiagnosticSeverity::WARNING,
-                        error_msg.to_string(),
-                    ));
+            for error in handle_errors {
+                if error.source_file() != doc.source_file() {
+                    continue;
                 }
+                let span = error.source_span();
+                let line = span.start_line().saturating_sub(1) as u32;
+                let col = span.start_column().saturating_sub(1) as u32;
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + error.name.len() as u32,
+                    DiagnosticSeverity::ERROR,
+                    error.to_string(),
+                ));
             }
         }
         let export_bindings =
@@ -2666,16 +2670,20 @@ impl DiagnosticEngine {
                 &export_bindings,
             )
         {
-            for error_msg in ref_errors.split('\n') {
-                if let Some((line, col)) = self.find_ref_error_position(doc, error_msg) {
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        col,
-                        col + 1,
-                        DiagnosticSeverity::WARNING,
-                        error_msg.to_string(),
-                    ));
+            for error in ref_errors {
+                if error.source_file() != doc.source_file() {
+                    continue;
                 }
+                let span = error.source_span();
+                let line = span.start_line().saturating_sub(1) as u32;
+                let col = span.start_column().saturating_sub(1) as u32;
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + error.name.len() as u32,
+                    DiagnosticSeverity::ERROR,
+                    error.to_string(),
+                ));
             }
         }
 
@@ -2687,13 +2695,6 @@ impl DiagnosticEngine {
         parsed: &carina_core::parser::File<ParsedExportParam, D>,
     ) -> carina_core::validation::inference::SchemaCheckedExportParams {
         carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
-    }
-
-    /// Find the position of a ref type error in exports by extracting the param name.
-    fn find_ref_error_position(&self, doc: &Document, error_msg: &str) -> Option<(u32, u32)> {
-        // Error format: "export 'NAME': type mismatch ..."
-        let name = error_msg.strip_prefix("export '")?.split('\'').next()?;
-        self.find_exports_param_position(doc, name)
     }
 
     /// Find the position of an exports parameter name in the document.

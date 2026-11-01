@@ -228,10 +228,10 @@ The parser accepts `r`, aliases, and `child.r`; it rejects literals, `r.id`, val
 data sources, and other non-handles. Expansion substitutes structurally, then the expanded binding index produces
 `ResolvedResourceId` after prefixing/final identity assignment and before the differ.
 
-Resource/data-source typestate exposes unresolved dependencies only before this transition and
-`ResolvedDependencies` afterward. Extend the resolved-resource boundary or parameterize dependency phase; do not
-add an optional parallel field. Differ, waits, effects, satisfier hints, graph/sort, and plan image accept only the
-resolved phase.
+`Resource<S, D>` and `DataSource<S, D>` carry the dependency phase in `D`. Parser-phase values use
+`UnexpandedDependencyFields`; the graph transition consumes those fields and produces resolved wrappers containing
+`ResolvedDependencies`. There is no optional parallel field and no post-resolution accessor for authored dependency
+spellings. Differ, waits, effects, satisfier hints, graph/sort, and plan image accept only the resolved phase.
 
 Wait lowering therefore constructs:
 
@@ -290,6 +290,11 @@ Use the same messages in validate, plan, and LSP, at the declaration/argument sp
 
 Print a named identity type instead of `String` when known; never suggest an annotation workaround.
 
+`InferredExportParam` retains the parser's declaration source. Export boundary and reference validation return
+typed `ExportBoundaryError` values carrying that provenance. LSP filters by source file, anchors the diagnostic at
+the parser span start with the export-name width, and reports these boundary violations as errors; it never scans
+source text to reconstruct a position.
+
 ## Persistence and identity boundaries
 
 The structural separation is:
@@ -308,8 +313,8 @@ projection described below. This changes the state wire shape to version 21 and 
 import, moved, orphan-destroy, and migration paths.
 
 Saved-plan shape also changes. Keep its version number in the single `PlanFile::CURRENT_VERSION` constant; tests
-and encoders reference that constant instead of repeating the integer. Select the merge-time value from current
-main. Old saved plans remain unsupported.
+and encoders reference that constant instead of repeating the integer. Storing the migration classification bumps
+that constant once, while the state format remains v21. Old saved plans remain unsupported.
 
 ## Legacy dependency migration
 
@@ -328,21 +333,27 @@ values and literal arguments have no local destroy edge. Passing `value_dependen
 state writer does not type-check.
 
 Loading pre-v21 state follows the existing keyed chain through v19 → v20 and then stops in an unwritable in-memory
-typestate. The v20 → v21 transition requires either the live expanded graph or the equivalent projection saved in
-a plan. It carries every v20 field through, including token-less create-outcome-unknown rows. Source-less commands
-such as `state list`, `state show`, and `state lookup` may inspect the pending typestate, display
+typestate. The v20 → v21 transition requires either the live expanded graph or the complete
+`LegacyDependencyClassification` saved in a plan. It carries every v20 field through, including token-less
+create-outcome-unknown rows. Source-less commands such as `state list`, `state show`, and `state lookup` may inspect
+the pending typestate, display
 `dependencies not yet migrated (legacy: ...)`, and never write it.
 
 Configuration-aware commands classify each legacy name against state rows first and then the current expanded
 graph. For a row inside a module instance, resolution tries that instance's scope before root because old releases
 stored module-local dependency and argument spellings inconsistently. A configured row fails with a typed
-`LegacyDependencyMigrationError` when a name is missing or ambiguous. A saved plan persists the graph's
-already-classified legacy-name projection so `apply --plan` cannot fall back to the old kind-blind strings.
+`LegacyDependencyMigrationError` when a name is missing or ambiguous. A saved plan persists the complete
+classification, including its source fingerprints and warnings, so `apply --plan` validates it against the loaded
+state and cannot fall back to the old kind-blind strings. Move scope is an opaque `ResolvedMovePairs` value with no
+`Default` or empty constructor, built only from addressed moves or saved `Effect::Move` entries; migration APIs
+cannot be called with an untyped empty slice.
 
 An orphan or deposed row is different: deletion must remain possible after its former module or dependency has
 left the configuration. Classification retains every known managed edge and returns a typed
-`LegacyDestroyOrderingWarning` for each unresolved name. Planning and apply/destroy output display that warning
-before state can be rewritten. Scheduling uses the known edges. The warning is operation-scoped rather than state
+`LegacyDestroyOrderingWarning` for each unresolved name. Applying a classification yields
+`UnreportedMigratedState`, not a writable `StateFile`; the only transition back reports every current and deposed
+warning through one CLI formatter on stderr before returning the v21 state. This also precedes terminal wait
+validation and any state write. Scheduling uses the known edges. The warning is operation-scoped rather than state
 data: v21 persists the known managed IDs only, never the unresolved name. Thus an unresolved name can leave memory
 only after it has been surfaced, while the v21 format remains free of dependency strings.
 
@@ -353,6 +364,8 @@ or state writes. It loads only provider metadata from exact installed artifacts;
 artifacts. The schema-only host admits the released protocol-v12 metadata function signatures and upgrades their
 older schema JSON in memory, while the ordinary runtime loader continues to require the current protocol. The
 command reports configured-row errors and orphan/deposed warnings and explicitly states that no state was written.
+If an unmaterialized deferred loop could own a state row, offline classification returns the typed `RequiresReads`
+outcome instead of guessing; the operator must run a read-capable migration path.
 
 ## Consumers to update
 

@@ -45,7 +45,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(binding.into()),
-        dependency_bindings: Default::default(),
+        dependencies: Default::default(),
         module_source: None,
         default_tag_keys: Default::default(),
         loop_provenance: Default::default(),
@@ -126,9 +126,9 @@ fn resolve_managed_refs_records_dependency_bindings() {
     .expect("resolve managed");
 
     assert!(
-        managed[1].dependency_bindings.contains("a"),
+        managed[1].dependencies.value_bindings.contains("a"),
         "expected dependency on `a`, got {:?}",
-        managed[1].dependency_bindings,
+        managed[1].dependencies.value_bindings,
     );
 }
 
@@ -175,7 +175,9 @@ fn resolve_live_composition_refs_post_apply_uses_provided_bindings() {
     // that the post-apply entry resolves `LiveComposition` refs
     // against the supplied view.
     let referenced = make_managed("a", &[("value", s("post_apply_value"))]);
-    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+        crate::resource::UnexpandedDependencyFields,
+    > {
         managed: std::slice::from_ref(&referenced),
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -237,7 +239,9 @@ fn resolve_live_composition_refs_post_apply_picks_post_apply_value_not_pre_apply
 fn resolve_live_composition_refs_post_apply_leaves_non_ref_values_intact() {
     // A literal attribute on a `LiveComposition` should be preserved
     // verbatim by the post-apply pass.
-    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+        crate::resource::UnexpandedDependencyFields,
+    > {
         managed: &[],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -282,7 +286,7 @@ fn resolve_managed_refs_with_empty_slice_is_ok() {
 #[test]
 fn resolve_live_composition_refs_post_apply_with_empty_slice_is_ok() {
     let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-        managed: &[],
+        managed: &[] as &[Resource],
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
@@ -342,8 +346,8 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
         // pipeline performs; the bridge's writeback contract names
         // both fields, so the equivalence guard does too.
         assert_eq!(
-            m.dependency_bindings,
-            l.dependency_bindings,
+            m.dependencies.value_bindings,
+            l.dependencies.value_bindings,
             "managed/legacy dependency_bindings divergence for {}",
             m.id.identity_str().expect("resolved identity"),
         );

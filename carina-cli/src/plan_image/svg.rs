@@ -1169,6 +1169,12 @@ mod tests {
     use crate::plan_image::layout::layout_graph;
     use crate::plan_image::model::{PlanImageInput, StateMetadata, build_model};
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
+    }
+
     fn fixture_svg_with_theme(name: &str, theme: SvgTheme) -> String {
         let fixture = crate::fixture_plan::build_plan_from_fixture_name(name);
         let state = fixture.state_file.as_ref().map(|state| StateMetadata {
@@ -1241,10 +1247,10 @@ mod tests {
         plan.add(Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new("credential-id").unwrap(),
-            to: ResolvedResource::new(resource.clone()),
+            to: resolved(resource.clone()),
             changed_attributes: vec!["secret_token".to_string(), "write_only_token".to_string()],
         });
-        let desired = vec![ResolvedResource::new(resource)];
+        let desired = vec![resolved(resource)];
         let summary = crate::plan_summary::PlanChangeSummary::new(
             &plan,
             &[],
@@ -1296,10 +1302,10 @@ mod tests {
         plan.add(Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new("long-label-id").unwrap(),
-            to: ResolvedResource::new(resource.clone()),
+            to: resolved(resource.clone()),
             changed_attributes,
         });
-        let desired = vec![ResolvedResource::new(resource)];
+        let desired = vec![resolved(resource)];
         let summary = crate::plan_summary::PlanChangeSummary::new(
             &plan,
             &[],
@@ -1420,7 +1426,7 @@ mod tests {
         }
         let unresolved: Vec<_> = desired
             .iter()
-            .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
+            .map(|resource| UnresolvedResource::from_resolved_for_test(resource.as_inner().clone()))
             .collect();
         let summary = crate::plan_summary::PlanChangeSummary::new(
             &plan,

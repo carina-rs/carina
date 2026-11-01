@@ -76,14 +76,43 @@ fn diff(
 }
 
 fn migrate_legacy_with_config(
-    mut state: StateFile,
+    state: StateFile,
     resources: &[Resource],
-) -> Result<(StateFile, LegacyDependencyMigrationReport), LegacyDependencyMigrationError> {
+) -> Result<(StateFile, ReportedLegacyMigration), LegacyDependencyMigrationError> {
     let mut parsed: carina_core::parser::ParsedFile = Default::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, resources, &[])
         .expect("legacy migration fixture graph must resolve");
-    let report = state.migrate_legacy_dependencies(&graph, resources, &[])?;
-    Ok((state, report))
+    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
+    let moved_pairs = carina_core::effect::ResolvedMovePairs::from_saved_plan(&no_move_plan);
+    let input = LegacyMigrationInput::planned(&graph, resources, &moved_pairs);
+    let classification = state.classify_legacy_dependencies(&input)?;
+    let migration = state.with_legacy_classification(classification)?;
+    let migrated_rows = migration.migrated_rows();
+    let mut warnings = Vec::new();
+    let state = migration.report(|warning| warnings.push(warning.clone()));
+    Ok((
+        state,
+        ReportedLegacyMigration {
+            migrated_rows,
+            warnings,
+        },
+    ))
+}
+
+#[derive(Debug)]
+struct ReportedLegacyMigration {
+    migrated_rows: usize,
+    warnings: Vec<LegacyDestroyOrderingWarning>,
+}
+
+impl ReportedLegacyMigration {
+    fn migrated_rows(&self) -> usize {
+        self.migrated_rows
+    }
+
+    fn warnings(&self) -> &[LegacyDestroyOrderingWarning] {
+        &self.warnings
+    }
 }
 
 fn finish_legacy_dependency_migration(state: StateFile) -> StateFile {
@@ -1095,7 +1124,9 @@ fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
 }
 
 fn resolved(resource: &carina_core::resource::Resource) -> carina_core::resource::ResolvedResource {
-    carina_core::resource::ResolvedResource::new(resource.clone())
+    carina_core::resource::ResolvedResource::collect_resolved([resource.clone()])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 fn list_rule(port: i64, description: Option<&str>) -> Value {
@@ -4778,7 +4809,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
     };
 
     let resolved_resource = ResolvedResource::from_resolved_parts(
-        resource.clone(),
+        resource.clone().into_resolved_dependency_phase_for_test(),
         fixture_dependencies(["my_vpc"]),
         Default::default(),
     )
@@ -5136,8 +5167,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
             .validate()
             .expect("legacy fixture schema is valid"),
     );
-    let resolved = ResolvedResource::resolve_with_schemas(desired, &schemas)
-        .expect("legacy desired resource resolves against its schema");
+    let resolved = resolved(&desired);
     let id = resolved.id.clone();
     let current = match state.build_state_for_resource(&id) {
         Current::Absent(state) => carina_core::resource::Current::Absent(state),
@@ -5152,6 +5182,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     };
     let plan_input_states = carina_core::resource::into_plan_input_current_map::<
         carina_core::resource::ModuleSource,
+        carina_core::resource::UnexpandedDependencyFields,
     >(HashMap::from([(id.clone(), current)]), &schemas, &[]);
     let plan = carina_core::differ::create_plan_for_test(
         &[resolved],
@@ -6108,7 +6139,7 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
     consumer["binding"] = serde_json::json!("old_consumer");
     consumer["dependency_bindings"] = serde_json::json!(["target"]);
     let json = state_json_with_resources(20, vec![target, consumer]);
-    let mut state = check_and_migrate(&json)
+    let state = check_and_migrate(&json)
         .expect("moved-row fixture must load as pending migration")
         .into_state();
 
@@ -6140,11 +6171,24 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
     let from = resolved_dependency("mock", "test.Consumer", "old_consumer", None);
     let to = resolved_dependency("mock", "test.Consumer", "module_instance.consumer", None);
 
-    let report = state
-        .migrate_legacy_dependencies(&graph, &resources, &[(from, to)])
+    let mut move_plan: carina_core::plan::Plan<SavedModuleSource> =
+        carina_core::plan::Plan::default();
+    move_plan.add(carina_core::effect::Effect::Move {
+        from,
+        to,
+        origin: None,
+    });
+    let moved_pairs = carina_core::effect::ResolvedMovePairs::from_saved_plan(&move_plan);
+    let input = LegacyMigrationInput::planned(&graph, &resources, &moved_pairs);
+    let classification = state
+        .classify_legacy_dependencies(&input)
+        .expect("the moved row must classify with its configured destination scope");
+    let migration = state
+        .with_legacy_classification(classification)
         .expect("the moved row must use its configured destination scope");
 
-    assert!(report.warnings().is_empty());
+    assert!(migration.warnings().is_empty());
+    let state = migration.report(|_| panic!("fixture must not report warnings"));
     let row = state
         .find_resource("mock", "test.Consumer", "old_consumer")
         .expect("migration classifies but does not itself move the row");
@@ -6157,6 +6201,48 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
             None,
         )])
     );
+}
+
+#[test]
+fn with_legacy_classification_rejects_stale_sources() {
+    let mut target = persisted_resource("mock", "test.Target", "target");
+    target["binding"] = serde_json::json!("target");
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["dependency_bindings"] = serde_json::json!(["target"]);
+    let original = check_and_migrate(&state_json_with_resources(
+        20,
+        vec![target.clone(), consumer.clone()],
+    ))
+    .expect("original v20 state loads")
+    .into_state();
+
+    let configured = vec![
+        Resource::with_provider("mock", "test.Target", "target", None).with_binding("target"),
+        Resource::with_provider("mock", "test.Consumer", "consumer", None).with_binding("consumer"),
+    ];
+    let mut parsed: carina_core::parser::ParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &configured, &[])
+        .expect("stale-classification graph resolves");
+    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
+    let moved_pairs = carina_core::effect::ResolvedMovePairs::from_saved_plan(&no_move_plan);
+    let input = LegacyMigrationInput::planned(&graph, &configured, &moved_pairs);
+    let classification = original
+        .classify_legacy_dependencies(&input)
+        .expect("original source classifies");
+
+    consumer["dependency_bindings"] = serde_json::json!(["different_target"]);
+    let changed = check_and_migrate(&state_json_with_resources(20, vec![target, consumer]))
+        .expect("changed v20 state loads")
+        .into_state();
+    let error = changed
+        .clone()
+        .with_legacy_classification(classification)
+        .expect_err("changed source names must reject the saved classification");
+
+    assert_eq!(error, LegacyDependencyMigrationError::StaleClassification);
+    assert_eq!(changed.version, 20);
+    assert!(changed.requires_legacy_dependency_migration());
 }
 
 #[test]
@@ -6241,6 +6327,56 @@ fn v20_dependency_migration_keeps_known_orphan_edges_and_reports_each_unknown_ge
     let encoded = serde_json::to_string(&migrated).expect("v21 state must be writable");
     assert!(!encoded.contains("removed_module.gone"));
     assert!(!encoded.contains("removed_module.old_gone"));
+}
+
+#[test]
+fn report_invokes_sink_for_every_current_and_deposed_warning_before_returning_state() {
+    let mut orphan = persisted_resource("mock", "test.Orphan", "removed.consumer");
+    orphan["binding"] = serde_json::json!("removed.consumer");
+    orphan["dependency_bindings"] = serde_json::json!(["gone-current"]);
+    orphan["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "orphan-old",
+        "attributes": {},
+        "dependency_bindings": ["gone-deposed"]
+    }]);
+    let state = check_and_migrate(&state_json_with_resources(20, vec![orphan]))
+        .expect("warning fixture loads into the migration typestate")
+        .into_state();
+    let mut parsed: carina_core::parser::ParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, &[], &[])
+        .expect("empty warning graph resolves");
+    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
+    let moved_pairs = carina_core::effect::ResolvedMovePairs::from_saved_plan(&no_move_plan);
+    let configured: Vec<Resource> = Vec::new();
+    let input = LegacyMigrationInput::planned(&graph, &configured, &moved_pairs);
+    let classification = state
+        .classify_legacy_dependencies(&input)
+        .expect("orphan unknown names classify as warnings");
+    let migration = state
+        .with_legacy_classification(classification)
+        .expect("classification applies to its source state");
+
+    let mut reported = Vec::new();
+    let state = migration.report(|warning| {
+        reported.push((
+            warning
+                .generation
+                .as_ref()
+                .map(|key| key.as_str().to_string()),
+            warning.legacy_names.clone(),
+        ));
+    });
+
+    assert_eq!(reported.len(), 2);
+    assert!(reported.iter().any(|(generation, names)| {
+        generation.is_none() && names == &BTreeSet::from(["gone-current".to_string()])
+    }));
+    assert!(reported.iter().any(|(generation, names)| {
+        generation.as_deref() == Some("old-generation")
+            && names == &BTreeSet::from(["gone-deposed".to_string()])
+    }));
+    assert_eq!(state.version, StateFile::CURRENT_VERSION);
 }
 
 fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
@@ -6335,8 +6471,8 @@ fn v21_state_rejects_destroy_dependencies_that_are_not_managed_rows() {
             resolved_dependency("", "__wait", "ready", None),
         ),
         (
-            "data source",
-            resolved_dependency("mock", "test.Lookup", "lookup", None),
+            "empty provider",
+            resolved_dependency("", "test.Thing", "x", None),
         ),
     ];
 
@@ -6348,8 +6484,7 @@ fn v21_state_rejects_destroy_dependencies_that_are_not_managed_rows() {
 
         let message = invalid_state_message(check_and_migrate(&json));
         assert!(
-            message.contains("dependency_bindings")
-                && message.contains("not a managed state row"),
+            message.contains("dependency_bindings") && message.contains("not a managed state row"),
             "{kind} dependency must be rejected with row context: {message}",
         );
     }

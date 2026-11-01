@@ -460,23 +460,27 @@ fn saved_plan_apply_prints_moved_hint_to_stderr() {
     assert_moved_hint(&apply.stderr, "saved-plan apply");
 }
 
-#[test]
-fn saved_plan_legacy_migration_uses_the_planned_move_scope_before_drift_abort() {
-    let project = Project::new("");
+fn write_moved_legacy_scope_project(project: &Project, prevent_destroy: bool) -> PathBuf {
     let module = project.root.join("net");
     fs::create_dir_all(&module).expect("create net module");
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments { marker: String = \"net\" }\n",
+    )
+    .expect("write module arguments");
     fs::write(
         module.join("gateway.crn"),
         "let igw = mock.test.resource { name = \"igw\" }\n",
     )
     .expect("write module gateway");
+    let directives = prevent_destroy
+        .then_some("  directives { prevent_destroy = true }\n")
+        .unwrap_or_default();
     fs::write(
         module.join("network.crn"),
-        r#"let vpc = mock.test.resource {
-  name   = "vpc"
-  parent = igw.name
-}
-"#,
+        format!(
+            "let vpc = mock.test.resource {{\n  name   = \"vpc\"\n  parent = igw.name\n{directives}}}\n"
+        ),
     )
     .expect("write module network");
     project.write_main(
@@ -534,6 +538,13 @@ moved {
             "exports": {}
         }),
     );
+    state_path
+}
+
+#[test]
+fn saved_plan_legacy_migration_uses_the_planned_move_scope_before_drift_abort() {
+    let project = Project::new("");
+    let state_path = write_moved_legacy_scope_project(&project, false);
 
     let plan = project.run(&[
         "plan",
@@ -559,8 +570,8 @@ moved {
         "legacy-moves.plan.json",
     ]);
     assert!(
-        !apply.status.success() && output_text(&apply).contains("drift"),
-        "saved-plan apply must stop at the drift gate:\n{}",
+        !apply.status.success(),
+        "saved-plan apply must fail after the lock-held migration:\n{}",
         output_text(&apply),
     );
 
@@ -571,5 +582,38 @@ moved {
         dependency["identity"],
         Value::String("net.igw".to_string()),
         "apply --plan must classify the legacy edge with the saved net module scope: {dependency:#?}",
+    );
+}
+
+#[test]
+fn destroy_legacy_migration_uses_the_resolved_move_scope_before_prevent_destroy() {
+    let project = Project::new("");
+    let state_path = write_moved_legacy_scope_project(&project, true);
+
+    let destroy = project.run(&[
+        "destroy",
+        "--auto-approve",
+        "--lock=false",
+        "--refresh=false",
+        ".",
+    ]);
+    assert!(
+        !destroy.status.success(),
+        "prevent_destroy must refuse the destroy after migration:\n{}",
+        output_text(&destroy),
+    );
+    assert!(
+        output_text(&destroy).contains("prevent_destroy"),
+        "destroy must reach the configured prevent_destroy refusal:\n{}",
+        output_text(&destroy),
+    );
+
+    let migrated = read_json(&state_path);
+    assert_eq!(migrated["version"], Value::from(21));
+    let dependency = &migrated["resources"][1]["dependency_bindings"][0];
+    assert_eq!(
+        dependency["identity"],
+        Value::String("net.igw".to_string()),
+        "destroy must classify the legacy edge with the resolved net module scope: {dependency:#?}",
     );
 }

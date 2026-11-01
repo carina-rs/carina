@@ -471,8 +471,8 @@ fn data_source_values_from_saved_plan<S: Clone>(
     Ok(values)
 }
 
-fn saved_plan_unresolved_by_resolved_id<S: Clone>(
-    sorted_resources: &[carina_core::resource::Resource<S>],
+fn saved_plan_unresolved_by_resolved_id<S: Clone, D>(
+    sorted_resources: &[carina_core::resource::Resource<S, D>],
     unresolved_resources: &[carina_core::resource::Resource<S>],
     apply_target: ApplyTarget<'_>,
 ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource<S>>, AppError> {
@@ -1234,7 +1234,7 @@ impl DriftCheckResult {
 /// verification pass for the saved-plan gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn detect_drift<S: Clone>(
-    sorted_resources: &[carina_core::resource::Resource<S>],
+    sorted_resources: &[carina_core::resource::Resource<S, ()>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
     operation_provider: &dyn Provider,
@@ -1452,8 +1452,12 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
         schemas,
         sorted_resources.iter().map(|resource| &resource.id),
     );
+    let sorted_resources = ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?
+        .into_iter()
+        .map(ResolvedResource::into_inner)
+        .collect::<Vec<_>>();
     detect_drift(
-        sorted_resources,
+        &sorted_resources,
         planned_state_entries,
         historical_addresses,
         operation_provider,
@@ -2154,9 +2158,8 @@ async fn run_apply_locked_owned(
                 moved_origins,
                 prev_explicit,
                 wait_aliases,
-                legacy_dependency_projections: _,
+                legacy_dependency_classification: _,
                 migrated_legacy_state,
-                legacy_dependency_migration: _,
             } = artifacts;
             let legacy_state_migrated = migrated_legacy_state.is_some();
             if let Some(migrated) = migrated_legacy_state {
@@ -2550,7 +2553,7 @@ async fn run_apply_locked_owned(
                     provider_context,
                     cancel,
                 } = *context;
-                let export_resources: Vec<Resource> = state_save_inputs
+                let export_resources: Vec<Resource<ModuleSource, ()>> = state_save_inputs
                     .sorted_resources()
                     .iter()
                     .map(|resource| resource.as_resource().clone())
@@ -2699,7 +2702,7 @@ trait SavedPlanResourceLike {
     fn attributes(&self) -> &indexmap::IndexMap<String, Value>;
 }
 
-impl<S> SavedPlanResourceLike for carina_core::resource::Resource<S> {
+impl<S, D> SavedPlanResourceLike for carina_core::resource::Resource<S, D> {
     fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -2713,7 +2716,7 @@ impl<S> SavedPlanResourceLike for carina_core::resource::Resource<S> {
     }
 }
 
-impl<S> SavedPlanResourceLike for carina_core::resource::DataSource<S> {
+impl<S, D> SavedPlanResourceLike for carina_core::resource::DataSource<S, D> {
     fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -3441,35 +3444,26 @@ async fn run_apply_from_plan_locked_owned(
     let removed_legacy_data_source_rows = state_file
         .as_mut()
         .is_some_and(|state| state.remove_legacy_data_source_rows(&legacy_data_source_origins) > 0);
-    if let Some(state) = state_file.as_mut() {
+    if let Some(mut state) = state_file.take() {
         state.complete_legacy_dependency_migration_without_names();
         if state.requires_legacy_dependency_migration() {
+            let classification = try_with_lock!(
+                inspected_plan
+                    .legacy_dependency_classification()
+                    .cloned()
+                    .ok_or_else(|| AppError::Config(
+                        "saved plan does not contain the pending legacy dependency classification"
+                            .to_string(),
+                    ))
+            );
             let migration = try_with_lock!(
                 state
-                    .migrate_legacy_dependencies(
-                        inspected_plan.legacy_dependency_projections(),
-                        inspected_plan.sorted_resources(),
-                        &[],
-                    )
+                    .with_legacy_classification(classification)
                     .map_err(|error| AppError::Backend(error.into()))
             );
-            // Saved-plan migration is persisted before drift detection can
-            // return. Emit orphan/deposed uncertainty at that same boundary
-            // so no unresolved legacy spelling can disappear from state
-            // without being shown to the operator.
-            for warning in migration.warnings() {
-                for legacy_name in &warning.legacy_names {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "Warning: destroy ordering for {} is partially unknown: legacy dependency {:?} no longer resolves.",
-                            warning.row, legacy_name
-                        )
-                        .yellow()
-                    );
-                }
-            }
+            state = crate::wiring::report_legacy_migration(migration);
         }
+        state_file = Some(state);
     }
     if (pending_migration.is_some() || removed_legacy_data_source_rows)
         && let Some(state) = state_file.as_mut()

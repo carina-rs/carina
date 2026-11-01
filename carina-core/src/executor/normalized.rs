@@ -64,8 +64,8 @@ use std::collections::HashMap;
 use crate::parser::ProviderConfig;
 use crate::provider::{ProviderNormalizer, ProviderResult, merge_default_tags};
 use crate::resource::{
-    ConcreteValue, DeferredValue, ModuleSource, Resource, ResourceId, State, Value,
-    value_contains_unknown,
+    ConcreteValue, DeferredValue, ModuleSource, Resource, ResourceId, State,
+    UnexpandedDependencyFields, Value, value_contains_unknown,
 };
 use crate::schema::{SchemaRegistry, find_resource_block_name_alias};
 
@@ -77,27 +77,27 @@ use crate::schema::{SchemaRegistry, find_resource_block_name_alias};
 /// they introduce one again. Consequently every schema-known map behind this
 /// wrapper uses canonical attribute names.
 #[derive(Debug, Clone, PartialEq)]
-pub struct NormalizedResource<S = ModuleSource>(Resource<S>);
+pub struct NormalizedResource<S = ModuleSource, D = UnexpandedDependencyFields>(Resource<S, D>);
 
-impl<S> NormalizedResource<S> {
+impl<S, D> NormalizedResource<S, D> {
     /// Borrow the normalized resource for read-only consumers.
-    pub fn as_resource(&self) -> &Resource<S> {
+    pub fn as_resource(&self) -> &Resource<S, D> {
         &self.0
     }
 
-    pub(super) fn into_resource(self) -> Resource<S> {
+    pub(super) fn into_resource(self) -> Resource<S, D> {
         self.0
     }
 }
 
 /// Normalize one desired resource and return the typestate proof consumed by
 /// executor patch builders.
-pub async fn apply_desired_normalization<S: Clone>(
-    resource: Resource<S>,
+pub async fn apply_desired_normalization<S: Clone, D: Clone + Default>(
+    resource: Resource<S, D>,
     provider_configs: &[ProviderConfig],
     normalizer: &dyn ProviderNormalizer,
     schemas: &SchemaRegistry,
-) -> ProviderResult<NormalizedResource<S>> {
+) -> ProviderResult<NormalizedResource<S, D>> {
     let mut one = [resource];
     apply_desired_normalization_slice(&mut one, provider_configs, normalizer, schemas).await?;
     let [resource] = one;
@@ -115,8 +115,8 @@ pub async fn apply_desired_normalization<S: Clone>(
 /// 5. Run [`merge_default_tags`] for each provider instance.
 ///
 /// An error stops the pipeline before later stages run.
-pub async fn apply_desired_normalization_slice<S: Clone>(
-    resources: &mut [Resource<S>],
+pub async fn apply_desired_normalization_slice<S: Clone, D: Clone + Default>(
+    resources: &mut [Resource<S, D>],
     provider_configs: &[ProviderConfig],
     normalizer: &dyn ProviderNormalizer,
     schemas: &SchemaRegistry,
@@ -147,8 +147,8 @@ pub async fn apply_desired_normalization_slice<S: Clone>(
     Ok(())
 }
 
-fn reject_provider_boundary_block_aliases<S>(
-    resources: &[Resource<S>],
+fn reject_provider_boundary_block_aliases<S, D>(
+    resources: &[Resource<S, D>],
     schemas: &SchemaRegistry,
 ) -> ProviderResult<()> {
     for resource in resources {

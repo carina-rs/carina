@@ -1,21 +1,19 @@
 //! The single fallible transition from authored dependency operands to
 //! complete scheduler addresses.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-
-use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 use crate::eval_value::UnexpandedResourceHandle;
 use crate::parser::{
-    File, ResourceTypePath, UnexpandedCompositionAttribute, UnexpandedDependencyOperand,
-    WaitBinding,
+    File, ResourceTypePath, UnexpandedCompositionAttribute, UnexpandedDependencies,
+    UnexpandedDependencyOperand, WaitBinding,
 };
 use crate::resource::{
     AccessMissPolicy, AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart,
     LiveCompositionAttribute, PathSegment, PersistedDestroyDependencies,
     PersistedDestroyDependencyProjection, ResolvedDataSource, ResolvedDependencies,
     ResolvedDependencyReads, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, Value, resolve_resource_ignore_changes,
+    ResourceIdentity, SYNTHETIC_TYPE_PREFIX, Value, resolve_resource_ignore_changes,
 };
 use crate::schema::SchemaRegistry;
 use crate::wait::{ManagedWaitTarget, ResolvedWaitBinding};
@@ -76,7 +74,6 @@ pub enum ExpandedGraphResolutionError {
 enum ExpandedTarget {
     Managed {
         id: ResolvedResourceId,
-        resource_type: ResourceTypePath,
         value_binding: String,
     },
     DataSource {
@@ -165,6 +162,33 @@ impl ExpandedTargets {
     fn contains_key(&self, reference: &str) -> bool {
         self.bindings.contains_key(reference) || self.identities.contains_key(reference)
     }
+
+    fn managed(
+        &self,
+        reference: &str,
+        owner: &str,
+    ) -> Result<ResolvedHandleTarget, ExpandedGraphResolutionError> {
+        match self.get(reference) {
+            Some(ExpandedTarget::Managed { id, value_binding }) => Ok(ResolvedHandleTarget {
+                id: id.clone(),
+                value_binding: value_binding.clone(),
+            }),
+            Some(ExpandedTarget::DataSource { .. }) => {
+                Err(ExpandedGraphResolutionError::DataSourceHandle {
+                    owner: owner.to_string(),
+                    reference: reference.to_string(),
+                })
+            }
+            Some(ExpandedTarget::Wait { .. }) => Err(ExpandedGraphResolutionError::WaitHandle {
+                owner: owner.to_string(),
+                reference: reference.to_string(),
+            }),
+            None => Err(ExpandedGraphResolutionError::MissingDependency {
+                owner: owner.to_string(),
+                reference: reference.to_string(),
+            }),
+        }
+    }
 }
 
 /// Complete address index built only after module prefixing, provider routing,
@@ -191,89 +215,9 @@ pub struct ExpandedBindingIndex {
     upstream_bindings: HashSet<String>,
 }
 
-/// Saved-plan copy of the expanded graph's legacy-name classification.
-///
-/// The plan format needs this projection because `carina plan --out` is
-/// read-only: it may classify a v20 state in memory without rewriting that
-/// state. A later `apply --plan` can therefore encounter the same legacy
-/// names even when the source configuration is no longer parseable. Values
-/// contain only already-projected managed-row edges or an explicit
-/// no-local-edge result; plan validation checks every managed ID before this
-/// index is accepted by state migration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct LegacyDependencyProjectionIndex(BTreeMap<String, PersistedDestroyDependencyProjection>);
-
-mod legacy_dependency_projector_sealed {
-    pub trait Sealed {}
-}
-
-/// Closed interface consumed by the v20 state migration classifier.
-///
-/// Only a live expanded graph or its saved-plan projection can implement this
-/// interface, so dependency sets cannot be minted from the old kind-blind
-/// string snapshot.
-pub trait LegacyDependencyProjector: legacy_dependency_projector_sealed::Sealed {
-    fn project_legacy_dependency(
-        &self,
-        reference: &str,
-        owner: &str,
-    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError>;
-
-    /// Mint an edge to a row whose identity was proven by the state-row
-    /// classifier rather than the current configuration graph.
-    fn project_legacy_state_row(&self, id: ResolvedResourceId) -> PersistedDestroyDependencies {
-        PersistedDestroyDependencies::from_graph_projection(std::iter::once(id))
-    }
-}
-
-impl legacy_dependency_projector_sealed::Sealed for ExpandedBindingIndex {}
-impl legacy_dependency_projector_sealed::Sealed for LegacyDependencyProjectionIndex {}
-
-impl LegacyDependencyProjectionIndex {
-    pub fn project_legacy_dependency(
-        &self,
-        reference: &str,
-        owner: &str,
-    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
-        self.0.get(reference).cloned().ok_or_else(|| {
-            ExpandedGraphResolutionError::MissingDependency {
-                owner: owner.to_string(),
-                reference: reference.to_string(),
-            }
-        })
-    }
-
-    /// Iterate every managed row mentioned by the saved projection so the
-    /// saved-plan decoder can prove that no data-source or synthetic wait ID
-    /// entered this graph-only type.
-    pub fn managed_dependencies(&self) -> impl Iterator<Item = &ResolvedResourceId> {
-        self.0
-            .values()
-            .flat_map(|projection| match projection {
-                PersistedDestroyDependencyProjection::Managed(dependencies) => {
-                    Some(dependencies.iter())
-                }
-                PersistedDestroyDependencyProjection::NoLocalDestroyEdge => None,
-            })
-            .flatten()
-    }
-}
-
-impl LegacyDependencyProjector for LegacyDependencyProjectionIndex {
-    fn project_legacy_dependency(
-        &self,
-        reference: &str,
-        owner: &str,
-    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
-        self.project_legacy_dependency(reference, owner)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedHandleTarget {
     id: ResolvedResourceId,
-    resource_type: ResourceTypePath,
     /// Instance-qualified binding used by ordinary deferred value references.
     /// Unlike dependency identity, value resolution still addresses the
     /// managed binding's attribute map by this canonical post-expansion name.
@@ -442,27 +386,14 @@ impl ExpandedBindingIndex {
         owner: &str,
     ) -> Result<(ResolvedResourceId, ResourceTypePath), ExpandedGraphResolutionError> {
         if let Some(target) = self.handle_outputs.get(reference) {
-            return Ok((target.id.clone(), target.resource_type.clone()));
+            return Ok((
+                target.id.clone(),
+                ResourceTypePath::new(target.id.provider(), target.id.resource_type()),
+            ));
         }
-        match self.targets.get(reference) {
-            Some(ExpandedTarget::Managed {
-                id, resource_type, ..
-            }) => Ok((id.clone(), resource_type.clone())),
-            Some(ExpandedTarget::DataSource { .. }) => {
-                Err(ExpandedGraphResolutionError::DataSourceHandle {
-                    owner: owner.to_string(),
-                    reference: reference.to_string(),
-                })
-            }
-            Some(ExpandedTarget::Wait { .. }) => Err(ExpandedGraphResolutionError::WaitHandle {
-                owner: owner.to_string(),
-                reference: reference.to_string(),
-            }),
-            None => Err(ExpandedGraphResolutionError::MissingDependency {
-                owner: owner.to_string(),
-                reference: reference.to_string(),
-            }),
-        }
+        let target = self.targets.managed(reference, owner)?;
+        let resource_type = ResourceTypePath::new(target.id.provider(), target.id.resource_type());
+        Ok((target.id, resource_type))
     }
 
     pub fn resolve_handle(
@@ -505,6 +436,18 @@ impl ExpandedBindingIndex {
                     .map(|(id, _resource_type)| std::iter::once(id).collect())
             }
         }
+    }
+
+    fn resolve_explicit_operands(
+        &self,
+        operands: &UnexpandedDependencies,
+        owner: &str,
+    ) -> Result<ResolvedDependencies, ExpandedGraphResolutionError> {
+        let mut dependencies = ResolvedDependencies::default();
+        for operand in operands {
+            dependencies.extend(self.resolve_explicit_operand(operand, owner)?);
+        }
+        Ok(dependencies)
     }
 
     fn resolve_implicit_binding(
@@ -566,27 +509,20 @@ impl ExpandedBindingIndex {
         reference: &str,
         owner: &str,
     ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
-        if let Some(target) = self.handle_outputs.get(reference) {
-            return Ok(PersistedDestroyDependencyProjection::Managed(
-                PersistedDestroyDependencies::from_graph_projection(std::iter::once(
-                    target.id.clone(),
-                )),
-            ));
-        }
-        if let Some(target) = self.targets.get(reference) {
-            let dependencies: ResolvedDependencies = std::iter::once(target.id().clone()).collect();
+        let dependencies = self
+            .handle_outputs
+            .get(reference)
+            .map(|target| std::iter::once(target.id.clone()).collect())
+            .or_else(|| {
+                self.targets
+                    .get(reference)
+                    .map(|target| std::iter::once(target.id().clone()).collect())
+            })
+            .or_else(|| self.managed_groups.get(reference).cloned())
+            .or_else(|| self.composition_dependencies.get(reference).cloned());
+        if let Some(dependencies) = dependencies {
             return self
                 .project_resolved_dependencies(&dependencies, owner)
-                .map(PersistedDestroyDependencyProjection::Managed);
-        }
-        if let Some(dependencies) = self.managed_groups.get(reference) {
-            return self
-                .project_resolved_dependencies(dependencies, owner)
-                .map(PersistedDestroyDependencyProjection::Managed);
-        }
-        if let Some(dependencies) = self.composition_dependencies.get(reference) {
-            return self
-                .project_resolved_dependencies(dependencies, owner)
                 .map(PersistedDestroyDependencyProjection::Managed);
         }
         if let Some(projection) = self.legacy_argument_projections.get(reference) {
@@ -599,40 +535,6 @@ impl ExpandedBindingIndex {
             owner: owner.to_string(),
             reference: reference.to_string(),
         })
-    }
-
-    /// Freeze every legacy-addressable name after the expanded graph has
-    /// projected its plan-scoped nodes to managed state rows.
-    pub fn legacy_dependency_projection_index(
-        &self,
-    ) -> Result<LegacyDependencyProjectionIndex, ExpandedGraphResolutionError> {
-        let references = self
-            .targets
-            .bindings
-            .keys()
-            .chain(self.targets.identities.keys())
-            .chain(self.managed_groups.keys())
-            .chain(self.handle_outputs.keys())
-            .chain(self.composition_dependencies.keys())
-            .chain(self.legacy_argument_projections.keys())
-            .chain(self.upstream_bindings.iter())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let projections = references
-            .into_iter()
-            .map(|reference| {
-                self.project_legacy_dependency(&reference, "saved-plan legacy projection")
-                    .map(|projection| (reference, projection))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        Ok(LegacyDependencyProjectionIndex(projections))
-    }
-
-    /// Mint a persisted edge from a state row proven managed by the state
-    /// migration classifier. This is the only non-deserialization route for a
-    /// legacy orphan row that is absent from the current graph.
-    pub fn project_legacy_state_row(&self, id: ResolvedResourceId) -> PersistedDestroyDependencies {
-        PersistedDestroyDependencies::from_graph_projection(std::iter::once(id))
     }
 
     fn resolve_value_dependencies<'a>(
@@ -699,19 +601,16 @@ impl ExpandedBindingIndex {
         resolve_resource_ignore_changes(&mut resource, schemas)?;
         let (value_dependencies, value_dependency_reads) = self.resolve_value_dependencies(
             resource.attributes.values(),
-            resource.dependency_bindings.iter(),
+            resource.dependencies.value_bindings.iter(),
             &owner,
         )?;
-        let mut explicit_dependencies = ResolvedDependencies::default();
-        for operand in &resource.directives.depends_on {
-            explicit_dependencies.extend(self.resolve_explicit_operand(operand, &owner)?);
-        }
+        let explicit_dependencies =
+            self.resolve_explicit_operands(&resource.dependencies.depends_on, &owner)?;
         let persisted_value_destroy_dependencies =
             self.project_resolved_dependencies(&value_dependencies, &owner)?;
         let persisted_explicit_destroy_dependencies =
             self.project_resolved_dependencies(&explicit_dependencies, &owner)?;
-        resource.dependency_bindings.clear();
-        resource.directives.depends_on = Default::default();
+        let resource = resource.with_dependency_phase(());
         Ok(ResolvedResource::from_resolved_parts_with_reads(
             resource,
             value_dependencies,
@@ -781,15 +680,12 @@ impl ExpandedBindingIndex {
         }
         let (value_dependencies, value_dependency_reads) = self.resolve_value_dependencies(
             data_source.attributes.values(),
-            data_source.dependency_bindings.iter(),
+            data_source.dependencies.value_bindings.iter(),
             &owner,
         )?;
-        let mut explicit_dependencies = ResolvedDependencies::default();
-        for operand in &data_source.directives.depends_on {
-            explicit_dependencies.extend(self.resolve_explicit_operand(operand, &owner)?);
-        }
-        data_source.dependency_bindings.clear();
-        data_source.directives.depends_on = Default::default();
+        let explicit_dependencies =
+            self.resolve_explicit_operands(&data_source.dependencies.depends_on, &owner)?;
+        let data_source = data_source.with_dependency_phase(());
         Ok(ResolvedDataSource::from_resolved_parts_with_reads(
             data_source,
             value_dependencies,
@@ -803,15 +699,12 @@ impl ExpandedBindingIndex {
         wait: &WaitBinding,
     ) -> Result<ResolvedWaitBinding, ExpandedGraphResolutionError> {
         let owner = format!("wait '{}'", wait.binding);
-        let (target_id, _resource_type) = self.managed_target(wait.target.as_str(), &owner)?;
-        let mut explicit_dependencies = ResolvedDependencies::default();
-        for operand in &wait.depends_on {
-            explicit_dependencies.extend(self.resolve_explicit_operand(operand, &owner)?);
-        }
+        let target = self.targets.managed(wait.target.as_str(), &owner)?;
+        let explicit_dependencies = self.resolve_explicit_operands(&wait.depends_on, &owner)?;
         let id = wait_scheduler_id(wait.binding.as_str());
         Ok(ResolvedWaitBinding {
             id,
-            target_id: ManagedWaitTarget::from_resolved_id(target_id),
+            target_id: ManagedWaitTarget::from_resolved_id(target.id),
             until_raw: wait.until_raw.clone(),
             until_predicate: wait.until_predicate.clone(),
             timeout_secs: wait.timeout_secs,
@@ -822,12 +715,11 @@ impl ExpandedBindingIndex {
 
     /// Compile a retained deferred-for template's dependency provenance into
     /// concrete graph addresses. Upstream-state roots are value inputs rather
-    /// than scheduler nodes and are admitted only when the caller proves they
-    /// came from the parsed upstream declaration set.
+    /// than scheduler nodes; the graph's parsed upstream declaration set is
+    /// the proof that an absent scheduler target is intentional.
     pub fn resolve_deferred_for_dependencies<S>(
         &self,
         template: &crate::parser::DeferredForExpression<S>,
-        upstream_bindings: &HashSet<String>,
     ) -> Result<ResolvedDependencies, ExpandedGraphResolutionError> {
         let owner = format!("deferred for '{}'", template.target.scheduler_key());
         let mut dependencies = ResolvedDependencies::default();
@@ -835,46 +727,29 @@ impl ExpandedBindingIndex {
         bindings.extend(
             template
                 .template_resource
-                .dependency_bindings
+                .dependencies
+                .value_bindings
                 .iter()
                 .cloned(),
         );
         for binding in bindings {
-            match self.resolve_implicit_binding(&binding, &owner) {
-                Ok(resolved) => dependencies.extend(resolved),
-                Err(ExpandedGraphResolutionError::MissingDependency { .. })
-                    if upstream_bindings.contains(&binding) => {}
-                Err(error) => return Err(error),
-            }
+            dependencies.extend(self.resolve_implicit_binding(&binding, &owner)?);
         }
-        for operand in &template.template_resource.directives.depends_on {
-            dependencies.extend(self.resolve_explicit_operand(operand, &owner)?);
-        }
+        dependencies.extend(self.resolve_explicit_operands(
+            &template.template_resource.dependencies.depends_on,
+            &owner,
+        )?);
         Ok(dependencies)
-    }
-}
-
-impl LegacyDependencyProjector for ExpandedBindingIndex {
-    fn project_legacy_dependency(
-        &self,
-        reference: &str,
-        owner: &str,
-    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
-        self.project_legacy_dependency(reference, owner)
     }
 }
 
 pub fn wait_scheduler_id(binding: &str) -> ResolvedResourceId {
     let identity = ResourceIdentity::try_from(binding.to_string())
         .expect("parser binding names are non-empty scheduler identities");
-    ResolvedResourceId::with_identity("__wait", identity)
+    ResolvedResourceId::with_identity(&format!("{SYNTHETIC_TYPE_PREFIX}wait"), identity)
 }
 
-fn resource_type_of(id: &ResolvedResourceId) -> ResourceTypePath {
-    ResourceTypePath::new(id.provider(), id.resource_type())
-}
-
-pub(crate) fn loop_group_bindings(binding: &str) -> Vec<String> {
+pub fn loop_group_bindings(binding: &str) -> Vec<String> {
     let mut groups = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
@@ -940,48 +815,21 @@ fn resolve_pending_output(
             visiting,
         )?
     } else {
-        match direct_targets.get(reference.as_ref()) {
-            Some(ExpandedTarget::Managed {
-                id,
-                resource_type,
-                value_binding,
-            }) => ResolvedHandleTarget {
-                id: id.clone(),
-                resource_type: resource_type.clone(),
-                value_binding: value_binding.clone(),
-            },
-            Some(ExpandedTarget::DataSource { .. }) => {
-                return Err(ExpandedGraphResolutionError::DataSourceHandle {
-                    owner: format!("module output '{key}'"),
-                    reference: reference.to_string(),
-                });
-            }
-            Some(ExpandedTarget::Wait { .. }) => {
-                return Err(ExpandedGraphResolutionError::WaitHandle {
-                    owner: format!("module output '{key}'"),
-                    reference: reference.to_string(),
-                });
-            }
-            None => {
-                return Err(ExpandedGraphResolutionError::MissingDependency {
-                    owner: format!("module output '{key}'"),
-                    reference: reference.to_string(),
-                });
-            }
-        }
+        direct_targets.managed(reference.as_ref(), &format!("module output '{key}'"))?
     };
     visiting.pop();
-    if &actual.resource_type != output.handle.resource_type() {
+    let actual_resource_type =
+        ResourceTypePath::new(actual.id.provider(), actual.id.resource_type());
+    if &actual_resource_type != output.handle.resource_type() {
         return Err(ExpandedGraphResolutionError::HandleTypeMismatch {
             owner: format!("module output '{key}'"),
             reference: output.handle.diagnostic_name().to_string(),
             expected: Box::new(output.handle.resource_type().clone()),
-            actual: Box::new(actual.resource_type),
+            actual: Box::new(actual_resource_type),
         });
     }
     let result = ResolvedHandleTarget {
         id: actual.id,
-        resource_type: output.handle.resource_type().clone(),
         value_binding: actual.value_binding,
     };
     resolved.insert(key.to_string(), result.clone());
@@ -1086,12 +934,60 @@ fn project_destroy_closure(
     Ok(closure)
 }
 
+fn require_resolved_id(
+    id: &ResourceId,
+) -> Result<ResolvedResourceId, ExpandedGraphResolutionError> {
+    ResolvedResourceId::try_new(id.clone()).ok_or_else(|| {
+        crate::resource::ResolvedResourceError::from(
+            crate::resource::PendingResourceIdentityError::new(id.clone()),
+        )
+        .into()
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitResolutionPolicy {
+    Strict,
+    DeferInvalidForLegacyClassification,
+}
+
 /// Resolve all module handle outputs and build the address index used by every
 /// subsequent resource, data-source, and wait transition.
 pub fn resolve_expanded_graph<E, D>(
     parsed: &mut File<E, D>,
     managed: &[Resource],
     data_sources: &[DataSource],
+) -> Result<ExpandedBindingIndex, ExpandedGraphResolutionError> {
+    resolve_expanded_graph_with_wait_policy(
+        parsed,
+        managed,
+        data_sources,
+        WaitResolutionPolicy::Strict,
+    )
+}
+
+/// Build the graph used only to classify legacy state before terminal wait
+/// validation. Invalid waits remain addressable but have no destroy closure,
+/// so legacy references to them fail closed as unresolved names. The strict
+/// graph transition must still run before any provider operation.
+pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
+    parsed: &mut File<E, D>,
+    managed: &[Resource],
+    data_sources: &[DataSource],
+) -> Result<ExpandedBindingIndex, ExpandedGraphResolutionError> {
+    resolve_expanded_graph_with_wait_policy(
+        parsed,
+        managed,
+        data_sources,
+        WaitResolutionPolicy::DeferInvalidForLegacyClassification,
+    )
+}
+
+fn resolve_expanded_graph_with_wait_policy<E, D>(
+    parsed: &mut File<E, D>,
+    managed: &[Resource],
+    data_sources: &[DataSource],
+    wait_policy: WaitResolutionPolicy,
 ) -> Result<ExpandedBindingIndex, ExpandedGraphResolutionError> {
     let upstream_bindings = parsed
         .upstream_binding_names()
@@ -1106,15 +1002,11 @@ pub fn resolve_expanded_graph<E, D>(
         .filter(|(_binding, handle)| handle.is_for_binding())
         .map(|(binding, _handle)| (binding.clone(), ResolvedDependencies::default()))
         .collect::<HashMap<_, _>>();
+    let mut managed_ids = HashSet::new();
     for resource in managed {
-        let Some(id) = ResolvedResourceId::try_new(resource.id.clone()) else {
-            return Err(crate::resource::ResolvedResourceError::from(
-                crate::resource::PendingResourceIdentityError::new(resource.id.clone()),
-            )
-            .into());
-        };
+        let id = require_resolved_id(&resource.id)?;
+        managed_ids.insert(id.clone());
         let target = ExpandedTarget::Managed {
-            resource_type: resource_type_of(&id),
             value_binding: resource
                 .binding
                 .clone()
@@ -1130,12 +1022,7 @@ pub fn resolve_expanded_graph<E, D>(
         targets.insert_identity(id.identity_str().to_string(), target)?;
     }
     for data_source in data_sources {
-        let Some(id) = ResolvedResourceId::try_new(data_source.id.clone()) else {
-            return Err(crate::resource::ResolvedResourceError::from(
-                crate::resource::PendingResourceIdentityError::new(data_source.id.clone()),
-            )
-            .into());
-        };
+        let id = require_resolved_id(&data_source.id)?;
         let target = ExpandedTarget::DataSource { id: id.clone() };
         if let Some(binding) = &data_source.binding {
             targets.insert_binding(binding.clone(), target.clone())?;
@@ -1235,10 +1122,6 @@ pub fn resolve_expanded_graph<E, D>(
         )?;
     }
 
-    let managed_ids = managed
-        .iter()
-        .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
-        .collect::<HashSet<_>>();
     let mut index = ExpandedBindingIndex {
         targets,
         managed_groups,
@@ -1262,27 +1145,54 @@ pub fn resolve_expanded_graph<E, D>(
             .unwrap_or_else(|| data_source.id.to_string());
         let (mut dependencies, _reads) = index.resolve_value_dependencies(
             data_source.attributes.values(),
-            data_source.dependency_bindings.iter(),
+            data_source.dependencies.value_bindings.iter(),
             &owner,
         )?;
-        for operand in &data_source.directives.depends_on {
-            dependencies.extend(index.resolve_explicit_operand(operand, &owner)?);
-        }
-        let id = ResolvedResourceId::try_new(data_source.id.clone()).ok_or_else(|| {
-            crate::resource::ResolvedResourceError::from(
-                crate::resource::PendingResourceIdentityError::new(data_source.id.clone()),
-            )
-        })?;
+        dependencies
+            .extend(index.resolve_explicit_operands(&data_source.dependencies.depends_on, &owner)?);
+        let id = require_resolved_id(&data_source.id)?;
         ephemeral_dependencies.insert(id, dependencies);
     }
+    let mut invalid_ephemeral_ids = HashSet::new();
     for wait in &parsed.wait_bindings {
         let owner = format!("wait '{}'", wait.binding);
-        let (target_id, _resource_type) = index.managed_target(wait.target.as_str(), &owner)?;
-        let mut dependencies: ResolvedDependencies = std::iter::once(target_id).collect();
-        for operand in &wait.depends_on {
-            dependencies.extend(index.resolve_explicit_operand(operand, &owner)?);
+        let id = wait_scheduler_id(wait.binding.as_str());
+        let dependencies = (|| {
+            let target = index.targets.managed(wait.target.as_str(), &owner)?;
+            let mut dependencies: ResolvedDependencies = std::iter::once(target.id).collect();
+            dependencies.extend(index.resolve_explicit_operands(&wait.depends_on, &owner)?);
+            Ok(dependencies)
+        })();
+        match dependencies {
+            Ok(dependencies) => {
+                ephemeral_dependencies.insert(id, dependencies);
+            }
+            Err(_error)
+                if wait_policy == WaitResolutionPolicy::DeferInvalidForLegacyClassification =>
+            {
+                invalid_ephemeral_ids.insert(id);
+            }
+            Err(error) => return Err(error),
         }
-        ephemeral_dependencies.insert(wait_scheduler_id(wait.binding.as_str()), dependencies);
+    }
+    if wait_policy == WaitResolutionPolicy::DeferInvalidForLegacyClassification {
+        loop {
+            let newly_invalid = ephemeral_dependencies
+                .iter()
+                .filter(|(id, dependencies)| {
+                    !invalid_ephemeral_ids.contains(*id)
+                        && dependencies
+                            .iter()
+                            .any(|dependency| invalid_ephemeral_ids.contains(dependency))
+                })
+                .map(|(id, _dependencies)| id.clone())
+                .collect::<Vec<_>>();
+            if newly_invalid.is_empty() {
+                break;
+            }
+            invalid_ephemeral_ids.extend(newly_invalid);
+        }
+        ephemeral_dependencies.retain(|id, _dependencies| !invalid_ephemeral_ids.contains(id));
     }
     let ephemeral_ids = ephemeral_dependencies.keys().cloned().collect::<Vec<_>>();
     for id in ephemeral_ids {
@@ -1317,6 +1227,12 @@ pub fn resolve_expanded_graph<E, D>(
                 Err(ExpandedGraphResolutionError::MissingDependency { .. }) => continue,
                 Err(error) => return Err(error),
             };
+            if dependencies
+                .iter()
+                .any(|dependency| invalid_ephemeral_ids.contains(dependency))
+            {
+                continue;
+            }
             let projected = index.project_resolved_dependencies(&dependencies, &owner)?;
             let projection = if projected.is_empty() {
                 PersistedDestroyDependencyProjection::NoLocalDestroyEdge
@@ -1330,4 +1246,43 @@ pub fn resolve_expanded_graph<E, D>(
     }
 
     Ok(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding, UpstreamState};
+    use crate::resource::{Resource, Value};
+
+    use super::resolve_expanded_graph;
+
+    #[test]
+    fn deferred_for_over_upstream_state_dotted_root_resolves_without_external_binding_set() {
+        let mut parsed = crate::parser::InferredFile::default();
+        parsed.upstream_states.push(UpstreamState {
+            binding: "orgs".to_string(),
+            source: "../organizations".into(),
+        });
+        let graph = resolve_expanded_graph(&mut parsed, &[], &[])
+            .expect("upstream-only graph must resolve");
+        let template = DeferredForExpression {
+            file: Some("main.crn".to_string()),
+            line: 4,
+            header: "for name in orgs.accounts.names".to_string(),
+            resource_type: "mock.test.resource".to_string(),
+            attributes: Vec::new(),
+            target: DeferredForTarget::Bound {
+                binding: "children".to_string(),
+            },
+            iterable: Value::resource_ref("orgs", "accounts", vec!["names".to_string()]),
+            binding: ForBinding::Simple("name".to_string()),
+            template_resource: Resource::with_provider("mock", "test.resource", "child", None)
+                .with_binding("children"),
+        };
+
+        let dependencies = graph
+            .resolve_deferred_for_dependencies(&template)
+            .expect("the graph's upstream declaration is sufficient proof");
+
+        assert!(dependencies.is_empty());
+    }
 }

@@ -238,7 +238,12 @@ mod tests {
     fn read_effect_uses_the_same_has_changes_decision_as_text_output() {
         let mut plan = Plan::new();
         plan.add(Effect::Read {
-            resource: ResolvedDataSource::new(DataSource::new("test.lookup", "lookup")),
+            resource: ResolvedDataSource::collect_resolved([DataSource::new(
+                "test.lookup",
+                "lookup",
+            )])
+            .expect("fixture identity resolves")
+            .remove(0),
         });
 
         let no_deferred = resolved_deferred_for_for_test([]);

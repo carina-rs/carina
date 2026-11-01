@@ -224,11 +224,11 @@ pub fn run_lint(
             message: finding.to_string(),
         })
         .collect();
-    if let Some(message) = export_handle_errors {
-        warnings.extend(message.lines().map(|message| LintWarning {
-            file: path.to_path_buf(),
-            line: 1,
-            message: message.to_string(),
+    if let Some(boundary_errors) = export_handle_errors {
+        warnings.extend(boundary_errors.into_iter().map(|error| LintWarning {
+            file: error.source_file().to_path_buf(),
+            line: error.source_span().start_line(),
+            message: error.to_string(),
         }));
     }
     if let Some(message) = provider_factory_error {

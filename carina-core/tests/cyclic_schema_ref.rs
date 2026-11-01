@@ -32,6 +32,19 @@ use carina_core::schema::{
     ValidatedConfigSchema, ValidatedProviderSchemaWitness,
 };
 
+fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedResource {
+    let mut parsed = carina_core::parser::ParsedFile::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut parsed,
+        std::slice::from_ref(&resource),
+        &[],
+    )
+    .expect("cyclic-schema fixture graph must resolve");
+    graph
+        .resolve_resource(resource, registry)
+        .expect("cyclic-schema fixture resource must resolve")
+}
+
 /// Build a minimal WAFv2-WebACL-shaped cyclic schema.
 ///
 /// Top-level attribute `rules` is `List<Struct{ statement: Ref(Statement) }>`.
@@ -188,14 +201,8 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
         )
         .expect("comparison provider route is initialized");
 
-    let d = diff(
-        &ResolvedResource::new(desired),
-        &current,
-        &saved,
-        None,
-        Some(&schema),
-        &comparison,
-    );
+    let desired = resolve_resource(desired, &schemas);
+    let d = diff(&desired, &current, &saved, None, Some(&schema), &comparison);
     assert!(
         matches!(d, Diff::NoChange(_)),
         "equal cyclic values must produce NoChange, got: {d:?}"
@@ -251,14 +258,8 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         )
         .expect("comparison provider route is initialized");
 
-    let d = diff(
-        &ResolvedResource::new(desired),
-        &current,
-        &saved,
-        None,
-        Some(&schema),
-        &comparison,
-    );
+    let desired = resolve_resource(desired, &schemas);
+    let d = diff(&desired, &current, &saved, None, Some(&schema), &comparison);
     match d {
         Diff::Update {
             changed_attributes, ..

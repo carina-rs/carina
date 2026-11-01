@@ -3708,9 +3708,9 @@ pub fn redact_secrets_in_attributes(
 }
 
 /// Redact all secrets in a `Resource`, returning a new Resource with secrets replaced by hashes.
-pub fn redact_secrets_in_resource(
-    resource: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SerializationError> {
+pub fn redact_secrets_in_resource<S: Clone, D: Clone>(
+    resource: &crate::resource::Resource<S, D>,
+) -> Result<crate::resource::Resource<S, D>, SerializationError> {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |_, value| {
         redact_secrets_in_value(value)
     })?;
@@ -3722,10 +3722,10 @@ pub fn redact_secrets_in_resource(
 
 /// Redact desired secrets while reusing matching persisted digests at the
 /// same nested paths.
-pub fn redact_secrets_in_resource_reusing_persisted_hashes(
-    resource: &crate::resource::Resource,
+pub fn redact_secrets_in_resource_reusing_persisted_hashes<S: Clone, D: Clone>(
+    resource: &crate::resource::Resource<S, D>,
     persisted: &crate::provider::PersistedAttributes,
-) -> Result<crate::resource::Resource, SerializationError> {
+) -> Result<crate::resource::Resource<S, D>, SerializationError> {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |key, value| {
         match persisted.encoded_value(key) {
             Some(previous) => redact_with_guide(
@@ -3746,10 +3746,10 @@ pub fn redact_secrets_in_resource_reusing_persisted_hashes(
 /// stay exactly as they appear in the effect: replacement creates may carry a
 /// temporary name, and cascade updates may deliberately retain unresolved
 /// references for apply-time resolution.
-fn redact_resource_using_redacted_shape(
-    resource: &crate::resource::Resource,
-    guide: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SerializationError> {
+fn redact_resource_using_redacted_shape<S: Clone, D: Clone, T, E>(
+    resource: &crate::resource::Resource<S, D>,
+    guide: &crate::resource::Resource<T, E>,
+) -> Result<crate::resource::Resource<S, D>, SerializationError> {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |key, value| match guide
         .attributes
         .get(key)
@@ -3766,10 +3766,10 @@ fn redact_resource_using_redacted_shape(
 /// Redact an authored resource by pairing it with the evaluator's resource at
 /// the same identity. Attribute names form the first path segment; nested
 /// paths are handled by [`redact_secrets_using_evaluated`].
-pub fn redact_secrets_in_resource_using_evaluated(
-    source: &crate::resource::Resource,
-    evaluated: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SerializationError> {
+pub fn redact_secrets_in_resource_using_evaluated<S: Clone, D: Clone, T, E>(
+    source: &crate::resource::Resource<S, D>,
+    evaluated: &crate::resource::Resource<T, E>,
+) -> Result<crate::resource::Resource<S, D>, SerializationError> {
     let attributes =
         redact_attrs_with_guide(source.attributes.iter(), |key, value| {
             match evaluated.attributes.get(key) {
@@ -3784,10 +3784,10 @@ pub fn redact_secrets_in_resource_using_evaluated(
 }
 
 /// Restore every placeholder in a resource from a freshly evaluated resource.
-pub fn rehydrate_resource_secrets<S: Clone, T>(
-    saved: &crate::resource::Resource<S>,
-    evaluated: &crate::resource::Resource<T>,
-) -> Result<crate::resource::Resource<S>, SecretRehydrationSiteError> {
+pub fn rehydrate_resource_secrets<S: Clone, D: Clone, T, E>(
+    saved: &crate::resource::Resource<S, D>,
+    evaluated: &crate::resource::Resource<T, E>,
+) -> Result<crate::resource::Resource<S, D>, SecretRehydrationSiteError> {
     let mut resource = saved.clone();
     for (key, saved_value) in &saved.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -3803,9 +3803,9 @@ pub fn rehydrate_resource_secrets<S: Clone, T>(
 }
 
 /// Redact all secrets in a [`DataSource`](crate::resource::DataSource).
-pub fn redact_secrets_in_data_source(
-    resource: &crate::resource::DataSource,
-) -> Result<crate::resource::DataSource, SerializationError> {
+pub fn redact_secrets_in_data_source<S: Clone, D: Clone>(
+    resource: &crate::resource::DataSource<S, D>,
+) -> Result<crate::resource::DataSource<S, D>, SerializationError> {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |_, value| {
         redact_secrets_in_value(value)
     })?;
@@ -3815,10 +3815,10 @@ pub fn redact_secrets_in_data_source(
     })
 }
 
-pub fn redact_secrets_in_data_source_using_evaluated(
-    source: &crate::resource::DataSource,
-    evaluated: &crate::resource::DataSource,
-) -> Result<crate::resource::DataSource, SerializationError> {
+pub fn redact_secrets_in_data_source_using_evaluated<S: Clone, D: Clone, T, E>(
+    source: &crate::resource::DataSource<S, D>,
+    evaluated: &crate::resource::DataSource<T, E>,
+) -> Result<crate::resource::DataSource<S, D>, SerializationError> {
     let attributes =
         redact_attrs_with_guide(source.attributes.iter(), |key, value| {
             match evaluated.attributes.get(key) {
@@ -3832,10 +3832,10 @@ pub fn redact_secrets_in_data_source_using_evaluated(
     })
 }
 
-pub fn rehydrate_data_source_secrets<S: Clone, T>(
-    saved: &crate::resource::DataSource<S>,
-    evaluated: &crate::resource::DataSource<T>,
-) -> Result<crate::resource::DataSource<S>, SecretRehydrationSiteError> {
+pub fn rehydrate_data_source_secrets<S: Clone, D: Clone, T, E>(
+    saved: &crate::resource::DataSource<S, D>,
+    evaluated: &crate::resource::DataSource<T, E>,
+) -> Result<crate::resource::DataSource<S, D>, SecretRehydrationSiteError> {
     let mut resource = saved.clone();
     for (key, saved_value) in &saved.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -3989,9 +3989,9 @@ pub fn redact_secrets_in_state(
 
 /// Redact provider plaintext in a state using the corresponding desired
 /// resource as the secret-shape authority.
-pub fn redact_secrets_in_state_using_resource(
+pub fn redact_secrets_in_state_using_resource<D>(
     state: &crate::resource::State,
-    desired: &crate::resource::Resource,
+    desired: &crate::resource::Resource<crate::resource::ModuleSource, D>,
 ) -> Result<crate::resource::State, SerializationError> {
     let attributes = redact_attrs_with_guide(state.attributes.iter(), |key, value| match desired
         .attributes
@@ -4245,7 +4245,8 @@ pub fn redact_secrets_in_effect(
 pub fn redact_secrets_in_plan(
     plan: &crate::plan::Plan,
 ) -> Result<crate::plan::Plan, SerializationError> {
-    redact_secrets_in_plan_with_desired_and_historical(plan, &HashMap::new(), &HashMap::new())
+    let planned_resources: HashMap<_, crate::resource::Resource> = HashMap::new();
+    redact_secrets_in_plan_with_desired_and_historical(plan, &planned_resources, &HashMap::new())
 }
 
 fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resource::ResourceId>> {
@@ -4268,9 +4269,12 @@ fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resour
         .collect()
 }
 
-pub fn redact_secrets_in_plan_with_desired_and_historical(
+pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
     plan: &crate::plan::Plan,
-    planned_resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
+    planned_resources: &HashMap<
+        crate::resource::ResourceId,
+        crate::resource::Resource<crate::resource::ModuleSource, D>,
+    >,
     historical: &HashMap<crate::resource::ResourceId, crate::resource::State>,
 ) -> Result<crate::plan::Plan, SerializationError> {
     let reusable_resource = |id: &crate::resource::ResourceId| {
@@ -6220,12 +6224,16 @@ fn canonicalize_to_string_list(value: Value) -> Value {
 /// through another borrow, so identity code can require this type as
 /// evidence that the canonicalize pass already ran.
 #[derive(Debug)]
-pub struct CanonicalizedResources<'a, S = crate::resource::ModuleSource> {
-    resources: &'a mut [crate::resource::Resource<S>],
+pub struct CanonicalizedResources<
+    'a,
+    S = crate::resource::ModuleSource,
+    D = crate::resource::UnexpandedDependencyFields,
+> {
+    resources: &'a mut [crate::resource::Resource<S, D>],
 }
 
-impl<'a, S> CanonicalizedResources<'a, S> {
-    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S>] {
+impl<'a, S, D> CanonicalizedResources<'a, S, D> {
+    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S, D>] {
         self.resources
     }
 }
@@ -6387,10 +6395,10 @@ pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
-pub fn canonicalize_resources_with_schemas<'a, S>(
-    resources: &'a mut [crate::resource::Resource<S>],
+pub fn canonicalize_resources_with_schemas<'a, S, D>(
+    resources: &'a mut [crate::resource::Resource<S, D>],
     registry: &crate::schema::SchemaRegistry,
-) -> Result<CanonicalizedResources<'a, S>, EnumCanonicalizationError> {
+) -> Result<CanonicalizedResources<'a, S, D>, EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
         if let Some(schema) = registry.get_for(resource) {
             canonicalize_desired_attribute_map_with_schema(
@@ -6415,8 +6423,8 @@ pub fn canonicalize_resources_with_schemas<'a, S>(
 /// Guest output is provider/state text, so strings resolve only by literal API
 /// membership or a declared alias. Dotted strings are never reinterpreted as
 /// namespaced DSL identifiers.
-pub fn canonicalize_normalized_resources_with_schemas<S>(
-    resources: &mut [crate::resource::Resource<S>],
+pub fn canonicalize_normalized_resources_with_schemas<S, D>(
+    resources: &mut [crate::resource::Resource<S, D>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
@@ -6574,8 +6582,8 @@ pub fn canonicalize_provider_configs_with_schemas(
 /// authored `read` inputs, so `EnumIdentifier` uses authored-DSL semantics. Unknown
 /// non-enum values pass through, while an identifier without a resolvable
 /// schema is rejected (carina#3181, carina#3740).
-pub fn canonicalize_data_sources_with_schemas<S>(
-    data_sources: &mut [crate::resource::DataSource<S>],
+pub fn canonicalize_data_sources_with_schemas<S, D>(
+    data_sources: &mut [crate::resource::DataSource<S, D>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for data_source in data_sources.iter_mut() {
@@ -10385,7 +10393,7 @@ mod tests {
                 canonical_from.id.identity_display().to_string(),
             ),
             from: Box::new(canonical_from.clone()),
-            to: ResolvedResource::new(to.clone()),
+            to: ResolvedResource::new(to.clone().with_dependency_phase(())),
             changed_attributes: vec!["items".to_string()],
         });
 
@@ -12664,7 +12672,7 @@ mod tests {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("p1".to_string()),
-            dependency_bindings: Default::default(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -13638,7 +13646,7 @@ mod tests {
 
         let mut plan = crate::plan::Plan::new();
         plan.add_replacement(ReplacementGroup {
-            create: ResolvedResource::new(create),
+            create: ResolvedResource::new(create.with_dependency_phase(())),
             delete: ReplacementDelete {
                 id: ResolvedResourceId::new(id.clone()),
                 identifier: crate::effect::fixture_applied_identifier("bucket-old"),

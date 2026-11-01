@@ -12824,11 +12824,11 @@ fn inferred_and_declared_handle_exports_have_exact_state_boundary_diagnostics() 
     let expected = [
         (
             "export 'inferred': inferred resource handle mock.compute.Instance cannot cross a state boundary; export an identity value such as mock.compute.Instance.Id instead",
-            Range::new(Position::new(1, 2), Position::new(1, 3)),
+            Range::new(Position::new(1, 2), Position::new(1, 10)),
         ),
         (
             "export 'declared': resource handle mock.compute.Instance cannot cross a state boundary; export an identity value such as mock.compute.Instance.Id instead",
-            Range::new(Position::new(2, 2), Position::new(2, 3)),
+            Range::new(Position::new(2, 2), Position::new(2, 10)),
         ),
     ];
     for (message, range) in expected {
@@ -12837,7 +12837,7 @@ fn inferred_and_declared_handle_exports_have_exact_state_boundary_diagnostics() 
             .filter(|diagnostic| diagnostic.message == message)
             .collect::<Vec<_>>();
         assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
-        assert_eq!(matching[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(matching[0].range, range, "diagnostic: {:#?}", matching[0]);
     }
 }
@@ -12862,9 +12862,9 @@ fn one_line_multifile_handle_export_is_an_error_anchored_by_parser_span() {
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| {
-            diagnostic
-                .message
-                .contains("inferred resource handle mock.compute.Instance cannot cross a state boundary")
+            diagnostic.message.contains(
+                "inferred resource handle mock.compute.Instance cannot cross a state boundary",
+            )
         })
         .unwrap_or_else(|| panic!("missing one-line handle boundary error: {diagnostics:#?}"));
 
@@ -12872,6 +12872,32 @@ fn one_line_multifile_handle_export_is_an_error_anchored_by_parser_span() {
     assert_eq!(
         diagnostic.range,
         Range::new(Position::new(0, 10), Position::new(0, 18)),
+    );
+}
+
+#[test]
+fn sibling_file_handle_export_is_not_misanchored_in_the_analyzed_buffer() {
+    let root = tempfile::tempdir().expect("create cross-file handle-export fixture");
+    std::fs::write(
+        root.path().join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    )
+    .expect("write sibling resource fixture");
+    std::fs::write(
+        root.path().join("exports.crn"),
+        "exports {\n  inferred = instance\n}\n",
+    )
+    .expect("write sibling exports fixture");
+    let main = "\n";
+    std::fs::write(root.path().join("main.crn"), main).expect("write analyzed buffer fixture");
+
+    let diagnostics = analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", main);
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("cannot cross a state boundary")),
+        "a sibling export must not be anchored in main.crn: {diagnostics:#?}",
     );
 }
 

@@ -25,7 +25,9 @@ use tempfile::TempDir;
 const UPDATE_DELAY_MS: &str = "200";
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
@@ -252,7 +254,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         );
     let consumer_from = consumer_current_state(&consumer.id);
     let resolved_consumer = ResolvedResource::from_resolved_parts(
-        consumer.clone(),
+        resolved(consumer.clone()).into_inner(),
         [validation_dependency.clone()].into_iter().collect(),
         ResolvedDependencies::default(),
     );
@@ -327,10 +329,14 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             attribute_spans: Default::default(),
         }),
         plan,
-        sorted_resources: sorted_resources.clone(),
+        sorted_resources: sorted_resources
+            .iter()
+            .cloned()
+            .map(|resource| resolved(resource).into_inner())
+            .collect(),
         sorted_value_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
         sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
-        legacy_dependency_projections: Default::default(),
+        legacy_dependency_classification: None,
         unresolved_resources: sorted_resources,
         compositions: vec![],
         data_sources: vec![],
