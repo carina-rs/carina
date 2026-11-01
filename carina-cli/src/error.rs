@@ -11,6 +11,48 @@ use carina_state::BackendError;
 
 use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 
+/// Final execution summary with the actual failed endpoints and typed causes.
+#[derive(Debug, Clone)]
+pub struct ExecutionFailureReport {
+    summary: String,
+    failures: Vec<carina_core::executor::EffectFailure>,
+}
+
+impl ExecutionFailureReport {
+    pub fn new(summary: String, failures: &[carina_core::executor::EffectFailure]) -> Self {
+        Self {
+            summary,
+            failures: failures.to_vec(),
+        }
+    }
+
+    pub fn failures(&self) -> &[carina_core::executor::EffectFailure] {
+        &self.failures
+    }
+}
+
+impl std::fmt::Display for ExecutionFailureReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.summary)?;
+        for failure in &self.failures {
+            let endpoint = failure
+                .endpoint()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "module constraint".into());
+            let reason = failure
+                .to_string()
+                .lines()
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" ");
+            write!(f, "\n  {endpoint}: {reason}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ExecutionFailureReport {}
+
 /// State encoding failure annotated with the resource row being written.
 #[derive(Debug)]
 pub struct LocatedResourceStateEncodingError {
@@ -972,6 +1014,10 @@ pub enum AppError {
     /// Configuration errors (missing attributes, invalid paths, etc.)
     #[error("{0}")]
     Config(String),
+
+    /// Apply or destroy failed, with every retained failure available to callers.
+    #[error(transparent)]
+    ExecutionFailed(#[from] ExecutionFailureReport),
 
     /// Anonymous resource identity could not be assigned safely.
     #[error(transparent)]

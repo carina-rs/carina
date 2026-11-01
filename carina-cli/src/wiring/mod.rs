@@ -91,11 +91,13 @@ use carina_core::deps::{
     sort_resources_by_dependencies,
 };
 use carina_core::differ::{
+    CascadeDependents, block_deletes_on_prior_consumer_updates, create_plan_with_cascades,
+};
+use carina_core::differ::{
     Orphan, Orphans, PlanPriorStates, binding_matches_deferred_template, into_all_prior_states,
     lift_prior_state_enum_leaves, provider_states_for, rekey_current_for_move,
     transform_prior_managed_provider_states, transform_prior_provider_states,
 };
-use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::effect::{
     DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration,
     MoveAuthority, NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedMove,
@@ -6034,7 +6036,12 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     );
     let mut plan = create_plan_with_cascades(
         &resolved_resources,
-        &resolved_unresolved_resources,
+        CascadeDependents::new(
+            &resolved_unresolved_resources,
+            deferred_create_targets
+                .iter()
+                .map(|target| &target.template),
+        ),
         &data_sources_for_plan,
         provider,
         PlanPriorStates::new(&plan_input_current, &addressed.orphans),

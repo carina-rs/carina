@@ -2281,22 +2281,7 @@ async fn lock_released_on_write_state_failure() {
     };
     let lock = LockInfo::for_test("apply");
 
-    let result = ApplyResult {
-        success_count: 0,
-        failure_count: 0,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::new(),
-        runtime_synthesized_resources: Vec::new(),
-        permanent_name_overrides: HashMap::new(),
-        successfully_deleted: HashSet::new(),
-        managed_current: HashMap::new(),
-        data_source_states: HashMap::new(),
-        bindings: carina_core::binding_index::ResolvedBindings::default(),
-        failed_refreshes: HashSet::new(),
-    };
+    let result = ApplyResult::empty();
 
     // This mirrors the pattern used in run_apply_locked / run_apply_from_plan_locked:
     // call finalize_apply (which may fail), then always release lock in the caller.
@@ -2433,22 +2418,7 @@ async fn finalize_apply_uses_write_state_locked() {
     let backend = LockTrackingBackend::new();
     let lock = LockInfo::for_test("apply");
 
-    let result = ApplyResult {
-        success_count: 0,
-        failure_count: 0,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::new(),
-        runtime_synthesized_resources: Vec::new(),
-        permanent_name_overrides: HashMap::new(),
-        successfully_deleted: HashSet::new(),
-        managed_current: HashMap::new(),
-        data_source_states: HashMap::new(),
-        bindings: carina_core::binding_index::ResolvedBindings::default(),
-        failed_refreshes: HashSet::new(),
-    };
+    let result = ApplyResult::empty();
 
     let op_result = finalize_apply(
         FinalizeApplyInput {
@@ -2784,22 +2754,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
     let backend = LockTrackingBackend::new();
     let state_lock = StateLock::disabled_for_test();
 
-    let result = ApplyResult {
-        success_count: 0,
-        failure_count: 0,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::new(),
-        runtime_synthesized_resources: Vec::new(),
-        permanent_name_overrides: HashMap::new(),
-        successfully_deleted: HashSet::new(),
-        managed_current: HashMap::new(),
-        data_source_states: HashMap::new(),
-        bindings: carina_core::binding_index::ResolvedBindings::default(),
-        failed_refreshes: HashSet::new(),
-    };
+    let result = ApplyResult::empty();
 
     let op_result = finalize_apply(
         FinalizeApplyInput {
@@ -2860,21 +2815,11 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
             Value::Concrete(ConcreteValue::String("from-execution-result".into())),
         )]),
     );
-    let result = ApplyResult {
-        success_count: 1,
-        failure_count: 0,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::new(),
-        runtime_synthesized_resources: Vec::new(),
-        permanent_name_overrides: HashMap::new(),
-        successfully_deleted: HashSet::new(),
-        managed_current: HashMap::new(),
-        data_source_states: HashMap::from([(data_source_id, data_source_state)]),
-        bindings: carina_core::binding_index::ResolvedBindings::default(),
-        failed_refreshes: HashSet::new(),
+    let result = {
+        let mut result = ApplyResult::empty();
+        result.success_count = 1;
+        result.data_source_states = HashMap::from([(data_source_id, data_source_state)]);
+        result
     };
     let export_params = vec![InferredExportParam {
         name: "answer".to_string(),
@@ -4940,22 +4885,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
         serde_json::json!(["ns-1572.awsdns-04.co.uk"]),
     );
 
-    let result = ApplyResult {
-        success_count: 0,
-        failure_count: 0,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::new(),
-        runtime_synthesized_resources: Vec::new(),
-        permanent_name_overrides: HashMap::new(),
-        successfully_deleted: HashSet::new(),
-        managed_current: HashMap::new(),
-        data_source_states: HashMap::new(),
-        bindings: carina_core::binding_index::ResolvedBindings::default(),
-        failed_refreshes: HashSet::new(),
-    };
+    let result = ApplyResult::empty();
 
     let op_result = finalize_apply(
         FinalizeApplyInput {
@@ -5008,22 +4938,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
     let mut state_in = StateFile::new();
     state_in.insert_export_json_for_test("vpc_id", serde_json::json!("vpc-0abc123"));
 
-    let result = ApplyResult {
-        success_count: 0,
-        failure_count: 0,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::new(),
-        runtime_synthesized_resources: Vec::new(),
-        permanent_name_overrides: HashMap::new(),
-        successfully_deleted: HashSet::new(),
-        managed_current: HashMap::new(),
-        data_source_states: HashMap::new(),
-        bindings: carina_core::binding_index::ResolvedBindings::default(),
-        failed_refreshes: HashSet::new(),
-    };
+    let result = ApplyResult::empty();
 
     let op_result = finalize_apply(
         FinalizeApplyInput {
@@ -5085,22 +5000,29 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         Value::Concrete(ConcreteValue::String("a-id".into())),
     );
     let a_state = State::existing(a_id.clone(), a_attrs).with_identifier("a-id");
+    let failed_effect = Effect::Create(resolved(resource_a.clone()));
 
-    let result = ApplyResult {
-        success_count: 1,
-        failure_count: 1,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::from([(a_id.clone(), complete_create(a_state.clone()))]),
-        runtime_synthesized_resources: Vec::new(),
-        permanent_name_overrides: HashMap::new(),
-        successfully_deleted: HashSet::new(),
-        managed_current: HashMap::from([(a_id, Current::from_state(a_state))]),
-        data_source_states: HashMap::new(),
-        bindings: carina_core::binding_index::ResolvedBindings::default(),
-        failed_refreshes: HashSet::new(),
+    let result = {
+        let mut result = ApplyResult::empty();
+        result.success_count = 1;
+        result.applied_states = HashMap::from([(a_id.clone(), complete_create(a_state.clone()))]);
+        result.managed_current = HashMap::from([(a_id, Current::from_state(a_state))]);
+        result.failure_sink().record(
+            &carina_core::executor::NoopExecutionObserver,
+            carina_core::executor::FailureReport::Effect {
+                effect: &failed_effect,
+                kind: carina_core::executor::EffectFailureKind::message("fixture failure"),
+                context: carina_core::executor::FailureEventContext {
+                    recovery: None,
+                    duration: std::time::Duration::ZERO,
+                    progress: carina_core::executor::ProgressInfo {
+                        completed: 1,
+                        total: 1,
+                    },
+                },
+            },
+        );
+        result
     };
 
     let export_params = vec![
@@ -5150,7 +5072,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         "the caller must receive the skipped-export summary after state save",
     );
     assert!(
-        result.failure_count > 0,
+        result.failure_count() > 0,
         "the modeled apply result must still represent a partial failure"
     );
 
@@ -5204,21 +5126,13 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         )]),
     )
     .with_identifier("created-id");
-    let result = ApplyResult {
-        success_count: 1,
-        failure_count: 0,
-        partial_count: 0,
-        partial_diagnostics: Vec::new(),
-        skip_count: 0,
-        interrupted_count: 0,
-        applied_states: HashMap::from([(resource_id.clone(), complete_create(state.clone()))]),
-        runtime_synthesized_resources: Vec::new(),
-        permanent_name_overrides: HashMap::new(),
-        successfully_deleted: HashSet::new(),
-        managed_current: HashMap::from([(resource_id, Current::from_state(state))]),
-        data_source_states: HashMap::new(),
-        bindings: carina_core::binding_index::ResolvedBindings::default(),
-        failed_refreshes: HashSet::new(),
+    let result = {
+        let mut result = ApplyResult::empty();
+        result.success_count = 1;
+        result.applied_states =
+            HashMap::from([(resource_id.clone(), complete_create(state.clone()))]);
+        result.managed_current = HashMap::from([(resource_id, Current::from_state(state))]);
+        result
     };
     let export_params = vec![InferredExportParam {
         name: "broken".to_string(),

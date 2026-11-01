@@ -147,7 +147,7 @@ fn plan_for(
         crate::resource::into_plan_input_current_map_from_states(current_states, &schemas, &[]);
     create_plan_with_cascades(
         &resolved,
-        &unresolved,
+        CascadeDependents::new(&unresolved, std::iter::empty()),
         &[],
         &provider,
         crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
@@ -691,4 +691,206 @@ fn chained_cbd_anonymous_middle_node_auto_promoted() {
         delete_blocked_by(&plan, &middle_id).contains(&ResourceIdentity::new("consumer")),
         "anonymous middle delete should wait for downstream consumer update"
     );
+}
+
+#[test]
+fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
+    use crate::effect::deps::{
+        ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
+    };
+    use crate::effect::{DeferredReplaceDelete, DeferredReplacePayload, NonEmptyDeletes};
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::resource::{LoopSlot, ModuleSource, ResolvedResource};
+
+    let schemas = base_schemas(false);
+    let (managed_vpc, unresolved_vpc) = vpc_resources(false);
+    let vpc_id = managed_vpc.id.clone();
+    let vpc_state = standard_states().remove(&vpc_id).unwrap();
+
+    let child_id = ResourceId::with_identity("ec2.Subnet", "subnets.a");
+    let child_state = state(
+        &child_id,
+        &[
+            ("name", string("subnet-a")),
+            ("vpc_id", string("vpc-old")),
+            ("cidr_block", string("10.1.1.0/24")),
+            ("availability_zone", string("us-east-1a")),
+        ],
+        "subnet-old",
+    )
+    .with_dependency_bindings(["vpc".to_string()].into());
+    let orphans = Orphans::from([Orphan::from_state(
+        child_state,
+        Some("subnets.a".to_string()),
+        Directives::default(),
+    )]);
+
+    let template_resource: Resource<ModuleSource, LoopSlot> =
+        Resource::new("ec2.Subnet", "subnets").with_binding("subnets");
+    let deferred = DeferredForExpression::new(
+        Some("main.crn".to_string()),
+        2,
+        "for _, subnet in vpc.subnets".to_string(),
+        DeferredForTarget::bound("subnets").expect("fixture binding is valid"),
+        ref_value("vpc", "subnets"),
+        ForBinding::Map("_".to_string(), "subnet".to_string()),
+        template_resource,
+    );
+
+    let managed = ResolvedResource::collect_resolved([managed_vpc])
+        .expect("fixture source identity is resolved");
+    let unresolved = ResolvedResource::collect_resolved([unresolved_vpc.clone()])
+        .expect("fixture source identity is resolved");
+    let (schemas, provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        managed.iter().map(|resource| &resource.id),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(vpc_id.clone(), vpc_state)]),
+        &schemas,
+        &[],
+    );
+    let mut plan = create_plan_with_cascades(
+        &managed,
+        CascadeDependents::new(&unresolved, std::iter::once(&deferred)),
+        &[],
+        &provider,
+        PlanPriorStates::new(&current, &orphans),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[],
+        &HashSet::new(),
+    )
+    .expect("test provider hints should succeed");
+
+    let absorbed = plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Delete {
+                id,
+                identifier,
+                generation: crate::effect::EffectGeneration::Current,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            } if id.as_inner() == &child_id => Some(DeferredReplaceDelete {
+                id: id.clone(),
+                identifier: identifier.clone(),
+                directives: directives.clone(),
+                binding: binding.clone(),
+                dependencies: dependencies.clone(),
+                explicit_dependencies: explicit_dependencies.clone(),
+                blocked_by_updates: blocked_by_updates.clone(),
+            }),
+            _ => None,
+        })
+        .expect("orphan child delete must be planned");
+    plan.retain(|effect| effect.resource_id() != &child_id);
+    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+        deletes: NonEmptyDeletes::try_new(vec![absorbed]).expect("fixture has one delete"),
+        template: Box::new(deferred),
+    })));
+
+    assert!(
+        replacement_metadata(&plan, &vpc_id).create_before_destroy,
+        "a producer referenced by a deferred-for consumer must be promoted to CBD before replacement decomposition",
+    );
+
+    let unresolved_resources = HashMap::from([(
+        vpc_id,
+        crate::executor::UnresolvedResource::from_pre_resolve(unresolved_vpc),
+    )]);
+    let deps = build_dependency_analysis(
+        plan.effects(),
+        &unresolved_resources,
+        &[],
+        ScheduleInputs::Apply,
+    )
+    .expect("all scheduler dependencies must resolve")
+    .into_deps_of();
+    let mut remaining = deps;
+    let mut completed = HashSet::new();
+    loop {
+        let ready = remaining
+            .iter()
+            .filter_map(|(idx, dependencies)| {
+                dependencies
+                    .iter()
+                    .all(|dependency| completed.contains(dependency))
+                    .then_some(*idx)
+            })
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            break;
+        }
+        for idx in ready {
+            remaining.remove(&idx);
+            completed.insert(idx);
+        }
+    }
+    assert!(
+        remaining.is_empty(),
+        "the planned deferred replacement graph must be acyclic; remaining={remaining:?}, effects={:?}",
+        plan.effects(),
+    );
+}
+
+#[test]
+fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::resource::{LoopSlot, ModuleSource};
+    for binding in [
+        ForBinding::Simple("vpc".into()),
+        ForBinding::Indexed("vpc".into(), "value".into()),
+        ForBinding::Map("key".into(), "vpc".into()),
+    ] {
+        let schemas = base_schemas(false);
+        let (managed, unresolved) = vpc_resources(false);
+        let id = managed.id.clone();
+        let managed = ResolvedResource::collect_resolved([managed]).unwrap();
+        let unresolved = ResolvedResource::collect_resolved([unresolved]).unwrap();
+        let template: Resource<ModuleSource, LoopSlot> = Resource::new("ec2.Subnet", "subnets")
+            .with_attribute("vpc_id", Value::resource_ref("vpc", "vpc_id", vec![]));
+        let deferred = DeferredForExpression::new(
+            None,
+            1,
+            "for vpc in other.items".into(),
+            DeferredForTarget::bound("subnets").unwrap(),
+            ref_value("other", "items"),
+            binding,
+            template,
+        );
+        let (schemas, provider) = crate::provider::comparison_fixture_for_test(
+            &schemas,
+            managed.iter().map(|resource| &resource.id),
+        );
+        let current = crate::resource::into_plan_input_current_map_from_states(
+            standard_states(),
+            &schemas,
+            &[],
+        );
+        let plan = create_plan_with_cascades(
+            &managed,
+            CascadeDependents::new(&unresolved, [&deferred]),
+            &[],
+            &provider,
+            PlanPriorStates::new(&current, &Orphans::new()),
+            &HashMap::new(),
+            &schemas,
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &[],
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            !replacement_metadata(&plan, &id).create_before_destroy,
+            "the loop-local vpc must not refer to the top-level producer"
+        );
+    }
 }

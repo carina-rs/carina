@@ -17,6 +17,29 @@ use crate::resource::{
     ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
     ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
 };
+
+/// Resource-shaped dependents consulted while cascading replacement changes.
+///
+/// Deferred-for targets are retained outside the ordinary managed-resource
+/// slice until apply time. Keeping both sets in this required planner input
+/// ensures their references participate in create-before-destroy promotion
+/// before replacement effects are decomposed.
+pub struct CascadeDependents<'a> {
+    managed: &'a [ResolvedResource],
+    deferred: Vec<&'a crate::parser::DeferredForExpression>,
+}
+
+impl<'a> CascadeDependents<'a> {
+    pub fn new(
+        managed: &'a [ResolvedResource],
+        deferred: impl IntoIterator<Item = &'a crate::parser::DeferredForExpression>,
+    ) -> Self {
+        Self {
+            managed,
+            deferred: deferred.into_iter().collect(),
+        }
+    }
+}
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
     WAIT_DEFAULT_TIMEOUT,
@@ -401,7 +424,7 @@ pub(crate) fn create_plan_with_provider(
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan_with_cascades(
     managed: &[ResolvedResource],
-    unresolved_managed: &[ResolvedResource],
+    dependents: CascadeDependents<'_>,
     data_sources: &[DataSource],
     provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
@@ -429,7 +452,7 @@ pub fn create_plan_with_cascades(
     cascade_dependent_updates(
         &mut build.plan,
         &mut build.pending_replaces,
-        unresolved_managed,
+        &dependents,
         &managed_current,
         registry,
         outcome_unknown_import_replacements,
@@ -1076,13 +1099,13 @@ fn known_binding_names(
 fn cascade_dependent_updates(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[ResolvedResource],
+    dependents: &CascadeDependents<'_>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) {
     loop {
-        promote_referenced_replaces_to_cbd(plan, pending_replaces, unresolved_managed, registry);
+        promote_referenced_replaces_to_cbd(plan, pending_replaces, dependents, registry);
 
         if pending_replaces.is_empty() {
             return;
@@ -1091,7 +1114,11 @@ fn cascade_dependent_updates(
         let promoted = promote_pending_replaces_for_dependents(
             plan,
             pending_replaces,
-            unresolved_managed,
+            // Deferred children have no concrete desired identities here.
+            // Their prior rows are orphan deletes grouped into DeferredReplace
+            // by the caller, which replaces them at materialization, including
+            // template attributes with create-only producer references.
+            dependents.managed,
             current_states,
             registry,
             outcome_unknown_import_replacements,
@@ -1106,14 +1133,29 @@ fn cascade_dependent_updates(
 fn promote_referenced_replaces_to_cbd(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[ResolvedResource],
+    dependents: &CascadeDependents<'_>,
     registry: &SchemaRegistry,
 ) {
     let ref_targets = pending_reference_targets(pending_replaces, false);
     let mut promote = Vec::new();
 
-    for resource in unresolved_managed {
-        let deps = get_resource_dependencies(resource);
+    let managed_dependencies = dependents
+        .managed
+        .iter()
+        .map(|resource| (Some(&resource.id), get_resource_dependencies(resource)));
+    let deferred_dependencies = dependents.deferred.iter().map(|deferred| {
+        let mut dependencies =
+            get_resource_dependencies(deferred.template_resource().as_resource());
+        // Header bindings shadow top-level names only inside the body. The
+        // iterable still resolves in the enclosing scope.
+        for local in deferred.binding.names() {
+            dependencies.remove(local);
+        }
+        dependencies.extend(deferred.root_bindings());
+        (None, dependencies)
+    });
+
+    for (dependent_id, deps) in managed_dependencies.chain(deferred_dependencies) {
         for dep in &deps {
             let Some(replaced_identity) = ref_targets.get(dep) else {
                 continue;
@@ -1121,7 +1163,9 @@ fn promote_referenced_replaces_to_cbd(
             let Some(pending) = pending_replaces.get(replaced_identity) else {
                 continue;
             };
-            if pending.create_before_destroy || pending.create.id == resource.id {
+            if pending.create_before_destroy
+                || dependent_id.is_some_and(|id| pending.create.id == *id)
+            {
                 continue;
             }
             promote.push(replaced_identity.clone());

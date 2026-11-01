@@ -24,7 +24,10 @@ use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub use plan::create_plan_for_test;
-pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades};
+pub use plan::{
+    CascadeDependents, block_deletes_on_prior_consumer_updates, create_plan,
+    create_plan_with_cascades,
+};
 
 /// Project the differ's managed-resource decision into the attribute
 /// definitiveness required by reference/coalesce resolution.

@@ -204,19 +204,24 @@ pub(super) fn unsatisfiable_reason_message(reason: &UnsatisfiableReason) -> Stri
     }
 }
 
-pub(super) fn wait_failure_message(outcome: &WaitOutcome, target_id: &ResourceId) -> String {
+pub(super) fn wait_failure(
+    outcome: WaitOutcome,
+    target_id: &ResourceId,
+) -> super::EffectFailureKind {
     match outcome {
         WaitOutcome::Timeout {
             last_attrs,
             elapsed,
         } => {
-            let observed = format_wait_last_attrs(last_attrs);
-            format!(
+            let observed = format_wait_last_attrs(&last_attrs);
+            super::EffectFailureKind::message(format!(
                 "wait on {} timed out after {:?} (last observed attributes: {})",
                 target_id, elapsed, observed
-            )
+            ))
         }
-        WaitOutcome::NotFound(err) | WaitOutcome::ReadFailed(err) => err.to_string(),
+        WaitOutcome::NotFound(error) | WaitOutcome::ReadFailed(error) => {
+            super::EffectFailureKind::provider(error)
+        }
         WaitOutcome::Satisfied { .. }
         | WaitOutcome::Cancelled
         | WaitOutcome::Abandoned
@@ -393,6 +398,25 @@ pub(super) struct StartedEffect<'a, S> {
     terminal_emitted: bool,
 }
 
+#[cfg(test)]
+pub(super) fn started_effect_for_test<'a, S: Clone>(
+    observer: &'a dyn ExecutionObserver<S>,
+    effect: &Effect<S>,
+) -> StartedEffect<'a, S> {
+    InFlightStart {
+        idx: 0,
+        interrupted: Arc::new(Mutex::new(InterruptedRegistry::default())),
+    }
+    .emit_started(
+        observer,
+        effect,
+        ProgressInfo {
+            completed: 1,
+            total: 1,
+        },
+    )
+}
+
 impl<S> StartedEffect<'_, S> {
     fn finish(&mut self) -> ProgressInfo {
         self.interrupted
@@ -450,24 +474,38 @@ impl<S> StartedEffect<'_, S> {
             });
     }
 
-    pub(super) fn failed(self, error: &str, duration: Duration) {
-        self.failed_with_recovery(error, None, duration);
+    pub(super) fn failed(
+        self,
+        accumulator: &mut super::ExecutionAccumulator<S>,
+        kind: super::EffectFailureKind,
+        duration: Duration,
+    ) where
+        S: Clone,
+    {
+        self.failed_with_recovery(accumulator, kind, None, duration);
     }
 
     pub(super) fn failed_with_recovery(
         mut self,
-        error: &str,
+        accumulator: &mut super::ExecutionAccumulator<S>,
+        kind: super::EffectFailureKind,
         recovery: Option<&crate::plan::PlanError>,
         duration: Duration,
-    ) {
+    ) where
+        S: Clone,
+    {
         let progress = self.finish();
-        self.observer.on_event(&ExecutionEvent::EffectFailed {
-            effect: self.effect(),
-            error,
-            recovery,
-            duration,
-            progress,
-        });
+        super::record_effect_failure(
+            accumulator,
+            self.observer,
+            self.effect(),
+            kind,
+            super::FailureEventContext {
+                recovery,
+                duration,
+                progress,
+            },
+        );
     }
 
     pub(super) fn skipped(mut self, reason: &str) {
@@ -1476,7 +1514,7 @@ mod tests {
             elapsed: Duration::from_secs(1),
         };
 
-        let message = wait_failure_message(&outcome, &target);
+        let message = wait_failure(outcome, &target).to_string();
 
         assert!(message.contains(
             "last observed attributes: arn=arn:aws:acm:1:certificate/abc, status=pending"
@@ -1493,7 +1531,7 @@ mod tests {
             elapsed: Duration::from_secs(1),
         };
 
-        let message = wait_failure_message(&outcome, &target);
+        let message = wait_failure(outcome, &target).to_string();
 
         assert!(message.contains("last observed attributes: no observed attributes"));
     }
@@ -1519,7 +1557,7 @@ mod tests {
             elapsed: Duration::from_secs(1),
         };
 
-        let message = wait_failure_message(&outcome, &target);
+        let message = wait_failure(outcome, &target).to_string();
 
         assert!(
             message.contains(

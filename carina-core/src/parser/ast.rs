@@ -1005,6 +1005,8 @@ where
             serialize = "S: serde::Serialize, P: PlaceholderKind + serde::Serialize, T: PlaceholderKind + serde::Serialize"
         ))]
         struct WireRef<'a, S, P: PlaceholderKind, T: PlaceholderKind> {
+            file: Option<&'a str>,
+            line: usize,
             header: &'a str,
             resource_type: &'a str,
             target: &'a DeferredForTarget,
@@ -1015,6 +1017,11 @@ where
 
         serde::Serialize::serialize(
             &WireRef {
+                file: self
+                    .file
+                    .as_deref()
+                    .filter(|file| std::path::Path::new(file).is_relative()),
+                line: self.line,
                 header: &self.header,
                 resource_type: self.resource_type(),
                 target: &self.target,
@@ -1045,6 +1052,9 @@ where
             deserialize = "S: serde::Deserialize<'de>, P: PlaceholderKind + serde::Deserialize<'de>, T: PlaceholderKind + serde::Deserialize<'de>"
         ))]
         struct Wire<S, P: PlaceholderKind, T: PlaceholderKind> {
+            #[serde(deserialize_with = "deserialize_relative_diagnostic_file")]
+            file: Option<String>,
+            line: usize,
             header: String,
             resource_type: String,
             target: DeferredForTarget,
@@ -1102,8 +1112,8 @@ where
 
         let template_resource = DeferredForTemplateResource::new(template_resource);
         Ok(Self::from_template_resource(
-            None,
-            0,
+            wire.file,
+            wire.line,
             wire.header,
             wire.target,
             wire.iterable,
@@ -1111,6 +1121,22 @@ where
             template_resource,
         ))
     }
+}
+
+fn deserialize_relative_diagnostic_file<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let file = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    if file
+        .as_deref()
+        .is_some_and(|file| std::path::Path::new(file).is_absolute())
+    {
+        return Err(serde::de::Error::custom(
+            "deferred-for diagnostic file must be relative",
+        ));
+    }
+    Ok(file)
 }
 
 impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
@@ -6855,7 +6881,7 @@ mod substitute_placeholder_tests {
     }
 
     #[test]
-    fn deferred_for_expression_serde_skips_diagnostic_location() {
+    fn deferred_for_expression_serde_omits_absolute_file_but_preserves_line() {
         let deferred: DeferredForExpression = DeferredForExpression::new(
             Some("/abs/path.crn".to_string()),
             42,
@@ -6878,8 +6904,73 @@ mod substitute_placeholder_tests {
         let decoded = serde_json::from_str::<SavedDeferredForExpression>(&json)
             .expect("deserialize deferred for expression");
         assert_eq!(decoded.file, None);
-        assert_eq!(decoded.line, 0);
+        assert_eq!(decoded.line, 42);
         assert_eq!(decoded.iterable, deferred.iterable);
+    }
+
+    #[test]
+    fn deferred_for_expression_serde_preserves_relative_diagnostic_location() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            Some("modules/child/main.crn".to_string()),
+            17,
+            "for opt in cert.options".to_string(),
+            DeferredForTarget::bound("children").expect("fixture binding is valid"),
+            Value::resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            Resource::new("mock.Target", "children"),
+        );
+
+        let json = serde_json::to_string(&deferred).expect("serialize deferred for expression");
+        let decoded = serde_json::from_str::<SavedDeferredForExpression>(&json)
+            .expect("deserialize deferred for expression");
+
+        assert_eq!(decoded.file.as_deref(), Some("modules/child/main.crn"));
+        assert_eq!(decoded.line, 17);
+    }
+
+    #[test]
+    fn deferred_for_wire_requires_both_diagnostic_location_fields() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            None,
+            0,
+            "for opt in cert.options".into(),
+            DeferredForTarget::bound("children").unwrap(),
+            Value::resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".into()),
+            Resource::new("mock.Target", "children"),
+        );
+        let wire = serde_json::to_value(&deferred).unwrap();
+        for field in ["file", "line"] {
+            assert!(
+                wire.get(field).is_some(),
+                "required field {field} must be serialized even when empty: {wire}"
+            );
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SavedDeferredForExpression>(missing).is_err(),
+                "missing {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_for_wire_rejects_absolute_diagnostic_file() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            Some("main.crn".into()),
+            1,
+            "for opt in cert.options".into(),
+            DeferredForTarget::bound("children").unwrap(),
+            Value::resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".into()),
+            Resource::new("mock.Target", "children"),
+        );
+        let mut wire = serde_json::to_value(&deferred).unwrap();
+        wire["file"] = serde_json::json!("/machine/local/main.crn");
+        assert!(
+            serde_json::from_value::<SavedDeferredForExpression>(wire).is_err(),
+            "saved diagnostic files must be relative"
+        );
     }
 
     #[test]
@@ -7237,6 +7328,8 @@ mod substitute_placeholder_tests {
     fn bound_deferred_for_wire_matches_resource_shape_byte_for_byte() {
         #[derive(serde::Serialize)]
         struct ResourceShapedWire<'a> {
+            file: Option<&'a str>,
+            line: usize,
             header: &'a str,
             resource_type: &'a str,
             target: &'a DeferredForTarget,
@@ -7294,6 +7387,8 @@ mod substitute_placeholder_tests {
         assert_eq!(expression.template_resource_binding(), Some("children[?]"));
         let resource_type = expression.resource_type();
         let resource_shaped = ResourceShapedWire {
+            file: expression.file.as_deref(),
+            line: expression.line,
             header: &expression.header,
             resource_type,
             target: expression.target(),

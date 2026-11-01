@@ -26,8 +26,8 @@ use crate::value::{SerializationContext, SerializationError};
 
 use super::wait::{InFlightStart, StartedEffect};
 use super::{
-    AcceptedRequest, Applied, ExecutionAccumulator, ExecutionCheckpointSink, ExecutionEvent,
-    ExecutionObserver, ProgressInfo,
+    AcceptedRequest, Applied, EffectFailureKind, ExecutionAccumulator, ExecutionCheckpointSink,
+    ExecutionEvent, ExecutionObserver, ProgressInfo, ReportedError,
 };
 
 pub(super) struct CompletedEffect {
@@ -54,7 +54,7 @@ pub(super) enum BasicEffectResult {
         binding: Option<String>,
     },
     Failure {
-        error: String,
+        failure: EffectFailureKind,
         refresh: Option<(ResourceId, AppliedIdentifier)>,
     },
     ResumeSuccess {
@@ -64,7 +64,7 @@ pub(super) enum BasicEffectResult {
         binding: Option<String>,
     },
     ClassifiedFailure {
-        error: String,
+        failure: EffectFailureKind,
         recovery: Option<Box<crate::plan::PlanError>>,
         resource_id: ResourceId,
         applied: Applied,
@@ -101,38 +101,6 @@ impl<'a, S> StartedBasicEffectResult<'a, S> {
             duration: began.elapsed(),
             outcome,
         }
-    }
-
-    fn emit_terminal(self) -> BasicEffectResult {
-        let Self {
-            started,
-            duration,
-            outcome,
-        } = self;
-        match &outcome {
-            BasicEffectResult::Success { completed, .. } => {
-                started.succeeded(Some(&completed.state), duration)
-            }
-            BasicEffectResult::PartialSuccess {
-                completed,
-                diagnostic,
-                ..
-            } => started.partially_succeeded(&completed.state, diagnostic, duration),
-            BasicEffectResult::Failure { error, .. } => {
-                started.failed(error, duration);
-            }
-            BasicEffectResult::ClassifiedFailure {
-                error, recovery, ..
-            } => started.failed_with_recovery(error, recovery.as_deref(), duration),
-            BasicEffectResult::ResumeSuccess { completed, .. } => {
-                let state = completed.observed_state();
-                started.succeeded(Some(&state), duration);
-            }
-            BasicEffectResult::Deleted { .. } => {
-                started.succeeded(None, duration);
-            }
-        }
-        outcome
     }
 }
 
@@ -183,11 +151,7 @@ pub(super) async fn refresh_pending_states<S: Clone>(
                 });
             }
             Err(error) => {
-                let error_str = error.to_string();
-                observer.on_event(&ExecutionEvent::RefreshFailed {
-                    id,
-                    error: &error_str,
-                });
+                observer.on_event(&ExecutionEvent::RefreshFailed { id, error: &error });
                 accumulator.mutate(|result| {
                     result.failed_refreshes.insert(id.clone());
                 });
@@ -215,15 +179,17 @@ pub(super) async fn refresh_pending_states<S: Clone>(
 pub(super) async fn resolve_resource<S: Clone>(
     input: Result<CheckInput<Resource<S>>, String>,
     context: &ProviderPreparationContext<'_>,
-) -> Result<(ProviderReadyResource, SecretPreservingAttributes), String> {
+) -> Result<(ProviderReadyResource, SecretPreservingAttributes), EffectFailureKind> {
     let bindings = context.bindings();
-    let input = input?;
+    let input = input.map_err(EffectFailureKind::message)?;
     let checked = match input {
         CheckInput::Authored(source) => {
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
-                let resolved_value = resolve_ref_value(expr, bindings)?;
-                assert_fully_resolved(&resolved_value, key, bindings)?;
+                let resolved_value =
+                    resolve_ref_value(expr, bindings).map_err(EffectFailureKind::message)?;
+                assert_fully_resolved(&resolved_value, key, bindings)
+                    .map_err(|error| EffectFailureKind::Execution { error })?;
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
             ResolvedCheckInput::authored(resolved)
@@ -241,8 +207,10 @@ pub(super) async fn resolve_resource<S: Clone>(
                 let expr = source_expr
                     .filter(|source_expr| needs_apply_resolution(source_expr))
                     .unwrap_or(target_expr);
-                let resolved_value = resolve_ref_value(expr, bindings)?;
-                assert_fully_resolved(&resolved_value, key, bindings)?;
+                let resolved_value =
+                    resolve_ref_value(expr, bindings).map_err(EffectFailureKind::message)?;
+                assert_fully_resolved(&resolved_value, key, bindings)
+                    .map_err(|error| EffectFailureKind::Execution { error })?;
                 if resolves_at_apply {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
                     apply_resolved_attributes.insert(key.clone());
@@ -253,8 +221,10 @@ pub(super) async fn resolve_resource<S: Clone>(
                 if target.attributes.contains_key(key) {
                     continue;
                 }
-                let resolved_value = resolve_ref_value(source_expr, bindings)?;
-                assert_fully_resolved(&resolved_value, key, bindings)?;
+                let resolved_value =
+                    resolve_ref_value(source_expr, bindings).map_err(EffectFailureKind::message)?;
+                assert_fully_resolved(&resolved_value, key, bindings)
+                    .map_err(|error| EffectFailureKind::Execution { error })?;
                 if needs_apply_resolution(source_expr) {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
                     apply_resolved_attributes.insert(key.clone());
@@ -271,7 +241,7 @@ pub(super) async fn resolve_resource<S: Clone>(
     let resolved_secret_shapes = checked.value().resolved_attributes();
     let provider_ready = prepare_provider_ready_resource_after_resolution(checked, context)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(EffectFailureKind::execution)?;
     let provider_values = provider_ready.as_resource().resolved_attributes();
     let resolved_desired_attributes =
         SecretPreservingAttributes::from_provider_values(&resolved_secret_shapes, &provider_values);
@@ -314,12 +284,13 @@ fn needs_apply_resolution(value: &Value) -> bool {
 pub(super) fn resolve_data_source<S: Clone>(
     input: Result<CheckInput<DataSource<S>>, String>,
     bindings: &ResolvedBindings,
-) -> Result<ResolvedCheckInput<DataSource<S>>, String> {
-    let checked = match input? {
+) -> Result<ResolvedCheckInput<DataSource<S>>, ReportedError> {
+    let checked = match input.map_err(ReportedError::message)? {
         CheckInput::Authored(source) => {
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
-                let resolved_value = resolve_ref_value(expr, bindings)?;
+                let resolved_value =
+                    resolve_ref_value(expr, bindings).map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
@@ -338,7 +309,8 @@ pub(super) fn resolve_data_source<S: Clone>(
                 let expr = source_expr
                     .filter(|source_expr| needs_apply_resolution(source_expr))
                     .unwrap_or(target_expr);
-                let resolved_value = resolve_ref_value(expr, bindings)?;
+                let resolved_value =
+                    resolve_ref_value(expr, bindings).map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 if resolves_at_apply {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -350,7 +322,8 @@ pub(super) fn resolve_data_source<S: Clone>(
                 if target.attributes.contains_key(key) {
                     continue;
                 }
-                let resolved_value = resolve_ref_value(source_expr, bindings)?;
+                let resolved_value =
+                    resolve_ref_value(source_expr, bindings).map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 if needs_apply_resolution(source_expr) {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -389,7 +362,7 @@ fn assert_fully_resolved(
     value: &Value,
     attribute_key: &str,
     bindings: &ResolvedBindings,
-) -> Result<(), String> {
+) -> Result<(), ReportedError> {
     match value {
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
@@ -407,14 +380,16 @@ fn assert_fully_resolved(
             assert_fully_resolved(inner, attribute_key, bindings)
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(format!(
+        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(ReportedError::message(format!(
             "Attribute '{}' contains an unresolved module-template conditional",
             attribute_key
-        )),
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(format!(
-            "Attribute '{}' contains a saved-plan secret that was not rehydrated; create a new saved plan before applying",
-            attribute_key
-        )),
+        ))),
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
+            Err(ReportedError::message(format!(
+                "Attribute '{}' contains a saved-plan secret that was not rehydrated; create a new saved plan before applying",
+                attribute_key
+            )))
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => Err(unresolved_binding_message(
             attribute_key,
             UnresolvedSite::Ref {
@@ -432,10 +407,9 @@ fn assert_fully_resolved(
             bindings,
         )),
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
-            Err(SerializationError::UnresolvedCoalesce {
+            Err(ReportedError::new(SerializationError::UnresolvedCoalesce {
                 context: SerializationContext::WasmBoundary,
-            }
-            .to_string())
+            }))
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
@@ -493,11 +467,10 @@ fn assert_fully_resolved(
             ))
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
-            Err(SerializationError::UnknownNotAllowed {
+            Err(ReportedError::new(SerializationError::UnknownNotAllowed {
                 reason: reason.clone(),
                 context: SerializationContext::WasmBoundary,
-            }
-            .to_string())
+            }))
         }
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
@@ -523,7 +496,7 @@ fn unresolved_binding_message(
     site: UnresolvedSite,
     referenced_binding: &str,
     bindings: &ResolvedBindings,
-) -> String {
+) -> ReportedError {
     let opener = match &site {
         UnresolvedSite::Ref { path } => format!(
             "attribute `{attribute_key}` references `{path}` which has not been published yet by the upstream binding."
@@ -551,7 +524,7 @@ fn unresolved_binding_message(
         _ => "At least one referenced binding has not been published yet; add a `wait` block on the upstream binding to synchronize before downstream resources read it.".to_string(),
     };
 
-    format!("{opener} {remediation}")
+    ReportedError::message(format!("{opener} {remediation}"))
 }
 
 fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
@@ -643,23 +616,22 @@ pub(super) fn process_basic_result<S: Clone>(
     result: StartedBasicEffectResult<'_, S>,
     exec: &mut ExecutionState<'_, S>,
 ) -> BasicEffectCompletion {
-    process_basic_outcome(result.emit_terminal(), exec)
-}
-
-fn process_basic_outcome<S: Clone>(
-    result: BasicEffectResult,
-    exec: &mut ExecutionState<'_, S>,
-) -> BasicEffectCompletion {
+    let StartedBasicEffectResult {
+        started,
+        duration,
+        outcome,
+    } = result;
     let idx = exec.idx;
     let failed_indices = &mut *exec.failed_indices;
     let pending_refreshes = &mut *exec.pending_refreshes;
-    match result {
+    match outcome {
         BasicEffectResult::Success {
             completed,
             resource_id,
             resolved_attrs,
             binding,
         } => {
+            started.succeeded(Some(&completed.state), duration);
             let CompletedEffect { state, request } = completed;
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
@@ -680,9 +652,8 @@ fn process_basic_outcome<S: Clone>(
             );
             BasicEffectCompletion::Succeeded
         }
-        BasicEffectResult::Failure { error: _, refresh } => {
-            exec.accumulator
-                .mutate(|accumulated| accumulated.failure_count += 1);
+        BasicEffectResult::Failure { failure, refresh } => {
+            started.failed(exec.accumulator, failure, duration);
             failed_indices.insert(idx);
             if let Some((id, identifier)) = &refresh {
                 queue_state_refresh(pending_refreshes, id, identifier);
@@ -696,6 +667,7 @@ fn process_basic_outcome<S: Clone>(
             binding,
         } => {
             let state = completed.observed_state();
+            started.succeeded(Some(&state), duration);
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
                 accumulated
@@ -710,13 +682,12 @@ fn process_basic_outcome<S: Clone>(
             BasicEffectCompletion::Succeeded
         }
         BasicEffectResult::ClassifiedFailure {
-            error: _,
-            recovery: _,
+            failure,
+            recovery,
             resource_id,
             applied,
         } => {
-            exec.accumulator
-                .mutate(|accumulated| accumulated.failure_count += 1);
+            started.failed_with_recovery(exec.accumulator, failure, recovery.as_deref(), duration);
             failed_indices.insert(idx);
             exec.accumulator.insert_unpublished(resource_id, applied);
             BasicEffectCompletion::Failed
@@ -728,6 +699,7 @@ fn process_basic_outcome<S: Clone>(
             resolved_attrs,
             binding,
         } => {
+            started.partially_succeeded(&state, &diagnostic, duration);
             exec.accumulator.mutate(|accumulated| {
                 accumulated.partial_count += 1;
                 if let Some(attrs) = &resolved_attrs {
@@ -751,6 +723,7 @@ fn process_basic_outcome<S: Clone>(
             BasicEffectCompletion::Succeeded
         }
         BasicEffectResult::Deleted { instance_key } => {
+            started.succeeded(None, duration);
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
                 accumulated.successfully_deleted.insert(instance_key);
@@ -824,12 +797,12 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
             {
                 Ok(r) => r,
-                Err(e) => {
+                Err(failure) => {
                     return StartedBasicEffectResult::new(
                         started_effect,
                         started,
                         BasicEffectResult::Failure {
-                            error: e,
+                            failure,
                             refresh: None,
                         },
                     );
@@ -868,16 +841,13 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     }
                 }
                 Err(failure) => match failure.into_kind() {
-                    CreateFailureKind::Untracked(error) => {
-                        let error_str = error.to_string();
-                        BasicEffectResult::Failure {
-                            error: error_str,
-                            refresh: None,
-                        }
-                    }
+                    CreateFailureKind::Untracked(error) => BasicEffectResult::Failure {
+                        failure: EffectFailureKind::provider(error),
+                        refresh: None,
+                    },
                     CreateFailureKind::OutcomeUnknown { unknown, error } => {
                         BasicEffectResult::ClassifiedFailure {
-                            error: error.to_string(),
+                            failure: EffectFailureKind::provider(error),
                             recovery: Some(Box::new(
                                 crate::plan::PlanError::create_outcome_unknown(resource.id.clone()),
                             )),
@@ -888,19 +858,20 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     CreateFailureKind::Created { created, error } => {
                         let created =
                             created.with_resolved_desired_attributes(resolved_attrs.clone());
-                        let error_str = format!("{error}\n{}", created.post_error_note());
+                        let note = created.post_error_note();
                         BasicEffectResult::ClassifiedFailure {
-                            error: error_str,
+                            failure: EffectFailureKind::provider_with_note(error, note),
                             recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::Observed(created.into()),
                         }
                     }
                     CreateFailureKind::InFlight { pending, error } => {
-                        let error_str =
-                            format!("{error}\ncreate still in progress; the next apply resumes it");
                         BasicEffectResult::ClassifiedFailure {
-                            error: error_str,
+                            failure: EffectFailureKind::provider_with_note(
+                                error,
+                                "create still in progress; the next apply resumes it",
+                            ),
                             recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateInFlight(pending),
@@ -916,12 +887,12 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
             {
                 Ok(resolved) => resolved,
-                Err(error) => {
+                Err(failure) => {
                     return StartedBasicEffectResult::new(
                         started_effect,
                         started,
                         BasicEffectResult::Failure {
-                            error,
+                            failure,
                             refresh: None,
                         },
                     );
@@ -938,7 +909,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         started_effect,
                         started,
                         BasicEffectResult::Failure {
-                            error,
+                            failure: EffectFailureKind::message(error),
                             refresh: None,
                         },
                     );
@@ -950,12 +921,11 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let request = match ResumeCreateRequest::new(pending, create_request) {
                 Ok(request) => request,
                 Err(error) => {
-                    let error = error.to_string();
                     return StartedBasicEffectResult::new(
                         started_effect,
                         started,
                         BasicEffectResult::Failure {
-                            error,
+                            failure: EffectFailureKind::execution(error),
                             refresh: None,
                         },
                     );
@@ -1002,31 +972,29 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     }
                 }
                 Err(failure) => match failure.into_kind() {
-                    ResumeFailureKind::Ended(error) => {
-                        let error = error.to_string();
-                        BasicEffectResult::ClassifiedFailure {
-                            error,
-                            recovery: None,
-                            resource_id: resource.id.clone(),
-                            applied: Applied::CreateEnded,
-                        }
-                    }
+                    ResumeFailureKind::Ended(error) => BasicEffectResult::ClassifiedFailure {
+                        failure: EffectFailureKind::provider(error),
+                        recovery: None,
+                        resource_id: resource.id.clone(),
+                        applied: Applied::CreateEnded,
+                    },
                     ResumeFailureKind::Created { created, error } => {
                         let created =
                             created.with_resolved_desired_attributes(resolved_attrs.clone());
-                        let error = format!("{error}\n{}", created.post_error_note());
+                        let note = created.post_error_note();
                         BasicEffectResult::ClassifiedFailure {
-                            error,
+                            failure: EffectFailureKind::provider_with_note(error, note),
                             recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::Observed(created.into()),
                         }
                     }
                     ResumeFailureKind::InFlight { pending, error } => {
-                        let error =
-                            format!("{error}\ncreate still in progress; the next apply resumes it");
                         BasicEffectResult::ClassifiedFailure {
-                            error,
+                            failure: EffectFailureKind::provider_with_note(
+                                error,
+                                "create still in progress; the next apply resumes it",
+                            ),
                             recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateInFlight(pending),
@@ -1057,12 +1025,12 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let (resolved_to, resolved_desired_attributes) =
                 match resolve_resource(check_input, preparation).await {
                     Ok(r) => r,
-                    Err(e) => {
+                    Err(failure) => {
                         return StartedBasicEffectResult::new(
                             started_effect,
                             started,
                             BasicEffectResult::Failure {
-                                error: e,
+                                failure,
                                 refresh: None,
                             },
                         );
@@ -1083,12 +1051,11 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let schema = match managed_update_schema(preparation.schemas(), resolved_resource) {
                 Ok(schema) => schema,
                 Err(error) => {
-                    let error = error.to_string();
                     return StartedBasicEffectResult::new(
                         started_effect,
                         started,
                         BasicEffectResult::Failure {
-                            error,
+                            failure: EffectFailureKind::execution(error),
                             refresh: None,
                         },
                     );
@@ -1108,7 +1075,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         started_effect,
                         started,
                         BasicEffectResult::Failure {
-                            error: error.to_string(),
+                            failure: EffectFailureKind::provider(error),
                             refresh: None,
                         },
                     );
@@ -1167,7 +1134,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         started_effect,
                         started,
                         BasicEffectResult::Failure {
-                            error: error.to_string(),
+                            failure: EffectFailureKind::execution(error),
                             refresh: None,
                         },
                     );
@@ -1207,13 +1174,10 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         }
                     }
                 }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    BasicEffectResult::Failure {
-                        error: error_str,
-                        refresh: Some((id.clone(), identifier.clone())),
-                    }
-                }
+                Err(error) => BasicEffectResult::Failure {
+                    failure: EffectFailureKind::provider(error),
+                    refresh: Some((id.clone(), identifier.clone())),
+                },
             }
         }
         BasicEffect::Delete {
@@ -1236,16 +1200,13 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         identifier.to_string(),
                     ),
                 },
-                Err(e) => {
-                    let error_str = e.to_string();
-                    BasicEffectResult::Failure {
-                        error: error_str,
-                        refresh: match generation {
-                            EffectGeneration::Current => Some((id.clone(), identifier.clone())),
-                            EffectGeneration::Deposed(_) => None,
-                        },
-                    }
-                }
+                Err(error) => BasicEffectResult::Failure {
+                    failure: EffectFailureKind::provider(error),
+                    refresh: match generation {
+                        EffectGeneration::Current => Some((id.clone(), identifier.clone())),
+                        EffectGeneration::Deposed(_) => None,
+                    },
+                },
             }
         }
     };
@@ -1263,7 +1224,7 @@ mod process_basic_result_tests {
     fn empty_execution_result() -> ExecutionResult {
         ExecutionResult {
             success_count: 0,
-            failure_count: 0,
+            failures: super::super::FailureSink::default(),
             partial_count: 0,
             partial_diagnostics: Vec::new(),
             skip_count: 0,
@@ -1346,23 +1307,31 @@ mod process_basic_result_tests {
             pending_refreshes: &mut pending_refreshes,
         };
 
-        process_basic_outcome(
-            BasicEffectResult::PartialSuccess {
-                completed: CompletedEffect {
-                    state: Box::new(writeback_state),
-                    request: AcceptedRequest::create_for_test(),
+        let effect = Effect::Create(crate::resource::ResolvedResource::new(resource));
+        process_basic_result(
+            StartedBasicEffectResult::new(
+                super::super::wait::started_effect_for_test(
+                    &super::super::NoopExecutionObserver,
+                    &effect,
+                ),
+                Instant::now(),
+                BasicEffectResult::PartialSuccess {
+                    completed: CompletedEffect {
+                        state: Box::new(writeback_state),
+                        request: AcceptedRequest::create_for_test(),
+                    },
+                    resource_id: id.clone(),
+                    diagnostic: diagnostic.clone(),
+                    resolved_attrs: None::<SecretPreservingAttributes>,
+                    binding: None,
                 },
-                resource_id: id.clone(),
-                diagnostic: diagnostic.clone(),
-                resolved_attrs: None::<SecretPreservingAttributes>,
-                binding: None,
-            },
+            ),
             &mut exec,
         );
 
         let result = accumulator.result();
         assert_eq!(result.success_count, 0);
-        assert_eq!(result.failure_count, 0);
+        assert_eq!(result.failure_count(), 0);
         assert_eq!(result.partial_count, 1);
         assert_eq!(result.partial_diagnostics, vec![(id.clone(), diagnostic)]);
         let applied = accumulator
@@ -1462,7 +1431,10 @@ mod assert_fully_resolved_tests {
         ));
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("Unknown must be rejected at apply seam");
-        assert!(err.contains("value is not yet known"), "got: {err}");
+        assert!(
+            err.to_string().contains("value is not yet known"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1472,8 +1444,8 @@ mod assert_fully_resolved_tests {
         });
         let err = assert_fully_resolved(&v, "password", &empty_bindings())
             .expect_err("saved-plan placeholder must be rejected before provider dispatch");
-        assert!(err.contains("not rehydrated"), "got: {err}");
-        assert!(err.contains("new saved plan"), "got: {err}");
+        assert!(err.to_string().contains("not rehydrated"), "got: {err}");
+        assert!(err.to_string().contains("new saved plan"), "got: {err}");
     }
 
     #[test]
@@ -1481,11 +1453,12 @@ mod assert_fully_resolved_tests {
         let err = assert_fully_resolved(&dvo_chained_ref(), "name", &empty_bindings())
             .expect_err("direct ResourceRef must be rejected at apply seam");
         assert!(
-            err.contains("cert.domain_validation_options[0].resource_record_value"),
+            err.to_string()
+                .contains("cert.domain_validation_options[0].resource_record_value"),
             "error must name the unresolved path; got: {err}",
         );
         assert!(
-            err.contains("wait"),
+            err.to_string().contains("wait"),
             "error must point at `wait` as the workaround; got: {err}",
         );
     }
@@ -1497,7 +1470,10 @@ mod assert_fully_resolved_tests {
         let v = Value::Concrete(ConcreteValue::List(vec![dvo_chained_ref()]));
         let err = assert_fully_resolved(&v, "resource_records", &empty_bindings())
             .expect_err("list-wrapped ResourceRef must be rejected");
-        assert!(err.contains("resource_record_value"), "got: {err}");
+        assert!(
+            err.to_string().contains("resource_record_value"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1510,7 +1486,10 @@ mod assert_fully_resolved_tests {
             &empty_bindings(),
         )
         .expect_err("map-wrapped ResourceRef must be rejected");
-        assert!(err.contains("resource_record_value"), "got: {err}");
+        assert!(
+            err.to_string().contains("resource_record_value"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1521,7 +1500,10 @@ mod assert_fully_resolved_tests {
         let v = Value::Deferred(DeferredValue::Secret(Box::new(dvo_chained_ref())));
         let err = assert_fully_resolved(&v, "password", &empty_bindings())
             .expect_err("Secret wrapping does not exempt unresolved refs");
-        assert!(err.contains("resource_record_value"), "got: {err}");
+        assert!(
+            err.to_string().contains("resource_record_value"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1531,8 +1513,8 @@ mod assert_fully_resolved_tests {
         });
         let err = assert_fully_resolved(&v, "vpc_id", &empty_bindings())
             .expect_err("bare BindingRef must be rejected");
-        assert!(err.contains("vpc"), "got: {err}");
-        assert!(err.contains("wait"), "got: {err}");
+        assert!(err.to_string().contains("vpc"), "got: {err}");
+        assert!(err.to_string().contains("wait"), "got: {err}");
     }
 
     #[test]
@@ -1543,7 +1525,7 @@ mod assert_fully_resolved_tests {
         ]));
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("Interpolation that did not collapse must be rejected");
-        assert!(err.contains("interpolation"), "got: {err}");
+        assert!(err.to_string().contains("interpolation"), "got: {err}");
     }
 
     #[test]
@@ -1555,7 +1537,7 @@ mod assert_fully_resolved_tests {
         });
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("FunctionCall that did not evaluate must be rejected");
-        assert!(err.contains("concat"), "got: {err}");
+        assert!(err.to_string().contains("concat"), "got: {err}");
     }
 
     #[test]
@@ -1585,15 +1567,19 @@ mod assert_fully_resolved_tests {
         .unwrap();
 
         let error = resolve_ref_value(&value, &bindings)
+            .map_err(ReportedError::message)
             .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
             .expect_err("the apply path must reject the final computed list access");
 
         assert!(
-            error.contains("index 5 out of range for list of length 3"),
+            error
+                .to_string()
+                .contains("index 5 out of range for list of length 3"),
             "unexpected apply error: {error}"
         );
         assert!(
-            !error.contains("did not fully resolve") && !error.contains("wait"),
+            !error.to_string().contains("did not fully resolve")
+                && !error.to_string().contains("wait"),
             "a concrete range failure must not use unresolved/wait wording: {error}"
         );
     }
@@ -1620,16 +1606,19 @@ mod assert_fully_resolved_tests {
             .expect_err("ResourceRef against unpublished upstream_state must be rejected");
 
         assert!(
-            !err.contains("Add a `wait` block")
-                && !err.contains("add a `wait` block on the upstream binding"),
+            !err.to_string().contains("Add a `wait` block")
+                && !err
+                    .to_string()
+                    .contains("add a `wait` block on the upstream binding"),
             "upstream_state remediation must not suggest a `wait` block; got: {err}",
         );
         assert!(
-            err.contains("upstream_state") && err.contains("Apply the upstream stack first"),
+            err.to_string().contains("upstream_state")
+                && err.to_string().contains("Apply the upstream stack first"),
             "upstream_state remediation must name `upstream_state` and tell the user to apply the upstream stack first; got: {err}",
         );
         assert!(
-            err.contains("infra"),
+            err.to_string().contains("infra"),
             "error must name the upstream binding; got: {err}",
         );
     }
@@ -1651,12 +1640,15 @@ mod assert_fully_resolved_tests {
             .expect_err("Interpolation containing upstream_state ref must be rejected");
 
         assert!(
-            !err.contains("Add a `wait` block")
-                && !err.contains("add a `wait` block on the upstream"),
+            !err.to_string().contains("Add a `wait` block")
+                && !err
+                    .to_string()
+                    .contains("add a `wait` block on the upstream"),
             "interpolation-with-upstream_state must not suggest `wait`; got: {err}",
         );
         assert!(
-            err.contains("upstream_state") && err.contains("Apply the upstream stack first"),
+            err.to_string().contains("upstream_state")
+                && err.to_string().contains("Apply the upstream stack first"),
             "upstream_state remediation expected; got: {err}",
         );
     }
@@ -1676,9 +1668,13 @@ mod assert_fully_resolved_tests {
 
         let error = assert_fully_resolved(&value, "port", &bindings)
             .expect_err("unresolved arithmetic must fail before provider dispatch");
-        assert!(error.contains("infra"), "binding must be named: {error}");
         assert!(
-            error.contains("upstream_state") && error.contains("Apply the upstream stack first"),
+            error.to_string().contains("infra"),
+            "binding must be named: {error}"
+        );
+        assert!(
+            error.to_string().contains("upstream_state")
+                && error.to_string().contains("Apply the upstream stack first"),
             "upstream remediation must be selected: {error}"
         );
     }
@@ -1697,12 +1693,14 @@ mod assert_fully_resolved_tests {
             .expect_err("BindingRef against upstream_state binding must be rejected");
 
         assert!(
-            !err.contains("Add a `wait` block")
-                && !err.contains("add a `wait` block on the upstream"),
+            !err.to_string().contains("Add a `wait` block")
+                && !err
+                    .to_string()
+                    .contains("add a `wait` block on the upstream"),
             "upstream_state BindingRef must not suggest `wait`; got: {err}",
         );
         assert!(
-            err.contains("upstream_state"),
+            err.to_string().contains("upstream_state"),
             "remediation must name `upstream_state`; got: {err}",
         );
     }
@@ -1735,11 +1733,12 @@ mod assert_fully_resolved_tests {
             .expect_err("Interpolation with unresolved upstream ref must be rejected");
 
         assert!(
-            err.contains("upstream_state") && err.contains("Apply the upstream stack first"),
+            err.to_string().contains("upstream_state")
+                && err.to_string().contains("Apply the upstream stack first"),
             "mixed-binding remediation must point at upstream_state; got: {err}",
         );
         assert!(
-            err.contains("infra"),
+            err.to_string().contains("infra"),
             "remediation must name the upstream binding (`infra`); got: {err}",
         );
     }
@@ -1758,11 +1757,11 @@ mod assert_fully_resolved_tests {
             .expect_err("Local ResourceRef must still be rejected with wait hint");
 
         assert!(
-            err.contains("wait"),
+            err.to_string().contains("wait"),
             "local-binding error must still mention `wait`; got: {err}",
         );
         assert!(
-            !err.contains("upstream_state"),
+            !err.to_string().contains("upstream_state"),
             "local-binding error must not invoke upstream_state wording; got: {err}",
         );
     }

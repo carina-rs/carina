@@ -116,7 +116,7 @@ fn handle_event<S>(
         }
         ExecutionEvent::EffectFailed {
             effect,
-            error,
+            failure,
             recovery,
             duration,
             progress,
@@ -124,7 +124,7 @@ fn handle_event<S>(
             let key = EffectProgressKey::new(effect);
             let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
-            let mut details = vec![error.to_string()];
+            let mut details = vec![failure.to_string()];
             if let Some(recovery) = recovery {
                 details.push(recovery.display_with_project_dir(project_dir).to_string());
             }
@@ -189,11 +189,18 @@ fn handle_event<S>(
             progress_backend.outcome_line(NonFailureOutcome::success(format!("Refresh {id}")));
         }
         ExecutionEvent::RefreshFailed { id, error } => {
-            progress_backend.info_line(format!("{} Refresh {} - {}", "!".yellow(), id, error));
+            progress_backend.info_line(format!(
+                "{} Refresh {} - {}",
+                "!".yellow(),
+                id,
+                carina_core::executor::render_error_chain(*error)
+            ));
         }
-        ExecutionEvent::ModuleConstraintFailed { error } => {
-            progress_backend
-                .failed_line(FailedOutcome::new("Module constraint", [error.to_string()]));
+        ExecutionEvent::ModuleConstraintFailed { failure } => {
+            progress_backend.failed_line(FailedOutcome::new(
+                "Module constraint",
+                [failure.to_string()],
+            ));
         }
     }
 }
@@ -658,9 +665,13 @@ mod tests {
     #[test]
     fn plain_failed_includes_error_on_second_line() {
         let effect = dummy_create_effect();
+        let failure = carina_core::executor::EffectFailure::new(
+            &effect,
+            carina_core::executor::EffectFailureKind::message("boom"),
+        );
         let output = plain_output(&ExecutionEvent::EffectFailed {
             effect: &effect,
-            error: "boom",
+            failure: &failure,
             recovery: None,
             duration: Duration::from_millis(50),
             progress: ProgressInfo {
@@ -684,10 +695,14 @@ mod tests {
         let effect = dummy_create_effect();
         let recovery =
             carina_core::plan::PlanError::create_outcome_unknown(effect.resource_id().clone());
+        let failure = carina_core::executor::EffectFailure::new(
+            &effect,
+            carina_core::executor::EffectFailureKind::message("guest call timed out"),
+        );
         let output = plain_output_at(
             &ExecutionEvent::EffectFailed {
                 effect: &effect,
-                error: "guest call timed out",
+                failure: &failure,
                 recovery: Some(&recovery),
                 duration: Duration::from_millis(50),
                 progress: ProgressInfo {

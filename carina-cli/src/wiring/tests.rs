@@ -8298,7 +8298,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         ExecutionOutcome::Completed(result) => result,
         ExecutionOutcome::Cancelled(_) => panic!("test plan should not be cancelled"),
     };
-    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.failure_count(), 0);
 
     let create_calls = provider.create_calls();
     let subnet_call = create_calls

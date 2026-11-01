@@ -20,6 +20,10 @@ use carina_core::effect::deps::{
     build_effect_dependency_analysis,
 };
 use carina_core::effect::{Effect, EffectGeneration};
+use carina_core::executor::{
+    EffectFailure, EffectFailureKind, ExecutionEvent, ExecutionObserver, FailureEventContext,
+    FailureReport, FailureSink, ProgressInfo, classify_stalled_effects as classify_destroy_stall,
+};
 use carina_core::parser::WaitBinding;
 use carina_core::plan::{Plan, PlanError};
 use carina_core::provider::Provider;
@@ -207,11 +211,59 @@ struct DestroyExecuted {
     state_base: FinalStateBase,
     destroyed_instances: Vec<DestroyedInstance>,
     success_count: usize,
-    failure_count: usize,
+    failures: FailureSink,
     skip_count: usize,
     unknown_count: usize,
     cancelled: bool,
     cancel: ShutdownToken,
+}
+
+fn record_destroy_failure<S>(
+    failures: &mut FailureSink,
+    effect: &Effect<S>,
+    kind: EffectFailureKind,
+    render: impl FnOnce(&EffectFailure) + Send,
+) {
+    struct Renderer<F>(std::sync::Mutex<Option<F>>);
+    impl<S, F: FnOnce(&EffectFailure) + Send> ExecutionObserver<S> for Renderer<F> {
+        fn on_event(&self, event: &ExecutionEvent<'_, S>) {
+            if let ExecutionEvent::EffectFailed { failure, .. } = event {
+                self.0
+                    .lock()
+                    .expect("destroy failure observer poisoned")
+                    .take()
+                    .expect("one failure event")(failure);
+            }
+        }
+    }
+    failures.record(
+        &Renderer(std::sync::Mutex::new(Some(render))),
+        FailureReport::Effect {
+            effect,
+            kind,
+            context: FailureEventContext {
+                recovery: None,
+                duration: std::time::Duration::ZERO,
+                progress: ProgressInfo {
+                    completed: 0,
+                    total: 0,
+                },
+            },
+        },
+    );
+}
+
+fn destroy_execution_error(
+    success_count: usize,
+    failures: &[EffectFailure],
+    skip_count: usize,
+    unknown_count: usize,
+) -> AppError {
+    crate::error::ExecutionFailureReport::new(
+        format_destroy_failure_summary(success_count, failures.len(), skip_count, unknown_count),
+        failures,
+    )
+    .into()
 }
 
 struct DestroyedInstances {
@@ -832,7 +884,7 @@ async fn run_destroy_locked_owned(
     let progress = ProgressBackend::new(ProgressSink::Human);
 
     let mut success_count = 0;
-    let mut failure_count = 0;
+    let mut failures = FailureSink::default();
     let mut skip_count = 0;
     let mut unknown_count = 0;
     let saver = IncrementalStateSaver::start(
@@ -1036,33 +1088,44 @@ async fn run_destroy_locked_owned(
             if all_retried {
                 for &idx in &remaining {
                     let (_, effect) = &resource_info[idx];
+                    record_destroy_failure(
+                        &mut failures,
+                        effect,
+                        EffectFailureKind::message(
+                            "destroy retries exhausted (no progress possible)",
+                        ),
+                        |failure| {
+                            let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
+                                &completed_counter,
+                                destroy_total,
+                                effect,
+                                format!("- {failure}"),
+                            ));
+                            progress.failed_line(outcome);
+                        },
+                    );
+                    failed_indices.insert(idx);
+                    dispatched.insert(idx);
+                    completed_indices.insert(idx);
+                }
+                break;
+            }
+            // Non-retry cycle: retain one shared cycle and attribute every
+            // remaining effect to it instead of silently counting failures.
+            let effects = resource_info.iter().map(|(_, effect)| effect.clone()).collect::<Vec<_>>();
+            for (idx, kind) in classify_destroy_stall(&effects, &deletion_deps, &remaining.into_iter().collect(), &completed_indices) {
+                let (_, effect) = &resource_info[idx];
+                record_destroy_failure(&mut failures, effect, kind, |failure| {
                     let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
                         &completed_counter,
                         destroy_total,
                         effect,
-                        "- retries exhausted (no progress possible)",
+                        format!("- {failure}"),
                     ));
                     progress.failed_line(outcome);
-                    failed_indices.insert(idx);
-                    dispatched.insert(idx);
-                    completed_indices.insert(idx);
-                    failure_count += 1;
-                }
-                break;
-            }
-            // Non-retry cycle: fail every remaining outcome.
-            for &idx in &remaining {
-                let (_, effect) = &resource_info[idx];
-                let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
-                    &completed_counter,
-                    destroy_total,
-                    effect,
-                    "- dependency cycle (no progress possible)",
-                ));
-                progress.failed_line(outcome);
+                });
                 dispatched.insert(idx);
                 completed_indices.insert(idx);
-                failure_count += 1;
             }
             break;
         }
@@ -1148,17 +1211,23 @@ async fn run_destroy_locked_owned(
                     active_progress.finish(outcome);
                 } else {
                     let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
-                    let outcome = FailedOutcome::new(
-                        format_destroy_outcome_summary(
-                            &completed_counter,
-                            destroy_total,
-                            effect,
-                            timing,
-                        ),
-                        [e.to_string()],
+                    record_destroy_failure(
+                        &mut failures,
+                        effect,
+                        EffectFailureKind::provider(e),
+                        |failure| {
+                            let outcome = FailedOutcome::new(
+                                format_destroy_outcome_summary(
+                                    &completed_counter,
+                                    destroy_total,
+                                    effect,
+                                    timing,
+                                ),
+                                [failure.to_string()],
+                            );
+                            active_progress.finish_failed(outcome);
+                        },
                     );
-                    active_progress.finish_failed(outcome);
-                    failure_count += 1;
                     failed_indices.insert(finished_idx);
                 }
             }
@@ -1215,7 +1284,7 @@ async fn run_destroy_locked_owned(
         state_base,
         destroyed_instances,
         success_count,
-        failure_count,
+        failures,
         skip_count,
         unknown_count,
         cancelled,
@@ -1244,12 +1313,13 @@ async fn run_destroy_locked_owned(
                     state_base,
                     destroyed_instances,
                     success_count,
-                    failure_count,
+                    failures,
                     skip_count,
                     unknown_count,
                     cancelled,
                     cancel,
                 } = *context;
+                let failure_count = failures.failures().len();
                 if cancelled && destroyed_instances.is_empty() {
                     println!();
                     println!(
@@ -1314,12 +1384,12 @@ async fn run_destroy_locked_owned(
                     );
                     Ok(())
                 } else {
-                    Err(AppError::Config(format_destroy_failure_summary(
+                    Err(destroy_execution_error(
                         success_count,
-                        failure_count,
+                        failures.failures(),
                         skip_count,
                         unknown_count,
-                    )))
+                    ))
                 }
             }
         }
@@ -2075,6 +2145,66 @@ mod tests {
     mod cancellation_fixture;
 
     use cancellation_fixture::DestroyCancellationFixture;
+
+    #[test]
+    fn destroy_stall_matches_apply_scc_and_no_progress_classification() {
+        let effects = ["first", "second", "blocked", "external"].map(|name| {
+            Effect::Create(carina_core::resource::ResolvedResource::new(
+                carina_core::resource::Resource::new("test.resource", name),
+            ))
+        });
+        for (dependencies, remaining) in [
+            (
+                HashMap::from([
+                    (0, HashSet::from([1])),
+                    (1, HashSet::from([0])),
+                    (2, HashSet::from([0])),
+                ]),
+                HashSet::from([0, 1, 2]),
+            ),
+            (HashMap::from([(2, HashSet::from([3]))]), HashSet::from([2])),
+        ] {
+            let completed = HashSet::new();
+            let apply = carina_core::executor::classify_stalled_effects(
+                &effects,
+                &dependencies,
+                &remaining,
+                &completed,
+            );
+            let destroy = classify_destroy_stall(&effects, &dependencies, &remaining, &completed);
+            let render = |failures: Vec<(usize, EffectFailureKind)>| {
+                failures
+                    .into_iter()
+                    .map(|(idx, kind)| (idx, format!("{kind:?}")))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(render(destroy), render(apply));
+        }
+    }
+
+    #[test]
+    fn destroy_final_error_retains_failed_endpoint_and_source() {
+        let effect: Effect = Effect::Create(carina_core::resource::ResolvedResource::new(
+            carina_core::resource::Resource::new("test.resource", "failed"),
+        ));
+        let failure = EffectFailure::new(
+            &effect,
+            EffectFailureKind::provider_with_context(
+                "delete context",
+                std::io::Error::other("root detail"),
+            ),
+        );
+        let error = destroy_execution_error(0, &[failure], 0, 0);
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("create test.resource.failed") && rendered.contains("root detail"),
+            "{rendered}"
+        );
+        let AppError::ExecutionFailed(report) = error else {
+            panic!("destroy failures must remain typed");
+        };
+        assert_eq!(report.failures().len(), 1);
+    }
 
     #[derive(Clone, Default)]
     struct SharedProgressWriter(Arc<Mutex<Vec<u8>>>);
