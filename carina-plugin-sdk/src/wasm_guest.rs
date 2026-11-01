@@ -698,6 +698,18 @@ macro_rules! __carina_egress_json {
     };
 }
 
+/// Generate provider bindings from Carina's single canonical WIT path.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __carina_wit_bindgen {
+    ({ $($bindgen:tt)* }) => {
+        wit_bindgen::generate!({
+            path: "../carina-plugin-wit/wit",
+            $($bindgen)*
+        });
+    };
+}
+
 /// Macro to export a `CarinaProvider` implementation as a WASM component.
 ///
 /// This macro generates wit-bindgen bindings in the consumer crate and implements
@@ -709,11 +721,19 @@ macro_rules! __carina_egress_json {
 /// #[cfg(target_arch = "wasm32")]
 /// carina_plugin_sdk::export_provider!(MyProvider);
 ///
-/// // HTTP-capable provider (e.g., AWS provider)
+/// // Generic HTTP-capable provider
 /// #[cfg(target_arch = "wasm32")]
 /// carina_plugin_sdk::export_provider!(
 ///     MyProvider,
 ///     http,
+///     egress: ["**.amazonaws.com", "**.amazonaws.com.cn"],
+/// );
+///
+/// // AWS-kind provider with host-resolved credentials and HTTP
+/// #[cfg(target_arch = "wasm32")]
+/// carina_plugin_sdk::export_provider!(
+///     MyProvider,
+///     aws,
 ///     egress: ["**.amazonaws.com", "**.amazonaws.com.cn"],
 /// );
 /// ```
@@ -721,9 +741,8 @@ macro_rules! __carina_egress_json {
 macro_rules! export_provider {
     ($provider_type:ty) => {
         $crate::export_provider!(@internal $provider_type, {
-            path: "../carina-plugin-wit/wit",
             world: "carina-provider",
-        });
+        }, {});
     };
     ($provider_type:ty, http, egress: [$($host:literal),* $(,)?] $(,)?) => {
         const _: () = {
@@ -738,7 +757,6 @@ macro_rules! export_provider {
             $crate::wasm_guest::egress_json_bytes($crate::__carina_egress_json!($($host),*));
 
         $crate::export_provider!(@internal $provider_type, {
-            path: "../carina-plugin-wit/wit",
             world: "carina-provider-with-http",
             with: {
                 "wasi:io/poll@0.2.6": ::wasi::io::poll,
@@ -748,13 +766,48 @@ macro_rules! export_provider {
                 "wasi:http/types@0.2.6": ::wasi::http::types,
                 "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
             },
+        }, {});
+    };
+    ($provider_type:ty, aws, egress: [$($host:literal),* $(,)?] $(,)?) => {
+        const _: () = {
+            $(
+                $crate::wasm_guest::assert_egress_pattern_structure($host);
+            )*
+        };
+
+        #[used]
+        #[unsafe(link_section = "carina:egress")]
+        static __CARINA_EGRESS_DECLARATION: [u8; $crate::__carina_egress_json!($($host),*).len()] =
+            $crate::wasm_guest::egress_json_bytes($crate::__carina_egress_json!($($host),*));
+
+        $crate::export_provider!(@internal $provider_type, {
+            world: "carina-provider-aws",
+            with: {
+                "wasi:io/poll@0.2.6": ::wasi::io::poll,
+                "wasi:io/error@0.2.6": ::wasi::io::error,
+                "wasi:io/streams@0.2.6": ::wasi::io::streams,
+                "wasi:clocks/monotonic-clock@0.2.6": ::wasi::clocks::monotonic_clock,
+                "wasi:http/types@0.2.6": ::wasi::http::types,
+                "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
+            },
+        }, {
+            // Keep the AWS-world import in the component even when the
+            // provider never calls it. The host uses the import itself as the
+            // type-safe proof that an AWS-kind provider selected this world.
+            #[used]
+            static __CARINA_AWS_CREDENTIALS_IMPORT: fn() =
+                __carina_keep_aws_credentials_import;
+
+            fn __carina_keep_aws_credentials_import() {
+                let _ = carina::provider::aws_credentials::current_credentials();
+            }
         });
     };
-    (@internal $provider_type:ty, { $($bindgen:tt)* }) => {
+    (@internal $provider_type:ty, { $($bindgen:tt)* }, { $($world_items:item)* }) => {
         mod __carina_wasm_guest {
-            wit_bindgen::generate!({
-                $($bindgen)*
-            });
+            $crate::__carina_wit_bindgen!({ $($bindgen)* });
+
+            $($world_items)*
 
             use super::*;
             use $crate::types as proto;

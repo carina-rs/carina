@@ -3175,11 +3175,6 @@ impl PendingCallEgress {
         self.settle();
     }
 
-    /// Record that this request did not leave the host.
-    pub fn not_dispatched(mut self) {
-        self.settle();
-    }
-
     fn settle(&mut self) {
         if self.settled {
             return;
@@ -8183,7 +8178,7 @@ mod tests {
             !classification.is_finished(),
             "classification must wait for the host's dispatch decision"
         );
-        pending.not_dispatched();
+        drop(pending);
 
         let failure = classification.await.expect("classification task");
         let CreateFailureKind::Untracked(error) = failure.into_kind() else {
@@ -8205,6 +8200,18 @@ mod tests {
         };
         assert_eq!(unknown.id(), &id);
         assert_eq!(error.to_string(), "returned value could not be decoded");
+
+        let pending_id = ResourceId::with_provider_identity("test", "widget", "pending", None);
+        let (attempt, receiver) = CreateAttempt::new(pending_id.clone());
+        let started = attempt.start_guest_call();
+        let pending = started.egress_recorder().begin_request();
+        drop(started);
+        let reports = receiver.drain();
+        let [CancelledCreateReport::OutcomeUnknown(unknown)] = reports.as_slice() else {
+            panic!("a dropped call with an unresolved dispatch must report one unknown outcome")
+        };
+        assert_eq!(unknown.id(), &pending_id);
+        drop(pending);
     }
 
     #[test]
@@ -8227,18 +8234,6 @@ mod tests {
             receiver.drain().as_slice(),
             [CancelledCreateReport::Untracked]
         ));
-
-        let pending_id = ResourceId::with_provider_identity("test", "widget", "pending", None);
-        let (attempt, receiver) = CreateAttempt::new(pending_id.clone());
-        let started = attempt.start_guest_call();
-        let pending = started.egress_recorder().begin_request();
-        drop(started);
-        let reports = receiver.drain();
-        let [CancelledCreateReport::OutcomeUnknown(unknown)] = reports.as_slice() else {
-            panic!("a dropped call with an unresolved dispatch must report one unknown outcome")
-        };
-        assert_eq!(unknown.id(), &pending_id);
-        pending.not_dispatched();
     }
 
     #[test]

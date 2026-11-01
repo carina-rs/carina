@@ -1337,7 +1337,6 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
                     parser::DeferredIfBody::Resource(resource) => Some(resource.id.clone()),
                     parser::DeferredIfBody::DataSource(data_source) => Some(data_source.id.clone()),
                     parser::DeferredIfBody::ModuleCall(_) => None,
-                    parser::DeferredIfBody::ExpandedModuleCall(_) => None,
                 }),
         )
         .collect::<Vec<_>>();
@@ -1385,7 +1384,6 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
                         origin.set_display_file(&display_file);
                     }
                 }
-                parser::DeferredIfBody::ExpandedModuleCall(_) => {}
             }
         }
     }

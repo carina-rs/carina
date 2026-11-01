@@ -2017,7 +2017,6 @@ fn select_deferred_module_ifs(
     let mut contribution = ParsedFile::default();
     let mut forwarded = Vec::new();
     let mut selected_bindings = HashSet::new();
-    let mut nested_dropped = HashMap::new();
     for deferred in &module.deferred_module_ifs {
         let condition = resolve_module_value(deferred.condition().value(), resolver)
             .map_err(|error| error.with_source_file(deferred.condition().source_file()))?;
@@ -2075,19 +2074,10 @@ fn select_deferred_module_ifs(
                 contribution.data_sources.push((**data_source).clone());
             }
             DeferredIfBody::ModuleCall(call) => contribution.module_calls.push(call.clone()),
-            DeferredIfBody::ExpandedModuleCall(prepared) => {
-                let mut prepared = prepared.as_ref().clone();
-                let nested = select_deferred_module_ifs(&prepared, module_call, resolver)?;
-                prepared.deferred_module_ifs.clear();
-                prepared.merge_from(nested.contribution);
-                contribution.merge_from(prepared);
-                forwarded.extend(nested.forwarded);
-                nested_dropped.extend(nested.dropped);
-            }
         }
     }
 
-    let mut dropped = origins
+    let dropped = origins
         .into_iter()
         .filter(|(binding, _origin)| !selected_bindings.contains(binding))
         .map(|(binding, origin)| {
@@ -2095,7 +2085,6 @@ fn select_deferred_module_ifs(
             (absolute, (binding, origin))
         })
         .collect::<HashMap<_, _>>();
-    dropped.extend(nested_dropped);
     Ok(SelectedDeferredIfs {
         contribution,
         forwarded,
@@ -2118,15 +2107,6 @@ fn expand_forwarded_if_body(
         DeferredIfBody::ModuleCall(call) => Ok(DeferredIfBody::ModuleCall(
             resolve_nested_module_call(call, resolver)?,
         )),
-        DeferredIfBody::ExpandedModuleCall(contribution) => {
-            let contribution = contribution
-                .as_ref()
-                .clone()
-                .resolve_bindings(&mut |binding| resolver.scope.resolve(binding));
-            Ok(DeferredIfBody::ExpandedModuleCall(std::sync::Arc::new(
-                contribution,
-            )))
-        }
     }
 }
 

@@ -48,6 +48,22 @@ fn root_resource_ref(binding: &str, attribute: &str) -> carina_core::resource::V
         .resolve_root_for_test()
 }
 
+struct UnusedAwsCredentialProvisioner;
+
+impl carina_plugin_host::AwsCredentialProvisioner for UnusedAwsCredentialProvisioner {
+    fn provision(
+        &self,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            Arc<dyn carina_plugin_host::AwsCredentialSource>,
+            carina_plugin_host::AwsCredentialError,
+        >,
+    > {
+        Box::pin(async { panic!("an untrusted test provider must not provision AWS credentials") })
+    }
+}
+
 fn validate_with_test_factories(
     parsed: &carina_core::parser::InferredFile,
     base_dir: &Path,
@@ -443,6 +459,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             fresh_verified,
             cache.path(),
             Some(&locked_egress),
+            &UnusedAwsCredentialProvisioner,
         )
         .await
         .expect("load mock HTTP WASM provider")
@@ -518,6 +535,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             replacement_verified,
             cache.path(),
             Some(&locked_egress),
+            &UnusedAwsCredentialProvisioner,
         )
         .await
         .expect("load replacement mock HTTP WASM provider")

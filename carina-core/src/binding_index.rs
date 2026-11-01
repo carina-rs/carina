@@ -647,19 +647,6 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                             });
                     }
                 }
-                DeferredIfBody::ExpandedModuleCall(contribution) => {
-                    for composition in &contribution.compositions {
-                        let Some(binding_name) = composition.binding.as_ref() else {
-                            continue;
-                        };
-                        known_names.insert(binding_name.to_string());
-                        entries
-                            .entry(binding_name.to_string())
-                            .or_insert(BindingEntry {
-                                target: BindingTarget::LiveComposition(composition),
-                            });
-                    }
-                }
             }
         }
         // Module-call bindings expose the imported module's declared output

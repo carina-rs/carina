@@ -6,14 +6,13 @@
 //! state.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, DataSource, ModuleSource, ParserPlaceholder,
     PlaceholderKind, RelativeBindingName, Resource, Value,
 };
 
-use super::{File, ModuleCall, ParsedDeferredForPhase, ParsedExportParam};
+use super::ModuleCall;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredIfCondition<
@@ -212,9 +211,6 @@ impl<P: PlaceholderKind, B: BindingAddress> DeferredStructuralIf<P, B> {
     }
 }
 
-type ExpandedModuleCallFile<P, B> =
-    File<ParsedExportParam<P, B>, P, P, ParsedDeferredForPhase<P, B>, B>;
-
 #[derive(Debug, Clone)]
 pub enum DeferredIfBody<
     P: PlaceholderKind = ParserPlaceholder,
@@ -223,10 +219,6 @@ pub enum DeferredIfBody<
     Resource(Box<Resource<ModuleSource, P, B>>),
     DataSource(Box<DataSource<ModuleSource, P, B>>),
     ModuleCall(ModuleCall<P, B>),
-    /// Resolver-prepared nested call contribution. Parsing only constructs
-    /// `ModuleCall`; nested-module resolution replaces it with this form
-    /// while the callee's binding/type scope is still available.
-    ExpandedModuleCall(Arc<ExpandedModuleCallFile<P, B>>),
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> DeferredIfBody<P, B> {
@@ -235,10 +227,6 @@ impl<P: PlaceholderKind, B: BindingAddress> DeferredIfBody<P, B> {
             Self::Resource(resource) => resource.binding.as_ref(),
             Self::DataSource(data_source) => data_source.binding.as_ref(),
             Self::ModuleCall(call) => call.binding_name.as_ref(),
-            Self::ExpandedModuleCall(contribution) => contribution
-                .compositions
-                .iter()
-                .find_map(|composition| composition.binding.as_ref()),
         }
     }
 
@@ -288,11 +276,6 @@ impl<P: PlaceholderKind> DeferredIfBody<P, RelativeBindingName> {
                 DeferredIfBody::DataSource(Box::new(data_source.resolve_bindings(resolve)))
             }
             Self::ModuleCall(call) => DeferredIfBody::ModuleCall(call.resolve_bindings(resolve)),
-            Self::ExpandedModuleCall(contribution) => {
-                let contribution = Arc::try_unwrap(contribution)
-                    .unwrap_or_else(|contribution| (*contribution).clone());
-                DeferredIfBody::ExpandedModuleCall(Arc::new(contribution.resolve_bindings(resolve)))
-            }
         }
     }
 }
@@ -319,9 +302,6 @@ impl<P: PlaceholderKind> DeferredIfBody<P, AbsoluteBindingAddress> {
             Self::Resource(resource) => resource.map_absolute_bindings(map),
             Self::DataSource(data_source) => data_source.map_absolute_bindings(map),
             Self::ModuleCall(call) => call.map_absolute_bindings(map),
-            Self::ExpandedModuleCall(contribution) => {
-                Arc::make_mut(contribution).map_absolute_bindings(map);
-            }
         }
     }
 }

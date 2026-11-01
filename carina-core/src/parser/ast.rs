@@ -5572,11 +5572,6 @@ impl<E, B: BindingAddress>
                         captured.push((data_source.id.clone(), data_source.attributes.clone()));
                     }
                     DeferredIfBody::ModuleCall(_) => {}
-                    DeferredIfBody::ExpandedModuleCall(contribution) => {
-                        for nested in &contribution.deferred_module_ifs {
-                            capture_deferred(nested, captured);
-                        }
-                    }
                 }
             }
         }
@@ -5682,7 +5677,6 @@ impl<E, B: BindingAddress>
                             origin.set_binding_scope(std::sync::Arc::clone(&binding_scope));
                         }
                     }
-                    DeferredIfBody::ExpandedModuleCall(_) => {}
                 }
             }
         }
@@ -6490,9 +6484,7 @@ where
                         DeferredIfBody::DataSource(data_source) => {
                             Some(ResourceRef::DataSource(data_source))
                         }
-                        DeferredIfBody::ModuleCall(_) | DeferredIfBody::ExpandedModuleCall(_) => {
-                            None
-                        }
+                        DeferredIfBody::ModuleCall(_) => None,
                     }),
             )
     }
@@ -6517,9 +6509,7 @@ where
                         DeferredIfBody::DataSource(data_source) => {
                             Some(ResourceMut::DataSource(data_source))
                         }
-                        DeferredIfBody::ModuleCall(_) | DeferredIfBody::ExpandedModuleCall(_) => {
-                            None
-                        }
+                        DeferredIfBody::ModuleCall(_) => None,
                     }),
             )
     }
@@ -6878,12 +6868,6 @@ fn collect_deferred_if_placeholders<B: BindingAddress>(
             }
             DeferredIfBody::ModuleCall(call) => {
                 collect_module_call_placeholders(call, policy, errors);
-            }
-            DeferredIfBody::ExpandedModuleCall(contribution) => {
-                errors.extend(leftover_placeholders(
-                    contribution.as_ref(),
-                    ParserPlaceholderBoundary::ModuleDefinition,
-                ));
             }
         }
     }

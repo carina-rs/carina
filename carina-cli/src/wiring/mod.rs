@@ -123,7 +123,7 @@ use carina_core::parser::{
 use carina_core::parser::{MovedAddresses, ParseWarning};
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
-    self as provider_mod, AppliedIdentifier, InitializedProvider, LiftedSavedAttrs,
+    self as provider_mod, AppliedIdentifier, BoxFuture, InitializedProvider, LiftedSavedAttrs,
     LoadedProviderSnapshot, NormalizerRouter, Provider, ProviderError, ProviderFactory,
     ProviderLoadedSchemaRegistry, ProviderNormalizer, ProviderRouter,
 };
@@ -1874,6 +1874,46 @@ enum ProviderFactoryNetwork {
     Runtime,
 }
 
+struct CliAwsCredentialProvisioner {
+    source: tokio::sync::OnceCell<Arc<dyn carina_plugin_host::AwsCredentialSource>>,
+}
+
+impl CliAwsCredentialProvisioner {
+    fn new() -> Self {
+        Self {
+            source: tokio::sync::OnceCell::new(),
+        }
+    }
+}
+
+impl carina_plugin_host::AwsCredentialProvisioner for CliAwsCredentialProvisioner {
+    fn provision(
+        &self,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            Arc<dyn carina_plugin_host::AwsCredentialSource>,
+            carina_plugin_host::AwsCredentialError,
+        >,
+    > {
+        Box::pin(async move {
+            let source = self
+                .source
+                .get_or_try_init(|| async {
+                    carina_credentials_aws::AwsSdkCredentialSource::new()
+                        .await
+                        .map(|source| {
+                            Arc::new(source) as Arc<dyn carina_plugin_host::AwsCredentialSource>
+                        })
+                })
+                .await?
+                .clone();
+            source.current().await?;
+            Ok(source)
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ProviderFactoryDiagnostic {
     LockConstraint(carina_provider_resolver::LockConstraintError),
@@ -2212,6 +2252,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
         TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
     let loader_user_dirs = user_dirs.clone();
     let loader_project_dir = base_dir.to_path_buf();
+    let aws = Arc::new(CliAwsCredentialProvisioner::new());
     build_factories_from_providers_impl_using(
         user_dirs,
         providers,
@@ -2221,6 +2262,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
         move |verified| {
             let user_dirs = loader_user_dirs.clone();
             let project_dir = loader_project_dir.clone();
+            let aws = Arc::clone(&aws);
             async move {
                 match network {
                     ProviderFactoryNetwork::SchemaOnly => {
@@ -2234,6 +2276,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
                             verified,
                             &user_dirs,
                             locked_egress.as_ref(),
+                            aws.as_ref(),
                         )
                         .await
                     }
@@ -2330,6 +2373,11 @@ where
                     Ok(unverified) => return Err(AppError::from(unverified)),
                     Err(error) => error,
                 };
+                if let Some(carina_plugin_host::WasmProviderLoadError::AwsCredentials(error)) =
+                    error.loader_error()
+                {
+                    return Err(crate::error::AwsCredentialStartupError::new(error.clone()).into());
+                }
                 if report_errors
                     && let Some(mismatch) =
                         source_provider_kind_mismatch_from_load_error(source, &error)
@@ -4178,6 +4226,9 @@ fn source_provider_kind_mismatch_from_load_error(
         | carina_plugin_host::WasmProviderLoadError::EgressLock(_)
         | carina_plugin_host::WasmProviderLoadError::EgressConsent(_)
         | carina_plugin_host::WasmProviderLoadError::Instantiation(_)
+        | carina_plugin_host::WasmProviderLoadError::AwsCredentials(_)
+        | carina_plugin_host::WasmProviderLoadError::AwsCredentialsImportMissing
+        | carina_plugin_host::WasmProviderLoadError::AwsCredentialsRequired
         | carina_plugin_host::WasmProviderLoadError::Metadata { .. }
         | carina_plugin_host::WasmProviderLoadError::Other(_) => None,
     }

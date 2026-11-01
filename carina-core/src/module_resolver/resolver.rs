@@ -1198,9 +1198,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             .flat_map(|deferred| deferred.branches())
             .filter_map(|branch| match branch {
                 DeferredIfBody::ModuleCall(call) => Some(call.clone()),
-                DeferredIfBody::Resource(_)
-                | DeferredIfBody::DataSource(_)
-                | DeferredIfBody::ExpandedModuleCall(_) => None,
+                DeferredIfBody::Resource(_) | DeferredIfBody::DataSource(_) => None,
             })
             .collect::<Vec<_>>();
 
