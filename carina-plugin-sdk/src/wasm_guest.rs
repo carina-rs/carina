@@ -1301,8 +1301,11 @@ macro_rules! export_provider {
             }
 
             enum CreateStepEncodeFailure {
-                /// Reuse the last decodable token on a poll. Without a prior
-                /// token or identifier, trap so the host uses its egress record.
+                /// A dispatched continuation failed token encoding. An
+                /// initial create without an identifier must trap so the host
+                /// classifies its per-call egress record; a poll can instead
+                /// reuse its last decodable token. Once an identifier exists,
+                /// the failure becomes `Created` plus `ReadFailed`.
                 PendingToken {
                     progress: wit_types::CreateProgress,
                     sent: wit_types::SentAttributes,
@@ -1336,56 +1339,83 @@ macro_rules! export_provider {
                             poll_after_secs: _poll_after_secs,
                             error,
                         } => match wit_create_identifier(progress) {
-                            Some(identifier) => wit_types::CreateVerdict::Created(wit_types::CreatedFailure {
-                                identifier,
-                                read: wit_types::Observation::ReadFailed(error.clone()),
-                                sent,
-                                error,
-                            }),
+                            Some(identifier) => {
+                                wit_types::CreateVerdict::Created(wit_types::CreatedFailure {
+                                    identifier,
+                                    read: wit_types::Observation::ReadFailed(error.clone()),
+                                    sent,
+                                    error,
+                                })
+                            }
                             None => panic!(
                                 "WASM boundary failed to encode a dispatched create continuation token without an identifier; refusing to report the create as untracked"
                             ),
                         },
-                        Self::CreatedAttributes(created) => wit_types::CreateVerdict::Created(created),
+                        Self::CreatedAttributes(created) => {
+                            wit_types::CreateVerdict::Created(created)
+                        }
                     }
                 }
 
-                fn into_poll_verdict(self, previous: wit_types::PendingCreate) -> wit_types::PollVerdict {
+                fn into_poll_verdict(
+                    self,
+                    previous: wit_types::PendingCreate,
+                ) -> wit_types::PollVerdict {
                     match self {
                         Self::PendingToken {
                             progress,
                             sent,
                             poll_after_secs,
                             error,
-                        } => wit_types::PollVerdict::InFlight(wit_types::CreateInFlight {
-                            pending: wit_types::PendingCreate {
-                                operation: wit_types::PendingOperation {
-                                    token: previous.operation.token,
-                                    poll_after_secs,
+                        } => {
+                            let wit_types::PendingCreate {
+                                operation,
+                                progress: _previous_progress,
+                                sent: _previous_sent,
+                            } = previous;
+                            let wit_types::PendingOperation {
+                                token,
+                                poll_after_secs: _previous_poll_after_secs,
+                            } = operation;
+                            wit_types::PollVerdict::InFlight(wit_types::CreateInFlight {
+                                pending: wit_types::PendingCreate {
+                                    operation: wit_types::PendingOperation {
+                                        token,
+                                        poll_after_secs,
+                                    },
+                                    progress,
+                                    sent,
                                 },
-                                progress,
-                                sent,
-                            },
-                            error,
-                        }),
-                        Self::CreatedAttributes(created) => wit_types::PollVerdict::Created(created),
+                                error,
+                            })
+                        }
+                        Self::CreatedAttributes(created) => {
+                            wit_types::PollVerdict::Created(created)
+                        }
                     }
                 }
             }
 
             enum ResumeStepEncodeFailure {
-                /// Reuse the last decodable token, retaining the new progress.
+                /// A resume reuses its last decodable token while retaining
+                /// any identifier and poll interval returned by this call.
                 PendingToken {
                     progress: wit_types::CreateProgress,
                     poll_after_secs: u32,
                     error: wit_types::ProviderError,
                 },
                 Created(wit_types::ResumedFailure),
+                /// A resent create still has the persisted pre-call resume
+                /// continuation available if its replacement token cannot be
+                /// encoded.
                 Resent(CreateStepEncodeFailure),
             }
 
             impl ResumeStepEncodeFailure {
-                fn created(identifier: proto::AppliedIdentifier, error: wit_types::ProviderError) -> Self {
+                fn created(
+                    identifier: proto::AppliedIdentifier,
+                    error: wit_types::ProviderError,
+                ) -> Self {
                     Self::Created(wit_types::ResumedFailure {
                         identifier: identifier.into_inner(),
                         read: wit_types::Observation::ReadFailed(error.clone()),
@@ -1393,24 +1423,39 @@ macro_rules! export_provider {
                     })
                 }
 
-                fn into_resume_verdict(self, previous: wit_types::ResumePending) -> wit_types::ResumeVerdict {
+                fn into_resume_verdict(
+                    self,
+                    previous: wit_types::ResumePending,
+                ) -> wit_types::ResumeVerdict {
                     match self {
                         Self::PendingToken {
                             progress,
                             poll_after_secs,
                             error,
-                        } => wit_types::ResumeVerdict::InFlight(wit_types::ResumeInFlight {
-                            pending: wit_types::ResumePending {
-                                operation: wit_types::PendingOperation {
-                                    token: previous.operation.token,
-                                    poll_after_secs,
+                        } => {
+                            let wit_types::ResumePending {
+                                operation,
+                                progress: _previous_progress,
+                            } = previous;
+                            let wit_types::PendingOperation {
+                                token,
+                                poll_after_secs: _previous_poll_after_secs,
+                            } = operation;
+                            wit_types::ResumeVerdict::InFlight(wit_types::ResumeInFlight {
+                                pending: wit_types::ResumePending {
+                                    operation: wit_types::PendingOperation {
+                                        token,
+                                        poll_after_secs,
+                                    },
+                                    progress,
                                 },
-                                progress,
-                            },
-                            error,
-                        }),
+                                error,
+                            })
+                        }
                         Self::Created(created) => wit_types::ResumeVerdict::Created(created),
-                        Self::Resent(error) => error.into_resent_resume_verdict(previous),
+                        Self::Resent(error) => {
+                            error.into_resent_resume_verdict(previous)
+                        }
                     }
                 }
             }
@@ -1426,11 +1471,15 @@ macro_rules! export_provider {
                             sent: _sent,
                             poll_after_secs: _poll_after_secs,
                             error,
-                        } => wit_types::ResumeVerdict::InFlight(wit_types::ResumeInFlight {
-                            pending: previous,
-                            error,
-                        }),
-                        failure => wit_types::ResumeVerdict::Resent(failure.into_create_verdict()),
+                        } => wit_types::ResumeVerdict::InFlight(
+                            wit_types::ResumeInFlight {
+                                pending: previous,
+                                error,
+                            },
+                        ),
+                        failure => wit_types::ResumeVerdict::Resent(
+                            failure.into_create_verdict(),
+                        ),
                     }
                 }
             }
@@ -1445,11 +1494,12 @@ macro_rules! export_provider {
                 let token = match serde_json::to_string(&token) {
                     Ok(token) => token,
                     Err(error) => {
+                        let error = boundary_token_encode_to_provider_error(operation, error);
                         return Err(CreateStepEncodeFailure::PendingToken {
                             progress,
                             sent,
                             poll_after_secs,
-                            error: boundary_token_encode_to_provider_error(operation, error),
+                            error,
                         });
                     }
                 };
@@ -1469,12 +1519,13 @@ macro_rules! export_provider {
             ) -> Result<wit_types::ResumePending, ResumeStepEncodeFailure> {
                 let (token, progress, poll_after_secs) = pending.into_parts();
                 let progress = proto_to_wit_create_progress(progress);
-                let token =
-                    serde_json::to_string(&token).map_err(|error| ResumeStepEncodeFailure::PendingToken {
+                let token = serde_json::to_string(&token).map_err(|error| {
+                    ResumeStepEncodeFailure::PendingToken {
                         progress: progress.clone(),
                         poll_after_secs,
                         error: boundary_token_encode_to_provider_error(operation, error),
-                    })?;
+                    }
+                })?;
                 Ok(wit_types::ResumePending {
                     operation: wit_types::PendingOperation {
                         token,

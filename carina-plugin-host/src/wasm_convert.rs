@@ -2078,14 +2078,6 @@ mod tests {
     use super::*;
     use carina_core::resource::NoPlaceholder;
 
-    fn wit_to_core_poll_request(request: wit::PollRequest) -> proto::PollRequest {
-        let finality = match request.finality {
-            wit::PollFinality::Continue => proto::PollFinality::Continue,
-            wit::PollFinality::FinalAttempt => proto::PollFinality::FinalAttempt,
-        };
-        proto::PollRequest { finality }
-    }
-
     fn find_error_in_chain<'a, T: std::error::Error + 'static>(
         error: &'a (dyn std::error::Error + 'static),
     ) -> Option<&'a T> {
@@ -2137,34 +2129,6 @@ mod tests {
             assert_eq!(resume.progress, progress);
             assert_eq!(resume.token, token);
             assert_eq!(resume.poll_after_secs, 9);
-        }
-    }
-
-    #[test]
-    fn pending_phase_and_poll_request_roundtrip_through_wit() {
-        for phase in [
-            proto::PendingPhase::Operation,
-            proto::PendingPhase::ReadBack,
-        ] {
-            let operation = PendingOperation {
-                token: PendingToken("opaque".to_string()),
-                poll_after_secs: 7,
-                phase,
-            };
-            let roundtrip = PendingOperation::from_wit(operation.into_wit());
-            assert_eq!(roundtrip.phase(), phase);
-            assert_eq!(roundtrip.poll_after_secs(), 7);
-        }
-
-        for finality in [
-            proto::PollFinality::Continue,
-            proto::PollFinality::FinalAttempt,
-        ] {
-            let request = proto::PollRequest { finality };
-            assert_eq!(
-                wit_to_core_poll_request(core_to_wit_poll_request(request)),
-                request,
-            );
         }
     }
 

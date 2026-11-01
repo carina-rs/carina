@@ -5066,7 +5066,7 @@ enum PendingResume {
         wit_request: wit_types::CreateRequest,
         resume: CoreResume,
         poll_after_secs: u32,
-        progress: proto::CreateProgress,
+        phase: proto::PendingPhase,
     },
     Resent(PendingResentCreate),
 }
@@ -5074,7 +5074,7 @@ enum PendingResume {
 #[derive(Clone)]
 struct ResumePoll {
     poll_after_secs: u32,
-    progress: proto::CreateProgress,
+    phase: proto::PendingPhase,
     finality: proto::PollFinality,
 }
 
@@ -5094,7 +5094,7 @@ impl PendingResume {
                 wit_request: _wit_request,
                 resume: _resume,
                 poll_after_secs,
-                progress: _progress,
+                phase: _phase,
             } => *poll_after_secs,
             Self::Resent(pending) => pending.pending.poll_after_secs(),
         }
@@ -5102,7 +5102,7 @@ impl PendingResume {
 
     fn phase(&self) -> proto::PendingPhase {
         match self {
-            Self::Resume { progress, .. } => progress.phase(),
+            Self::Resume { phase, .. } => *phase,
             Self::Resent(pending) => pending.pending.phase(),
         }
     }
@@ -5115,7 +5115,7 @@ impl PendingResume {
                 wit_request: _wit_request,
                 resume,
                 poll_after_secs: _poll_after_secs,
-                progress: _progress,
+                phase: _phase,
             } => resume.preserve(error),
             Self::Resent(pending) => pending.pending.preserve(error),
         }
@@ -5310,6 +5310,24 @@ impl WasmProvider {
             "WASM provider {operation} violated the read-back polling protocol by returning pending after a final-attempt sent to a read-back continuation or by regressing to operation"
         ))
         .for_resource(id)
+    }
+
+    // In-flight verdicts retain a continuation but bypass the generic driver's
+    // Pending branch, so validate their phase before converting them to failures.
+    fn in_flight_poll_error(
+        operation: &'static str,
+        id: &ResourceId,
+        previous_phase: proto::PendingPhase,
+        next_phase: proto::PendingPhase,
+        error: ProviderError,
+    ) -> ProviderError {
+        if previous_phase == proto::PendingPhase::ReadBack
+            && next_phase == proto::PendingPhase::Operation
+        {
+            Self::read_back_protocol_violation(operation, id.clone())
+        } else {
+            error
+        }
     }
 
     async fn call_operation<WitOutcome, Progress, DecodeError, GuestCall, Decode>(
@@ -5529,6 +5547,7 @@ impl WasmProvider {
                 id,
                 &wit_request,
                 starting,
+                proto::PendingPhase::Operation,
                 proto::ResumeVerdict::Resent(proto::CreateVerdict::Created(
                     proto::CreatedFailure {
                         identifier,
@@ -5788,6 +5807,13 @@ impl WasmProvider {
             }
             proto::PollVerdict::InFlight(in_flight) => {
                 let proto::CreateInFlight { pending, error } = in_flight;
+                let error = Self::in_flight_poll_error(
+                    "create",
+                    &starting.id,
+                    starting.pending.phase(),
+                    pending.phase(),
+                    error,
+                );
                 match Self::map_polled_pending_create(starting, pending) {
                     Ok(pending) => {
                         CreateProgress::Verdict(Box::new(pending.pending.preserve(error)))
@@ -5937,6 +5963,13 @@ impl WasmProvider {
             }
             proto::PollVerdict::InFlight(in_flight) => {
                 let proto::CreateInFlight { pending, error } = in_flight;
+                let error = Self::in_flight_poll_error(
+                    "resume_create",
+                    &starting.id,
+                    starting.pending.phase(),
+                    pending.phase(),
+                    error,
+                );
                 match Self::map_polled_resent_pending_create(starting, pending) {
                     Ok(pending) => {
                         ResumeProgress::Verdict(Box::new(pending.pending.preserve(error)))
@@ -5987,27 +6020,17 @@ impl WasmProvider {
     fn map_resumed_pending_create(
         starting: CoreResume,
         next: proto::ResumePending<proto::PendingToken>,
-    ) -> (CoreResume, u32, proto::CreateProgress) {
-        let (token, mut progress, poll_after_secs) = next.into_parts();
+    ) -> (CoreResume, u32, proto::PendingPhase) {
+        let (token, progress, poll_after_secs) = next.into_parts();
+        let phase = progress.phase();
         let resume = match starting {
             CoreResume::Unissued(attempt) => match progress.identifier().cloned() {
                 Some(identifier) => attempt.issued(identifier).repend(token),
                 None => attempt.repend(token),
             },
-            CoreResume::Issued(resumed) => {
-                let identifier = resumed.identifier().clone();
-                progress = match progress {
-                    proto::CreateProgress::Operating { .. } => proto::CreateProgress::Operating {
-                        identifier: Some(identifier),
-                    },
-                    proto::CreateProgress::ReadingBack { .. } => {
-                        proto::CreateProgress::ReadingBack { identifier }
-                    }
-                };
-                resumed.repend(token)
-            }
+            CoreResume::Issued(resumed) => resumed.repend(token),
         };
-        (resume, poll_after_secs, progress)
+        (resume, poll_after_secs, phase)
     }
 
     fn resumed_create_step(
@@ -6047,7 +6070,7 @@ impl WasmProvider {
                 ResumeProgress::Done(outcome)
             }
             proto::ResumeStep::Pending(next) => {
-                let (resume, poll_after_secs, progress) =
+                let (resume, poll_after_secs, phase) =
                     Self::map_resumed_pending_create(starting, next);
                 ResumeProgress::Pending(Box::new(PendingResume::Resume {
                     id,
@@ -6055,7 +6078,7 @@ impl WasmProvider {
                     wit_request,
                     resume,
                     poll_after_secs,
-                    progress,
+                    phase,
                 }))
             }
             proto::ResumeStep::Resent(step) => {
@@ -6183,6 +6206,7 @@ impl WasmProvider {
         id: ResourceId,
         wit_request: &wit_types::CreateRequest,
         starting: CoreResume,
+        previous_phase: proto::PendingPhase,
         verdict: wasm_convert::DecodedResumeVerdict,
     ) -> ResumeProgress {
         match verdict {
@@ -6201,7 +6225,14 @@ impl WasmProvider {
             }
             proto::ResumeVerdict::InFlight(in_flight) => {
                 let proto::ResumeInFlight { pending, error } = in_flight;
-                let (resume, _poll_after_secs, _progress) =
+                let error = Self::in_flight_poll_error(
+                    "resume_create",
+                    &id,
+                    previous_phase,
+                    pending.phase(),
+                    error,
+                );
+                let (resume, _poll_after_secs, _phase) =
                     Self::map_resumed_pending_create(starting, pending);
                 ResumeProgress::Verdict(Box::new(resume.preserve(error)))
             }
@@ -6267,9 +6298,20 @@ impl WasmProvider {
         resume: CoreResume,
         poll: ResumePoll,
     ) -> ResumeProgress {
+        let progress = match poll.phase {
+            proto::PendingPhase::Operation => proto::CreateProgress::Operating {
+                identifier: resume.identifier().cloned(),
+            },
+            proto::PendingPhase::ReadBack => proto::CreateProgress::ReadingBack {
+                identifier: resume
+                    .identifier()
+                    .expect("a read-back continuation must have an identifier")
+                    .clone(),
+            },
+        };
         let wit_pending = wasm_convert::core_to_wit_resume_pending(
             resume.token(),
-            &poll.progress,
+            &progress,
             poll.poll_after_secs,
         );
         let wit_poll = wasm_convert::core_to_wit_poll_request(proto::PollRequest {
@@ -6307,7 +6349,7 @@ impl WasmProvider {
             },
             Err(verdict) => match wasm_convert::wit_to_core_resume_verdict(verdict, &id) {
                 Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => {
-                    Self::resumed_create_verdict(id, &wit_request, resume, verdict)
+                    Self::resumed_create_verdict(id, &wit_request, resume, poll.phase, verdict)
                 }
                 Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
                     Self::resumed_created_read_decode_failure(id, wit_request, resume, failure)
@@ -6332,7 +6374,7 @@ impl WasmProvider {
                 wit_request,
                 resume,
                 poll_after_secs,
-                progress,
+                phase,
             } => {
                 self.call_resume_record(
                     id,
@@ -6341,7 +6383,7 @@ impl WasmProvider {
                     resume,
                     ResumePoll {
                         poll_after_secs,
-                        progress,
+                        phase,
                         finality,
                     },
                 )
@@ -6604,9 +6646,6 @@ impl WasmProvider {
         // both fields. The WIT/SDK contract marks these first-call values as
         // non-authoritative; the provider's returned pending phase drives the
         // host from this point onward.
-        let progress = proto::CreateProgress::Operating {
-            identifier: resume.identifier().cloned(),
-        };
         let initial = self.call_resume_record(
             id.clone(),
             wit_id,
@@ -6614,7 +6653,7 @@ impl WasmProvider {
             resume,
             ResumePoll {
                 poll_after_secs: 1,
-                progress,
+                phase: proto::PendingPhase::Operation,
                 finality: proto::PollFinality::Continue,
             },
         );
@@ -7795,13 +7834,6 @@ mod tests {
         assert_type::<wit_types::Observation>();
         assert_type::<wit_types::SentAttributes>();
         assert_type::<wit_types::PendingCreate>();
-        assert_type::<wit_types::PendingOperation>();
-        assert_type::<wit_types::CreateProgress>();
-        assert_type::<wit_types::PendingUpdate>();
-        assert_type::<wit_types::PendingDelete>();
-        assert_type::<wit_types::PendingPhase>();
-        assert_type::<wit_types::PollFinality>();
-        assert_type::<wit_types::PollRequest>();
         assert_type::<wit_types::CreateInFlight>();
         assert_type::<wit_types::CreateStep>();
         assert_type::<wit_types::CreateVerdict>();
@@ -7810,8 +7842,6 @@ mod tests {
         assert_type::<wit_types::ResumeInFlight>();
         assert_type::<wit_types::ResumeStep>();
         assert_type::<wit_types::ResumeVerdict>();
-        assert_type::<version_checked_bindings::aws_credentials::AwsCredentials>();
-        assert_type::<version_checked_bindings::aws_credentials::AwsCredentialError>();
     }
 
     fn test_string_value(value: &str) -> Value {
@@ -8275,9 +8305,9 @@ mod tests {
                     wit_request,
                     resume,
                     poll_after_secs,
-                    progress,
+                    phase,
                 } => panic!(
-                    "invalid resume boundary response unexpectedly replaced the record for {id} ({wit_id:?}, {wit_request:?}, {resume:?}, {poll_after_secs}, {progress:?})"
+                    "invalid resume boundary response unexpectedly replaced the record for {id} ({wit_id:?}, {wit_request:?}, {resume:?}, {poll_after_secs}, {phase:?})"
                 ),
                 PendingResume::Resent(pending) => panic!(
                     "invalid resume boundary response unexpectedly resent create for {}",
@@ -8401,6 +8431,158 @@ mod tests {
         );
     }
 
+    #[test]
+    fn poll_in_flight_phase_regression_is_protocol_violation_and_preserves_continuation() {
+        let (id, wit_id, wit_request) = boundary_resource();
+        let starting = PendingCreate {
+            pending: CreateAttempt::for_test(id.clone())
+                .issued(
+                    AppliedIdentifier::new("issued-id").unwrap(),
+                    sent_name_only(),
+                )
+                .pending_read_back(proto::PendingToken::new("read-back-token"), 1),
+            id,
+            wit_id,
+            wit_request,
+        };
+        let verdict = proto::PollVerdict::InFlight(proto::CreateInFlight {
+            pending: proto::PendingCreate {
+                token: proto::PendingToken::new("regressed-token"),
+                progress: proto::CreateProgress::Operating { identifier: None },
+                sent: sent_name_only(),
+                poll_after_secs: 7,
+            },
+            error: ProviderError::timeout("poll interrupted"),
+        });
+
+        let CreateProgress::Verdict(failure) =
+            WasmProvider::polled_create_verdict(starting, verdict)
+        else {
+            panic!("a phase regression must preserve a continuation")
+        };
+        let CreateFailureKind::InFlight { pending, error } = failure.into_kind() else {
+            panic!("a phase regression must remain recoverable")
+        };
+        assert_eq!(
+            pending.token().expose_for_provider_call(),
+            "regressed-token"
+        );
+        assert_eq!(
+            pending.identifier().map(AppliedIdentifier::as_str),
+            Some("issued-id")
+        );
+        let InFlightPersistence::Fresh(fresh) = pending.persistence() else {
+            panic!("the poll must retain its fresh send evidence")
+        };
+        assert_eq!(fresh.sent(), &sent_name_only());
+        assert_eq!(fresh.poll_after_secs(), 7);
+        assert!(error.to_string().contains("polling protocol"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn resume_in_flight_phase_regression_is_protocol_violation_and_preserves_continuation() {
+        for resent in [false, true] {
+            for read_back_budget in [
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(30),
+            ] {
+                let (id, wit_id, wit_request) = boundary_resource();
+                let resume = resume_witness(persisted_resume_without_identifier()).await;
+                let progress = proto::CreateProgress::ReadingBack {
+                    identifier: AppliedIdentifier::new("issued-id").unwrap(),
+                };
+                let token = proto::PendingToken::new("read-back-token");
+                let step = if resent {
+                    proto::ResumeStep::Resent(proto::CreateStep::Pending(proto::PendingCreate {
+                        token,
+                        progress,
+                        sent: sent_name_only(),
+                        poll_after_secs: 1,
+                    }))
+                } else {
+                    proto::ResumeStep::Pending(proto::ResumePending {
+                        token,
+                        progress,
+                        poll_after_secs: 1,
+                    })
+                };
+                let initial =
+                    WasmProvider::resumed_create_step(id, wit_id, wit_request, resume, step);
+                let outcome = carina_provider_protocol::drive_pending_infallible(
+                    std::time::Duration::from_secs(60),
+                    read_back_budget,
+                    std::future::ready(initial.into_step()),
+                    |pending, finality| {
+                        assert_eq!(pending.phase(), proto::PendingPhase::ReadBack);
+                        assert_eq!(
+                            finality,
+                            if read_back_budget.is_zero() {
+                                proto::PollFinality::FinalAttempt
+                            } else {
+                                proto::PollFinality::Continue
+                            }
+                        );
+                        let token = proto::PendingToken::new("regressed-token");
+                        let progress = proto::CreateProgress::Operating { identifier: None };
+                        let error = ProviderError::timeout("resume interrupted");
+                        let next = match *pending {
+                            PendingResume::Resume {
+                                id,
+                                wit_request,
+                                resume,
+                                phase,
+                                ..
+                            } => WasmProvider::resumed_create_verdict(
+                                id,
+                                &wit_request,
+                                resume,
+                                phase,
+                                proto::ResumeVerdict::InFlight(proto::ResumeInFlight {
+                                    pending: proto::ResumePending {
+                                        token,
+                                        progress,
+                                        poll_after_secs: 7,
+                                    },
+                                    error,
+                                }),
+                            ),
+                            PendingResume::Resent(starting) => WasmProvider::polled_resent_verdict(
+                                starting,
+                                proto::PollVerdict::InFlight(proto::CreateInFlight {
+                                    pending: proto::PendingCreate {
+                                        token,
+                                        progress,
+                                        sent: sent_name_only(),
+                                        poll_after_secs: 7,
+                                    },
+                                    error,
+                                }),
+                            ),
+                        };
+                        std::future::ready(next.into_step())
+                    },
+                    |_| std::future::ready(()),
+                )
+                .await;
+                let carina_provider_protocol::DriveOutcome::Verdict(failure) = outcome else {
+                    panic!("a phase regression must preserve its classified continuation")
+                };
+                let ResumeFailureKind::InFlight { pending, error } = failure.into_kind() else {
+                    panic!("a phase regression must remain recoverable")
+                };
+                assert_eq!(
+                    pending.token().expose_for_provider_call(),
+                    "regressed-token"
+                );
+                assert_eq!(
+                    pending.identifier().map(AppliedIdentifier::as_str),
+                    Some("issued-id")
+                );
+                assert!(error.to_string().contains("polling protocol"), "{error}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn resume_read_back_in_flight_keeps_an_identifier_learned_during_the_call() {
         let (id, _wit_id, wit_request) = boundary_resource();
@@ -8418,9 +8600,13 @@ mod tests {
                 error: ProviderError::timeout("resume interrupted"),
             });
 
-        let ResumeProgress::Verdict(failure) =
-            WasmProvider::resumed_create_verdict(id, &wit_request, resume, verdict)
-        else {
+        let ResumeProgress::Verdict(failure) = WasmProvider::resumed_create_verdict(
+            id,
+            &wit_request,
+            resume,
+            proto::PendingPhase::Operation,
+            verdict,
+        ) else {
             panic!("resume in-flight verdict must preserve a continuation")
         };
         let ResumeFailureKind::InFlight { pending, error: _ } = failure.into_kind() else {
@@ -8454,9 +8640,13 @@ mod tests {
                 error: ProviderError::timeout("resent create interrupted"),
             }));
 
-        let ResumeProgress::Verdict(failure) =
-            WasmProvider::resumed_create_verdict(id, &wit_request, resume, verdict)
-        else {
+        let ResumeProgress::Verdict(failure) = WasmProvider::resumed_create_verdict(
+            id,
+            &wit_request,
+            resume,
+            proto::PendingPhase::Operation,
+            verdict,
+        ) else {
             panic!("resent in-flight verdict must preserve a continuation")
         };
         let ResumeFailureKind::InFlight { pending, error: _ } = failure.into_kind() else {
@@ -8723,7 +8913,13 @@ mod tests {
         let verdict: wasm_convert::DecodedResumeVerdict =
             proto::ResumeVerdict::Untracked(ProviderError::internal("untracked"));
         assert_original_resumed_record(
-            WasmProvider::resumed_create_verdict(id, &wit_request, resume, verdict),
+            WasmProvider::resumed_create_verdict(
+                id,
+                &wit_request,
+                resume,
+                proto::PendingPhase::Operation,
+                verdict,
+            ),
             &starting,
         );
 
@@ -8733,7 +8929,13 @@ mod tests {
         let verdict: wasm_convert::DecodedResumeVerdict =
             proto::ResumeVerdict::Undetermined(ProviderError::internal("undetermined"));
         assert_original_resumed_record(
-            WasmProvider::resumed_create_verdict(id, &wit_request, resume, verdict),
+            WasmProvider::resumed_create_verdict(
+                id,
+                &wit_request,
+                resume,
+                proto::PendingPhase::Operation,
+                verdict,
+            ),
             &starting,
         );
 
