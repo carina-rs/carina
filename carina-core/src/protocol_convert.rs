@@ -30,8 +30,8 @@ use carina_provider_protocol::types as protocol;
 use indexmap::IndexMap;
 
 use crate::provider::{
-    AppliedState, PartialReadDiagnostic, PatchOp, ProviderDirectives, ReadOutcome, UpdateOutcome,
-    UpdateOutcomeKind, UpdatePatch,
+    AppliedState, PartialReadDiagnostic, PatchOp, ProviderDirectiveProtocolParts,
+    ProviderDirectives, ReadOutcome, UpdateOutcome, UpdateOutcomeKind, UpdatePatch,
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, RedactedSecretHash, Resource, ResourceId,
@@ -2113,10 +2113,18 @@ pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
 
 /// Encode directives that have already been resolved for a provider boundary.
 pub fn directives_to_protocol(directives: &ProviderDirectives) -> protocol::Directives {
+    let ProviderDirectiveProtocolParts {
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
+        // Protection provenance is host policy metadata. WIT v13 transports
+        // only the three effective booleans.
+        prevent_destroy_source: _prevent_destroy_source,
+    } = directives.protocol_parts();
     protocol::Directives {
-        force_delete: directives.force_delete(),
-        create_before_destroy: directives.create_before_destroy(),
-        prevent_destroy: directives.prevent_destroy(),
+        force_delete,
+        create_before_destroy,
+        prevent_destroy,
     }
 }
 
@@ -2594,6 +2602,11 @@ mod tests {
         TypeIdentity::new(Some("aws"), ["lambda", "Function"], kind)
     }
 
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
+
     fn reference_form() -> ReferenceForm {
         ReferenceForm::Template {
             long: ReferenceTemplate::new(
@@ -2842,7 +2855,7 @@ mod tests {
     #[test]
     fn schema_default_prevent_destroy_is_true_in_provider_protocol_resources() {
         let schema = ResourceSchema::new("test.Widget").default_prevent_destroy();
-        let resource = Resource::with_provider(
+        let resource: Resource = Resource::with_provider(
             "test",
             "test.Widget",
             ResourceIdentity::from("example"),
@@ -2992,7 +3005,9 @@ mod tests {
             Err(ProtocolConvertError::DurationOutOfRange)
         ));
 
-        let resolved_function = std::sync::Arc::new(crate::parser::UserFunction {
+        let resolved_function: std::sync::Arc<
+            crate::parser::UserFunction<crate::resource::AbsoluteBindingAddress>,
+        > = std::sync::Arc::new(crate::parser::UserFunction {
             name: "fixture".to_string(),
             params: Vec::new(),
             return_type: None,
@@ -3006,7 +3021,7 @@ mod tests {
         let access = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "upstream".to_string(),
+                    binding: absolute_binding("upstream"),
                 },
             )),
             crate::resource::PathSegment::Field {
@@ -3021,14 +3036,17 @@ mod tests {
             RedactedSecretHash::from_encoded_digest(&digest).expect("fixture digest must be valid");
         let non_wire = [
             Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
-            Value::resource_ref("source", "value", Vec::new()),
+            crate::resource::AuthoredValue::resource_ref("source", "value", Vec::new())
+                .resolve_root(&crate::resource::RootScope::new())
+                .into_expanded()
+                .expect("protocol fixture contains no parser placeholder"),
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "source".to_string(),
+                binding: absolute_binding("source"),
             }),
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::Deferred(DeferredValue::Unknown(
                     crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                        binding: "upstream".to_string(),
+                        binding: absolute_binding("upstream"),
                     },
                 ))),
                 default: Box::new(Value::Concrete(ConcreteValue::Int(1))),
@@ -3060,7 +3078,7 @@ mod tests {
             Value::Deferred(DeferredValue::RedactedSecret { hash }),
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "upstream".to_string(),
+                    binding: absolute_binding("upstream"),
                 },
             )),
         ];

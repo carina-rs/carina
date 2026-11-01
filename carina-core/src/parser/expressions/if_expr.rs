@@ -424,7 +424,7 @@ fn parse_if_body(
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = match target {
-                    LoopParseTarget::Bound { .. } => Some(target.scheduler_key().to_string()),
+                    LoopParseTarget::Bound(bound) => Some(bound.binding_address().clone()),
                     LoopParseTarget::Unbound(_) => None,
                 };
                 call.set_loop_origin(target.if_origin());

@@ -448,7 +448,7 @@ where
             .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok())
             .map(|exports| exports.build_remote_bindings())
             .unwrap_or_default();
-        remote_bindings.insert(us.binding.clone(), bindings);
+        remote_bindings.insert(us.binding.to_string(), bindings);
     }
     let resolved_provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
         parsed,
@@ -567,11 +567,12 @@ where
     // a display residual instead of turning it into an executable deferred
     // create. This stays fixture-only because production must retain those
     // deferred creates for apply-time expansion.
-    let managed_bindings: HashSet<String> = expansion_prelude
-        .sorted_resources()
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .collect();
+    let managed_bindings: HashSet<carina_core::resource::AbsoluteBindingAddress> =
+        expansion_prelude
+            .sorted_resources()
+            .iter()
+            .filter_map(|resource| resource.binding.clone())
+            .collect();
     let (non_managed_deferred_for, _managed_deferred_for) = parsed
         .deferred_for_expressions()
         .clone()

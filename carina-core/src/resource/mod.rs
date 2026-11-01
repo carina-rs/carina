@@ -9,6 +9,7 @@
 //! Legacy loop addresses remain crate-private migration provenance rather than
 //! public live resource identities.
 
+pub(crate) mod binding_address;
 mod enum_value;
 mod ignore_changes;
 mod loop_origin;
@@ -37,6 +38,12 @@ use crate::parser::display_string_literal;
 use crate::provider::{AppliedIdentifier, InFlightCreate, UnknownCreateOutcome};
 use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
 
+#[cfg(any(test, feature = "test-support"))]
+pub use binding_address::absolute_binding_address_for_test;
+pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
+pub(crate) use binding_address::{
+    binding_with_index, binding_with_map_key, module_argument_placeholder,
+};
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
@@ -51,6 +58,25 @@ pub use loop_origin::{
     UnboundLoopTemplate,
 };
 pub(crate) use loop_origin::{LegacyLoopAddress, LoopModulePrefixOrigin};
+
+/// Resolver for names authored in the root directory.
+///
+/// The root adds no textual prefix, but making it explicit keeps root and
+/// module resources on the same absolute-address side of the phase boundary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RootScope {
+    _private: (),
+}
+
+impl RootScope {
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+
+    pub(crate) fn resolve(&self, relative: RelativeBindingName) -> AbsoluteBindingAddress {
+        AbsoluteBindingAddress::from_scope(relative.into_value_string())
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct EnumAttr<'a> {
@@ -870,8 +896,8 @@ impl From<PendingResourceIdentityError> for ResolvedResourceError {
 /// when a saved plan is loaded. Bound templates instead expose their derived
 /// materialized address while directives are checked, so diagnostics name the
 /// template (for example, `items[?]`) rather than a pending placeholder.
-pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind>(
-    resource: &mut Resource<S, P>,
+pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &mut Resource<S, P, B>,
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), ResolvedResourceError> {
     let ignore_changes = if resource.directives.ignore_changes.is_empty() {
@@ -1191,20 +1217,25 @@ impl std::fmt::Display for PathSegment {
 /// type system — there is no way to construct an `AccessPath` without
 /// both.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AccessPath {
-    binding: ValueString,
+pub struct AccessPath<B: BindingAddress = AbsoluteBindingAddress> {
+    binding: B,
     attribute: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     segments: Vec<PathSegment>,
+    #[serde(skip, default)]
+    diagnostic_source: DiagnosticSourceLocation,
 }
 
-impl AccessPath {
+pub type AuthoredAccessPath = AccessPath<RelativeBindingName>;
+pub type ExpandedAccessPath = AccessPath<AbsoluteBindingAddress>;
+
+impl AccessPath<RelativeBindingName> {
     /// Create an `AccessPath` referring to a top-level attribute of a binding.
     ///
     /// `attribute` must be non-empty. A bare-binding reference (no
     /// `.attr`) is represented by [`Value::BindingRef`], not by an
     /// `AccessPath` with an empty attribute.
-    pub fn new(binding: impl Into<ValueString>, attribute: impl Into<String>) -> Self {
+    pub fn new(binding: impl Into<RelativeBindingName>, attribute: impl Into<String>) -> Self {
         Self::with_segments(binding, attribute, Vec::new())
     }
 
@@ -1214,7 +1245,7 @@ impl AccessPath {
     ///
     /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_fields(
-        binding: impl Into<ValueString>,
+        binding: impl Into<RelativeBindingName>,
         attribute: impl Into<String>,
         field_path: Vec<String>,
     ) -> Self {
@@ -1231,7 +1262,7 @@ impl AccessPath {
     ///
     /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_fields_and_subscripts(
-        binding: impl Into<ValueString>,
+        binding: impl Into<RelativeBindingName>,
         attribute: impl Into<String>,
         field_path: Vec<String>,
         subscripts: Vec<Subscript>,
@@ -1258,11 +1289,102 @@ impl AccessPath {
     ///
     /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_segments(
-        binding: impl Into<ValueString>,
+        binding: impl Into<RelativeBindingName>,
         attribute: impl Into<String>,
         segments: Vec<PathSegment>,
     ) -> Self {
-        let binding = binding.into();
+        Self::from_binding(binding.into(), attribute, segments)
+    }
+
+    pub(crate) fn with_segments_at_source(
+        binding: impl Into<RelativeBindingName>,
+        attribute: impl Into<String>,
+        segments: Vec<PathSegment>,
+        source_file: &std::path::Path,
+        source_line: usize,
+    ) -> Self {
+        let mut path = Self::with_segments(binding, attribute, segments);
+        path.diagnostic_source = DiagnosticSourceLocation::authored(source_file, source_line);
+        path
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_root(self, scope: &RootScope) -> AccessPath<AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn resolve_root_for_test(self) -> AccessPath<AbsoluteBindingAddress> {
+        self.resolve_root(&RootScope::new())
+    }
+
+    pub fn resolve_module(self, scope: &ModuleInstanceScope) -> AccessPath<AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> AccessPath<AbsoluteBindingAddress> {
+        self.map_bindings(resolve)
+    }
+}
+
+#[cfg(test)]
+impl AccessPath<AbsoluteBindingAddress> {
+    pub fn root(binding: impl Into<String>, attribute: impl Into<String>) -> Self {
+        AccessPath::<RelativeBindingName>::new(RelativeBindingName::new(binding.into()), attribute)
+            .resolve_root(&RootScope::new())
+    }
+
+    pub fn root_with_fields(
+        binding: impl Into<String>,
+        attribute: impl Into<String>,
+        field_path: Vec<String>,
+    ) -> Self {
+        AccessPath::<RelativeBindingName>::with_fields(
+            RelativeBindingName::new(binding.into()),
+            attribute,
+            field_path,
+        )
+        .resolve_root(&RootScope::new())
+    }
+
+    pub fn root_with_fields_and_subscripts(
+        binding: impl Into<String>,
+        attribute: impl Into<String>,
+        field_path: Vec<String>,
+        subscripts: Vec<Subscript>,
+    ) -> Self {
+        AccessPath::<RelativeBindingName>::with_fields_and_subscripts(
+            RelativeBindingName::new(binding.into()),
+            attribute,
+            field_path,
+            subscripts,
+        )
+        .resolve_root(&RootScope::new())
+    }
+
+    pub fn root_with_segments(
+        binding: impl Into<String>,
+        attribute: impl Into<String>,
+        segments: Vec<PathSegment>,
+    ) -> Self {
+        AccessPath::<RelativeBindingName>::with_segments(
+            RelativeBindingName::new(binding.into()),
+            attribute,
+            segments,
+        )
+        .resolve_root(&RootScope::new())
+    }
+}
+
+impl<B: BindingAddress> AccessPath<B> {
+    pub(crate) fn from_binding(
+        binding: B,
+        attribute: impl Into<String>,
+        segments: Vec<PathSegment>,
+    ) -> Self {
         let attribute = attribute.into();
         assert!(
             !attribute.is_empty(),
@@ -1274,6 +1396,22 @@ impl AccessPath {
             binding,
             attribute,
             segments,
+            diagnostic_source: DiagnosticSourceLocation::default(),
+        }
+    }
+
+    fn map_bindings<T: BindingAddress>(self, map: &mut impl FnMut(B) -> T) -> AccessPath<T> {
+        let Self {
+            binding,
+            attribute,
+            segments,
+            diagnostic_source,
+        } = self;
+        AccessPath {
+            binding: map(binding),
+            attribute,
+            segments,
+            diagnostic_source,
         }
     }
 
@@ -1289,7 +1427,11 @@ impl AccessPath {
 
     /// Returns the binding name.
     pub fn binding(&self) -> &str {
-        self.binding.expose_plaintext()
+        self.binding.as_str()
+    }
+
+    pub fn binding_address(&self) -> &B {
+        &self.binding
     }
 
     /// Returns the attribute name.
@@ -1301,6 +1443,10 @@ impl AccessPath {
     /// for a top-level attribute reference. carina#3025.
     pub fn segments(&self) -> &[PathSegment] {
         &self.segments
+    }
+
+    pub(crate) fn diagnostic_source_owned(&self) -> Option<(Option<std::path::PathBuf>, usize)> {
+        self.diagnostic_source.owned()
     }
 
     /// Returns the leading run of `.field` segments before the first
@@ -1387,7 +1533,7 @@ impl AccessPath {
             })
             .sum();
         let binding = if expose_plaintext {
-            self.binding.expose_plaintext()
+            self.binding.as_str()
         } else {
             self.binding
                 .diagnostic_literal()
@@ -1416,7 +1562,16 @@ impl AccessPath {
     }
 }
 
-impl std::fmt::Display for AccessPath {
+impl AccessPath<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        *self = self.clone().map_bindings(&mut |binding| map(&binding));
+    }
+}
+
+impl<B: BindingAddress> std::fmt::Display for AccessPath<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_dot_string())
     }
@@ -1428,17 +1583,19 @@ impl std::fmt::Display for AccessPath {
 /// validation. This enum lets static type resolution cover both without
 /// weakening `AccessPath`'s non-empty-attribute invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ReferencePath {
-    Access(AccessPath),
-    Binding(String),
+pub enum ReferencePath<B: BindingAddress = AbsoluteBindingAddress> {
+    Access(AccessPath<B>),
+    Binding(B),
     BindingAccess {
-        binding: String,
+        binding: B,
         segments: Vec<PathSegment>,
     },
 }
 
-impl ReferencePath {
-    pub fn as_ref(&self) -> ReferencePathRef<'_> {
+pub type AuthoredReferencePath = ReferencePath<RelativeBindingName>;
+
+impl<B: BindingAddress> ReferencePath<B> {
+    pub fn as_ref(&self) -> ReferencePathRef<'_, B> {
         match self {
             Self::Access(path) => ReferencePathRef::Access(path),
             Self::Binding(binding) => ReferencePathRef::Binding(binding),
@@ -1451,9 +1608,15 @@ impl ReferencePath {
     pub fn to_dot_string(&self) -> String {
         match self {
             Self::Access(path) => path.to_dot_string(),
-            Self::Binding(binding) => binding.clone(),
+            Self::Binding(binding) => binding
+                .diagnostic_literal()
+                .unwrap_or("value from env()")
+                .to_string(),
             Self::BindingAccess { binding, segments } => {
-                let mut rendered = binding.clone();
+                let mut rendered = binding
+                    .diagnostic_literal()
+                    .unwrap_or("value from env()")
+                    .to_string();
                 for segment in segments {
                     segment.append_to_dot_string(&mut rendered);
                 }
@@ -1465,9 +1628,9 @@ impl ReferencePath {
     pub fn to_plaintext_dot_string(&self) -> String {
         match self {
             Self::Access(path) => path.to_plaintext_dot_string(),
-            Self::Binding(binding) => binding.clone(),
+            Self::Binding(binding) => binding.as_str().to_string(),
             Self::BindingAccess { binding, segments } => {
-                let mut rendered = binding.clone();
+                let mut rendered = binding.as_str().to_string();
                 for segment in segments {
                     rendered.push_str(&segment.to_plaintext_dot_string());
                 }
@@ -1477,11 +1640,11 @@ impl ReferencePath {
     }
 }
 
-impl std::fmt::Display for ReferencePath {
+impl<B: BindingAddress> std::fmt::Display for ReferencePath<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Access(path) => path.fmt(f),
-            Self::Binding(binding) => binding.fmt(f),
+            Self::Access(path) => std::fmt::Display::fmt(path, f),
+            Self::Binding(_) => f.write_str(&self.to_dot_string()),
             Self::BindingAccess { .. } => f.write_str(&self.to_dot_string()),
         }
     }
@@ -1495,10 +1658,12 @@ impl std::fmt::Display for ReferencePath {
 /// This projection is validation metadata only: it does not weaken
 /// the construction invariant that a structural reference-rooted access is
 /// canonicalized to `ResourceRef` / `BindingRef`.
-pub(crate) fn module_argument_reference_path<P: PlaceholderKind>(
-    value: &Value<P>,
-) -> Option<ReferencePath> {
-    fn collect<P: PlaceholderKind>(value: &Value<P>) -> Option<(String, Vec<PathSegment>)> {
+pub fn module_argument_reference_path<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> Option<ReferencePath<B>> {
+    fn collect<P: PlaceholderKind, B: BindingAddress>(
+        value: &Value<P, B>,
+    ) -> Option<(String, Vec<PathSegment>)> {
         match value {
             Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder
                 .module_argument_name()
@@ -1513,6 +1678,7 @@ pub(crate) fn module_argument_reference_path<P: PlaceholderKind>(
     }
 
     let (binding, segments) = collect(value)?;
+    let binding = module_argument_placeholder::<B>(binding)?;
     if segments.is_empty() {
         Some(ReferencePath::Binding(binding))
     } else {
@@ -1521,22 +1687,24 @@ pub(crate) fn module_argument_reference_path<P: PlaceholderKind>(
 }
 
 /// Borrowed projection of [`ReferencePath`] used by validation walkers.
-#[derive(Debug, Clone, Copy)]
-pub enum ReferencePathRef<'a> {
-    Access(&'a AccessPath),
-    Binding(&'a str),
+#[derive(Debug)]
+pub enum ReferencePathRef<'a, B: BindingAddress = AbsoluteBindingAddress> {
+    Access(&'a AccessPath<B>),
+    Binding(&'a B),
     BindingAccess {
-        binding: &'a str,
+        binding: &'a B,
         segments: &'a [PathSegment],
     },
 }
 
-impl<'a> ReferencePathRef<'a> {
+pub type AuthoredReferencePathRef<'a> = ReferencePathRef<'a, RelativeBindingName>;
+
+impl<'a, B: BindingAddress> ReferencePathRef<'a, B> {
     pub fn binding(self) -> &'a str {
         match self {
             Self::Access(path) => path.binding(),
-            Self::Binding(binding) => binding,
-            Self::BindingAccess { binding, .. } => binding,
+            Self::Binding(binding) => binding.as_str(),
+            Self::BindingAccess { binding, .. } => binding.as_str(),
         }
     }
 
@@ -1568,32 +1736,40 @@ impl<'a> ReferencePathRef<'a> {
         }
     }
 
-    pub fn to_owned(self) -> ReferencePath {
+    pub fn to_owned(self) -> ReferencePath<B> {
         match self {
             Self::Access(path) => ReferencePath::Access(path.clone()),
-            Self::Binding(binding) => ReferencePath::Binding(binding.to_string()),
+            Self::Binding(binding) => ReferencePath::Binding(binding.clone()),
             Self::BindingAccess { binding, segments } => ReferencePath::BindingAccess {
-                binding: binding.to_string(),
+                binding: binding.clone(),
                 segments: segments.to_vec(),
             },
         }
     }
 }
 
-impl<'a> From<&'a AccessPath> for ReferencePathRef<'a> {
-    fn from(path: &'a AccessPath) -> Self {
+impl<B: BindingAddress> Copy for ReferencePathRef<'_, B> {}
+
+impl<B: BindingAddress> Clone for ReferencePathRef<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, B: BindingAddress> From<&'a AccessPath<B>> for ReferencePathRef<'a, B> {
+    fn from(path: &'a AccessPath<B>) -> Self {
         Self::Access(path)
     }
 }
 
-impl<'a> From<&'a str> for ReferencePathRef<'a> {
-    fn from(binding: &'a str) -> Self {
+impl<'a, B: BindingAddress> From<&'a B> for ReferencePathRef<'a, B> {
+    fn from(binding: &'a B) -> Self {
         Self::Binding(binding)
     }
 }
 
-impl<'a> From<&'a ReferencePath> for ReferencePathRef<'a> {
-    fn from(path: &'a ReferencePath) -> Self {
+impl<'a, B: BindingAddress> From<&'a ReferencePath<B>> for ReferencePathRef<'a, B> {
+    fn from(path: &'a ReferencePath<B>) -> Self {
         path.as_ref()
     }
 }
@@ -1604,7 +1780,9 @@ impl<'a> From<&'a ReferencePath> for ReferencePathRef<'a> {
 /// leaf (#2439; plan-display redaction depends on the tag). Single
 /// source of truth for the secret-tunnel discipline, shared by
 /// `resolver::resolve_ref_value` and [`navigate_value_path`].
-pub(crate) fn peel_secrets<P: PlaceholderKind>(mut value: Value<P>) -> (Value<P>, usize) {
+pub(crate) fn peel_secrets<P: PlaceholderKind, B: BindingAddress>(
+    mut value: Value<P, B>,
+) -> (Value<P, B>, usize) {
     let mut depth = 0;
     while let Value::Deferred(DeferredValue::Secret(inner)) = value {
         value = *inner;
@@ -1615,7 +1793,10 @@ pub(crate) fn peel_secrets<P: PlaceholderKind>(mut value: Value<P>) -> (Value<P>
 
 /// Re-wrap `value` in `depth` layers of `Value::Secret`. Inverse of
 /// [`peel_secrets`].
-pub(crate) fn rewrap_secrets<P: PlaceholderKind>(value: Value<P>, depth: usize) -> Value<P> {
+pub(crate) fn rewrap_secrets<P: PlaceholderKind, B: BindingAddress>(
+    value: Value<P, B>,
+    depth: usize,
+) -> Value<P, B> {
     (0..depth).fold(value, |acc, _| {
         Value::Deferred(DeferredValue::Secret(Box::new(acc)))
     })
@@ -1723,7 +1904,9 @@ impl std::fmt::Display for ValueAccessError {
 
 impl std::error::Error for ValueAccessError {}
 
-fn concrete_value_shape<P: PlaceholderKind>(value: &ConcreteValue<P>) -> &'static str {
+fn concrete_value_shape<P: PlaceholderKind, B: BindingAddress>(
+    value: &ConcreteValue<P, B>,
+) -> &'static str {
     match value {
         ConcreteValue::String(_) => "string",
         ConcreteValue::EnumIdentifier(_) | ConcreteValue::CanonicalEnum(_) => "enum",
@@ -1800,9 +1983,12 @@ pub enum AccessMissPolicy {
 /// resolution preserve the original `ResourceRef` when navigation itself is
 /// undecidable, without guessing from the returned `Value` shape.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ValuePathSegmentResult<P: PlaceholderKind = NoPlaceholder> {
-    Resolved(Value<P>),
-    Deferred(Value<P>),
+pub(crate) enum ValuePathSegmentResult<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    Resolved(Value<P, B>),
+    Deferred(Value<P, B>),
     /// The selected element is absent from a concrete container, but the
     /// caller's source policy says that view may be incomplete.  The caller
     /// must retain its original unresolved expression; constructing an
@@ -1810,8 +1996,8 @@ pub(crate) enum ValuePathSegmentResult<P: PlaceholderKind = NoPlaceholder> {
     DeferredMiss(ValueAccessError),
 }
 
-impl<P: PlaceholderKind> ValuePathSegmentResult<P> {
-    pub(crate) fn into_value(self) -> Result<Value<P>, ValueAccessError> {
+impl<P: PlaceholderKind, B: BindingAddress> ValuePathSegmentResult<P, B> {
+    pub(crate) fn into_value(self) -> Result<Value<P, B>, ValueAccessError> {
         match self {
             Self::Resolved(value) | Self::Deferred(value) => Ok(value),
             Self::DeferredMiss(error) => Err(error),
@@ -1819,11 +2005,11 @@ impl<P: PlaceholderKind> ValuePathSegmentResult<P> {
     }
 }
 
-fn deferred_access<P: PlaceholderKind>(
-    base: Value<P>,
+fn deferred_access<P: PlaceholderKind, B: BindingAddress>(
+    base: Value<P, B>,
     step: PathSegment,
     source_line: usize,
-) -> Value<P> {
+) -> Value<P, B> {
     let display_root = match &base {
         Value::Deferred(DeferredValue::Access(access)) => match &access.display_root {
             Some(LoopAccessDisplayRoot::Rooted(binding)) if access.is_rooted_at_loop_slot() => {
@@ -1844,10 +2030,10 @@ fn deferred_access<P: PlaceholderKind>(
     }))
 }
 
-fn handle_access_miss<P: PlaceholderKind>(
+fn handle_access_miss<P: PlaceholderKind, B: BindingAddress>(
     miss_policy: AccessMissPolicy,
     miss: ValueAccessMiss,
-) -> Result<ValuePathSegmentResult<P>, ValueAccessError> {
+) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
     let error = ValueAccessError::from(miss);
     match miss_policy {
         AccessMissPolicy::Error => Err(error),
@@ -1861,12 +2047,12 @@ fn handle_access_miss<P: PlaceholderKind>(
 /// and [`navigate_value_path`]. Concrete containers are navigated immediately;
 /// a deferred base is retained as [`DeferredValue::Access`]. Secret wrappers
 /// are peeled before navigation and restored around the selected value.
-pub(crate) fn apply_value_path_segment<P: PlaceholderKind>(
-    base: Value<P>,
+pub(crate) fn apply_value_path_segment<P: PlaceholderKind, B: BindingAddress>(
+    base: Value<P, B>,
     step: PathSegment,
     source_line: usize,
     miss_policy: AccessMissPolicy,
-) -> Result<ValuePathSegmentResult<P>, ValueAccessError> {
+) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
     let (peeled, secret_depth) = peel_secrets(base);
     let selected = match peeled {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
@@ -1881,17 +2067,17 @@ pub(crate) fn apply_value_path_segment<P: PlaceholderKind>(
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             let reference = match step {
                 PathSegment::Field { name } => Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new(binding, name),
+                    path: AccessPath::from_binding(binding, name, Vec::new()),
                 }),
                 PathSegment::Subscript {
                     index: Subscript::Int { index },
                 } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: format!("{binding}[{index}]"),
+                    binding: binding_with_index(&binding, index),
                 }),
                 PathSegment::Subscript {
                     index: Subscript::Str { key },
                 } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: crate::utils::map_key_address(&binding, key.expose_plaintext()),
+                    binding: binding_with_map_key(&binding, &key),
                 }),
             };
             return Ok(ValuePathSegmentResult::Deferred(rewrap_secrets(
@@ -2002,12 +2188,12 @@ pub(crate) fn apply_value_path_segment<P: PlaceholderKind>(
 /// it can return a concrete selection or canonical reference just as the
 /// parser and resolver do. The raw [`DeferredValue::Access`] constructor is
 /// intentionally unavailable outside this module.
-pub fn apply_postfix_access<P: PlaceholderKind>(
-    base: Value<P>,
+pub fn apply_postfix_access<P: PlaceholderKind, B: BindingAddress>(
+    base: Value<P, B>,
     step: PathSegment,
     source_line: usize,
     miss_policy: AccessMissPolicy,
-) -> Result<Value<P>, ValueAccessError> {
+) -> Result<Value<P, B>, ValueAccessError> {
     apply_value_path_segment(base, step, source_line, miss_policy)
         .and_then(ValuePathSegmentResult::into_value)
 }
@@ -2023,7 +2209,7 @@ pub(crate) fn parser_deferred_for_access(
     slot: LoopSlot,
     step: PathSegment,
     source_line: usize,
-) -> Value<ParserPlaceholder> {
+) -> Value<ParserPlaceholder, RelativeBindingName> {
     Value::Deferred(DeferredValue::Access(AccessExpr {
         base: Box::new(Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::Loop(slot),
@@ -2055,7 +2241,10 @@ pub(crate) fn parser_deferred_for_access(
 /// [`DeferredValue::Access`] for a concrete navigation result. A
 /// loop-variable path that does not navigate is "not resolvable here", never
 /// a panic or a wrong value.
-pub fn navigate_value_path(root: &Value, path: &AccessPath) -> Option<Value> {
+pub fn navigate_value_path<P: PlaceholderKind, B: BindingAddress>(
+    root: &Value<P, B>,
+    path: &AccessPath<B>,
+) -> Option<Value<P, B>> {
     // The `attribute` head is the first hop: `root` is the loop
     // element, `root[attribute]` is the first navigated value.
     let (peeled_root, root_secret) = peel_secrets(root.clone());
@@ -2118,10 +2307,14 @@ pub(crate) mod duration_secs {
 /// JSON shape.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub enum Value<P: PlaceholderKind = NoPlaceholder> {
-    Concrete(ConcreteValue<P>),
-    Deferred(DeferredValue<P>),
+pub enum Value<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
+    Concrete(ConcreteValue<P, B>),
+    Deferred(DeferredValue<P, B>),
 }
+
+/// Value tree in the authored, pre-expansion binding phase.
+pub type AuthoredValue = Value<ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedValue = Value<NoPlaceholder, AbsoluteBindingAddress>;
 
 /// A runtime string together with provenance used exclusively to make
 /// diagnostic rendering safe.
@@ -2229,6 +2422,18 @@ impl PartialEq for ValueString {
 
 impl Eq for ValueString {}
 
+impl PartialOrd for ValueString {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ValueString {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.plaintext.cmp(&other.plaintext)
+    }
+}
+
 impl Hash for ValueString {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.plaintext.hash(state);
@@ -2280,7 +2485,10 @@ impl<'de> Deserialize<'de> for ValueString {
 /// Concrete-axis variants: values that carry their own runtime type
 /// and are safe to type-check at validate time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConcreteValue<P: PlaceholderKind = NoPlaceholder> {
+pub enum ConcreteValue<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     String(ValueString),
     /// An enum identifier — a value written in the DSL as a bare
     /// identifier (`tcp`) or namespaced identifier
@@ -2303,13 +2511,16 @@ pub enum ConcreteValue<P: PlaceholderKind = NoPlaceholder> {
     /// contract).
     #[serde(with = "duration_secs")]
     Duration(std::time::Duration),
-    List(Vec<Value<P>>),
+    List(Vec<Value<P, B>>),
     /// Canonical form for fields whose schema type is
     /// `Union(vec![String, list(String)])` — the IAM-style
     /// `string_or_list_of_strings` shape. See #2481, #2510.
     StringList(Vec<ValueString>),
-    Map(IndexMap<String, Value<P>>),
+    Map(IndexMap<String, Value<P, B>>),
 }
+
+pub type AuthoredConcreteValue = ConcreteValue<ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedConcreteValue = ConcreteValue<NoPlaceholder, AbsoluteBindingAddress>;
 
 /// Shared typed operand used while function and module arguments cross
 /// evaluation boundaries. A structural handle never becomes a public
@@ -2319,37 +2530,47 @@ pub enum ConcreteValue<P: PlaceholderKind = NoPlaceholder> {
 /// it is a pre-classification tree for directory fixed-point parsing, whereas
 /// this enum represents one already-classified argument operand.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StructuralOperand<P: PlaceholderKind = NoPlaceholder> {
+pub(crate) enum StructuralOperand<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     Value {
-        value: Value<P>,
-        access_base: Option<Value<P>>,
+        value: Value<P, B>,
+        access_base: Option<Value<P, B>>,
     },
     Handle {
-        handle: crate::eval_value::StructuralHandle,
-        access_base: Value<P>,
+        handle: crate::eval_value::StructuralHandle<B>,
+        access_base: Value<P, B>,
     },
     /// A bare module parameter forwarded across a nested argument boundary
     /// before the outermost caller has determined whether it is a value or a
     /// handle. Keeping this state beside `Value` and `Handle` prevents a
     /// placeholder `Value` from prematurely deciding the classification.
-    Parameter { name: String, access_base: Value<P> },
+    Parameter {
+        name: String,
+        access_base: Value<P, B>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum StructuralOperandRef<'a, P: PlaceholderKind = NoPlaceholder> {
-    Value(&'a Value<P>),
+pub(crate) enum StructuralOperandRef<
+    'a,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    Value(&'a Value<P, B>),
     Handle {
-        handle: &'a crate::eval_value::StructuralHandle,
-        access_base: &'a Value<P>,
+        handle: &'a crate::eval_value::StructuralHandle<B>,
+        access_base: &'a Value<P, B>,
     },
     Parameter {
         name: &'a str,
-        access_base: &'a Value<P>,
+        access_base: &'a Value<P, B>,
     },
 }
 
-impl<P: PlaceholderKind> StructuralOperand<P> {
-    pub(crate) fn from_value(value: Value<P>) -> Self {
+impl<P: PlaceholderKind, B: BindingAddress> StructuralOperand<P, B> {
+    pub(crate) fn from_value(value: Value<P, B>) -> Self {
         if let Value::Deferred(DeferredValue::Placeholder(placeholder)) = &value
             && let Some(name) = placeholder.module_argument_name()
         {
@@ -2365,8 +2586,8 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
     }
 
     pub(crate) fn from_value_with_access_base(
-        value: Value<P>,
-        access_base: Option<Value<P>>,
+        value: Value<P, B>,
+        access_base: Option<Value<P, B>>,
     ) -> Self {
         if access_base.is_none()
             && let Value::Deferred(DeferredValue::Placeholder(placeholder)) = &value
@@ -2381,8 +2602,8 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
     }
 
     pub(crate) fn from_handle_with_access_base(
-        handle: crate::eval_value::StructuralHandle,
-        access_base: Value<P>,
+        handle: crate::eval_value::StructuralHandle<B>,
+        access_base: Value<P, B>,
     ) -> Self {
         Self::Handle {
             handle,
@@ -2390,14 +2611,14 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
         }
     }
 
-    pub(crate) fn value(&self) -> Option<&Value<P>> {
+    pub(crate) fn value(&self) -> Option<&Value<P, B>> {
         match self {
             Self::Value { value, .. } => Some(value),
             Self::Handle { .. } | Self::Parameter { .. } => None,
         }
     }
 
-    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle> {
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle<B>> {
         match self {
             Self::Value { .. } | Self::Parameter { .. } => None,
             Self::Handle { handle, .. } => Some(handle),
@@ -2411,7 +2632,7 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
         }
     }
 
-    pub(crate) fn value_ref(&self) -> StructuralOperandRef<'_, P> {
+    pub(crate) fn value_ref(&self) -> StructuralOperandRef<'_, P, B> {
         match self {
             Self::Value { value, .. } => StructuralOperandRef::Value(value),
             Self::Handle {
@@ -2427,25 +2648,7 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
         }
     }
 
-    pub(crate) fn access_ref(&self) -> StructuralOperandRef<'_, P> {
-        match self {
-            Self::Value { value, access_base } => {
-                StructuralOperandRef::Value(access_base.as_ref().unwrap_or(value))
-            }
-            Self::Handle {
-                handle,
-                access_base,
-            } => StructuralOperandRef::Handle {
-                handle,
-                access_base,
-            },
-            Self::Parameter { name, access_base } => {
-                StructuralOperandRef::Parameter { name, access_base }
-            }
-        }
-    }
-
-    pub(crate) fn explicit_access_base(&self) -> Option<&Value<P>> {
+    pub(crate) fn explicit_access_base(&self) -> Option<&Value<P, B>> {
         match self {
             Self::Value { access_base, .. } => access_base.as_ref(),
             Self::Handle { access_base, .. } => Some(access_base),
@@ -2453,21 +2656,21 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
         }
     }
 
-    pub(crate) fn traversal_value(&self) -> &Value<P> {
+    pub(crate) fn traversal_value(&self) -> &Value<P, B> {
         match self {
             Self::Value { value, .. } => value,
             Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
         }
     }
 
-    pub(crate) fn traversal_value_mut(&mut self) -> &mut Value<P> {
+    pub(crate) fn traversal_value_mut(&mut self) -> &mut Value<P, B> {
         match self {
             Self::Value { value, .. } => value,
             Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
         }
     }
 
-    pub(crate) fn visit_values(&self, visitor: &mut impl FnMut(&Value<P>)) {
+    pub(crate) fn visit_values(&self, visitor: &mut impl FnMut(&Value<P, B>)) {
         match self {
             Self::Value { value, access_base } => {
                 visitor(value);
@@ -2483,7 +2686,7 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
 
     pub(crate) fn try_visit_values<E>(
         &self,
-        visitor: &mut impl FnMut(&Value<P>) -> Result<(), E>,
+        visitor: &mut impl FnMut(&Value<P, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
             Self::Value { value, access_base } => {
@@ -2501,7 +2704,7 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
 
     pub(crate) fn try_map<E>(
         &self,
-        mut map: impl FnMut(&Value<P>) -> Result<Value<P>, E>,
+        mut map: impl FnMut(&Value<P, B>) -> Result<Value<P, B>, E>,
     ) -> Result<Self, E> {
         Ok(match self {
             Self::Value { value, access_base } => Self::Value {
@@ -2524,8 +2727,8 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
 
     pub(crate) fn try_map_stage<Q: PlaceholderKind, E>(
         self,
-        map: &mut dyn FnMut(Value<P>) -> Result<Value<Q>, E>,
-    ) -> Result<StructuralOperand<Q>, E> {
+        map: &mut dyn FnMut(Value<P, B>) -> Result<Value<Q, B>, E>,
+    ) -> Result<StructuralOperand<Q, B>, E> {
         Ok(match self {
             Self::Value { value, access_base } => StructuralOperand::Value {
                 value: map(value)?,
@@ -2546,8 +2749,8 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
     }
 }
 
-impl StructuralOperand<ParserPlaceholder> {
-    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
+impl<B: BindingAddress> StructuralOperand<ParserPlaceholder, B> {
+    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle<B>) -> Self {
         let access_base = handle.access_base_value();
         Self::Handle {
             handle,
@@ -2556,8 +2759,8 @@ impl StructuralOperand<ParserPlaceholder> {
     }
 }
 
-impl<'a, P: PlaceholderKind> StructuralOperandRef<'a, P> {
-    pub(crate) fn value(self) -> &'a Value<P> {
+impl<'a, P: PlaceholderKind, B: BindingAddress> StructuralOperandRef<'a, P, B> {
+    pub(crate) fn value(self) -> &'a Value<P, B> {
         match self {
             Self::Value(value) => value,
             Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
@@ -2572,22 +2775,25 @@ impl<'a, P: PlaceholderKind> StructuralOperandRef<'a, P> {
 /// lookup without lowering it into the public value model. It is consumed by
 /// function resolution before plans or state are serialized.
 #[derive(Clone, PartialEq)]
-pub struct FunctionArgument<P: PlaceholderKind = NoPlaceholder> {
-    operand: StructuralOperand<P>,
+pub struct FunctionArgument<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    operand: StructuralOperand<P, B>,
 }
 
-impl<P: PlaceholderKind> FunctionArgument<P> {
-    pub fn from_value(value: Value<P>) -> Self {
+impl<P: PlaceholderKind, B: BindingAddress> FunctionArgument<P, B> {
+    pub fn from_value(value: Value<P, B>) -> Self {
         Self {
             operand: StructuralOperand::from_value(value),
         }
     }
 
-    pub fn value(&self) -> Option<&Value<P>> {
+    pub fn value(&self) -> Option<&Value<P, B>> {
         self.operand.value()
     }
 
-    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle> {
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle<B>> {
         self.operand.handle()
     }
 
@@ -2599,24 +2805,24 @@ impl<P: PlaceholderKind> FunctionArgument<P> {
     /// canonicalization, and diagnostic walkers. Semantic consumers must use
     /// [`Self::value`] and [`Self::handle`] so a handle cannot accidentally be
     /// treated as a value.
-    pub(crate) fn walker_value(&self) -> &Value<P> {
+    pub(crate) fn walker_value(&self) -> &Value<P, B> {
         self.operand.traversal_value()
     }
 
-    pub(crate) fn walker_value_mut(&mut self) -> &mut Value<P> {
+    pub(crate) fn walker_value_mut(&mut self) -> &mut Value<P, B> {
         self.operand.traversal_value_mut()
     }
 
     pub(crate) fn try_visit_values<E>(
         &self,
-        visit: &mut impl FnMut(&Value<P>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<P, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         self.operand.try_visit_values(visit)
     }
 
     pub(crate) fn try_map_value<E>(
         &self,
-        map: impl FnOnce(&Value<P>) -> Result<Value<P>, E>,
+        map: impl FnOnce(&Value<P, B>) -> Result<Value<P, B>, E>,
     ) -> Result<Self, E> {
         let operand = match &self.operand {
             StructuralOperand::Value { value, .. } => StructuralOperand::from_value(map(value)?),
@@ -2632,7 +2838,7 @@ impl<P: PlaceholderKind> FunctionArgument<P> {
         Ok(Self { operand })
     }
 
-    pub(crate) fn try_into_expanded(self) -> Result<FunctionArgument<NoPlaceholder>, P> {
+    pub(crate) fn try_into_expanded(self) -> Result<FunctionArgument<NoPlaceholder, B>, P> {
         let mut reject = |placeholder| Err(placeholder);
         let operand = self
             .operand
@@ -2641,16 +2847,16 @@ impl<P: PlaceholderKind> FunctionArgument<P> {
     }
 }
 
-impl FunctionArgument<ParserPlaceholder> {
-    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
+impl<B: BindingAddress> FunctionArgument<ParserPlaceholder, B> {
+    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle<B>) -> Self {
         Self {
             operand: StructuralOperand::from_handle(handle),
         }
     }
 }
 
-impl FunctionArgument<NoPlaceholder> {
-    pub(crate) fn into_placeholder_type<P: PlaceholderKind>(self) -> FunctionArgument<P> {
+impl<B: BindingAddress> FunctionArgument<NoPlaceholder, B> {
+    pub(crate) fn into_placeholder_type<P: PlaceholderKind>(self) -> FunctionArgument<P, B> {
         let operand =
             match self
                 .operand
@@ -2664,13 +2870,13 @@ impl FunctionArgument<NoPlaceholder> {
     }
 }
 
-impl<P: PlaceholderKind> From<Value<P>> for FunctionArgument<P> {
-    fn from(value: Value<P>) -> Self {
+impl<P: PlaceholderKind, B: BindingAddress> From<Value<P, B>> for FunctionArgument<P, B> {
+    fn from(value: Value<P, B>) -> Self {
         Self::from_value(value)
     }
 }
 
-impl<P: PlaceholderKind + fmt::Debug> fmt::Debug for FunctionArgument<P> {
+impl<P: PlaceholderKind + fmt::Debug, B: BindingAddress> fmt::Debug for FunctionArgument<P, B> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.operand.value_ref() {
             StructuralOperandRef::Value(value) => value.fmt(f),
@@ -2686,9 +2892,10 @@ impl<P: PlaceholderKind + fmt::Debug> fmt::Debug for FunctionArgument<P> {
     }
 }
 
-impl<P> Serialize for FunctionArgument<P>
+impl<P, B> Serialize for FunctionArgument<P, B>
 where
     P: PlaceholderKind + Serialize,
+    B: BindingAddress + Serialize,
 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.operand.value_ref() {
@@ -2704,12 +2911,13 @@ where
     }
 }
 
-impl<'de, P> Deserialize<'de> for FunctionArgument<P>
+impl<'de, P, B> Deserialize<'de> for FunctionArgument<P, B>
 where
     P: PlaceholderKind + Deserialize<'de>,
+    B: BindingAddress + Deserialize<'de>,
 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Value::<P>::deserialize(deserializer).map(Self::from_value)
+        Value::<P, B>::deserialize(deserializer).map(Self::from_value)
     }
 }
 
@@ -2748,6 +2956,13 @@ impl DiagnosticSourceLine {
     }
 }
 
+impl Hash for DiagnosticSourceLine {
+    fn hash<H: Hasher>(&self, _state: &mut H) {
+        // Source positions are excluded from value identity. Hashing must
+        // follow the same rule as `PartialEq`.
+    }
+}
+
 impl From<usize> for DiagnosticSourceLine {
     fn from(line: usize) -> Self {
         Self::authored(line)
@@ -2764,6 +2979,81 @@ impl PartialEq for DiagnosticSourceLine {
 }
 
 impl Eq for DiagnosticSourceLine {}
+
+/// Parser-only source provenance for one binding-bearing syntax node.
+///
+/// The path and line are diagnostic metadata: they never participate in
+/// equality, hashing, or serialization. Deserialized and programmatically
+/// constructed values therefore remain semantically identical to authored
+/// values while parser-produced nodes can still point an error at the exact
+/// source expression.
+#[derive(Debug, Clone, Default)]
+struct DiagnosticSourceLocation {
+    source_file: Option<std::path::PathBuf>,
+    source_line: DiagnosticSourceLine,
+}
+
+impl DiagnosticSourceLocation {
+    fn authored(source_file: &std::path::Path, source_line: usize) -> Self {
+        Self {
+            source_file: Some(source_file.to_path_buf()),
+            source_line: DiagnosticSourceLine::authored(source_line),
+        }
+    }
+
+    fn owned(&self) -> Option<(Option<std::path::PathBuf>, usize)> {
+        self.source_line
+            .get()
+            .map(|line| (self.source_file.clone(), line))
+    }
+}
+
+impl PartialEq for DiagnosticSourceLocation {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticSourceLocation {}
+
+impl Hash for DiagnosticSourceLocation {
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
+}
+
+/// Diagnostic source slots aligned with [`Directives::depends_on`].
+///
+/// This wrapper is public only because `Directives` is publicly
+/// constructible. Its contents have no public constructor and are populated
+/// exclusively by the parser. The wrapper deliberately compares equal for
+/// every value so diagnostic provenance cannot become configuration identity.
+#[derive(Debug, Clone, Default)]
+pub struct DiagnosticSourceLocations(Vec<DiagnosticSourceLocation>);
+
+impl DiagnosticSourceLocations {
+    pub(crate) fn authored(
+        source_file: &std::path::Path,
+        source_lines: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        Self(
+            source_lines
+                .into_iter()
+                .map(|line| DiagnosticSourceLocation::authored(source_file, line))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn get_owned(&self, index: usize) -> Option<(Option<std::path::PathBuf>, usize)> {
+        self.0.get(index).and_then(DiagnosticSourceLocation::owned)
+    }
+}
+
+impl PartialEq for DiagnosticSourceLocations {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticSourceLocations {}
 
 /// Authored parser span attached to a value-shaped node for diagnostics.
 ///
@@ -2975,31 +3265,34 @@ impl fmt::Display for UnavailableReason {
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
-pub enum DeferredValue<P: PlaceholderKind = NoPlaceholder> {
+pub enum DeferredValue<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     /// A value-level `if` whose condition depends on a reusable module
     /// argument. Module expansion selects a branch after call-site
     /// substitution; it cannot cross the expansion boundary.
-    ModuleIf(Box<crate::parser::DeferredValueIf<P>>),
+    ModuleIf(Box<crate::parser::DeferredValueIf<P, B>>),
     /// Reference to another resource's attribute via an access path.
-    ResourceRef { path: AccessPath },
+    ResourceRef { path: AccessPath<B> },
     /// Reference to a binding without an attribute selector.
-    BindingRef { binding: String },
+    BindingRef { binding: B },
     /// Null/missing coalescing deferred until the left operand's resolution
     /// boundary can distinguish a definitive absence from an unknown value.
     Coalesce {
-        value: Box<Value<P>>,
-        default: Box<Value<P>>,
+        value: Box<Value<P, B>>,
+        default: Box<Value<P, B>>,
     },
     /// A typed binary Int expression that is evaluated once both operands are
     /// available. This is an intrinsic node, not a hidden built-in call.
-    IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
+    IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P, B>),
     /// String interpolation: `"prefix-${expr}-suffix"`
-    Interpolation(Vec<InterpolationPart<P>>),
+    Interpolation(Vec<InterpolationPart<P, B>>),
     /// Built-in function call: `join("-", ["a", "b"])` or via pipe
     /// `["a", "b"] |> join("-")`. Evaluated during reference resolution.
     FunctionCall {
         name: crate::builtins::BuiltinFunction,
-        args: Vec<FunctionArgument<P>>,
+        args: Vec<FunctionArgument<P, B>>,
         /// One-based authored line, or `None` for a synthetic/deserialized
         /// call. Diagnostic metadata is excluded from equality and serde by
         /// [`DiagnosticSourceLine`].
@@ -3013,7 +3306,7 @@ pub enum DeferredValue<P: PlaceholderKind = NoPlaceholder> {
     /// the saved expression is evaluated again.
     Unavailable {
         name: crate::builtins::BuiltinFunction,
-        args: Vec<FunctionArgument<P>>,
+        args: Vec<FunctionArgument<P, B>>,
         reason: UnavailableReason,
         /// One-based authored line, or `None` for a synthetic node.
         source_line: DiagnosticSourceLine,
@@ -3022,20 +3315,21 @@ pub enum DeferredValue<P: PlaceholderKind = NoPlaceholder> {
     /// been resolved. Unlike `FunctionCall`, this node never consults the
     /// function table of whichever later consumer happens to evaluate it.
     ResolvedFunctionCall {
-        function: std::sync::Arc<crate::parser::UserFunction>,
+        function: std::sync::Arc<crate::parser::UserFunction<B>>,
         /// Lexical function scope captured with `function`. Function bodies
         /// may call sibling helpers after this outer call is deferred.
-        functions: std::sync::Arc<std::collections::HashMap<String, crate::parser::UserFunction>>,
-        args: Vec<FunctionArgument<P>>,
+        functions:
+            std::sync::Arc<std::collections::HashMap<String, crate::parser::UserFunction<B>>>,
+        args: Vec<FunctionArgument<P, B>>,
         source_line: DiagnosticSourceLine,
     },
     /// Field/index access whose base is not concrete yet. Once `base`
     /// resolves, the resolver applies `step` through
     /// [`apply_value_path_segment`].
-    Access(AccessExpr<P>),
+    Access(AccessExpr<P, B>),
     /// A secret value. The inner value is sent to the provider but
     /// stored as an Argon2id hash in state.
-    Secret(Box<Value<P>>),
+    Secret(Box<Value<P, B>>),
     /// An opaque secret hash loaded from persisted state or a serialized
     /// saved plan.
     ///
@@ -3046,12 +3340,12 @@ pub enum DeferredValue<P: PlaceholderKind = NoPlaceholder> {
     /// The DSL parser has no syntax that can construct it.
     RedactedSecret { hash: RedactedSecretHash },
     /// A value not known at plan time. RFC #2371.
-    Unknown(ApplyTimeUnknown),
+    Unknown(ApplyTimeUnknown<B>),
     /// A stage-specific slot that must be consumed at its phase boundary.
     Placeholder(P),
 }
 
-impl<P: PlaceholderKind> DeferredValue<P> {
+impl<P: PlaceholderKind, B: BindingAddress> DeferredValue<P, B> {
     /// Project a pending or unsuccessfully attempted built-in call onto the
     /// representation shared by persistence, identity, and display.
     ///
@@ -3059,7 +3353,7 @@ impl<P: PlaceholderKind> DeferredValue<P> {
     /// the function and resolved arguments are its stable value material.
     pub fn as_function_call_parts(
         &self,
-    ) -> Option<(crate::builtins::BuiltinFunction, &[FunctionArgument<P>])> {
+    ) -> Option<(crate::builtins::BuiltinFunction, &[FunctionArgument<P, B>])> {
         match self {
             Self::ModuleIf(_) => None,
             Self::FunctionCall { name, args, .. } => Some((*name, args)),
@@ -3093,8 +3387,11 @@ enum LoopAccessDisplayRoot {
 }
 
 #[derive(Clone)]
-pub struct AccessExpr<P: PlaceholderKind = NoPlaceholder> {
-    base: Box<Value<P>>,
+pub struct AccessExpr<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    base: Box<Value<P, B>>,
     step: PathSegment,
     source_line: usize,
     /// Parser-only authored root for deferred-for diagnostics (`item` in
@@ -3103,8 +3400,8 @@ pub struct AccessExpr<P: PlaceholderKind = NoPlaceholder> {
     display_root: Option<LoopAccessDisplayRoot>,
 }
 
-impl<P: PlaceholderKind> AccessExpr<P> {
-    pub fn base(&self) -> &Value<P> {
+impl<P: PlaceholderKind, B: BindingAddress> AccessExpr<P, B> {
+    pub fn base(&self) -> &Value<P, B> {
         &self.base
     }
 
@@ -3149,12 +3446,12 @@ impl<P: PlaceholderKind> AccessExpr<P> {
     /// is retained when the result remains deferred.
     pub(crate) fn rebuild_result(
         &self,
-        base: Value<P>,
+        base: Value<P, B>,
         step: PathSegment,
         miss_policy: AccessMissPolicy,
-    ) -> Result<ValuePathSegmentResult<P>, ValueAccessError> {
+    ) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
         apply_value_path_segment(base, step, self.source_line, miss_policy).map(|result| {
-            let restore_display_root = |value: Value<P>| match &self.display_root {
+            let restore_display_root = |value: Value<P, B>| match &self.display_root {
                 Some(LoopAccessDisplayRoot::Rooted(root))
                     if matches!(
                         &value,
@@ -3185,19 +3482,19 @@ impl<P: PlaceholderKind> AccessExpr<P> {
 
     pub(crate) fn rebuild(
         &self,
-        base: Value<P>,
+        base: Value<P, B>,
         step: PathSegment,
         miss_policy: AccessMissPolicy,
-    ) -> Result<Value<P>, ValueAccessError> {
+    ) -> Result<Value<P, B>, ValueAccessError> {
         self.rebuild_result(base, step, miss_policy)
             .and_then(ValuePathSegmentResult::into_value)
     }
 
     pub(crate) fn rebuild_with_base(
         &self,
-        base: Value<P>,
+        base: Value<P, B>,
         miss_policy: AccessMissPolicy,
-    ) -> Result<Value<P>, ValueAccessError> {
+    ) -> Result<Value<P, B>, ValueAccessError> {
         self.rebuild(base, self.step.clone(), miss_policy)
     }
 
@@ -3207,7 +3504,7 @@ impl<P: PlaceholderKind> AccessExpr<P> {
     /// placeholders are being substituted. The fallback may never be chosen,
     /// so a concrete missing-field error must remain dormant until `??`
     /// selects it at a later resolution boundary.
-    pub(crate) fn rebuild_lazy_with_base(&self, base: Value<P>) -> Value<P> {
+    pub(crate) fn rebuild_lazy_with_base(&self, base: Value<P, B>) -> Value<P, B> {
         Value::Deferred(DeferredValue::Access(Self {
             base: Box::new(base),
             step: self.step.clone(),
@@ -3222,7 +3519,7 @@ impl<P: PlaceholderKind> AccessExpr<P> {
     }
 }
 
-impl<P: PlaceholderKind> Value<P> {
+impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
     /// Whether this value is the one syntactic shape for which `??` may
     /// interpret a missing selection as absence: a direct reference, or an
     /// access chain whose base is itself a direct reference.
@@ -3256,15 +3553,31 @@ impl<P: PlaceholderKind> Value<P> {
     /// Collect the root binding names referenced anywhere in this value.
     /// Resource references and bare binding references share this one helper
     /// so dependency and diagnostic callers cannot drift.
-    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
         let mut roots = std::collections::BTreeSet::new();
         self.visit_resource_refs(&mut |path| {
-            roots.insert(path.binding().to_string());
+            roots.insert(path.binding_address().clone());
         });
         self.visit_binding_refs(&mut |binding| {
-            roots.insert(binding.to_string());
+            roots.insert(binding.clone());
         });
         roots
+    }
+
+    /// Return the authored source of the first resource-reference node whose
+    /// root is `binding`. Programmatic and deserialized references have no
+    /// diagnostic source and return `None`.
+    pub(crate) fn diagnostic_source_for_root_binding(
+        &self,
+        binding: &B,
+    ) -> Option<(Option<std::path::PathBuf>, usize)> {
+        let mut source = None;
+        self.visit_resource_refs(&mut |path| {
+            if source.is_none() && path.binding_address() == binding {
+                source = path.diagnostic_source_owned();
+            }
+        });
+        source
     }
 
     /// Whether this value contains no runtime-deferred computation.
@@ -3337,44 +3650,45 @@ impl<P: PlaceholderKind> Value<P> {
     }
 }
 
-impl<P> Serialize for DeferredValue<P>
+impl<P, B> Serialize for DeferredValue<P, B>
 where
     P: PlaceholderKind + Serialize,
+    B: BindingAddress + Serialize,
 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         #[serde(untagged)]
-        enum SerializableUnknown<'a> {
-            ApplyTime(&'a ApplyTimeUnknown),
+        enum SerializableUnknown<'a, B: BindingAddress> {
+            ApplyTime(&'a ApplyTimeUnknown<B>),
             LoopSlot(LoopSlot),
         }
 
         #[derive(Serialize)]
-        enum SerializableDeferredValue<'a, P: PlaceholderKind> {
+        enum SerializableDeferredValue<'a, P: PlaceholderKind, B: BindingAddress> {
             ResourceRef {
-                path: &'a AccessPath,
+                path: &'a AccessPath<B>,
             },
             BindingRef {
-                binding: &'a str,
+                binding: &'a B,
             },
             Coalesce {
-                value: &'a Value<P>,
-                default: &'a Value<P>,
+                value: &'a Value<P, B>,
+                default: &'a Value<P, B>,
             },
-            IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<P>),
-            Interpolation(&'a [InterpolationPart<P>]),
+            IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<P, B>),
+            Interpolation(&'a [InterpolationPart<P, B>]),
             FunctionCall {
                 name: &'a str,
-                args: &'a [FunctionArgument<P>],
+                args: &'a [FunctionArgument<P, B>],
             },
             Access {
-                base: &'a Value<P>,
+                base: &'a Value<P, B>,
                 step: &'a PathSegment,
             },
             RedactedSecret {
                 hash: &'a RedactedSecretHash,
             },
-            Unknown(SerializableUnknown<'a>),
+            Unknown(SerializableUnknown<'a, B>),
             Placeholder(&'a P),
         }
 
@@ -3383,15 +3697,13 @@ where
                 "module-template conditional cannot be serialized before expansion",
             )),
             Self::ResourceRef { path } => {
-                let value: SerializableDeferredValue<'_, P> =
+                let value: SerializableDeferredValue<'_, P, B> =
                     SerializableDeferredValue::ResourceRef { path };
                 value.serialize(serializer)
             }
             Self::BindingRef { binding } => {
-                let value: SerializableDeferredValue<'_, P> =
-                    SerializableDeferredValue::BindingRef {
-                        binding: binding.as_str(),
-                    };
+                let value: SerializableDeferredValue<'_, P, B> =
+                    SerializableDeferredValue::BindingRef { binding };
                 value.serialize(serializer)
             }
             Self::Coalesce { value, default } => {
@@ -3423,69 +3735,71 @@ where
                 "raw secret values cannot be serialized; redact or materialize them at the typed boundary",
             )),
             Self::RedactedSecret { hash } => {
-                let value: SerializableDeferredValue<'_, P> =
+                let value: SerializableDeferredValue<'_, P, B> =
                     SerializableDeferredValue::RedactedSecret { hash };
                 value.serialize(serializer)
             }
             Self::Unknown(reason) => {
-                let value: SerializableDeferredValue<'_, P> =
+                let value: SerializableDeferredValue<'_, P, B> =
                     SerializableDeferredValue::Unknown(SerializableUnknown::ApplyTime(reason));
                 value.serialize(serializer)
             }
             Self::Placeholder(placeholder) => match placeholder.loop_slot() {
                 Some(slot) => {
-                    SerializableDeferredValue::<P>::Unknown(SerializableUnknown::LoopSlot(slot))
+                    SerializableDeferredValue::<P, B>::Unknown(SerializableUnknown::LoopSlot(slot))
                         .serialize(serializer)
                 }
-                None => SerializableDeferredValue::Placeholder(placeholder).serialize(serializer),
+                None => SerializableDeferredValue::<P, B>::Placeholder(placeholder)
+                    .serialize(serializer),
             },
         }
     }
 }
 
-impl<'de, P> Deserialize<'de> for DeferredValue<P>
+impl<'de, P, B> Deserialize<'de> for DeferredValue<P, B>
 where
     P: PlaceholderKind + Deserialize<'de>,
+    B: BindingAddress + Deserialize<'de>,
 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum DeserializableUnknown {
-            ApplyTime(ApplyTimeUnknown),
+        enum DeserializableUnknown<B: BindingAddress> {
+            ApplyTime(ApplyTimeUnknown<B>),
             LoopSlot(LoopSlot),
         }
 
         #[derive(Deserialize)]
-        enum DeserializableDeferredValue<P: PlaceholderKind> {
+        enum DeserializableDeferredValue<P: PlaceholderKind, B: BindingAddress> {
             ResourceRef {
-                path: AccessPath,
+                path: AccessPath<B>,
             },
             BindingRef {
-                binding: String,
+                binding: B,
             },
             Coalesce {
-                value: Box<Value<P>>,
-                default: Box<Value<P>>,
+                value: Box<Value<P, B>>,
+                default: Box<Value<P, B>>,
             },
-            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
-            Interpolation(Vec<InterpolationPart<P>>),
+            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P, B>),
+            Interpolation(Vec<InterpolationPart<P, B>>),
             FunctionCall {
                 name: String,
-                args: Vec<FunctionArgument<P>>,
+                args: Vec<FunctionArgument<P, B>>,
             },
             Access {
-                base: Box<Value<P>>,
+                base: Box<Value<P, B>>,
                 step: PathSegment,
             },
-            Secret(Box<Value<P>>),
+            Secret(Box<Value<P, B>>),
             RedactedSecret {
                 hash: RedactedSecretHash,
             },
-            Unknown(DeserializableUnknown),
+            Unknown(DeserializableUnknown<B>),
             Placeholder(P),
         }
 
-        match DeserializableDeferredValue::deserialize(deserializer)? {
+        match DeserializableDeferredValue::<P, B>::deserialize(deserializer)? {
             DeserializableDeferredValue::ResourceRef { path } => Ok(Self::ResourceRef { path }),
             DeserializableDeferredValue::BindingRef { binding } => Ok(Self::BindingRef { binding }),
             DeserializableDeferredValue::Coalesce { value, default } => {
@@ -3538,20 +3852,21 @@ where
     }
 }
 
-impl<'de, P> Deserialize<'de> for Value<P>
+impl<'de, P, B> Deserialize<'de> for Value<P, B>
 where
     P: PlaceholderKind + Deserialize<'de>,
+    B: BindingAddress + Deserialize<'de>,
 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum DeserializableUnknown {
-            ApplyTime(ApplyTimeUnknown),
+        enum DeserializableUnknown<B: BindingAddress> {
+            ApplyTime(ApplyTimeUnknown<B>),
             LoopSlot(LoopSlot),
         }
 
         #[derive(Deserialize)]
-        enum DeserializableValue<P: PlaceholderKind> {
+        enum DeserializableValue<P: PlaceholderKind, B: BindingAddress> {
             String(ValueString),
             EnumIdentifier(RawEnumIdentifier),
             CanonicalEnum(CanonicalEnumValue),
@@ -3560,34 +3875,34 @@ where
             Bool(bool),
             #[serde(with = "duration_secs")]
             Duration(std::time::Duration),
-            List(Vec<Value<P>>),
+            List(Vec<Value<P, B>>),
             StringList(Vec<ValueString>),
-            Map(IndexMap<String, Value<P>>),
+            Map(IndexMap<String, Value<P, B>>),
             ResourceRef {
-                path: AccessPath,
+                path: AccessPath<B>,
             },
             BindingRef {
-                binding: String,
+                binding: B,
             },
             Coalesce {
-                value: Box<Value<P>>,
-                default: Box<Value<P>>,
+                value: Box<Value<P, B>>,
+                default: Box<Value<P, B>>,
             },
-            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
-            Interpolation(Vec<InterpolationPart<P>>),
+            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P, B>),
+            Interpolation(Vec<InterpolationPart<P, B>>),
             FunctionCall {
                 name: String,
-                args: Vec<FunctionArgument<P>>,
+                args: Vec<FunctionArgument<P, B>>,
             },
             Access {
-                base: Box<Value<P>>,
+                base: Box<Value<P, B>>,
                 step: PathSegment,
             },
-            Secret(Box<Value<P>>),
+            Secret(Box<Value<P, B>>),
             RedactedSecret {
                 hash: RedactedSecretHash,
             },
-            Unknown(DeserializableUnknown),
+            Unknown(DeserializableUnknown<B>),
             Placeholder(P),
         }
 
@@ -3666,7 +3981,7 @@ where
     }
 }
 
-impl<P: PlaceholderKind + fmt::Debug> fmt::Debug for DeferredValue<P> {
+impl<P: PlaceholderKind + fmt::Debug, B: BindingAddress> fmt::Debug for DeferredValue<P, B> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::ModuleIf(deferred) => f.debug_tuple("ModuleIf").field(deferred).finish(),
@@ -4460,7 +4775,11 @@ impl fmt::Debug for RedactedSecretHash {
 /// `Value` because lists and maps can mix concrete and deferred
 /// elements (e.g. `["literal", vpc.id]`).
 #[derive(Debug)]
-pub enum ConcreteValueRef<'a, P: PlaceholderKind = NoPlaceholder> {
+pub enum ConcreteValueRef<
+    'a,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     String(&'a ValueString),
     /// See `ConcreteValue::EnumIdentifier`.
     EnumIdentifier(&'a RawEnumIdentifier),
@@ -4469,20 +4788,20 @@ pub enum ConcreteValueRef<'a, P: PlaceholderKind = NoPlaceholder> {
     Float(f64),
     Bool(bool),
     Duration(std::time::Duration),
-    List(&'a [Value<P>]),
+    List(&'a [Value<P, B>]),
     StringList(&'a [ValueString]),
-    Map(&'a IndexMap<String, Value<P>>),
+    Map(&'a IndexMap<String, Value<P, B>>),
 }
 
-impl<P: PlaceholderKind> Copy for ConcreteValueRef<'_, P> {}
+impl<P: PlaceholderKind, B: BindingAddress> Copy for ConcreteValueRef<'_, P, B> {}
 
-impl<P: PlaceholderKind> Clone for ConcreteValueRef<'_, P> {
+impl<P: PlaceholderKind, B: BindingAddress> Clone for ConcreteValueRef<'_, P, B> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, P: PlaceholderKind> ConcreteValueRef<'a, P> {
+impl<'a, P: PlaceholderKind, B: BindingAddress> ConcreteValueRef<'a, P, B> {
     /// Return the inner `&str` for either textual variant at call sites where
     /// source shape is deliberately irrelevant (for example, generic custom
     /// scalar validation). Enum-aware formatting, comparison, and resolution
@@ -4497,7 +4816,7 @@ impl<'a, P: PlaceholderKind> ConcreteValueRef<'a, P> {
     }
 }
 
-impl<P: PlaceholderKind> ConcreteValue<P> {
+impl<P: PlaceholderKind, B: BindingAddress> ConcreteValue<P, B> {
     /// Build a parser-surface enum identifier from source/display text.
     ///
     /// This is a raw-value convenience API for parsers and tests. Durable
@@ -4518,43 +4837,47 @@ impl<P: PlaceholderKind> ConcreteValue<P> {
 ///
 /// Phase 1 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972).
 #[derive(Debug, Clone, Copy)]
-pub enum DeferredValueRef<'a, P: PlaceholderKind = NoPlaceholder> {
-    ModuleIf(&'a crate::parser::DeferredValueIf<P>),
+pub enum DeferredValueRef<
+    'a,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    ModuleIf(&'a crate::parser::DeferredValueIf<P, B>),
     ResourceRef {
-        path: &'a AccessPath,
+        path: &'a AccessPath<B>,
     },
     BindingRef {
-        binding: &'a str,
+        binding: &'a B,
     },
     Coalesce {
-        value: &'a Value<P>,
-        default: &'a Value<P>,
+        value: &'a Value<P, B>,
+        default: &'a Value<P, B>,
     },
-    IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<P>),
-    Interpolation(&'a [InterpolationPart<P>]),
+    IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<P, B>),
+    Interpolation(&'a [InterpolationPart<P, B>]),
     FunctionCall {
         name: &'a str,
-        args: &'a [FunctionArgument<P>],
+        args: &'a [FunctionArgument<P, B>],
         source_line: Option<NonZeroUsize>,
     },
     Unavailable {
         name: crate::builtins::BuiltinFunction,
-        args: &'a [FunctionArgument<P>],
+        args: &'a [FunctionArgument<P, B>],
         reason: &'a UnavailableReason,
         source_line: Option<NonZeroUsize>,
     },
     Access {
-        base: &'a Value<P>,
+        base: &'a Value<P, B>,
         step: &'a PathSegment,
         source_line: usize,
     },
-    Secret(&'a Value<P>),
+    Secret(&'a Value<P, B>),
     RedactedSecret(&'a RedactedSecretHash),
-    Unknown(&'a ApplyTimeUnknown),
+    Unknown(&'a ApplyTimeUnknown<B>),
     Placeholder(&'a P),
 }
 
-impl<P: PlaceholderKind> Value<P> {
+impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
     /// Whether this value tree carries any `env()`-derived string whose
     /// plaintext must be excluded from diagnostics.
     pub(crate) fn contains_diagnostic_sensitive_string(&self) -> bool {
@@ -4638,7 +4961,7 @@ impl<P: PlaceholderKind> Value<P> {
     /// cannot represent a deferred value, so the "deferred leaked
     /// into concrete-only path" bug class becomes structurally
     /// unrepresentable. See RFC #2972.
-    pub fn as_concrete(&self) -> Option<ConcreteValueRef<'_, P>> {
+    pub fn as_concrete(&self) -> Option<ConcreteValueRef<'_, P, B>> {
         match self {
             Value::Concrete(c) => Some(match c {
                 ConcreteValue::String(s) => ConcreteValueRef::String(s),
@@ -4659,7 +4982,7 @@ impl<P: PlaceholderKind> Value<P> {
     /// If this value is on the deferred axis, return a borrowing
     /// projection. Returns `None` for concrete variants. Mirror of
     /// [`Self::as_concrete`].
-    pub fn as_deferred(&self) -> Option<DeferredValueRef<'_, P>> {
+    pub fn as_deferred(&self) -> Option<DeferredValueRef<'_, P, B>> {
         match self {
             Value::Deferred(d) => Some(match d {
                 DeferredValue::ModuleIf(deferred) => DeferredValueRef::ModuleIf(deferred),
@@ -4847,7 +5170,7 @@ pub enum LoopSlot {
 
 /// Why a value remains unknown until apply or a later refresh.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ApplyTimeUnknown {
+pub enum ApplyTimeUnknown<B: BindingAddress = AbsoluteBindingAddress> {
     /// One export reached through an attribute path on an `upstream_state`
     /// binding that did not resolve (state file missing, or the export was absent).
     /// Renders as `(known after upstream apply: <path.to_dot_string()>)`.
@@ -4855,7 +5178,7 @@ pub enum ApplyTimeUnknown {
     /// chained field access (`network.accounts[0]`, `vpc.tags["Name"]`).
     // Keep the wire tag independent of the Rust variant name.
     #[serde(rename = "UpstreamRef")]
-    UpstreamExport { path: AccessPath },
+    UpstreamExport { path: AccessPath<B> },
     /// The complete set of exports from an `upstream_state` binding referenced
     /// without an attribute selector — `let v = bootstrap` (since the type-split
     /// in #2856 lowers a bare identifier to `Value::BindingRef`). Renders as
@@ -4866,7 +5189,7 @@ pub enum ApplyTimeUnknown {
     /// #2876.
     // Keep the wire tag independent of the Rust variant name.
     #[serde(rename = "UpstreamBareRef")]
-    UpstreamAllExports { binding: String },
+    UpstreamAllExports { binding: B },
     /// An apply completed, but its follow-up read did not resolve the value.
     PendingReRead(PendingReRead),
 }
@@ -5299,13 +5622,83 @@ impl PlaceholderKind for ParserPlaceholder {
     }
 }
 
-impl<P: PlaceholderKind> Value<P> {
+impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
     /// Clone this value into the placeholder-free stage, returning `None` if
     /// any placeholder remains anywhere in the tree.
-    pub fn to_expanded(&self) -> Option<Value> {
+    pub fn to_expanded(&self) -> Option<Value<NoPlaceholder, B>> {
         self.clone()
             .try_map_placeholder::<NoPlaceholder, ()>(&mut |_placeholder| Err(()))
             .ok()
+    }
+
+    /// Convert a value whose tree contains neither a stage placeholder nor a
+    /// binding-bearing node into the absolute binding phase without inventing
+    /// an address. Provider validation uses this only after withholding every
+    /// unresolved authored expression.
+    pub(crate) fn try_into_address_free_absolute(self) -> Option<Value<P, AbsoluteBindingAddress>> {
+        match self {
+            Value::Concrete(value) => Some(Value::Concrete(match value {
+                ConcreteValue::String(value) => ConcreteValue::String(value),
+                ConcreteValue::EnumIdentifier(value) => ConcreteValue::EnumIdentifier(value),
+                ConcreteValue::CanonicalEnum(value) => ConcreteValue::CanonicalEnum(value),
+                ConcreteValue::Int(value) => ConcreteValue::Int(value),
+                ConcreteValue::Float(value) => ConcreteValue::Float(value),
+                ConcreteValue::Bool(value) => ConcreteValue::Bool(value),
+                ConcreteValue::Duration(value) => ConcreteValue::Duration(value),
+                ConcreteValue::List(values) => ConcreteValue::List(
+                    values
+                        .into_iter()
+                        .map(Value::try_into_address_free_absolute)
+                        .collect::<Option<Vec<_>>>()?,
+                ),
+                ConcreteValue::StringList(values) => ConcreteValue::StringList(values),
+                ConcreteValue::Map(values) => ConcreteValue::Map(
+                    values
+                        .into_iter()
+                        .map(|(name, value)| {
+                            value
+                                .try_into_address_free_absolute()
+                                .map(|value| (name, value))
+                        })
+                        .collect::<Option<IndexMap<_, _>>>()?,
+                ),
+            })),
+            Value::Deferred(DeferredValue::Secret(value)) => Some(Value::Deferred(
+                DeferredValue::Secret(Box::new(value.try_into_address_free_absolute()?)),
+            )),
+            Value::Deferred(
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::ResourceRef { path: _ }
+                | DeferredValue::BindingRef { binding: _ }
+                | DeferredValue::Coalesce {
+                    value: _,
+                    default: _,
+                }
+                | DeferredValue::IntegerArithmetic(_)
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall {
+                    name: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::Unavailable {
+                    name: _,
+                    args: _,
+                    reason: _,
+                    source_line: _,
+                }
+                | DeferredValue::ResolvedFunctionCall {
+                    function: _,
+                    functions: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::Access(_)
+                | DeferredValue::RedactedSecret { hash: _ }
+                | DeferredValue::Unknown(_)
+                | DeferredValue::Placeholder(_),
+            ) => None,
+        }
     }
 
     pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P)) {
@@ -5379,11 +5772,11 @@ impl<P: PlaceholderKind> Value<P> {
 
     pub(crate) fn try_map_placeholder<Q: PlaceholderKind, E>(
         self,
-        map: &mut dyn FnMut(P) -> Result<Value<Q>, E>,
-    ) -> Result<Value<Q>, E> {
-        let map_argument = |argument: FunctionArgument<P>,
-                            map: &mut dyn FnMut(P) -> Result<Value<Q>, E>|
-         -> Result<FunctionArgument<Q>, E> {
+        map: &mut dyn FnMut(P) -> Result<Value<Q, B>, E>,
+    ) -> Result<Value<Q, B>, E> {
+        let map_argument = |argument: FunctionArgument<P, B>,
+                            map: &mut dyn FnMut(P) -> Result<Value<Q, B>, E>|
+         -> Result<FunctionArgument<Q, B>, E> {
             let operand = argument
                 .operand
                 .try_map_stage(&mut |value| value.try_map_placeholder(map))?;
@@ -5524,8 +5917,8 @@ impl<P: PlaceholderKind> Value<P> {
     }
 }
 
-impl Value<NoPlaceholder> {
-    pub(crate) fn into_placeholder_type<P: PlaceholderKind>(self) -> Value<P> {
+impl<B: BindingAddress> Value<NoPlaceholder, B> {
+    pub(crate) fn into_placeholder_type<P: PlaceholderKind>(self) -> Value<P, B> {
         match self.try_map_placeholder::<P, std::convert::Infallible>(&mut |never| match never {}) {
             Ok(value) => value,
             Err(never) => match never {},
@@ -5533,7 +5926,7 @@ impl Value<NoPlaceholder> {
     }
 }
 
-impl Value<ParserPlaceholder> {
+impl<B: BindingAddress> Value<ParserPlaceholder, B> {
     pub(crate) fn collect_leftover_placeholders(
         &self,
         context: LeftoverPlaceholderContext,
@@ -5562,7 +5955,7 @@ impl Value<ParserPlaceholder> {
         });
     }
 
-    pub fn into_expanded(self) -> Result<Value, LeftoverPlaceholder> {
+    pub fn into_expanded(self) -> Result<Value<NoPlaceholder, B>, LeftoverPlaceholder> {
         self.try_map_placeholder(&mut |placeholder| {
             Err(LeftoverPlaceholder {
                 placeholder,
@@ -5571,7 +5964,7 @@ impl Value<ParserPlaceholder> {
         })
     }
 
-    pub(crate) fn into_loop_template(self) -> Result<Value<LoopSlot>, LeftoverPlaceholder> {
+    pub(crate) fn into_loop_template(self) -> Result<Value<LoopSlot, B>, LeftoverPlaceholder> {
         self.try_map_placeholder(&mut |placeholder| match placeholder {
             ParserPlaceholder::Loop(slot) => Ok(Value::Deferred(DeferredValue::Placeholder(slot))),
             placeholder => Err(LeftoverPlaceholder {
@@ -5584,12 +5977,12 @@ impl Value<ParserPlaceholder> {
 
 /// Cross a string-keyed value map into the expanded stage. Resource owners
 /// may supply their id so leftover placeholders retain attribute context.
-pub fn into_expanded_value_map<C>(
-    values: impl IntoIterator<Item = (String, Value<ParserPlaceholder>)>,
+pub fn into_expanded_value_map<C, B: BindingAddress>(
+    values: impl IntoIterator<Item = (String, Value<ParserPlaceholder, B>)>,
     resource: Option<&ResourceId>,
 ) -> Result<C, LeftoverPlaceholder>
 where
-    C: FromIterator<(String, Value)>,
+    C: FromIterator<(String, Value<NoPlaceholder, B>)>,
 {
     values
         .into_iter()
@@ -5607,11 +6000,299 @@ where
 
 /// A part of a string interpolation expression
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum InterpolationPart<P: PlaceholderKind = NoPlaceholder> {
+pub enum InterpolationPart<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     /// Literal text segment
     Literal(ValueString),
     /// An expression to be evaluated and converted to string
-    Expr(Value<P>),
+    Expr(Value<P, B>),
+}
+
+pub type AuthoredDeferredValue = DeferredValue<ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedDeferredValue = DeferredValue<NoPlaceholder, AbsoluteBindingAddress>;
+pub type AuthoredInterpolationPart = InterpolationPart<ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedInterpolationPart = InterpolationPart<NoPlaceholder, AbsoluteBindingAddress>;
+pub type AuthoredApplyTimeUnknown = ApplyTimeUnknown<RelativeBindingName>;
+pub type ExpandedApplyTimeUnknown = ApplyTimeUnknown<AbsoluteBindingAddress>;
+
+impl<P: PlaceholderKind> Value<P, RelativeBindingName> {
+    pub fn resource_ref(
+        binding_name: impl Into<RelativeBindingName>,
+        attribute_name: impl Into<String>,
+        field_path: Vec<String>,
+    ) -> Self {
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_fields(binding_name, attribute_name, field_path),
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_root(self, scope: &RootScope) -> Value<P, AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn resolve_root_for_test(self) -> Value<P, AbsoluteBindingAddress> {
+        self.resolve_root(&RootScope::new())
+    }
+
+    pub fn resolve_module(self, scope: &ModuleInstanceScope) -> Value<P, AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> Value<P, AbsoluteBindingAddress> {
+        self.map_bindings(resolve)
+    }
+}
+
+impl<P: PlaceholderKind> Value<P, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        *self = self.clone().map_bindings(&mut |binding| map(&binding));
+    }
+}
+
+#[cfg(test)]
+impl Value<NoPlaceholder, AbsoluteBindingAddress> {
+    pub fn root_resource_ref(
+        binding_name: impl Into<String>,
+        attribute_name: impl Into<String>,
+        field_path: Vec<String>,
+    ) -> Self {
+        Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+            RelativeBindingName::new(binding_name.into()),
+            attribute_name,
+            field_path,
+        )
+        .resolve_root(&RootScope::new())
+    }
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
+    pub(crate) fn map_bindings<T: BindingAddress>(
+        self,
+        map: &mut impl FnMut(B) -> T,
+    ) -> Value<P, T> {
+        match self {
+            Value::Concrete(value) => Value::Concrete(value.map_bindings(map)),
+            Value::Deferred(value) => Value::Deferred(value.map_bindings(map)),
+        }
+    }
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> ConcreteValue<P, B> {
+    fn map_bindings<T: BindingAddress>(self, map: &mut impl FnMut(B) -> T) -> ConcreteValue<P, T> {
+        match self {
+            ConcreteValue::String(value) => ConcreteValue::String(value),
+            ConcreteValue::EnumIdentifier(value) => ConcreteValue::EnumIdentifier(value),
+            ConcreteValue::CanonicalEnum(value) => ConcreteValue::CanonicalEnum(value),
+            ConcreteValue::Int(value) => ConcreteValue::Int(value),
+            ConcreteValue::Float(value) => ConcreteValue::Float(value),
+            ConcreteValue::Bool(value) => ConcreteValue::Bool(value),
+            ConcreteValue::Duration(value) => ConcreteValue::Duration(value),
+            ConcreteValue::List(values) => ConcreteValue::List(
+                values
+                    .into_iter()
+                    .map(|value| value.map_bindings(map))
+                    .collect(),
+            ),
+            ConcreteValue::StringList(values) => ConcreteValue::StringList(values),
+            ConcreteValue::Map(values) => ConcreteValue::Map(
+                values
+                    .into_iter()
+                    .map(|(name, value)| (name, value.map_bindings(map)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl<P: PlaceholderKind> FunctionArgument<P, RelativeBindingName> {
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> FunctionArgument<P, AbsoluteBindingAddress> {
+        self.map_bindings(resolve)
+    }
+}
+
+impl<P: PlaceholderKind> FunctionArgument<P, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        self.operand.map_absolute_bindings(map);
+    }
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> FunctionArgument<P, B> {
+    fn map_bindings<T: BindingAddress>(
+        self,
+        map: &mut impl FnMut(B) -> T,
+    ) -> FunctionArgument<P, T> {
+        let Self { operand } = self;
+        FunctionArgument {
+            operand: operand.map_bindings(map),
+        }
+    }
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> StructuralOperand<P, B> {
+    pub(crate) fn map_bindings<T: BindingAddress>(
+        self,
+        map: &mut impl FnMut(B) -> T,
+    ) -> StructuralOperand<P, T> {
+        match self {
+            StructuralOperand::Value { value, access_base } => StructuralOperand::Value {
+                value: value.map_bindings(map),
+                access_base: access_base.map(|value| value.map_bindings(map)),
+            },
+            StructuralOperand::Handle {
+                handle,
+                access_base,
+            } => StructuralOperand::Handle {
+                handle: handle.map_bindings(map),
+                access_base: access_base.map_bindings(map),
+            },
+            StructuralOperand::Parameter { name, access_base } => StructuralOperand::Parameter {
+                name,
+                access_base: access_base.map_bindings(map),
+            },
+        }
+    }
+}
+
+impl<P: PlaceholderKind> StructuralOperand<P, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        *self = self.clone().map_bindings(&mut |binding| map(&binding));
+    }
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> DeferredValue<P, B> {
+    fn map_bindings<T: BindingAddress>(self, map: &mut impl FnMut(B) -> T) -> DeferredValue<P, T> {
+        match self {
+            DeferredValue::ModuleIf(deferred) => {
+                DeferredValue::ModuleIf(Box::new(deferred.map_bindings(map)))
+            }
+            DeferredValue::ResourceRef { path } => DeferredValue::ResourceRef {
+                path: path.map_bindings(map),
+            },
+            DeferredValue::BindingRef { binding } => DeferredValue::BindingRef {
+                binding: map(binding),
+            },
+            DeferredValue::Coalesce { value, default } => DeferredValue::Coalesce {
+                value: Box::new(value.map_bindings(map)),
+                default: Box::new(default.map_bindings(map)),
+            },
+            DeferredValue::IntegerArithmetic(expression) => {
+                DeferredValue::IntegerArithmetic(expression.map_bindings(map))
+            }
+            DeferredValue::Interpolation(parts) => DeferredValue::Interpolation(
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        InterpolationPart::Literal(value) => InterpolationPart::Literal(value),
+                        InterpolationPart::Expr(value) => {
+                            InterpolationPart::Expr(value.map_bindings(map))
+                        }
+                    })
+                    .collect(),
+            ),
+            DeferredValue::FunctionCall {
+                name,
+                args,
+                source_line,
+            } => DeferredValue::FunctionCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|argument| argument.map_bindings(map))
+                    .collect(),
+                source_line,
+            },
+            DeferredValue::Unavailable {
+                name,
+                args,
+                reason,
+                source_line,
+            } => DeferredValue::Unavailable {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|argument| argument.map_bindings(map))
+                    .collect(),
+                reason,
+                source_line,
+            },
+            DeferredValue::ResolvedFunctionCall {
+                function,
+                functions,
+                args,
+                source_line,
+            } => {
+                let function = (*function).clone().map_bindings(map);
+                let functions = functions
+                    .iter()
+                    .map(|(name, function)| (name.clone(), function.clone().map_bindings(map)))
+                    .collect();
+                DeferredValue::ResolvedFunctionCall {
+                    function: Arc::new(function),
+                    functions: Arc::new(functions),
+                    args: args
+                        .into_iter()
+                        .map(|argument| argument.map_bindings(map))
+                        .collect(),
+                    source_line,
+                }
+            }
+            DeferredValue::Access(access) => {
+                let AccessExpr {
+                    base,
+                    step,
+                    source_line,
+                    display_root,
+                } = access;
+                DeferredValue::Access(AccessExpr {
+                    base: Box::new(base.map_bindings(map)),
+                    step,
+                    source_line,
+                    display_root,
+                })
+            }
+            DeferredValue::Secret(value) => {
+                DeferredValue::Secret(Box::new(value.map_bindings(map)))
+            }
+            DeferredValue::RedactedSecret { hash } => DeferredValue::RedactedSecret { hash },
+            DeferredValue::Unknown(reason) => DeferredValue::Unknown(reason.map_bindings(map)),
+            DeferredValue::Placeholder(placeholder) => DeferredValue::Placeholder(placeholder),
+        }
+    }
+}
+
+impl<B: BindingAddress> ApplyTimeUnknown<B> {
+    fn map_bindings<T: BindingAddress>(self, map: &mut impl FnMut(B) -> T) -> ApplyTimeUnknown<T> {
+        match self {
+            ApplyTimeUnknown::UpstreamExport { path } => ApplyTimeUnknown::UpstreamExport {
+                path: path.map_bindings(map),
+            },
+            ApplyTimeUnknown::UpstreamAllExports { binding } => {
+                ApplyTimeUnknown::UpstreamAllExports {
+                    binding: map(binding),
+                }
+            }
+            ApplyTimeUnknown::PendingReRead(value) => ApplyTimeUnknown::PendingReRead(value),
+        }
+    }
 }
 
 /// `PartialEq` for `Value` is hand-rolled (not derived) to enforce one
@@ -5624,7 +6305,7 @@ pub enum InterpolationPart<P: PlaceholderKind = NoPlaceholder> {
 /// argument token is the sole exception: fixed-point directory parsing must
 /// be able to recognize the same lexical placeholder across passes, and it is
 /// always substituted before values reach the differ. See RFC #2371.
-impl<P: PlaceholderKind + PartialEq> PartialEq for Value<P> {
+impl<P: PlaceholderKind + PartialEq, B: BindingAddress> PartialEq for Value<P, B> {
     fn eq(&self, other: &Self) -> bool {
         if let (Value::Deferred(left), Value::Deferred(right)) = (self, other)
             && let (Some((left_name, left_args)), Some((right_name, right_args))) = (
@@ -5760,8 +6441,10 @@ impl<P: PlaceholderKind + PartialEq> PartialEq for Value<P> {
 /// fold simple `Expr(scalar)` into a `Literal` (consuming the scalar's
 /// string), merge adjacent `Literal`s, and collapse the result to
 /// `Value::String` when no `Expr` parts remain.
-fn canonicalize_interpolation<P: PlaceholderKind>(parts: Vec<InterpolationPart<P>>) -> Value<P> {
-    let mut merged: Vec<InterpolationPart<P>> = Vec::with_capacity(parts.len());
+fn canonicalize_interpolation<P: PlaceholderKind, B: BindingAddress>(
+    parts: Vec<InterpolationPart<P, B>>,
+) -> Value<P, B> {
+    let mut merged: Vec<InterpolationPart<P, B>> = Vec::with_capacity(parts.len());
     let mut contains_folded_secret = false;
     for part in parts {
         let next = match part {
@@ -5814,7 +6497,9 @@ fn canonicalize_interpolation<P: PlaceholderKind>(parts: Vec<InterpolationPart<P
 /// A scalar inside `Secret(_)` is folded through the same conversion and
 /// reports that provenance to the caller, which wraps the completed
 /// interpolation in `Secret` rather than dropping the sensitivity tag.
-fn value_into_literal<P: PlaceholderKind>(v: Value<P>) -> Result<(ValueString, bool), Value<P>> {
+fn value_into_literal<P: PlaceholderKind, B: BindingAddress>(
+    v: Value<P, B>,
+) -> Result<(ValueString, bool), Value<P, B>> {
     match v {
         Value::Concrete(ConcreteValue::String(s)) => Ok((s, false)),
         Value::Concrete(ConcreteValue::Int(n)) => Ok((n.to_string().into(), false)),
@@ -5835,7 +6520,7 @@ pub enum ResourceRefUsage {
     CoalesceValue,
 }
 
-impl<P: PlaceholderKind> Value<P> {
+impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
     /// Recursively normalize this `Value` so that downstream code does not
     /// have to handle redundant `Interpolation` shapes.
     ///
@@ -5855,7 +6540,7 @@ impl<P: PlaceholderKind> Value<P> {
     /// unchanged. The transformation is idempotent.
     ///
     /// See #2227.
-    pub fn canonicalize(mut self) -> Value<P> {
+    pub fn canonicalize(mut self) -> Value<P, B> {
         self.canonicalize_in_place();
         self
     }
@@ -5930,22 +6615,6 @@ impl<P: PlaceholderKind> Value<P> {
         }
     }
 
-    /// Create a `ResourceRef` from binding name, attribute name, and optional field path.
-    ///
-    /// `attribute_name` must be non-empty. A bare-binding reference (no
-    /// `.attr`) is a [`Value::BindingRef`], not a `ResourceRef` with an
-    /// empty attribute — see #2847 for the regression that motivated
-    /// the type-level split.
-    pub fn resource_ref(
-        binding_name: impl Into<ValueString>,
-        attribute_name: impl Into<String>,
-        field_path: Vec<String>,
-    ) -> Self {
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_fields(binding_name, attribute_name, field_path),
-        })
-    }
-
     /// If this is a `ResourceRef`, returns the binding name.
     pub fn ref_binding(&self) -> Option<&str> {
         match self {
@@ -5975,7 +6644,7 @@ impl<P: PlaceholderKind> Value<P> {
     ///
     /// Companion: `visit_binding_refs` for bare `BindingRef` names. A consumer that
     /// needs both must call both — drift is visible at the call site.
-    pub fn visit_resource_refs(&self, f: &mut impl FnMut(&AccessPath)) {
+    pub fn visit_resource_refs(&self, f: &mut impl FnMut(&AccessPath<B>)) {
         self.visit_resource_refs_with_usage(&mut |path, _usage| f(path));
     }
 
@@ -5988,7 +6657,7 @@ impl<P: PlaceholderKind> Value<P> {
     /// `a ?? (b ?? c)`. References nested in computations remain required.
     pub fn visit_resource_refs_with_usage(
         &self,
-        f: &mut impl FnMut(&AccessPath, ResourceRefUsage),
+        f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage),
     ) {
         self.visit_resource_refs_with_usage_inner(ResourceRefUsage::Required, f);
     }
@@ -5996,7 +6665,7 @@ impl<P: PlaceholderKind> Value<P> {
     fn visit_resource_refs_with_usage_inner(
         &self,
         usage: ResourceRefUsage,
-        f: &mut impl FnMut(&AccessPath, ResourceRefUsage),
+        f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage),
     ) {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
@@ -6089,7 +6758,7 @@ impl<P: PlaceholderKind> Value<P> {
     ///
     /// Companion: `visit_resource_refs` for `ResourceRef` access paths. A consumer
     /// that needs both must call both — drift is visible at the call site.
-    pub fn visit_binding_refs(&self, f: &mut impl FnMut(&str)) {
+    pub fn visit_binding_refs(&self, f: &mut impl FnMut(&B)) {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 deferred
@@ -6171,14 +6840,14 @@ impl<P: PlaceholderKind> Value<P> {
 /// values must run `carina_core::resolver::resolve_refs_with_state_and_remote`
 /// (or an equivalent) first. See #1683 for a regression caused by assuming
 /// this method performed resolution.
-pub fn attrs_to_hashmap<P: PlaceholderKind>(
-    attrs: &IndexMap<String, Value<P>>,
-) -> HashMap<String, Value<P>> {
+pub fn attrs_to_hashmap<P: PlaceholderKind, B: BindingAddress>(
+    attrs: &IndexMap<String, Value<P, B>>,
+) -> HashMap<String, Value<P, B>> {
     attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 /// Check if a Value contains any ResourceRef (possibly nested)
-pub fn contains_resource_ref<P: PlaceholderKind>(value: &Value<P>) -> bool {
+pub fn contains_resource_ref<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
     let mut found = false;
     value.visit_resource_refs(&mut |_| found = true);
     found
@@ -6237,8 +6906,8 @@ pub(crate) enum UnavailableSecretPolicy {
 
 /// Find the first built-in evaluation that was attempted and definitively
 /// failed, using the caller's explicit coalesce and secret traversal policy.
-pub(crate) fn find_unavailable_evaluation<P: PlaceholderKind>(
-    value: &Value<P>,
+pub(crate) fn find_unavailable_evaluation<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
     coalesce_policy: UnavailableCoalescePolicy,
     secret_policy: UnavailableSecretPolicy,
 ) -> Option<(
@@ -6246,8 +6915,8 @@ pub(crate) fn find_unavailable_evaluation<P: PlaceholderKind>(
     &UnavailableReason,
     DiagnosticSourceLine,
 )> {
-    fn find<P: PlaceholderKind>(
-        value: &Value<P>,
+    fn find<P: PlaceholderKind, B: BindingAddress>(
+        value: &Value<P, B>,
         coalesce_policy: UnavailableCoalescePolicy,
         secret_policy: UnavailableSecretPolicy,
         inside_secret: bool,
@@ -6326,12 +6995,12 @@ pub(crate) fn find_unavailable_evaluation<P: PlaceholderKind>(
     find(value, coalesce_policy, secret_policy, false)
 }
 
-impl Value {
+impl<B: BindingAddress> Value<NoPlaceholder, B> {
     /// Semantic equality: for Lists, compares as multisets (order-insensitive);
     /// for Maps, compares values recursively with semantic equality;
     /// for single-element List([Map]) vs Map, treats them as equivalent (bare struct);
     /// for all other variants, falls back to PartialEq.
-    pub fn semantically_equal(&self, other: &Value) -> bool {
+    pub fn semantically_equal(&self, other: &Value<NoPlaceholder, B>) -> bool {
         match (self, other) {
             (Value::Concrete(ConcreteValue::List(a)), Value::Concrete(ConcreteValue::List(b))) => {
                 lists_equal(a, b)
@@ -6499,7 +7168,10 @@ impl Value {
 
 /// Compare two maps using semantic equality for their values.
 /// This ensures nested lists within maps are compared order-insensitively.
-fn maps_semantically_equal(a: &IndexMap<String, Value>, b: &IndexMap<String, Value>) -> bool {
+fn maps_semantically_equal<B: BindingAddress>(
+    a: &IndexMap<String, Value<NoPlaceholder, B>>,
+    b: &IndexMap<String, Value<NoPlaceholder, B>>,
+) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -6517,7 +7189,10 @@ const HASH_THRESHOLD: usize = 20;
 ///
 /// For small lists (< 20 elements), uses O(n^2) matching.
 /// For large lists, uses hash-based bucketing to achieve O(n) average case.
-fn lists_equal(a: &[Value], b: &[Value]) -> bool {
+fn lists_equal<B: BindingAddress>(
+    a: &[Value<NoPlaceholder, B>],
+    b: &[Value<NoPlaceholder, B>],
+) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -6528,7 +7203,10 @@ fn lists_equal(a: &[Value], b: &[Value]) -> bool {
 }
 
 /// O(n^2) multiset comparison for small lists.
-fn lists_equal_quadratic(a: &[Value], b: &[Value]) -> bool {
+fn lists_equal_quadratic<B: BindingAddress>(
+    a: &[Value<NoPlaceholder, B>],
+    b: &[Value<NoPlaceholder, B>],
+) -> bool {
     let mut matched = vec![false; b.len()];
     for item_a in a {
         let mut found = false;
@@ -6549,7 +7227,10 @@ fn lists_equal_quadratic(a: &[Value], b: &[Value]) -> bool {
 /// Hash-based multiset comparison for large lists.
 /// Groups elements by hash, then does quadratic matching only within same-hash buckets.
 /// Average case O(n), worst case O(n^2) on hash collisions.
-fn lists_equal_hashed(a: &[Value], b: &[Value]) -> bool {
+fn lists_equal_hashed<B: BindingAddress>(
+    a: &[Value<NoPlaceholder, B>],
+    b: &[Value<NoPlaceholder, B>],
+) -> bool {
     // Build hash buckets for b
     let mut b_buckets: HashMap<u64, Vec<usize>> = HashMap::new();
     for (j, item) in b.iter().enumerate() {
@@ -7556,8 +8237,9 @@ impl PreventDestroy {
 /// These are instructions to Carina about how to handle the resource,
 /// not metadata about the resource itself. The provider-visible subset
 /// mirrors the WIT `directives` record; host-only fields remain outside it.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Directives {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "B: Serialize", deserialize = "B: Deserialize<'de>"))]
+pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
     /// If true, force-delete the resource (e.g., non-empty S3 buckets)
     #[serde(default)]
     pub force_delete: bool,
@@ -7573,7 +8255,12 @@ pub struct Directives {
     /// Set semantics (deduplicated, order-insensitive); represented as
     /// Vec to preserve source order for `carina fmt` round-tripping.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<B>,
+    /// Parser-only source locations aligned with `depends_on`. This is skipped
+    /// by serde and ignored by equality; programmatic callers should leave it
+    /// at its default value.
+    #[serde(skip, default)]
+    pub depends_on_diagnostic_sources: DiagnosticSourceLocations,
     /// Authored attribute paths whose external changes Carina must preserve.
     /// These remain syntax-only until resolved against the resource schema.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -7584,6 +8271,84 @@ pub struct Directives {
     /// routing land in Phase 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
+}
+
+pub type AuthoredDirectives = Directives<RelativeBindingName>;
+pub type ExpandedDirectives = Directives<AbsoluteBindingAddress>;
+
+impl<B: BindingAddress> Directives<B> {
+    /// Move every directive field across a binding-address phase boundary.
+    ///
+    /// Callers resolve the public dependency addresses, while this defining
+    /// module alone carries the private authored destruction setting into the
+    /// new phase.
+    pub(crate) fn with_resolved_depends_on<C: BindingAddress>(
+        self,
+        depends_on: Vec<C>,
+    ) -> Directives<C> {
+        let Self {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            depends_on: _depends_on,
+            depends_on_diagnostic_sources,
+            ignore_changes,
+            provider_instance,
+        } = self;
+        Directives {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            depends_on,
+            depends_on_diagnostic_sources,
+            ignore_changes,
+            provider_instance,
+        }
+    }
+}
+
+impl Directives<RelativeBindingName> {
+    fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> Directives<AbsoluteBindingAddress> {
+        let depends_on = self.depends_on.iter().cloned().map(resolve).collect();
+        self.with_resolved_depends_on(depends_on)
+    }
+}
+
+impl Directives<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            force_delete: _force_delete,
+            create_before_destroy: _create_before_destroy,
+            prevent_destroy: _prevent_destroy,
+            depends_on,
+            depends_on_diagnostic_sources: _depends_on_diagnostic_sources,
+            ignore_changes: _ignore_changes,
+            provider_instance: _provider_instance,
+        } = self;
+        for binding in depends_on {
+            *binding = map(binding);
+        }
+    }
+}
+
+impl<B: BindingAddress> Default for Directives<B> {
+    fn default() -> Self {
+        Self {
+            force_delete: false,
+            create_before_destroy: false,
+            prevent_destroy: PreventDestroy::default(),
+            depends_on: Vec::new(),
+            depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
+            ignore_changes: Vec::new(),
+            provider_instance: None,
+        }
+    }
 }
 
 /// State-file projection of [`Directives`].
@@ -7600,7 +8365,7 @@ pub struct PersistedDirectives {
     #[serde(default)]
     prevent_destroy: PreventDestroy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<AbsoluteBindingAddress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
 }
@@ -7646,7 +8411,7 @@ impl Display for PersistedDirectiveField {
 enum PersistedDirectiveFieldValue {
     Boolean(bool),
     PreventDestroy(PreventDestroy),
-    DependsOn(BTreeSet<String>),
+    DependsOn(BTreeSet<AbsoluteBindingAddress>),
     ProviderInstance(Option<String>),
 }
 
@@ -7685,7 +8450,7 @@ impl PersistedDirectiveFieldChange {
     }
 }
 
-impl Directives {
+impl<B: BindingAddress> Directives<B> {
     pub fn with_force_delete(mut self, value: bool) -> Self {
         self.force_delete = value;
         self
@@ -7696,7 +8461,7 @@ impl Directives {
         self
     }
 
-    pub fn with_depends_on(mut self, depends_on: Vec<String>) -> Self {
+    pub fn with_depends_on(mut self, depends_on: Vec<B>) -> Self {
         self.depends_on = depends_on;
         self
     }
@@ -7836,12 +8601,12 @@ fn prevent_destroy_label(value: PreventDestroy) -> &'static str {
     }
 }
 
-fn bindings_label(bindings: &BTreeSet<String>) -> String {
+fn bindings_label(bindings: &BTreeSet<AbsoluteBindingAddress>) -> String {
     format!(
         "[{}]",
         bindings
             .iter()
-            .map(String::as_str)
+            .map(AbsoluteBindingAddress::as_str)
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -7851,13 +8616,14 @@ fn provider_instance_label(provider_instance: Option<&str>) -> String {
     provider_instance.unwrap_or("unspecified").to_string()
 }
 
-impl From<&Directives> for PersistedDirectives {
-    fn from(directives: &Directives) -> Self {
+impl From<&ExpandedDirectives> for PersistedDirectives {
+    fn from(directives: &ExpandedDirectives) -> Self {
         let Directives {
             force_delete,
             create_before_destroy,
             prevent_destroy,
             depends_on,
+            depends_on_diagnostic_sources: _depends_on_diagnostic_sources,
             ignore_changes: _ignore_changes,
             provider_instance,
         } = directives;
@@ -7871,13 +8637,13 @@ impl From<&Directives> for PersistedDirectives {
     }
 }
 
-impl From<Directives> for PersistedDirectives {
-    fn from(directives: Directives) -> Self {
+impl From<ExpandedDirectives> for PersistedDirectives {
+    fn from(directives: ExpandedDirectives) -> Self {
         Self::from(&directives)
     }
 }
 
-impl From<&PersistedDirectives> for Directives {
+impl From<&PersistedDirectives> for ExpandedDirectives {
     fn from(directives: &PersistedDirectives) -> Self {
         let PersistedDirectives {
             force_delete,
@@ -7891,25 +8657,26 @@ impl From<&PersistedDirectives> for Directives {
             create_before_destroy: *create_before_destroy,
             prevent_destroy: *prevent_destroy,
             depends_on: depends_on.clone(),
+            depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
             ignore_changes: Vec::new(),
             provider_instance: provider_instance.clone(),
         }
     }
 }
 
-impl From<PersistedDirectives> for Directives {
+impl From<PersistedDirectives> for ExpandedDirectives {
     fn from(directives: PersistedDirectives) -> Self {
         Self::from(&directives)
     }
 }
 
-impl PartialEq<Directives> for PersistedDirectives {
-    fn eq(&self, other: &Directives) -> bool {
+impl PartialEq<ExpandedDirectives> for PersistedDirectives {
+    fn eq(&self, other: &ExpandedDirectives) -> bool {
         self == &Self::from(other)
     }
 }
 
-impl PartialEq<PersistedDirectives> for Directives {
+impl PartialEq<PersistedDirectives> for ExpandedDirectives {
     fn eq(&self, other: &PersistedDirectives) -> bool {
         other == self
     }
@@ -7960,6 +8727,15 @@ impl ModuleInstanceScope {
             key: format!("{}.{}", self.key, child.key),
             display,
         }
+    }
+
+    /// Resolve one module-authored name into this instance's absolute scope.
+    pub fn resolve(&self, relative: RelativeBindingName) -> AbsoluteBindingAddress {
+        let spelling = ValueString::derived_from(
+            format!("{}.{}", self.key, relative.as_str()),
+            [relative.value_string()],
+        );
+        AbsoluteBindingAddress::from_scope(spelling)
     }
 
     pub(crate) fn remap_prefix(&self, from: &str, to: &str) -> Self {
@@ -8194,6 +8970,21 @@ impl Hash for ModuleSource {
 }
 
 impl ModuleSource {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        match self {
+            Self::Root => {}
+            Self::Module(ModuleCallSource {
+                name: _name,
+                instance: _instance,
+                scope: _scope,
+                call_path,
+            }) => call_path.map_absolute_bindings(map),
+        }
+    }
+
     pub(crate) fn expanded_module(
         name: impl Into<String>,
         instance: impl Into<String>,
@@ -8283,10 +9074,14 @@ impl DefaultTagKeys {
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize, P: PlaceholderKind + Serialize",
-    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>"
+    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize",
+    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>"
 ))]
-pub struct Resource<S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
+pub struct Resource<
+    S = ModuleSource,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     ///
@@ -8294,12 +9089,12 @@ pub struct Resource<S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
     /// the user wrote attributes in the `.crn` file. Anything that
     /// re-renders attributes — diagnostic messages, formatter output,
     /// plan display, snapshot tests — depends on this stability (#2222).
-    pub attributes: IndexMap<String, Value<P>>,
+    pub attributes: IndexMap<String, Value<P, B>>,
     /// `directives` meta-argument block: Carina-side instructions for
     /// how to handle this resource (force-delete, create-before-destroy,
     /// prevent-destroy).
-    #[serde(default)]
-    pub directives: Directives,
+    #[serde(default = "Directives::<B>::default")]
+    pub directives: Directives<B>,
     /// Schema-resolved host lifecycle metadata. Persisted resources carry only
     /// the authored directive; every saved-plan load resolves it again after
     /// checking the provider schema fingerprint.
@@ -8311,7 +9106,7 @@ pub struct Resource<S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
     pub prefixes: HashMap<String, String>,
     /// Binding name from `let` bindings in DSL (e.g., `let vpc = ...`)
     #[serde(default)]
-    pub binding: Option<String>,
+    pub binding: Option<B>,
     /// Binding names of resources this resource depends on (via ResourceRef).
     ///
     /// Set semantics (BTreeSet): the same binding referenced multiple times
@@ -8319,7 +9114,7 @@ pub struct Resource<S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
     /// iteration is alphabetically sorted so consumers (plan display,
     /// state files) see a deterministic order. See #2228.
     #[serde(default)]
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: BTreeSet<B>,
     /// Module source info for resources that belong to a module
     #[serde(default)]
     pub module_source: Option<S>,
@@ -8361,6 +9156,109 @@ pub struct Resource<S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
 /// display-only [`SavedModuleSource`] metadata rather than a live call path.
 pub type SavedResource = Resource<SavedModuleSource>;
 
+/// Parser/module-definition form before scope expansion.
+pub type AuthoredResource<S = ModuleSource> = Resource<S, ParserPlaceholder, RelativeBindingName>;
+pub type ExpandedResource<S = ModuleSource> = Resource<S, NoPlaceholder, AbsoluteBindingAddress>;
+
+impl<S, P: PlaceholderKind> Resource<S, P, RelativeBindingName> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_root(self, scope: &RootScope) -> Resource<S, P, AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn resolve_root_for_test(self) -> Resource<S, P, AbsoluteBindingAddress> {
+        self.resolve_root(&RootScope::new())
+    }
+
+    pub fn resolve_module(
+        self,
+        scope: &ModuleInstanceScope,
+    ) -> Resource<S, P, AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> Resource<S, P, AbsoluteBindingAddress> {
+        let Self {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        } = self;
+        Resource {
+            id,
+            attributes: attributes
+                .into_iter()
+                .map(|(name, value)| (name, value.resolve_bindings(resolve)))
+                .collect(),
+            directives: directives.resolve_bindings(resolve),
+            resolved_ignore_changes,
+            prefixes,
+            binding: binding.map(&mut *resolve),
+            dependency_bindings: dependency_bindings.into_iter().map(resolve).collect(),
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        }
+    }
+
+    pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
+        self.binding = Some(RelativeBindingName::new(binding.into()));
+        self
+    }
+
+    pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
+        self.dependency_bindings = deps.into_iter().map(RelativeBindingName::new).collect();
+        self
+    }
+}
+
+impl<P: PlaceholderKind> Resource<ModuleSource, P, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            id: _id,
+            attributes,
+            directives,
+            resolved_ignore_changes: _resolved_ignore_changes,
+            prefixes: _prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys: _default_tag_keys,
+            loop_provenance: _loop_provenance,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = self;
+        for value in attributes.values_mut() {
+            value.map_absolute_bindings(map);
+        }
+        directives.map_absolute_bindings(map);
+        if let Some(binding) = binding {
+            *binding = map(binding);
+        }
+        *dependency_bindings = std::mem::take(dependency_bindings)
+            .into_iter()
+            .map(|binding| map(&binding))
+            .collect();
+        if let Some(source) = module_source {
+            source.map_absolute_bindings(map);
+        }
+    }
+}
+
 /// Source-neutral resource payload exposed to provider normalizers and CRUD
 /// request construction.
 pub type ProviderResource = Resource<ProviderModuleSource>;
@@ -8371,8 +9269,10 @@ impl From<Resource> for ProviderResource {
     }
 }
 
-impl<P: PlaceholderKind> From<Resource<ModuleSource, P>> for Resource<SavedModuleSource, P> {
-    fn from(resource: Resource<ModuleSource, P>) -> Self {
+impl<P: PlaceholderKind, B: BindingAddress> From<Resource<ModuleSource, P, B>>
+    for Resource<SavedModuleSource, P, B>
+{
+    fn from(resource: Resource<ModuleSource, P, B>) -> Self {
         let Resource {
             id,
             attributes,
@@ -8402,8 +9302,8 @@ impl<P: PlaceholderKind> From<Resource<ModuleSource, P>> for Resource<SavedModul
     }
 }
 
-impl<S> Resource<S, ParserPlaceholder> {
-    pub fn into_expanded(self) -> Result<Resource<S>, LeftoverPlaceholder> {
+impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
+    pub fn into_expanded(self) -> Result<Resource<S, NoPlaceholder, B>, LeftoverPlaceholder> {
         let Resource {
             id,
             attributes,
@@ -8434,8 +9334,10 @@ impl<S> Resource<S, ParserPlaceholder> {
     }
 }
 
-impl<S> Resource<S, ParserPlaceholder> {
-    pub(crate) fn into_loop_template(self) -> Result<Resource<S, LoopSlot>, LeftoverPlaceholder> {
+impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
+    pub(crate) fn into_loop_template(
+        self,
+    ) -> Result<Resource<S, LoopSlot, B>, LeftoverPlaceholder> {
         let Resource {
             id,
             attributes,
@@ -8474,7 +9376,7 @@ impl<S> Resource<S, ParserPlaceholder> {
     }
 }
 
-impl<P: PlaceholderKind> Resource<ModuleSource, P> {
+impl<P: PlaceholderKind, B: BindingAddress> Resource<ModuleSource, P, B> {
     pub fn from_id(id: ResourceId) -> Self {
         Self {
             id,
@@ -8536,7 +9438,7 @@ impl<P: PlaceholderKind> Resource<ModuleSource, P> {
     }
 }
 
-impl<S: Clone, P: PlaceholderKind> Resource<S, P> {
+impl<S: Clone, P: PlaceholderKind, B: BindingAddress> Resource<S, P, B> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut resource = self.clone();
         resource.id = self.id.instantiate_pending();
@@ -8698,45 +9600,68 @@ impl<S> Resource<S> {
     }
 }
 
-impl<S, P: PlaceholderKind> Resource<S, P> {
+impl<S, P: PlaceholderKind, B: BindingAddress> Resource<S, P, B> {
     /// Returns the attributes projected to a `HashMap`.
-    pub fn resolved_attributes(&self) -> HashMap<String, Value<P>> {
+    pub fn resolved_attributes(&self) -> HashMap<String, Value<P, B>> {
         self.attributes
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
     }
 
-    pub fn get_attr(&self, key: &str) -> Option<&Value<P>> {
+    pub fn get_attr(&self, key: &str) -> Option<&Value<P, B>> {
         self.attributes.get(key)
     }
 
-    pub fn get_attr_mut(&mut self, key: &str) -> Option<&mut Value<P>> {
+    pub fn get_attr_mut(&mut self, key: &str) -> Option<&mut Value<P, B>> {
         self.attributes.get_mut(key)
     }
 
-    pub fn set_attr(&mut self, key: impl Into<String>, value: Value<P>) {
+    pub fn set_attr(&mut self, key: impl Into<String>, value: Value<P, B>) {
         self.attributes.insert(key.into(), value);
     }
 
-    pub fn with_attribute(mut self, key: impl Into<String>, value: Value<P>) -> Self {
+    pub fn with_attribute(mut self, key: impl Into<String>, value: Value<P, B>) -> Self {
         self.attributes.insert(key.into(), value);
         self
     }
 
-    pub fn with_value_attributes(mut self, attrs: HashMap<String, Value<P>>) -> Self {
+    pub fn with_value_attributes(mut self, attrs: HashMap<String, Value<P, B>>) -> Self {
         self.attributes = attrs.into_iter().collect();
         self
     }
+}
 
-    pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
-        self.binding = Some(binding.into());
+impl<S, P: PlaceholderKind> Resource<S, P, AbsoluteBindingAddress> {
+    pub fn with_absolute_binding(mut self, binding: AbsoluteBindingAddress) -> Self {
+        self.binding = Some(binding);
         self
     }
 
-    pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
+    pub fn with_absolute_dependency_bindings(
+        mut self,
+        deps: BTreeSet<AbsoluteBindingAddress>,
+    ) -> Self {
         self.dependency_bindings = deps;
         self
+    }
+}
+
+#[cfg(test)]
+impl<S> Resource<S> {
+    pub fn with_root_binding(self, binding: impl Into<String>) -> Self {
+        self.with_absolute_binding(
+            RootScope::new().resolve(RelativeBindingName::new(binding.into())),
+        )
+    }
+
+    pub fn with_root_dependency_bindings(self, deps: BTreeSet<String>) -> Self {
+        let root = RootScope::new();
+        self.with_absolute_dependency_bindings(
+            deps.into_iter()
+                .map(|binding| root.resolve(RelativeBindingName::new(binding)))
+                .collect(),
+        )
     }
 }
 
@@ -8871,7 +9796,8 @@ mod enum_attr_tests {
     #[test]
     fn attribute_absent_is_ok_none() {
         let schema = schema_with_status();
-        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+        let resource: Resource =
+            Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
         assert!(matches!(
             resource.get_enum_attr(&schema, "status"),
@@ -8882,7 +9808,8 @@ mod enum_attr_tests {
     #[test]
     fn missing_schema_attribute_is_an_error() {
         let schema = schema_with_status();
-        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+        let resource: Resource =
+            Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
         assert!(matches!(
             resource.get_enum_attr(&schema, "missing"),
@@ -9271,7 +10198,8 @@ mod enum_attr_tests {
         let schema = schema_with_options(vec![
             StructField::optional("dns_support", status_enum_type()).build(),
         ]);
-        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+        let resource: Resource =
+            Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
         assert!(matches!(
             resource.get_enum_struct_field(&schema, "options", "dns_support"),
@@ -9330,7 +10258,8 @@ mod enum_attr_tests {
             )
             .build(),
         );
-        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+        let resource: Resource =
+            Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
         assert!(matches!(
             resource.get_enum_struct_field(&schema, "options", "dns_support"),
@@ -9379,7 +10308,8 @@ mod enum_attr_tests {
         let schema = schema_with_options(vec![
             StructField::optional("dns_support", AttributeType::string()).build(),
         ]);
-        let resource = Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
+        let resource: Resource =
+            Resource::with_provider("aws", "s3.BucketVersioning", "example", None);
 
         assert!(matches!(
             resource.get_enum_struct_field(&schema, "options", "dns_support"),
@@ -9572,7 +10502,7 @@ pub(crate) fn assert_value_fully_resolved(
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             Err(crate::value::SerializationError::UnresolvedResourceRef {
-                path: binding.clone(),
+                path: binding.to_string(),
                 context,
             })
         }
@@ -9605,7 +10535,7 @@ pub(crate) fn assert_value_fully_resolved(
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(crate::value::SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context,
             })
         }
@@ -9910,7 +10840,10 @@ impl Current {
         }
     }
 
-    pub fn set_dependency_bindings(&mut self, dependency_bindings: BTreeSet<String>) {
+    pub fn set_dependency_bindings(
+        &mut self,
+        dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
+    ) {
         match self {
             Self::Absent(state) => state.0.dependency_bindings = dependency_bindings,
             Self::Present(present) => {
@@ -10250,7 +11183,7 @@ pub struct State {
     /// Used by the executor to determine delete ordering during replace operations.
     ///
     /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
-    pub dependency_bindings: BTreeSet<String>,
+    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
     /// Present when this state came from a partial-success create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_read: Option<PartialReadMarker>,
@@ -10284,9 +11217,19 @@ impl State {
         self
     }
 
-    pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
+    pub fn with_dependency_bindings(mut self, deps: BTreeSet<AbsoluteBindingAddress>) -> Self {
         self.dependency_bindings = deps;
         self
+    }
+
+    #[cfg(test)]
+    pub fn with_root_dependency_bindings(self, deps: BTreeSet<String>) -> Self {
+        let root = RootScope::new();
+        self.with_dependency_bindings(
+            deps.into_iter()
+                .map(|binding| root.resolve(RelativeBindingName::new(binding)))
+                .collect(),
+        )
     }
 
     /// Reconstruct plan-time unknowns from the partial-read marker.
@@ -10316,14 +11259,20 @@ pub mod persistent_id;
 
 pub(crate) use composition::CompositionRuntimeRef;
 pub use composition::{
-    CompositionCall, CompositionCallPath, CompositionSourceIdentityError,
-    CompositionSourceIdentityResolver, LiveComposition, LiveCompositionArgument,
-    LiveCompositionAttribute, LiveCompositionSignature, ModuleConstraintId,
-    PendingModuleConstraint, SavedComposition, SavedCompositionArgument, SavedCompositionAttribute,
-    SavedCompositionOriginId, SavedCompositionSignature, SavedModuleCallId,
+    AuthoredCompositionCall, AuthoredCompositionCallPath, AuthoredLiveComposition,
+    AuthoredLiveCompositionArgument, AuthoredLiveCompositionAttribute,
+    AuthoredLiveCompositionSignature, CompositionCall, CompositionCallPath,
+    CompositionSourceIdentityError, CompositionSourceIdentityResolver, ExpandedCompositionCall,
+    ExpandedCompositionCallPath, ExpandedLiveComposition, ExpandedLiveCompositionArgument,
+    ExpandedLiveCompositionAttribute, ExpandedLiveCompositionSignature, LiveComposition,
+    LiveCompositionArgument, LiveCompositionAttribute, LiveCompositionSignature,
+    ModuleConstraintId, PendingModuleConstraint, SavedComposition, SavedCompositionArgument,
+    SavedCompositionAttribute, SavedCompositionOriginId, SavedCompositionSignature,
+    SavedModuleCallId,
 };
 pub use data_source::{
-    DataSource, ProviderDataSource, ResolvedDataSource, SavedDataSource, SavedResolvedDataSource,
+    AuthoredDataSource, DataSource, ExpandedDataSource, ProviderDataSource, ResolvedDataSource,
+    SavedDataSource, SavedResolvedDataSource,
 };
 pub use expansion_trace::{CallSite, ExpansionTrace};
 pub use graph_node::GraphNode;

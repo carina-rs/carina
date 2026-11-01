@@ -19,12 +19,12 @@ use crate::binding_index::IterableBindings;
 use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandleMetadata};
 use crate::provider_source::ProviderSource;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, ForLoopElement, FunctionArgument,
-    GraphNode, LeafNode, LeftoverPlaceholderContext, LeftoverPlaceholderPolicy,
-    LeftoverPlaceholders, LiveComposition, LoopSlot, ModuleSource, NoPlaceholder,
-    ParserPlaceholder, PathSegment, PlaceholderKind, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, ResourceIdentityError, SavedModuleSource, StructuralOperand,
-    StructuralOperandRef, UnboundLoopTemplate, Value,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DataSource, DeferredValue, Directives,
+    ForLoopElement, FunctionArgument, GraphNode, LeafNode, LeftoverPlaceholderContext,
+    LeftoverPlaceholderPolicy, LeftoverPlaceholders, LiveComposition, LoopSlot, ModuleSource,
+    NoPlaceholder, ParserPlaceholder, PathSegment, PlaceholderKind, RelativeBindingName,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, ResourceIdentityError, RootScope,
+    SavedModuleSource, StructuralOperand, StructuralOperandRef, UnboundLoopTemplate, Value,
 };
 use crate::static_type::{ConsumerStaticType, ExportStaticType};
 use crate::version_constraint::VersionConstraint;
@@ -33,42 +33,39 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Typed identity of the draft resource that represents a bound deferred
-/// `for` before its iterable materializes.
-///
-/// Construction is private to [`BoundDeferredTarget`], which is the only
-/// production code that spells the placeholder suffix.
+/// A bound deferred template address keeps its binding phase while retaining
+/// the distinct resource identity used for the draft resource.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DeferredForTemplateAddress(ResourceIdentity);
+pub struct DeferredForTemplateAddress<B: BindingAddress = AbsoluteBindingAddress> {
+    binding: B,
+    identity: ResourceIdentity,
+}
 
-impl DeferredForTemplateAddress {
+impl<B: BindingAddress> DeferredForTemplateAddress<B> {
     pub(crate) fn resource_identity(&self) -> &ResourceIdentity {
-        &self.0
+        &self.identity
     }
 
     fn matches_resource_identity(&self, identity: &ResourceIdentity) -> bool {
-        &self.0 == identity
+        &self.identity == identity
     }
 
-    fn as_str(&self) -> &str {
-        self.0.as_str()
+    pub(crate) fn binding_address(&self) -> &B {
+        &self.binding
     }
 }
 
-impl std::fmt::Display for DeferredForTemplateAddress {
+impl<B: BindingAddress> std::fmt::Display for DeferredForTemplateAddress<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
+        std::fmt::Display::fmt(&self.binding, f)
     }
 }
 
-/// Bound destination of a deferred `for` expression.
-///
-/// The authored binding and its template address are validated and cached
-/// together. The address cannot be constructed independently.
+/// The target's binding and derived template address cannot disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BoundDeferredTarget {
-    binding: ResourceIdentity,
-    template_address: DeferredForTemplateAddress,
+pub struct BoundDeferredTarget<B: BindingAddress = AbsoluteBindingAddress> {
+    binding: B,
+    template_address: DeferredForTemplateAddress<B>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -79,9 +76,11 @@ pub enum BoundDeferredTargetError {
     TrailingIndex,
 }
 
-impl BoundDeferredTarget {
-    pub fn new(binding: impl Into<String>) -> Result<Self, BoundDeferredTargetError> {
-        let binding = ResourceIdentity::try_from(binding.into())?;
+impl<B: BindingAddress> BoundDeferredTarget<B> {
+    pub fn new(binding: B) -> Result<Self, BoundDeferredTargetError> {
+        if binding.as_str().is_empty() {
+            return Err(ResourceIdentityError::Empty.into());
+        }
         let final_segment = binding.as_str().rsplit('.').next().unwrap_or_default();
         if final_segment.contains('[') || final_segment.ends_with(']') {
             return Err(BoundDeferredTargetError::TrailingIndex);
@@ -89,32 +88,40 @@ impl BoundDeferredTarget {
         Ok(Self::from_unindexed_binding(binding))
     }
 
-    fn from_unindexed_binding(binding: ResourceIdentity) -> Self {
-        let final_segment = binding.as_str().rsplit('.').next().unwrap_or_default();
-        debug_assert!(!final_segment.contains('[') && !final_segment.ends_with(']'));
-        let template_address =
-            DeferredForTemplateAddress(ResourceIdentity::new(format!("{}[?]", binding.as_str())));
+    fn from_unindexed_binding(binding: B) -> Self {
+        let template_binding =
+            crate::resource::binding_address::deferred_template_binding(&binding);
+        let template_address = DeferredForTemplateAddress {
+            identity: ResourceIdentity::new(template_binding.as_str()),
+            binding: template_binding,
+        };
         Self {
             binding,
             template_address,
         }
     }
 
-    pub(super) fn from_parser_binding(binding: &ParserBindingName) -> Self {
-        Self::from_unindexed_binding(ResourceIdentity::new(binding.as_str()))
-    }
-
-    pub(crate) fn with_instance_prefix(&self, prefix: &str) -> Self {
-        let binding = ResourceIdentity::new(format!("{prefix}.{}", self.binding()));
-        Self::from_unindexed_binding(binding)
-    }
-
     pub fn binding(&self) -> &str {
         self.binding.as_str()
     }
 
-    pub fn template_address(&self) -> &DeferredForTemplateAddress {
+    pub fn binding_address(&self) -> &B {
+        &self.binding
+    }
+
+    pub fn template_address(&self) -> &DeferredForTemplateAddress<B> {
         &self.template_address
+    }
+
+    pub(crate) fn map_bindings<T: BindingAddress>(
+        self,
+        map: &mut impl FnMut(B) -> T,
+    ) -> BoundDeferredTarget<T> {
+        let Self {
+            binding,
+            template_address: _template_address,
+        } = self;
+        BoundDeferredTarget::from_unindexed_binding(map(binding))
     }
 
     pub(crate) fn template_resource_id(
@@ -130,44 +137,38 @@ impl BoundDeferredTarget {
             provider_instance,
         )
     }
+}
 
-    fn scheduler_identity(&self) -> &ResourceIdentity {
-        &self.binding
+impl BoundDeferredTarget<RelativeBindingName> {
+    pub(super) fn from_parser_binding(binding: &ParserBindingName) -> Self {
+        Self::from_unindexed_binding(RelativeBindingName::new(binding.as_str()))
     }
 }
 
-impl serde::Serialize for BoundDeferredTarget {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+impl<B: BindingAddress + serde::Serialize> serde::Serialize for BoundDeferredTarget<B> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(serde::Serialize)]
-        struct Wire<'a> {
-            binding: &'a ResourceIdentity,
+        struct Wire<'a, B> {
+            binding: &'a B,
         }
-
-        serde::Serialize::serialize(
-            &Wire {
-                binding: &self.binding,
-            },
-            serializer,
-        )
+        Wire {
+            binding: &self.binding,
+        }
+        .serialize(serializer)
     }
 }
 
-impl<'de> serde::Deserialize<'de> for BoundDeferredTarget {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
+impl<'de, B: BindingAddress + serde::Deserialize<'de>> serde::Deserialize<'de>
+    for BoundDeferredTarget<B>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Wire {
-            binding: String,
+        struct Wire<B> {
+            binding: B,
         }
-
-        let wire = Wire::deserialize(deserializer)?;
-        Self::new(wire.binding).map_err(serde::de::Error::custom)
+        let Wire { binding } = Wire::deserialize(deserializer)?;
+        Self::new(binding).map_err(serde::de::Error::custom)
     }
 }
 
@@ -175,31 +176,33 @@ impl<'de> serde::Deserialize<'de> for BoundDeferredTarget {
 /// anonymous resources carrying migration-only loop provenance.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum DeferredForTarget {
-    Bound(BoundDeferredTarget),
+pub enum DeferredForTarget<B: BindingAddress = AbsoluteBindingAddress> {
+    Bound(BoundDeferredTarget<B>),
     Unbound { template: UnboundLoopTemplate },
 }
 
-impl DeferredForTarget {
-    pub fn bound(binding: impl Into<String>) -> Result<Self, BoundDeferredTargetError> {
+impl<B: BindingAddress> DeferredForTarget<B> {
+    pub fn bound(binding: B) -> Result<Self, BoundDeferredTargetError> {
         BoundDeferredTarget::new(binding).map(Self::Bound)
     }
 
-    pub fn bound_binding(&self) -> Option<&str> {
+    pub fn bound_binding_address(&self) -> Option<&B> {
         match self {
-            Self::Bound(target) => Some(target.binding()),
-            Self::Unbound { .. } => None,
+            Self::Bound(target) => Some(target.binding_address()),
+            Self::Unbound {
+                template: _template,
+            } => None,
         }
     }
 
-    pub fn scheduler_key(&self) -> &str {
-        self.scheduler_identity().as_str()
+    pub fn bound_binding(&self) -> Option<&str> {
+        self.bound_binding_address().map(BindingAddress::as_str)
     }
 
-    fn scheduler_identity(&self) -> &ResourceIdentity {
+    pub fn scheduler_key(&self) -> &str {
         match self {
-            Self::Bound(target) => target.scheduler_identity(),
-            Self::Unbound { template } => template.scheduler_identity(),
+            Self::Bound(target) => target.binding(),
+            Self::Unbound { template } => template.scheduler_key(),
         }
     }
 
@@ -216,9 +219,18 @@ impl DeferredForTarget {
             (Self::Unbound { template: left }, Self::Unbound { template: right }) => {
                 left.same_system_target(right)
             }
-            (Self::Bound(_), Self::Unbound { .. }) | (Self::Unbound { .. }, Self::Bound(_)) => {
-                false
-            }
+            (
+                Self::Bound(_bound),
+                Self::Unbound {
+                    template: _template,
+                },
+            )
+            | (
+                Self::Unbound {
+                    template: _template,
+                },
+                Self::Bound(_bound),
+            ) => false,
         }
     }
 
@@ -251,13 +263,17 @@ impl DeferredForTarget {
 /// refreshed from the owning target. Read access sees the materialized
 /// resource. Its display type is a cache derived from the immutable id fields.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeferredForTemplateResource<S = ModuleSource, P: PlaceholderKind = LoopSlot> {
-    resource: Resource<S, P>,
+pub struct DeferredForTemplateResource<
+    S = ModuleSource,
+    P: PlaceholderKind = LoopSlot,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    resource: Resource<S, P, B>,
     display_type: String,
 }
 
-impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
-    pub(crate) fn new(resource: Resource<S, P>) -> Self {
+impl<S, P: PlaceholderKind, B: BindingAddress> DeferredForTemplateResource<S, P, B> {
+    pub(crate) fn new(resource: Resource<S, P, B>) -> Self {
         let display_type = resource.id.display_type();
         Self {
             resource,
@@ -265,7 +281,7 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
         }
     }
 
-    fn into_materialized_for_target(mut self, target: &DeferredForTarget) -> Self {
+    fn into_materialized_for_target(mut self, target: &DeferredForTarget<B>) -> Self {
         materialize_template_address(target, &mut self.resource);
         self.display_type = self.resource.id.display_type();
         self
@@ -275,7 +291,7 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
         &self.resource.id
     }
 
-    pub fn as_resource(&self) -> &Resource<S, P> {
+    pub fn as_resource(&self) -> &Resource<S, P, B> {
         &self.resource
     }
 
@@ -295,19 +311,23 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
         self.resource.id.provider_instance.as_deref()
     }
 
-    pub fn attributes(&self) -> &IndexMap<String, Value<P>> {
+    pub fn attributes(&self) -> &IndexMap<String, Value<P, B>> {
         &self.resource.attributes
     }
 
-    pub fn directives(&self) -> &Directives {
+    pub fn directives(&self) -> &Directives<B> {
         &self.resource.directives
     }
 
     pub fn binding(&self) -> Option<&str> {
-        self.resource.binding.as_deref()
+        self.resource.binding.as_ref().map(BindingAddress::as_str)
     }
 
-    pub fn dependency_bindings(&self) -> &std::collections::BTreeSet<String> {
+    pub(crate) fn binding_address(&self) -> Option<&B> {
+        self.resource.binding.as_ref()
+    }
+
+    pub fn dependency_bindings(&self) -> &std::collections::BTreeSet<B> {
         &self.resource.dependency_bindings
     }
 
@@ -319,21 +339,21 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
         &self.resource.quoted_string_attrs
     }
 
-    fn map_resource<S2, P2: PlaceholderKind>(
+    fn map_resource<S2, P2: PlaceholderKind, B2: BindingAddress>(
         self,
-        map: impl FnOnce(Resource<S, P>) -> Resource<S2, P2>,
-    ) -> DeferredForTemplateResource<S2, P2> {
+        map: impl FnOnce(Resource<S, P, B>) -> Resource<S2, P2, B2>,
+    ) -> DeferredForTemplateResource<S2, P2, B2> {
         DeferredForTemplateResource::new(map(self.resource))
     }
 
-    fn try_map_resource<S2, P2: PlaceholderKind, E>(
+    fn try_map_resource<S2, P2: PlaceholderKind, B2: BindingAddress, E>(
         self,
-        map: impl FnOnce(Resource<S, P>) -> Result<Resource<S2, P2>, E>,
-    ) -> Result<DeferredForTemplateResource<S2, P2>, E> {
+        map: impl FnOnce(Resource<S, P, B>) -> Result<Resource<S2, P2, B2>, E>,
+    ) -> Result<DeferredForTemplateResource<S2, P2, B2>, E> {
         map(self.resource).map(DeferredForTemplateResource::new)
     }
 
-    pub(crate) fn attributes_mut(&mut self) -> &mut IndexMap<String, Value<P>> {
+    pub(crate) fn attributes_mut(&mut self) -> &mut IndexMap<String, Value<P, B>> {
         &mut self.resource.attributes
     }
 
@@ -342,13 +362,13 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
     }
 
     #[cfg(test)]
-    pub(crate) fn directives_mut(&mut self) -> &mut Directives {
+    pub(crate) fn directives_mut(&mut self) -> &mut Directives<B> {
         &mut self.resource.directives
     }
 
     pub(crate) fn id_and_attributes_mut(
         &mut self,
-    ) -> (&ResourceId, &mut IndexMap<String, Value<P>>) {
+    ) -> (&ResourceId, &mut IndexMap<String, Value<P, B>>) {
         (&self.resource.id, &mut self.resource.attributes)
     }
 
@@ -360,19 +380,22 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
     }
 }
 
-impl<S: Clone, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
-    pub(crate) fn instantiate(&self) -> Resource<S, P> {
+impl<S: Clone, P: PlaceholderKind, B: BindingAddress> DeferredForTemplateResource<S, P, B> {
+    pub(crate) fn instantiate(&self) -> Resource<S, P, B> {
         self.resource.instantiate()
     }
 
-    pub(crate) fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Resource<S, P> {
+    pub(crate) fn instantiate_with_identity(
+        &self,
+        identity: ResourceIdentity,
+    ) -> Resource<S, P, B> {
         self.resource.instantiate_with_identity(identity)
     }
 }
 
-fn materialize_template_address<S, P: PlaceholderKind>(
-    target: &DeferredForTarget,
-    resource: &mut Resource<S, P>,
+fn materialize_template_address<S, P: PlaceholderKind, B: BindingAddress>(
+    target: &DeferredForTarget<B>,
+    resource: &mut Resource<S, P, B>,
 ) {
     match target {
         DeferredForTarget::Bound(target) => {
@@ -381,9 +404,11 @@ fn materialize_template_address<S, P: PlaceholderKind>(
                 &resource.id.resource_type,
                 resource.id.provider_instance.clone(),
             );
-            resource.binding = Some(target.template_address().to_string());
+            resource.binding = Some(target.template_address().binding_address().clone());
         }
-        DeferredForTarget::Unbound { .. } => {
+        DeferredForTarget::Unbound {
+            template: _template,
+        } => {
             if resource.id.identity().is_some() {
                 resource.id = ResourceId::pending_with_provider(
                     resource.id.provider.clone(),
@@ -396,16 +421,86 @@ fn materialize_template_address<S, P: PlaceholderKind>(
     }
 }
 
-fn deferred_effect_id<S, P: PlaceholderKind>(
-    target: &DeferredForTarget,
-    resource: &DeferredForTemplateResource<S, P>,
+fn deferred_effect_id<S, P: PlaceholderKind, B: BindingAddress>(
+    target: &DeferredForTarget<B>,
+    resource: &DeferredForTemplateResource<S, P, B>,
 ) -> ResolvedResourceId {
     ResolvedResourceId::with_provider_identity(
         resource.provider(),
         resource.resource_type(),
-        target.scheduler_identity().clone(),
+        match target {
+            DeferredForTarget::Bound(target) => {
+                target.template_address().resource_identity().clone()
+            }
+            DeferredForTarget::Unbound { template } => template.scheduler_identity().clone(),
+        },
         resource.provider_instance().map(str::to_string),
     )
+}
+
+/// Immutable diagnostic provenance for one authored deferred loop. Display and
+/// source paths are derived together; callers cannot edit either independently.
+/// Only the display path and line cross the saved-plan wire boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticLocation {
+    display_file: Option<String>,
+    source_file: Option<PathBuf>,
+    line: usize,
+}
+
+impl DiagnosticLocation {
+    fn new(file: Option<String>, line: usize) -> Self {
+        Self {
+            source_file: file.as_ref().map(PathBuf::from),
+            display_file: file,
+            line,
+        }
+    }
+
+    fn from_source(source: &Path, project_root: &Path, line: usize) -> Self {
+        let display = source
+            .strip_prefix(project_root)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|relative| relative.to_string_lossy().into_owned())
+            .or_else(|| {
+                source
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| source.display().to_string());
+        Self {
+            display_file: Some(display),
+            source_file: Some(source.to_path_buf()),
+            line,
+        }
+    }
+
+    fn into_saved(self) -> Self {
+        // Saved plans have no parse-warning owner. Normalize the entire value
+        // to the portable location that deserialization can reconstruct.
+        Self::new(self.display_file, self.line)
+    }
+
+    pub fn display_file(&self) -> Option<&str> {
+        self.display_file.as_deref()
+    }
+
+    pub fn source_file(&self) -> Option<&Path> {
+        self.source_file.as_deref()
+    }
+
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    /// Match warning ownership against the original source, not the portable
+    /// display path. Same-line warnings from other files or kinds are unrelated.
+    pub fn matches_deferred_warning(&self, warning: &ParseWarning) -> bool {
+        warning.kind == WarningKind::DeferredFor
+            && warning.line == self.line
+            && warning.file.as_deref().map(Path::new) == self.source_file()
+    }
 }
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
@@ -413,37 +508,46 @@ fn deferred_effect_id<S, P: PlaceholderKind>(
 /// Parser-side deferred loops use [`ParsedDeferredForExpression`] instead.
 /// This resource-only shape is the resolved typestate consumed by planning,
 /// execution, display, and state persistence.
+///
+/// Diagnostic filenames cannot be edited independently of their source:
+///
+/// ```compile_fail
+/// use carina_core::parser::DeferredForExpression;
+/// fn mutate_file(expression: &mut DeferredForExpression) {
+///     expression.file = Some("unrelated.crn".into());
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredForExpression<
     S = ModuleSource,
     P: PlaceholderKind = NoPlaceholder,
     T: PlaceholderKind = LoopSlot,
+    B: BindingAddress = AbsoluteBindingAddress,
 > {
-    pub file: Option<String>,
-    pub line: usize,
+    location: DiagnosticLocation,
     pub header: String,
-    target: DeferredForTarget,
-    pub iterable: Value<P>,
+    target: DeferredForTarget<B>,
+    pub iterable: Value<P, B>,
     pub binding: ForBinding,
-    template_resource: DeferredForTemplateResource<S, T>,
+    template_resource: DeferredForTemplateResource<S, T, B>,
     deferred_effect_id: ResolvedResourceId,
 }
 
-impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
-    #[allow(clippy::too_many_arguments)]
+impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
+    DeferredForExpression<S, P, T, B>
+{
     pub fn new(
         file: Option<String>,
         line: usize,
         header: String,
-        target: DeferredForTarget,
-        iterable: Value<P>,
+        target: DeferredForTarget<B>,
+        iterable: Value<P, B>,
         binding: ForBinding,
-        template_resource: Resource<S, T>,
+        template_resource: Resource<S, T, B>,
     ) -> Self {
         let template_resource = DeferredForTemplateResource::new(template_resource);
         Self::from_template_resource(
-            file,
-            line,
+            DiagnosticLocation::new(file, line),
             header,
             target,
             iterable,
@@ -452,21 +556,18 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn from_template_resource(
-        file: Option<String>,
-        line: usize,
+        location: DiagnosticLocation,
         header: String,
-        target: DeferredForTarget,
-        iterable: Value<P>,
+        target: DeferredForTarget<B>,
+        iterable: Value<P, B>,
         binding: ForBinding,
-        template_resource: DeferredForTemplateResource<S, T>,
+        template_resource: DeferredForTemplateResource<S, T, B>,
     ) -> Self {
         let template_resource = template_resource.into_materialized_for_target(&target);
         let deferred_effect_id = deferred_effect_id(&target, &template_resource);
         Self {
-            file,
-            line,
+            location,
             header,
             target,
             iterable,
@@ -476,7 +577,19 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         }
     }
 
-    pub fn target(&self) -> &DeferredForTarget {
+    pub fn location(&self) -> &DiagnosticLocation {
+        &self.location
+    }
+
+    pub fn file(&self) -> Option<&str> {
+        self.location.display_file()
+    }
+
+    pub fn line(&self) -> usize {
+        self.location.line()
+    }
+
+    pub fn target(&self) -> &DeferredForTarget<B> {
         &self.target
     }
 
@@ -484,7 +597,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         self.template_resource.display_type()
     }
 
-    pub fn attributes(&self) -> &IndexMap<String, Value<T>> {
+    pub fn attributes(&self) -> &IndexMap<String, Value<T, B>> {
         self.template_resource.attributes()
     }
 
@@ -492,7 +605,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         self.template_resource.id()
     }
 
-    pub fn template_resource(&self) -> &DeferredForTemplateResource<S, T> {
+    pub fn template_resource(&self) -> &DeferredForTemplateResource<S, T, B> {
         &self.template_resource
     }
 
@@ -504,12 +617,29 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         &self.deferred_effect_id
     }
 
-    pub(crate) fn template_attributes_mut(&mut self) -> &mut IndexMap<String, Value<T>> {
+    /// Preserve the v36 scheduler-id spelling only at the wire boundary.
+    /// Runtime resource identity remains the distinct template identity;
+    /// dependency lookup uses the phase-typed target binding.
+    pub(crate) fn deferred_effect_wire_id(&self) -> ResourceId {
+        // v36 encoded a bound loop's scheduling spelling in the id field.
+        // This compatibility-only ID is serialized immediately, never used as
+        // a runtime resource identity or a binding-phase conversion.
+        ResourceId::with_provider_identity(
+            self.template_resource.provider(),
+            self.template_resource.resource_type(),
+            ResourceIdentity::new(self.target.scheduler_key()),
+            self.template_resource
+                .provider_instance()
+                .map(str::to_owned),
+        )
+    }
+
+    pub(crate) fn template_attributes_mut(&mut self) -> &mut IndexMap<String, Value<T, B>> {
         self.template_resource.attributes_mut()
     }
 
     #[cfg(test)]
-    pub(crate) fn template_directives_mut(&mut self) -> &mut Directives {
+    pub(crate) fn template_directives_mut(&mut self) -> &mut Directives<B> {
         self.template_resource.directives_mut()
     }
 
@@ -520,10 +650,10 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         self.template_resource.resolve_ignore_changes(registry)
     }
 
-    pub fn site(&self) -> DeferredForSite<'_, P> {
+    pub fn site(&self) -> DeferredForSite<'_, P, B> {
         DeferredForSite {
-            file: self.file.as_deref(),
-            line: self.line,
+            file: self.file(),
+            line: self.line(),
             header: &self.header,
             binding: &self.binding,
             iterable: &self.iterable,
@@ -537,18 +667,21 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
 /// substituted caller arguments. Only the resource arm can cross the final
 /// resolution seam into [`DeferredForExpression`].
 #[derive(Debug, Clone)]
-pub enum DeferredForBody<P: PlaceholderKind = ParserPlaceholder> {
-    Resource(Box<DeferredForTemplateResource<ModuleSource, P>>),
-    Read(Box<DataSource<ModuleSource, P>>),
-    ModuleCall(ModuleCall<P>),
+pub enum DeferredForBody<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    Resource(Box<DeferredForTemplateResource<ModuleSource, P, B>>),
+    Read(Box<DataSource<ModuleSource, P, B>>),
+    ModuleCall(ModuleCall<P, B>),
 }
 
-impl<P: PlaceholderKind> DeferredForBody<P> {
-    pub(crate) fn resource(resource: Resource<ModuleSource, P>) -> Self {
+impl<P: PlaceholderKind, B: BindingAddress> DeferredForBody<P, B> {
+    pub(crate) fn resource(resource: Resource<ModuleSource, P, B>) -> Self {
         Self::Resource(Box::new(DeferredForTemplateResource::new(resource)))
     }
 
-    fn into_materialized_for_target(self, target: &DeferredForTarget) -> Self {
+    fn into_materialized_for_target(self, target: &DeferredForTarget<B>) -> Self {
         match self {
             Self::Resource(resource) => {
                 Self::Resource(Box::new((*resource).into_materialized_for_target(target)))
@@ -561,6 +694,7 @@ impl<P: PlaceholderKind> DeferredForBody<P> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedDeferredForIterableState {
     Deferred,
+    DependsOnEnclosingModuleArgument,
     UndefinedIdentifier { name: String },
 }
 
@@ -574,36 +708,95 @@ pub(crate) enum DeferredForResourceExpressionError {
 }
 
 /// Parser-side typestate for a deferred `for` expression.
+///
+/// ```compile_fail
+/// use carina_core::parser::ParsedDeferredForExpression;
+/// fn mutate_file(expression: &mut ParsedDeferredForExpression) {
+///     expression.file = Some("unrelated.crn".into());
+/// }
+/// ```
 #[derive(Debug, Clone)]
-pub struct ParsedDeferredForExpression<P: PlaceholderKind = ParserPlaceholder> {
-    pub file: Option<String>,
-    pub line: usize,
+pub struct ParsedDeferredForExpression<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    location: DiagnosticLocation,
     pub span: SourceSpan,
     pub header: String,
-    target: DeferredForTarget,
-    pub iterable: Value<P>,
+    pub(crate) target: DeferredForTarget<B>,
+    pub iterable: Value<P, B>,
     pub(crate) iterable_state: ParsedDeferredForIterableState,
     pub binding: ForBinding,
-    body: DeferredForBody<P>,
+    pub(crate) body: DeferredForBody<P, B>,
 }
 
-impl<P: PlaceholderKind> ParsedDeferredForExpression<P> {
-    #[allow(clippy::too_many_arguments)]
+/// Read-only exhaustive projection used by the module binding-phase seam.
+pub(crate) struct ParsedDeferredForParts<'a, P: PlaceholderKind, B: BindingAddress> {
+    pub location: &'a DiagnosticLocation,
+    pub span: SourceSpan,
+    pub header: &'a str,
+    pub target: &'a DeferredForTarget<B>,
+    pub iterable: &'a Value<P, B>,
+    pub iterable_state: &'a ParsedDeferredForIterableState,
+    pub binding: &'a ForBinding,
+    pub body: &'a DeferredForBody<P, B>,
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
+    pub(crate) fn parts(&self) -> ParsedDeferredForParts<'_, P, B> {
+        let Self {
+            location,
+            span,
+            header,
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        } = self;
+        ParsedDeferredForParts {
+            location,
+            span: *span,
+            header,
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        }
+    }
+
     pub(crate) fn new(
-        file: Option<String>,
-        line: usize,
-        span: SourceSpan,
-        header: String,
-        target: DeferredForTarget,
-        iterable: Value<P>,
+        site: (Option<String>, usize, SourceSpan, String),
+        target: DeferredForTarget<B>,
+        iterable: Value<P, B>,
         iterable_state: ParsedDeferredForIterableState,
         binding: ForBinding,
-        body: DeferredForBody<P>,
+        body: DeferredForBody<P, B>,
     ) -> Self {
+        let (file, line, span, header) = site;
+        Self::from_location(
+            (DiagnosticLocation::new(file, line), span, header),
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        )
+    }
+
+    pub(crate) fn from_location(
+        site: (DiagnosticLocation, SourceSpan, String),
+        target: DeferredForTarget<B>,
+        iterable: Value<P, B>,
+        iterable_state: ParsedDeferredForIterableState,
+        binding: ForBinding,
+        body: DeferredForBody<P, B>,
+    ) -> Self {
+        let (location, span, header) = site;
         let body = body.into_materialized_for_target(&target);
         Self {
-            file,
-            line,
+            location,
             span,
             header,
             target,
@@ -614,20 +807,41 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P> {
         }
     }
 
-    pub fn target(&self) -> &DeferredForTarget {
+    pub fn location(&self) -> &DiagnosticLocation {
+        &self.location
+    }
+
+    pub fn file(&self) -> Option<&str> {
+        self.location.display_file()
+    }
+
+    pub fn line(&self) -> usize {
+        self.location.line()
+    }
+
+    /// Called once by the loader after parsing, before any module rebuilds.
+    pub(crate) fn record_source_location(&mut self, source: &Path, project_root: &Path) {
+        assert!(
+            self.location.source_file().is_none(),
+            "deferred diagnostic source was already recorded"
+        );
+        self.location = DiagnosticLocation::from_source(source, project_root, self.line());
+    }
+
+    pub fn target(&self) -> &DeferredForTarget<B> {
         &self.target
     }
 
-    pub fn body(&self) -> &DeferredForBody<P> {
+    pub fn body(&self) -> &DeferredForBody<P, B> {
         &self.body
     }
 
     #[cfg(test)]
-    pub(crate) fn into_body(self) -> DeferredForBody<P> {
+    pub(crate) fn into_body(self) -> DeferredForBody<P, B> {
         self.body
     }
 
-    pub(crate) fn template_attributes_mut(&mut self) -> Option<&mut IndexMap<String, Value<P>>> {
+    pub(crate) fn template_attributes_mut(&mut self) -> Option<&mut IndexMap<String, Value<P, B>>> {
         match &mut self.body {
             DeferredForBody::Resource(resource) => Some(resource.attributes_mut()),
             DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
@@ -654,14 +868,14 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P> {
         self.target.set_loop_binding_scope(binding_scope);
     }
 
-    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
         self.site().root_bindings()
     }
 
-    pub fn site(&self) -> DeferredForSite<'_, P> {
+    pub fn site(&self) -> DeferredForSite<'_, P, B> {
         DeferredForSite {
-            file: self.file.as_deref(),
-            line: self.line,
+            file: self.file(),
+            line: self.line(),
             header: &self.header,
             binding: &self.binding,
             iterable: &self.iterable,
@@ -675,31 +889,30 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P> {
         };
         let error = ParseError::undefined_deferred_iterable(
             name.clone(),
-            self.line,
+            self.line(),
             known_bindings.to_vec(),
             self.span,
         );
-        Some(match &self.file {
+        Some(match self.location.source_file() {
             Some(path) => error.in_file(path),
             None => error,
         })
     }
 }
 
-impl ParsedDeferredForExpression<ParserPlaceholder> {
+impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
     pub(crate) fn into_resource_expression(
         self,
         known_bindings: &[String],
     ) -> Result<
-        DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>,
+        DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder, B>,
         DeferredForResourceExpressionError,
     > {
         if let Some(error) = self.undefined_iterable_error(known_bindings) {
             return Err(DeferredForResourceExpressionError::UndefinedIterable(error));
         }
         let Self {
-            file,
-            line,
+            location,
             span,
             header,
             target,
@@ -711,8 +924,13 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
         debug_assert!(matches!(
             iterable_state,
             ParsedDeferredForIterableState::Deferred
+                | ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
         ));
-        let iterable_resolution = if super::functions::contains_module_argument(&iterable) {
+        let iterable_resolution = if matches!(
+            iterable_state,
+            ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
+        ) || super::functions::contains_module_argument(&iterable)
+        {
             DeferredForIterableResolution::DependsOnEnclosingModuleArgument
         } else {
             match &iterable {
@@ -726,9 +944,11 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
             DeferredForBody::Resource(resource) => *resource,
             DeferredForBody::Read(data_source) => {
                 return Err(DeferredForResourceExpressionError::Unsupported {
-                    file,
+                    file: location
+                        .source_file()
+                        .map(|file| file.display().to_string()),
                     error: Box::new(DeferredForBodyUnsupportedError {
-                        line,
+                        line: location.line(),
                         header,
                         body: DeferredForBodyKind::Read {
                             resource_type: data_source.id.display_type(),
@@ -740,9 +960,11 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
             }
             DeferredForBody::ModuleCall(call) => {
                 return Err(DeferredForResourceExpressionError::Unsupported {
-                    file,
+                    file: location
+                        .source_file()
+                        .map(|file| file.display().to_string()),
                     error: Box::new(DeferredForBodyUnsupportedError {
-                        line,
+                        line: location.line(),
                         header,
                         body: DeferredForBodyKind::ModuleCall {
                             name: call.module_name,
@@ -754,8 +976,7 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
             }
         };
         Ok(DeferredForExpression::from_template_resource(
-            file,
-            line,
+            location,
             header,
             target,
             iterable,
@@ -765,30 +986,144 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
     }
 }
 
+impl<P: PlaceholderKind> ParsedDeferredForExpression<P, RelativeBindingName> {
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> ParsedDeferredForExpression<P, AbsoluteBindingAddress> {
+        let Self {
+            location,
+            span,
+            header,
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        } = self;
+        ParsedDeferredForExpression {
+            location,
+            span,
+            header,
+            target: match target {
+                DeferredForTarget::Bound(target) => {
+                    DeferredForTarget::Bound(target.map_bindings(resolve))
+                }
+                DeferredForTarget::Unbound { template } => DeferredForTarget::Unbound { template },
+            },
+            iterable: iterable.resolve_bindings(resolve),
+            iterable_state,
+            binding,
+            body: match body {
+                DeferredForBody::Resource(resource) => DeferredForBody::Resource(Box::new(
+                    (*resource).map_resource(|resource| resource.resolve_bindings(resolve)),
+                )),
+                DeferredForBody::Read(data_source) => {
+                    DeferredForBody::Read(Box::new(data_source.resolve_bindings(resolve)))
+                }
+                DeferredForBody::ModuleCall(call) => {
+                    DeferredForBody::ModuleCall(call.resolve_bindings(resolve))
+                }
+            },
+        }
+    }
+}
+
+impl<P: PlaceholderKind> ParsedDeferredForExpression<P, AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            location: _location,
+            span: _span,
+            header: _header,
+            target,
+            iterable,
+            iterable_state: _iterable_state,
+            binding: _binding,
+            body,
+        } = self;
+        match target {
+            DeferredForTarget::Bound(bound) => {
+                *bound = bound.clone().map_bindings(&mut |binding| map(&binding));
+            }
+            DeferredForTarget::Unbound {
+                template: _template,
+            } => {}
+        }
+        iterable.map_absolute_bindings(map);
+        match body {
+            DeferredForBody::Resource(resource) => {
+                resource.resource.map_absolute_bindings(map);
+                materialize_template_address(target, &mut resource.resource);
+            }
+            DeferredForBody::Read(data_source) => data_source.map_absolute_bindings(map),
+            DeferredForBody::ModuleCall(call) => call.map_absolute_bindings(map),
+        }
+    }
+}
+
+impl<P: PlaceholderKind, T: PlaceholderKind>
+    DeferredForExpression<ModuleSource, P, T, AbsoluteBindingAddress>
+{
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            location: _location,
+            header: _header,
+            target,
+            iterable,
+            binding: _binding,
+            template_resource,
+            deferred_effect_id,
+        } = self;
+        match target {
+            DeferredForTarget::Bound(bound) => {
+                *bound = bound.clone().map_bindings(&mut |binding| map(&binding));
+            }
+            DeferredForTarget::Unbound {
+                template: _template,
+            } => {}
+        }
+        iterable.map_absolute_bindings(map);
+        template_resource.resource.map_absolute_bindings(map);
+        materialize_template_address(target, &mut template_resource.resource);
+        *deferred_effect_id = self::deferred_effect_id(target, template_resource);
+    }
+}
+
 /// Phase-neutral, read-only metadata for a deferred `for` expression.
 #[derive(Debug, Clone, Copy)]
-pub struct DeferredForSite<'a, P: PlaceholderKind = NoPlaceholder> {
+pub struct DeferredForSite<
+    'a,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     pub file: Option<&'a str>,
     pub line: usize,
     pub header: &'a str,
     pub binding: &'a ForBinding,
-    pub iterable: &'a Value<P>,
+    pub iterable: &'a Value<P, B>,
 }
 
-impl<P: PlaceholderKind> DeferredForSite<'_, P> {
-    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+impl<P: PlaceholderKind, B: BindingAddress> DeferredForSite<'_, P, B> {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
         self.iterable.root_bindings()
     }
 }
 
 pub type SavedDeferredForExpression =
-    DeferredForExpression<SavedModuleSource, NoPlaceholder, LoopSlot>;
+    DeferredForExpression<SavedModuleSource, NoPlaceholder, LoopSlot, AbsoluteBindingAddress>;
+pub type ExpandedDeferredForExpression =
+    DeferredForExpression<ModuleSource, NoPlaceholder, LoopSlot, AbsoluteBindingAddress>;
 
 impl From<DeferredForExpression> for SavedDeferredForExpression {
     fn from(expression: DeferredForExpression) -> Self {
         let DeferredForExpression {
-            file,
-            line,
+            location,
             header,
             target,
             iterable,
@@ -797,8 +1132,7 @@ impl From<DeferredForExpression> for SavedDeferredForExpression {
             deferred_effect_id: _,
         } = expression;
         Self::from_template_resource(
-            file,
-            line,
+            location.into_saved(),
             header,
             target,
             iterable,
@@ -827,14 +1161,16 @@ mod deferred_template_resource_serde {
     }
 
     #[derive(Serialize)]
-    #[serde(bound(serialize = "S: Serialize, T: PlaceholderKind + Serialize"))]
-    struct ResourceRef<'a, S, T: PlaceholderKind> {
+    #[serde(bound(
+        serialize = "S: Serialize, T: PlaceholderKind + Serialize, B: BindingAddress + Serialize"
+    ))]
+    struct ResourceRef<'a, S, T: PlaceholderKind, B: BindingAddress> {
         id: ResourceIdRef<'a>,
-        attributes: &'a IndexMap<String, Value<T>>,
-        directives: &'a Directives,
+        attributes: &'a IndexMap<String, Value<T, B>>,
+        directives: &'a Directives<B>,
         prefixes: &'a HashMap<String, String>,
-        binding: &'a Option<String>,
-        dependency_bindings: &'a BTreeSet<String>,
+        binding: &'a Option<B>,
+        dependency_bindings: &'a BTreeSet<B>,
         module_source: &'a Option<S>,
         #[serde(skip_serializing_if = "crate::resource::DefaultTagKeys::is_empty")]
         default_tag_keys: &'a crate::resource::DefaultTagKeys,
@@ -842,14 +1178,15 @@ mod deferred_template_resource_serde {
         loop_provenance: &'a crate::resource::LoopProvenance,
     }
 
-    pub(super) struct SerializableResource<'a, S, T: PlaceholderKind>(
-        pub(super) &'a Resource<S, T>,
+    pub(super) struct SerializableResource<'a, S, T: PlaceholderKind, B: BindingAddress>(
+        pub(super) &'a Resource<S, T, B>,
     );
 
-    impl<S, T> serde::Serialize for SerializableResource<'_, S, T>
+    impl<S, T, B> serde::Serialize for SerializableResource<'_, S, T, B>
     where
         S: Serialize,
         T: PlaceholderKind + Serialize,
+        B: BindingAddress + Serialize,
     {
         fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
         where
@@ -897,18 +1234,20 @@ mod deferred_template_resource_serde {
     }
 
     #[derive(Deserialize)]
-    #[serde(bound(deserialize = "S: Deserialize<'de>, T: PlaceholderKind + Deserialize<'de>"))]
-    struct ResourceWire<S, T: PlaceholderKind> {
+    #[serde(bound(
+        deserialize = "S: Deserialize<'de>, T: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>"
+    ))]
+    struct ResourceWire<S, T: PlaceholderKind, B: BindingAddress> {
         id: ResourceIdWire,
-        attributes: IndexMap<String, Value<T>>,
+        attributes: IndexMap<String, Value<T, B>>,
         #[serde(default)]
-        directives: Directives,
+        directives: Directives<B>,
         #[serde(default)]
         prefixes: HashMap<String, String>,
         #[serde(default)]
-        binding: Option<String>,
+        binding: Option<B>,
         #[serde(default)]
-        dependency_bindings: BTreeSet<String>,
+        dependency_bindings: BTreeSet<B>,
         #[serde(default)]
         module_source: Option<S>,
         #[serde(default)]
@@ -917,15 +1256,16 @@ mod deferred_template_resource_serde {
         loop_provenance: crate::resource::LoopProvenance,
     }
 
-    pub(super) struct DeserializableResource<S, T: PlaceholderKind> {
-        pub(super) resource: Resource<S, T>,
+    pub(super) struct DeserializableResource<S, T: PlaceholderKind, B: BindingAddress> {
+        pub(super) resource: Resource<S, T, B>,
         pub(super) legacy_null_name: bool,
     }
 
-    impl<'de, S, T> serde::Deserialize<'de> for DeserializableResource<S, T>
+    impl<'de, S, T, B> serde::Deserialize<'de> for DeserializableResource<S, T, B>
     where
         S: Deserialize<'de>,
         T: PlaceholderKind + Deserialize<'de>,
+        B: BindingAddress + Deserialize<'de>,
     {
         fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
         where
@@ -990,11 +1330,12 @@ mod deferred_template_resource_serde {
     }
 }
 
-impl<S, P, T> serde::Serialize for DeferredForExpression<S, P, T>
+impl<S, P, T, B> serde::Serialize for DeferredForExpression<S, P, T, B>
 where
     S: serde::Serialize,
     P: PlaceholderKind + serde::Serialize,
     T: PlaceholderKind + serde::Serialize,
+    B: BindingAddress + serde::Serialize,
 {
     fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
     where
@@ -1002,19 +1343,25 @@ where
     {
         #[derive(serde::Serialize)]
         #[serde(bound(
-            serialize = "S: serde::Serialize, P: PlaceholderKind + serde::Serialize, T: PlaceholderKind + serde::Serialize"
+            serialize = "S: serde::Serialize, P: PlaceholderKind + serde::Serialize, T: PlaceholderKind + serde::Serialize, B: BindingAddress + serde::Serialize"
         ))]
-        struct WireRef<'a, S, P: PlaceholderKind, T: PlaceholderKind> {
+        struct WireRef<'a, S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> {
+            file: Option<&'a str>,
+            line: usize,
             header: &'a str,
             resource_type: &'a str,
-            target: &'a DeferredForTarget,
-            iterable: &'a Value<P>,
+            target: &'a DeferredForTarget<B>,
+            iterable: &'a Value<P, B>,
             binding: &'a ForBinding,
-            template_resource: deferred_template_resource_serde::SerializableResource<'a, S, T>,
+            template_resource: deferred_template_resource_serde::SerializableResource<'a, S, T, B>,
         }
 
         serde::Serialize::serialize(
             &WireRef {
+                file: self
+                    .file()
+                    .filter(|file| std::path::Path::new(file).is_relative()),
+                line: self.line(),
                 header: &self.header,
                 resource_type: self.resource_type(),
                 target: &self.target,
@@ -1029,11 +1376,12 @@ where
     }
 }
 
-impl<'de, S, P, T> serde::Deserialize<'de> for DeferredForExpression<S, P, T>
+impl<'de, S, P, T, B> serde::Deserialize<'de> for DeferredForExpression<S, P, T, B>
 where
     S: serde::de::DeserializeOwned,
     P: PlaceholderKind + serde::de::DeserializeOwned,
     T: PlaceholderKind + serde::de::DeserializeOwned,
+    B: BindingAddress + serde::de::DeserializeOwned,
 {
     fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
     where
@@ -1042,18 +1390,21 @@ where
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         #[serde(bound(
-            deserialize = "S: serde::Deserialize<'de>, P: PlaceholderKind + serde::Deserialize<'de>, T: PlaceholderKind + serde::Deserialize<'de>"
+            deserialize = "S: serde::Deserialize<'de>, P: PlaceholderKind + serde::Deserialize<'de>, T: PlaceholderKind + serde::Deserialize<'de>, B: BindingAddress + serde::Deserialize<'de>"
         ))]
-        struct Wire<S, P: PlaceholderKind, T: PlaceholderKind> {
+        struct Wire<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> {
+            #[serde(deserialize_with = "deserialize_relative_diagnostic_file")]
+            file: Option<String>,
+            line: usize,
             header: String,
             resource_type: String,
-            target: DeferredForTarget,
-            iterable: Value<P>,
+            target: DeferredForTarget<B>,
+            iterable: Value<P, B>,
             binding: ForBinding,
-            template_resource: deferred_template_resource_serde::DeserializableResource<S, T>,
+            template_resource: deferred_template_resource_serde::DeserializableResource<S, T, B>,
         }
 
-        let wire = Wire::<S, P, T>::deserialize(deserializer)?;
+        let wire = Wire::<S, P, T, B>::deserialize(deserializer)?;
         let deferred_template_resource_serde::DeserializableResource {
             resource: template_resource,
             legacy_null_name,
@@ -1079,14 +1430,16 @@ where
                         target.binding()
                     )));
                 }
-                if template_resource.binding.as_deref() != Some(expected.as_str()) {
+                if template_resource.binding.as_ref() != Some(expected.binding_address()) {
                     return Err(serde::de::Error::custom(format!(
                         "Invalid saved plan: deferred template resource binding does not match bound deferred target `{}`",
                         target.binding()
                     )));
                 }
             }
-            DeferredForTarget::Unbound { .. } => {
+            DeferredForTarget::Unbound {
+                template: _template,
+            } => {
                 if template_resource.id.identity().is_some() {
                     return Err(serde::de::Error::custom(
                         "Invalid saved plan: deferred template resource identity for an unbound deferred target must be pending",
@@ -1102,8 +1455,7 @@ where
 
         let template_resource = DeferredForTemplateResource::new(template_resource);
         Ok(Self::from_template_resource(
-            None,
-            0,
+            DiagnosticLocation::new(wire.file, wire.line),
             wire.header,
             wire.target,
             wire.iterable,
@@ -1113,10 +1465,28 @@ where
     }
 }
 
-impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
+fn deserialize_relative_diagnostic_file<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let file = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    if file
+        .as_deref()
+        .is_some_and(|file| std::path::Path::new(file).is_absolute())
+    {
+        return Err(serde::de::Error::custom(
+            "deferred-for diagnostic file must be relative",
+        ));
+    }
+    Ok(file)
+}
+
+impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
+    DeferredForExpression<S, P, T, B>
+{
     /// Every binding that can affect the iterable, including references in a
     /// coalesce fallback.
-    pub fn root_bindings(&self) -> std::collections::BTreeSet<String> {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
         self.site().root_bindings()
     }
 
@@ -1140,18 +1510,24 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         if roots.is_empty() {
             crate::value::format_value(&self.iterable)
         } else {
-            roots.into_iter().collect::<Vec<_>>().join(", ")
+            roots
+                .into_iter()
+                .map(|binding| binding.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     }
 }
 
-impl<S> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder> {
+impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder, B> {
     fn into_expanded(
         self,
-    ) -> Result<DeferredForExpression<S>, crate::resource::LeftoverPlaceholder> {
+    ) -> Result<
+        DeferredForExpression<S, NoPlaceholder, LoopSlot, B>,
+        crate::resource::LeftoverPlaceholder,
+    > {
         let Self {
-            file,
-            line,
+            location,
             header,
             target,
             iterable,
@@ -1160,10 +1536,9 @@ impl<S> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder> {
             deferred_effect_id: _,
         } = self;
         let template_resource = template_resource
-            .try_map_resource(Resource::<S, ParserPlaceholder>::into_loop_template)?;
+            .try_map_resource(Resource::<S, ParserPlaceholder, B>::into_loop_template)?;
         Ok(DeferredForExpression::from_template_resource(
-            file,
-            line,
+            location,
             header,
             target,
             iterable.into_expanded()?,
@@ -1244,8 +1619,11 @@ pub enum ResourceContext<
     S: 'a = ModuleSource,
     P: PlaceholderKind + 'a = NoPlaceholder,
     T: PlaceholderKind + 'a = P,
-    D: DeferredForPhaseTraversal<P, T> + 'a = ResolvedDeferredForPhase<P, T>,
-> {
+    D = ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>,
+    B: BindingAddress + 'a = AbsoluteBindingAddress,
+> where
+    D: DeferredForPhaseTraversal<P, T, B> + 'a,
+{
     Direct,
     Deferred(D::DeferredRef<'a, S>),
 }
@@ -1266,18 +1644,21 @@ pub enum ResourceRef<
     S: 'a = ModuleSource,
     P: PlaceholderKind + 'a = NoPlaceholder,
     T: PlaceholderKind + 'a = P,
-    D: DeferredForPhaseTraversal<P, T> + 'a = ResolvedDeferredForPhase<P, T>,
-> {
+    D = ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>,
+    B: BindingAddress + 'a = AbsoluteBindingAddress,
+> where
+    D: DeferredForPhaseTraversal<P, T, B> + 'a,
+{
     /// A top-level resource.
-    Resource(&'a Resource<S, P>),
+    Resource(&'a Resource<S, P, B>),
     /// A top-level composition (module-expansion synthetic node).
-    LiveComposition(&'a LiveComposition<P>),
+    LiveComposition(&'a LiveComposition<P, B>),
     /// A top-level data source (`read`-keyword resource).
-    DataSource(&'a DataSource<S, P>),
+    DataSource(&'a DataSource<S, P, B>),
     /// The template body of a deferred `for` expression — always a
     /// resource (`for` bodies never carry `read` / composition).
     Deferred {
-        resource: &'a DeferredForTemplateResource<S, T>,
+        resource: &'a DeferredForTemplateResource<S, T, B>,
         deferred: D::DeferredRef<'a, S>,
     },
 }
@@ -1285,13 +1666,18 @@ pub enum ResourceRef<
 /// Mutable counterpart of [`ResourceRef`] used by whole-file resource
 /// transformations.
 #[derive(Debug)]
-pub enum ResourceMut<'a, P: PlaceholderKind = NoPlaceholder, T: PlaceholderKind = P> {
-    Resource(&'a mut Resource<ModuleSource, P>),
-    LiveComposition(&'a mut LiveComposition<P>),
-    DataSource(&'a mut DataSource<ModuleSource, P>),
+pub enum ResourceMut<
+    'a,
+    P: PlaceholderKind = NoPlaceholder,
+    T: PlaceholderKind = P,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    Resource(&'a mut Resource<ModuleSource, P, B>),
+    LiveComposition(&'a mut LiveComposition<P, B>),
+    DataSource(&'a mut DataSource<ModuleSource, P, B>),
     Deferred {
         id: &'a ResourceId,
-        attributes: &'a mut IndexMap<String, Value<T>>,
+        attributes: &'a mut IndexMap<String, Value<T, B>>,
     },
 }
 
@@ -1299,13 +1685,18 @@ pub enum ResourceMut<'a, P: PlaceholderKind = NoPlaceholder, T: PlaceholderKind 
 /// deferred-template arm, so consumers of [`File::iter_top_level_resources`]
 /// cannot encode an impossible fallback or panic.
 #[derive(Debug, Clone, Copy)]
-pub enum TopLevelResourceRef<'a, S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
-    Resource(&'a Resource<S, P>),
-    LiveComposition(&'a LiveComposition<P>),
-    DataSource(&'a DataSource<S, P>),
+pub enum TopLevelResourceRef<
+    'a,
+    S = ModuleSource,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    Resource(&'a Resource<S, P, B>),
+    LiveComposition(&'a LiveComposition<P, B>),
+    DataSource(&'a DataSource<S, P, B>),
 }
 
-impl<'a, S, P: PlaceholderKind> TopLevelResourceRef<'a, S, P> {
+impl<'a, S, P: PlaceholderKind, B: BindingAddress> TopLevelResourceRef<'a, S, P, B> {
     pub fn id(&self) -> &'a ResourceId {
         match self {
             Self::Resource(resource) => &resource.id,
@@ -1316,13 +1707,25 @@ impl<'a, S, P: PlaceholderKind> TopLevelResourceRef<'a, S, P> {
 
     pub fn binding(&self) -> Option<&'a str> {
         match self {
-            Self::Resource(resource) => resource.binding.as_deref(),
-            Self::LiveComposition(composition) => composition.binding.as_deref(),
-            Self::DataSource(data_source) => data_source.binding.as_deref(),
+            Self::Resource(resource) => resource.binding.as_ref().map(BindingAddress::as_str),
+            Self::LiveComposition(composition) => {
+                composition.binding.as_ref().map(BindingAddress::as_str)
+            }
+            Self::DataSource(data_source) => {
+                data_source.binding.as_ref().map(BindingAddress::as_str)
+            }
         }
     }
 
-    pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<String> {
+    pub fn binding_address(&self) -> Option<&'a B> {
+        match self {
+            Self::Resource(resource) => resource.binding.as_ref(),
+            Self::LiveComposition(composition) => composition.binding.as_ref(),
+            Self::DataSource(data_source) => data_source.binding.as_ref(),
+        }
+    }
+
+    pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<B> {
         match self {
             Self::Resource(resource) => &resource.dependency_bindings,
             Self::LiveComposition(composition) => &composition.dependency_bindings,
@@ -1330,7 +1733,7 @@ impl<'a, S, P: PlaceholderKind> TopLevelResourceRef<'a, S, P> {
         }
     }
 
-    pub fn directives(&self) -> Option<&'a Directives> {
+    pub fn directives(&self) -> Option<&'a Directives<B>> {
         match self {
             Self::Resource(resource) => Some(&resource.directives),
             Self::LiveComposition(_) => None,
@@ -1346,7 +1749,7 @@ impl<'a, S, P: PlaceholderKind> TopLevelResourceRef<'a, S, P> {
         }
     }
 
-    pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value<P>>> {
+    pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value<P, B>>> {
         match self {
             Self::Resource(resource) => std::borrow::Cow::Borrowed(&resource.attributes),
             Self::LiveComposition(composition) => std::borrow::Cow::Owned(
@@ -1361,42 +1764,59 @@ impl<'a, S, P: PlaceholderKind> TopLevelResourceRef<'a, S, P> {
         }
     }
 
-    pub fn resolved_attributes(&self) -> HashMap<String, Value<P>> {
+    pub fn resolved_attributes(&self) -> HashMap<String, Value<P, B>> {
         crate::resource::attrs_to_hashmap(&self.attributes())
     }
 }
 
-impl<S, P: PlaceholderKind, T: PlaceholderKind, D: DeferredForPhaseTraversal<P, T>> Copy
-    for ResourceContext<'_, S, P, T, D>
-{
-}
-
-impl<S, P: PlaceholderKind, T: PlaceholderKind, D: DeferredForPhaseTraversal<P, T>> Clone
-    for ResourceContext<'_, S, P, T, D>
-{
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<S, P: PlaceholderKind, T: PlaceholderKind, D: DeferredForPhaseTraversal<P, T>> Copy
-    for ResourceRef<'_, S, P, T, D>
-{
-}
-
-impl<S, P: PlaceholderKind, T: PlaceholderKind, D: DeferredForPhaseTraversal<P, T>> Clone
-    for ResourceRef<'_, S, P, T, D>
-{
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<'a, S, P, T, D> ResourceRef<'a, S, P, T, D>
+impl<S, P, T, D, B> Copy for ResourceContext<'_, S, P, T, D, B>
 where
     P: PlaceholderKind,
     T: PlaceholderKind,
-    D: DeferredForPhaseTraversal<P, T>,
+    B: BindingAddress,
+    D: DeferredForPhaseTraversal<P, T, B>,
+{
+}
+
+impl<S, P, T, D, B> Clone for ResourceContext<'_, S, P, T, D, B>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    B: BindingAddress,
+    D: DeferredForPhaseTraversal<P, T, B>,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S, P, T, D, B> Copy for ResourceRef<'_, S, P, T, D, B>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    B: BindingAddress,
+    D: DeferredForPhaseTraversal<P, T, B>,
+{
+}
+
+impl<S, P, T, D, B> Clone for ResourceRef<'_, S, P, T, D, B>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    B: BindingAddress,
+    D: DeferredForPhaseTraversal<P, T, B>,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, S, P, T, D, B> ResourceRef<'a, S, P, T, D, B>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    B: BindingAddress,
+    D: DeferredForPhaseTraversal<P, T, B>,
 {
     /// Stable identifier of this resource.
     pub fn id(&self) -> &'a ResourceId {
@@ -1414,13 +1834,26 @@ where
     /// `let` binding name if any.
     pub fn binding(&self) -> Option<&'a str> {
         match self {
-            ResourceRef::Resource(r) => r.binding.as_deref(),
-            ResourceRef::LiveComposition(v) => v.binding.as_deref(),
-            ResourceRef::DataSource(d) => d.binding.as_deref(),
+            ResourceRef::Resource(r) => r.binding.as_ref().map(BindingAddress::as_str),
+            ResourceRef::LiveComposition(v) => v.binding.as_ref().map(BindingAddress::as_str),
+            ResourceRef::DataSource(d) => d.binding.as_ref().map(BindingAddress::as_str),
             ResourceRef::Deferred {
                 resource,
                 deferred: _deferred,
-            } => resource.binding(),
+            } => resource.binding_address().map(BindingAddress::as_str),
+        }
+    }
+
+    /// Typed `let` binding address, preserving the file's binding phase.
+    pub(crate) fn binding_address(&self) -> Option<&'a B> {
+        match self {
+            ResourceRef::Resource(resource) => resource.binding.as_ref(),
+            ResourceRef::LiveComposition(composition) => composition.binding.as_ref(),
+            ResourceRef::DataSource(data_source) => data_source.binding.as_ref(),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => resource.binding_address(),
         }
     }
 
@@ -1430,7 +1863,7 @@ where
     /// Mirrors the field formerly exposed by
     /// `ResourceLike::dependency_bindings`; #3308 lifts this accessor
     /// onto `ResourceRef` so the trait can retire.
-    pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<String> {
+    pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<B> {
         match self {
             ResourceRef::Resource(r) => &r.dependency_bindings,
             ResourceRef::LiveComposition(v) => &v.dependency_bindings,
@@ -1445,7 +1878,7 @@ where
     /// `directives` meta-argument block. [`LiveComposition`] drops the
     /// field (no `prevent_destroy` on a synthetic node) — returns `None`
     /// for the `Virtual` arm.
-    pub fn directives(&self) -> Option<&'a Directives> {
+    pub fn directives(&self) -> Option<&'a Directives<B>> {
         match self {
             ResourceRef::Resource(r) => Some(&r.directives),
             ResourceRef::LiveComposition(_) => None,
@@ -1473,7 +1906,7 @@ where
     /// The [`ResourceContext`] an old `iter_all_resources` caller would
     /// have seen — `Deferred` for a for-expression template, `Direct`
     /// otherwise.
-    pub fn context(&self) -> ResourceContext<'a, S, P, T, D> {
+    pub fn context(&self) -> ResourceContext<'a, S, P, T, D, B> {
         match self {
             ResourceRef::Deferred {
                 resource: _resource,
@@ -1486,10 +1919,11 @@ where
     }
 }
 
-impl<'a, S, P, D> ResourceRef<'a, S, P, P, D>
+impl<'a, S, P, D, B> ResourceRef<'a, S, P, P, D, B>
 where
     P: PlaceholderKind,
-    D: DeferredForPhaseTraversal<P, P>,
+    B: BindingAddress,
+    D: DeferredForPhaseTraversal<P, P, B>,
 {
     /// Source-order preserving attribute map as `Value`s.
     ///
@@ -1498,7 +1932,7 @@ where
     /// [`LiveCompositionAttribute`](crate::resource::LiveCompositionAttribute)
     /// since #3294, and must materialize a `Value`-typed view on
     /// demand. The other three variants return a borrowed reference.
-    pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value<P>>> {
+    pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value<P, B>>> {
         match self {
             ResourceRef::Resource(r) => std::borrow::Cow::Borrowed(&r.attributes),
             ResourceRef::LiveComposition(v) => std::borrow::Cow::Owned(
@@ -1517,7 +1951,7 @@ where
 
     /// Attributes projected to a `HashMap<String, Value>` — the
     /// lookup-shaped view consumed by schema validation.
-    pub fn resolved_attributes(&self) -> HashMap<String, Value<P>> {
+    pub fn resolved_attributes(&self) -> HashMap<String, Value<P, B>> {
         crate::resource::attrs_to_hashmap(&self.attributes())
     }
 }
@@ -1690,22 +2124,27 @@ mod type_expr_display_tests {
 
 /// Argument parameter definition (in `arguments { ... }` block)
 #[derive(Debug, Clone)]
-pub struct ArgumentParameter<T = TypeExpr, P: PlaceholderKind = ParserPlaceholder> {
+pub struct ArgumentParameter<
+    T = TypeExpr,
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     pub name: String,
     pub static_type: T,
-    pub default: Option<Value<P>>,
+    pub default: Option<Value<P, B>>,
     /// Optional description (from block form)
     pub description: Option<String>,
     /// Optional validation blocks (from block form). Multiple blocks are allowed.
-    pub validations: Vec<ValidationBlock<P>>,
+    pub validations: Vec<ValidationBlock<P, B>>,
 }
 
-pub type ConsumerArgumentParameter = ArgumentParameter<ConsumerStaticType>;
+pub type ConsumerArgumentParameter<B = RelativeBindingName> =
+    ArgumentParameter<ConsumerStaticType, ParserPlaceholder, B>;
 
-impl<T> ArgumentParameter<T, ParserPlaceholder> {
+impl<T, B: BindingAddress> ArgumentParameter<T, ParserPlaceholder, B> {
     fn into_expanded(
         self,
-    ) -> Result<ArgumentParameter<T, NoPlaceholder>, crate::resource::LeftoverPlaceholder> {
+    ) -> Result<ArgumentParameter<T, NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(ArgumentParameter {
             name: self.name,
             static_type: self.static_type,
@@ -1722,15 +2161,18 @@ impl<T> ArgumentParameter<T, ParserPlaceholder> {
 
 /// A validate block: `validation { condition = <expr> error_message = "..." }`
 #[derive(Debug, Clone)]
-pub struct ValidationBlock<P: PlaceholderKind = NoPlaceholder> {
-    pub condition: ValidateExpr<P>,
+pub struct ValidationBlock<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    pub condition: ValidateExpr<P, B>,
     pub error_message: Option<String>,
     source: DeclarationSource,
 }
 
-impl<P: PlaceholderKind> ValidationBlock<P> {
+impl<P: PlaceholderKind, B: BindingAddress> ValidationBlock<P, B> {
     pub(crate) fn new_in_source(
-        condition: ValidateExpr<P>,
+        condition: ValidateExpr<P, B>,
         error_message: Option<String>,
         source_span: SourceSpan,
         source_file: PathBuf,
@@ -1743,7 +2185,7 @@ impl<P: PlaceholderKind> ValidationBlock<P> {
     }
 
     #[cfg(test)]
-    pub(crate) fn dummy(condition: ValidateExpr<P>, error_message: Option<String>) -> Self {
+    pub(crate) fn dummy(condition: ValidateExpr<P, B>, error_message: Option<String>) -> Self {
         Self::new_in_source(
             condition,
             error_message,
@@ -1760,7 +2202,7 @@ impl<P: PlaceholderKind> ValidationBlock<P> {
         &self.source.file
     }
 
-    pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr<P> {
+    pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr<P, B> {
         let Self {
             condition,
             error_message: _error_message,
@@ -1770,8 +2212,10 @@ impl<P: PlaceholderKind> ValidationBlock<P> {
     }
 }
 
-impl ValidationBlock<ParserPlaceholder> {
-    fn into_expanded(self) -> Result<ValidationBlock, crate::resource::LeftoverPlaceholder> {
+impl<B: BindingAddress> ValidationBlock<ParserPlaceholder, B> {
+    fn into_expanded(
+        self,
+    ) -> Result<ValidationBlock<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(ValidationBlock {
             condition: self.condition.into_expanded()?,
             error_message: self.error_message,
@@ -1784,7 +2228,10 @@ impl ValidationBlock<ParserPlaceholder> {
 
 /// Validate expression AST node
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum ValidateExpr<P: PlaceholderKind = NoPlaceholder> {
+pub enum ValidateExpr<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     /// Boolean literal
     Bool(bool),
     /// Integer literal
@@ -1812,13 +2259,13 @@ pub enum ValidateExpr<P: PlaceholderKind = NoPlaceholder> {
         /// Authored operand, including any postfix path, used for diagnostics.
         #[serde(default)]
         operand: String,
-        value: Value<P>,
+        value: Value<P, B>,
     },
     /// Binary Int arithmetic used by `require` and argument validation.
     IntegerArithmetic {
-        lhs: Box<ValidateExpr<P>>,
+        lhs: Box<ValidateExpr<P, B>>,
         op: crate::integer_arithmetic::IntegerOp,
-        rhs: Box<ValidateExpr<P>>,
+        rhs: Box<ValidateExpr<P, B>>,
         #[serde(
             skip,
             default = "crate::integer_arithmetic::IntegerOperatorSpan::synthetic"
@@ -1827,26 +2274,26 @@ pub enum ValidateExpr<P: PlaceholderKind = NoPlaceholder> {
     },
     /// Comparison: lhs op rhs
     Compare {
-        lhs: Box<ValidateExpr<P>>,
+        lhs: Box<ValidateExpr<P, B>>,
         op: CompareOp,
-        rhs: Box<ValidateExpr<P>>,
+        rhs: Box<ValidateExpr<P, B>>,
     },
     /// Logical AND
-    And(Box<ValidateExpr<P>>, Box<ValidateExpr<P>>),
+    And(Box<ValidateExpr<P, B>>, Box<ValidateExpr<P, B>>),
     /// Logical OR
-    Or(Box<ValidateExpr<P>>, Box<ValidateExpr<P>>),
+    Or(Box<ValidateExpr<P, B>>, Box<ValidateExpr<P, B>>),
     /// Logical NOT
-    Not(Box<ValidateExpr<P>>),
+    Not(Box<ValidateExpr<P, B>>),
     /// Function call (e.g., len(x))
     FunctionCall {
         name: String,
-        args: Vec<ValidateExpr<P>>,
+        args: Vec<ValidateExpr<P, B>>,
     },
     /// Null literal
     Null,
 }
 
-impl ValidateExpr<ParserPlaceholder> {
+impl<B: BindingAddress> ValidateExpr<ParserPlaceholder, B> {
     pub(crate) fn collect_leftover_placeholders(
         &self,
         context: &LeftoverPlaceholderContext,
@@ -1900,7 +2347,7 @@ impl ValidateExpr<ParserPlaceholder> {
 
     pub(crate) fn into_expanded(
         self,
-    ) -> Result<ValidateExpr, crate::resource::LeftoverPlaceholder> {
+    ) -> Result<ValidateExpr<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(match self {
             Self::Bool(value) => ValidateExpr::Bool(value),
             Self::Int(value) => ValidateExpr::Int(value),
@@ -1955,18 +2402,129 @@ impl ValidateExpr<ParserPlaceholder> {
     }
 }
 
+impl<P: PlaceholderKind> ValidateExpr<P, RelativeBindingName> {
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> ValidateExpr<P, AbsoluteBindingAddress> {
+        match self {
+            Self::Bool(value) => ValidateExpr::Bool(value),
+            Self::Int(value) => ValidateExpr::Int(value),
+            Self::Float(value) => ValidateExpr::Float(value),
+            Self::Duration(value) => ValidateExpr::Duration(value),
+            Self::String(value) => ValidateExpr::String(value),
+            Self::Var(name) => ValidateExpr::Var(name),
+            Self::Access { argument, path } => ValidateExpr::Access { argument, path },
+            Self::BoundArgument {
+                argument,
+                operand,
+                value,
+            } => ValidateExpr::BoundArgument {
+                argument,
+                operand,
+                value: value.resolve_bindings(resolve),
+            },
+            Self::IntegerArithmetic {
+                lhs,
+                op,
+                rhs,
+                operator_span,
+            } => ValidateExpr::IntegerArithmetic {
+                lhs: Box::new(lhs.resolve_bindings(resolve)),
+                op,
+                rhs: Box::new(rhs.resolve_bindings(resolve)),
+                operator_span,
+            },
+            Self::Compare { lhs, op, rhs } => ValidateExpr::Compare {
+                lhs: Box::new(lhs.resolve_bindings(resolve)),
+                op,
+                rhs: Box::new(rhs.resolve_bindings(resolve)),
+            },
+            Self::And(left, right) => ValidateExpr::And(
+                Box::new(left.resolve_bindings(resolve)),
+                Box::new(right.resolve_bindings(resolve)),
+            ),
+            Self::Or(left, right) => ValidateExpr::Or(
+                Box::new(left.resolve_bindings(resolve)),
+                Box::new(right.resolve_bindings(resolve)),
+            ),
+            Self::Not(value) => ValidateExpr::Not(Box::new(value.resolve_bindings(resolve))),
+            Self::FunctionCall { name, args } => ValidateExpr::FunctionCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|argument| argument.resolve_bindings(resolve))
+                    .collect(),
+            },
+            Self::Null => ValidateExpr::Null,
+        }
+    }
+}
+
+impl<P: PlaceholderKind> ValidateExpr<P, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        match self {
+            Self::Bool(_value) => {}
+            Self::Int(_value) => {}
+            Self::Float(_value) => {}
+            Self::Duration(_value) => {}
+            Self::String(_value) => {}
+            Self::Var(_name) => {}
+            Self::Access {
+                argument: _argument,
+                path: _path,
+            } => {}
+            Self::BoundArgument {
+                argument: _argument,
+                operand: _operand,
+                value,
+            } => value.map_absolute_bindings(map),
+            Self::IntegerArithmetic {
+                lhs,
+                op: _op,
+                rhs,
+                operator_span: _operator_span,
+            } => {
+                lhs.map_absolute_bindings(map);
+                rhs.map_absolute_bindings(map);
+            }
+            Self::Compare { lhs, op: _op, rhs } => {
+                lhs.map_absolute_bindings(map);
+                rhs.map_absolute_bindings(map);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.map_absolute_bindings(map);
+                right.map_absolute_bindings(map);
+            }
+            Self::Not(value) => value.map_absolute_bindings(map),
+            Self::FunctionCall { name: _name, args } => {
+                for argument in args {
+                    argument.map_absolute_bindings(map);
+                }
+            }
+            Self::Null => {}
+        }
+    }
+}
+
 /// A require block: `require <condition>, "error message"`
 /// Used for cross-argument constraints at the module top level.
 #[derive(Debug, Clone)]
-pub struct RequireBlock<P: PlaceholderKind = NoPlaceholder> {
-    pub condition: ValidateExpr<P>,
+pub struct RequireBlock<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    pub condition: ValidateExpr<P, B>,
     pub error_message: String,
     source: DeclarationSource,
 }
 
-impl<P: PlaceholderKind> RequireBlock<P> {
+impl<P: PlaceholderKind, B: BindingAddress> RequireBlock<P, B> {
     pub(crate) fn new_in_source(
-        condition: ValidateExpr<P>,
+        condition: ValidateExpr<P, B>,
         error_message: String,
         source_span: SourceSpan,
         source_file: PathBuf,
@@ -1979,7 +2537,7 @@ impl<P: PlaceholderKind> RequireBlock<P> {
     }
 
     #[cfg(test)]
-    pub(crate) fn dummy(condition: ValidateExpr<P>, error_message: String) -> Self {
+    pub(crate) fn dummy(condition: ValidateExpr<P, B>, error_message: String) -> Self {
         Self::new_in_source(
             condition,
             error_message,
@@ -1996,7 +2554,7 @@ impl<P: PlaceholderKind> RequireBlock<P> {
         &self.source.file
     }
 
-    pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr<P> {
+    pub(crate) fn condition_for_module_if_audit(&self) -> &ValidateExpr<P, B> {
         let Self {
             condition,
             error_message: _error_message,
@@ -2006,8 +2564,10 @@ impl<P: PlaceholderKind> RequireBlock<P> {
     }
 }
 
-impl RequireBlock<ParserPlaceholder> {
-    fn into_expanded(self) -> Result<RequireBlock, crate::resource::LeftoverPlaceholder> {
+impl<B: BindingAddress> RequireBlock<ParserPlaceholder, B> {
+    fn into_expanded(
+        self,
+    ) -> Result<RequireBlock<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(RequireBlock {
             condition: self.condition.into_expanded()?,
             error_message: self.error_message,
@@ -2018,18 +2578,22 @@ impl RequireBlock<ParserPlaceholder> {
 
 /// Attribute parameter definition (in `attributes { ... }` block)
 #[derive(Debug, Clone)]
-pub struct AttributeParameter<T = TypeExpr, P: PlaceholderKind = ParserPlaceholder> {
+pub struct AttributeParameter<
+    T = TypeExpr,
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     pub name: String,
     pub static_type: Option<T>,
-    pub value: Option<Value<P>>,
+    pub value: Option<Value<P, B>>,
     source: DeclarationSource,
 }
 
-impl<P: PlaceholderKind> AttributeParameter<TypeExpr, P> {
+impl<P: PlaceholderKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
-        value: Option<Value<P>>,
+        value: Option<Value<P, B>>,
         source_span: SourceSpan,
         source_file: PathBuf,
     ) -> Self {
@@ -2045,7 +2609,7 @@ impl<P: PlaceholderKind> AttributeParameter<TypeExpr, P> {
     pub(crate) fn dummy(
         name: String,
         type_expr: Option<TypeExpr>,
-        value: Option<Value<P>>,
+        value: Option<Value<P, B>>,
     ) -> Self {
         Self::new_in_source(
             name,
@@ -2065,8 +2629,8 @@ impl<P: PlaceholderKind> AttributeParameter<TypeExpr, P> {
     }
 }
 
-impl<T, P: PlaceholderKind> AttributeParameter<T, P> {
-    pub(crate) fn value_for_module_if_audit(&self) -> Option<&Value<P>> {
+impl<T, P: PlaceholderKind, B: BindingAddress> AttributeParameter<T, P, B> {
+    pub(crate) fn value_for_module_if_audit(&self) -> Option<&Value<P, B>> {
         let Self {
             name: _name,
             static_type: _static_type,
@@ -2076,7 +2640,7 @@ impl<T, P: PlaceholderKind> AttributeParameter<T, P> {
         value.as_ref()
     }
 
-    pub(crate) fn map_type_expr<U>(self, map: impl FnOnce(T) -> U) -> AttributeParameter<U, P> {
+    pub(crate) fn map_type_expr<U>(self, map: impl FnOnce(T) -> U) -> AttributeParameter<U, P, B> {
         AttributeParameter {
             name: self.name,
             static_type: self.static_type.map(map),
@@ -2086,10 +2650,10 @@ impl<T, P: PlaceholderKind> AttributeParameter<T, P> {
     }
 }
 
-impl<T> AttributeParameter<T, ParserPlaceholder> {
+impl<T, B: BindingAddress> AttributeParameter<T, ParserPlaceholder, B> {
     fn into_expanded(
         self,
-    ) -> Result<AttributeParameter<T, NoPlaceholder>, crate::resource::LeftoverPlaceholder> {
+    ) -> Result<AttributeParameter<T, NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         let name = self.name;
         Ok(AttributeParameter {
             name: name.clone(),
@@ -2104,7 +2668,8 @@ impl<T> AttributeParameter<T, ParserPlaceholder> {
     }
 }
 
-pub type ConsumerAttributeParameter = AttributeParameter<ConsumerStaticType>;
+pub type ConsumerAttributeParameter<B = RelativeBindingName> =
+    AttributeParameter<ConsumerStaticType, ParserPlaceholder, B>;
 
 /// An export parameter in an `exports { }` block, as produced by the
 /// parser before any inference runs.
@@ -2114,18 +2679,21 @@ pub type ConsumerAttributeParameter = AttributeParameter<ConsumerStaticType>;
 /// (#2360 stage 2) to resolve the effective type and emits
 /// [`InferredExportParam`] downstream.
 #[derive(Debug, Clone)]
-pub struct ParsedExportParam<P: PlaceholderKind = ParserPlaceholder> {
+pub struct ParsedExportParam<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     pub name: String,
     pub static_type: Option<TypeExpr>,
-    pub value: Option<Value<P>>,
+    pub value: Option<Value<P, B>>,
     source: DeclarationSource,
 }
 
-impl<P: PlaceholderKind> ParsedExportParam<P> {
+impl<P: PlaceholderKind, B: BindingAddress> ParsedExportParam<P, B> {
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
-        value: Option<Value<P>>,
+        value: Option<Value<P, B>>,
         source_span: SourceSpan,
         source_file: PathBuf,
     ) -> Self {
@@ -2141,7 +2709,7 @@ impl<P: PlaceholderKind> ParsedExportParam<P> {
     pub(crate) fn dummy(
         name: String,
         type_expr: Option<TypeExpr>,
-        value: Option<Value<P>>,
+        value: Option<Value<P, B>>,
     ) -> Self {
         Self::new_in_source(
             name,
@@ -2161,7 +2729,7 @@ impl<P: PlaceholderKind> ParsedExportParam<P> {
     }
 }
 
-impl<P: PlaceholderKind + PartialEq> PartialEq for ParsedExportParam<P> {
+impl<P: PlaceholderKind + PartialEq, B: BindingAddress> PartialEq for ParsedExportParam<P, B> {
     fn eq(&self, other: &Self) -> bool {
         let Self {
             name,
@@ -2183,34 +2751,40 @@ impl<P: PlaceholderKind + PartialEq> PartialEq for ParsedExportParam<P> {
 /// produce the parser-phase shape) read naturally as
 /// `ExportParameter`; downstream consumers should use the explicit
 /// [`ParsedExportParam`] / [`InferredExportParam`] names.
-pub type ExportParameter = ParsedExportParam<ParserPlaceholder>;
+pub type ExportParameter = ParsedExportParam<ParserPlaceholder, RelativeBindingName>;
 
 /// Phase-agnostic accessor over an export parameter. Implemented by both
 /// [`ParsedExportParam`] (parser phase) and [`InferredExportParam`]
 /// (post-loader phase) so reference resolution, type validation, module
 /// resolution, and upstream-state checks work uniformly across both shapes.
-pub trait ExportParamLike<P: PlaceholderKind = ParserPlaceholder> {
+pub trait ExportParamLike<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+>
+{
     fn name(&self) -> &str;
-    fn value(&self) -> Option<&Value<P>>;
+    fn value(&self) -> Option<&Value<P, B>>;
     /// Replace the value after binding-aware export resolution.
     ///
     /// This mutator is intentionally part of the phase-agnostic trait so the
     /// export boundary can return the same parser/inference shape wrapped in
     /// a checked type instead of maintaining parallel representations.
-    fn set_value(&mut self, value: Option<Value<P>>);
+    fn set_value(&mut self, value: Option<Value<P, B>>);
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
     fn inference_failed(&self) -> bool;
 }
 
-impl<P: PlaceholderKind + PartialEq> ExportParamLike<P> for ParsedExportParam<P> {
+impl<P: PlaceholderKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
+    for ParsedExportParam<P, B>
+{
     fn name(&self) -> &str {
         &self.name
     }
-    fn value(&self) -> Option<&Value<P>> {
+    fn value(&self) -> Option<&Value<P, B>> {
         self.value.as_ref()
     }
-    fn set_value(&mut self, value: Option<Value<P>>) {
+    fn set_value(&mut self, value: Option<Value<P, B>>) {
         self.value = value;
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
@@ -2224,17 +2798,53 @@ impl<P: PlaceholderKind + PartialEq> ExportParamLike<P> for ParsedExportParam<P>
     }
 }
 
-#[doc(hidden)]
-pub trait IntoExpandedExportParam: ExportParamLike<ParserPlaceholder> {
-    type Expanded: ExportParamLike<NoPlaceholder>;
+pub trait IntoExpandedExportParam<B: BindingAddress = RelativeBindingName>:
+    ExportParamLike<ParserPlaceholder, B>
+{
+    type Expanded: ExportParamLike<NoPlaceholder, B>;
 
     fn collect_leftover_placeholders(&self, errors: &mut Vec<crate::resource::LeftoverPlaceholder>);
 
     fn into_expanded(self) -> Result<Self::Expanded, crate::resource::LeftoverPlaceholder>;
 }
 
-impl IntoExpandedExportParam for ParsedExportParam<ParserPlaceholder> {
-    type Expanded = ParsedExportParam<NoPlaceholder>;
+pub trait ResolveExportBindingPhase<P: PlaceholderKind>:
+    ExportParamLike<P, RelativeBindingName> + Sized
+{
+    type Absolute: ExportParamLike<P, AbsoluteBindingAddress>;
+
+    fn resolve_export_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> Self::Absolute;
+
+    #[cfg(feature = "test-support")]
+    fn resolve_root_for_test(self) -> Self::Absolute {
+        let scope = RootScope::new();
+        self.resolve_export_bindings(&mut |binding| scope.resolve(binding))
+    }
+}
+
+impl<P: PlaceholderKind + PartialEq> ResolveExportBindingPhase<P>
+    for ParsedExportParam<P, RelativeBindingName>
+{
+    type Absolute = ParsedExportParam<P, AbsoluteBindingAddress>;
+
+    fn resolve_export_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> Self::Absolute {
+        ParsedExportParam {
+            name: self.name,
+            static_type: self.static_type,
+            value: self.value.map(|value| value.resolve_bindings(resolve)),
+            source: self.source,
+        }
+    }
+}
+
+impl<B: BindingAddress> IntoExpandedExportParam<B> for ParsedExportParam<ParserPlaceholder, B> {
+    type Expanded = ParsedExportParam<NoPlaceholder, B>;
 
     fn collect_leftover_placeholders(
         &self,
@@ -2499,7 +3109,8 @@ impl MovedAddresses {
 
 /// State manipulation block (import, removed, moved)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum StateBlock<P: PlaceholderKind = NoPlaceholder> {
+pub enum StateBlock<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress>
+{
     /// Import existing infrastructure into Carina management
     Import {
         /// Target resource address (routing-agnostic — see
@@ -2518,7 +3129,7 @@ pub enum StateBlock<P: PlaceholderKind = NoPlaceholder> {
         /// `String` shape silently dropped `${...}` segments at parse
         /// time and presented a partially-substituted literal as if it
         /// were a real cloud identifier. See carina#3329.
-        id: Value<P>,
+        id: Value<P, B>,
     },
     /// Remove a resource from state without destroying it
     Removed {
@@ -2532,8 +3143,10 @@ pub enum StateBlock<P: PlaceholderKind = NoPlaceholder> {
     },
 }
 
-impl StateBlock<ParserPlaceholder> {
-    fn into_expanded(self) -> Result<StateBlock, crate::resource::LeftoverPlaceholder> {
+impl<B: BindingAddress> StateBlock<ParserPlaceholder, B> {
+    fn into_expanded(
+        self,
+    ) -> Result<StateBlock<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(match self {
             Self::Import { to, to_span, id } => StateBlock::Import {
                 to,
@@ -2584,17 +3197,17 @@ impl UseStatement {
 
 /// Parameter for a user-defined function
 #[derive(Debug, Clone)]
-pub struct FnParam {
+pub struct FnParam<B: BindingAddress = RelativeBindingName> {
     pub name: String,
     pub param_type: Option<TypeExpr>,
-    pub default: Option<Value<ParserPlaceholder>>,
+    pub default: Option<Value<ParserPlaceholder, B>>,
 }
 
 /// The body of a user-defined function: a value expression.
 /// Functions are pure value transformations only.
 #[derive(Debug, Clone)]
-pub struct UserFunctionBody {
-    pub value: Value<ParserPlaceholder>,
+pub struct UserFunctionBody<B: BindingAddress = RelativeBindingName> {
+    pub value: Value<ParserPlaceholder, B>,
     pub source_line: usize,
     /// Owning `.crn` file, stamped by the directory loader after parsing.
     pub source_file: Option<std::path::PathBuf>,
@@ -2602,47 +3215,77 @@ pub struct UserFunctionBody {
 
 /// User-defined pure function
 #[derive(Debug, Clone)]
-pub struct UserFunction {
+pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
     pub name: String,
-    pub params: Vec<FnParam>,
+    pub params: Vec<FnParam<B>>,
     /// Optional return type annotation
     pub return_type: Option<TypeExpr>,
     /// Local let bindings inside the function body (name, expression)
-    pub local_lets: Vec<(String, Value<ParserPlaceholder>, usize)>,
+    pub local_lets: Vec<(String, Value<ParserPlaceholder, B>, usize)>,
     /// The body of the function
-    pub body: UserFunctionBody,
+    pub body: UserFunctionBody<B>,
+}
+
+impl<B: BindingAddress> UserFunction<B> {
+    pub(crate) fn map_bindings<T: BindingAddress>(
+        self,
+        map: &mut impl FnMut(B) -> T,
+    ) -> UserFunction<T> {
+        UserFunction {
+            name: self.name,
+            params: self
+                .params
+                .into_iter()
+                .map(|param| FnParam {
+                    name: param.name,
+                    param_type: param.param_type,
+                    default: param.default.map(|value| value.map_bindings(map)),
+                })
+                .collect(),
+            return_type: self.return_type,
+            local_lets: self
+                .local_lets
+                .into_iter()
+                .map(|(name, value, line)| (name, value.map_bindings(map), line))
+                .collect(),
+            body: UserFunctionBody {
+                value: self.body.value.map_bindings(map),
+                source_line: self.body.source_line,
+                source_file: self.body.source_file,
+            },
+        }
+    }
 }
 
 /// Module call (instantiation)
 #[derive(Debug, Clone, PartialEq)]
-pub struct ModuleArgument<P: PlaceholderKind = ParserPlaceholder> {
-    operand: StructuralOperand<P>,
+pub struct ModuleArgument<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    operand: StructuralOperand<P, B>,
 }
 
-impl<P: PlaceholderKind> ModuleArgument<P> {
-    pub(crate) fn value_ref(&self) -> StructuralOperandRef<'_, P> {
+impl<P: PlaceholderKind, B: BindingAddress> ModuleArgument<P, B> {
+    pub(crate) fn value_ref(&self) -> StructuralOperandRef<'_, P, B> {
         self.operand.value_ref()
     }
 
-    pub(crate) fn access_ref(&self) -> StructuralOperandRef<'_, P> {
-        self.operand.access_ref()
-    }
-
-    pub(crate) fn from_parts(value: Value<P>, access_base: Option<Value<P>>) -> Self {
+    pub(crate) fn from_parts(value: Value<P, B>, access_base: Option<Value<P, B>>) -> Self {
         Self {
             operand: StructuralOperand::from_value_with_access_base(value, access_base),
         }
     }
 
-    pub fn new(value: Value<P>) -> Self {
+    pub fn new(value: Value<P, B>) -> Self {
         Self::from_parts(value, None)
     }
 
-    pub(crate) fn with_access_base(value: Value<P>, access_base: Value<P>) -> Self {
+    pub(crate) fn with_access_base(value: Value<P, B>, access_base: Value<P, B>) -> Self {
         Self::from_parts(value, Some(access_base))
     }
 
-    pub fn value(&self) -> Option<&Value<P>> {
+    pub fn value(&self) -> Option<&Value<P, B>> {
         self.operand.value()
     }
 
@@ -2652,7 +3295,7 @@ impl<P: PlaceholderKind> ModuleArgument<P> {
         self.handle().map(|handle| handle.bare_error().to_string())
     }
 
-    pub(crate) fn handle(&self) -> Option<&StructuralHandle> {
+    pub(crate) fn handle(&self) -> Option<&StructuralHandle<B>> {
         self.operand.handle()
     }
 
@@ -2660,34 +3303,34 @@ impl<P: PlaceholderKind> ModuleArgument<P> {
         self.operand.parameter()
     }
 
-    pub(crate) fn access_base(&self) -> Option<&Value<P>> {
+    pub(crate) fn access_base(&self) -> Option<&Value<P, B>> {
         self.operand.explicit_access_base()
     }
 
     /// Value-shaped projection reserved for generic reference/dependency
     /// walkers. Semantic consumers must use the typed operand accessors.
-    pub(crate) fn walker_value(&self) -> &Value<P> {
+    pub(crate) fn walker_value(&self) -> &Value<P, B> {
         self.operand.traversal_value()
     }
 
     pub(crate) fn try_visit_values<E>(
         &self,
-        visit: &mut impl FnMut(&Value<P>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<P, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         self.operand.try_visit_values(visit)
     }
 
     pub(crate) fn try_rewrite<E>(
         &mut self,
-        rewrite: impl FnMut(&Value<P>) -> Result<Value<P>, E>,
+        rewrite: impl FnMut(&Value<P, B>) -> Result<Value<P, B>, E>,
     ) -> Result<(), E> {
         self.operand = self.operand.try_map(rewrite)?;
         Ok(())
     }
 }
 
-impl ModuleArgument<ParserPlaceholder> {
-    pub(crate) fn from_handle(handle: StructuralHandle) -> Self {
+impl<B: BindingAddress> ModuleArgument<ParserPlaceholder, B> {
+    pub(crate) fn from_handle(handle: StructuralHandle<B>) -> Self {
         Self {
             operand: StructuralOperand::from_handle(handle),
         }
@@ -2695,16 +3338,37 @@ impl ModuleArgument<ParserPlaceholder> {
 
     fn into_expanded(
         self,
-    ) -> Result<ModuleArgument<NoPlaceholder>, crate::resource::LeftoverPlaceholder> {
+    ) -> Result<ModuleArgument<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(ModuleArgument {
             operand: self.operand.try_map_stage(&mut Value::into_expanded)?,
         })
     }
 }
 
-impl<P: PlaceholderKind> From<Value<P>> for ModuleArgument<P> {
-    fn from(value: Value<P>) -> Self {
+impl<P: PlaceholderKind, B: BindingAddress> From<Value<P, B>> for ModuleArgument<P, B> {
+    fn from(value: Value<P, B>) -> Self {
         Self::new(value)
+    }
+}
+
+impl<P: PlaceholderKind> ModuleArgument<P, RelativeBindingName> {
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> ModuleArgument<P, AbsoluteBindingAddress> {
+        let Self { operand } = self;
+        ModuleArgument {
+            operand: operand.map_bindings(resolve),
+        }
+    }
+}
+
+impl<P: PlaceholderKind> ModuleArgument<P, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        self.operand.map_absolute_bindings(map);
     }
 }
 
@@ -2869,27 +3533,35 @@ pub struct PendingValueSlot {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum BareBindingSource {
+pub(crate) enum BareBindingSource<B: BindingAddress = RelativeBindingName> {
     Value {
-        value: Arc<Value<ParserPlaceholder>>,
+        value: Arc<Value<ParserPlaceholder, B>>,
         declared_type: Option<Arc<TypeExpr>>,
     },
-    Structural(StructuralHandle),
+    Structural(StructuralHandle<B>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ParsedBareBindingUse {
+pub(crate) struct ParsedBareBindingUse<B: BindingAddress = RelativeBindingName> {
     pub(crate) authored: BareBindingUse,
-    pub(crate) source: BareBindingSource,
+    pub(crate) source: BareBindingSource<B>,
     pub(crate) pending_slot: Option<PendingValueSlot>,
 }
 
 /// Opaque parsed-file side data for bare binding provenance and pending sinks.
-#[doc(hidden)]
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ParsedBindingUses {
-    records: Vec<ParsedBareBindingUse>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedBindingUses<B: BindingAddress = RelativeBindingName> {
+    records: Vec<ParsedBareBindingUse<B>>,
     record_indices_by_owner: HashMap<BindingUseOwnerKey, Vec<usize>>,
+}
+
+impl<B: BindingAddress> Default for ParsedBindingUses<B> {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            record_indices_by_owner: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2907,11 +3579,11 @@ impl From<&BindingUseOwner> for BindingUseOwnerKey {
     }
 }
 
-impl ParsedBindingUses {
+impl<B: BindingAddress> ParsedBindingUses<B> {
     pub(crate) fn record(
         &mut self,
         authored: BareBindingUse,
-        source: BareBindingSource,
+        source: BareBindingSource<B>,
         pending_slot: Option<PendingValueSlot>,
     ) {
         let owner = BindingUseOwnerKey::from(&authored.owner);
@@ -2934,13 +3606,13 @@ impl ParsedBindingUses {
             .push(index);
     }
 
-    pub(crate) fn records(&self) -> &[ParsedBareBindingUse] {
+    pub(crate) fn records(&self) -> &[ParsedBareBindingUse<B>] {
         &self.records
     }
 
     pub(crate) fn try_visit_values<E>(
         &self,
-        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         let Self {
             records,
@@ -2953,26 +3625,6 @@ impl ParsedBindingUses {
                     declared_type: _declared_type,
                 } => visit(value)?,
                 BareBindingSource::Structural(_handle) => {}
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn try_rewrite_values<E>(
-        &mut self,
-        mut rewrite: impl FnMut(&Value<ParserPlaceholder>) -> Result<Value<ParserPlaceholder>, E>,
-    ) -> Result<(), E> {
-        let Self {
-            records,
-            record_indices_by_owner: _record_indices_by_owner,
-        } = self;
-        for record in records {
-            if let BareBindingSource::Value {
-                value,
-                declared_type: _declared_type,
-            } = &mut record.source
-            {
-                *value = Arc::new(rewrite(value.as_ref())?);
             }
         }
         Ok(())
@@ -3057,6 +3709,77 @@ impl ParsedBindingUses {
     }
 }
 
+impl ParsedBindingUses<RelativeBindingName> {
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> ParsedBindingUses<AbsoluteBindingAddress> {
+        let Self {
+            records,
+            record_indices_by_owner,
+        } = self;
+        ParsedBindingUses {
+            records: records
+                .into_iter()
+                .map(|record| {
+                    let ParsedBareBindingUse {
+                        authored,
+                        source,
+                        pending_slot,
+                    } = record;
+                    ParsedBareBindingUse {
+                        authored,
+                        source: match source {
+                            BareBindingSource::Value {
+                                value,
+                                declared_type,
+                            } => BareBindingSource::Value {
+                                value: Arc::new((*value).clone().resolve_bindings(resolve)),
+                                declared_type,
+                            },
+                            BareBindingSource::Structural(handle) => {
+                                BareBindingSource::Structural(handle.resolve_bindings(resolve))
+                            }
+                        },
+                        pending_slot,
+                    }
+                })
+                .collect(),
+            record_indices_by_owner,
+        }
+    }
+}
+
+impl ParsedBindingUses<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            records,
+            record_indices_by_owner: _record_indices_by_owner,
+        } = self;
+        for record in records {
+            let ParsedBareBindingUse {
+                authored: _authored,
+                source,
+                pending_slot: _pending_slot,
+            } = record;
+            match source {
+                BareBindingSource::Value {
+                    value,
+                    declared_type: _declared_type,
+                } => {
+                    let mut mapped = (**value).clone();
+                    mapped.map_absolute_bindings(map);
+                    *value = Arc::new(mapped);
+                }
+                BareBindingSource::Structural(handle) => handle.map_absolute_bindings(map),
+            }
+        }
+    }
+}
+
 /// Parser-owned discriminator for one concrete `for` expansion.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExpansionKey(String);
@@ -3123,20 +3846,23 @@ impl ModuleCallId {
 
 /// Module call (instantiation)
 #[derive(Debug, Clone)]
-pub struct ModuleCall<P: PlaceholderKind = ParserPlaceholder> {
+pub struct ModuleCall<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     pub module_name: String,
-    pub binding_name: Option<String>,
-    arguments: HashMap<String, AuthoredModuleArgument<P>>,
+    pub binding_name: Option<B>,
+    arguments: HashMap<String, AuthoredModuleArgument<P, B>>,
     source: Box<ModuleCallSite>,
     loop_origin: Option<Box<crate::resource::LoopElementOrigin>>,
 }
 
-impl<P: PlaceholderKind> ModuleCall<P> {
+impl<P: PlaceholderKind, B: BindingAddress> ModuleCall<P, B> {
     pub(super) fn from_authored_arguments_in_source(
         module_name: impl Into<String>,
-        binding_name: Option<String>,
+        binding_name: Option<B>,
         call_span: SourceSpan,
-        arguments: HashMap<String, AuthoredModuleArgument<P>>,
+        arguments: HashMap<String, AuthoredModuleArgument<P, B>>,
         source_file: PathBuf,
     ) -> Self {
         Self {
@@ -3148,25 +3874,6 @@ impl<P: PlaceholderKind> ModuleCall<P> {
             }),
             loop_origin: None,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test(
-        module_name: impl Into<String>,
-        binding_name: Option<String>,
-        arguments: HashMap<String, ModuleArgument<P>>,
-    ) -> Self {
-        let span = SourceSpan::dummy();
-        Self::from_authored_arguments_in_source(
-            module_name,
-            binding_name,
-            span,
-            arguments
-                .into_iter()
-                .map(|(name, argument)| (name, AuthoredModuleArgument::new(argument, span, span)))
-                .collect(),
-            PathBuf::from("test.crn"),
-        )
     }
 
     pub(super) fn set_expansion_key(&mut self, expansion_key: String) {
@@ -3203,7 +3910,7 @@ impl<P: PlaceholderKind> ModuleCall<P> {
     }
 
     /// Iterate authored arguments, each of which carries parser spans by construction.
-    pub fn arguments(&self) -> impl Iterator<Item = (&str, &ModuleArgument<P>)> {
+    pub fn arguments(&self) -> impl Iterator<Item = (&str, &ModuleArgument<P, B>)> {
         self.arguments
             .iter()
             .map(|(name, argument)| (name.as_str(), &argument.argument))
@@ -3212,7 +3919,9 @@ impl<P: PlaceholderKind> ModuleCall<P> {
     /// Iterate borrowed authored arguments with their parser key and value spans.
     ///
     /// Every authored argument carries both spans by construction.
-    pub fn arguments_with_source_spans(&self) -> impl Iterator<Item = AuthoredArgumentRef<'_, P>> {
+    pub fn arguments_with_source_spans(
+        &self,
+    ) -> impl Iterator<Item = AuthoredArgumentRef<'_, P, B>> {
         self.arguments
             .iter()
             .map(|(name, argument)| AuthoredArgumentRef {
@@ -3223,13 +3932,13 @@ impl<P: PlaceholderKind> ModuleCall<P> {
             })
     }
 
-    pub fn argument(&self, name: &str) -> Option<&ModuleArgument<P>> {
+    pub fn argument(&self, name: &str) -> Option<&ModuleArgument<P, B>> {
         self.arguments.get(name).map(|argument| &argument.argument)
     }
 
     pub(crate) fn try_visit_values_for_module_if_audit<E>(
         &self,
-        visit: &mut impl FnMut(&Value<P>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<P, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         let Self {
             module_name: _module_name,
@@ -3244,7 +3953,7 @@ impl<P: PlaceholderKind> ModuleCall<P> {
         Ok(())
     }
 
-    pub fn authored_argument(&self, name: &str) -> Option<AuthoredArgumentRef<'_, P>> {
+    pub fn authored_argument(&self, name: &str) -> Option<AuthoredArgumentRef<'_, P, B>> {
         self.arguments
             .get_key_value(name)
             .map(|(name, argument)| AuthoredArgumentRef {
@@ -3259,7 +3968,7 @@ impl<P: PlaceholderKind> ModuleCall<P> {
         self.arguments.contains_key(name)
     }
 
-    pub(crate) fn arguments_mut(&mut self) -> impl Iterator<Item = &mut ModuleArgument<P>> {
+    pub(crate) fn arguments_mut(&mut self) -> impl Iterator<Item = &mut ModuleArgument<P, B>> {
         self.arguments
             .values_mut()
             .map(|argument| &mut argument.argument)
@@ -3273,10 +3982,10 @@ impl<P: PlaceholderKind> ModuleCall<P> {
     }
 }
 
-impl ModuleCall<ParserPlaceholder> {
+impl<B: BindingAddress> ModuleCall<ParserPlaceholder, B> {
     fn into_expanded(
         self,
-    ) -> Result<ModuleCall<NoPlaceholder>, crate::resource::LeftoverPlaceholder> {
+    ) -> Result<ModuleCall<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(ModuleCall {
             module_name: self.module_name,
             binding_name: self.binding_name,
@@ -3300,43 +4009,183 @@ impl ModuleCall<ParserPlaceholder> {
     }
 }
 
+impl<P: PlaceholderKind> ModuleCall<P, RelativeBindingName> {
+    #[cfg(test)]
+    pub(crate) fn test(
+        module_name: impl Into<String>,
+        binding_name: Option<String>,
+        arguments: HashMap<String, ModuleArgument<P, RelativeBindingName>>,
+    ) -> Self {
+        let span = SourceSpan::dummy();
+        Self::from_authored_arguments_in_source(
+            module_name,
+            binding_name.map(RelativeBindingName::new),
+            span,
+            arguments
+                .into_iter()
+                .map(|(name, argument)| (name, AuthoredModuleArgument::new(argument, span, span)))
+                .collect(),
+            PathBuf::from("test.crn"),
+        )
+    }
+
+    pub(crate) fn try_resolve_bindings<E>(
+        self,
+        resolve_binding: &mut impl FnMut(RelativeBindingName) -> Result<AbsoluteBindingAddress, E>,
+        resolve_argument: &mut impl FnMut(
+            ModuleArgument<P, RelativeBindingName>,
+        )
+            -> Result<ModuleArgument<P, AbsoluteBindingAddress>, E>,
+    ) -> Result<ModuleCall<P, AbsoluteBindingAddress>, E> {
+        let Self {
+            module_name,
+            binding_name,
+            arguments,
+            source,
+            loop_origin,
+        } = self;
+        Ok(ModuleCall {
+            module_name,
+            binding_name: binding_name.map(&mut *resolve_binding).transpose()?,
+            arguments: arguments
+                .into_iter()
+                .map(|(name, authored)| {
+                    let AuthoredModuleArgument {
+                        argument,
+                        key_span,
+                        value_span,
+                    } = authored;
+                    Ok((
+                        name,
+                        AuthoredModuleArgument {
+                            argument: resolve_argument(argument)?,
+                            key_span,
+                            value_span,
+                        },
+                    ))
+                })
+                .collect::<Result<_, E>>()?,
+            source,
+            loop_origin,
+        })
+    }
+
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> ModuleCall<P, AbsoluteBindingAddress> {
+        let Self {
+            module_name,
+            binding_name,
+            arguments,
+            source,
+            loop_origin,
+        } = self;
+        ModuleCall {
+            module_name,
+            binding_name: binding_name.map(&mut *resolve),
+            arguments: arguments
+                .into_iter()
+                .map(|(name, authored)| {
+                    let AuthoredModuleArgument {
+                        argument,
+                        key_span,
+                        value_span,
+                    } = authored;
+                    (
+                        name,
+                        AuthoredModuleArgument {
+                            argument: argument.resolve_bindings(resolve),
+                            key_span,
+                            value_span,
+                        },
+                    )
+                })
+                .collect(),
+            source,
+            loop_origin,
+        }
+    }
+}
+
+impl<P: PlaceholderKind> ModuleCall<P, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            module_name: _module_name,
+            binding_name,
+            arguments,
+            source: _source,
+            loop_origin: _loop_origin,
+        } = self;
+        if let Some(binding) = binding_name {
+            *binding = map(binding);
+        }
+        for authored in arguments.values_mut() {
+            let AuthoredModuleArgument {
+                argument,
+                key_span: _key_span,
+                value_span: _value_span,
+            } = authored;
+            argument.map_absolute_bindings(map);
+        }
+    }
+}
+
 /// Borrowed view of one parser-authored module-call argument.
-#[derive(Debug, Clone, Copy)]
-pub struct AuthoredArgumentRef<'a, P: PlaceholderKind = ParserPlaceholder> {
+#[derive(Debug)]
+pub struct AuthoredArgumentRef<
+    'a,
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     name: &'a str,
-    argument: &'a ModuleArgument<P>,
+    argument: &'a ModuleArgument<P, B>,
     key_span: SourceSpan,
     value_span: SourceSpan,
 }
 
-impl<'a, P: PlaceholderKind> AuthoredArgumentRef<'a, P> {
-    pub fn name(&self) -> &'a str {
+impl<P: PlaceholderKind, B: BindingAddress> Copy for AuthoredArgumentRef<'_, P, B> {}
+
+impl<P: PlaceholderKind, B: BindingAddress> Clone for AuthoredArgumentRef<'_, P, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, P: PlaceholderKind, B: BindingAddress> AuthoredArgumentRef<'a, P, B> {
+    pub fn name(self) -> &'a str {
         self.name
     }
 
-    pub fn argument(&self) -> &'a ModuleArgument<P> {
+    pub fn argument(self) -> &'a ModuleArgument<P, B> {
         self.argument
     }
 
-    pub fn key_span(&self) -> SourceSpan {
+    pub fn key_span(self) -> SourceSpan {
         self.key_span
     }
 
-    pub fn value_span(&self) -> SourceSpan {
+    pub fn value_span(self) -> SourceSpan {
         self.value_span
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AuthoredModuleArgument<P: PlaceholderKind = ParserPlaceholder> {
-    argument: ModuleArgument<P>,
+pub(crate) struct AuthoredModuleArgument<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    argument: ModuleArgument<P, B>,
     key_span: SourceSpan,
     value_span: SourceSpan,
 }
 
-impl<P: PlaceholderKind> AuthoredModuleArgument<P> {
+impl<P: PlaceholderKind, B: BindingAddress> AuthoredModuleArgument<P, B> {
     pub(crate) fn new(
-        argument: ModuleArgument<P>,
+        argument: ModuleArgument<P, B>,
         key_span: SourceSpan,
         value_span: SourceSpan,
     ) -> Self {
@@ -3551,16 +4400,29 @@ impl ModuleCallDiagnosticSource {
 /// This type is public only because [`File`] is publicly constructible. Its
 /// contents stay crate-private so evaluator-only handles cannot escape into the
 /// runtime [`Value`] model.
-#[doc(hidden)]
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ParserBindingMetadata {
-    structural_handles: IndexMap<String, StructuralHandle>,
-    structural_aliases: IndexMap<String, StructuralHandle>,
-    value_structural_handles: IndexMap<String, StructuralHandleMetadata>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
+    structural_handles: IndexMap<B, StructuralHandle<B>>,
+    structural_aliases: IndexMap<B, StructuralHandle<B>>,
+    value_structural_handles: IndexMap<B, StructuralHandleMetadata<B>>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
-    template_dependency_values: HashMap<ResourceId, IndexMap<String, Value<ParserPlaceholder>>>,
+    template_dependency_values: HashMap<ResourceId, IndexMap<String, Value<ParserPlaceholder, B>>>,
     argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
-    pending_function_type_checks: Vec<PendingFunctionTypeCheck>,
+    pending_function_type_checks: Vec<PendingFunctionTypeCheck<B>>,
+}
+
+impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
+    fn default() -> Self {
+        Self {
+            structural_handles: IndexMap::new(),
+            structural_aliases: IndexMap::new(),
+            value_structural_handles: IndexMap::new(),
+            resource_source_files: HashMap::new(),
+            template_dependency_values: HashMap::new(),
+            argument_type_sources: IndexMap::new(),
+            pending_function_type_checks: Vec::new(),
+        }
+    }
 }
 
 /// A call whose body was evaluable during bootstrap parsing but whose dotted
@@ -3568,40 +4430,20 @@ pub struct ParserBindingMetadata {
 /// Kept parser-only so the computed result can drive structural parsing (for
 /// example a `for` iterable) without silently dropping the later type check.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingFunctionTypeCheck {
+pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingName> {
     pub(crate) function_name: String,
-    pub(crate) arguments: Vec<FunctionArgument<ParserPlaceholder>>,
+    pub(crate) arguments: Vec<FunctionArgument<ParserPlaceholder, B>>,
     pub(crate) source_line: usize,
     pub(crate) source_file: Option<PathBuf>,
 }
 
-impl ParserBindingMetadata {
-    pub(crate) fn structural_handles(&self) -> &IndexMap<String, StructuralHandle> {
+impl<B: BindingAddress> ParserBindingMetadata<B> {
+    pub(crate) fn structural_handles(&self) -> &IndexMap<B, StructuralHandle<B>> {
         &self.structural_handles
     }
 
-    pub(crate) fn insert_structural_handle(&mut self, name: String, handle: StructuralHandle) {
-        self.structural_handles.insert(name, handle);
-    }
-
-    pub(crate) fn structural_aliases(&self) -> &IndexMap<String, StructuralHandle> {
+    pub(crate) fn structural_aliases(&self) -> &IndexMap<B, StructuralHandle<B>> {
         &self.structural_aliases
-    }
-
-    pub(crate) fn insert_structural_alias(&mut self, name: String, handle: StructuralHandle) {
-        self.structural_aliases.insert(name, handle);
-    }
-
-    pub(crate) fn value_structural_handles(&self, name: &str) -> Option<&StructuralHandleMetadata> {
-        self.value_structural_handles.get(name)
-    }
-
-    pub(crate) fn insert_value_structural_handles(
-        &mut self,
-        name: String,
-        metadata: StructuralHandleMetadata,
-    ) {
-        self.value_structural_handles.insert(name, metadata);
     }
 
     pub(crate) fn insert_resource_source_file(&mut self, id: ResourceId, path: PathBuf) {
@@ -3615,7 +4457,7 @@ impl ParserBindingMetadata {
     pub(crate) fn insert_template_dependency_values(
         &mut self,
         id: ResourceId,
-        values: IndexMap<String, Value<ParserPlaceholder>>,
+        values: IndexMap<String, Value<ParserPlaceholder, B>>,
     ) {
         self.template_dependency_values.insert(id, values);
     }
@@ -3623,7 +4465,7 @@ impl ParserBindingMetadata {
     pub(crate) fn template_dependency_values(
         &self,
         id: &ResourceId,
-    ) -> Option<&IndexMap<String, Value<ParserPlaceholder>>> {
+    ) -> Option<&IndexMap<String, Value<ParserPlaceholder, B>>> {
         self.template_dependency_values.get(id)
     }
 
@@ -3643,19 +4485,22 @@ impl ParserBindingMetadata {
             .map(|(source_file, span)| (source_file, *span))
     }
 
-    pub(crate) fn insert_pending_function_type_check(&mut self, check: PendingFunctionTypeCheck) {
+    pub(crate) fn insert_pending_function_type_check(
+        &mut self,
+        check: PendingFunctionTypeCheck<B>,
+    ) {
         if !self.pending_function_type_checks.contains(&check) {
             self.pending_function_type_checks.push(check);
         }
     }
 
-    pub(crate) fn pending_function_type_checks(&self) -> &[PendingFunctionTypeCheck] {
+    pub(crate) fn pending_function_type_checks(&self) -> &[PendingFunctionTypeCheck<B>] {
         &self.pending_function_type_checks
     }
 
     pub(crate) fn try_visit_values<E>(
         &self,
-        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         let Self {
             structural_handles: _structural_handles,
@@ -3692,7 +4537,7 @@ impl ParserBindingMetadata {
         self.pending_function_type_checks.clear();
     }
 
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&B) -> bool) {
         self.structural_handles.retain(|name, _| keep(name));
         self.structural_aliases.retain(|name, _| keep(name));
         self.value_structural_handles.retain(|name, _| keep(name));
@@ -3715,19 +4560,180 @@ impl ParserBindingMetadata {
     }
 }
 
+impl ParserBindingMetadata<RelativeBindingName> {
+    pub(crate) fn insert_structural_handle(
+        &mut self,
+        name: String,
+        handle: StructuralHandle<RelativeBindingName>,
+    ) {
+        self.structural_handles
+            .insert(RelativeBindingName::new(name), handle);
+    }
+
+    pub(crate) fn insert_structural_alias(
+        &mut self,
+        name: String,
+        handle: StructuralHandle<RelativeBindingName>,
+    ) {
+        self.structural_aliases
+            .insert(RelativeBindingName::new(name), handle);
+    }
+
+    pub(crate) fn value_structural_handles_by_name(
+        &self,
+        name: &str,
+    ) -> Option<&StructuralHandleMetadata<RelativeBindingName>> {
+        self.value_structural_handles.get(name)
+    }
+
+    pub(crate) fn insert_value_structural_handles(
+        &mut self,
+        name: String,
+        metadata: StructuralHandleMetadata<RelativeBindingName>,
+    ) {
+        self.value_structural_handles
+            .insert(RelativeBindingName::new(name), metadata);
+    }
+
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> ParserBindingMetadata<AbsoluteBindingAddress> {
+        let Self {
+            structural_handles,
+            structural_aliases,
+            value_structural_handles,
+            resource_source_files,
+            template_dependency_values,
+            argument_type_sources,
+            pending_function_type_checks,
+        } = self;
+        ParserBindingMetadata {
+            structural_handles: structural_handles
+                .into_iter()
+                .map(|(name, handle)| (resolve(name), handle.resolve_bindings(resolve)))
+                .collect(),
+            structural_aliases: structural_aliases
+                .into_iter()
+                .map(|(name, handle)| (resolve(name), handle.resolve_bindings(resolve)))
+                .collect(),
+            value_structural_handles: value_structural_handles
+                .into_iter()
+                .map(|(name, metadata)| (resolve(name), metadata.resolve_bindings(resolve)))
+                .collect(),
+            resource_source_files,
+            template_dependency_values: template_dependency_values
+                .into_iter()
+                .map(|(id, values)| {
+                    (
+                        id,
+                        values
+                            .into_iter()
+                            .map(|(name, value)| (name, value.resolve_bindings(resolve)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            argument_type_sources,
+            pending_function_type_checks: pending_function_type_checks
+                .into_iter()
+                .map(|check| {
+                    let PendingFunctionTypeCheck {
+                        function_name,
+                        arguments,
+                        source_line,
+                        source_file,
+                    } = check;
+                    PendingFunctionTypeCheck {
+                        function_name,
+                        arguments: arguments
+                            .into_iter()
+                            .map(|argument| argument.resolve_bindings(resolve))
+                            .collect(),
+                        source_line,
+                        source_file,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+impl ParserBindingMetadata<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            structural_handles,
+            structural_aliases,
+            value_structural_handles,
+            resource_source_files: _resource_source_files,
+            template_dependency_values,
+            argument_type_sources: _argument_type_sources,
+            pending_function_type_checks,
+        } = self;
+
+        let mut mapped_structural_handles = IndexMap::new();
+        for (binding, mut handle) in std::mem::take(structural_handles) {
+            let binding = map(&binding);
+            handle.map_absolute_bindings(map);
+            mapped_structural_handles.insert(binding, handle);
+        }
+        *structural_handles = mapped_structural_handles;
+
+        let mut mapped_structural_aliases = IndexMap::new();
+        for (binding, mut handle) in std::mem::take(structural_aliases) {
+            let binding = map(&binding);
+            handle.map_absolute_bindings(map);
+            mapped_structural_aliases.insert(binding, handle);
+        }
+        *structural_aliases = mapped_structural_aliases;
+
+        let mut mapped_value_structural_handles = IndexMap::new();
+        for (binding, mut metadata) in std::mem::take(value_structural_handles) {
+            let binding = map(&binding);
+            metadata.map_absolute_bindings(map);
+            mapped_value_structural_handles.insert(binding, metadata);
+        }
+        *value_structural_handles = mapped_value_structural_handles;
+
+        for values in template_dependency_values.values_mut() {
+            for value in values.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+        }
+
+        for check in pending_function_type_checks {
+            let PendingFunctionTypeCheck {
+                function_name: _function_name,
+                arguments,
+                source_line: _source_line,
+                source_file: _source_file,
+            } = check;
+            for argument in arguments {
+                argument.map_absolute_bindings(map);
+            }
+        }
+    }
+}
+
 /// Provider configuration
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(bound(
-    serialize = "P: PlaceholderKind + serde::Serialize",
-    deserialize = "P: PlaceholderKind + serde::Deserialize<'de>"
+    serialize = "P: PlaceholderKind + serde::Serialize, B: serde::Serialize",
+    deserialize = "P: PlaceholderKind + serde::Deserialize<'de>, B: serde::Deserialize<'de>"
 ))]
-pub struct ProviderConfig<P: PlaceholderKind = NoPlaceholder> {
+pub struct ProviderConfig<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     pub name: String,
-    pub attributes: IndexMap<String, Value<P>>,
+    pub attributes: IndexMap<String, Value<P, B>>,
     /// Default tags to apply to all resources that support tags.
     /// Extracted from `default_tags = { ... }` in the provider block.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-    pub default_tags: IndexMap<String, Value<P>>,
+    pub default_tags: IndexMap<String, Value<P, B>>,
     /// Provider source (e.g., "carina-rs/awscc", "github.com/carina-rs/carina-provider-awscc",
     /// or "file:///path/to/binary").
     /// Extracted from the provider block and not passed to the provider.
@@ -3745,7 +4751,7 @@ pub struct ProviderConfig<P: PlaceholderKind = NoPlaceholder> {
     /// drained and validated by the post-resolver finalize step. Invariant:
     /// empty after finalization. In-memory transit only — never serialized.
     #[serde(skip)]
-    pub unresolved_attributes: IndexMap<String, Value<P>>,
+    pub unresolved_attributes: IndexMap<String, Value<P, B>>,
     /// The sole source of truth for whether this entry is default or named.
     /// `Some(name)` identifies a named instance declared via
     /// `let <name> = provider <kind> { ... }`; `None` identifies the default
@@ -3757,7 +4763,7 @@ pub struct ProviderConfig<P: PlaceholderKind = NoPlaceholder> {
     pub binding: Option<String>,
 }
 
-impl<P: PlaceholderKind> ProviderConfig<P> {
+impl<P: PlaceholderKind, B: BindingAddress> ProviderConfig<P, B> {
     /// Whether this entry is the kind's default instance.
     ///
     /// Default instances come from top-level `provider <kind> { ... }`
@@ -3772,7 +4778,7 @@ impl<P: PlaceholderKind> ProviderConfig<P> {
     /// deliberately excluded: factories read source/version/revision and
     /// binding identity, while configured values are consumed later by the
     /// provider instance.
-    pub fn loading_projection(&self) -> ProviderConfig {
+    pub fn loading_projection(&self) -> ProviderConfig<NoPlaceholder, B> {
         let Self {
             name,
             attributes,
@@ -3797,8 +4803,10 @@ impl<P: PlaceholderKind> ProviderConfig<P> {
     }
 }
 
-impl ProviderConfig<ParserPlaceholder> {
-    fn into_expanded(self) -> Result<ProviderConfig, crate::resource::LeftoverPlaceholder> {
+impl<B: BindingAddress> ProviderConfig<ParserPlaceholder, B> {
+    fn into_expanded(
+        self,
+    ) -> Result<ProviderConfig<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(ProviderConfig {
             name: self.name,
             attributes: crate::resource::into_expanded_value_map(self.attributes, None)?,
@@ -3817,24 +4825,61 @@ impl ProviderConfig<ParserPlaceholder> {
 
 /// Backend configuration for state storage
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BackendConfig<P: PlaceholderKind = NoPlaceholder> {
+pub struct BackendConfig<
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     /// Backend type (e.g., "s3", "gcs", "local")
     pub backend_type: String,
     /// Backend-specific attributes
-    pub attributes: HashMap<String, Value<P>>,
+    pub attributes: HashMap<String, Value<P, B>>,
     /// Parser-authored source spans for attribute keys. Runtime and saved-plan
     /// representations deliberately omit this diagnostic-only metadata.
     #[serde(skip)]
     pub attribute_spans: HashMap<String, SourceSpan>,
 }
 
-impl BackendConfig<ParserPlaceholder> {
-    pub fn into_expanded(self) -> Result<BackendConfig, crate::resource::LeftoverPlaceholder> {
+impl<B: BindingAddress> BackendConfig<ParserPlaceholder, B> {
+    pub fn into_expanded(
+        self,
+    ) -> Result<BackendConfig<NoPlaceholder, B>, crate::resource::LeftoverPlaceholder> {
         Ok(BackendConfig {
             backend_type: self.backend_type,
             attributes: crate::resource::into_expanded_value_map(self.attributes, None)?,
             attribute_spans: self.attribute_spans,
         })
+    }
+}
+
+impl<P: PlaceholderKind> BackendConfig<P, RelativeBindingName> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_root(
+        self,
+        scope: &RootScope,
+    ) -> BackendConfig<P, AbsoluteBindingAddress> {
+        let Self {
+            backend_type,
+            attributes,
+            attribute_spans,
+        } = self;
+        BackendConfig {
+            backend_type,
+            attributes: attributes
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name,
+                        value.resolve_bindings(&mut |binding| scope.resolve(binding)),
+                    )
+                })
+                .collect(),
+            attribute_spans,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resolve_root_for_test(self) -> BackendConfig<P, AbsoluteBindingAddress> {
+        self.resolve_root(&RootScope::new())
     }
 }
 
@@ -3855,140 +4900,37 @@ impl BackendConfig<ParserPlaceholder> {
 /// `upstream_state` does not affect resolution. The upstream's backend and
 /// state file are derived from the upstream configuration itself.
 #[derive(Debug, Clone)]
-pub struct UpstreamState {
+pub struct UpstreamState<B: BindingAddress = RelativeBindingName> {
     /// The binding name (e.g., "orgs")
-    pub binding: String,
+    pub binding: B,
     /// Source directory (raw, unresolved path)
     pub source: std::path::PathBuf,
 }
+
+pub type ExpandedProviderConfig = ProviderConfig<NoPlaceholder, AbsoluteBindingAddress>;
+pub type ExpandedBackendConfig = BackendConfig<NoPlaceholder, AbsoluteBindingAddress>;
+pub type ExpandedStateBlock = StateBlock<NoPlaceholder, AbsoluteBindingAddress>;
+pub type ExpandedUpstreamState = UpstreamState<AbsoluteBindingAddress>;
 
 /// Typed `until` predicate captured at parse time. MVP supports the
 /// `<binding>.<attr-path> == <value>` shape; future operators
 /// (`!=`, `&&`/`||`, comparisons, `in`) will grow new variants here
 /// without breaking existing fields.
 ///
-/// `lhs_segments` is the dotted path under the target binding —
-/// `[target, attr]` for `cert.status`, `[target, parent, attr]` for
-/// `cert.renewal_summary.renewal_status`. Always non-empty and the
-/// first segment is the target binding name (enforced by the parser).
+/// `root` is the target binding and `attribute_segments` is the non-empty
+/// dotted path beneath it. Keeping the root in the binding phase type prevents
+/// module expansion from overlooking the predicate's binding-bearing slot.
 ///
 /// `rhs` is the literal value to compare against, captured as a
 /// `Value` so namespaced enums (`aws.acm.Certificate.Status.Issued`),
 /// string literals, integers, booleans, and durations all flow into
 /// the same predicate type.
 ///
-/// The RHS cannot carry a parser placeholder:
-///
-/// ```compile_fail
-/// use carina_core::parser::UntilPredicateAst;
-/// use carina_core::resource::{DeferredValue, ParserPlaceholder, Value};
-///
-/// let _: UntilPredicateAst = UntilPredicateAst {
-///     lhs_segments: vec!["target".into(), "status".into()],
-///     rhs: Value::<ParserPlaceholder>::Deferred(DeferredValue::Placeholder(
-///         ParserPlaceholder::FnParam { name: "status".into() },
-///     )),
-/// };
-/// ```
 #[derive(Debug, Clone)]
-pub struct UntilPredicateAst {
-    pub lhs_segments: Vec<String>,
-    pub rhs: crate::resource::Value,
-}
-
-/// A binding identifier (a `let`/`wait`/`depends_on` name such as
-/// `cert_issued` or its instance-prefixed form `r.cert_issued`).
-///
-/// This newtype exists so a binding name cannot be confused with an
-/// arbitrary `String` at a binding-expecting position, and so the
-/// instance-prefix operation is typed as `BindingName -> BindingName`
-/// (see `module_resolver::apply_instance_prefix`). It deliberately does
-/// **not** encode prefix state (Raw vs Prefixed): the wait-binding list
-/// mixes top-level (never-prefixed) and module-derived (prefixed)
-/// entries in one `Vec`, so a state-in-the-type distinction is not
-/// expressible here — that larger data-flow reshape is tracked
-/// separately (carina#3066).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BindingName(String);
-
-impl BindingName {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl std::ops::Deref for BindingName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for BindingName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<String> for BindingName {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for BindingName {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
-
-/// Compare a `BindingName` directly against a string slice so existing
-/// `wb.target == some_str` / lookup sites don't need `.as_str()`
-/// ceremony. The newtype's value is preventing *accidental* String
-/// substitution at construction/parameter boundaries, not forbidding
-/// equality checks.
-impl PartialEq<str> for BindingName {
-    fn eq(&self, other: &str) -> bool {
-        self.0 == other
-    }
-}
-
-impl PartialEq<&str> for BindingName {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<BindingName> for str {
-    fn eq(&self, other: &BindingName) -> bool {
-        self == other.0
-    }
-}
-
-impl PartialEq<BindingName> for &str {
-    fn eq(&self, other: &BindingName) -> bool {
-        *self == other.0
-    }
-}
-
-impl PartialEq<String> for BindingName {
-    fn eq(&self, other: &String) -> bool {
-        &self.0 == other
-    }
-}
-
-impl PartialEq<BindingName> for String {
-    fn eq(&self, other: &BindingName) -> bool {
-        self == &other.0
-    }
+pub struct UntilPredicateAst<B: BindingAddress = RelativeBindingName> {
+    pub root: B,
+    pub attribute_segments: Vec<String>,
+    pub rhs: crate::resource::Value<NoPlaceholder, B>,
 }
 
 /// A `wait <target> { ... }` declaration captured during parse.
@@ -4001,25 +4943,54 @@ impl PartialEq<BindingName> for String {
 ///
 /// See `notes/specs/2026-05-09-wait-construct-design.md`.
 #[derive(Debug, Clone)]
-pub struct WaitBinding {
+pub struct WaitBinding<B: BindingAddress = RelativeBindingName> {
     /// The wait's binding name (e.g. `cert_issued`).
-    pub binding: BindingName,
+    pub binding: B,
     /// Identifier of the target resource binding (e.g. `cert`).
-    pub target: BindingName,
+    pub target: B,
     /// Surface form of the `until` expression as the user wrote it
     /// (e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`).
     pub until_raw: String,
     /// Structured predicate for the differ / executor to consume.
-    pub until_predicate: UntilPredicateAst,
+    pub until_predicate: UntilPredicateAst<B>,
     /// Optional user override of the wait timeout, in whole seconds. When
     /// `None` the differ falls back to the target schema's default.
     pub timeout_secs: Option<u64>,
     /// Additional ordering edges declared via `depends_on = [...]`. The
     /// ordering machinery itself is shared with the per-resource
     /// `directives.depends_on` (carina#2823).
-    pub depends_on: Vec<BindingName>,
+    pub depends_on: Vec<B>,
     /// Source line of the `wait` keyword. Used by diagnostics.
     pub line: usize,
+}
+
+impl WaitBinding<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            binding,
+            target,
+            until_raw: _until_raw,
+            until_predicate,
+            timeout_secs: _timeout_secs,
+            depends_on,
+            line: _line,
+        } = self;
+        *binding = map(binding);
+        *target = map(target);
+        let UntilPredicateAst {
+            root,
+            attribute_segments: _attribute_segments,
+            rhs,
+        } = until_predicate;
+        *root = map(root);
+        rhs.map_absolute_bindings(map);
+        for dependency in depends_on {
+            *dependency = map(dependency);
+        }
+    }
 }
 
 /// An export parameter as seen post-inference (#2360 stage 2).
@@ -4027,20 +4998,25 @@ pub struct WaitBinding {
 /// `static_type` retains whether the effective type came from an annotation or
 /// rhs inference, plus any typed reason why checking is unavailable.
 #[derive(Debug, Clone, PartialEq)]
-pub struct InferredExportParam<P: PlaceholderKind = ParserPlaceholder> {
+pub struct InferredExportParam<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     pub name: String,
     pub static_type: ExportStaticType,
-    pub value: Option<Value<P>>,
+    pub value: Option<Value<P, B>>,
 }
 
-impl<P: PlaceholderKind + PartialEq> ExportParamLike<P> for InferredExportParam<P> {
+impl<P: PlaceholderKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
+    for InferredExportParam<P, B>
+{
     fn name(&self) -> &str {
         &self.name
     }
-    fn value(&self) -> Option<&Value<P>> {
+    fn value(&self) -> Option<&Value<P, B>> {
         self.value.as_ref()
     }
-    fn set_value(&mut self, value: Option<Value<P>>) {
+    fn set_value(&mut self, value: Option<Value<P, B>>) {
         self.value = value;
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
@@ -4065,8 +5041,8 @@ impl<P: PlaceholderKind + PartialEq> ExportParamLike<P> for InferredExportParam<
     }
 }
 
-impl IntoExpandedExportParam for InferredExportParam<ParserPlaceholder> {
-    type Expanded = InferredExportParam<NoPlaceholder>;
+impl<B: BindingAddress> IntoExpandedExportParam<B> for InferredExportParam<ParserPlaceholder, B> {
+    type Expanded = InferredExportParam<NoPlaceholder, B>;
 
     fn collect_leftover_placeholders(
         &self,
@@ -4104,13 +5080,33 @@ impl IntoExpandedExportParam for InferredExportParam<ParserPlaceholder> {
     }
 }
 
-/// Deferred-loop bodies before the module-resolution seam.
-#[derive(Debug, Clone)]
-pub struct ParsedDeferredForPhase<P: PlaceholderKind = ParserPlaceholder> {
-    pub(crate) expressions: Vec<ParsedDeferredForExpression<P>>,
+impl<P: PlaceholderKind + PartialEq> ResolveExportBindingPhase<P>
+    for InferredExportParam<P, RelativeBindingName>
+{
+    type Absolute = InferredExportParam<P, AbsoluteBindingAddress>;
+
+    fn resolve_export_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> Self::Absolute {
+        InferredExportParam {
+            name: self.name,
+            static_type: self.static_type,
+            value: self.value.map(|value| value.resolve_bindings(resolve)),
+        }
+    }
 }
 
-impl<P: PlaceholderKind> Default for ParsedDeferredForPhase<P> {
+/// Deferred-loop bodies before the module-resolution seam.
+#[derive(Debug, Clone)]
+pub struct ParsedDeferredForPhase<
+    P: PlaceholderKind = ParserPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
+    pub(crate) expressions: Vec<ParsedDeferredForExpression<P, B>>,
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> Default for ParsedDeferredForPhase<P, B> {
     fn default() -> Self {
         Self {
             expressions: Vec::new(),
@@ -4123,20 +5119,23 @@ impl<P: PlaceholderKind> Default for ParsedDeferredForPhase<P> {
 pub struct ResolvedDeferredForExpressions<
     P: PlaceholderKind = NoPlaceholder,
     T: PlaceholderKind = LoopSlot,
->(Vec<DeferredForExpression<ModuleSource, P, T>>);
+    B: BindingAddress = AbsoluteBindingAddress,
+>(Vec<DeferredForExpression<ModuleSource, P, T, B>>);
 
-impl<P: PlaceholderKind, T: PlaceholderKind> ResolvedDeferredForExpressions<P, T> {
-    pub fn as_slice(&self) -> &[DeferredForExpression<ModuleSource, P, T>] {
+impl<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
+    ResolvedDeferredForExpressions<P, T, B>
+{
+    pub fn as_slice(&self) -> &[DeferredForExpression<ModuleSource, P, T, B>] {
         &self.0
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, DeferredForExpression<ModuleSource, P, T>> {
+    pub fn iter(&self) -> std::slice::Iter<'_, DeferredForExpression<ModuleSource, P, T, B>> {
         self.0.iter()
     }
 
     pub fn iter_mut(
         &mut self,
-    ) -> std::slice::IterMut<'_, DeferredForExpression<ModuleSource, P, T>> {
+    ) -> std::slice::IterMut<'_, DeferredForExpression<ModuleSource, P, T, B>> {
         self.0.iter_mut()
     }
 
@@ -4154,7 +5153,7 @@ impl<P: PlaceholderKind, T: PlaceholderKind> ResolvedDeferredForExpressions<P, T
 
     pub fn partition(
         self,
-        mut predicate: impl FnMut(&DeferredForExpression<ModuleSource, P, T>) -> bool,
+        mut predicate: impl FnMut(&DeferredForExpression<ModuleSource, P, T, B>) -> bool,
     ) -> (Self, Self) {
         let (selected, retained) = self.0.into_iter().partition(|item| predicate(item));
         (Self(selected), Self(retained))
@@ -4163,18 +5162,18 @@ impl<P: PlaceholderKind, T: PlaceholderKind> ResolvedDeferredForExpressions<P, T
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn from_expressions_for_test(
-        expressions: impl IntoIterator<Item = DeferredForExpression<ModuleSource, P, T>>,
+        expressions: impl IntoIterator<Item = DeferredForExpression<ModuleSource, P, T, B>>,
     ) -> Self {
         Self(expressions.into_iter().collect())
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn pop(&mut self) -> Option<DeferredForExpression<ModuleSource, P, T>> {
+    pub fn pop(&mut self) -> Option<DeferredForExpression<ModuleSource, P, T, B>> {
         self.0.pop()
     }
 
-    pub(crate) fn remove(&mut self, index: usize) -> DeferredForExpression<ModuleSource, P, T> {
+    pub(crate) fn remove(&mut self, index: usize) -> DeferredForExpression<ModuleSource, P, T, B> {
         self.0.remove(index)
     }
 
@@ -4187,28 +5186,30 @@ impl<P: PlaceholderKind, T: PlaceholderKind> ResolvedDeferredForExpressions<P, T
     }
 }
 
-impl<P: PlaceholderKind, T: PlaceholderKind> std::ops::Index<usize>
-    for ResolvedDeferredForExpressions<P, T>
+impl<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> std::ops::Index<usize>
+    for ResolvedDeferredForExpressions<P, T, B>
 {
-    type Output = DeferredForExpression<ModuleSource, P, T>;
+    type Output = DeferredForExpression<ModuleSource, P, T, B>;
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.0[index]
     }
 }
 
-impl<P: PlaceholderKind, T: PlaceholderKind> std::ops::Deref
-    for ResolvedDeferredForExpressions<P, T>
+impl<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> std::ops::Deref
+    for ResolvedDeferredForExpressions<P, T, B>
 {
-    type Target = [DeferredForExpression<ModuleSource, P, T>];
+    type Target = [DeferredForExpression<ModuleSource, P, T, B>];
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl<P: PlaceholderKind, T: PlaceholderKind> IntoIterator for ResolvedDeferredForExpressions<P, T> {
-    type Item = DeferredForExpression<ModuleSource, P, T>;
+impl<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> IntoIterator
+    for ResolvedDeferredForExpressions<P, T, B>
+{
+    type Item = DeferredForExpression<ModuleSource, P, T, B>;
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -4216,11 +5217,11 @@ impl<P: PlaceholderKind, T: PlaceholderKind> IntoIterator for ResolvedDeferredFo
     }
 }
 
-impl<'a, P: PlaceholderKind, T: PlaceholderKind> IntoIterator
-    for &'a ResolvedDeferredForExpressions<P, T>
+impl<'a, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> IntoIterator
+    for &'a ResolvedDeferredForExpressions<P, T, B>
 {
-    type Item = &'a DeferredForExpression<ModuleSource, P, T>;
-    type IntoIter = std::slice::Iter<'a, DeferredForExpression<ModuleSource, P, T>>;
+    type Item = &'a DeferredForExpression<ModuleSource, P, T, B>;
+    type IntoIter = std::slice::Iter<'a, DeferredForExpression<ModuleSource, P, T, B>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
@@ -4232,11 +5233,14 @@ impl<'a, P: PlaceholderKind, T: PlaceholderKind> IntoIterator
 pub struct ResolvedDeferredForPhase<
     P: PlaceholderKind = NoPlaceholder,
     T: PlaceholderKind = LoopSlot,
+    B: BindingAddress = AbsoluteBindingAddress,
 > {
-    pub(crate) expressions: ResolvedDeferredForExpressions<P, T>,
+    pub(crate) expressions: ResolvedDeferredForExpressions<P, T, B>,
 }
 
-impl<P: PlaceholderKind, T: PlaceholderKind> Default for ResolvedDeferredForPhase<P, T> {
+impl<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> Default
+    for ResolvedDeferredForPhase<P, T, B>
+{
     fn default() -> Self {
         Self {
             expressions: ResolvedDeferredForExpressions(Vec::new()),
@@ -4248,27 +5252,30 @@ mod deferred_for_phase_private {
     pub trait Sealed {}
 }
 
-#[doc(hidden)]
-pub trait DeferredForPhaseTraversal<P: PlaceholderKind = ParserPlaceholder, T: PlaceholderKind = P>:
-    deferred_for_phase_private::Sealed
+pub trait DeferredForPhaseTraversal<
+    P: PlaceholderKind = ParserPlaceholder,
+    T: PlaceholderKind = P,
+    B: BindingAddress = RelativeBindingName,
+>: deferred_for_phase_private::Sealed
 {
     type DeferredRef<'a, S: 'a>: Copy
     where
         Self: 'a,
         P: 'a,
-        T: 'a;
+        T: 'a,
+        B: 'a;
 
     fn resource_refs(
         &self,
-    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, T, Self>> + '_>
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, T, Self, B>> + '_>
     where
         Self: Sized;
 
-    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T>> + '_>
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T, B>> + '_>
     where
         Self: Sized;
 
-    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P>> + '_>;
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P, B>> + '_>;
 
     fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str
     where
@@ -4281,27 +5288,32 @@ pub trait DeferredForPhaseTraversal<P: PlaceholderKind = ParserPlaceholder, T: P
         T: 'a;
 }
 
-#[doc(hidden)]
-pub trait ParserDeferredForPhaseAudit:
-    DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder>
+pub trait ParserDeferredForPhaseAudit<B: BindingAddress = RelativeBindingName>:
+    DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>
 {
     fn try_visit_values_for_module_if_audit<E>(
         &self,
-        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), E>,
     ) -> Result<(), E>;
 }
 
-impl<P: PlaceholderKind> deferred_for_phase_private::Sealed for ParsedDeferredForPhase<P> {}
+impl<P: PlaceholderKind, B: BindingAddress> deferred_for_phase_private::Sealed
+    for ParsedDeferredForPhase<P, B>
+{
+}
 
-impl<P: PlaceholderKind> DeferredForPhaseTraversal<P, P> for ParsedDeferredForPhase<P> {
+impl<P: PlaceholderKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
+    for ParsedDeferredForPhase<P, B>
+{
     type DeferredRef<'a, S: 'a>
-        = &'a ParsedDeferredForExpression<P>
+        = &'a ParsedDeferredForExpression<P, B>
     where
-        P: 'a;
+        P: 'a,
+        B: 'a;
 
     fn resource_refs(
         &self,
-    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, P, Self>> + '_> {
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, P, Self, B>> + '_> {
         Box::new(
             self.expressions
                 .iter()
@@ -4314,7 +5326,7 @@ impl<P: PlaceholderKind> DeferredForPhaseTraversal<P, P> for ParsedDeferredForPh
         )
     }
 
-    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, P>> + '_> {
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, P, B>> + '_> {
         Box::new(
             self.expressions
                 .iter_mut()
@@ -4328,7 +5340,7 @@ impl<P: PlaceholderKind> DeferredForPhaseTraversal<P, P> for ParsedDeferredForPh
         )
     }
 
-    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P>> + '_> {
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P, B>> + '_> {
         Box::new(
             self.expressions
                 .iter()
@@ -4341,14 +5353,16 @@ impl<P: PlaceholderKind> DeferredForPhaseTraversal<P, P> for ParsedDeferredForPh
     }
 
     fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize {
-        deferred.line
+        deferred.line()
     }
 }
 
-impl ParserDeferredForPhaseAudit for ParsedDeferredForPhase<ParserPlaceholder> {
+impl<B: BindingAddress> ParserDeferredForPhaseAudit<B>
+    for ParsedDeferredForPhase<ParserPlaceholder, B>
+{
     fn try_visit_values_for_module_if_audit<E>(
         &self,
-        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         for expression in &self.expressions {
             visit(&expression.iterable)?;
@@ -4372,23 +5386,24 @@ impl ParserDeferredForPhaseAudit for ParsedDeferredForPhase<ParserPlaceholder> {
     }
 }
 
-impl<P: PlaceholderKind, T: PlaceholderKind> deferred_for_phase_private::Sealed
-    for ResolvedDeferredForPhase<P, T>
+impl<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> deferred_for_phase_private::Sealed
+    for ResolvedDeferredForPhase<P, T, B>
 {
 }
 
-impl<P: PlaceholderKind, T: PlaceholderKind> DeferredForPhaseTraversal<P, T>
-    for ResolvedDeferredForPhase<P, T>
+impl<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> DeferredForPhaseTraversal<P, T, B>
+    for ResolvedDeferredForPhase<P, T, B>
 {
     type DeferredRef<'a, S: 'a>
-        = &'a DeferredForExpression<S, P, T>
+        = &'a DeferredForExpression<S, P, T, B>
     where
         P: 'a,
-        T: 'a;
+        T: 'a,
+        B: 'a;
 
     fn resource_refs(
         &self,
-    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, T, Self>> + '_> {
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, T, Self, B>> + '_> {
         Box::new(
             self.expressions
                 .iter()
@@ -4399,14 +5414,14 @@ impl<P: PlaceholderKind, T: PlaceholderKind> DeferredForPhaseTraversal<P, T>
         )
     }
 
-    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T>> + '_> {
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T, B>> + '_> {
         Box::new(self.expressions.iter_mut().map(|deferred| {
             let (id, attributes) = deferred.template_resource.id_and_attributes_mut();
             ResourceMut::Deferred { id, attributes }
         }))
     }
 
-    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P>> + '_> {
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, P, B>> + '_> {
         Box::new(self.expressions.iter().map(DeferredForExpression::site))
     }
 
@@ -4423,16 +5438,16 @@ impl<P: PlaceholderKind, T: PlaceholderKind> DeferredForPhaseTraversal<P, T>
         P: 'a,
         T: 'a,
     {
-        deferred.line
+        deferred.line()
     }
 }
 
-impl ParserDeferredForPhaseAudit
-    for ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder>
+impl<B: BindingAddress> ParserDeferredForPhaseAudit<B>
+    for ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder, B>
 {
     fn try_visit_values_for_module_if_audit<E>(
         &self,
-        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         for expression in &self.expressions {
             visit(&expression.iterable)?;
@@ -4444,6 +5459,39 @@ impl ParserDeferredForPhaseAudit
     }
 }
 
+pub(crate) trait AbsoluteDeferredForPhaseMap<P: PlaceholderKind, T: PlaceholderKind> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    );
+}
+
+impl<P: PlaceholderKind> AbsoluteDeferredForPhaseMap<P, P>
+    for ParsedDeferredForPhase<P, AbsoluteBindingAddress>
+{
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        for expression in &mut self.expressions {
+            expression.map_absolute_bindings(map);
+        }
+    }
+}
+
+impl<P: PlaceholderKind, T: PlaceholderKind> AbsoluteDeferredForPhaseMap<P, T>
+    for ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>
+{
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        for expression in self.expressions.iter_mut() {
+            expression.map_absolute_bindings(map);
+        }
+    }
+}
+
 /// Parse result, generic over export parameters, ordinary values, template
 /// values, and the deferred-loop phase.
 #[derive(Debug, Clone)]
@@ -4451,72 +5499,97 @@ pub struct File<
     E,
     P: PlaceholderKind = ParserPlaceholder,
     T: PlaceholderKind = P,
-    D = ParsedDeferredForPhase<P>,
+    D = ParsedDeferredForPhase<P, RelativeBindingName>,
+    B: BindingAddress = RelativeBindingName,
 > {
-    pub providers: Vec<ProviderConfig<P>>,
-    pub resources: Vec<Resource<ModuleSource, P>>,
-    pub data_sources: Vec<DataSource<ModuleSource, P>>,
-    pub compositions: Vec<LiveComposition<P>>,
-    pub variables: IndexMap<String, Value<P>>,
+    pub providers: Vec<ProviderConfig<P, B>>,
+    pub resources: Vec<Resource<ModuleSource, P, B>>,
+    pub data_sources: Vec<DataSource<ModuleSource, P, B>>,
+    pub compositions: Vec<LiveComposition<P, B>>,
+    pub variables: IndexMap<String, Value<P, B>>,
     pub uses: Vec<UseStatement>,
-    pub module_calls: Vec<ModuleCall<P>>,
-    pub arguments: Vec<ArgumentParameter<TypeExpr, P>>,
-    pub attribute_params: Vec<AttributeParameter<TypeExpr, P>>,
+    pub module_calls: Vec<ModuleCall<P, B>>,
+    pub arguments: Vec<ArgumentParameter<TypeExpr, P, B>>,
+    pub attribute_params: Vec<AttributeParameter<TypeExpr, P, B>>,
     pub export_params: Vec<E>,
-    pub backend: Option<BackendConfig<P>>,
-    pub state_blocks: Vec<StateBlock<P>>,
-    pub user_functions: HashMap<String, UserFunction>,
-    pub upstream_states: Vec<UpstreamState>,
-    pub wait_bindings: Vec<WaitBinding>,
-    pub requires: Vec<RequireBlock<P>>,
-    pub structural_bindings: HashSet<String>,
-    #[doc(hidden)]
-    pub parser_binding_metadata: ParserBindingMetadata,
-    #[doc(hidden)]
+    pub backend: Option<BackendConfig<P, B>>,
+    pub state_blocks: Vec<StateBlock<P, B>>,
+    pub user_functions: HashMap<String, UserFunction<B>>,
+    pub upstream_states: Vec<UpstreamState<B>>,
+    pub wait_bindings: Vec<WaitBinding<B>>,
+    pub requires: Vec<RequireBlock<P, B>>,
+    pub structural_bindings: HashSet<B>,
+    pub parser_binding_metadata: ParserBindingMetadata<B>,
     #[cfg(not(test))]
-    parsed_binding_uses: ParsedBindingUses,
+    parsed_binding_uses: ParsedBindingUses<B>,
     #[cfg(test)]
-    pub(crate) parsed_binding_uses: ParsedBindingUses,
+    pub(crate) parsed_binding_uses: ParsedBindingUses<B>,
     pub warnings: Vec<ParseWarning>,
     pub(crate) deferred_for_phase: D,
     /// Carries the deferred-template placeholder stage even when `D` is an
     /// opaque phase parameter. The marker has no runtime representation.
     pub(crate) template_placeholder: std::marker::PhantomData<fn() -> T>,
-    pub deferred_module_ifs: Vec<super::DeferredStructuralIf<P>>,
+    pub deferred_module_ifs: Vec<super::DeferredStructuralIf<P, B>>,
     pub expansion_trace: crate::resource::ExpansionTrace,
 }
 
 pub type ParsedFile = File<
-    ParsedExportParam<ParserPlaceholder>,
+    ParsedExportParam<ParserPlaceholder, RelativeBindingName>,
     ParserPlaceholder,
     ParserPlaceholder,
-    ParsedDeferredForPhase<ParserPlaceholder>,
+    ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+    RelativeBindingName,
 >;
 
 pub type InferredFile = File<
-    InferredExportParam<ParserPlaceholder>,
+    InferredExportParam<ParserPlaceholder, RelativeBindingName>,
     ParserPlaceholder,
     ParserPlaceholder,
-    ParsedDeferredForPhase<ParserPlaceholder>,
+    ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+    RelativeBindingName,
 >;
 
-pub type ModuleResolvedFile<E> = File<
+pub type ModuleResolvedFile<E, B = AbsoluteBindingAddress> = File<
     E,
     ParserPlaceholder,
     ParserPlaceholder,
-    ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder>,
+    ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder, B>,
+    B,
 >;
 
-pub type ModuleResolvedParsedFile = ModuleResolvedFile<ParsedExportParam<ParserPlaceholder>>;
+pub type ModuleResolvedParsedFile =
+    ModuleResolvedFile<ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>>;
 
-pub type ModuleResolvedInferredFile = ModuleResolvedFile<InferredExportParam<ParserPlaceholder>>;
+pub type ModuleResolvedInferredExportParam =
+    InferredExportParam<ParserPlaceholder, AbsoluteBindingAddress>;
+pub type ModuleResolvedInferredFile = ModuleResolvedFile<ModuleResolvedInferredExportParam>;
 
-pub type ExpandedFile<E> =
-    File<E, NoPlaceholder, LoopSlot, ResolvedDeferredForPhase<NoPlaceholder, LoopSlot>>;
+pub type RootBindingResolvedFile<E> = File<
+    E,
+    ParserPlaceholder,
+    ParserPlaceholder,
+    ParsedDeferredForPhase<ParserPlaceholder, AbsoluteBindingAddress>,
+    AbsoluteBindingAddress,
+>;
+pub type RootBindingResolvedParsedFile =
+    RootBindingResolvedFile<ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>>;
+pub type RootBindingResolvedInferredFile =
+    RootBindingResolvedFile<InferredExportParam<ParserPlaceholder, AbsoluteBindingAddress>>;
 
-pub type ExpandedParsedFile = ExpandedFile<ParsedExportParam<NoPlaceholder>>;
-pub type ExpandedInferredFile = ExpandedFile<InferredExportParam<NoPlaceholder>>;
-pub type ExpandedInferredExportParam = InferredExportParam<NoPlaceholder>;
+pub type ExpandedFile<E> = File<
+    E,
+    NoPlaceholder,
+    LoopSlot,
+    ResolvedDeferredForPhase<NoPlaceholder, LoopSlot, AbsoluteBindingAddress>,
+    AbsoluteBindingAddress,
+>;
+
+pub type ExpandedParsedFile =
+    ExpandedFile<ParsedExportParam<NoPlaceholder, AbsoluteBindingAddress>>;
+pub type ExpandedParsedExportParam = ParsedExportParam<NoPlaceholder, AbsoluteBindingAddress>;
+pub type ExpandedInferredFile =
+    ExpandedFile<InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>>;
+pub type ExpandedInferredExportParam = InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParserPlaceholderBoundary {
@@ -4524,10 +5597,11 @@ pub enum ParserPlaceholderBoundary {
     ModuleDefinition,
 }
 
-impl<E, P, T, D> Default for File<E, P, T, D>
+impl<E, P, T, D, B> Default for File<E, P, T, D, B>
 where
     P: PlaceholderKind,
     T: PlaceholderKind,
+    B: BindingAddress,
     D: Default,
 {
     fn default() -> Self {
@@ -4560,11 +5634,16 @@ where
     }
 }
 
-impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<ParserPlaceholder>> {
+type CapturedTemplateDependencyValues<B> =
+    Vec<(ResourceId, IndexMap<String, Value<ParserPlaceholder, B>>)>;
+
+impl<E, B: BindingAddress>
+    File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<ParserPlaceholder, B>, B>
+{
     pub(crate) fn capture_template_dependency_values(&mut self) {
-        fn capture_deferred(
-            deferred: &super::DeferredStructuralIf<ParserPlaceholder>,
-            captured: &mut Vec<(ResourceId, IndexMap<String, Value<ParserPlaceholder>>)>,
+        fn capture_deferred<B: BindingAddress>(
+            deferred: &super::DeferredStructuralIf<ParserPlaceholder, B>,
+            captured: &mut CapturedTemplateDependencyValues<B>,
         ) {
             for branch in deferred.branches() {
                 match branch {
@@ -4575,11 +5654,6 @@ impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<Par
                         captured.push((data_source.id.clone(), data_source.attributes.clone()));
                     }
                     DeferredIfBody::ModuleCall(_) => {}
-                    DeferredIfBody::ExpandedModuleCall(contribution) => {
-                        for nested in &contribution.deferred_module_ifs {
-                            capture_deferred(nested, captured);
-                        }
-                    }
                 }
             }
         }
@@ -4616,13 +5690,15 @@ impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<Par
         }
     }
 
-    pub fn parsed_deferred_for_expressions(&self) -> &[ParsedDeferredForExpression] {
+    pub fn parsed_deferred_for_expressions(
+        &self,
+    ) -> &[ParsedDeferredForExpression<ParserPlaceholder, B>] {
         &self.deferred_for_phase.expressions
     }
 
     pub fn deferred_for_scope_reference_sites(
         &self,
-    ) -> impl Iterator<Item = DeferredForSite<'_, ParserPlaceholder>> {
+    ) -> impl Iterator<Item = DeferredForSite<'_, ParserPlaceholder, B>> {
         self.deferred_for_phase
             .expressions
             .iter()
@@ -4637,11 +5713,13 @@ impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<Par
 
     pub(crate) fn parsed_deferred_for_expressions_mut(
         &mut self,
-    ) -> &mut Vec<ParsedDeferredForExpression> {
+    ) -> &mut Vec<ParsedDeferredForExpression<ParserPlaceholder, B>> {
         &mut self.deferred_for_phase.expressions
     }
 
-    pub fn into_parsed_deferred_for_expressions(self) -> Vec<ParsedDeferredForExpression> {
+    pub fn into_parsed_deferred_for_expressions(
+        self,
+    ) -> Vec<ParsedDeferredForExpression<ParserPlaceholder, B>> {
         self.deferred_for_phase.expressions
     }
 
@@ -4681,13 +5759,14 @@ impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<Par
                             origin.set_binding_scope(std::sync::Arc::clone(&binding_scope));
                         }
                     }
-                    DeferredIfBody::ExpandedModuleCall(_) => {}
                 }
             }
         }
     }
 
-    pub(crate) fn empty_with_parsed_binding_uses(parsed_binding_uses: ParsedBindingUses) -> Self {
+    pub(crate) fn empty_with_parsed_binding_uses(
+        parsed_binding_uses: ParsedBindingUses<B>,
+    ) -> Self {
         Self {
             parsed_binding_uses,
             ..Self::default()
@@ -4756,12 +5835,12 @@ impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<Par
     pub(crate) fn map_deferred_for_phase<A>(
         self,
         map: impl FnOnce(
-            Vec<ParsedDeferredForExpression>,
+            Vec<ParsedDeferredForExpression<ParserPlaceholder, B>>,
         ) -> (
-            Vec<DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>>,
+            Vec<DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder, B>>,
             A,
         ),
-    ) -> (ModuleResolvedFile<E>, A) {
+    ) -> (ModuleResolvedFile<E, B>, A) {
         let File {
             providers,
             resources,
@@ -4823,14 +5902,489 @@ impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<Par
     }
 }
 
+impl<E, P> File<E, P, P, ParsedDeferredForPhase<P, RelativeBindingName>, RelativeBindingName>
+where
+    P: PlaceholderKind,
+    E: ResolveExportBindingPhase<P>,
+{
+    pub(crate) fn resolve_root(
+        self,
+        scope: &RootScope,
+    ) -> File<
+        E::Absolute,
+        P,
+        P,
+        ParsedDeferredForPhase<P, AbsoluteBindingAddress>,
+        AbsoluteBindingAddress,
+    > {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn resolve_root_for_test(
+        self,
+    ) -> File<
+        E::Absolute,
+        P,
+        P,
+        ParsedDeferredForPhase<P, AbsoluteBindingAddress>,
+        AbsoluteBindingAddress,
+    > {
+        self.resolve_root(&RootScope::new())
+    }
+
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> File<
+        E::Absolute,
+        P,
+        P,
+        ParsedDeferredForPhase<P, AbsoluteBindingAddress>,
+        AbsoluteBindingAddress,
+    > {
+        let File {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings,
+            deferred_for_phase,
+            template_placeholder,
+            deferred_module_ifs,
+            expansion_trace,
+        } = self;
+
+        File {
+            providers: providers
+                .into_iter()
+                .map(|provider| {
+                    let ProviderConfig {
+                        name,
+                        attributes,
+                        default_tags,
+                        source,
+                        version,
+                        revision,
+                        unresolved_attributes,
+                        binding,
+                    } = provider;
+                    ProviderConfig {
+                        name,
+                        attributes: attributes
+                            .into_iter()
+                            .map(|(name, value)| (name, value.resolve_bindings(resolve)))
+                            .collect(),
+                        default_tags: default_tags
+                            .into_iter()
+                            .map(|(name, value)| (name, value.resolve_bindings(resolve)))
+                            .collect(),
+                        source,
+                        version,
+                        revision,
+                        unresolved_attributes: unresolved_attributes
+                            .into_iter()
+                            .map(|(name, value)| (name, value.resolve_bindings(resolve)))
+                            .collect(),
+                        binding,
+                    }
+                })
+                .collect(),
+            resources: resources
+                .into_iter()
+                .map(|resource| resource.resolve_bindings(resolve))
+                .collect(),
+            data_sources: data_sources
+                .into_iter()
+                .map(|data_source| data_source.resolve_bindings(resolve))
+                .collect(),
+            compositions: compositions
+                .into_iter()
+                .map(|composition| composition.resolve_bindings(resolve))
+                .collect(),
+            variables: variables
+                .into_iter()
+                .map(|(name, value)| (name, value.resolve_bindings(resolve)))
+                .collect(),
+            uses,
+            module_calls: module_calls
+                .into_iter()
+                .map(|call| call.resolve_bindings(resolve))
+                .collect(),
+            arguments: arguments
+                .into_iter()
+                .map(|argument| {
+                    let ArgumentParameter {
+                        name,
+                        static_type,
+                        default,
+                        description,
+                        validations,
+                    } = argument;
+                    ArgumentParameter {
+                        name,
+                        static_type,
+                        default: default.map(|value| value.resolve_bindings(resolve)),
+                        description,
+                        validations: validations
+                            .into_iter()
+                            .map(|validation| {
+                                let ValidationBlock {
+                                    condition,
+                                    error_message,
+                                    source,
+                                } = validation;
+                                ValidationBlock {
+                                    condition: condition.resolve_bindings(resolve),
+                                    error_message,
+                                    source,
+                                }
+                            })
+                            .collect(),
+                    }
+                })
+                .collect(),
+            attribute_params: attribute_params
+                .into_iter()
+                .map(|attribute| {
+                    let AttributeParameter {
+                        name,
+                        static_type,
+                        value,
+                        source,
+                    } = attribute;
+                    AttributeParameter {
+                        name,
+                        static_type,
+                        value: value.map(|value| value.resolve_bindings(resolve)),
+                        source,
+                    }
+                })
+                .collect(),
+            export_params: export_params
+                .into_iter()
+                .map(|export| export.resolve_export_bindings(resolve))
+                .collect(),
+            backend: backend.map(|backend| {
+                let BackendConfig {
+                    backend_type,
+                    attributes,
+                    attribute_spans,
+                } = backend;
+                BackendConfig {
+                    backend_type,
+                    attributes: attributes
+                        .into_iter()
+                        .map(|(name, value)| (name, value.resolve_bindings(resolve)))
+                        .collect(),
+                    attribute_spans,
+                }
+            }),
+            state_blocks: state_blocks
+                .into_iter()
+                .map(|block| match block {
+                    StateBlock::Import { to, to_span, id } => StateBlock::Import {
+                        to,
+                        to_span,
+                        id: id.resolve_bindings(resolve),
+                    },
+                    StateBlock::Removed { from } => StateBlock::Removed { from },
+                    StateBlock::Moved { addresses } => StateBlock::Moved { addresses },
+                })
+                .collect(),
+            user_functions: user_functions
+                .into_iter()
+                .map(|(name, function)| (name, function.map_bindings(resolve)))
+                .collect(),
+            upstream_states: upstream_states
+                .into_iter()
+                .map(|upstream| {
+                    let UpstreamState { binding, source } = upstream;
+                    UpstreamState {
+                        binding: resolve(binding),
+                        source,
+                    }
+                })
+                .collect(),
+            wait_bindings: wait_bindings
+                .into_iter()
+                .map(|wait| {
+                    let WaitBinding {
+                        binding,
+                        target,
+                        until_raw,
+                        until_predicate,
+                        timeout_secs,
+                        depends_on,
+                        line,
+                    } = wait;
+                    let UntilPredicateAst {
+                        root,
+                        attribute_segments,
+                        rhs,
+                    } = until_predicate;
+                    WaitBinding {
+                        binding: resolve(binding),
+                        target: resolve(target),
+                        until_raw,
+                        until_predicate: UntilPredicateAst {
+                            root: resolve(root),
+                            attribute_segments,
+                            rhs: rhs.resolve_bindings(resolve),
+                        },
+                        timeout_secs,
+                        depends_on: depends_on.into_iter().map(&mut *resolve).collect(),
+                        line,
+                    }
+                })
+                .collect(),
+            requires: requires
+                .into_iter()
+                .map(|require| {
+                    let RequireBlock {
+                        condition,
+                        error_message,
+                        source,
+                    } = require;
+                    RequireBlock {
+                        condition: condition.resolve_bindings(resolve),
+                        error_message,
+                        source,
+                    }
+                })
+                .collect(),
+            structural_bindings: structural_bindings.into_iter().map(&mut *resolve).collect(),
+            parser_binding_metadata: parser_binding_metadata.resolve_bindings(resolve),
+            parsed_binding_uses: parsed_binding_uses.resolve_bindings(resolve),
+            warnings,
+            deferred_for_phase: ParsedDeferredForPhase {
+                expressions: deferred_for_phase
+                    .expressions
+                    .into_iter()
+                    .map(|deferred| deferred.resolve_bindings(resolve))
+                    .collect(),
+            },
+            template_placeholder,
+            deferred_module_ifs: deferred_module_ifs
+                .into_iter()
+                .map(|deferred| deferred.resolve_bindings(resolve))
+                .collect(),
+            expansion_trace,
+        }
+    }
+}
+
+impl<E, P, T, D> File<E, P, T, D, AbsoluteBindingAddress>
+where
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    E: ExportParamLike<P, AbsoluteBindingAddress>,
+{
+    /// Rewrite every expanded binding address held by a file.
+    ///
+    /// The exhaustive destructure is intentional: adding a top-level slot
+    /// forces this traversal to classify it before the crate compiles.
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) where
+        D: AbsoluteDeferredForPhaseMap<P, T>,
+    {
+        let File {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses: _uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings: _warnings,
+            deferred_for_phase,
+            template_placeholder: _template_placeholder,
+            deferred_module_ifs,
+            expansion_trace: _expansion_trace,
+        } = self;
+
+        for provider in providers {
+            let ProviderConfig {
+                name: _name,
+                attributes,
+                default_tags,
+                source: _source,
+                version: _version,
+                revision: _revision,
+                unresolved_attributes,
+                binding: _binding,
+            } = provider;
+            for value in attributes.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+            for value in default_tags.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+            for value in unresolved_attributes.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+        }
+        for resource in resources {
+            resource.map_absolute_bindings(map);
+        }
+        for data_source in data_sources {
+            data_source.map_absolute_bindings(map);
+        }
+        for composition in compositions {
+            composition.map_absolute_bindings(map);
+        }
+        for value in variables.values_mut() {
+            value.map_absolute_bindings(map);
+        }
+        for call in module_calls {
+            call.map_absolute_bindings(map);
+        }
+        for argument in arguments {
+            let ArgumentParameter {
+                name: _name,
+                static_type: _static_type,
+                default,
+                description: _description,
+                validations,
+            } = argument;
+            if let Some(default) = default {
+                default.map_absolute_bindings(map);
+            }
+            for validation in validations {
+                let ValidationBlock {
+                    condition,
+                    error_message: _error_message,
+                    source: _source,
+                } = validation;
+                condition.map_absolute_bindings(map);
+            }
+        }
+        for attribute in attribute_params {
+            let AttributeParameter {
+                name: _name,
+                static_type: _static_type,
+                value,
+                source: _source,
+            } = attribute;
+            if let Some(value) = value {
+                value.map_absolute_bindings(map);
+            }
+        }
+        for export in export_params {
+            let mut value = export.value().cloned();
+            if let Some(value) = &mut value {
+                value.map_absolute_bindings(map);
+            }
+            export.set_value(value);
+        }
+        if let Some(backend) = backend {
+            let BackendConfig {
+                backend_type: _backend_type,
+                attributes,
+                attribute_spans: _attribute_spans,
+            } = backend;
+            for value in attributes.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+        }
+        for block in state_blocks {
+            match block {
+                StateBlock::Import {
+                    to: _to,
+                    to_span: _to_span,
+                    id,
+                } => id.map_absolute_bindings(map),
+                StateBlock::Removed { from: _from } => {}
+                StateBlock::Moved {
+                    addresses: _addresses,
+                } => {}
+            }
+        }
+        for function in user_functions.values_mut() {
+            *function = function.clone().map_bindings(&mut |binding| map(&binding));
+        }
+        for upstream in upstream_states {
+            let UpstreamState {
+                binding,
+                source: _source,
+            } = upstream;
+            *binding = map(binding);
+        }
+        for wait in wait_bindings {
+            wait.map_absolute_bindings(map);
+        }
+        for require in requires {
+            let RequireBlock {
+                condition,
+                error_message: _error_message,
+                source: _source,
+            } = require;
+            condition.map_absolute_bindings(map);
+        }
+        *structural_bindings = std::mem::take(structural_bindings)
+            .into_iter()
+            .map(|binding| map(&binding))
+            .collect();
+        parser_binding_metadata.map_absolute_bindings(map);
+        parsed_binding_uses.map_absolute_bindings(map);
+        deferred_for_phase.map_absolute_bindings(map);
+        for deferred in deferred_module_ifs {
+            deferred.map_absolute_bindings(map);
+        }
+    }
+}
+
 #[cfg(any(test, feature = "test-utils"))]
-impl<E: IntoExpandedExportParam>
-    File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<ParserPlaceholder>>
+impl<E>
+    File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+        RelativeBindingName,
+    >
+where
+    E: ResolveExportBindingPhase<ParserPlaceholder>,
+    E::Absolute: IntoExpandedExportParam<AbsoluteBindingAddress>,
 {
     /// Unit-test convenience for fixtures that do not exercise the module
     /// resolver itself. Production callers must cross the resolver's typed
     /// deferred-body finalization seam before publishing an expanded file.
-    pub fn into_expanded(self) -> Result<ExpandedFile<E::Expanded>, LeftoverPlaceholders> {
+    pub fn into_expanded(
+        self,
+    ) -> Result<
+        ExpandedFile<<E::Absolute as IntoExpandedExportParam<AbsoluteBindingAddress>>::Expanded>,
+        LeftoverPlaceholders,
+    > {
         let mut known_bindings = self
             .structural_binding_names()
             .into_iter()
@@ -4839,7 +6393,8 @@ impl<E: IntoExpandedExportParam>
         known_bindings.extend(self.variables.keys().cloned());
         known_bindings.sort_unstable();
         known_bindings.dedup();
-        let (resolved, errors) = self.map_deferred_for_phase(|pending| {
+        let authored = self.resolve_root(&RootScope::new());
+        let (resolved, errors) = authored.map_deferred_for_phase(|pending| {
             let mut resolved = Vec::with_capacity(pending.len());
             let mut errors = Vec::new();
             for expression in pending {
@@ -4858,18 +6413,19 @@ impl<E: IntoExpandedExportParam>
     }
 }
 
-impl<E, P, T, D> File<E, P, T, D>
+impl<E, P, T, D, B> File<E, P, T, D, B>
 where
     P: PlaceholderKind,
     T: PlaceholderKind,
+    B: BindingAddress,
 {
-    pub fn bare_binding_uses(&self) -> &ParsedBindingUses {
+    pub fn bare_binding_uses(&self) -> &ParsedBindingUses<B> {
         &self.parsed_binding_uses
     }
 
     pub(crate) fn try_visit_bare_binding_values<A>(
         &self,
-        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), A>,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), A>,
     ) -> Result<(), A> {
         self.parsed_binding_uses.try_visit_values(visit)
     }
@@ -4903,7 +6459,7 @@ where
         } = self;
     }
 
-    pub fn map_export_params<B>(self, f: impl FnOnce(Vec<E>) -> Vec<B>) -> File<B, P, T, D> {
+    pub fn map_export_params<F>(self, f: impl FnOnce(Vec<E>) -> Vec<F>) -> File<F, P, T, D, B> {
         let File {
             providers,
             resources,
@@ -4961,7 +6517,7 @@ where
 
     pub fn iter_top_level_resources(
         &self,
-    ) -> impl Iterator<Item = TopLevelResourceRef<'_, ModuleSource, P>> {
+    ) -> impl Iterator<Item = TopLevelResourceRef<'_, ModuleSource, P, B>> {
         self.resources
             .iter()
             .map(TopLevelResourceRef::Resource)
@@ -4985,15 +6541,16 @@ where
     }
 }
 
-impl<E, P, T, D> File<E, P, T, D>
+impl<E, P, T, D, B> File<E, P, T, D, B>
 where
     P: PlaceholderKind,
     T: PlaceholderKind,
-    D: DeferredForPhaseTraversal<P, T>,
+    B: BindingAddress,
+    D: DeferredForPhaseTraversal<P, T, B>,
 {
     pub fn iter_all_resources(
         &self,
-    ) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, P, T, D>> {
+    ) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, P, T, D, B>> {
         self.resources
             .iter()
             .map(ResourceRef::Resource)
@@ -5009,14 +6566,12 @@ where
                         DeferredIfBody::DataSource(data_source) => {
                             Some(ResourceRef::DataSource(data_source))
                         }
-                        DeferredIfBody::ModuleCall(_) | DeferredIfBody::ExpandedModuleCall(_) => {
-                            None
-                        }
+                        DeferredIfBody::ModuleCall(_) => None,
                     }),
             )
     }
 
-    pub fn iter_all_resources_mut(&mut self) -> impl Iterator<Item = ResourceMut<'_, P, T>> {
+    pub fn iter_all_resources_mut(&mut self) -> impl Iterator<Item = ResourceMut<'_, P, T, B>> {
         self.resources
             .iter_mut()
             .map(ResourceMut::Resource)
@@ -5036,65 +6591,65 @@ where
                         DeferredIfBody::DataSource(data_source) => {
                             Some(ResourceMut::DataSource(data_source))
                         }
-                        DeferredIfBody::ModuleCall(_) | DeferredIfBody::ExpandedModuleCall(_) => {
-                            None
-                        }
+                        DeferredIfBody::ModuleCall(_) => None,
                     }),
             )
     }
 
-    pub fn deferred_for_sites(&self) -> impl Iterator<Item = DeferredForSite<'_, P>> {
+    pub fn deferred_for_sites(&self) -> impl Iterator<Item = DeferredForSite<'_, P, B>> {
         self.deferred_for_phase.sites()
     }
 }
 
-impl<E, D> File<E, ParserPlaceholder, ParserPlaceholder, D>
+impl<E, B: BindingAddress, D> File<E, ParserPlaceholder, ParserPlaceholder, D, B>
 where
-    D: ParserDeferredForPhaseAudit,
+    D: ParserDeferredForPhaseAudit<B>,
 {
     pub(crate) fn try_visit_deferred_for_values_for_module_if_audit<A>(
         &self,
-        visit: &mut impl FnMut(&Value<ParserPlaceholder>) -> Result<(), A>,
+        visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), A>,
     ) -> Result<(), A> {
         self.deferred_for_phase
             .try_visit_values_for_module_if_audit(visit)
     }
 }
 
-impl<E, P, T> File<E, P, T, ResolvedDeferredForPhase<P, T>>
+impl<E, P, T, B> File<E, P, T, ResolvedDeferredForPhase<P, T, B>, B>
 where
     P: PlaceholderKind,
     T: PlaceholderKind,
+    B: BindingAddress,
 {
-    pub fn deferred_for_expressions(&self) -> &ResolvedDeferredForExpressions<P, T> {
+    pub fn deferred_for_expressions(&self) -> &ResolvedDeferredForExpressions<P, T, B> {
         &self.deferred_for_phase.expressions
     }
 
-    pub fn deferred_for_expressions_mut(&mut self) -> &mut ResolvedDeferredForExpressions<P, T> {
+    pub fn deferred_for_expressions_mut(&mut self) -> &mut ResolvedDeferredForExpressions<P, T, B> {
         &mut self.deferred_for_phase.expressions
     }
 
-    pub fn take_deferred_for_expressions(&mut self) -> ResolvedDeferredForExpressions<P, T> {
+    pub fn take_deferred_for_expressions(&mut self) -> ResolvedDeferredForExpressions<P, T, B> {
         let empty = self.deferred_for_phase.expressions.empty_like();
         std::mem::replace(&mut self.deferred_for_phase.expressions, empty)
     }
 
     pub fn replace_deferred_for_expressions(
         &mut self,
-        expressions: ResolvedDeferredForExpressions<P, T>,
-    ) -> ResolvedDeferredForExpressions<P, T> {
+        expressions: ResolvedDeferredForExpressions<P, T, B>,
+    ) -> ResolvedDeferredForExpressions<P, T, B> {
         std::mem::replace(&mut self.deferred_for_phase.expressions, expressions)
     }
 
-    pub fn into_deferred_for_expressions(self) -> ResolvedDeferredForExpressions<P, T> {
+    pub fn into_deferred_for_expressions(self) -> ResolvedDeferredForExpressions<P, T, B> {
         self.deferred_for_phase.expressions
     }
 }
 
-impl<E, P, T, D> File<E, P, T, D>
+impl<E, P, T, D, B> File<E, P, T, D, B>
 where
     P: PlaceholderKind,
     T: PlaceholderKind,
+    B: BindingAddress,
 {
     /// Every non-variable binding name declared in the file.
     ///
@@ -5110,7 +6665,7 @@ where
         names.extend(
             self.module_calls
                 .iter()
-                .filter_map(|c| c.binding_name.as_deref()),
+                .filter_map(|c| c.binding_name.as_ref().map(BindingAddress::as_str)),
         );
         names.extend(
             self.deferred_module_ifs
@@ -5123,12 +6678,12 @@ where
         names.extend(self.uses.iter().map(|u| u.alias.as_str()));
         names.extend(self.user_functions.keys().map(String::as_str));
         names.extend(self.providers.iter().filter_map(|p| p.binding.as_deref()));
-        names.extend(self.structural_bindings.iter().map(String::as_str));
+        names.extend(self.structural_bindings.iter().map(BindingAddress::as_str));
         names.extend(
             self.parser_binding_metadata
                 .structural_handles()
                 .keys()
-                .map(String::as_str),
+                .map(BindingAddress::as_str),
         );
         names
     }
@@ -5146,9 +6701,9 @@ where
     /// for the same reason as the borrowing iterator above.
     pub fn into_graph_nodes(self) -> impl Iterator<Item = GraphNode>
     where
-        GraphNode: From<Resource<ModuleSource, P>>
-            + From<LiveComposition<P>>
-            + From<DataSource<ModuleSource, P>>,
+        GraphNode: From<Resource<ModuleSource, P, B>>
+            + From<LiveComposition<P, B>>
+            + From<DataSource<ModuleSource, P, B>>,
     {
         self.resources
             .into_iter()
@@ -5174,7 +6729,7 @@ where
     /// `ExpansionTrace` once #3295 introduces it.
     pub fn into_leaf_nodes(self) -> impl Iterator<Item = LeafNode>
     where
-        LeafNode: From<Resource<ModuleSource, P>> + From<DataSource<ModuleSource, P>>,
+        LeafNode: From<Resource<ModuleSource, P, B>> + From<DataSource<ModuleSource, P, B>>,
     {
         self.resources
             .into_iter()
@@ -5188,7 +6743,7 @@ where
         resource_type: &str,
         attr_name: &str,
         attr_value: &str,
-    ) -> Option<&Resource<ModuleSource, P>> {
+    ) -> Option<&Resource<ModuleSource, P, B>> {
         self.resources.iter().find(|r| {
             r.id.resource_type == resource_type
                 && matches!(r.get_attr(attr_name), Some(Value::Concrete(ConcreteValue::String(n))) if n == attr_value)
@@ -5230,7 +6785,7 @@ where
     }
 }
 
-trait ParserBoundaryDeferredPhase {
+trait ParserBoundaryDeferredPhase<B: BindingAddress> {
     fn collect_leftover_placeholders(
         &self,
         module_expansion_field: LeftoverPlaceholderPolicy,
@@ -5239,7 +6794,9 @@ trait ParserBoundaryDeferredPhase {
     );
 }
 
-impl ParserBoundaryDeferredPhase for ParsedDeferredForPhase<ParserPlaceholder> {
+impl<B: BindingAddress> ParserBoundaryDeferredPhase<B>
+    for ParsedDeferredForPhase<ParserPlaceholder, B>
+{
     fn collect_leftover_placeholders(
         &self,
         module_expansion_field: LeftoverPlaceholderPolicy,
@@ -5283,8 +6840,8 @@ impl ParserBoundaryDeferredPhase for ParsedDeferredForPhase<ParserPlaceholder> {
     }
 }
 
-impl ParserBoundaryDeferredPhase
-    for ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder>
+impl<B: BindingAddress> ParserBoundaryDeferredPhase<B>
+    for ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder, B>
 {
     fn collect_leftover_placeholders(
         &self,
@@ -5310,9 +6867,9 @@ impl ParserBoundaryDeferredPhase
     }
 }
 
-fn collect_deferred_for_resource_placeholders(
+fn collect_deferred_for_resource_placeholders<B: BindingAddress>(
     header: &str,
-    resource: &Resource<ModuleSource, ParserPlaceholder>,
+    resource: &Resource<ModuleSource, ParserPlaceholder, B>,
     policy: LeftoverPlaceholderPolicy,
     errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
 ) {
@@ -5328,16 +6885,16 @@ fn collect_deferred_for_resource_placeholders(
     }
 }
 
-fn collect_module_call_placeholders(
-    call: &ModuleCall<ParserPlaceholder>,
+fn collect_module_call_placeholders<B: BindingAddress>(
+    call: &ModuleCall<ParserPlaceholder, B>,
     policy: LeftoverPlaceholderPolicy,
     errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
 ) {
     let module_call_name = call
         .binding_name
         .as_ref()
-        .unwrap_or(&call.module_name)
-        .clone();
+        .map(ToString::to_string)
+        .unwrap_or_else(|| call.module_name.clone());
     for (argument_name, authored_argument) in &call.arguments {
         authored_argument
             .argument
@@ -5355,8 +6912,8 @@ fn collect_module_call_placeholders(
     }
 }
 
-fn collect_deferred_if_placeholders(
-    deferred: &super::DeferredStructuralIf<ParserPlaceholder>,
+fn collect_deferred_if_placeholders<B: BindingAddress>(
+    deferred: &super::DeferredStructuralIf<ParserPlaceholder, B>,
     policy: LeftoverPlaceholderPolicy,
     errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
 ) {
@@ -5394,367 +6951,398 @@ fn collect_deferred_if_placeholders(
             DeferredIfBody::ModuleCall(call) => {
                 collect_module_call_placeholders(call, policy, errors);
             }
-            DeferredIfBody::ExpandedModuleCall(contribution) => {
-                errors.extend(
-                    contribution.leftover_placeholders(ParserPlaceholderBoundary::ModuleDefinition),
-                );
-            }
         }
     }
 }
 
-#[allow(private_bounds)]
-impl<E, D> File<E, ParserPlaceholder, ParserPlaceholder, D>
+fn leftover_placeholders<E, B: BindingAddress, D>(
+    file: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    boundary: ParserPlaceholderBoundary,
+) -> Vec<crate::resource::LeftoverPlaceholder>
 where
-    E: IntoExpandedExportParam,
-    D: ParserBoundaryDeferredPhase,
+    E: IntoExpandedExportParam<B>,
+    D: ParserBoundaryDeferredPhase<B>,
 {
-    fn leftover_placeholders(
-        &self,
-        boundary: ParserPlaceholderBoundary,
-    ) -> Vec<crate::resource::LeftoverPlaceholder> {
-        let File {
-            providers,
-            resources,
-            data_sources,
-            compositions,
-            variables,
-            uses,
-            module_calls,
-            arguments,
-            attribute_params,
-            export_params,
-            backend,
-            state_blocks,
-            user_functions,
-            upstream_states,
-            wait_bindings,
-            requires,
-            structural_bindings,
-            parser_binding_metadata,
-            parsed_binding_uses,
-            warnings,
-            deferred_for_phase,
-            template_placeholder: _template_placeholder,
-            deferred_module_ifs,
-            expansion_trace,
-        } = self;
-        let _non_value_fields = (
-            uses,
-            user_functions,
-            upstream_states,
-            wait_bindings,
-            structural_bindings,
-            parser_binding_metadata,
-            parsed_binding_uses,
-            warnings,
-            expansion_trace,
-        );
+    let File {
+        providers,
+        resources,
+        data_sources,
+        compositions,
+        variables,
+        uses,
+        module_calls,
+        arguments,
+        attribute_params,
+        export_params,
+        backend,
+        state_blocks,
+        user_functions,
+        upstream_states,
+        wait_bindings,
+        requires,
+        structural_bindings,
+        parser_binding_metadata,
+        parsed_binding_uses,
+        warnings,
+        deferred_for_phase,
+        template_placeholder: _template_placeholder,
+        deferred_module_ifs,
+        expansion_trace,
+    } = file;
+    let _non_value_fields = (
+        uses,
+        user_functions,
+        upstream_states,
+        wait_bindings,
+        structural_bindings,
+        parser_binding_metadata,
+        parsed_binding_uses,
+        warnings,
+        expansion_trace,
+    );
 
-        let mut errors = Vec::new();
-        let reject_all = LeftoverPlaceholderPolicy::REJECT_ALL;
-        let allow_module_arguments = boundary == ParserPlaceholderBoundary::ModuleDefinition;
-        let module_expansion_field =
-            LeftoverPlaceholderPolicy::module_expansion_field(allow_module_arguments);
-        let deferred_template =
-            LeftoverPlaceholderPolicy::deferred_template(allow_module_arguments);
+    let mut errors = Vec::new();
+    let reject_all = LeftoverPlaceholderPolicy::REJECT_ALL;
+    let allow_module_arguments = boundary == ParserPlaceholderBoundary::ModuleDefinition;
+    let module_expansion_field =
+        LeftoverPlaceholderPolicy::module_expansion_field(allow_module_arguments);
+    let deferred_template = LeftoverPlaceholderPolicy::deferred_template(allow_module_arguments);
 
-        for provider in providers {
-            let ProviderConfig {
-                name,
-                attributes,
-                default_tags,
-                source,
-                version,
-                revision,
-                unresolved_attributes,
-                binding,
-            } = provider;
-            let _provider_metadata = (source, version, revision, binding);
-            for (attribute, value) in attributes {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::ProviderAttribute {
-                        provider: name.clone(),
-                        attribute: attribute.clone(),
-                    },
-                    reject_all,
-                    &mut errors,
-                );
-            }
-            for (attribute, value) in default_tags {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::ProviderAttribute {
-                        provider: name.clone(),
-                        attribute: format!("default_tags.{attribute}"),
-                    },
-                    reject_all,
-                    &mut errors,
-                );
-            }
-            for (attribute, value) in unresolved_attributes {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::ProviderAttribute {
-                        provider: name.clone(),
-                        attribute: attribute.clone(),
-                    },
-                    reject_all,
-                    &mut errors,
-                );
-            }
-        }
-
-        for resource in resources {
-            let Resource {
-                id,
-                attributes,
-                directives,
-                resolved_ignore_changes,
-                prefixes,
-                binding,
-                dependency_bindings,
-                module_source,
-                default_tag_keys,
-                loop_provenance,
-                quoted_string_attrs,
-            } = resource;
-            let _resource_metadata = (
-                directives,
-                resolved_ignore_changes,
-                prefixes,
-                binding,
-                dependency_bindings,
-                module_source,
-                default_tag_keys,
-                loop_provenance,
-                quoted_string_attrs,
-            );
-            for (attribute, value) in attributes {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::ResourceAttribute {
-                        resource: id.to_string(),
-                        attribute: attribute.clone(),
-                    },
-                    module_expansion_field,
-                    &mut errors,
-                );
-            }
-        }
-
-        for data_source in data_sources {
-            let DataSource {
-                id,
-                attributes,
-                directives,
-                binding,
-                dependency_bindings,
-                module_source,
-                quoted_string_attrs,
-            } = data_source;
-            let _data_source_metadata = (
-                directives,
-                binding,
-                dependency_bindings,
-                module_source,
-                quoted_string_attrs,
-            );
-            for (attribute, value) in attributes {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::ResourceAttribute {
-                        resource: id.to_string(),
-                        attribute: attribute.clone(),
-                    },
-                    module_expansion_field,
-                    &mut errors,
-                );
-            }
-        }
-
-        for composition in compositions {
-            composition.collect_leftover_placeholders(module_expansion_field, &mut errors);
-        }
-
-        for (name, value) in variables {
+    for provider in providers {
+        let ProviderConfig {
+            name,
+            attributes,
+            default_tags,
+            source,
+            version,
+            revision,
+            unresolved_attributes,
+            binding,
+        } = provider;
+        let _provider_metadata = (source, version, revision, binding);
+        for (attribute, value) in attributes {
             value.collect_leftover_placeholders(
-                LeftoverPlaceholderContext::Variable { name: name.clone() },
-                module_expansion_field,
+                LeftoverPlaceholderContext::ProviderAttribute {
+                    provider: name.clone(),
+                    attribute: attribute.clone(),
+                },
+                reject_all,
                 &mut errors,
             );
         }
-
-        for module_call in module_calls {
-            let ModuleCall {
-                module_name,
-                binding_name,
-                arguments,
-                source,
-                loop_origin,
-            } = module_call;
-            let _module_call_metadata = (source, loop_origin);
-            let module_call_name = binding_name.as_ref().unwrap_or(module_name).clone();
-            for (argument_name, authored_argument) in arguments {
-                let AuthoredModuleArgument {
-                    argument,
-                    key_span,
-                    value_span,
-                } = authored_argument;
-                let _argument_source = (key_span, value_span);
-                let ModuleArgument { operand } = argument;
-                operand.visit_values(&mut |value| {
-                    value.collect_leftover_placeholders(
-                        LeftoverPlaceholderContext::ModuleCallArgument {
-                            module_call: module_call_name.clone(),
-                            argument: argument_name.clone(),
-                        },
-                        module_expansion_field,
-                        &mut errors,
-                    );
-                });
-            }
+        for (attribute, value) in default_tags {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::ProviderAttribute {
+                    provider: name.clone(),
+                    attribute: format!("default_tags.{attribute}"),
+                },
+                reject_all,
+                &mut errors,
+            );
         }
-
-        for argument in arguments {
-            let ArgumentParameter {
-                name,
-                static_type,
-                default,
-                description,
-                validations,
-            } = argument;
-            let _argument_metadata = (static_type, description);
-            if let Some(value) = default {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::ArgumentDefault { name: name.clone() },
-                    module_expansion_field,
-                    &mut errors,
-                );
-            }
-            for validation in validations {
-                let ValidationBlock {
-                    condition,
-                    error_message,
-                    source,
-                } = validation;
-                let _validation_metadata = (error_message, source);
-                condition.collect_leftover_placeholders(
-                    &LeftoverPlaceholderContext::ArgumentValidation { name: name.clone() },
-                    module_expansion_field,
-                    &mut errors,
-                );
-            }
+        for (attribute, value) in unresolved_attributes {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::ProviderAttribute {
+                    provider: name.clone(),
+                    attribute: attribute.clone(),
+                },
+                reject_all,
+                &mut errors,
+            );
         }
+    }
 
-        for attribute in attribute_params {
-            let AttributeParameter {
-                name,
-                static_type,
-                value,
-                source,
-            } = attribute;
-            let _attribute_metadata = (static_type, source);
-            if let Some(value) = value {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::AttributeDefault { name: name.clone() },
-                    module_expansion_field,
-                    &mut errors,
-                );
-            }
-        }
-
-        for export in export_params {
-            export.collect_leftover_placeholders(&mut errors);
-        }
-
-        if let Some(backend) = backend {
-            let BackendConfig {
-                backend_type,
-                attributes,
-                attribute_spans,
-            } = backend;
-            let _attribute_spans = attribute_spans;
-            for (attribute, value) in attributes {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::BackendAttribute {
-                        backend: backend_type.clone(),
-                        attribute: attribute.clone(),
-                    },
-                    reject_all,
-                    &mut errors,
-                );
-            }
-        }
-
-        for state_block in state_blocks {
-            match state_block {
-                StateBlock::Import {
-                    to,
-                    to_span: _to_span,
-                    id,
-                } => id.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::StateImport {
-                        target: to.to_string(),
-                    },
-                    reject_all,
-                    &mut errors,
-                ),
-                StateBlock::Removed { from: _from } => {}
-                StateBlock::Moved {
-                    addresses: _addresses,
-                } => {}
-            }
-        }
-
-        for (index, require) in requires.iter().enumerate() {
-            let RequireBlock {
-                condition,
-                error_message,
-                source,
-            } = require;
-            let _require_metadata = (error_message, source);
-            condition.collect_leftover_placeholders(
-                &LeftoverPlaceholderContext::Require {
-                    label: (index + 1).to_string(),
+    for resource in resources {
+        let Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        } = resource;
+        let _resource_metadata = (
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        );
+        for (attribute, value) in attributes {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::ResourceAttribute {
+                    resource: id.to_string(),
+                    attribute: attribute.clone(),
                 },
                 module_expansion_field,
                 &mut errors,
             );
         }
-
-        deferred_for_phase.collect_leftover_placeholders(
-            module_expansion_field,
-            deferred_template,
-            &mut errors,
-        );
-
-        for deferred in deferred_module_ifs {
-            collect_deferred_if_placeholders(deferred, module_expansion_field, &mut errors);
-        }
-
-        errors
     }
 
+    for data_source in data_sources {
+        let DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs,
+        } = data_source;
+        let _data_source_metadata = (
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs,
+        );
+        for (attribute, value) in attributes {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::ResourceAttribute {
+                    resource: id.to_string(),
+                    attribute: attribute.clone(),
+                },
+                module_expansion_field,
+                &mut errors,
+            );
+        }
+    }
+
+    for composition in compositions {
+        composition.collect_leftover_placeholders(module_expansion_field, &mut errors);
+    }
+
+    for (name, value) in variables {
+        value.collect_leftover_placeholders(
+            LeftoverPlaceholderContext::Variable { name: name.clone() },
+            module_expansion_field,
+            &mut errors,
+        );
+    }
+
+    for module_call in module_calls {
+        let ModuleCall {
+            module_name,
+            binding_name,
+            arguments,
+            source,
+            loop_origin,
+        } = module_call;
+        let _module_call_metadata = (source, loop_origin);
+        let module_call_name = binding_name
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| module_name.clone());
+        for (argument_name, authored_argument) in arguments {
+            let AuthoredModuleArgument {
+                argument,
+                key_span,
+                value_span,
+            } = authored_argument;
+            let _argument_source = (key_span, value_span);
+            let ModuleArgument { operand } = argument;
+            operand.visit_values(&mut |value| {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ModuleCallArgument {
+                        module_call: module_call_name.clone(),
+                        argument: argument_name.clone(),
+                    },
+                    module_expansion_field,
+                    &mut errors,
+                );
+            });
+        }
+    }
+
+    for argument in arguments {
+        let ArgumentParameter {
+            name,
+            static_type,
+            default,
+            description,
+            validations,
+        } = argument;
+        let _argument_metadata = (static_type, description);
+        if let Some(value) = default {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::ArgumentDefault { name: name.clone() },
+                module_expansion_field,
+                &mut errors,
+            );
+        }
+        for validation in validations {
+            let ValidationBlock {
+                condition,
+                error_message,
+                source,
+            } = validation;
+            let _validation_metadata = (error_message, source);
+            condition.collect_leftover_placeholders(
+                &LeftoverPlaceholderContext::ArgumentValidation { name: name.clone() },
+                module_expansion_field,
+                &mut errors,
+            );
+        }
+    }
+
+    for attribute in attribute_params {
+        let AttributeParameter {
+            name,
+            static_type,
+            value,
+            source,
+        } = attribute;
+        let _attribute_metadata = (static_type, source);
+        if let Some(value) = value {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::AttributeDefault { name: name.clone() },
+                module_expansion_field,
+                &mut errors,
+            );
+        }
+    }
+
+    for export in export_params {
+        export.collect_leftover_placeholders(&mut errors);
+    }
+
+    if let Some(backend) = backend {
+        let BackendConfig {
+            backend_type,
+            attributes,
+            attribute_spans,
+        } = backend;
+        let _attribute_spans = attribute_spans;
+        for (attribute, value) in attributes {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::BackendAttribute {
+                    backend: backend_type.clone(),
+                    attribute: attribute.clone(),
+                },
+                reject_all,
+                &mut errors,
+            );
+        }
+    }
+
+    for state_block in state_blocks {
+        match state_block {
+            StateBlock::Import {
+                to,
+                to_span: _to_span,
+                id,
+            } => id.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::StateImport {
+                    target: to.to_string(),
+                },
+                reject_all,
+                &mut errors,
+            ),
+            StateBlock::Removed { from: _from } => {}
+            StateBlock::Moved {
+                addresses: _addresses,
+            } => {}
+        }
+    }
+
+    for (index, require) in requires.iter().enumerate() {
+        let RequireBlock {
+            condition,
+            error_message,
+            source,
+        } = require;
+        let _require_metadata = (error_message, source);
+        condition.collect_leftover_placeholders(
+            &LeftoverPlaceholderContext::Require {
+                label: (index + 1).to_string(),
+            },
+            module_expansion_field,
+            &mut errors,
+        );
+    }
+
+    deferred_for_phase.collect_leftover_placeholders(
+        module_expansion_field,
+        deferred_template,
+        &mut errors,
+    );
+
+    for deferred in deferred_module_ifs {
+        collect_deferred_if_placeholders(deferred, module_expansion_field, &mut errors);
+    }
+
+    errors
+}
+
+fn validate_expansion_boundary<E, B: BindingAddress, D>(
+    file: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    boundary: ParserPlaceholderBoundary,
+) -> Result<(), LeftoverPlaceholders>
+where
+    E: IntoExpandedExportParam<B>,
+    D: ParserBoundaryDeferredPhase<B>,
+{
+    let errors = leftover_placeholders(file, boundary);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LeftoverPlaceholders::new(errors))
+    }
+}
+
+impl<E, B: BindingAddress>
+    File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<ParserPlaceholder, B>, B>
+where
+    E: IntoExpandedExportParam<B>,
+{
     /// Check every value-bearing field at the parser-placeholder boundary.
     pub fn validate_expansion_boundary(
         &self,
         boundary: ParserPlaceholderBoundary,
     ) -> Result<(), LeftoverPlaceholders> {
-        let errors = self.leftover_placeholders(boundary);
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(LeftoverPlaceholders::new(errors))
-        }
+        validate_expansion_boundary(self, boundary)
     }
 }
 
-impl<E: IntoExpandedExportParam>
+impl<E, B: BindingAddress>
     File<
         E,
         ParserPlaceholder,
         ParserPlaceholder,
-        ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder>,
+        ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder, B>,
+        B,
+    >
+where
+    E: IntoExpandedExportParam<B>,
+{
+    /// Check every value-bearing field at the parser-placeholder boundary.
+    pub fn validate_expansion_boundary(
+        &self,
+        boundary: ParserPlaceholderBoundary,
+    ) -> Result<(), LeftoverPlaceholders> {
+        validate_expansion_boundary(self, boundary)
+    }
+}
+
+impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
+    File<
+        E,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        ResolvedDeferredForPhase<ParserPlaceholder, ParserPlaceholder, AbsoluteBindingAddress>,
+        AbsoluteBindingAddress,
     >
 {
-    #[doc(hidden)]
     pub fn into_expanded(self) -> Result<ExpandedFile<E::Expanded>, LeftoverPlaceholders> {
         self.validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)?;
 
@@ -5893,7 +7481,7 @@ impl<E> ExpandedFile<E> {
                 match bindings
                     .resolve_value(&deferred.iterable)
                     .map_err(|message| DeferredForExpansionError::Resolution {
-                        line: deferred.line,
+                        line: deferred.line(),
                         expression: crate::value::format_value(&deferred.iterable),
                         message,
                     })? {
@@ -5936,8 +7524,11 @@ impl<E> ExpandedFile<E> {
                 (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::List(_))) => {
                     mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
-                        file: deferred.file.clone(),
-                        line: deferred.line,
+                        file: deferred
+                            .location()
+                            .source_file()
+                            .map(|file| file.display().to_string()),
+                        line: deferred.line(),
                         kind: WarningKind::DeferredFor,
                         span: None,
                         message: format!(
@@ -5951,8 +7542,11 @@ impl<E> ExpandedFile<E> {
                 | (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
                     mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
-                        file: deferred.file.clone(),
-                        line: deferred.line,
+                        file: deferred
+                            .location()
+                            .source_file()
+                            .map(|file| file.display().to_string()),
+                        line: deferred.line(),
                         kind: WarningKind::DeferredFor,
                         span: None,
                         message: format!(
@@ -5997,9 +7591,7 @@ fn retain_non_matching_deferred_for_warnings(
     warnings: &mut Vec<ParseWarning>,
     deferred: &DeferredForExpression,
 ) {
-    warnings.retain(|w| {
-        w.kind != WarningKind::DeferredFor || w.line != deferred.line || w.file != deferred.file
-    });
+    warnings.retain(|warning| !deferred.location().matches_deferred_warning(warning));
 }
 
 pub fn expand_deferred_children<S: Clone>(
@@ -6107,7 +7699,18 @@ fn build_expanded_child<S: Clone>(
             let mut resource = deferred
                 .template_resource
                 .instantiate_with_identity(ResourceIdentity::new(address.clone()));
-            resource.binding = Some(address);
+            resource.binding = Some(match &element {
+                ForLoopElement::Index(index) => crate::resource::binding_with_index(
+                    target.binding_address(),
+                    (*index)
+                        .try_into()
+                        .expect("for-loop index fits in the signed address domain"),
+                ),
+                ForLoopElement::Key(key) => crate::resource::binding_with_map_key(
+                    target.binding_address(),
+                    &key.as_str().into(),
+                ),
+            });
             resource
         }
         DeferredForTarget::Unbound { template } => {
@@ -6471,12 +8074,25 @@ fn normalize_substituted_lazily(value: &mut Value) -> Result<(), PlaceholderAcce
 mod substitute_placeholder_tests {
     use super::*;
     use crate::resource::{
-        AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart,
-        LiveCompositionSignature, ResourceId, Value,
+        AbsoluteBindingAddress, AccessPath, ApplyTimeUnknown, AuthoredDataSource,
+        AuthoredLiveComposition, AuthoredLiveCompositionSignature, AuthoredResource, AuthoredValue,
+        CompositionCall, CompositionCallPath, ConcreteValue, DeferredValue, InterpolationPart,
+        RelativeBindingName, ResourceId, RootScope, Value,
     };
     use std::collections::BTreeSet;
 
-    type LoopValue = Value<LoopSlot>;
+    type LoopValue = Value<LoopSlot, AbsoluteBindingAddress>;
+    type LoopResource = Resource<ModuleSource, LoopSlot, AbsoluteBindingAddress>;
+
+    fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
+    }
+
+    fn loop_resource_ref(binding: &str, attribute: &str) -> LoopValue {
+        LoopValue::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::root(binding, attribute),
+        })
+    }
 
     #[test]
     fn lazy_coalesce_for_substitution_rejects_non_integer_items_without_panicking() {
@@ -6492,7 +8108,7 @@ mod substitute_placeholder_tests {
             )
             .expect("a for-value placeholder is admitted until substitution");
             let value: LoopValue = Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(Value::resource_ref("source", "optional", Vec::new())),
+                value: Box::new(loop_resource_ref("source", "optional")),
                 default: Box::new(arithmetic),
             });
 
@@ -6508,11 +8124,11 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn module_argument_rewrite_cannot_leave_its_access_base_stale() {
-        let string = |value: &str| -> Value<ParserPlaceholder> {
-            Value::Concrete(ConcreteValue::String(value.into()))
+        let string = |value: &str| -> AuthoredValue {
+            AuthoredValue::Concrete(ConcreteValue::String(value.into()))
         };
         let call = |value: &str| {
-            Value::Deferred(DeferredValue::FunctionCall {
+            AuthoredValue::Deferred(DeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::upper,
                 args: vec![string(value).into()],
                 source_line: (0).into(),
@@ -6522,7 +8138,7 @@ mod substitute_placeholder_tests {
 
         argument
             .try_rewrite(|value| match value {
-                Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+                AuthoredValue::Deferred(DeferredValue::FunctionCall { args, .. }) => {
                     Ok::<_, std::convert::Infallible>(args[0].walker_value().clone())
                 }
                 other => Ok(other.clone()),
@@ -6537,29 +8153,37 @@ mod substitute_placeholder_tests {
     fn structural_binding_names_covers_every_non_variable_kind() {
         let mut parsed = ParsedFile::default();
 
-        let mut resource = Resource::new("mock.compute.Instance", "resource_node");
-        resource.binding = Some("resource_name".to_string());
+        let mut resource = AuthoredResource::new("mock.compute.Instance", "resource_node");
+        resource.binding = Some("resource_name".into());
         parsed.resources.push(resource); // allow: direct — fixture test inspection
 
-        let mut data_source = DataSource::new("mock.compute.Instance", "data_node");
-        data_source.binding = Some("data_source_name".to_string());
+        let mut data_source = AuthoredDataSource::new("mock.compute.Instance", "data_node");
+        data_source.binding = Some("data_source_name".into());
         parsed.data_sources.push(data_source);
 
-        parsed.compositions.push(LiveComposition {
+        parsed.compositions.push(AuthoredLiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual",
                 "composition_node",
             )),
-            signature: LiveCompositionSignature {
+            signature: AuthoredLiveCompositionSignature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
                 pending_constraints: Vec::new(),
             },
-            binding: Some("composition_name".to_string()),
+            binding: Some("composition_name".into()),
             dependency_bindings: BTreeSet::new(),
             module_name: "module_name".to_string(),
             instance: "composition_name".to_string(),
-            call_path: Default::default(),
+            call_path: CompositionCallPath::direct(CompositionCall {
+                id: crate::parser::ModuleCallId::test_dummy_in("composition.crn"),
+                module_name: "module_name".to_string(),
+                binding: Some("composition_name".into()),
+                instance: "composition_name".to_string(),
+                module_source: None,
+                module_directory: None,
+                loop_origin: None,
+            }),
             quoted_string_attrs: HashSet::new(),
         });
 
@@ -6576,15 +8200,16 @@ mod substitute_placeholder_tests {
             HashMap::new(),
         ));
         parsed.upstream_states.push(UpstreamState {
-            binding: "upstream_name".to_string(),
+            binding: "upstream_name".into(),
             source: "upstream".into(),
         });
         parsed.wait_bindings.push(WaitBinding {
-            binding: BindingName::from("wait_name"),
-            target: BindingName::from("resource_name"),
+            binding: "wait_name".into(),
+            target: "resource_name".into(),
             until_raw: "resource_name.status == 'ready'".to_string(),
             until_predicate: UntilPredicateAst {
-                lhs_segments: vec!["resource_name".to_string(), "status".to_string()],
+                root: "resource_name".into(),
+                attribute_segments: vec!["status".to_string()],
                 rhs: Value::Concrete(ConcreteValue::String("ready".into())),
             },
             timeout_secs: None,
@@ -6621,7 +8246,7 @@ mod substitute_placeholder_tests {
         });
         parsed
             .structural_bindings
-            .insert("structural_name".to_string());
+            .insert(RelativeBindingName::new("structural_name"));
         parsed.variables.insert(
             "plain_value_name".to_string(),
             Value::Concrete(ConcreteValue::String("literal".into())),
@@ -6686,8 +8311,8 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn expand_deferred_children_returns_shape_mismatch_for_simple_binding_with_map_iterable() {
-        let mut template_resource = Resource::new("mock.Target", "children");
-        template_resource.binding = Some("children".to_string());
+        let mut template_resource = LoopResource::new("mock.Target", "children");
+        template_resource.binding = Some(absolute_binding("children"));
         template_resource.set_attr(
             "name",
             Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
@@ -6696,8 +8321,9 @@ mod substitute_placeholder_tests {
             None,
             1,
             "for opt in cert.options".to_string(),
-            DeferredForTarget::bound("children").expect("fixture binding is valid"),
-            Value::resource_ref("cert", "options", Vec::new()),
+            DeferredForTarget::bound(absolute_binding("children"))
+                .expect("fixture binding is valid"),
+            Value::root_resource_ref("cert", "options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
@@ -6719,9 +8345,8 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn expand_deferred_children_consumes_loop_slot_template_values() {
-        let mut template_resource: Resource<ModuleSource, LoopSlot> =
-            Resource::new("mock.Target", "children");
-        template_resource.binding = Some("children".to_string());
+        let mut template_resource = LoopResource::new("mock.Target", "children");
+        template_resource.binding = Some(absolute_binding("children"));
         template_resource.set_attr(
             "name",
             Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
@@ -6730,8 +8355,9 @@ mod substitute_placeholder_tests {
             None,
             1,
             "for child in source.children".to_string(),
-            DeferredForTarget::bound("children").expect("fixture binding is valid"),
-            Value::resource_ref("source", "children", Vec::new()),
+            DeferredForTarget::bound(absolute_binding("children"))
+                .expect("fixture binding is valid"),
+            Value::root_resource_ref("source", "children", Vec::new()),
             ForBinding::Simple("child".to_string()),
             template_resource,
         );
@@ -6758,10 +8384,11 @@ mod substitute_placeholder_tests {
                 None,
                 1,
                 "for child in source.children".to_string(),
-                DeferredForTarget::bound("children").expect("fixture binding is valid"),
-                Value::resource_ref("source", "children", Vec::new()),
+                DeferredForTarget::bound(absolute_binding("children"))
+                    .expect("fixture binding is valid"),
+                Value::root_resource_ref("source", "children", Vec::new()),
                 binding,
-                Resource::pending_with_provider("mock", "Target", None),
+                LoopResource::pending_with_provider("mock", "Target", None),
             )
         };
 
@@ -6821,7 +8448,13 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed = parsed.into_expanded().expect("template must expand");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam")
+        .into_expanded()
+        .expect("template must expand");
         let deferred = &parsed.deferred_for_expressions()[0];
         let children = expand_deferred_children(
             deferred,
@@ -6855,18 +8488,19 @@ mod substitute_placeholder_tests {
     }
 
     #[test]
-    fn deferred_for_expression_serde_skips_diagnostic_location() {
+    fn deferred_for_expression_serde_omits_absolute_file_but_preserves_line() {
         let deferred: DeferredForExpression = DeferredForExpression::new(
             Some("/abs/path.crn".to_string()),
             42,
             "for opt in cert.options".to_string(),
-            DeferredForTarget::bound("children").expect("fixture binding is valid"),
+            DeferredForTarget::bound(absolute_binding("children"))
+                .expect("fixture binding is valid"),
             Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(Value::resource_ref("cert", "options", Vec::new())),
+                value: Box::new(Value::root_resource_ref("cert", "options", Vec::new())),
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
             }),
             ForBinding::Simple("opt".to_string()),
-            Resource::new("mock.Target", "children"),
+            LoopResource::new("mock.Target", "children"),
         );
 
         let json = serde_json::to_string(&deferred).expect("serialize deferred for expression");
@@ -6877,9 +8511,122 @@ mod substitute_placeholder_tests {
 
         let decoded = serde_json::from_str::<SavedDeferredForExpression>(&json)
             .expect("deserialize deferred for expression");
-        assert_eq!(decoded.file, None);
-        assert_eq!(decoded.line, 0);
+        assert_eq!(decoded.file(), None);
+        assert_eq!(decoded.line(), 42);
         assert_eq!(decoded.iterable, deferred.iterable);
+    }
+
+    #[test]
+    fn deferred_for_expression_serde_preserves_relative_diagnostic_location() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            Some("modules/child/main.crn".to_string()),
+            17,
+            "for opt in cert.options".to_string(),
+            DeferredForTarget::bound(absolute_binding("children"))
+                .expect("fixture binding is valid"),
+            Value::root_resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            Resource::new("mock.Target", "children"),
+        );
+
+        let json = serde_json::to_string(&deferred).expect("serialize deferred for expression");
+        let decoded = serde_json::from_str::<SavedDeferredForExpression>(&json)
+            .expect("deserialize deferred for expression");
+
+        assert_eq!(decoded.file(), Some("modules/child/main.crn"));
+        assert_eq!(decoded.line(), 17);
+    }
+
+    #[test]
+    fn deferred_for_wire_requires_both_diagnostic_location_fields() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            None,
+            0,
+            "for opt in cert.options".into(),
+            DeferredForTarget::bound(absolute_binding("children")).unwrap(),
+            Value::root_resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".into()),
+            Resource::new("mock.Target", "children"),
+        );
+        let wire = serde_json::to_value(&deferred).unwrap();
+        for field in ["file", "line"] {
+            assert!(
+                wire.get(field).is_some(),
+                "required field {field} must be serialized even when empty: {wire}"
+            );
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SavedDeferredForExpression>(missing).is_err(),
+                "missing {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_for_wire_rejects_absolute_diagnostic_file() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            Some("main.crn".into()),
+            1,
+            "for opt in cert.options".into(),
+            DeferredForTarget::bound(absolute_binding("children")).unwrap(),
+            Value::root_resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".into()),
+            Resource::new("mock.Target", "children"),
+        );
+        let mut wire = serde_json::to_value(&deferred).unwrap();
+        wire["file"] = serde_json::json!("/machine/local/main.crn");
+        assert!(
+            serde_json::from_value::<SavedDeferredForExpression>(wire).is_err(),
+            "saved diagnostic files must be relative"
+        );
+    }
+
+    #[test]
+    fn deferred_diagnostic_location_moves_through_resolution_and_saved_conversion() {
+        let source = Path::new("/project/modules/child/main.crn");
+        let mut parsed = ParsedDeferredForExpression::new(
+            (
+                None,
+                17,
+                SourceSpan::dummy(),
+                "for item in upstream.items".into(),
+            ),
+            DeferredForTarget::bound(RelativeBindingName::new("rows")).unwrap(),
+            Value::resource_ref("upstream", "items", vec![]),
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".into()),
+            DeferredForBody::resource(Resource::new("mock.test.resource", "rows")),
+        );
+        parsed.record_source_location(source, Path::new("/project"));
+        let location = parsed.location().clone();
+        let expression = parsed
+            .resolve_bindings(&mut |binding| RootScope::new().resolve(binding))
+            .into_resource_expression(&[])
+            .unwrap()
+            .into_expanded()
+            .unwrap();
+        assert_eq!(expression.location(), &location);
+        assert_eq!(expression.file(), Some("modules/child/main.crn"));
+        assert_eq!(expression.line(), 17);
+        assert_eq!(expression.location().source_file(), Some(source));
+        let warning = ParseWarning {
+            file: Some(source.display().to_string()),
+            line: 17,
+            kind: WarningKind::DeferredFor,
+            span: None,
+            message: "deferred".into(),
+        };
+        assert!(expression.location().matches_deferred_warning(&warning));
+        let saved = SavedDeferredForExpression::from(expression);
+        let wire = serde_json::to_value(&saved).unwrap();
+        assert_eq!(wire["file"], "modules/child/main.crn");
+        assert_eq!(wire["line"], 17);
+        assert!(!wire.to_string().contains("/project"));
+        assert_eq!(
+            serde_json::from_value::<SavedDeferredForExpression>(wire).unwrap(),
+            saved
+        );
     }
 
     #[test]
@@ -6917,11 +8664,30 @@ mod substitute_placeholder_tests {
             None,
             0,
             "for child in parent.children".to_string(),
-            DeferredForTarget::bound("children").expect("valid bound target"),
-            Value::resource_ref("parent", "children", Vec::new()),
+            DeferredForTarget::bound(absolute_binding("children")).expect("valid bound target"),
+            Value::root_resource_ref("parent", "children", Vec::new()),
             ForBinding::Simple("child".to_string()),
             resource,
         )
+    }
+
+    #[test]
+    fn deferred_effect_wire_id_uses_the_resource_id_serializer() {
+        let expression = saved_bound_deferred_expression_fixture();
+        let wire_id: ResourceId = expression.deferred_effect_wire_id();
+        assert_eq!(wire_id.identity_str(), Some("children"));
+        assert_eq!(
+            expression.deferred_effect_id().identity_str(),
+            "children[?]"
+        );
+        let effect = crate::effect::Effect::DeferredCreate(
+            crate::effect::DeferredCreatePayload::new(Box::new(expression)),
+        );
+        let json = serde_json::to_value(effect).expect("serialize deferred effect");
+        assert_eq!(
+            json["DeferredCreate"]["id"],
+            serde_json::to_value(wire_id).unwrap()
+        );
     }
 
     #[test]
@@ -6978,7 +8744,7 @@ mod substitute_placeholder_tests {
             ),
         );
         let mut right = left.clone();
-        right.resource.binding = Some("different-derived-binding".to_string());
+        right.resource.binding = Some(absolute_binding("different-derived-binding"));
 
         assert_ne!(
             left, right,
@@ -6988,23 +8754,31 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn parsed_deferred_for_rederives_template_identity_from_its_target() {
-        let owning_target = DeferredForTarget::bound("right").expect("valid owning target");
-        let mut resource = Resource::<ModuleSource, ParserPlaceholder>::with_provider(
-            "mock",
-            "test.resource",
-            "wrong[?]",
-            None,
-        );
-        resource.binding = Some("wrong[?]".to_string());
+        let owning_target = DeferredForTarget::bound(RelativeBindingName::new("right"))
+            .expect("valid owning target");
+        let mut resource =
+            Resource::<ModuleSource, ParserPlaceholder, RelativeBindingName>::with_provider(
+                "mock",
+                "test.resource",
+                "wrong[?]",
+                None,
+            );
+        resource.binding = Some(RelativeBindingName::new("wrong[?]"));
         let body = DeferredForBody::resource(resource);
 
         let parsed = ParsedDeferredForExpression::new(
-            None,
-            1,
-            SourceSpan::dummy(),
-            "for item in upstream.items".to_string(),
+            (
+                None,
+                1,
+                SourceSpan::dummy(),
+                "for item in upstream.items".to_string(),
+            ),
             owning_target,
-            Value::resource_ref("upstream", "items", Vec::new()),
+            crate::resource::Value::<ParserPlaceholder, RelativeBindingName>::resource_ref(
+                "upstream",
+                "items",
+                Vec::new(),
+            ),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".to_string()),
             body,
@@ -7023,26 +8797,33 @@ mod substitute_placeholder_tests {
             Some("right[?]")
         );
         assert_eq!(expression.template_resource_binding(), Some("right[?]"));
-        assert_eq!(expression.deferred_effect_id().identity_str(), "right");
+        assert_eq!(expression.deferred_effect_id().identity_str(), "right[?]");
     }
 
     #[test]
     fn parsed_deferred_for_conversion_rederives_template_identity_from_its_target() {
-        let target = DeferredForTarget::bound("right").expect("valid target");
-        let body = DeferredForBody::resource(
-            Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
-                "mock",
-                "test.resource",
-                None,
-            ),
-        );
+        let target =
+            DeferredForTarget::bound(RelativeBindingName::new("right")).expect("valid target");
+        let body = DeferredForBody::resource(Resource::<
+            ModuleSource,
+            ParserPlaceholder,
+            RelativeBindingName,
+        >::pending_with_provider(
+            "mock", "test.resource", None
+        ));
         let mut parsed = ParsedDeferredForExpression::new(
-            None,
-            1,
-            SourceSpan::dummy(),
-            "for item in upstream.items".to_string(),
+            (
+                None,
+                1,
+                SourceSpan::dummy(),
+                "for item in upstream.items".to_string(),
+            ),
             target,
-            Value::resource_ref("upstream", "items", Vec::new()),
+            crate::resource::Value::<ParserPlaceholder, RelativeBindingName>::resource_ref(
+                "upstream",
+                "items",
+                Vec::new(),
+            ),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".to_string()),
             body,
@@ -7053,7 +8834,7 @@ mod substitute_placeholder_tests {
         };
         template.resource.id =
             ResourceId::with_provider_identity("mock", "test.resource", "wrong[?]", None);
-        template.resource.binding = Some("wrong[?]".to_string());
+        template.resource.binding = Some(RelativeBindingName::new("wrong[?]"));
 
         let expression = parsed
             .into_resource_expression(&[])
@@ -7063,7 +8844,7 @@ mod substitute_placeholder_tests {
             Some("right[?]")
         );
         assert_eq!(expression.template_resource_binding(), Some("right[?]"));
-        assert_eq!(expression.deferred_effect_id().identity_str(), "right");
+        assert_eq!(expression.deferred_effect_id().identity_str(), "right[?]");
     }
 
     #[test]
@@ -7079,21 +8860,27 @@ mod substitute_placeholder_tests {
                 crate::resource::LegacyLoopAddress::new("_for0"),
             ),
         };
-        let template = DeferredForTemplateResource::new(
-            Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
-                "mock",
-                "test.resource",
-                None,
-            ),
-        );
+        let template = DeferredForTemplateResource::new(Resource::<
+            ModuleSource,
+            ParserPlaceholder,
+            RelativeBindingName,
+        >::pending_with_provider(
+            "mock", "test.resource", None
+        ));
         let pending_id = template.id().clone();
         let parsed = ParsedDeferredForExpression::new(
-            None,
-            1,
-            SourceSpan::dummy(),
-            "for item in upstream.items".to_string(),
+            (
+                None,
+                1,
+                SourceSpan::dummy(),
+                "for item in upstream.items".to_string(),
+            ),
             target,
-            Value::resource_ref("upstream", "items", Vec::new()),
+            crate::resource::Value::<ParserPlaceholder, RelativeBindingName>::resource_ref(
+                "upstream",
+                "items",
+                Vec::new(),
+            ),
             ParsedDeferredForIterableState::Deferred,
             ForBinding::Simple("item".to_string()),
             DeferredForBody::Resource(Box::new(template)),
@@ -7199,23 +8986,24 @@ mod substitute_placeholder_tests {
     #[test]
     fn bound_deferred_target_rejects_indexed_final_segment() {
         assert_eq!(
-            BoundDeferredTarget::new("rs[?]"),
+            BoundDeferredTarget::new(RelativeBindingName::new("rs[?]")),
             Err(BoundDeferredTargetError::TrailingIndex),
         );
         assert_eq!(
-            BoundDeferredTarget::new("rs[0]"),
+            BoundDeferredTarget::new(RelativeBindingName::new("rs[0]")),
             Err(BoundDeferredTargetError::TrailingIndex),
         );
         assert_eq!(
-            BoundDeferredTarget::new("rs]"),
+            BoundDeferredTarget::new(RelativeBindingName::new("rs]")),
             Err(BoundDeferredTargetError::TrailingIndex),
         );
     }
 
     #[test]
     fn bound_deferred_target_accepts_index_in_earlier_segment() {
-        let target = BoundDeferredTarget::new("ms[0].i_0123456789abcdef.rs")
-            .expect("a nested binding may contain an index before its final segment");
+        let target =
+            BoundDeferredTarget::new(RelativeBindingName::new("ms[0].i_0123456789abcdef.rs"))
+                .expect("a nested binding may contain an index before its final segment");
         assert_eq!(target.binding(), "ms[0].i_0123456789abcdef.rs");
         assert_eq!(
             target.template_address().to_string(),
@@ -7237,6 +9025,8 @@ mod substitute_placeholder_tests {
     fn bound_deferred_for_wire_matches_resource_shape_byte_for_byte() {
         #[derive(serde::Serialize)]
         struct ResourceShapedWire<'a> {
+            file: Option<&'a str>,
+            line: usize,
             header: &'a str,
             resource_type: &'a str,
             target: &'a DeferredForTarget,
@@ -7247,7 +9037,7 @@ mod substitute_placeholder_tests {
 
         let mut resource: Resource<ModuleSource, LoopSlot> =
             Resource::with_provider("mock", "Target", "legacy-independent-identity", None);
-        resource.binding = Some("children[?]".to_string());
+        resource.binding = Some(absolute_binding("children[?]"));
         resource.directives.set_prevent_destroy(true);
         resource.set_attr(
             "tags",
@@ -7282,8 +9072,9 @@ mod substitute_placeholder_tests {
             Some("ignored.crn".to_string()),
             9,
             "for child in parent.children".to_string(),
-            DeferredForTarget::bound("children").expect("fixture binding is non-empty"),
-            Value::resource_ref("parent", "children", Vec::new()),
+            DeferredForTarget::bound(absolute_binding("children"))
+                .expect("fixture binding is non-empty"),
+            Value::root_resource_ref("parent", "children", Vec::new()),
             ForBinding::Simple("child".to_string()),
             resource,
         );
@@ -7294,6 +9085,8 @@ mod substitute_placeholder_tests {
         assert_eq!(expression.template_resource_binding(), Some("children[?]"));
         let resource_type = expression.resource_type();
         let resource_shaped = ResourceShapedWire {
+            file: expression.file(),
+            line: expression.line(),
             header: &expression.header,
             resource_type,
             target: expression.target(),
@@ -7314,7 +9107,8 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn bound_deferred_target_rejects_empty_binding_without_panicking() {
-        let construction = std::panic::catch_unwind(|| BoundDeferredTarget::new(""));
+        let construction =
+            std::panic::catch_unwind(|| BoundDeferredTarget::new(RelativeBindingName::new("")));
         assert!(
             construction.is_ok(),
             "public construction must not panic for an empty runtime binding"
@@ -7337,9 +9131,11 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         let target = parsed.deferred_for_expressions()[0].target();
         let mut json = serde_json::to_value(target).expect("serialize deferred target");
         json["template"]["source"]
@@ -7419,7 +9215,7 @@ mod substitute_placeholder_tests {
     #[test]
     fn coalesce_placeholder_substitutes_default_when_left_remains_unknown() {
         let value = LoopValue::Deferred(DeferredValue::Coalesce {
-            value: Box::new(LoopValue::resource_ref("up", "optional", Vec::new())),
+            value: Box::new(loop_resource_ref("up", "optional")),
             default: Box::new(for_value_field("name")),
         });
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -7448,7 +9244,7 @@ mod substitute_placeholder_tests {
     #[test]
     fn coalesce_placeholder_defers_missing_default_access_while_left_is_unknown() {
         let value = LoopValue::Deferred(DeferredValue::Coalesce {
-            value: Box::new(LoopValue::resource_ref("up", "optional", Vec::new())),
+            value: Box::new(loop_resource_ref("up", "optional")),
             default: Box::new(for_value_field("missing")),
         });
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
@@ -7493,7 +9289,7 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn leaves_upstream_export_unchanged() {
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".into()]);
         let v = LoopValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));

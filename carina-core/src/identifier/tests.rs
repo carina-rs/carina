@@ -1,10 +1,14 @@
 use super::*;
+use crate::parser::ExpandedProviderConfig as ProviderConfig;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    AccessPath, ApplyTimeUnknown, CompositionCall, CompositionCallPath, InterpolationPart,
-    LoopModulePrefixOrigin, LoopProvenance, LoopSlot, ModuleInstanceScope, ModuleSource,
-    PendingReRead, ReReadReason, Resource as StagedResource, ResourceIdentity, Subscript,
-    ValueString,
+    AbsoluteBindingAddress, ApplyTimeUnknown, ExpandedAccessPath as AccessPath,
+    ExpandedCompositionCall as CompositionCall, ExpandedCompositionCallPath as CompositionCallPath,
+    ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+    ExpandedInterpolationPart as InterpolationPart, ExpandedResource as Resource,
+    ExpandedValue as Value, LoopModulePrefixOrigin, LoopProvenance, LoopSlot, ModuleInstanceScope,
+    ModuleSource, PendingReRead, ReReadReason, RelativeBindingName, ResourceIdentity, RootScope,
+    Subscript, ValueString,
 };
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate,
@@ -14,14 +18,14 @@ use crate::schema::{
 use indexmap::IndexMap;
 use std::path::Path;
 
-type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
-type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
-type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
-type Resource = StagedResource<ModuleSource, crate::resource::NoPlaceholder>;
 type LoopValue = crate::resource::Value<LoopSlot>;
 type LoopConcreteValue = crate::resource::ConcreteValue<LoopSlot>;
 type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
-type LoopResource = StagedResource<ModuleSource, LoopSlot>;
+type LoopResource = crate::resource::Resource<ModuleSource, LoopSlot>;
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn concrete_string(value: impl Into<ValueString>) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
@@ -113,7 +117,7 @@ fn live_module_source(name: &str, instance: &str) -> ModuleSource {
         CompositionCallPath::direct(CompositionCall {
             id: crate::parser::ModuleCallId::test_dummy_in(format!("{instance}.crn")),
             module_name: name.to_string(),
-            binding: Some(instance.to_string()),
+            binding: Some(absolute_binding(instance)),
             instance: instance.to_string(),
             module_source: Some(format!("./{name}")),
             module_directory: None,
@@ -123,12 +127,17 @@ fn live_module_source(name: &str, instance: &str) -> ModuleSource {
 }
 
 fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
-    crate::parser::parse_file(
+    let parsed = crate::parser::parse_file(
         source,
         Path::new(file),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("valid loop fixture")
+    .expect("valid loop fixture");
+    crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        Path::new("."),
+    )
+    .expect("loop fixture crosses the module-resolution seam")
     .into_expanded()
     .expect("loop fixture contains no parser placeholders")
     .resources
@@ -626,7 +635,7 @@ fn record_set_identity_schema() -> ResourceSchema {
 
 #[test]
 fn anonymous_identity_basis_is_unavailable_without_a_schema() {
-    let resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
 
     assert_eq!(
         classify_anonymous_identity_basis(&resource, &SchemaRegistry::new()),
@@ -636,7 +645,7 @@ fn anonymous_identity_basis_is_unavailable_without_a_schema() {
 
 #[test]
 fn schema_less_anonymous_resources_do_not_create_attribute_derived_conflicts() {
-    let resources = vec![
+    let resources: Vec<Resource> = vec![
         Resource::pending_with_provider("mock", "unknown.Widget", None),
         Resource::pending_with_provider("mock", "unknown.Widget", None),
     ];
@@ -662,7 +671,7 @@ fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set
         "mock",
         schema.validate().expect("schema fixture must be valid"),
     );
-    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let mut resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("alpha".into())),
@@ -826,7 +835,10 @@ fn anonymous_reference_valued_declared_identity_produces_a_stable_address() {
             .expect("identity schema fixture must be valid"),
     );
     let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
-    resource.set_attr("name", Value::resource_ref("source", "name", Vec::new()));
+    resource.set_attr(
+        "name",
+        Value::root_resource_ref("source", "name", Vec::new()),
+    );
     let mut resources = vec![resource];
 
     compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
@@ -978,7 +990,11 @@ fn interpolation_over_reference_declared_identity_has_a_stable_address() {
     let expression = || {
         Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("/aws/ecs/".into()),
-            InterpolationPart::Expr(Value::resource_ref("cluster", "cluster_name", Vec::new())),
+            InterpolationPart::Expr(Value::root_resource_ref(
+                "cluster",
+                "cluster_name",
+                Vec::new(),
+            )),
         ]))
     };
 
@@ -994,7 +1010,7 @@ fn function_call_over_reference_declared_identity_has_a_stable_address() {
     let expression = || {
         Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::upper,
-            args: vec![Value::resource_ref("cluster", "cluster_name", Vec::new()).into()],
+            args: vec![Value::root_resource_ref("cluster", "cluster_name", Vec::new()).into()],
             source_line: 0.into(),
         })
     };
@@ -1011,7 +1027,7 @@ fn written_and_reference_expression_identity_spellings_do_not_collide() {
     let mut written = Resource::pending_with_provider("mock", "test.resource", None);
     written.set_attr("name", concrete_string("ResourceRef(zone.id)"));
     let mut referenced = Resource::pending_with_provider("mock", "test.resource", None);
-    referenced.set_attr("name", Value::resource_ref("zone", "id", Vec::new()));
+    referenced.set_attr("name", Value::root_resource_ref("zone", "id", Vec::new()));
     let mut resources = vec![written, referenced];
 
     compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
@@ -1040,7 +1056,7 @@ fn written_and_prefix_identity_spellings_do_not_collide() {
 #[test]
 fn declared_identity_prefix_expression_hashes_by_spelling_with_distinct_kind() {
     let registry = scalar_identity_registry();
-    let reference = || Value::resource_ref("prefix_source", "value", Vec::new());
+    let reference = || Value::root_resource_ref("prefix_source", "value", Vec::new());
     let mut direct = Resource::pending_with_provider("mock", "test.resource", None);
     direct.set_attr("name", reference());
     let mut prefixed = Resource::pending_with_provider("mock", "test.resource", None);
@@ -1072,7 +1088,7 @@ fn named_resource_is_unaffected_by_missing_declared_identity() {
         ResourceIdentity::new("monthly_budget"),
         None,
     );
-    named.binding = Some("monthly_budget".to_string());
+    named.binding = Some(absolute_binding("monthly_budget"));
     named.attributes = incomplete.attributes;
     let mut resources = vec![named];
 
@@ -1322,7 +1338,7 @@ fn reference_record_set(zone_binding: &str, name: &str, record_type: &str) -> Re
     let mut resource = Resource::pending_with_provider("mock", "route53.RecordSet", None);
     resource.set_attr(
         "hosted_zone_id".to_string(),
-        Value::resource_ref(zone_binding, "id", Vec::new()),
+        Value::root_resource_ref(zone_binding, "id", Vec::new()),
     );
     resource.set_attr("name".to_string(), concrete_string(name));
     resource.set_attr("type".to_string(), concrete_string(record_type));
@@ -1392,7 +1408,7 @@ fn longer_reference_chain_is_a_complete_identity_value() {
     let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "name",
-        Value::resource_ref("source", "details", vec!["generated_name".to_string()]),
+        Value::root_resource_ref("source", "details", vec!["generated_name".to_string()]),
     );
     let mut resources = vec![resource];
 
@@ -1404,7 +1420,8 @@ fn longer_reference_chain_is_a_complete_identity_value() {
 
 #[test]
 fn longer_reference_chain_resolves_from_state_for_legacy_identity_migration() {
-    let reference = Value::resource_ref("source", "details", vec!["generated_name".to_string()]);
+    let reference =
+        Value::root_resource_ref("source", "details", vec!["generated_name".to_string()]);
     let source = AnonymousIdBindingStateInfo {
         name: "source".to_string(),
         attribute_values: HashMap::from([(
@@ -1440,11 +1457,11 @@ fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
         "mock",
         schema.validate().expect("schema fixture must be valid"),
     );
-    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let mut resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "immutable_name".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("source", "name"),
+            path: AccessPath::root("source", "name"),
         }),
     );
 
@@ -1467,7 +1484,7 @@ fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
         "mock",
         schema.validate().expect("schema fixture must be valid"),
     );
-    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let mut resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource
         .prefixes
         .insert("immutable_name".to_string(), "example-".to_string());
@@ -1490,7 +1507,7 @@ fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
         "mock",
         schema.validate().expect("schema fixture must be valid"),
     );
-    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let mut resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "immutable_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("example-".into())),
@@ -1618,9 +1635,11 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("the parser must preserve the authored use for typed validation");
-    let parsed =
-        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-            .expect("the fixture crosses module resolution before readiness validation");
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("the fixture crosses module resolution before readiness validation");
     let error = crate::validation::resolve_bare_binding_uses(
         parsed,
         &SchemaRegistry::new(),
@@ -1686,7 +1705,7 @@ fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
         resource.set_attr(
             "source".to_string(),
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::with_fields_and_subscripts(
+                path: AccessPath::root_with_fields_and_subscripts(
                     "source",
                     "values",
                     vec![],
@@ -1922,7 +1941,7 @@ fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let resources = vec![
+    let resources: Vec<Resource> = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
         Resource::pending_with_provider("mock", "test.resource", None),
     ];
@@ -1948,7 +1967,7 @@ fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let resources = vec![
+    let resources: Vec<Resource> = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
         Resource::pending_with_provider("mock", "test.resource", Some("west".to_string())),
     ];
@@ -1990,7 +2009,7 @@ fn check_allows_stable_named_and_separate_module_instance_resources() {
     );
 
     let mut named = Resource::pending_with_provider("mock", "other.resource", None);
-    named.binding = Some("named".to_string());
+    named.binding = Some(absolute_binding("named"));
 
     let module_one = Resource::pending_with_provider("mock", "other.resource", None)
         .with_module_source(live_module_source("fixture", "module_one"));
@@ -2020,7 +2039,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
     let make_resource = || {
-        let mut resource = Resource::pending_with_provider("awscc", "ec2.Route", None);
+        let mut resource: Resource = Resource::pending_with_provider("awscc", "ec2.Route", None);
         resource.set_attr(
             "route_table_id".to_string(),
             Value::Concrete(ConcreteValue::String("rtb-123".into())),
@@ -4030,7 +4049,7 @@ fn reconcile_declared_identity_migration_evaluates_interpolation_over_state_back
     desired.set_attr(
         "name",
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(Value::resource_ref("zone", "name", Vec::new())),
+            InterpolationPart::Expr(Value::root_resource_ref("zone", "name", Vec::new())),
             InterpolationPart::Literal("-x".into()),
         ])),
     );
@@ -4074,7 +4093,7 @@ fn reconcile_unresolved_declared_identity_with_legacy_candidate_requires_moved()
     desired.set_attr(
         "name",
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(Value::resource_ref("missing_zone", "name", Vec::new())),
+            InterpolationPart::Expr(Value::root_resource_ref("missing_zone", "name", Vec::new())),
             InterpolationPart::Literal("-x".into()),
         ])),
     );
@@ -4481,13 +4500,13 @@ fn subnet_route_table_association_resource(
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(route_table_binding, "id"),
+            path: AccessPath::root(route_table_binding, "id"),
         }),
     );
     resource.set_attr(
         "subnet_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(subnet_binding, "id"),
+            path: AccessPath::root(subnet_binding, "id"),
         }),
     );
     resource
@@ -4549,7 +4568,7 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
     let deferred = Resource::new("test.Widget", "deferred").with_attribute(
         "config",
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("source", "config"),
+            path: AccessPath::root("source", "config"),
         }),
     );
     let find_state = |binding: &str| {
@@ -4655,7 +4674,7 @@ fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(route_table_binding, "id"),
+            path: AccessPath::root(route_table_binding, "id"),
         }),
     );
     resource
@@ -5085,7 +5104,7 @@ fn test_reconcile_deferred_binding_ambiguous_yields_no_value() {
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: crate::resource::AccessPath::new("private_rtb", "id"),
+            path: crate::resource::ExpandedAccessPath::root("private_rtb", "id"),
         }),
     );
     let resources = vec![resource];
@@ -5417,7 +5436,7 @@ fn canonical_enum_create_only_comparison_preserves_identity_hash_material() {
 #[test]
 fn upstream_unknown_identity_hash_strings_remain_stable() {
     let export = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-        path: AccessPath::new("network", "vpc_id"),
+        path: AccessPath::root("network", "vpc_id"),
     }));
     assert_eq!(
         deterministic_value_string(&export),
@@ -5426,7 +5445,7 @@ fn upstream_unknown_identity_hash_strings_remain_stable() {
 
     let all_exports = Value::Deferred(DeferredValue::Unknown(
         ApplyTimeUnknown::UpstreamAllExports {
-            binding: "network".into(),
+            binding: absolute_binding("network"),
         },
     ));
     assert_eq!(
@@ -5616,7 +5635,7 @@ fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
     // anonymous resource. Two attribute-derived anonymous declarations of the
     // same kind are rejected before reconciliation in production.
     let mut live_resource = prior_resources.remove(0);
-    live_resource.binding = Some(live_name.clone());
+    live_resource.binding = Some(absolute_binding(&live_name));
     let mut resources = vec![live_resource, simhash_eip_resource("staging")];
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
         .unwrap();
@@ -6572,7 +6591,7 @@ fn test_reconcile_skips_let_bound_resources() {
     // A let-bound resource whose name does NOT exist in state
     let mut ingress_new =
         Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_new", None);
-    ingress_new.binding = Some("ingress_new".to_string());
+    ingress_new.binding = Some(absolute_binding("ingress_new"));
     ingress_new.set_attr(
         "cidr_ip".to_string(),
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
@@ -7073,7 +7092,7 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -7107,7 +7126,7 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
 fn test_detect_rename_reference_form_matches_bare_name_and_arn() {
     let registry = lambda_permission_reference_registry();
     let mut resource = Resource::with_provider("mock", "lambda.Permission", "invoke", None);
-    resource.binding = Some("invoke".to_string());
+    resource.binding = Some(absolute_binding("invoke"));
     resource.set_attr("function_name", concrete_string("processor"));
     let state_entry = anonymous_state_entry(
         &registry,
@@ -7136,7 +7155,7 @@ fn test_detect_rename_reference_form_matches_bare_name_and_arn() {
 fn test_detect_rename_reference_form_prefix_uses_canonical_candidate_key() {
     let registry = lambda_permission_reference_registry();
     let mut resource = Resource::with_provider("mock", "lambda.Permission", "invoke", None);
-    resource.binding = Some("invoke".to_string());
+    resource.binding = Some(absolute_binding("invoke"));
     resource
         .prefixes
         .insert("function_name".to_string(), "processor-".to_string());
@@ -7169,7 +7188,7 @@ fn test_detect_rename_resolves_deferred_create_only_attrs_from_state_bindings() 
 
     let mut resource =
         subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
-    resource.binding = Some("nat_gw".to_string());
+    resource.binding = Some(absolute_binding("nat_gw"));
     let resources = vec![resource];
     let state_entries = vec![association_state_entry(
         &schemas,
@@ -7221,7 +7240,7 @@ fn test_detect_rename_matches_map_create_only_attr() {
         "zone".to_string() => Value::Concrete(ConcreteValue::String("a".into())),
     }));
     let mut resource = Resource::with_provider("awscc", "test.MapIdentity", "mapped", None);
-    resource.binding = Some("mapped".to_string());
+    resource.binding = Some(absolute_binding("mapped"));
     resource.set_attr("settings".to_string(), settings.clone());
     let resources = vec![resource];
     let state_entries = vec![anonymous_state_entry(
@@ -7271,7 +7290,7 @@ fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
     )));
     let priority = Value::Concrete(ConcreteValue::Int(7));
     let mut resource = Resource::with_provider("awscc", "test.TypedIdentity", "typed", None);
-    resource.binding = Some("typed".to_string());
+    resource.binding = Some(absolute_binding("typed"));
     resource.set_attr("domain".to_string(), domain.clone());
     resource.set_attr("priority".to_string(), priority.clone());
     let resources = vec![resource];
@@ -7327,7 +7346,7 @@ fn test_detect_rename_matches_mixed_canonical_and_identifier_enums_in_list_and_m
         "awscc.ec2.Eip.Domain.standard".to_string(),
     ));
     let mut resource = Resource::with_provider("awscc", "ec2.Eip", "typed", None);
-    resource.binding = Some("typed".to_string());
+    resource.binding = Some(absolute_binding("typed"));
     resource.set_attr(
         "domains".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
@@ -7387,7 +7406,7 @@ fn test_detect_rename_skips_ambiguous_resolved_create_only_matches() {
     let schemas = subnet_route_table_association_registry();
     let mut resource =
         subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
-    resource.binding = Some("nat_gw".to_string());
+    resource.binding = Some(absolute_binding("nat_gw"));
     let resources = vec![resource];
     let state_entries = vec![
         association_state_entry(
@@ -7468,7 +7487,7 @@ fn test_detect_rename_falls_back_to_simhash_when_state_lacks_create_only_attr() 
         "nat_gw",
         None,
     );
-    named.binding = Some("nat_gw".to_string());
+    named.binding = Some(absolute_binding("nat_gw"));
     let state_entries = vec![anonymous_state_entry(
         &schemas,
         "awscc",
@@ -7515,7 +7534,7 @@ fn test_detect_rename_falls_back_to_simhash_when_state_lacks_create_only_attr() 
     ];
     let mut ambiguous_resource =
         subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
-    ambiguous_resource.binding = Some("nat_gw".to_string());
+    ambiguous_resource.binding = Some(absolute_binding("nat_gw"));
     let ambiguous = detect_anonymous_to_named_renames_with_bindings_for_test(
         &[ambiguous_resource],
         &schemas,
@@ -7573,7 +7592,7 @@ fn test_detect_rename_simhash_fallback_rejects_explicit_create_only_mismatches()
 
     let mut named = anonymous_resources.remove(0);
     named.id = ResourceId::with_provider_identity("awscc", "ec2.Eip", "eip", None);
-    named.binding = Some("eip".to_string());
+    named.binding = Some(absolute_binding("eip"));
 
     let mut current_schemas = SchemaRegistry::new();
     current_schemas.insert(
@@ -7632,7 +7651,7 @@ fn test_detect_rename_does_not_match_unresolvable_create_only_ref() {
             .expect("schema fixture must be valid"),
     );
     let mut resource = route_with_deferred_route_table("route", "missing_rtb");
-    resource.binding = Some("route".to_string());
+    resource.binding = Some(absolute_binding("route"));
     let resources = vec![resource];
     let state_entries = vec![route_state_entry(
         &schemas,
@@ -7667,7 +7686,7 @@ fn test_detect_rename_invalid_enum_is_typed_unresolved_and_does_not_rename() {
             .expect("enum schema fixture must be valid"),
     );
     let mut resource = Resource::with_provider("awscc", "ec2.Eip", "eip", None);
-    resource.binding = Some("eip".to_string());
+    resource.binding = Some(absolute_binding("eip"));
     resource.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::enum_identifier(
@@ -7727,7 +7746,7 @@ fn test_detect_anonymous_to_named_skips_claimed_from() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -7778,7 +7797,7 @@ fn test_detect_anonymous_to_named_skips_claimed_to() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -7959,7 +7978,7 @@ fn test_detect_rename_skips_when_binding_already_in_state() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -7992,7 +8011,7 @@ fn test_detect_rename_existing_removed_from_binding_does_not_use_orphan() {
     let binding_name = "sso";
     let orphan_name = "sso_instance_0ac0620303071530";
     let mut resource = Resource::with_provider("awscc", "sso.Instance", binding_name, None);
-    resource.binding = Some(binding_name.to_string());
+    resource.binding = Some(absolute_binding(binding_name));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -8092,7 +8111,7 @@ fn test_detect_rename_skips_ambiguous_matches() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -8137,7 +8156,7 @@ fn test_detect_rename_ignores_non_hash_state_names() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -8209,7 +8228,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
 
     // Step 2: user wraps the same resource in a `let` binding.
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -8278,7 +8297,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
 
     // Let-bound resource with wildly different attributes.
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("completely-different".into())),
@@ -8364,7 +8383,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     ];
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -8397,7 +8416,7 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -8466,7 +8485,7 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     ];
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -8951,13 +8970,15 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         "for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}\n",
     )
     .expect("write loop fixture");
-    let mut parsed = crate::config_loader::parse_directory(
+    let parsed = crate::config_loader::parse_directory(
         fixture.path(),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("directory parses")
-    .into_expanded()
-    .expect("directory fixture contains no parser placeholders");
+    .expect("directory parses");
+    let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
+        .expect("directory fixture crosses the module-resolution seam")
+        .into_expanded()
+        .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =
@@ -9183,7 +9204,7 @@ fn legacy_loop_detector_compares_concrete_subset_when_other_inputs_are_reference
     let mut resources = parse_loop_fixture(source, "subnet.crn");
     resources[0].set_attr(
         "vpc_id",
-        Value::resource_ref("network", "vpc_id", Vec::new()),
+        Value::root_resource_ref("network", "vpc_id", Vec::new()),
     );
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -9364,7 +9385,7 @@ fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
     )
     .expect("bound map-key move destinations parse");
 
-    let resources = vec![
+    let resources: Vec<Resource> = vec![
         Resource::with_provider("mock", "ec2.Vpc", "items._private", None),
         Resource::with_provider("mock", "ec2.Vpc", "items['a._b']", None),
     ];
@@ -9477,7 +9498,7 @@ fn legacy_loop_detector_moves_named_and_anonymous_module_leaves() {
 
     let mut named =
         Resource::with_provider("mock", "test.NamedLeaf", "web_0123456789abcdef.named", None);
-    named.binding = Some("named".to_string());
+    named.binding = Some(absolute_binding("named"));
     named.loop_provenance = provenance();
     let mut anonymous = Resource::with_provider(
         "mock",

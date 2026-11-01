@@ -1,6 +1,6 @@
 //! `replace(search, replacement, string)` built-in function
 
-use crate::resource::{ConcreteValue, Value, ValueString};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -19,7 +19,9 @@ use super::value_type_name;
 /// replace("-", "_", "hello-world")  // => "hello_world"
 /// "hello-world" |> replace("-", "_") // => "hello_world" (pipe form)
 /// ```
-pub(crate) fn builtin_replace(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_replace<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 3 {
         return Err(format!(
             "replace() expects 3 arguments (search, replacement, string), got {}",
@@ -68,7 +70,7 @@ pub(crate) fn builtin_replace(args: &[Value]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
     fn replace_basic() {

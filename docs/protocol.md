@@ -256,6 +256,11 @@ placeholder values. Deferred template attributes are serialized only through
 their `template_resource`. Older plans are rejected with the same replan
 guidance; the state format remains unchanged.
 
+Saved-plan format 37 requires `file` (a relative path or null) and `line` on
+each deferred-for template so apply-time failures retain their source location.
+Absolute diagnostic paths are not persisted. Format 36 and older plans must
+be regenerated; there is no saved-plan backward compatibility.
+
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
 validates and preserves that continuation through the same typestate path as

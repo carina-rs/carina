@@ -46,6 +46,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             PlanErrorKind::PreventDestroy { .. } => prevent_destroy_count += 1,
             PlanErrorKind::SchemaNotRegistered(_)
             | PlanErrorKind::ReplacementCannotCoexist(_)
+            | PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }
             | PlanErrorKind::MissingProviderIdentifier
             | PlanErrorKind::InvalidImportProviderIdentifier
             | PlanErrorKind::MissingDeposedProviderIdentifier { .. }

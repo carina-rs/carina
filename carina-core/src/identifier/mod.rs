@@ -12,13 +12,12 @@ use crate::binding_index::{BindingCompleteness, BindingValueSource, ResolvedBind
 use crate::differ::ComparisonContext;
 use crate::effect::ResolvedMove;
 use crate::name_override::NameOverride;
-use crate::parser::ProviderConfig;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
 use crate::provider::{ComparisonResolutionError, ProviderFactory, ProviderRouter};
 use crate::resource::{
-    AnonymousIdentityModuleSource, ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue,
-    LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind, ResolvedResourceId,
-    Resource, ResourceId, ResourceIdentity, Value, ValueString,
+    AnonymousIdentityModuleSource, ApplyTimeUnknown, BindingAddress, ConcreteValue, DataSource,
+    DeferredValue, LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value, ValueString,
 };
 use crate::schema::{
     AttributeType, IdentityMode, IdentityPath, IdentityPathSegment, ResourceSchema, SchemaRegistry,
@@ -211,8 +210,8 @@ enum AnonymousIdentityInputs {
     CreateOnly(BTreeMap<String, String>),
 }
 
-fn top_level_stable_hash_value<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+fn top_level_stable_hash_value<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     attribute: &str,
 ) -> Option<String> {
     if let Some(prefix) = resource.prefixes.get(attribute) {
@@ -232,7 +231,9 @@ fn top_level_stable_hash_value<S, P: PlaceholderKind>(
         .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
 }
 
-fn value_has_authored_plan_time_expression<P: PlaceholderKind>(value: &Value<P>) -> bool {
+fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> bool {
     match value {
         Value::Concrete(ConcreteValue::List(values)) => {
             values.iter().all(value_has_authored_plan_time_expression)
@@ -294,22 +295,22 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind>(value: &Value<P>)
     }
 }
 
-enum IdentityPathInput<'a, P: PlaceholderKind> {
+enum IdentityPathInput<'a, P: PlaceholderKind, B: BindingAddress> {
     /// No value was authored at this path.
     Absent,
     /// An ancestor was written, but its plan-time shape is unavailable, so
     /// the leaf cannot be classified as absent.
     Unavailable,
     GeneratedPrefix(&'a str),
-    AuthoredPrefix(&'a Value<P>),
-    Value(&'a Value<P>),
+    AuthoredPrefix(&'a Value<P, B>),
+    Value(&'a Value<P, B>),
 }
 
 /// Missing roots or fields are absent; an unavailable ancestor shape is an error.
-fn value_at_identity_path<'a, P: PlaceholderKind>(
-    root: Option<&'a Value<P>>,
+fn value_at_identity_path<'a, P: PlaceholderKind, B: BindingAddress>(
+    root: Option<&'a Value<P, B>>,
     path: &IdentityPath,
-) -> Result<Option<&'a Value<P>>, ()> {
+) -> Result<Option<&'a Value<P, B>>, ()> {
     let Some(mut value) = root else {
         return Ok(None);
     };
@@ -325,10 +326,10 @@ fn value_at_identity_path<'a, P: PlaceholderKind>(
     Ok(Some(value))
 }
 
-fn identity_path_input<'a, S, P: PlaceholderKind>(
-    resource: &'a Resource<S, P>,
+fn identity_path_input<'a, S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &'a Resource<S, P, B>,
     path: &IdentityPath,
-) -> IdentityPathInput<'a, P> {
+) -> IdentityPathInput<'a, P, B> {
     if path.segments().len() == 1 {
         if let Some(prefix) = resource.prefixes.get(path.attribute_name()) {
             return IdentityPathInput::GeneratedPrefix(prefix);
@@ -347,8 +348,8 @@ fn identity_path_input<'a, S, P: PlaceholderKind>(
     }
 }
 
-fn complete_identity_value<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+fn complete_identity_value<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     schema: &ValidatedResourceSchema,
     path: &IdentityPath,
 ) -> Option<CompleteIdentityValue> {
@@ -423,8 +424,8 @@ fn complete_identity_value<S, P: PlaceholderKind>(
 /// `<attribute>_prefix` is treated identically to the same stable user prefix
 /// after [`resolve_attr_prefixes`] moves it into [`Resource::prefixes`]. Nested
 /// identity paths read their value directly from the enclosing concrete struct.
-fn anonymous_identity_inputs<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+fn anonymous_identity_inputs<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     schema: &ValidatedResourceSchema,
 ) -> AnonymousIdentityInputs {
     if !schema.identity_paths().is_empty() {
@@ -542,8 +543,8 @@ fn hash_declared_identity_inputs(
 /// When-present absence is a complete typed value. Authored resource
 /// references are complete because their expressions, rather than their later
 /// resolved values, enter the hash.
-pub fn classify_anonymous_identity_basis<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+pub fn classify_anonymous_identity_basis<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     registry: &SchemaRegistry,
 ) -> Option<AnonymousIdentityBasis> {
     let schema = registry.get_for(resource)?;
@@ -594,7 +595,9 @@ impl Ord for AnonymousResourceKind {
 }
 
 impl AnonymousResourceKind {
-    fn of<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(resource: &Resource<S, P>) -> Self {
+    fn of<S: AnonymousIdentityModuleSource, P: PlaceholderKind, B: BindingAddress>(
+        resource: &Resource<S, P, B>,
+    ) -> Self {
         let module_scope = resource
             .module_source
             .as_ref()
@@ -647,8 +650,8 @@ pub struct AnonymousIdentityErrorMember {
 }
 
 impl AnonymousIdentityErrorMember {
-    fn from_resource<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
-        resource: &Resource<S, P>,
+    fn from_resource<S: AnonymousIdentityModuleSource, P: PlaceholderKind, B: BindingAddress>(
+        resource: &Resource<S, P, B>,
     ) -> Self {
         let source_locations = if let Some(origin) = resource.loop_provenance.display_origin()
             && let Some(span) = origin.source_span()
@@ -681,8 +684,12 @@ impl AnonymousIdentityErrorMember {
     }
 }
 
-fn anonymous_identity_error_members<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
-    resources: &[Resource<S, P>],
+fn anonymous_identity_error_members<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
+    resources: &[Resource<S, P, B>],
     resource_indices: &[usize],
 ) -> Vec<AnonymousIdentityErrorMember> {
     resource_indices
@@ -743,8 +750,9 @@ impl std::error::Error for IncompleteDeclaredIdentity {}
 pub fn check_incomplete_declared_identities<
     S: AnonymousIdentityModuleSource,
     P: PlaceholderKind,
+    B: BindingAddress,
 >(
-    resources: &[Resource<S, P>],
+    resources: &[Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> Vec<IncompleteDeclaredIdentity> {
     let mut failures = BTreeMap::<
@@ -791,9 +799,9 @@ impl AttributeDerivedAnonymousResourceConflict {
     /// Return whether `resource` is one of the declarations represented by
     /// this conflict. This lets source-aware callers attach the shared error to
     /// each declaration without reimplementing the grouping rule.
-    pub fn includes<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
+    pub fn includes<S: AnonymousIdentityModuleSource, P: PlaceholderKind, B: BindingAddress>(
         &self,
-        resource: &Resource<S, P>,
+        resource: &Resource<S, P, B>,
         registry: &SchemaRegistry,
     ) -> bool {
         resource.binding.is_none()
@@ -1096,7 +1104,7 @@ pub fn compute_anonymous_identifiers_with_factories<
     P: PlaceholderKind,
 >(
     resources: CanonicalizedResources<'_, S, P>,
-    providers: &[ProviderConfig<P>],
+    providers: &[crate::parser::ProviderConfig<P, crate::resource::AbsoluteBindingAddress>],
     factories: &[Box<dyn ProviderFactory>],
     registry: &SchemaRegistry,
     conflict_policy: AnonymousIdentityConflictPolicy,
@@ -1265,8 +1273,8 @@ fn has_legacy_synthetic_identity_segment(identity: &str) -> bool {
 /// current resource, include that resource's resolved address in the repair
 /// text.
 pub fn check_legacy_loop_move_targets<S>(
-    state_blocks: &[StateBlock<impl PlaceholderKind>],
-    resources: &[Resource<S, impl PlaceholderKind>],
+    state_blocks: &[StateBlock<impl PlaceholderKind, impl crate::resource::BindingAddress>],
+    resources: &[Resource<S, impl PlaceholderKind, impl crate::resource::BindingAddress>],
 ) -> Vec<LegacyLoopMoveTargetError> {
     state_blocks
         .iter()
@@ -1343,8 +1351,9 @@ pub fn check_legacy_loop_move_targets<S>(
 pub fn check_attribute_derived_anonymous_resource_conflicts<
     S: AnonymousIdentityModuleSource,
     P: PlaceholderKind,
+    B: BindingAddress,
 >(
-    resources: &[Resource<S, P>],
+    resources: &[Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> Vec<AttributeDerivedAnonymousResourceConflict> {
     let mut counts = BTreeMap::<AnonymousResourceKind, usize>::new();
@@ -1377,18 +1386,21 @@ pub fn check_attribute_derived_anonymous_resource_conflicts<
 /// identity for them, so removing the binding would turn valid lint advice
 /// into a later hard error. Stable and singleton attribute-derived resources
 /// remain safe to anonymize.
-pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
-    resources: &[Resource<crate::resource::ModuleSource, P>],
+pub(crate) fn identity_required_bindings<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
+    resources: &[Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> HashSet<String> {
     let mut required = HashSet::new();
-    let mut resources_by_kind =
-        BTreeMap::<AnonymousResourceKind, Vec<&Resource<crate::resource::ModuleSource, P>>>::new();
+    let mut resources_by_kind = BTreeMap::<AnonymousResourceKind, Vec<&Resource<S, P, B>>>::new();
     for resource in resources {
         match classify_anonymous_identity_basis(resource, registry) {
             None => {
                 if let Some(binding) = &resource.binding {
-                    required.insert(binding.clone());
+                    required.insert(binding.to_string());
                 }
             }
             Some(AnonymousIdentityBasis::AttributeDerived) => {
@@ -1399,7 +1411,7 @@ pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
             }
             Some(AnonymousIdentityBasis::IncompleteDeclaredIdentity) => {
                 if let Some(binding) = &resource.binding {
-                    required.insert(binding.clone());
+                    required.insert(binding.to_string());
                 }
             }
             Some(AnonymousIdentityBasis::Stable) => {}
@@ -1411,7 +1423,7 @@ pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
             .into_values()
             .filter(|resources| resources.len() >= 2)
             .flatten()
-            .filter_map(|resource| resource.binding.clone()),
+            .filter_map(|resource| resource.binding.as_ref().map(ToString::to_string)),
     );
     required
 }
@@ -1425,8 +1437,8 @@ pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
 /// - Generates a temporary name: `prefix + random_suffix`
 ///
 /// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
-pub fn resolve_attr_prefixes<P: PlaceholderKind>(
-    resources: &mut [Resource<crate::resource::ModuleSource, P>],
+pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
+    resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
@@ -1581,7 +1593,9 @@ pub fn reconcile_prefixed_names(
 ///
 /// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
 /// so the output is consistent across runs (HashMap iteration order is random).
-fn deterministic_value_string<P: PlaceholderKind>(value: &Value<P>) -> String {
+fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> String {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
             "ModuleIf({}, {}, {})",
@@ -1717,7 +1731,9 @@ fn deterministic_value_string<P: PlaceholderKind>(value: &Value<P>) -> String {
 /// Stable concrete-value spelling used to decide whether a create-only value
 /// can participate in reconciliation. Provider-independent schema
 /// canonicalization is layered on top by [`schema_canonical_value_string`].
-fn comparable_create_only_value_string<P: PlaceholderKind>(value: &Value<P>) -> Option<String> {
+fn comparable_create_only_value_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> Option<String> {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
@@ -1762,15 +1778,17 @@ fn comparable_create_only_value_string<P: PlaceholderKind>(value: &Value<P>) -> 
     }
 }
 
-fn comparable_create_only_feature_string<P: PlaceholderKind>(value: &Value<P>) -> String {
+fn comparable_create_only_feature_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> String {
     comparable_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
 }
 
 /// Provider-independent canonical spelling for identity and create-only keys.
 /// Enum identifiers, provider/state strings, and already-canonical enum values
 /// all reduce to the schema's API value.
-fn schema_canonical_value_string<P: PlaceholderKind>(
-    value: &Value<P>,
+fn schema_canonical_value_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
 ) -> Option<String> {
@@ -1920,9 +1938,9 @@ pub(crate) fn closest_unique_simhash_match<C: Copy>(
 /// Map values are expanded so each entry becomes a separate feature (e.g., `tags.Environment`),
 /// allowing SimHash to produce close hashes when only one map entry changes.
 /// Non-map values use `deterministic_value_string` as the feature value.
-pub(crate) fn flatten_value_for_simhash<P: PlaceholderKind>(
+pub(crate) fn flatten_value_for_simhash<P: PlaceholderKind, B: BindingAddress>(
     prefix: &str,
-    value: &Value<P>,
+    value: &Value<P, B>,
     out: &mut std::collections::BTreeMap<String, String>,
 ) {
     match value {
@@ -2008,9 +2026,9 @@ pub fn anonymous_identity_discriminator(identity: &ResourceIdentity) -> Option<S
 /// This is the shared feature set used by both anonymous identifier computation
 /// (when the schema has no create-only attributes) and `compute_resource_simhash`
 /// so the two always agree on what a resource's anonymous ID would be.
-fn simhash_from_identity_and_resource<S, P: PlaceholderKind>(
+fn simhash_from_identity_and_resource<S, P: PlaceholderKind, B: BindingAddress>(
     identity_values: &BTreeMap<String, String>,
-    resource: &Resource<S, P>,
+    resource: &Resource<S, P, B>,
 ) -> SimHash {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
@@ -2332,7 +2350,7 @@ fn loop_module_conflicts<S, P: PlaceholderKind>(
 #[cfg(test)]
 pub fn compute_anonymous_identifiers_for_test(
     resources: &mut [Resource],
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
@@ -2745,7 +2763,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
 #[cfg(test)]
 pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
     resources: &mut [Resource],
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
@@ -3402,15 +3420,15 @@ fn resolve_deferred_create_only_value(
     }
     let mut bindings = ResolvedBindings::default();
     for binding in root_bindings {
-        let candidates = find_state_by_binding(&binding)
+        let candidates = find_state_by_binding(binding.as_str())
             .into_iter()
-            .filter(|entry| state_entry_matches_binding_scope(&binding, &entry.name))
+            .filter(|entry| state_entry_matches_binding_scope(binding.as_str(), &entry.name))
             .collect::<Vec<_>>();
         let [entry] = candidates.as_slice() else {
             continue;
         };
         bindings.set_with_completeness(
-            &binding,
+            binding.as_str(),
             entry.attribute_values.clone(),
             BindingValueSource::Local,
             BindingCompleteness::Complete,
@@ -4553,7 +4571,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {

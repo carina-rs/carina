@@ -1,7 +1,15 @@
 use super::{create_plan_for_tests as create_plan, *};
 
-use crate::resource::ConcreteValue;
+use crate::resource::{
+    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDirectives as Directives, ExpandedResource as Resource, ExpandedValue as Value,
+    RelativeBindingName, RootScope,
+};
 use indexmap::IndexMap;
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn diff_test(
     desired: &Resource,
@@ -1727,10 +1735,10 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
 
     let orphan_id = ResourceId::with_identity("subnet", "my-subnet");
     let orphan_state = existing_state(orphan_id.clone(), HashMap::new())
-        .with_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
+        .with_root_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
     let orphans = crate::differ::Orphans::from([Orphan::from_state(
         orphan_state,
-        Some("my_subnet".to_string()),
+        Some(absolute_binding("my_subnet")),
         crate::resource::Directives::default(),
     )]);
 
@@ -1765,12 +1773,12 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
             ..
         } => {
             assert_eq!(
-                binding.as_deref(),
+                binding.as_ref().map(AbsoluteBindingAddress::as_str),
                 Some("my_subnet"),
                 "Orphan Delete should preserve the typed binding"
             );
             assert!(
-                dependencies.contains("my_vpc"),
+                dependencies.contains(&absolute_binding("my_vpc")),
                 "Orphan Delete should preserve typed dependency bindings"
             );
         }

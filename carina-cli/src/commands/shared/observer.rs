@@ -116,7 +116,7 @@ fn handle_event<S>(
         }
         ExecutionEvent::EffectFailed {
             effect,
-            error,
+            failure,
             recovery,
             duration,
             progress,
@@ -124,7 +124,7 @@ fn handle_event<S>(
             let key = EffectProgressKey::new(effect);
             let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
-            let mut details = vec![error.to_string()];
+            let mut details = vec![failure.to_string()];
             if let Some(recovery) = recovery {
                 details.push(recovery.display_with_project_dir(project_dir).to_string());
             }
@@ -189,11 +189,18 @@ fn handle_event<S>(
             progress_backend.outcome_line(NonFailureOutcome::success(format!("Refresh {id}")));
         }
         ExecutionEvent::RefreshFailed { id, error } => {
-            progress_backend.info_line(format!("{} Refresh {} - {}", "!".yellow(), id, error));
+            progress_backend.info_line(format!(
+                "{} Refresh {} - {}",
+                "!".yellow(),
+                id,
+                carina_core::executor::render_error_chain(*error)
+            ));
         }
-        ExecutionEvent::ModuleConstraintFailed { error } => {
-            progress_backend
-                .failed_line(FailedOutcome::new("Module constraint", [error.to_string()]));
+        ExecutionEvent::ModuleConstraintFailed { failure } => {
+            progress_backend.failed_line(FailedOutcome::new(
+                "Module constraint",
+                [failure.to_string()],
+            ));
         }
     }
 }
@@ -267,6 +274,37 @@ mod tests {
         strip_ansi(&String::from_utf8(output.0.lock().unwrap().clone()).unwrap())
     }
 
+    fn plain_failure_output_at(
+        effect: &Effect,
+        kind: carina_core::executor::EffectFailureKind,
+        context: carina_core::executor::FailureEventContext<'_>,
+        project_dir: &Path,
+    ) -> String {
+        struct Renderer<'a> {
+            backend: ProgressBackend<EffectProgressKey>,
+            project_dir: &'a Path,
+        }
+        impl ExecutionObserver for Renderer<'_> {
+            fn on_event(&self, event: &ExecutionEvent<'_>) {
+                handle_event(&self.backend, event, self.project_dir);
+            }
+        }
+        let output = SharedWriter::default();
+        let observer = Renderer {
+            backend: ProgressBackend::plain(output.clone()),
+            project_dir,
+        };
+        carina_core::executor::FailureSink::default().record(
+            &observer,
+            carina_core::executor::FailureReport::Effect {
+                effect,
+                kind,
+                context,
+            },
+        );
+        strip_ansi(&String::from_utf8(output.0.lock().unwrap().clone()).unwrap())
+    }
+
     fn strip_ansi(input: &str) -> String {
         let mut output = String::with_capacity(input.len());
         let mut chars = input.chars().peekable();
@@ -288,6 +326,10 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
     fn dummy_create_effect() -> Effect {
         Effect::Create(resolved(Resource::new("aws.s3.Bucket", "demo")))
     }
@@ -295,8 +337,7 @@ mod tests {
     fn dummy_wait_effect() -> Effect {
         let target = resolved(Resource::new("aws.acm.Certificate", "demo"));
         Effect::Wait {
-            identity: carina_core::resource::ResourceIdentity::try_from("demo_ready".to_string())
-                .unwrap(),
+            identity: absolute_binding("demo_ready"),
             target_id: carina_core::wait::ManagedWaitTarget::for_test(&target),
             until: equals_predicate(AttrPath::single("status"), "issued"),
             until_surface: "demo.status == issued".to_string(),
@@ -312,7 +353,7 @@ mod tests {
             identifier: crate::fixture_applied_identifier("mock-id"),
             generation,
             directives: Default::default(),
-            binding: Some("same".to_string()),
+            binding: Some(absolute_binding("same")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -439,7 +480,8 @@ mod tests {
         let attrs = HashMap::from([(
             "status".to_string(),
             Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-                path: AccessPath::with_fields("bootstrap", "network", vec!["status".into()]),
+                path: AccessPath::with_fields("bootstrap", "network", vec!["status".into()])
+                    .resolve_root_for_test(),
             })),
         )]);
         let predicate = equals_predicate(AttrPath::single("missing"), "present");
@@ -656,18 +698,106 @@ mod tests {
     }
 
     #[test]
+    fn cycle_members_and_provider_chains_are_rendered_once_across_progress_and_summary() {
+        use carina_core::executor::{
+            EffectFailureKind, FailureEventContext, FailureReport, FailureSink,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        struct Renderer(ProgressBackend<EffectProgressKey>);
+        impl ExecutionObserver for Renderer {
+            fn on_event(&self, event: &ExecutionEvent<'_>) {
+                handle_event(&self.0, event, Path::new("project"));
+            }
+        }
+        let effects: Vec<Effect> = ["blocked", "a", "b", "c", "provider"]
+            .into_iter()
+            .map(|name| Effect::Create(ResolvedResource::new(Resource::new("test.resource", name))))
+            .collect();
+        let deps = HashMap::from([
+            (0, HashSet::from([3])),
+            (1, HashSet::from([2])),
+            (2, HashSet::from([3])),
+            (3, HashSet::from([1])),
+        ]);
+        let output = SharedWriter::default();
+        let observer = Renderer(ProgressBackend::plain(output.clone()));
+        let mut sink = FailureSink::default();
+        let mut classified = carina_core::executor::classify_stalled_effects(
+            &effects,
+            &deps,
+            &HashSet::from([0, 1, 2, 3]),
+            &HashSet::new(),
+        );
+        classified.push((
+            4,
+            EffectFailureKind::provider_with_context(
+                "delete failed",
+                std::io::Error::other("distinctive provider root"),
+            ),
+        ));
+        for (position, (idx, kind)) in classified.into_iter().enumerate() {
+            sink.record(
+                &observer,
+                FailureReport::Effect {
+                    effect: &effects[idx],
+                    kind,
+                    context: FailureEventContext {
+                        recovery: None,
+                        duration: Duration::ZERO,
+                        progress: ProgressInfo {
+                            completed: position + 1,
+                            total: effects.len(),
+                        },
+                    },
+                },
+            );
+        }
+        let streamed = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        let summary =
+            crate::error::ExecutionFailureReport::new("Apply failed.".into(), sink.failures())
+                .to_string();
+        let stderr = format!("{streamed}Error: {summary}");
+        let members = "{create test.resource.a, create test.resource.b, create test.resource.c}";
+        assert_eq!(stderr.matches(members).count(), 1, "{stderr}");
+        assert!(
+            stderr.find(members).unwrap()
+                < stderr
+                    .find("blocked by the dependency cycle containing create test.resource.a")
+                    .unwrap(),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("distinctive provider root").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(
+            summary.contains("create test.resource.provider: provider error"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("create test.resource.blocked: blocked by the dependency cycle containing create test.resource.a"),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn plain_failed_includes_error_on_second_line() {
         let effect = dummy_create_effect();
-        let output = plain_output(&ExecutionEvent::EffectFailed {
-            effect: &effect,
-            error: "boom",
-            recovery: None,
-            duration: Duration::from_millis(50),
-            progress: ProgressInfo {
-                completed: 2,
-                total: 3,
+        let output = plain_failure_output_at(
+            &effect,
+            carina_core::executor::EffectFailureKind::message("boom"),
+            carina_core::executor::FailureEventContext {
+                recovery: None,
+                duration: Duration::from_millis(50),
+                progress: ProgressInfo {
+                    completed: 2,
+                    total: 3,
+                },
             },
-        });
+            Path::new("test-project"),
+        );
         let lines: Vec<_> = output.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("✗"));
@@ -684,10 +814,10 @@ mod tests {
         let effect = dummy_create_effect();
         let recovery =
             carina_core::plan::PlanError::create_outcome_unknown(effect.resource_id().clone());
-        let output = plain_output_at(
-            &ExecutionEvent::EffectFailed {
-                effect: &effect,
-                error: "guest call timed out",
+        let output = plain_failure_output_at(
+            &effect,
+            carina_core::executor::EffectFailureKind::message("guest call timed out"),
+            carina_core::executor::FailureEventContext {
                 recovery: Some(&recovery),
                 duration: Duration::from_millis(50),
                 progress: ProgressInfo {

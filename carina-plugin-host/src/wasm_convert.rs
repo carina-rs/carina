@@ -351,7 +351,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
         }
         CoreValue::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -363,7 +363,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
         }
         CoreValue::Deferred(DeferredValue::BindingRef { binding }) => {
             Err(SerializationError::UnresolvedResourceRef {
-                path: binding.clone(),
+                path: binding.as_str().to_owned(),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -719,7 +719,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         }
         CoreValue::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -731,7 +731,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         }
         CoreValue::Deferred(DeferredValue::BindingRef { binding }) => {
             Err(SerializationError::UnresolvedResourceRef {
-                path: binding.clone(),
+                path: binding.as_str().to_owned(),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -2076,7 +2076,13 @@ fn proto_struct_field_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::resource::NoPlaceholder;
+
+    fn root_resource_ref(binding: &str, attribute: &str) -> CoreValue {
+        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+            .resolve_root_for_test()
+            .into_expanded()
+            .expect("root resource reference contains no placeholders")
+    }
 
     fn find_error_in_chain<'a, T: std::error::Error + 'static>(
         error: &'a (dyn std::error::Error + 'static),
@@ -3444,17 +3450,28 @@ mod tests {
     /// pin the contract by asserting the variant + context survives.
     #[test]
     fn unknown_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::{AccessPath, ApplyTimeUnknown};
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        use carina_core::resource::{ApplyTimeUnknown, AuthoredAccessPath as AccessPath};
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()])
+            .resolve_root_for_test();
         let v = CoreValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: ApplyTimeUnknown::UpstreamExport { path: p },
+                reason,
                 context: SerializationContext::WasmBoundary,
-            } => assert_eq!(p, path),
+            } => match *reason {
+                ApplyTimeUnknown::UpstreamExport {
+                    path: persisted_path,
+                } => assert_eq!(persisted_path, path),
+                ApplyTimeUnknown::UpstreamAllExports { binding } => {
+                    panic!("expected an upstream export path, got all exports for {binding}")
+                }
+                ApplyTimeUnknown::PendingReRead(pending) => {
+                    panic!("expected an upstream export path, got pending reread: {pending}")
+                }
+            },
             other => {
                 panic!("expected UnknownNotAllowed/UpstreamExport/WasmBoundary, got: {other:?}")
             }
@@ -3474,19 +3491,32 @@ mod tests {
 
     #[test]
     fn unknown_returns_err_in_core_value_to_json() {
-        use carina_core::resource::{AccessPath, ApplyTimeUnknown};
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        use carina_core::resource::{ApplyTimeUnknown, AuthoredAccessPath as AccessPath};
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()])
+            .resolve_root_for_test();
         let v = CoreValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_value_to_json(&v).unwrap_err();
-        assert!(matches!(
-            err,
+        match err {
             SerializationError::UnknownNotAllowed {
-                reason: ApplyTimeUnknown::UpstreamExport { .. },
+                reason,
                 context: SerializationContext::WasmBoundary,
+            } => match *reason {
+                ApplyTimeUnknown::UpstreamExport {
+                    path: persisted_path,
+                } => assert_eq!(persisted_path, path),
+                ApplyTimeUnknown::UpstreamAllExports { binding } => {
+                    panic!("expected an upstream export path, got all exports for {binding}")
+                }
+                ApplyTimeUnknown::PendingReRead(pending) => {
+                    panic!("expected an upstream export path, got pending reread: {pending}")
+                }
+            },
+            other => {
+                panic!("expected UnknownNotAllowed/UpstreamExport/WasmBoundary, got: {other:?}")
             }
-        ));
+        }
     }
 
     #[test]
@@ -3868,8 +3898,8 @@ mod tests {
     /// the provider.
     #[test]
     fn resource_ref_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::AccessPath;
-        let path = AccessPath::new("sso", "identity_store_id");
+        use carina_core::resource::AuthoredAccessPath as AccessPath;
+        let path = AccessPath::new("sso", "identity_store_id").resolve_root_for_test();
         let v = CoreValue::Deferred(DeferredValue::ResourceRef { path: path.clone() });
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
@@ -3884,7 +3914,7 @@ mod tests {
     #[test]
     fn coalesce_returns_err_in_core_to_wit_value() {
         let value = CoreValue::Deferred(DeferredValue::Coalesce {
-            value: Box::new(CoreValue::resource_ref("up", "optional", vec![])),
+            value: Box::new(root_resource_ref("up", "optional")),
             default: Box::new(CoreValue::Concrete(ConcreteValue::String(
                 "fallback".into(),
             ))),
@@ -3899,11 +3929,11 @@ mod tests {
 
     #[test]
     fn interpolation_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::{AccessPath, InterpolationPart};
+        use carina_core::resource::{AuthoredAccessPath as AccessPath, InterpolationPart};
         let v = CoreValue::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(CoreValue::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("vpc", "id"),
+                path: AccessPath::new("vpc", "id").resolve_root_for_test(),
             })),
         ]));
         let err = core_to_wit_value(&v).unwrap_err();
@@ -3917,13 +3947,13 @@ mod tests {
 
     #[test]
     fn function_call_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::AccessPath;
+        use carina_core::resource::AuthoredAccessPath as AccessPath;
         let v = CoreValue::Deferred(DeferredValue::FunctionCall {
             name: carina_core::builtins::BuiltinFunction::join,
             args: vec![
                 CoreValue::Concrete(ConcreteValue::String("-".into())).into(),
                 CoreValue::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new("vpc", "id"),
+                    path: AccessPath::new("vpc", "id").resolve_root_for_test(),
                 })
                 .into(),
             ],
@@ -3971,8 +4001,8 @@ mod tests {
 
     #[test]
     fn resource_ref_returns_err_in_core_value_to_json() {
-        use carina_core::resource::AccessPath;
-        let path = AccessPath::new("sso", "identity_store_id");
+        use carina_core::resource::AuthoredAccessPath as AccessPath;
+        let path = AccessPath::new("sso", "identity_store_id").resolve_root_for_test();
         let v = CoreValue::Deferred(DeferredValue::ResourceRef { path: path.clone() });
         let err = core_value_to_json(&v).unwrap_err();
         assert!(matches!(
@@ -5839,7 +5869,7 @@ mod tests {
         let err = registry
             .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
             .expect("decoded fixture must be owner-bound")
-            .validate_with_resolver::<NoPlaceholder>(&HashMap::new(), &|_| false, &resolver)
+            .validate_with_resolver(&HashMap::<String, CoreValue>::new(), &|_| false, &resolver)
             .unwrap_err();
         assert!(
             err.iter().any(|e| e

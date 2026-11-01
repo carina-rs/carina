@@ -8,8 +8,6 @@ use crate::effect::Effect;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
 use crate::provider::{AppliedIdentifier, CancelledCreateReport, Provider, ProviderRouter};
-#[cfg(test)]
-use crate::resource::Resource;
 use crate::resource::{ResourceId, ResourceIdentity};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
@@ -17,9 +15,7 @@ use super::basic::{
     BasicEffectCompletion, BasicEffectCtx, ExecutionState, count_actionable_effects,
     execute_basic_effect, process_basic_result, refresh_pending_states, resolve_data_source,
 };
-use super::deferred_dispatch::{
-    DeferredAnonymousIdentityGuard, PureMetaCtx, report_deferred_create_failure,
-};
+use super::deferred_dispatch::{DeferredAnonymousIdentityGuard, PureMetaCtx};
 use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
@@ -29,11 +25,12 @@ use super::scheduler::{
 use super::wait::{
     SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitEffectRef, WaitOutcome, WaitSignal,
     count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
-    wait_failure_message,
+    wait_failure,
 };
 use super::{
-    Applied, ExecutionAccumulator, ExecutionEvent, ExecutionObserver, ExecutionResult,
-    ProgressInfo, RuntimeExecutionInput, unresolved_data_source_inputs,
+    Applied, DependencyCycle, EffectEndpoint, EffectFailureKind, ExecutionAccumulator,
+    ExecutionEvent, ExecutionObserver, ExecutionResult, FailureEventContext, ProgressInfo,
+    RuntimeExecutionInput, record_effect_failure, unresolved_data_source_inputs,
 };
 #[cfg(test)]
 use super::{ExecutionInput, ProviderCheckInputs};
@@ -227,7 +224,7 @@ fn format_unresolved_read_inputs(unresolved: &[super::UnresolvedDataSourceInput]
                 .iter()
                 .map(|path| path.to_dot_string())
                 .collect::<Vec<_>>();
-            refs.extend(input.bindings.iter().cloned());
+            refs.extend(input.bindings.iter().map(ToString::to_string));
             refs.extend(
                 input
                     .unknowns
@@ -305,6 +302,187 @@ pub(super) fn build_dependency_levels(
     result
 }
 
+fn dependency_cycle_components(
+    deps_of: &HashMap<usize, HashSet<usize>>,
+    remaining: &HashSet<usize>,
+) -> Vec<Vec<usize>> {
+    fn visit(
+        node: usize,
+        graph: &HashMap<usize, HashSet<usize>>,
+        allowed: &HashSet<usize>,
+        visited: &mut HashSet<usize>,
+        order: &mut Vec<usize>,
+    ) {
+        if !visited.insert(node) {
+            return;
+        }
+        let mut neighbors = graph
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .filter(|neighbor| allowed.contains(neighbor))
+            .copied()
+            .collect::<Vec<_>>();
+        neighbors.sort_unstable();
+        for neighbor in neighbors {
+            visit(neighbor, graph, allowed, visited, order);
+        }
+        order.push(node);
+    }
+
+    fn collect(
+        node: usize,
+        reverse: &HashMap<usize, Vec<usize>>,
+        visited: &mut HashSet<usize>,
+        component: &mut Vec<usize>,
+    ) {
+        if !visited.insert(node) {
+            return;
+        }
+        component.push(node);
+        if let Some(neighbors) = reverse.get(&node) {
+            for &neighbor in neighbors {
+                collect(neighbor, reverse, visited, component);
+            }
+        }
+    }
+
+    let mut order = Vec::new();
+    let mut visited = HashSet::new();
+    let mut nodes = remaining.iter().copied().collect::<Vec<_>>();
+    nodes.sort_unstable();
+    for node in nodes {
+        visit(node, deps_of, remaining, &mut visited, &mut order);
+    }
+
+    let mut reverse: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (&node, dependencies) in deps_of {
+        if !remaining.contains(&node) {
+            continue;
+        }
+        for &dependency in dependencies {
+            if remaining.contains(&dependency) {
+                reverse.entry(dependency).or_default().push(node);
+            }
+        }
+    }
+    for neighbors in reverse.values_mut() {
+        neighbors.sort_unstable();
+    }
+
+    visited.clear();
+    let mut cycles = Vec::new();
+    for node in order.into_iter().rev() {
+        if visited.contains(&node) {
+            continue;
+        }
+        let mut component = Vec::new();
+        collect(node, &reverse, &mut visited, &mut component);
+        component.sort_unstable();
+        let self_cycle = component.len() == 1
+            && deps_of
+                .get(&component[0])
+                .is_some_and(|dependencies| dependencies.contains(&component[0]));
+        if component.len() > 1 || self_cycle {
+            cycles.push(component);
+        }
+    }
+    cycles.sort_by_key(|component| component[0]);
+    cycles
+}
+
+fn reachable_cycle(
+    start: usize,
+    deps_of: &HashMap<usize, HashSet<usize>>,
+    cycles: &[(HashSet<usize>, std::sync::Arc<DependencyCycle>)],
+    completed: &HashSet<usize>,
+) -> Option<std::sync::Arc<DependencyCycle>> {
+    let mut pending = vec![start];
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if completed.contains(&node) || !visited.insert(node) {
+            continue;
+        }
+        if let Some((_, cycle)) = cycles.iter().find(|(members, _)| members.contains(&node)) {
+            return Some(std::sync::Arc::clone(cycle));
+        }
+        if let Some(dependencies) = deps_of.get(&node) {
+            let mut dependencies = dependencies.iter().copied().collect::<Vec<_>>();
+            dependencies.sort_unstable_by(|left, right| right.cmp(left));
+            pending.extend(dependencies);
+        }
+    }
+    None
+}
+
+/// Classify a stalled scheduling graph for both apply and destroy drivers.
+pub fn classify_stalled_effects<S>(
+    effects: &[Effect<S>],
+    deps_of: &HashMap<usize, HashSet<usize>>,
+    remaining: &HashSet<usize>,
+    completed: &HashSet<usize>,
+) -> Vec<(usize, EffectFailureKind)> {
+    let cycles = dependency_cycle_components(deps_of, remaining)
+        .into_iter()
+        .map(|indices| {
+            let members = indices
+                .iter()
+                .map(|&idx| EffectEndpoint::from_effect(&effects[idx]))
+                .collect();
+            (
+                indices.into_iter().collect::<HashSet<_>>(),
+                std::sync::Arc::new(DependencyCycle::new(members)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut indices = remaining.iter().copied().collect::<Vec<_>>();
+    indices.sort_unstable();
+    let mut failures = indices
+        .into_iter()
+        .map(|idx| {
+            let Some(cycle) = reachable_cycle(idx, deps_of, &cycles, completed) else {
+                let mut dependencies = deps_of
+                    .get(&idx)
+                    .into_iter()
+                    .flatten()
+                    .filter(|dependency| !completed.contains(dependency))
+                    .copied()
+                    .collect::<Vec<_>>();
+                dependencies.sort_unstable();
+                let waiting_on = dependencies
+                    .into_iter()
+                    .map(|index| match effects.get(index) {
+                        Some(effect) => super::UnsatisfiedDependency::Effect(
+                            EffectEndpoint::from_effect(effect),
+                        ),
+                        None => super::UnsatisfiedDependency::MissingEffect { index },
+                    })
+                    .collect();
+                return (idx, EffectFailureKind::NoProgress { waiting_on });
+            };
+            let owns_cycle = cycles.iter().any(|(members, candidate)| {
+                std::sync::Arc::ptr_eq(candidate, &cycle)
+                    && members.iter().min().copied() == Some(idx)
+            });
+            let kind = if owns_cycle {
+                EffectFailureKind::DependencyCycle { cycle }
+            } else {
+                EffectFailureKind::BlockedByDependencyCycle { cycle }
+            };
+            (idx, kind)
+        })
+        .collect::<Vec<_>>();
+    // A blocked effect may precede the SCC owner in plan order. Render every
+    // cycle once before emitting the short references to it.
+    failures.sort_by_key(|(idx, kind)| {
+        (
+            !matches!(kind, EffectFailureKind::DependencyCycle { .. }),
+            *idx,
+        )
+    });
+    failures
+}
+
 pub(super) async fn execute_effects_sequential<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
@@ -316,7 +494,7 @@ pub(super) async fn execute_effects_sequential<
 ) -> (ExecutionResult<S>, bool) {
     let result = ExecutionResult {
         success_count: input.precompleted_success_count,
-        failure_count: 0,
+        failures: super::FailureSink::default(),
         partial_count: 0,
         partial_diagnostics: Vec::new(),
         skip_count: 0,
@@ -416,19 +594,23 @@ pub(super) async fn execute_effects_sequential<
 
     for dependency in scheduler_dependency_errors {
         let idx = dependency.effect_index();
-        let message = dependency.to_string();
         let progress = ProgressInfo {
             completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
             total,
         };
-        observer.on_event(&ExecutionEvent::EffectFailed {
-            effect: &effects[idx],
-            error: &message,
-            recovery: None,
-            duration: std::time::Duration::ZERO,
-            progress,
-        });
-        accumulated.mutate(|result| result.failure_count += 1);
+        record_effect_failure(
+            &mut accumulated,
+            observer,
+            &effects[idx],
+            EffectFailureKind::MissingDependency {
+                identity: dependency.identity().clone(),
+            },
+            FailureEventContext {
+                recovery: None,
+                duration: std::time::Duration::ZERO,
+                progress,
+            },
+        );
         completed_indices.insert(idx);
         failed_indices.insert(idx);
         dispatched.insert(idx);
@@ -552,9 +734,6 @@ pub(super) async fn execute_effects_sequential<
             }
 
             let dispatch_ctx = PureMetaCtx {
-                completed: &completed,
-                total,
-                observer,
                 identity_inputs: super::deferred_dispatch::DeferredIdentityInputs {
                     provider_configs: input.provider_configs,
                     factories: input.factories,
@@ -563,8 +742,21 @@ pub(super) async fn execute_effects_sequential<
             };
             match try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx) {
                 PureMetaOutcome::NotPureMeta => {}
-                PureMetaOutcome::Failed => {
-                    accumulated.mutate(|result| result.failure_count += 1);
+                PureMetaOutcome::Failed(failure) => {
+                    record_effect_failure(
+                        &mut accumulated,
+                        observer,
+                        &effect,
+                        EffectFailureKind::deferred(failure),
+                        FailureEventContext {
+                            recovery: None,
+                            duration: std::time::Duration::ZERO,
+                            progress: ProgressInfo {
+                                completed: completed.load(Ordering::Relaxed),
+                                total,
+                            },
+                        },
+                    );
                     failed_indices.insert(idx);
                     completed_indices.insert(idx);
                     completed_synchronous_dispatch = true;
@@ -577,8 +769,20 @@ pub(super) async fn execute_effects_sequential<
                         _ => unreachable!("pure meta materialization has a deferred template"),
                     };
                     if let Err(error) = anonymous_identity_guard.admit(template, &children) {
-                        report_deferred_create_failure(&effect, &error, &dispatch_ctx);
-                        accumulated.mutate(|result| result.failure_count += 1);
+                        record_effect_failure(
+                            &mut accumulated,
+                            observer,
+                            &effect,
+                            EffectFailureKind::deferred(error),
+                            FailureEventContext {
+                                recovery: None,
+                                duration: std::time::Duration::ZERO,
+                                progress: ProgressInfo {
+                                    completed: completed.load(Ordering::Relaxed),
+                                    total,
+                                },
+                            },
+                        );
                         failed_indices.insert(idx);
                         completed_indices.insert(idx);
                         completed_synchronous_dispatch = true;
@@ -611,19 +815,23 @@ pub(super) async fn execute_effects_sequential<
                             if !dispatched.insert(failed_idx) {
                                 continue;
                             }
-                            let message = dependency.to_string();
                             let progress = ProgressInfo {
                                 completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
                                 total,
                             };
-                            observer.on_event(&ExecutionEvent::EffectFailed {
-                                effect: &effects[failed_idx],
-                                error: &message,
-                                recovery: None,
-                                duration: std::time::Duration::ZERO,
-                                progress,
-                            });
-                            accumulated.mutate(|result| result.failure_count += 1);
+                            record_effect_failure(
+                                &mut accumulated,
+                                observer,
+                                &effects[failed_idx],
+                                EffectFailureKind::MissingDependency {
+                                    identity: dependency.identity().clone(),
+                                },
+                                FailureEventContext {
+                                    recovery: None,
+                                    duration: std::time::Duration::ZERO,
+                                    progress,
+                                },
+                            );
                             completed_indices.insert(failed_idx);
                             failed_indices.insert(failed_idx);
                         }
@@ -762,32 +970,42 @@ pub(super) async fn execute_effects_sequential<
                                                     )
                                                     .await
                                                     .map(|state| (resolved_attrs, state))
-                                                    .map_err(|err| {
-                                                        format!(
-                                                            "data source read failed for {}: {err}",
-                                                            resolved.id
+                                                    .map_err(|error| {
+                                                        EffectFailureKind::provider_with_context(
+                                                            format!(
+                                                                "data source read failed for {}",
+                                                                resolved.id
+                                                            ),
+                                                            error,
                                                         )
                                                     })
                                                 }
-                                                Err(err) => Err(format!(
-                                                    "data source preparation failed for {}: {err}",
-                                                    resolved.id
-                                                )),
+                                                Err(error) => Err(
+                                                    EffectFailureKind::execution_with_context(
+                                                        format!(
+                                                            "data source preparation failed for {}",
+                                                            resolved.id
+                                                        ),
+                                                        error,
+                                                    ),
+                                                ),
                                             }
                                         } else {
-                                            Err(format!(
+                                            Err(EffectFailureKind::message(format!(
                                                 "data source inputs for {} still contain \
                                                  unresolved references after dependencies \
                                                  completed: {}",
                                                 resolved.id,
                                                 format_unresolved_read_inputs(&unresolved)
-                                            ))
+                                            )))
                                         }
                                     }
-                                    Err(error) => Err(format!(
-                                        "failed to resolve data source inputs for {}: {error}",
-                                        resolved.id
-                                    )),
+                                    Err(error) => Err(EffectFailureKind::Execution {
+                                        error: error.with_context(format!(
+                                            "failed to resolve data source inputs for {}",
+                                            resolved.id
+                                        )),
+                                    }),
                                 }
                             };
                             SingleEffectResult::Read {
@@ -909,13 +1127,33 @@ pub(super) async fn execute_effects_sequential<
                     accumulated.mutate(|result| result.skip_count += 1);
                 }
             } else if remaining > 0 {
-                // Cycle detected: skip remaining effects as failures
-                for &idx in &actionable_indices {
-                    if !dispatched.contains(&idx) {
-                        dispatched.insert(idx);
-                        completed_indices.insert(idx);
-                        accumulated.mutate(|result| result.failure_count += 1);
-                    }
+                let remaining_indices = actionable_indices
+                    .iter()
+                    .filter(|idx| !dispatched.contains(idx))
+                    .copied()
+                    .collect::<HashSet<_>>();
+                for (idx, kind) in classify_stalled_effects(
+                    &effects,
+                    &deps_of,
+                    &remaining_indices,
+                    &completed_indices,
+                ) {
+                    dispatched.insert(idx);
+                    completed_indices.insert(idx);
+                    record_effect_failure(
+                        &mut accumulated,
+                        observer,
+                        &effects[idx],
+                        kind,
+                        FailureEventContext {
+                            recovery: None,
+                            duration: std::time::Duration::ZERO,
+                            progress: ProgressInfo {
+                                completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                                total,
+                            },
+                        },
+                    );
                 }
             }
             break;
@@ -990,7 +1228,7 @@ pub(super) async fn execute_effects_sequential<
                     accumulated.mutate(|result| {
                         result.success_count += 1;
                         result.bindings.record_applied(
-                            resource.binding.as_deref(),
+                            resource.binding.as_ref().map(|binding| binding.as_str()),
                             &resolved_attrs,
                             &state,
                             crate::binding_index::BindingCompleteness::Complete,
@@ -1005,9 +1243,8 @@ pub(super) async fn execute_effects_sequential<
                         &state,
                     );
                 }
-                Err(error) => {
-                    started.failed(&error, duration);
-                    accumulated.mutate(|result| result.failure_count += 1);
+                Err(failure) => {
+                    started.failed(&mut accumulated, failure, duration);
                     failed_indices.insert(finished_idx);
                 }
             },
@@ -1051,8 +1288,11 @@ pub(super) async fn execute_effects_sequential<
                             );
                         }
                         Err(error) => {
-                            started.failed(&error, duration);
-                            accumulated.mutate(|result| result.failure_count += 1);
+                            started.failed(
+                                &mut accumulated,
+                                EffectFailureKind::message(error),
+                                duration,
+                            );
                             failed_indices.insert(finished_idx);
                         }
                     }
@@ -1071,9 +1311,8 @@ pub(super) async fn execute_effects_sequential<
                 outcome @ (WaitOutcome::Timeout { .. }
                 | WaitOutcome::NotFound(_)
                 | WaitOutcome::ReadFailed(_)) => {
-                    let error = wait_failure_message(&outcome, effects[finished_idx].resource_id());
-                    started.failed(&error, duration);
-                    accumulated.mutate(|result| result.failure_count += 1);
+                    let failure = wait_failure(outcome, effects[finished_idx].resource_id());
+                    started.failed(&mut accumulated, failure, duration);
                     failed_indices.insert(finished_idx);
                 }
             },
@@ -1127,7 +1366,7 @@ pub(super) async fn execute_effects_sequential<
     cancelled |= refresh_cancelled;
 
     let report_unresolved_constraints =
-        accumulated.result().failure_count == 0 && accumulated.result().skip_count == 0;
+        accumulated.result().failure_count() == 0 && accumulated.result().skip_count == 0;
     if !cancelled
         && let Err(error) = module_gate.finish(
             &accumulated.result().bindings,
@@ -1135,9 +1374,7 @@ pub(super) async fn execute_effects_sequential<
         )
     {
         for failure in error.failures() {
-            let message = failure.to_string();
-            observer.on_event(&ExecutionEvent::ModuleConstraintFailed { error: &message });
-            accumulated.mutate(|result| result.failure_count += 1);
+            super::record_module_constraint_failure(&mut accumulated, observer, failure.clone());
         }
     }
     let result = accumulated.finish(&input.checkpoint_sink);
@@ -1159,8 +1396,8 @@ mod tests {
         ProviderResult, ReadRequest, UpdateRequest,
     };
     use crate::resource::{
-        ConcreteValue, Directives, LiveComposition, ResolvedResource, ResourceIdentity, State,
-        Value,
+        AbsoluteBindingAddress, ConcreteValue, Directives, ExpandedResource as Resource,
+        LiveComposition, ResolvedResource, RootScope, State, Value,
     };
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -1175,7 +1412,11 @@ mod tests {
         State::existing(id.clone(), HashMap::new()).with_identifier("id")
     }
 
-    fn unbound_deferred_template_in(file: &str) -> crate::parser::DeferredForExpression {
+    fn absolute(name: &str) -> AbsoluteBindingAddress {
+        RootScope::new().resolve(name.into())
+    }
+
+    fn unbound_deferred_template_in(file: &str) -> crate::parser::ExpandedDeferredForExpression {
         let parsed = crate::parser::parse_file(
             "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.accounts {\n\
@@ -1185,12 +1426,13 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred fixture parses");
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
-        let parsed = parsed
-            .into_expanded()
-            .expect("deferred fixture crosses the placeholder boundary");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam")
+        .into_expanded()
+        .expect("deferred fixture crosses the placeholder boundary");
         parsed
             .into_deferred_for_expressions()
             .into_iter()
@@ -1248,12 +1490,12 @@ mod tests {
 
     fn update_effect(binding: &'static str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
         let id = ResourceId::with_identity("test", binding);
-        let mut to = Resource::new("test", binding);
-        to.binding = Some(binding.to_string());
+        let mut to: Resource = Resource::new("test", binding);
+        to.binding = Some(absolute(binding));
         for (dep, attr) in reads {
             to.set_attr(
                 format!("{}_{}", dep, attr),
-                Value::resource_ref(*dep, *attr, vec![]),
+                Value::root_resource_ref(*dep, *attr, vec![]),
             );
         }
         Effect::Update {
@@ -1395,11 +1637,14 @@ mod tests {
                         .unwrap()
                         .push(format!("{}:{reason}", effect.resource_id()));
                 }
-                ExecutionEvent::EffectFailed { effect, error, .. } => {
-                    self.failures
-                        .lock()
-                        .unwrap()
-                        .push(format!("{}:{error}", effect.resource_id()));
+                ExecutionEvent::EffectFailed {
+                    effect, failure, ..
+                } => {
+                    self.failures.lock().unwrap().push(format!(
+                        "{}:{}",
+                        effect.resource_id(),
+                        failure
+                    ));
                 }
                 ExecutionEvent::Waiting { .. }
                 | ExecutionEvent::EffectStarted {
@@ -1453,17 +1698,17 @@ mod tests {
     async fn wait_marked_unsatisfiable_when_only_waits_in_flight() {
         let provider = TerminalWaitProvider::new();
 
-        let mut cert = Resource::new("test", "cert");
-        cert.binding = Some("cert".to_string());
+        let mut cert: Resource = Resource::new("test", "cert");
+        cert.binding = Some(absolute("cert"));
         let cert_id = cert.id.clone();
 
-        let mut alb = Resource::new("test", "alb");
-        alb.binding = Some("alb".to_string());
+        let mut alb: Resource = Resource::new("test", "alb");
+        alb.binding = Some(absolute("alb"));
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
             target_id: managed_wait_target(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -1527,7 +1772,7 @@ mod tests {
         let (result, was_cancelled) = result;
         assert!(!was_cancelled);
 
-        assert_eq!(result.failure_count, 1, "alb create should fail");
+        assert_eq!(result.failure_count(), 1, "alb create should fail");
         assert_eq!(
             result.skip_count, 1,
             "wait should be skipped when only waits remain in flight"
@@ -1553,28 +1798,28 @@ mod tests {
     async fn wait_marked_unsatisfiable_when_failing_sibling_blocks_consumer_inside_wait_subtree() {
         let provider = TerminalWaitProvider::new();
 
-        let mut cert = Resource::new("test", "cert");
-        cert.binding = Some("cert".to_string());
+        let mut cert: Resource = Resource::new("test", "cert");
+        cert.binding = Some(absolute("cert"));
         let cert_id = cert.id.clone();
 
-        let mut alb = Resource::new("test", "alb");
-        alb.binding = Some("alb".to_string());
+        let mut alb: Resource = Resource::new("test", "alb");
+        alb.binding = Some(absolute("alb"));
 
-        let mut listener = Resource::new("test", "listener");
-        listener.binding = Some("listener".to_string());
+        let mut listener: Resource = Resource::new("test", "listener");
+        listener.binding = Some(absolute("listener"));
         listener.set_attr(
             "load_balancer_arn",
-            Value::resource_ref("alb", "load_balancer_arn", vec![]),
+            Value::root_resource_ref("alb", "load_balancer_arn", vec![]),
         );
         listener.set_attr(
             "certificate_arn",
-            Value::resource_ref("cert_issued", "arn", vec![]),
+            Value::root_resource_ref("cert_issued", "arn", vec![]),
         );
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
             target_id: managed_wait_target(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -1655,9 +1900,9 @@ mod tests {
         assert!(!was_cancelled);
 
         assert!(
-            result.failure_count >= 1,
+            result.failure_count() >= 1,
             "alb create should fail; failure_count: {}",
-            result.failure_count
+            result.failure_count()
         );
         assert!(
             result.skip_count >= 1,
@@ -1726,7 +1971,7 @@ mod tests {
         child.set_attr(
             "whole_parent",
             Value::Deferred(crate::resource::DeferredValue::BindingRef {
-                binding: "parent".to_string(),
+                binding: absolute("parent"),
             }),
         );
         let child = Effect::Update {
@@ -1747,7 +1992,7 @@ mod tests {
             Effect::Update { to, .. } => to.into_inner(),
             _ => unreachable!(),
         };
-        child.directives.depends_on.push("parent".to_string());
+        child.directives.depends_on.push(absolute("parent"));
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new(state_for(&child.id)),
@@ -1769,7 +2014,7 @@ mod tests {
             Effect::Update { to, .. } => to.into_inner(),
             _ => unreachable!(),
         };
-        child.dependency_bindings.insert("parent".to_string());
+        child.dependency_bindings.insert(absolute("parent"));
         let child_id = child.id.clone();
         let effects = vec![
             parent,
@@ -1810,8 +2055,8 @@ mod tests {
 
     #[test]
     fn create_parent_update_child_is_not_relaxed() {
-        let mut parent = Resource::new("test", "parent");
-        parent.binding = Some("parent".to_string());
+        let mut parent: Resource = Resource::new("test", "parent");
+        parent.binding = Some(absolute("parent"));
         let deps = dependency_after_relax(
             Effect::Create(resolved(parent)),
             update_effect("child", &[("parent", "id")], &["tags"]),
@@ -1831,7 +2076,7 @@ mod tests {
         };
         child.set_attr(
             "forwarded",
-            Value::resource_ref("module", "parent_id", vec![]),
+            Value::root_resource_ref("module", "parent_id", vec![]),
         );
 
         let mut virt_attrs: indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute> =
@@ -1839,7 +2084,7 @@ mod tests {
         virt_attrs.insert(
             "parent_id".to_string(),
             crate::resource::LiveCompositionAttribute::from_value(
-                Value::resource_ref("parent", "id", vec![]),
+                Value::root_resource_ref("parent", "id", vec![]),
                 None,
             ),
         );
@@ -1852,7 +2097,7 @@ mod tests {
                 attributes: virt_attrs,
                 pending_constraints: Vec::new(),
             },
-            binding: Some("module".to_string()),
+            binding: Some(absolute("module")),
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "network".to_string(),
             instance: "module".to_string(),
@@ -1932,8 +2177,9 @@ mod tests {
     /// underlying resources their attributes reference.
     #[test]
     fn build_dependency_analysis_follows_virtual_module_binding() {
-        let mut role = Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
-        role.binding = Some("bootstrap.role".to_string());
+        let mut role: Resource =
+            Resource::with_provider("awscc", "iam.Role", "bootstrap.role", None);
+        role.binding = Some(absolute("bootstrap.role"));
 
         // carina#3181: composition resources are a distinct typestate.
         let mut virt_attrs: indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute> =
@@ -1941,7 +2187,7 @@ mod tests {
         virt_attrs.insert(
             "role_name".to_string(),
             crate::resource::LiveCompositionAttribute::from_value(
-                Value::resource_ref("bootstrap.role", "role_name", vec![]),
+                Value::root_resource_ref("bootstrap.role", "role_name", vec![]),
                 None,
             ),
         );
@@ -1957,7 +2203,7 @@ mod tests {
                 attributes: virt_attrs,
                 pending_constraints: Vec::new(),
             },
-            binding: Some("bootstrap".to_string()),
+            binding: Some(absolute("bootstrap")),
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github-oidc".to_string(),
             instance: "bootstrap".to_string(),
@@ -1965,10 +2211,11 @@ mod tests {
             quoted_string_attrs: std::collections::HashSet::new(),
         };
 
-        let mut role_policy = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let mut role_policy: Resource =
+            Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
         role_policy.set_attr(
             "role_name",
-            Value::resource_ref("bootstrap", "role_name", vec![]),
+            Value::root_resource_ref("bootstrap", "role_name", vec![]),
         );
 
         let effects = vec![

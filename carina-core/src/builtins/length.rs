@@ -1,6 +1,6 @@
 //! `length(value)` built-in function
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
 
 use super::value_type_name;
 
@@ -15,7 +15,9 @@ use super::value_type_name;
 /// length({a: 1, b: 2})  // => 2
 /// length("hello")       // => 5
 /// ```
-pub(crate) fn builtin_length(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_length<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 1 {
         return Err(format!("length() expects 1 argument, got {}", args.len()));
     }
@@ -42,7 +44,7 @@ mod tests {
     use indexmap::IndexMap;
 
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
     fn length_list() {
@@ -95,7 +97,7 @@ mod tests {
 
     #[test]
     fn length_wrong_arg_count_zero() {
-        let result = evaluate_builtin("length", &[]);
+        let result: Result<Value, String> = evaluate_builtin("length", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expects 1 argument"));
     }
