@@ -100,6 +100,9 @@ impl std::error::Error for AwsCredentialError {}
 mod bindings {
     crate::__carina_wit_bindgen!({
         world: "carina-provider-aws",
+        // LLD concatenates same-named sections; the consumer's export bindings
+        // use the default name, so the SDK bindings need their own suffix.
+        type_section_suffix: "carina-plugin-sdk-aws-credentials",
         with: {
             "wasi:io/poll@0.2.6": ::wasi::io::poll,
             "wasi:io/error@0.2.6": ::wasi::io::error,
