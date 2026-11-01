@@ -953,6 +953,36 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_schema_preserves_unique_list_refinement() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let schemas = factory.schemas();
+    let schema = schemas
+        .iter()
+        .find(|schema| schema.parts().resource_type == "actions.OidcSubject")
+        .unwrap();
+    let claims = schema.effective_attribute("claim_keys").unwrap();
+    let value: Value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::enum_identifier("repo")),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "mock.actions.OidcSubject.ClaimKey.repo",
+        )),
+    ]));
+    let error = claims.validate(&value).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            carina_core::schema::TypeError::DuplicateListElement {
+                index: 1,
+                first_index: 0,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn schema_only_loads_an_aws_world_without_a_credential_source() {
     let path = skip_if_no_aws_http_wasm!();
     let cache = tempfile::tempdir().expect("create schema-only cache tempdir");

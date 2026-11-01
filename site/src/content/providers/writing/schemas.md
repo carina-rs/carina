@@ -164,10 +164,55 @@ Provider-populated attributes can still be marked `deferred_populate` when the A
 - Scalars: `string()`, `int()`, `float()`, `bool()`, `duration()`.
 - Refined scalars carry extra rules: `refined_string(identity, pattern, length, to_dsl)`, `refined_int(identity, range)` and `refined_float(identity, range)`, plus the `_with_validator` forms described in [Validators and type identities](#validators-and-type-identities).
 - Collections: `list(inner)`, `unordered_list(inner)` for lists whose order the API does not keep, `map(value)` and `map_with_key(key, value)`.
+- Refined lists: `refined_list(element_type, ordered, length, elements)`, with an explicit `ListElements::AllowDuplicates` or `ListElements::Unique` policy.
 - Enums: `enum_(identity, values, dsl_aliases, validate, to_dsl)`.
 - Structs: `struct_(name, fields)`, with fields built from `StructField`.
 - Unions: `union(members)`, for a value that may take one of several shapes.
 - References: `ref_(name)` points at a definition registered with `ResourceSchema::with_def`, which is how recursive shapes are written.
+
+Use `ListElements::Unique` when the API requires distinct elements. Ordering,
+length, and uniqueness are independent: an ordered list can still require
+unique elements, and a minimum length can reject an empty list. For example:
+
+```rust
+use carina_plugin_sdk::core::schema::{
+    AttributeSchema, AttributeType, ListElements, ResourceSchema, TypeIdentity,
+};
+
+let claim_key = AttributeType::enum_(
+    TypeIdentity::new(Some("github"), ["actions", "OidcSubject"], "ClaimKey"),
+    Some(vec!["repo".into(), "context".into()]),
+    Vec::new(),
+    None,
+    None,
+);
+let schema = ResourceSchema::new("actions.OidcSubject")
+    .attribute(AttributeSchema::required(
+        "claim_keys",
+        AttributeType::refined_list(
+            claim_key,
+            true,
+            Some((Some(1), None)),
+            ListElements::Unique,
+        ),
+    ).build())
+    .validate()
+    .expect("the subject schema is valid");
+```
+
+The shared schema validator enforces this declaration in `carina validate`,
+planning, and LSP diagnostics. It compares canonical values, so `[repo, repo]`
+and `[repo, github.actions.OidcSubject.ClaimKey.repo]` both fail. Enum aliases
+resolve to the same API value before comparison. Strings, integers, and nested
+values also support uniqueness. An element containing an unresolved value is
+excluded from duplicate comparison until it becomes known; known elements in
+the same list are still checked. `list()` and `unordered_list()` allow
+duplicates.
+
+Protocol v17 requires every list schema JSON record to carry `elements` as
+`"allow_duplicates"` or `"unique"`, including ordinary lists. There is no
+default at decode. Rebuild providers against the updated SDK before loading
+them with a v17 host.
 
 Struct fields use the same three constructors as attributes, `StructField::optional`, `StructField::required` and `StructField::provider_populated`:
 

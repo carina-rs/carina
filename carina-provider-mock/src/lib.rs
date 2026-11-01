@@ -403,6 +403,30 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
         .collect()
 }
 
+/// Portable unique-list fixture shared by native diagnostics and the WASM mock.
+pub fn unique_list_schema() -> ResourceSchema {
+    use carina_core::schema::{ListElements, TypeIdentity};
+
+    ResourceSchema::new("actions.OidcSubject").attribute(
+        AttributeSchema::required(
+            "claim_keys",
+            AttributeType::refined_list(
+                AttributeType::enum_(
+                    TypeIdentity::new(Some("mock"), ["actions", "OidcSubject"], "ClaimKey"),
+                    Some(vec!["repo".into(), "context".into()]),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                true,
+                Some((Some(1), None)),
+                ListElements::Unique,
+            ),
+        )
+        .build(),
+    )
+}
+
 /// Identity schemas shared by the built-in and process mock providers.
 pub fn anonymous_identity_schemas() -> Vec<ResourceSchema> {
     vec![

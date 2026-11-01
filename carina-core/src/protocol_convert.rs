@@ -790,10 +790,12 @@ pub fn attribute_type_to_protocol(
             element_type,
             ordered,
             length,
+            elements,
         } => Ok(protocol::AttributeType::List {
             element_type: Box::new(attribute_type_to_protocol(element_type)?),
             ordered,
             length,
+            elements,
             validate: None,
         }),
         RawShape::Map { key, value } => Ok(protocol::AttributeType::Map {
@@ -1220,6 +1222,7 @@ pub fn protocol_to_attribute_type(
             element_type,
             ordered,
             length,
+            elements,
             validate,
         } => {
             reject_opaque_validator("List", validate)?;
@@ -1227,6 +1230,7 @@ pub fn protocol_to_attribute_type(
                 protocol_to_attribute_type(element_type)?,
                 *ordered,
                 *length,
+                *elements,
             ))
         }
         protocol::AttributeType::Map { inner, key } => Ok(AttributeType::map_with_key(
@@ -1443,6 +1447,7 @@ fn protocol_legacy_custom_to_core(
             element_type,
             ordered,
             length: base_length,
+            elements,
             validate: base_validate,
         } => {
             reject_opaque_validator("List", base_validate)?;
@@ -1458,6 +1463,7 @@ fn protocol_legacy_custom_to_core(
                 protocol_to_attribute_type(element_type)?,
                 *ordered,
                 prefer_outer_legacy_custom_metadata(length, *base_length),
+                *elements,
             ))
         }
         protocol::AttributeType::Bool => Err(SchemaDecodeError::unsupported_custom_base(
@@ -2598,6 +2604,42 @@ mod tests {
         ReferenceTemplate, ValidatedProviderSchemaWitness, ValidatorType,
     };
 
+    #[test]
+    fn list_elements_refinements_round_trip_through_json() {
+        use crate::schema::ListElements;
+        for elements in [ListElements::AllowDuplicates, ListElements::Unique] {
+            for ordered in [true, false] {
+                let original = AttributeType::refined_list(
+                    AttributeType::string(),
+                    ordered,
+                    Some((Some(1), Some(3))),
+                    elements,
+                );
+                let wire = attribute_type_to_protocol(&original).unwrap();
+                let json = serde_json::to_value(&wire).unwrap();
+                assert_eq!(json["elements"], serde_json::to_value(elements).unwrap());
+                let decoded_wire = serde_json::from_value(json.clone()).unwrap();
+                let decoded = protocol_to_attribute_type(&decoded_wire).unwrap();
+                assert_eq!(
+                    serde_json::to_value(attribute_type_to_protocol(&decoded).unwrap()).unwrap(),
+                    json
+                );
+                let RawShape::List {
+                    element_type: _element_type,
+                    ordered: back_ordered,
+                    length,
+                    elements: back_elements,
+                } = decoded.raw_shape()
+                else {
+                    panic!("list shape was lost");
+                };
+                assert_eq!(back_ordered, ordered);
+                assert_eq!(back_elements, elements);
+                assert_eq!(length, Some((Some(1), Some(3))));
+            }
+        }
+    }
+
     fn reference_identity(kind: &str) -> TypeIdentity {
         TypeIdentity::new(Some("aws"), ["lambda", "Function"], kind)
     }
@@ -3588,6 +3630,7 @@ mod tests {
         let mut wire = resource_schema_to_protocol(&schema).unwrap();
         let attribute = wire.attributes.get_mut("names").unwrap();
         attribute.attr_type = protocol::AttributeType::List {
+            elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
             element_type: Box::new(protocol::AttributeType::String {
                 pattern: None,
                 length: None,
@@ -3617,6 +3660,7 @@ mod tests {
             .build();
         let mut wire = struct_field_to_protocol(&field).unwrap();
         wire.field_type = protocol::AttributeType::List {
+            elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
             element_type: Box::new(protocol::AttributeType::String {
                 pattern: None,
                 length: None,
@@ -3722,6 +3766,7 @@ mod tests {
             (
                 "list",
                 protocol::AttributeType::List {
+                    elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                     element_type: Box::new(identity_struct()),
                     ordered: true,
                     length: None,
@@ -3832,6 +3877,7 @@ mod tests {
                     to_dsl: _to_dsl,
                 } => panic!("unexpected Enum builtin wire shape for {identity}"),
                 RawShape::List {
+                    elements: _elements,
                     element_type: _element_type,
                     ordered: _ordered,
                     length: _length,
@@ -4026,6 +4072,7 @@ mod tests {
         let wire = protocol::AttributeType::Custom {
             name: String::new(),
             base: Box::new(protocol::AttributeType::List {
+                elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                 element_type: Box::new(protocol::AttributeType::String {
                     pattern: None,
                     length: None,
@@ -4050,7 +4097,8 @@ mod tests {
             RawShape::List {
                 ordered: false,
                 length: Some((Some(1), Some(5))),
-                ..
+                element_type: _element_type,
+                elements: _elements,
             }
         ));
     }
@@ -4105,6 +4153,7 @@ mod tests {
         let list_wire = protocol::AttributeType::Custom {
             name: "test.IdentifiedList".to_string(),
             base: Box::new(protocol::AttributeType::List {
+                elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                 element_type: Box::new(protocol::AttributeType::String {
                     pattern: None,
                     length: None,

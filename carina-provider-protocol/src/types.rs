@@ -1707,6 +1707,14 @@ pub enum IdentityMode {
     WhenPresent,
 }
 
+/// Whether a list permits repeated canonical element values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListElements {
+    AllowDuplicates,
+    Unique,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttributeSchema {
     pub name: String,
@@ -1824,6 +1832,8 @@ pub enum AttributeType {
         ordered: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         length: Option<(Option<u64>, Option<u64>)>,
+        /// Required in protocol v17, including when duplicates are allowed.
+        elements: ListElements,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         validate: Option<serde_json::Value>,
     },
@@ -2285,8 +2295,8 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v16_state_json_bytes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 16);
+    fn ordered_maps_preserve_v17_state_json_bytes() {
+        assert_eq!(crate::PROTOCOL_VERSION, 17);
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),
@@ -2763,7 +2773,7 @@ mod tests {
         let error = serde_json::from_str::<AttributeSchema>(
             r#"{
                 "name":"settings",
-                "attr_type":{"type":"list","element_type":{"type":"String"}},
+                "attr_type":{"type":"list", "elements": "allow_duplicates","element_type":{"type":"String"}},
                 "required":false
             }"#,
         )
@@ -2781,7 +2791,7 @@ mod tests {
         for keyed_partial_update in [serde_json::Value::Null, serde_json::json!("key")] {
             let mut json = serde_json::json!({
                 "name": "settings",
-                "attr_type": {"type": "list", "element_type": {"type": "String"}},
+                "attr_type": {"type": "list", "elements": "allow_duplicates", "element_type": {"type": "String"}},
                 "required": false,
                 "keyed_partial_update": keyed_partial_update,
                 "identity": "none",
@@ -2860,6 +2870,7 @@ mod tests {
                 identity: Some("awscc.wafv2.Rate".to_string()),
             },
             AttributeType::List {
+                elements: ListElements::AllowDuplicates,
                 element_type: Box::new(string_attr()),
                 ordered: false,
                 length: Some((Some(1), Some(5))),
@@ -2912,7 +2923,7 @@ mod tests {
     #[test]
     fn list_inner_alias_deserializes_and_emits_element_type() {
         let json = r#"{
-            "type":"list",
+            "type":"list", "elements": "allow_duplicates",
             "inner":{"type":"String"},
             "ordered":false,
             "length":[1,3],
@@ -2921,6 +2932,7 @@ mod tests {
         let attr: AttributeType = serde_json::from_str(json).unwrap();
         match &attr {
             AttributeType::List {
+                elements,
                 element_type,
                 ordered,
                 length,
@@ -2928,6 +2940,7 @@ mod tests {
             } => {
                 assert!(matches!(**element_type, AttributeType::String { .. }));
                 assert!(!ordered);
+                assert_eq!(*elements, ListElements::AllowDuplicates);
                 assert_eq!(*length, Some((Some(1), Some(3))));
                 assert_eq!(*validate, Some(serde_json::json!(true)));
             }
@@ -2937,6 +2950,17 @@ mod tests {
         let emitted = serde_json::to_string(&attr).unwrap();
         assert!(emitted.contains("element_type"), "emitted: {emitted}");
         assert!(!emitted.contains("inner"), "emitted: {emitted}");
+    }
+
+    #[test]
+    fn list_elements_refinement_is_required() {
+        let error = serde_json::from_value::<AttributeType>(serde_json::json!({
+            "type": "list",
+            "element_type": { "type": "String" },
+            "ordered": true
+        }))
+        .expect_err("a list declaration must explicitly carry its elements refinement");
+        assert!(error.to_string().contains("elements"), "{error}");
     }
 
     #[test]
@@ -3137,6 +3161,7 @@ mod tests {
                     fields: vec![StructField {
                         name: "and_statement".into(),
                         field_type: AttributeType::List {
+                            elements: ListElements::AllowDuplicates,
                             element_type: Box::new(AttributeType::Ref {
                                 name: "Statement".into(),
                             }),

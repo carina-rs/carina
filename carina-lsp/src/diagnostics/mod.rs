@@ -92,7 +92,7 @@ fn render_module_call_findings(
                 let message = finding.message().to_string();
                 if let Some(type_error) = finding.message().type_error()
                     && let Some(mut diagnostic) =
-                        build_enum_diagnostic_from_error(type_error, Some(range))
+                        build_schema_diagnostic_from_error(type_error, Some(range))
                 {
                     diagnostic.severity = Some(severity);
                     diagnostic.message = message;
@@ -990,7 +990,7 @@ impl DiagnosticEngine {
                 let severity = DiagnosticSeverity::ERROR;
                 if let Some(type_error) = finding.error.type_error()
                     && let Some(mut diagnostic) =
-                        build_enum_diagnostic_from_error(type_error, Some(range))
+                        build_schema_diagnostic_from_error(type_error, Some(range))
                 {
                     diagnostic.severity = Some(severity);
                     diagnostics.push(diagnostic);
@@ -1368,6 +1368,7 @@ impl DiagnosticEngine {
                     let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
+                    let mut reported_attribute_diagnostics = HashSet::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let attr_value = if contains_function_call(authored_attr_value) {
                             resolved_resource_attributes
@@ -1556,6 +1557,21 @@ impl DiagnosticEngine {
                             // the type system).
                             let attr_shape = effective_type.shape();
                             let contains_struct = effective_type.contains_struct();
+                            let mut diagnose_schema_error = |error: TypeError| {
+                                let tagged = error.with_attribute(attr_name);
+                                let range = self.find_attribute_validation_range(
+                                    doc, attr_name, scope, &tagged,
+                                );
+                                if let Some(diagnostic) =
+                                    build_schema_diagnostic_from_error(&tagged, range)
+                                {
+                                    reported_attribute_diagnostics.insert(attr_name.clone());
+                                    diagnostics.push(diagnostic);
+                                    None
+                                } else {
+                                    Some(tagged.to_string())
+                                }
+                            };
                             let type_error = match (attr_shape, typecheck_value) {
                                 // Bool type should not receive String
                                 (
@@ -1712,7 +1728,7 @@ impl DiagnosticEngine {
                                 ) if !contains_struct => effective_attribute
                                     .validate(attr_value)
                                     .err()
-                                    .map(|e| e.with_attribute(attr_name).to_string()),
+                                    .and_then(&mut diagnose_schema_error),
                                 // Validate Map value types
                                 (
                                     carina_core::schema::Shape::Map { .. },
@@ -1735,19 +1751,12 @@ impl DiagnosticEngine {
                                                 | Value::Deferred(DeferredValue::Coalesce { .. })
                                         ) =>
                                 {
-                                    effective_attribute.validate(value).err().and_then(|error| {
-                                        let tagged = error.with_attribute(attr_name);
-                                        if let Some(diagnostic) = build_enum_diagnostic_from_error(
-                                            &tagged,
-                                            self.find_attribute_value_range(doc, attr_name, scope),
-                                        ) {
-                                            diagnostics.push(diagnostic);
-                                            None
-                                        } else {
-                                            Some(tagged.to_string())
-                                        }
-                                    })
+                                    effective_attribute
+                                        .validate(value)
+                                        .err()
+                                        .and_then(&mut diagnose_schema_error)
                                 }
+
                                 _ => None,
                             };
                             if let Some(message) = type_error {
@@ -1784,13 +1793,17 @@ impl DiagnosticEngine {
                             // carina#3349 — a raw match arm would silently
                             // drop `Ref` and skip the entire pass.
                             if contains_struct {
-                                diagnostics.extend(self.validate_struct_value(
+                                let nested_diagnostics = self.validate_struct_value(
                                     doc,
                                     attr_name,
                                     attr_value,
                                     &effective_type,
                                     self.find_attribute_value_range(doc, attr_name, scope),
-                                ));
+                                );
+                                if !nested_diagnostics.is_empty() {
+                                    reported_attribute_diagnostics.insert(attr_name.clone());
+                                }
+                                diagnostics.extend(nested_diagnostics);
                             }
                         }
                     }
@@ -1855,6 +1868,16 @@ impl DiagnosticEngine {
                                 continue;
                             }
                             let is_masked_secret_error = error.to_string().contains("(secret)");
+                            // Statically evaluated expressions may first become known
+                            // in this pass. Suppress a list refinement only when the
+                            // attribute pass actually emitted its diagnostic.
+                            if matches!(&error, TypeError::DuplicateListElement { .. })
+                                && error.attribute_name().is_some_and(|attribute| {
+                                    reported_attribute_diagnostics.contains(attribute)
+                                })
+                            {
+                                continue;
+                            }
                             if !is_masked_secret_error
                                 && matches!(
                                     &error,
@@ -2226,6 +2249,30 @@ impl DiagnosticEngine {
         None
     }
 
+    /// A duplicate-list diagnostic can anchor at the attribute when no single
+    /// value token exists. Enum quick fixes still require a replaceable value.
+    fn find_attribute_validation_range(
+        &self,
+        doc: &Document,
+        attr_name: &str,
+        scope: Option<(u32, u32)>,
+        error: &TypeError,
+    ) -> Option<Range> {
+        self.find_attribute_value_range(doc, attr_name, scope)
+            .or_else(|| {
+                if !matches!(error, TypeError::DuplicateListElement { .. }) {
+                    return None;
+                }
+                self.find_attribute_position(doc, attr_name, scope)
+                    .map(|(line, col)| {
+                        Range::new(
+                            Position::new(line, col),
+                            Position::new(line, col + attr_name.len() as u32),
+                        )
+                    })
+            })
+    }
+
     /// Locate the value side of `attr_name = <value>` and return the
     /// `Range` covering the value token. For a quoted string literal
     /// the range covers both surrounding quote characters; for a
@@ -2488,15 +2535,25 @@ fn build_enum_diagnostic(
     } else {
         tagged
     };
-    build_enum_diagnostic_from_error(&reshaped, value_range)
+    build_schema_diagnostic_from_error(&reshaped, value_range)
 }
 
-pub(super) fn build_enum_diagnostic_from_error(
+pub(super) fn build_schema_diagnostic_from_error(
     error: &carina_core::schema::TypeError,
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {
-    let data = crate::code_action::enum_diagnostic_data_for_error(error)?;
     let range = value_range?;
+    if matches!(
+        error,
+        carina_core::schema::TypeError::DuplicateListElement { .. }
+    ) {
+        return Some(carina_diagnostic_range(
+            range,
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
+        ));
+    }
+    let data = crate::code_action::enum_diagnostic_data_for_error(error)?;
     Some(Diagnostic {
         range,
         severity: Some(DiagnosticSeverity::WARNING),

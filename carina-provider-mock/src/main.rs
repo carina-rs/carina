@@ -782,6 +782,11 @@ impl CarinaProvider for MockProcessProvider {
                 .expect("normalization probe schema must be valid"),
         ]
         .into_iter()
+        .chain(std::iter::once(
+            carina_provider_mock::unique_list_schema()
+                .validate()
+                .expect("unique-list fixture is valid"),
+        ))
         .chain(
             carina_provider_mock::anonymous_identity_schemas()
                 .into_iter()

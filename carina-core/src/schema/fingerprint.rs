@@ -17,7 +17,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v7";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v8";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -341,11 +341,16 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             element_type,
             ordered,
             length,
+            elements,
         } => {
             encoder.tag(8);
             encode_attribute_type(encoder, element_type);
             encoder.bool(*ordered);
             encode_optional_u64_range(encoder, *length);
+            encoder.tag(match elements {
+                super::ListElements::AllowDuplicates => 0,
+                super::ListElements::Unique => 1,
+            });
             encode_callback_presence(encoder, false);
         }
         AttrTypeKind::Map { key, value } => {
@@ -620,7 +625,7 @@ mod tests {
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::list(AttributeType::bool())),
-            vec![8, 5, 1, 0, 0],
+            vec![8, 5, 1, 0, 0, 0],
             "List has no callback"
         );
     }
@@ -635,6 +640,23 @@ mod tests {
         ]);
 
         assert_eq!(once.semantic_fingerprint(), repeated.semantic_fingerprint());
+    }
+
+    #[test]
+    fn list_elements_refinement_changes_the_fingerprint() {
+        let schema = |elements| {
+            ResourceSchema::new("test.Subject").attribute(
+                AttributeSchema::optional(
+                    "claims",
+                    AttributeType::refined_list(AttributeType::string(), true, None, elements),
+                )
+                .build(),
+            )
+        };
+        assert_ne!(
+            schema(super::super::ListElements::AllowDuplicates).semantic_fingerprint(),
+            schema(super::super::ListElements::Unique).semantic_fingerprint()
+        );
     }
 
     #[test]

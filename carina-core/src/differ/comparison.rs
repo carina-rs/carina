@@ -224,7 +224,8 @@ fn type_aware_equal_on_path<'a>(
                 crate::schema::Shape::List {
                     element_type: inner,
                     ordered,
-                    ..
+                    length: _length,
+                    elements: _elements,
                 },
             ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered, context),
 
@@ -234,7 +235,8 @@ fn type_aware_equal_on_path<'a>(
                 crate::schema::Shape::List {
                     element_type: inner,
                     ordered,
-                    ..
+                    length: _length,
+                    elements: _elements,
                 },
             ) => {
                 // A StringList pair can reach any List shape; the

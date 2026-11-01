@@ -16,7 +16,7 @@ use carina_core::schema::{
     EffectiveType, FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema,
 };
 
-use super::{DiagnosticEngine, build_enum_diagnostic_from_error, carina_diagnostic};
+use super::{DiagnosticEngine, build_schema_diagnostic_from_error, carina_diagnostic};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -44,7 +44,8 @@ impl DiagnosticEngine {
             if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {
                 if path.is_empty() {
                     let tagged = err.clone().with_attribute(attr_name);
-                    if let Some(diagnostic) = build_enum_diagnostic_from_error(&tagged, value_range)
+                    if let Some(diagnostic) =
+                        build_schema_diagnostic_from_error(&tagged, value_range)
                     {
                         diagnostics.push(diagnostic);
                         continue;
@@ -326,9 +327,9 @@ impl DiagnosticEngine {
 
 fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
     match error {
-        TypeError::ReadOnlyAttribute { .. } | TypeError::FieldGroupViolation { .. } => {
-            DiagnosticSeverity::ERROR
-        }
+        TypeError::ReadOnlyAttribute { .. }
+        | TypeError::FieldGroupViolation { .. }
+        | TypeError::DuplicateListElement { .. } => DiagnosticSeverity::ERROR,
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }
         | TypeError::MapValueError { inner, .. }

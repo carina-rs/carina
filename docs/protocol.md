@@ -1,12 +1,34 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **16**.
+The current protocol and minimum supported provider protocol are both **17**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 17 | 17 | Required list element policy; portable canonical-value uniqueness validation. |
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 17
+
+Protocol v17 adds a required `elements` field to every list schema JSON record.
+Its closed values are `allow_duplicates` and `unique`; neither decoding nor
+encoding may omit the field. The core API exposes the same policy as
+`ListElements::{AllowDuplicates, Unique}` and requires callers of
+`AttributeType::refined_list(element_type, ordered, length, elements)` to choose
+explicitly. The `list` and `unordered_list` constructors allow duplicates.
+
+The shared schema validator checks uniqueness wherever it checks list length,
+including collect-all diagnostics and purpose-aware value fitting. Comparison
+uses resolved enum API values, so bare identifiers, qualified identifiers, and
+accepted aliases compare equally. Only fully known elements participate.
+Duplicate errors carry the value, duplicate index, first index, and attribute
+context through CLI and LSP diagnostics. Semantic schema fingerprints use
+encoding v8 to include this constraint.
+
+`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 17. A v17 host
+rejects v16 providers before decoding schemas, and providers must be rebuilt
+against the updated core/SDK. The WIT world is unchanged.
 
 ## Version 16
 

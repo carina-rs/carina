@@ -139,6 +139,7 @@ pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDi
         TypeError::TypeMismatch { .. }
         | TypeError::PatternMismatch { .. }
         | TypeError::LengthOutOfRange { .. }
+        | TypeError::DuplicateListElement { .. }
         | TypeError::ValidationFailed { .. }
         | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }

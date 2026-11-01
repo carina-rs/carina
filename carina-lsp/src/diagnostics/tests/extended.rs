@@ -8,6 +8,84 @@ const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is d
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
+#[test]
+fn unique_list_diagnostics_use_canonical_values_in_a_directory() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        carina_provider_mock::unique_list_schema()
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    for (claims, duplicate) in [
+        ("repo, context, repo", true),
+        ("repo, mock.actions.OidcSubject.ClaimKey.repo", true),
+        ("repo, mock.actions.OidcSubject.ClaimKey.context", false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let source = format!("mock.actions.OidcSubject {{\n  claim_keys = [{claims}]\n}}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        if duplicate {
+            let diagnostic = only_message_diagnostic(&diagnostics, "Duplicate list element");
+            assert!(diagnostic.message.contains("repo"), "{diagnostic:?}");
+            assert!(diagnostic.message.contains("claim_keys"), "{diagnostic:?}");
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(diagnostic.range.start, Position::new(1, 2));
+        } else {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn unique_list_diagnostics_cover_computed_and_nested_lists_in_a_directory() {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ListElements, ResourceSchema, StructField,
+    };
+    let list =
+        AttributeType::refined_list(AttributeType::string(), true, None, ListElements::Unique);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.UniqueLists")
+            .attribute(AttributeSchema::optional("values", list.clone()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "nested",
+                    AttributeType::struct_(
+                        "Nested",
+                        vec![StructField::required("values", list).build()],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    for body in [
+        "values = split(\",\", \"repo,repo\")",
+        "values = [\"repo\",\n    \"repo\"]",
+        "nested = {\n    values = [\"repo\", \"repo\"]\n  }",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let source = format!("mock.test.UniqueLists {{\n  {body}\n}}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        assert!(!diagnostics.is_empty(), "{body}: {diagnostics:?}");
+        let diagnostic = only_message_diagnostic(&diagnostics, "Duplicate list element");
+        assert_eq!(
+            diagnostic.severity,
+            Some(DiagnosticSeverity::ERROR),
+            "{body}: {diagnostics:?}"
+        );
+    }
+}
+
 fn anonymous_loop_engine() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
