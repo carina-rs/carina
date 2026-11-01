@@ -14,10 +14,9 @@ use crate::plan::{
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
 use crate::resource::{
-    CanonicalComparisonAttributes, ConcreteValue, Current, DataSource, Directives,
-    PlanInputCurrent, PlanInputDesiredResources, ResolvedDataSource, ResolvedResource,
-    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
-    plan_input_desired_resources,
+    ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, PlanInputDesiredResources,
+    ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+    ResourceIdentity, State, Value, plan_input_desired_resources,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
@@ -482,10 +481,6 @@ fn create_plan_parts(
 
     for comparison_desired in managed.iter() {
         let resource = comparison_desired.authored();
-        plan.record_comparison_attributes(
-            resource.id.clone(),
-            comparison_desired.comparison_attributes().clone(),
-        );
         let current = current_states
             .get(&resource.id)
             .cloned()
@@ -1280,7 +1275,6 @@ fn promote_pending_replaces_for_dependents(
                     resource,
                     &ref_attr_names,
                     current_states,
-                    owner_schema.schema().as_schema(),
                     outcome_unknown_import_replacements,
                 )
                 && let Some(replaced) = pending_replaces.get_mut(&replaced_identity)
@@ -1370,20 +1364,7 @@ fn promote_resource_to_pending_replace(
         ref_hints,
         registry,
     ) {
-        Ok(pending) => {
-            let schema = registry
-                .get_for(resource)
-                .map(|schema| schema.schema().as_schema());
-            let attributes = resource.resolved_attributes();
-            let comparison_attributes = match schema {
-                Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
-                None => CanonicalComparisonAttributes::from_unschematized(
-                    crate::resource::UnschematizedComparisonAttributes::new(attributes),
-                ),
-            };
-            plan.record_comparison_attributes(resource.id.clone(), comparison_attributes);
-            Some(pending)
-        }
+        Ok(pending) => Some(pending),
         Err(err) => {
             plan.add_error(PlanError::new(resource.id.clone(), err.into()));
             None
@@ -1414,11 +1395,8 @@ fn ensure_consumer_update(
     resource: &Resource,
     changed_attributes: &[String],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
-    schema: &ResourceSchema,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> bool {
-    let comparison_attributes =
-        CanonicalComparisonAttributes::canonicalize(resource.resolved_attributes(), schema);
     if let Some(effect) = plan
         .effects_mut()
         .iter_mut()
@@ -1437,7 +1415,6 @@ fn ensure_consumer_update(
                 }
             }
         }
-        plan.record_comparison_attributes(resource.id.clone(), comparison_attributes);
         return true;
     }
 
@@ -1475,7 +1452,6 @@ fn ensure_consumer_update(
         to: ResolvedResource::new(resource.clone()),
         changed_attributes: changed_attributes.to_vec(),
     });
-    plan.record_comparison_attributes(resource.id.clone(), comparison_attributes);
     true
 }
 
@@ -1522,7 +1498,6 @@ mod typed_current_identifier_tests {
             &resource,
             &["input".to_string()],
             &current,
-            &ResourceSchema::new("test.Resource"),
             &HashSet::new(),
         ));
         let [
@@ -1540,65 +1515,6 @@ mod typed_current_identifier_tests {
         assert_eq!(identifier.as_str(), "typed-provider-id");
         assert_eq!(to.id, resource.id);
         assert_eq!(changed_attributes, &["input".to_string()]);
-    }
-
-    #[test]
-    fn ensure_consumer_update_carries_the_rewritten_comparison_view() {
-        let old = Value::Concrete(ConcreteValue::String("old".into()));
-        let rewritten = Value::Concrete(ConcreteValue::String("rewritten".into()));
-        let resource = Resource::with_provider("mock", "test.Resource", "consumer", None)
-            .with_attribute("input", rewritten.clone());
-        let current = current_with_authoritative_identifier(&resource);
-        let schema = ResourceSchema::new("test.Resource").attribute(
-            crate::schema::AttributeSchema::optional(
-                "input",
-                crate::schema::AttributeType::string(),
-            )
-            .build(),
-        );
-        let previous_to = Resource::with_provider("mock", "test.Resource", "consumer", None)
-            .with_attribute("input", old.clone());
-        let mut plan = Plan::new();
-        plan.record_comparison_attributes(
-            resource.id.clone(),
-            CanonicalComparisonAttributes::canonicalize(previous_to.resolved_attributes(), &schema),
-        );
-        plan.add(Effect::Update {
-            from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
-            identifier: crate::provider::fixture_applied_identifier("typed-provider-id"),
-            to: ResolvedResource::new(previous_to),
-            changed_attributes: vec!["other".to_string()],
-        });
-
-        assert!(ensure_consumer_update(
-            &mut plan,
-            &resource,
-            &["input".to_string()],
-            &current,
-            &schema,
-            &HashSet::new(),
-        ));
-
-        assert_eq!(
-            plan.comparison_attributes(&resource.id)
-                .and_then(|attributes| attributes.get("input")),
-            Some(&rewritten),
-        );
-        let [
-            Effect::Update {
-                to,
-                changed_attributes,
-                ..
-            },
-        ] = plan.effects()
-        else {
-            panic!("expected one rewritten Update effect");
-        };
-        assert_eq!(to.get_attr("input"), Some(&rewritten));
-        assert_eq!(
-            changed_attributes,
-            &["other".to_string(), "input".to_string()]
-        );
     }
 
     #[test]

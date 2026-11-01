@@ -66,7 +66,6 @@ struct HistoricalListKeyRelease {
 struct HistoricalUpdateAttributes {
     attributes: HashMap<String, Value>,
     stored_attributes: Option<HashMap<String, Value>>,
-    comparison_attributes: Option<CanonicalComparisonAttributes>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +120,6 @@ impl HistoricalDisplayAttributes {
             match effect {
                 Effect::Update { from, to, .. } => {
                     let attributes = display.filter_released(&from.id, from.attributes.clone());
-                    let comparison_attributes = plan.comparison_attributes(&to.id).cloned();
                     display.updates.insert(
                         from.id.clone(),
                         HistoricalUpdateAttributes {
@@ -130,7 +128,6 @@ impl HistoricalDisplayAttributes {
                                 &to.attributes,
                             ),
                             stored_attributes: None,
-                            comparison_attributes,
                         },
                     );
                 }
@@ -240,10 +237,6 @@ impl HistoricalDisplayAttributes {
         let persisted_masked =
             mask_attributes_using_persisted_shape(&filtered_provider, persisted_attributes);
         let desired_shape = self.updates.get(&id).map(|entry| &entry.attributes);
-        let comparison_attributes = self
-            .updates
-            .get(&id)
-            .and_then(|entry| entry.comparison_attributes.clone());
         let masked = combine_with_desired_secret_shape(persisted_masked, desired_shape);
         // Keep the stored anchor unfiltered: its list indices must stay
         // aligned with `prev_explicit::ListElements` so projection can still
@@ -255,7 +248,6 @@ impl HistoricalDisplayAttributes {
             HistoricalUpdateAttributes {
                 attributes: masked,
                 stored_attributes,
-                comparison_attributes,
             },
         );
     }
@@ -912,25 +904,16 @@ fn build_update_rows<S>(
                 crate::resource::UnschematizedComparisonAttributes::new(attributes),
             ),
         });
-    let authored_comparison_attributes;
-    let comparison_attributes = match &historical.comparison_attributes {
-        Some(attributes) => attributes,
-        None => {
-            authored_comparison_attributes = match schema {
-                Some(schema) => {
-                    CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema)
-                }
-                None => CanonicalComparisonAttributes::from_unschematized(
-                    crate::resource::UnschematizedComparisonAttributes::new(
-                        to.resolved_attributes(),
-                    ),
-                ),
-            };
-            &authored_comparison_attributes
+    let comparison_attributes = match schema {
+        Some(schema) => {
+            CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema)
         }
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(to.resolved_attributes()),
+        ),
     };
     let comparison_attributes = to.resolved_ignore_changes.mask_comparison_readable_leaves(
-        comparison_attributes,
+        &comparison_attributes,
         &from_attributes,
         schema,
     );
@@ -1512,12 +1495,8 @@ pub fn build_replace_detail_rows_from_display<S>(
         .ok_or_else(|| ComparisonResolutionError::MissingResourceSchema { id: to.id.clone() })?;
     let resolved = provider.comparison_for(registry, &to.id)?;
     let schema = resolved.owner_schema().schema().as_schema();
-    let comparison_attributes = plan
-        .comparison_attributes(&to.id)
-        .cloned()
-        .unwrap_or_else(|| {
-            CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema)
-        });
+    let comparison_attributes =
+        CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema);
     Ok(build_replace_rows_from_attributes(
         &historical_attributes.attributes,
         historical_attributes.stored_attributes.as_ref(),
@@ -2668,19 +2647,6 @@ mod tests {
     ) -> Vec<DetailRow> {
         let mut plan = Plan::new();
         plan.add(effect.clone());
-        if let Effect::Update { to, .. } = effect {
-            let schema = registry
-                .and_then(|registry| registry.get_for(to))
-                .map(|schema| schema.schema().as_schema());
-            let attributes = to.resolved_attributes();
-            let comparison_attributes = match schema {
-                Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
-                None => CanonicalComparisonAttributes::from_unschematized(
-                    crate::resource::UnschematizedComparisonAttributes::new(attributes),
-                ),
-            };
-            plan.record_comparison_attributes(to.id.clone(), comparison_attributes);
-        }
         let mut historical_attributes = HistoricalDisplayAttributes::for_plan(&plan);
         if let Effect::Update { from, .. } = effect
             && let Some(update) = historical_attributes.updates.get_mut(&from.id)
@@ -2717,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_plan_secret_rehydration_removes_redacted_renderer_comparison_view() {
+    fn saved_plan_secret_rehydration_renders_from_rehydrated_effect() {
         let secret = |plaintext: &str| {
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::String(plaintext.into()),
@@ -2734,11 +2700,6 @@ mod tests {
         let desired = Resource::new("test.Widget", "example")
             .with_attribute("password", secret("new-secret"));
         let id = desired.id.clone();
-        let schema = registry
-            .get_for(&desired)
-            .expect("secret fixture schema")
-            .schema()
-            .as_schema();
         let to = ResolvedResource::resolve_with_schemas(desired.clone(), &registry)
             .expect("desired fixture resolves with its schema");
         let from = State::existing(
@@ -2755,30 +2716,16 @@ mod tests {
             to,
             changed_attributes: vec!["password".to_string()],
         });
-        plan.record_comparison_attributes(
-            id.clone(),
-            CanonicalComparisonAttributes::canonicalize(desired.resolved_attributes(), schema),
-        );
 
         let redacted =
             crate::value::redact_secrets_in_plan(&plan).expect("saved-plan fixture secrets redact");
         let wire =
             serde_json::to_string(&SavedPlan::from(redacted)).expect("saved plan serializes");
-        assert!(
-            !wire.contains("comparison_attributes"),
-            "the derived comparison view must remain outside saved-plan JSON"
-        );
         let unresolved: UnresolvedSavedPlan =
             serde_json::from_str(&wire).expect("saved plan wire format deserializes");
         let loaded = unresolved
             .resolve_with_schemas(&registry)
             .expect("saved plan resolves with current schemas");
-        assert!(matches!(
-            loaded
-                .comparison_attributes(&id)
-                .and_then(|attributes| attributes.get("password")),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
-        ));
 
         let deferred_templates: crate::parser::ResolvedDeferredForExpressions =
             crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([]);
@@ -2799,14 +2746,6 @@ mod tests {
         ));
 
         let historical = HistoricalDisplayAttributes::for_plan(&rehydrated);
-        assert!(
-            historical
-                .update(&id)
-                .expect("renderer has update history")
-                .comparison_attributes
-                .is_none(),
-            "renderer must derive comparison attributes from the rehydrated effect"
-        );
         let (registry, provider) =
             crate::provider::comparison_fixture_for_test(&registry, std::iter::once(&id));
         let rows = build_detail_rows_by_instance(
@@ -3104,13 +3043,6 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("after".into())),
             )
             .with_attribute("rules", rules(true));
-        let schema = registry
-            .get_for(&to)
-            .expect("schema fixture")
-            .schema()
-            .as_schema();
-        let comparison_attributes =
-            CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema);
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
             from: Box::new(from.clone()),
@@ -3118,7 +3050,6 @@ mod tests {
             changed_attributes: vec!["name".to_string()],
         };
         let mut plan = Plan::new();
-        plan.record_comparison_attributes(id.clone(), comparison_attributes);
         plan.add(effect);
         let mut historical = HistoricalDisplayAttributes::for_plan(&plan);
         let persisted = PersistedAttributes::from_typed_persisted_wire_values(HashMap::from([
