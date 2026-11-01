@@ -17,7 +17,7 @@ A provider is a [WebAssembly component](https://component-model.bytecodealliance
 | `carina-provider-with-http` | The provider calls an HTTP API through `wasi:http` and declares the hosts it may reach. |
 | `carina-provider-aws` | An AWS-kind provider needs `wasi:http` plus host-resolved AWS base credentials. |
 
-You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `CarinaProvider` trait, and its `export_provider!` macro generates the bindings and connects them to your implementation. The SDK re-exports the request and schema types from `carina-provider-protocol`.
+The `carina-plugin-sdk` crate defines a `CarinaProvider` trait and supplies bindings generated in Carina-owned crates from the SDK revision's WIT and binding generator. Its `export_provider!` macro connects those bindings to your implementation. Your provider needs no WIT submodule, `wit-bindgen` dependency, or direct dependency on the binding crates. The SDK re-exports the request and schema types from `carina-provider-protocol`.
 
 `export_provider!(MyProvider)` exports `carina-provider`. To export `carina-provider-with-http`, declare every hostname the provider may contact:
 
@@ -29,7 +29,7 @@ carina_plugin_sdk::export_provider!(
 );
 ```
 
-Add the `wasi` crate (version 0.14) to the provider's `wasm32` dependencies, because the generated bindings refer to it. The SDK's `carina_plugin_sdk::wasi_http::send_request` then sends an `http::Request` through the host.
+The SDK supplies the WASI imports. Its `carina_plugin_sdk::wasi_http::send_request` sends an `http::Request` through the host. Add a direct `wasi` dependency only if your own code calls WASI APIs.
 
 The HTTP form embeds a versioned `carina:egress` custom section in the component. The declaration is mandatory. The host reads it from the exact bytes being loaded and permits only consented patterns:
 
