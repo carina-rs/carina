@@ -9681,8 +9681,6 @@ fn v20_dependency_migration_rejects_missing_target_with_row_and_text() {
 
 #[test]
 fn v20_dependency_migration_preserves_matchable_resolution_cause() {
-    use std::error::Error;
-
     let mut target = persisted_resource("mock", "__wait", "invalid_target");
     target["binding"] = serde_json::json!("invalid_target");
     let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
@@ -9695,25 +9693,64 @@ fn v20_dependency_migration_preserves_matchable_resolution_cause() {
         .with_absolute_binding(absolute_binding("consumer"));
     let error = migrate_legacy_with_config(state, &[configured])
         .expect_err("a synthetic address cannot become a persisted destroy edge");
-    let mut source = error.source();
-    let mut cause = None;
-    while let Some(error) = source {
-        if let Some(error) = error.downcast_ref::<carina_core::resource::NotAManagedRow>() {
-            cause = Some(error);
-            break;
-        }
-        source = error.source();
-    }
+    assert!(std::error::Error::source(&error).is_none());
+    let LegacyDependencyMigrationError::InvalidStateDependency { reason, .. } = &error else {
+        panic!("migration must retain the typed decode error: {error:?}");
+    };
+    let carina_core::resource::NotAManagedRow(cause) = reason.as_ref();
     assert_eq!(
-        cause.map(|error| error.0.clone()),
-        Some(resolved_dependency(
-            "mock",
-            "__wait",
-            "invalid_target",
-            None
-        )),
+        cause,
+        &resolved_dependency("mock", "__wait", "invalid_target", None),
         "the typed decode error must survive migration context: {error:?}",
     );
+    assert_eq!(error.to_string().matches(&reason.to_string()).count(), 1);
+}
+
+#[test]
+fn legacy_dependency_resolution_error_retains_typed_cause_without_duplicate_source() {
+    let error = LegacyDependencyMigrationError::Resolution {
+        row_index: 0,
+        row: "consumer".to_string(),
+        location: "resources[0].dependency_bindings".to_string(),
+        dependency: "target".to_string(),
+        reason: Box::new(ExpandedGraphResolutionError::DataSourceHandle {
+            owner: "consumer".to_string(),
+            reference: "target".to_string(),
+        }),
+    };
+    assert_eq!(
+        error.to_string(),
+        "resources[0].dependency_bindings on consumer could not classify legacy dependency \
+         \"target\": consumer: expected a managed resource handle; 'target' is a data source"
+    );
+    assert!(std::error::Error::source(&error).is_none());
+    let LegacyDependencyMigrationError::Resolution { reason, .. } = error else {
+        panic!("migration must retain the typed graph resolution error");
+    };
+    assert!(matches!(
+        reason.as_ref(),
+        ExpandedGraphResolutionError::DataSourceHandle { owner, reference }
+            if owner == "consumer" && reference == "target"
+    ));
+}
+
+#[test]
+fn legacy_dependency_graph_validation_error_retains_typed_cause_without_duplicate_source() {
+    let cause = ExpandedGraphResolutionError::MissingDependency {
+        owner: "consumer".to_string(),
+        reference: "target".to_string(),
+    };
+    let error = LegacyDependencyMigrationError::from(cause.clone());
+    assert_eq!(error.to_string(), cause.to_string());
+    assert!(std::error::Error::source(&error).is_none());
+    let LegacyDependencyMigrationError::GraphValidation(reason) = error else {
+        panic!("migration must retain the typed graph validation error");
+    };
+    assert!(matches!(
+        reason.as_ref(),
+        ExpandedGraphResolutionError::MissingDependency { owner, reference }
+            if owner == "consumer" && reference == "target"
+    ));
 }
 
 #[test]
@@ -9754,7 +9791,7 @@ fn with_legacy_classification_rejects_stale_sources() {
     .expect("original v20 state loads")
     .into_state();
 
-    let configured = vec![
+    let configured = [
         Resource::with_provider("mock", "test.Target", "target", None)
             .with_absolute_binding(absolute_binding("target")),
         Resource::with_provider("mock", "test.Consumer", "consumer", None)
@@ -9763,8 +9800,8 @@ fn with_legacy_classification_rejects_stale_sources() {
     let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
         let mut configuration = parsed;
-        configuration.resources = (&configured).to_vec();
-        configuration.data_sources = (&[]).to_vec();
+        configuration.resources = configured.to_vec();
+        configuration.data_sources = [].to_vec();
         configuration.into()
     })
     .expect("stale-classification graph resolves");
@@ -9898,8 +9935,8 @@ fn report_invokes_sink_for_every_current_and_deposed_warning_before_returning_st
     let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
         let mut configuration = parsed;
-        configuration.resources = (&[]).to_vec();
-        configuration.data_sources = (&[]).to_vec();
+        configuration.resources = [].to_vec();
+        configuration.data_sources = [].to_vec();
         configuration.into()
     })
     .expect("empty warning graph resolves");
@@ -9976,8 +10013,8 @@ fn assert_moved_legacy_row_scope(
     let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
         let mut configuration = parsed;
-        configuration.resources = (&graph_resources).to_vec();
-        configuration.data_sources = (&[]).to_vec();
+        configuration.resources = graph_resources.to_vec();
+        configuration.data_sources = [].to_vec();
         configuration.into()
     })
     .expect("moved-row graph resolves");

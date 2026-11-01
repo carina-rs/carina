@@ -7067,14 +7067,14 @@ impl ModuleCallChecker<'_> {
                     crate::resource::Value::Deferred(
                         crate::resource::DeferredValue::ResourceRef { path },
                     ) => Some(check_reference_for_handle_sink(
-                        &bindings,
+                        bindings,
                         path.into(),
                         expected,
                     )),
                     crate::resource::Value::Deferred(
                         crate::resource::DeferredValue::BindingRef { binding },
                     ) => Some(check_reference_for_handle_sink(
-                        &bindings,
+                        bindings,
                         binding.into(),
                         expected,
                     )),

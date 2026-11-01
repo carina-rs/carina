@@ -1206,8 +1206,8 @@ mod tests {
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let graph = carina_core::resolved_graph::resolve_expanded_graph({
             let mut configuration = parsed;
-            configuration.resources = (&resources).to_vec();
-            configuration.data_sources = (&[]).to_vec();
+            configuration.resources = resources.clone();
+            configuration.data_sources = Vec::new();
             configuration.into()
         })
         .expect("test graph targets resolve");

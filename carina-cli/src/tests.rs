@@ -5346,7 +5346,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     let mut resource = Resource::with_provider("mock", "test.resource", "created", None);
     resource.binding = Some(absolute_binding("created"));
     let sorted_resources = vec![resolved(resource.clone())];
-    let export_resources = vec![resource.clone()];
+    let export_resources = [resource.clone()];
     let resource_id = resource.id.clone();
     let state = State::existing(
         resource_id.clone(),

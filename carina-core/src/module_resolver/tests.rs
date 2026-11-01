@@ -9571,8 +9571,8 @@ let consumer = mock.test.Consumer {
     let data_sources = parsed.data_sources.clone();
     let index = crate::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
-        configuration.resources = (&resources).to_vec();
-        configuration.data_sources = (&data_sources).to_vec();
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
         configuration.into()
     })
     .expect("transitive handle outputs resolve at the expanded graph seam");
@@ -9679,8 +9679,8 @@ let consumer = mock.test.Consumer {
     let data_sources = parsed.data_sources.clone();
     let index = crate::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
-        configuration.resources = (&resources).to_vec();
-        configuration.data_sources = (&data_sources).to_vec();
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
         configuration.into()
     })
     .expect("expanded dependency graph resolves both operands");
@@ -9766,8 +9766,8 @@ let child = consumer_module { peer = source }
     let data_sources = parsed.data_sources.clone();
     let index = crate::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
-        configuration.resources = (&resources).to_vec();
-        configuration.data_sources = (&data_sources).to_vec();
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
         configuration.into()
     })
     .expect("expanded graph resolves the caller-supplied wait dependency");
@@ -9826,12 +9826,9 @@ let child = consumer_module { peer = source }
         .into_expanded()
         .expect("root fixture has no remaining parser placeholders");
     let expected = parsed
-        .resources
-        .iter()
-        .find(|resource| {
-            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("source")
-        })
-        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .iter_all_resources()
+        .find(|resource| resource.binding() == Some("source"))
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id().clone()))
         .expect("caller source has a resolved identity");
     let wait = parsed
         .wait_bindings
@@ -9839,15 +9836,8 @@ let child = consumer_module { peer = source }
         .find(|wait| wait.binding.as_str() == "child.ready")
         .cloned()
         .expect("expanded wait");
-    let resources = parsed.resources.clone();
-    let data_sources = parsed.data_sources.clone();
-    let index = crate::resolved_graph::resolve_expanded_graph({
-        let mut configuration = parsed;
-        configuration.resources = (&resources).to_vec();
-        configuration.data_sources = (&data_sources).to_vec();
-        configuration.into()
-    })
-    .expect("expanded graph resolves the caller-supplied wait target");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed.into())
+        .expect("expanded graph resolves the caller-supplied wait target");
     let resolved = index
         .resolve_wait_binding(&wait)
         .expect("wait target and predicate root resolve through the module argument");
@@ -10024,8 +10014,8 @@ let child = consumer_module {}
     let data_sources = parsed.data_sources.clone();
     let index = crate::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
-        configuration.resources = (&resources).to_vec();
-        configuration.data_sources = (&data_sources).to_vec();
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
         configuration.into()
     })
     .expect("expanded graph registers the prefixed loop group");
@@ -10155,8 +10145,8 @@ let reader = mock.test.Consumer { name = consumer.observed_name }
     let data_sources = parsed.data_sources.clone();
     let index = crate::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
-        configuration.resources = (&resources).to_vec();
-        configuration.data_sources = (&data_sources).to_vec();
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
         configuration.into()
     })
     .expect("P3 graph addresses resolve");

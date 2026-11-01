@@ -59,11 +59,10 @@ pub enum ExpandedGraphResolutionError {
         reference: String,
         step: PathSegment,
     },
-    #[error("{owner}: failed to rebuild value access after handle resolution: {source}")]
+    #[error("{owner}: failed to rebuild value access after handle resolution: {error}")]
     ValueAccess {
         owner: String,
-        #[source]
-        source: GraphExpressionError,
+        error: GraphExpressionError,
     },
     #[error(
         "evaluated resource '{evaluated}' does not match authored dependency source '{authored}'"
@@ -365,7 +364,7 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
                 .rebuild_with_base(base, AccessMissPolicy::Error)
                 .map_err(|error| ExpandedGraphResolutionError::ValueAccess {
                     owner: owner.to_string(),
-                    source: GraphExpressionError::Access(error),
+                    error: GraphExpressionError::Access(error),
                 })
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
@@ -388,7 +387,7 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
             let expression = expression.rebuild(lhs, rhs).map_err(|error| {
                 ExpandedGraphResolutionError::ValueAccess {
                     owner: owner.to_string(),
-                    source: GraphExpressionError::Integer(error),
+                    error: GraphExpressionError::Integer(error),
                 }
             })?;
             Ok(Value::Deferred(DeferredValue::IntegerArithmetic(
@@ -867,7 +866,7 @@ impl ExpandedBindingIndex {
 pub fn wait_scheduler_id(binding: &AbsoluteBindingAddress) -> ResolvedResourceId {
     let identity = ResourceIdentity::try_from(binding.to_string())
         .expect("parser binding names are non-empty scheduler identities");
-    ResolvedResourceId::with_identity(&format!("{SYNTHETIC_TYPE_PREFIX}wait"), identity)
+    ResolvedResourceId::with_identity(format!("{SYNTHETIC_TYPE_PREFIX}wait"), identity)
 }
 
 pub fn loop_group_bindings<B: BindingAddress>(binding: &B) -> Vec<B> {
@@ -1527,23 +1526,24 @@ impl ExpandedBindingIndex {
     pub fn for_test_resources<S>(
         resources: &[Resource<S>],
     ) -> Result<Self, ExpandedGraphResolutionError> {
-        let mut configuration = crate::parser::ExpandedParsedFile::default();
-        configuration.resources = resources
-            .iter()
-            .map(|resource| Resource {
-                id: resource.id.clone(),
-                attributes: resource.attributes.clone(),
-                directives: resource.directives.clone(),
-                resolved_ignore_changes: resource.resolved_ignore_changes.clone(),
-                prefixes: resource.prefixes.clone(),
-                binding: resource.binding.clone(),
-                dependencies: resource.dependencies.clone(),
-                module_source: None,
-                default_tag_keys: resource.default_tag_keys.clone(),
-                loop_provenance: resource.loop_provenance.clone(),
-                quoted_string_attrs: resource.quoted_string_attrs.clone(),
-            })
-            .collect();
+        let configuration = crate::parser::ExpandedParsedFile::default().with_resources_for_test(
+            resources
+                .iter()
+                .map(|resource| Resource {
+                    id: resource.id.clone(),
+                    attributes: resource.attributes.clone(),
+                    directives: resource.directives.clone(),
+                    resolved_ignore_changes: resource.resolved_ignore_changes.clone(),
+                    prefixes: resource.prefixes.clone(),
+                    binding: resource.binding.clone(),
+                    dependencies: resource.dependencies.clone(),
+                    module_source: None,
+                    default_tag_keys: resource.default_tag_keys.clone(),
+                    loop_provenance: resource.loop_provenance.clone(),
+                    quoted_string_attrs: resource.quoted_string_attrs.clone(),
+                })
+                .collect(),
+        );
         resolve_expanded_graph(configuration.into()).map(|graph| graph.into_parts().1)
     }
 }
@@ -1551,6 +1551,42 @@ impl ExpandedBindingIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_access_error_retains_typed_cause_without_duplicate_source() {
+        for cause in [
+            GraphExpressionError::Access(crate::resource::ValueAccessError::IndexOutOfRange {
+                index: 2,
+                len: 1,
+            }),
+            GraphExpressionError::Integer(
+                crate::integer_arithmetic::IntegerOperandError::NonInteger {
+                    side: crate::integer_arithmetic::IntegerOperandSide::Left,
+                    actual: "String",
+                },
+            ),
+        ] {
+            let error = ExpandedGraphResolutionError::ValueAccess {
+                owner: "consumer".to_string(),
+                error: cause.clone(),
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "consumer: failed to rebuild value access after handle resolution: {cause}"
+                )
+            );
+            assert!(std::error::Error::source(&error).is_none());
+            let ExpandedGraphResolutionError::ValueAccess {
+                error: retained, ..
+            } = error
+            else {
+                panic!("value access failures must retain their typed cause");
+            };
+            assert_eq!(retained, cause);
+        }
+    }
+
     #[test]
     fn deferred_for_over_upstream_state_dotted_root_resolves_without_external_binding_set() {
         let root = crate::resource::RootScope::new();

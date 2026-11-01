@@ -1146,8 +1146,10 @@ mod tests {
             .dependencies
             .value_bindings
             .insert(absolute_binding("foo"));
-        let mut configuration = crate::parser::ExpandedParsedFile::default();
-        configuration.resources = vec![anonymous, consumer.clone()];
+        let configuration = crate::parser::ExpandedParsedFile {
+            resources: vec![anonymous, consumer.clone()],
+            ..Default::default()
+        };
         let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into());
         assert!(
             matches!(graph, Err(crate::resolved_graph::ExpandedGraphResolutionError::MissingDependency { reference, .. }) if reference == "foo")

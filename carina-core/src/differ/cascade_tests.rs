@@ -1646,17 +1646,17 @@ fn resolve_cascade_targets(
     targets: DeferredCreateTargets,
     resources: &[ResolvedResource],
 ) -> ResolvedDeferredCreateTargets {
-    let mut configuration = crate::parser::ExpandedParsedFile::default();
-    configuration.resources = resources
-        .iter()
-        .map(|resource| resource.as_inner().clone().into_unexpanded_for_test())
-        .collect();
-    configuration
-        .upstream_states
-        .push(crate::parser::UpstreamState {
+    let configuration = crate::parser::ExpandedParsedFile {
+        resources: resources
+            .iter()
+            .map(|resource| resource.as_inner().clone().into_unexpanded_for_test())
+            .collect(),
+        upstream_states: vec![crate::parser::UpstreamState {
             binding: absolute_binding("other"),
             source: "../other".into(),
-        });
+        }],
+        ..Default::default()
+    };
     let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
         .expect("cascade producer graph");
     targets

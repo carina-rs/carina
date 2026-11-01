@@ -473,9 +473,11 @@ fn write_moved_legacy_scope_project(project: &Project, prevent_destroy: bool) ->
         "let igw = mock.test.resource { name = \"igw\" }\n",
     )
     .expect("write module gateway");
-    let directives = prevent_destroy
-        .then_some("  directives { prevent_destroy = true }\n")
-        .unwrap_or_default();
+    let directives = if prevent_destroy {
+        "  directives { prevent_destroy = true }\n"
+    } else {
+        ""
+    };
     fs::write(
         module.join("network.crn"),
         format!(

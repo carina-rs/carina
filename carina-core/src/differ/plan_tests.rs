@@ -5256,8 +5256,8 @@ fn data_source_wait_is_rejected_at_the_expanded_graph_boundary() {
     parsed.wait_bindings.push(wait.clone());
     let error = crate::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
-        configuration.resources = (&resources).to_vec();
-        configuration.data_sources = (&data_sources).to_vec();
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
         configuration.into()
     })
     .expect_err("a data source cannot be a wait target");
@@ -5579,8 +5579,8 @@ fn wait_with_unknown_target_is_rejected_at_the_expanded_graph_boundary() {
     parsed.wait_bindings.push(wait.clone());
     let error = crate::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
-        configuration.resources = (&resources).to_vec();
-        configuration.data_sources = (&[]).to_vec();
+        configuration.resources = resources.clone();
+        configuration.data_sources = Vec::new();
         configuration.into()
     })
     .expect_err("missing wait target must fail graph resolution");

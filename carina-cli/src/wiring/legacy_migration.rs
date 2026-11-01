@@ -105,31 +105,20 @@ impl<E> std::ops::Deref for MaterializedConfiguration<E> {
     }
 }
 
+type ExpandedLegacyClassificationGraph<E> = LegacyClassificationGraph<
+    E,
+    carina_core::parser::ResolvedDeferredForPhase<
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::LoopSlot,
+        carina_core::resource::AbsoluteBindingAddress,
+    >,
+>;
+
 /// No writable state or executable graph can leave this owner until warnings
 /// have been reported and the same graph has passed strict wait validation.
 pub(crate) enum ClassifiedLegacyGraph<E> {
-    Current(
-        LegacyClassificationGraph<
-            E,
-            carina_core::parser::ResolvedDeferredForPhase<
-                carina_core::resource::NoPlaceholder,
-                carina_core::resource::LoopSlot,
-                carina_core::resource::AbsoluteBindingAddress,
-            >,
-        >,
-    ),
-    Migrating(
-        UnvalidatedLegacyMigration<
-            LegacyClassificationGraph<
-                E,
-                carina_core::parser::ResolvedDeferredForPhase<
-                    carina_core::resource::NoPlaceholder,
-                    carina_core::resource::LoopSlot,
-                    carina_core::resource::AbsoluteBindingAddress,
-                >,
-            >,
-        >,
-    ),
+    Current(Box<ExpandedLegacyClassificationGraph<E>>),
+    Migrating(Box<UnvalidatedLegacyMigration<ExpandedLegacyClassificationGraph<E>>>),
 }
 
 pub(crate) struct ValidatedLegacyGraph<E> {
@@ -203,7 +192,7 @@ pub(crate) fn classify_legacy_state<E>(
         match outcome {
             LegacyClassificationOutcome::Classified(migration) => {
                 Ok(LegacyClassificationOutcome::Classified(
-                    ClassifiedLegacyGraph::Migrating(migration),
+                    ClassifiedLegacyGraph::Migrating(Box::new(migration)),
                 ))
             }
             LegacyClassificationOutcome::RequiresReads(rows) => {
@@ -212,7 +201,7 @@ pub(crate) fn classify_legacy_state<E>(
         }
     } else {
         Ok(LegacyClassificationOutcome::Classified(
-            ClassifiedLegacyGraph::Current(graph),
+            ClassifiedLegacyGraph::Current(Box::new(graph)),
         ))
     }
 }

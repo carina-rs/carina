@@ -6715,6 +6715,16 @@ where
     T: PlaceholderKind,
     B: BindingAddress,
 {
+    /// Populate fixture resources while keeping parser-owned metadata private.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn with_resources_for_test(
+        mut self,
+        resources: Vec<Resource<ModuleSource, P, B>>,
+    ) -> Self {
+        self.resources = resources;
+        self
+    }
+
     pub fn bare_binding_uses(&self) -> &ParsedBindingUses<B> {
         &self.parsed_binding_uses
     }
@@ -8856,7 +8866,7 @@ mod substitute_placeholder_tests {
             ForBinding::Simple("opt".into()),
             Resource::new("mock.Target", "children"),
         );
-        let wire = serde_json::to_value(&deferred.clone().into_compiled()).unwrap();
+        let wire = serde_json::to_value(deferred.into_compiled()).unwrap();
         for field in ["file", "line"] {
             assert!(
                 wire.get(field).is_some(),
@@ -8882,7 +8892,7 @@ mod substitute_placeholder_tests {
             ForBinding::Simple("opt".into()),
             Resource::new("mock.Target", "children"),
         );
-        let mut wire = serde_json::to_value(&deferred.clone().into_compiled()).unwrap();
+        let mut wire = serde_json::to_value(deferred.into_compiled()).unwrap();
         wire["file"] = serde_json::json!("/machine/local/main.crn");
         assert!(
             serde_json::from_value::<SavedDeferredForExpression>(wire).is_err(),

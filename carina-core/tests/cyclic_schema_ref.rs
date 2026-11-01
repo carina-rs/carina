@@ -39,7 +39,7 @@ fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedRe
     let graph = carina_core::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
         configuration.resources = (std::slice::from_ref(&resource)).to_vec();
-        configuration.data_sources = (&[]).to_vec();
+        configuration.data_sources = Vec::new();
         configuration.into()
     })
     .expect("cyclic-schema fixture graph must resolve");

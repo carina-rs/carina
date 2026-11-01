@@ -348,20 +348,17 @@ fn format_value_display() {
 #[test]
 fn tree_structure_with_dependencies() {
     // Create a plan where subnet depends on vpc via ResourceRef
-    let mut resources = Vec::new();
-    resources.push(
+    let resources = vec![
         Resource::new("ec2.Vpc", "my-vpc")
             .with_absolute_binding(absolute("vpc"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
-    );
-    resources.push(
         Resource::new("ec2.Subnet", "my-subnet")
             .with_absolute_binding(absolute("subnet"))
             .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-    );
+    ];
     let plan = crate::create_plan_fixture(resources);
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());

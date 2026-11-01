@@ -1326,7 +1326,7 @@ fn lift_module_attribute_handles<E>(
 
     for call in &mut parsed.module_calls {
         for argument in call.arguments_mut() {
-            let handle = argument.value().and_then(&lift);
+            let handle = argument.value().and_then(lift);
             if let Some(handle) = handle {
                 argument.replace_with_resource_handle(handle);
             }

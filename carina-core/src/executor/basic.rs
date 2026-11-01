@@ -12,8 +12,8 @@ use crate::binding_index::{
 use crate::differ::{AttrComparison, LeafProvenance, TypedAttr, secret_grafted_comparison_view};
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
-    CheckInput, ProviderPreparationContext, ResolvedCheckInput, managed_update_schema,
-    prepare_provider_ready_resource_after_resolution,
+    CheckInput, DataSourceCheckInput, ProviderPreparationContext, ResolvedCheckInput,
+    ResourceCheckInput, managed_update_schema, prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
     AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
@@ -22,9 +22,11 @@ use crate::provider::{
     UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
+#[cfg(test)]
+use crate::resource::Resource;
 use crate::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, Resource,
-    ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, ResourceId, State,
+    Value,
 };
 use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
@@ -189,23 +191,7 @@ pub(super) async fn refresh_pending_states<S: Clone>(
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource<S: Clone>(
-    input: Result<
-        CheckInput<
-            Resource<
-                S,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                (),
-            >,
-            Resource<
-                S,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                (),
-            >,
-        >,
-        String,
-    >,
+    input: Result<ResourceCheckInput<S>, String>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<(ProviderReadyResource, SecretPreservingAttributes), EffectFailureKind> {
     let bindings = context.bindings();
@@ -310,23 +296,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
 }
 
 pub(super) fn resolve_data_source<S: Clone>(
-    input: Result<
-        CheckInput<
-            DataSource<
-                S,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                (),
-            >,
-            DataSource<
-                S,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                (),
-            >,
-        >,
-        String,
-    >,
+    input: Result<DataSourceCheckInput<S>, String>,
     bindings: &ResolvedBindings,
 ) -> Result<
     ResolvedCheckInput<

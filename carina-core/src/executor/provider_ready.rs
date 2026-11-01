@@ -23,13 +23,11 @@ use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
     CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, UpdateRequest,
 };
-#[cfg(test)]
-use crate::resource::NoPlaceholder;
 use crate::resource::{
-    BindingAddress, ConcreteValue, DataSource, DeferredValue, LiveComposition, ParserPlaceholder,
-    PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
-    RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
-    SavedComposition, Value,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DataSource, DeferredValue,
+    LiveComposition, NoPlaceholder, ParserPlaceholder, PlaceholderKind, ProviderDataSource,
+    ProviderModuleSource, ProviderResource, RelativeBindingName, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
@@ -204,6 +202,11 @@ pub(super) enum CheckInput<T, A = T> {
     Authored(T),
     PlanNormalized { resolved: T, authored: A },
 }
+
+pub(super) type ResourceCheckInput<S> =
+    CheckInput<Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>>;
+pub(super) type DataSourceCheckInput<S> =
+    CheckInput<DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>>;
 
 /// A resolved provider payload paired with the only valid schema-check scope.
 ///

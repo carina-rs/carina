@@ -427,14 +427,16 @@ mod tests {
         bindings: &ResolvedBindings,
         identity: &DeferredIdentityInputs<'_>,
     ) -> Result<Vec<Effect>, DeferredCreateFailure> {
-        let mut configuration = crate::parser::ExpandedParsedFile::default();
-        configuration.upstream_states = ["up", "parent", "upstream"]
-            .into_iter()
-            .map(|binding| crate::parser::UpstreamState {
-                binding: RootScope::new().resolve(binding.into()),
-                source: std::path::PathBuf::from("upstream"),
-            })
-            .collect();
+        let configuration = crate::parser::ExpandedParsedFile {
+            upstream_states: ["up", "parent", "upstream"]
+                .into_iter()
+                .map(|binding| crate::parser::UpstreamState {
+                    binding: RootScope::new().resolve(binding.into()),
+                    source: std::path::PathBuf::from("upstream"),
+                })
+                .collect(),
+            ..Default::default()
+        };
         let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
             .expect("fixture upstream declarations");
         let (template, descriptor) = graph

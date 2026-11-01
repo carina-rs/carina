@@ -2499,7 +2499,7 @@ pub struct MigrationInfo {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LegacyDependencyMigrationError {
     #[error(transparent)]
-    GraphValidation(#[from] ExpandedGraphResolutionError),
+    GraphValidation(Box<ExpandedGraphResolutionError>),
     #[error("legacy dependency classification is stale for this state")]
     StaleClassification,
     #[error(
@@ -2527,8 +2527,7 @@ pub enum LegacyDependencyMigrationError {
         row: String,
         location: String,
         dependency: String,
-        #[source]
-        reason: ExpandedGraphResolutionError,
+        reason: Box<ExpandedGraphResolutionError>,
     },
     #[error("{location} on {row} could not classify legacy dependency {dependency:?}: {reason}")]
     InvalidStateDependency {
@@ -2536,9 +2535,14 @@ pub enum LegacyDependencyMigrationError {
         row: String,
         location: String,
         dependency: String,
-        #[source]
-        reason: carina_core::resource::NotAManagedRow,
+        reason: Box<carina_core::resource::NotAManagedRow>,
     },
+}
+
+impl From<ExpandedGraphResolutionError> for LegacyDependencyMigrationError {
+    fn from(error: ExpandedGraphResolutionError) -> Self {
+        Self::GraphValidation(Box::new(error))
+    }
 }
 
 /// Binding texts retained from the kind-blind dependency snapshot written by
@@ -2878,7 +2882,7 @@ fn classify_legacy_names(
                                     row: row.to_string(),
                                     location: location.clone(),
                                     dependency: dependency.to_string(),
-                                    reason: error,
+                                    reason: Box::new(error),
                                 }
                             })?;
                         classified =
@@ -2920,7 +2924,7 @@ fn classify_legacy_names(
                         row: row.to_string(),
                         location,
                         dependency: dependency.to_string(),
-                        reason: error,
+                        reason: Box::new(error),
                     });
                 }
             }

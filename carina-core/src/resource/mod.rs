@@ -8623,7 +8623,7 @@ impl PreventDestroy {
 /// These are instructions to Carina about how to handle the resource,
 /// not metadata about the resource itself. The provider-visible subset
 /// mirrors the WIT `directives` record; host-only fields remain outside it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Directives {
     /// If true, force-delete the resource (e.g., non-empty S3 buckets)
     #[serde(default)]
@@ -8654,19 +8654,6 @@ pub struct Directives {
 
 pub type AuthoredDirectives = Directives;
 pub type ExpandedDirectives = Directives;
-
-impl Default for Directives {
-    fn default() -> Self {
-        Self {
-            force_delete: false,
-            create_before_destroy: false,
-            prevent_destroy: PreventDestroy::default(),
-            depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
-            ignore_changes: Vec::new(),
-            provider_instance: None,
-        }
-    }
-}
 
 /// State-file projection of [`Directives`].
 ///

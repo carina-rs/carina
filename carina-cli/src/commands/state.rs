@@ -1937,7 +1937,7 @@ pub(crate) async fn run_state_refresh_locked(
         if let DataSourceValue::DeferredToApply(unresolved) = value {
             eprintln!(
                 "{}",
-                format_deferred_state_refresh_warning(resource, &unresolved).yellow()
+                format_deferred_state_refresh_warning(resource, unresolved).yellow()
             );
         }
     }
@@ -6100,8 +6100,7 @@ mod tests {
                 "security_group",
                 None,
             )]),
-        )
-        .into();
+        );
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(

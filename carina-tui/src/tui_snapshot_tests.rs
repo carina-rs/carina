@@ -65,21 +65,16 @@ fn render_tui_with_schemas(
 
 /// Build a plan with VPC + route table + subnet (all Create effects with dependencies).
 fn build_all_create_plan() -> Plan {
-    let mut resources = Vec::new();
-    resources.push(
+    let resources = vec![
         Resource::new("ec2.Vpc", "my-vpc")
             .with_absolute_binding(absolute("vpc"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
-    );
-    resources.push(
         Resource::new("ec2.RouteTable", "my-rt")
             .with_absolute_binding(absolute("rt"))
             .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-    );
-    resources.push(
         Resource::new("ec2.Subnet", "my-subnet")
             .with_absolute_binding(absolute("subnet"))
             .with_attribute(
@@ -87,9 +82,8 @@ fn build_all_create_plan() -> Plan {
                 Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
             )
             .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-    );
-    let plan = crate::create_plan_fixture(resources);
-    plan
+    ];
+    crate::create_plan_fixture(resources)
 }
 
 /// Build a plan with mixed operations: VPC Update + SG Create + Subnet Delete.

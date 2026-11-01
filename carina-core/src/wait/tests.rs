@@ -20,12 +20,14 @@ fn resolve_wait_target(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
 ) -> WaitTargetLookup {
-    let mut configuration = crate::parser::ExpandedParsedFile::default();
-    configuration.resources = managed
-        .iter()
-        .map(|row| row.as_inner().clone().into_unexpanded_for_test())
-        .collect();
-    configuration.data_sources = data_sources.to_vec();
+    let configuration = crate::parser::ExpandedParsedFile {
+        resources: managed
+            .iter()
+            .map(|row| row.as_inner().clone().into_unexpanded_for_test())
+            .collect(),
+        data_sources: data_sources.to_vec(),
+        ..Default::default()
+    };
     let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
         .expect("legacy lookup fixture graph");
     match graph.project_legacy_dependency(reference, "legacy wait fixture") {

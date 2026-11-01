@@ -1671,8 +1671,8 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
-        sorted_value_destroy_dependencies: vec![Default::default(); 0],
-        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
         legacy_dependency_classification: None,
     }
     .record_for_test(
@@ -1765,8 +1765,8 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
-        sorted_value_destroy_dependencies: vec![Default::default(); 0],
-        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
         legacy_dependency_classification: None,
     });
     let encoded = serde_json::to_value(plan_file).expect("serialize plan fixture");
@@ -2040,8 +2040,8 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
     let graph_file = carina_core::parser::ExpandedParsedFile::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
         let mut configuration = graph_file;
-        configuration.resources = (&migration_resources).to_vec();
-        configuration.data_sources = (&[]).to_vec();
+        configuration.resources = migration_resources.clone();
+        configuration.data_sources = Vec::new();
         configuration.into()
     })
     .expect("saved-plan migration graph resolves");
@@ -2298,8 +2298,8 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
-        sorted_value_destroy_dependencies: vec![Default::default(); 0],
-        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
         legacy_dependency_classification: None,
     }
     .record_for_test(&planning_context, Vec::new())
@@ -2397,8 +2397,8 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
-        sorted_value_destroy_dependencies: vec![Default::default(); 0],
-        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
         legacy_dependency_classification: None,
     }
     .record_for_test(&planning_context, Vec::new())
@@ -4402,7 +4402,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     let parsed = carina_core::parser::ExpandedParsedFile::default();
     let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
-        configuration.resources = (&[target.clone(), consumer.clone()]).to_vec();
+        configuration.resources = vec![target.clone(), consumer.clone()];
         configuration.data_sources = (std::slice::from_ref(&lookup)).to_vec();
         configuration.into()
     })
@@ -4792,8 +4792,8 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
-        sorted_value_destroy_dependencies: vec![Default::default(); 0],
-        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
         legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_context(contents);
@@ -4907,8 +4907,8 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
-        sorted_value_destroy_dependencies: vec![Default::default(); 0],
-        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
         legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_context(contents);
@@ -9038,7 +9038,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     let mut registry_prod: Resource =
         Resource::with_provider("awscc", "organizations.account", "registry-prod", None);
     registry_prod.binding = Some(absolute_binding("registry_prod"));
-    let sorted_resources = vec![registry_prod];
+    let sorted_resources = [registry_prod];
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
@@ -9140,7 +9140,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         call_path: crate::test_composition_call_path(),
         quoted_string_attrs: std::collections::HashSet::new(),
     };
-    let sorted_resources = vec![role_resource];
+    let sorted_resources = [role_resource];
     let pre_resolve_compositions = vec![composition];
 
     let export_params = vec![ExportParameter::for_test(
@@ -9269,7 +9269,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         "role_arn",
     );
 
-    let sorted_resources = vec![role_resource];
+    let sorted_resources = [role_resource];
 
     let export_params = vec![ExportParameter::for_test(
         "role_arn".to_string(),
@@ -11471,11 +11471,8 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
         .value_bindings
         .insert(absolute_binding("registry_publish.target_role"));
 
-    let mut parsed = carina_core::parser::ExpandedParsedFile::default();
-    parsed.resources.push(target.clone());
-    parsed.data_sources.push(data_source.clone());
     let graph = carina_core::resolved_graph::resolve_expanded_graph({
-        let mut configuration = parsed;
+        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
         configuration.resources = (std::slice::from_ref(&target)).to_vec();
         configuration.data_sources = (std::slice::from_ref(&data_source)).to_vec();
         configuration.into()

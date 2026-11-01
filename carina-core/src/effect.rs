@@ -1207,6 +1207,20 @@ pub enum EffectWithSource<S> {
 pub type Effect<S = ModuleSource> = EffectWithSource<S>;
 pub type SavedEffect = EffectWithSource<SavedModuleSource>;
 
+/// Borrowed view of a graph-resolved resource carried by an effect.
+pub type EffectResourceRef<'a, S = ModuleSource> = crate::parser::ResourceRef<
+    'a,
+    S,
+    crate::resource::NoPlaceholder,
+    crate::resource::LoopSlot,
+    crate::parser::ResolvedDeferredForPhase<
+        crate::resource::NoPlaceholder,
+        crate::resource::LoopSlot,
+    >,
+    AbsoluteBindingAddress,
+    (),
+>;
+
 /// Saved-plan effect payload before authored resource directives have been
 /// resolved against the fingerprint-checked provider schemas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2217,22 +2231,7 @@ impl<S> EffectWithSource<S> {
     /// type match the variant directly; this helper covers the
     /// shared id/attributes/binding/dependency_bindings accessors
     /// through the borrowing `ResourceRef` enum.
-    pub fn as_resource_ref(
-        &self,
-    ) -> Option<
-        crate::parser::ResourceRef<
-            '_,
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::LoopSlot,
-            crate::parser::ResolvedDeferredForPhase<
-                crate::resource::NoPlaceholder,
-                crate::resource::LoopSlot,
-            >,
-            AbsoluteBindingAddress,
-            (),
-        >,
-    > {
+    pub fn as_resource_ref(&self) -> Option<EffectResourceRef<'_, S>> {
         match self {
             Effect::Create(resource) => Some(crate::parser::ResourceRef::Resource(resource)),
             Effect::ResumeCreate { resource, .. } => {
@@ -2750,7 +2749,7 @@ mod tests {
             DeferredCreate {
                 id: ResolvedResourceId,
                 template: Box<crate::parser::CompiledDeferredForExpression>,
-                dependency_template: crate::resource::DeferredDependencyTemplate,
+                dependency_template: Box<crate::resource::DeferredDependencyTemplate>,
             },
             DeferredReplace(Box<StoredDeferredReplacePayload>),
         }
@@ -2775,7 +2774,7 @@ mod tests {
         let stored_create = StoredEffect::DeferredCreate {
             id: create_id,
             template: create_template,
-            dependency_template: create_payload.dependency_template,
+            dependency_template: Box::new(create_payload.dependency_template),
         };
         assert_eq!(
             serde_json::to_vec(&current_create).expect("serialize current deferred create"),

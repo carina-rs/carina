@@ -410,8 +410,7 @@ fn structural_for_resource_pipe_is_not_exported_as_a_value() {
             .value
             .as_ref()
             .and_then(BoundaryExpression::handle)
-            .map(|handle| handle.diagnostic_name())
-            .as_deref(),
+            .map(|handle| handle.diagnostic_name()),
         Some("n"),
         "the computed pipe value must not escape under the resource binding name",
     );
@@ -15266,10 +15265,7 @@ fn parse_provider_expr_named_instance_in_let_binding() {
         .find(|p| !p.is_default())
         .expect("named instance from let binding");
     assert_eq!(named.name, "aws", "named instance carries the kind");
-    assert_eq!(
-        named.binding.as_ref().map(|binding| binding.as_str()),
-        Some("us")
-    );
+    assert_eq!(named.binding.as_deref(), Some("us"));
     // Named instances do NOT carry source/version/revision; those are kind-level.
     assert!(named.source.is_none());
     assert!(named.version.is_none());
@@ -15389,7 +15385,7 @@ fn parse_provider_expr_multiple_named_instances() {
     let mut bindings: Vec<Option<&str>> = parsed
         .providers
         .iter()
-        .map(|p| p.binding.as_ref().map(|binding| binding.as_str()))
+        .map(|p| p.binding.as_deref())
         .collect();
     bindings.sort();
     assert_eq!(bindings, vec![None, Some("tokyo"), Some("virginia")]);
@@ -15435,9 +15431,10 @@ fn parse_provider_expr_named_instance_visible_across_files() {
         .providers
         .iter()
         .any(|p| p.name == "aws" && p.is_default());
-    let has_named = parsed.providers.iter().any(|p| {
-        p.name == "aws" && p.binding.as_ref().map(|binding| binding.as_str()) == Some("us")
-    });
+    let has_named = parsed
+        .providers
+        .iter()
+        .any(|p| p.name == "aws" && p.binding.as_deref() == Some("us"));
     assert!(has_default, "default instance from providers.crn missing");
     assert!(has_named, "named instance from main.crn missing");
 }
@@ -15455,7 +15452,7 @@ fn parse_provider_expr_empty_body() {
     let named = parsed
         .providers
         .iter()
-        .find(|p| p.binding.as_ref().map(|binding| binding.as_str()) == Some("us"))
+        .find(|p| p.binding.as_deref() == Some("us"))
         .expect("named instance with empty body must parse");
     assert!(
         named.attributes.is_empty(),
@@ -15528,10 +15525,7 @@ fn provider_config_named_instance_serde_round_trip() {
     let decoded: ProviderConfig<ParserPlaceholder, RelativeBindingName> =
         serde_json::from_str(&json).expect("deserialize");
     assert_eq!(decoded.name, "aws");
-    assert_eq!(
-        decoded.binding.as_ref().map(|binding| binding.as_str()),
-        Some("us")
-    );
+    assert_eq!(decoded.binding.as_deref(), Some("us"));
     assert!(!decoded.is_default());
 }
 
@@ -15548,10 +15542,7 @@ fn provider_config_deserializes_legacy_plan_instance_shapes() {
         }"#,
     )
     .expect("deserialize named provider from an existing plan");
-    assert_eq!(
-        named.binding.as_ref().map(|binding| binding.as_str()),
-        Some("east")
-    );
+    assert_eq!(named.binding.as_deref(), Some("east"));
     assert!(!named.is_default());
 
     let default: ProviderConfig = serde_json::from_str(
@@ -15967,7 +15958,7 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
     let us = parsed
         .providers
         .iter()
-        .find(|p| p.binding.as_ref().map(|binding| binding.as_str()) == Some("us"))
+        .find(|p| p.binding.as_deref() == Some("us"))
         .expect("`us` named instance must exist in parsed.providers");
     // The parser stamps namespaced region literals as `EnumIdentifier` so the
     // host can resolve them with the provider config schema. It must not erase
@@ -16758,8 +16749,7 @@ exports { exported = vpc }"#,
             .value
             .as_ref()
             .and_then(crate::parser::BoundaryExpression::handle)
-            .map(|handle| handle.diagnostic_name())
-            .as_deref(),
+            .map(|handle| handle.diagnostic_name()),
         Some("vpc"),
     );
     assert_eq!(
@@ -16767,8 +16757,7 @@ exports { exported = vpc }"#,
             .value
             .as_ref()
             .and_then(crate::parser::BoundaryExpression::handle)
-            .map(|handle| handle.diagnostic_name())
-            .as_deref(),
+            .map(|handle| handle.diagnostic_name()),
         Some("vpc"),
     );
 }

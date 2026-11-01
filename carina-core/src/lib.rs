@@ -67,18 +67,20 @@ pub(crate) mod test_support {
     /// Explicit rows shared by scheduler/display deferred-loop fixtures.
     pub fn compiled_loop(template: Box<ExpandedDeferredForExpression>) -> DeferredCreatePayload {
         let root = RootScope::new();
-        let mut configuration = ExpandedParsedFile::default();
-        configuration.upstream_states = vec![crate::parser::UpstreamState {
-            binding: root.resolve("upstream".into()),
-            source: "upstream".into(),
-        }];
-        configuration.resources = ["cert", "primary", "fallback", "parent"]
-            .into_iter()
-            .map(|binding| {
-                Resource::new("test", binding)
-                    .with_absolute_binding(root.resolve(RelativeBindingName::new(binding)))
-            })
-            .collect();
+        let configuration = ExpandedParsedFile {
+            upstream_states: vec![crate::parser::UpstreamState {
+                binding: root.resolve("upstream".into()),
+                source: "upstream".into(),
+            }],
+            resources: ["cert", "primary", "fallback", "parent"]
+                .into_iter()
+                .map(|binding| {
+                    Resource::new("test", binding)
+                        .with_absolute_binding(root.resolve(RelativeBindingName::new(binding)))
+                })
+                .collect(),
+            ..Default::default()
+        };
         let graph = resolve_expanded_graph(configuration.into())
             .expect("deferred fixture rows form a valid graph");
         let (template, dependencies) = graph
@@ -117,12 +119,14 @@ pub(crate) mod test_support {
                     .with_absolute_binding(root.resolve(RelativeBindingName::new(binding)))
             })
             .collect::<Vec<_>>();
-        let mut configuration = ExpandedParsedFile::default();
-        configuration.resources = resources;
-        configuration.upstream_states = vec![crate::parser::UpstreamState {
-            binding: root.resolve("upstream".into()),
-            source: "upstream".into(),
-        }];
+        let configuration = ExpandedParsedFile {
+            resources,
+            upstream_states: vec![crate::parser::UpstreamState {
+                binding: root.resolve("upstream".into()),
+                source: "upstream".into(),
+            }],
+            ..Default::default()
+        };
         let graph =
             resolve_expanded_graph(configuration.into()).expect("fixture producers resolve");
         let (_, index) = graph.into_parts();

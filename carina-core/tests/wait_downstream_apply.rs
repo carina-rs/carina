@@ -95,7 +95,7 @@ fn resolve_plan_graph(
     let index = carina_core::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
         configuration.resources = (resources).to_vec();
-        configuration.data_sources = (&[]).to_vec();
+        configuration.data_sources = Vec::new();
         configuration.into()
     })
     .expect("expanded test graph must resolve");

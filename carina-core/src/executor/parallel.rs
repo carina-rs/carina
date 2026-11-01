@@ -1515,7 +1515,7 @@ mod tests {
             .iter()
             .map(|operand| match operand {
                 crate::parser::UnexpandedDependencyOperand::Handle(handle) => {
-                    fixture_id(handle.canonical_binding_name().as_ref())
+                    fixture_id(handle.canonical_binding_name())
                 }
                 crate::parser::UnexpandedDependencyOperand::BareBinding(binding) => {
                     fixture_id(binding.as_str())
@@ -1892,11 +1892,9 @@ mod tests {
         });
         plan.add(Effect::Create(resolved(alb.clone())));
         let listener_origin = listener.clone();
-        let mut configuration = crate::parser::ExpandedParsedFile::default();
-        configuration.resources = vec![cert.clone(), alb.clone(), listener.clone()];
-        configuration
-            .wait_bindings
-            .push(crate::parser::WaitBinding {
+        let configuration = crate::parser::ExpandedParsedFile {
+            resources: vec![cert.clone(), alb.clone(), listener.clone()],
+            wait_bindings: vec![crate::parser::WaitBinding {
                 binding: absolute("cert_issued"),
                 target: absolute("cert"),
                 until_raw: "cert.status == ISSUED".to_owned(),
@@ -1908,7 +1906,9 @@ mod tests {
                 timeout_secs: None,
                 depends_on: Default::default(),
                 line: 1,
-            });
+            }],
+            ..Default::default()
+        };
         let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
             .expect("wait fixture graph");
         plan.add(Effect::Create(
@@ -2191,20 +2191,22 @@ mod tests {
         };
 
         let child_id = child.id.clone();
-        let mut configuration = crate::parser::ExpandedParsedFile::default();
-        configuration.resources = vec![
-            parent
-                .as_resource_ref()
-                .and_then(|resource| match resource {
-                    crate::parser::ResourceRef::Resource(resource) => {
-                        Some(resource.clone().into_unexpanded_for_test())
-                    }
-                    _ => None,
-                })
-                .expect("parent resource"),
-            child.clone(),
-        ];
-        configuration.compositions = vec![virt];
+        let configuration = crate::parser::ExpandedParsedFile {
+            resources: vec![
+                parent
+                    .as_resource_ref()
+                    .and_then(|resource| match resource {
+                        crate::parser::ResourceRef::Resource(resource) => {
+                            Some(resource.clone().into_unexpanded_for_test())
+                        }
+                        _ => None,
+                    })
+                    .expect("parent resource"),
+                child.clone(),
+            ],
+            compositions: vec![virt],
+            ..Default::default()
+        };
         let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
             .expect("composition fixture graph");
         let resolved_child = graph
@@ -2324,8 +2326,8 @@ mod tests {
         parsed.compositions.push(virt.clone());
         let index = crate::resolved_graph::resolve_expanded_graph({
             let mut configuration = parsed;
-            configuration.resources = (&resources).to_vec();
-            configuration.data_sources = (&[]).to_vec();
+            configuration.resources = resources.clone();
+            configuration.data_sources = Vec::new();
             configuration.into()
         })
         .expect("composition references flatten at the expanded graph seam");

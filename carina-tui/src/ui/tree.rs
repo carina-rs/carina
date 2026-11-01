@@ -202,20 +202,17 @@ mod tests {
 
     #[test]
     fn tree_connector_single_child() {
-        let mut resources = Vec::new();
-        resources.push(
+        let resources = vec![
             Resource::new("ec2.Vpc", "my-vpc")
                 .with_absolute_binding(absolute("vpc"))
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 ),
-        );
-        resources.push(
             Resource::new("ec2.Subnet", "my-subnet")
                 .with_absolute_binding(absolute("subnet"))
                 .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-        );
+        ];
         let plan = crate::create_plan_fixture(resources);
         let app = App::for_plan(&plan, &SchemaRegistry::new());
 
@@ -226,18 +223,15 @@ mod tests {
 
     #[test]
     fn tree_connector_multiple_children() {
-        let mut resources = Vec::new();
-        resources.push(Resource::new("ec2.Vpc", "my-vpc").with_absolute_binding(absolute("vpc")));
-        resources.push(
+        let resources = vec![
+            Resource::new("ec2.Vpc", "my-vpc").with_absolute_binding(absolute("vpc")),
             Resource::new("ec2.Subnet", "subnet-a")
                 .with_absolute_binding(absolute("subnet_a"))
                 .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-        );
-        resources.push(
             Resource::new("ec2.Subnet", "subnet-b")
                 .with_absolute_binding(absolute("subnet_b"))
                 .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-        );
+        ];
         let plan = crate::create_plan_fixture(resources);
         let app = App::for_plan(&plan, &SchemaRegistry::new());
 
@@ -252,22 +246,17 @@ mod tests {
 
     #[test]
     fn selected_ancestor_row_keeps_connector_indent_unstyled() {
-        let mut resources = Vec::new();
-        resources.push(Resource::new("test.Root", "root").with_absolute_binding(absolute("root")));
-        resources.push(
+        let resources = vec![
+            Resource::new("test.Root", "root").with_absolute_binding(absolute("root")),
             Resource::new("test.Parent", "parent")
                 .with_absolute_binding(absolute("parent"))
                 .with_attribute("root_id", root_ref("root", "id")),
-        );
-        resources.push(
             Resource::new("test.Ancestor", "ancestor")
                 .with_absolute_binding(absolute("ancestor"))
                 .with_attribute("parent_id", root_ref("parent", "id")),
-        );
-        resources.push(
             Resource::new("test.Leaf", "matching-leaf")
                 .with_attribute("ancestor_id", root_ref("ancestor", "id")),
-        );
+        ];
         let plan = crate::create_plan_fixture(resources);
         let mut app = App::for_plan(&plan, &SchemaRegistry::new());
         app.search_query = "matching-leaf".to_string();

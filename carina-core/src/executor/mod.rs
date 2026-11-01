@@ -678,23 +678,7 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
             (),
         >,
         runtime_authored: bool,
-    ) -> Result<
-        provider_ready::CheckInput<
-            Resource<
-                S,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                (),
-            >,
-            Resource<
-                S,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                (),
-            >,
-        >,
-        String,
-    > {
+    ) -> Result<provider_ready::ResourceCheckInput<S>, String> {
         if runtime_authored || matches!(self, Self::Authored) {
             return Ok(provider_ready::CheckInput::Authored(resolved.clone()));
         }
@@ -724,23 +708,7 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
             crate::resource::AbsoluteBindingAddress,
             (),
         >,
-    ) -> Result<
-        provider_ready::CheckInput<
-            DataSource<
-                S,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                (),
-            >,
-            DataSource<
-                S,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                (),
-            >,
-        >,
-        String,
-    > {
+    ) -> Result<provider_ready::DataSourceCheckInput<S>, String> {
         match self {
             Self::Authored => Ok(provider_ready::CheckInput::Authored(resolved.clone())),
             Self::PlanNormalized {

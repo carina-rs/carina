@@ -10256,7 +10256,10 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
     )
     .expect("early move must re-key its orphan state");
     let early_pair = (early_source_id, desired_id.clone());
-    assert_eq!(addressed.moved_pairs.as_slice(), &[early_pair.clone()]);
+    assert_eq!(
+        addressed.moved_pairs.as_slice(),
+        std::slice::from_ref(&early_pair)
+    );
     assert!(addressed.orphans.contains_key(other_orphan_id.as_inner()));
     let comparison_provider =
         comparison_provider_for_resources(ctx.schemas(), resources.resources());
