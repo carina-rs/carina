@@ -8,7 +8,8 @@
 //! the legacy `from_*_with_state` entries have been removed (carina#3248).
 //! a thin shim over the two new entry points.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
@@ -103,7 +104,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(absolute_binding(binding)),
-        dependency_bindings: BTreeSet::new(),
+        dependencies: Default::default(),
         module_source: None,
         default_tag_keys: Default::default(),
         loop_provenance: Default::default(),
@@ -142,7 +143,9 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> LiveCompositi
 #[test]
 fn pre_apply_records_dsl_attributes() {
     let m = make_managed("a", &[("value", s("hello"))]);
-    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+        crate::resource::UnexpandedDependencyFields,
+    > {
         managed: &[m],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -202,7 +205,7 @@ fn pre_apply_skips_resources_without_binding() {
 fn pre_apply_composition_is_complete_for_coalesce_absence() {
     let composition = make_virtual("module", &[("present", s("value"))]);
     let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-        managed: &[],
+        managed: &[] as &[Resource],
         compositions: &[composition],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
@@ -225,14 +228,17 @@ fn pre_apply_composition_is_complete_for_coalesce_absence() {
 #[test]
 fn add_compositions_layers_on_top_of_resources() {
     let managed = make_managed("a", &[("value", s("from_managed"))]);
-    let mut bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-        managed: &[managed],
-        compositions: &[],
-        managed_current: &HashMap::new(),
-        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
-        wait_aliases: &[],
-    });
+    let mut bindings =
+        ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+            crate::resource::UnexpandedDependencyFields,
+        > {
+            managed: &[managed],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        });
     assert!(bindings.get("a").is_some());
 
     let virt = make_virtual("v", &[("role_arn", s("post_apply_arn"))]);
@@ -274,7 +280,7 @@ fn add_compositions_skips_unbound() {
     let mut virt = make_virtual("v", &[("k", s("x"))]);
     virt.binding = None;
     let mut bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-        managed: &[],
+        managed: &[] as &[Resource],
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),

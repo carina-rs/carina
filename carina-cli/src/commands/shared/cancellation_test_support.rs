@@ -1,4 +1,3 @@
-use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,9 +11,6 @@ use carina_state::{
     BackendError, BackendResult, LoadedState, LockInfo, RawState, StateBackend, StateFile,
 };
 use tempfile::TempDir;
-
-pub(crate) static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
 
 /// Delegates state I/O to a local backend but simulates another process taking
 /// the lock after the test confirms its provider call is blocked.
@@ -118,9 +114,6 @@ impl StateBackend for LockLossBackend {
     }
 }
 
-static REFRESH_DRAIN_BARRIER: std::sync::Mutex<Option<RefreshDrainBarrier>> =
-    std::sync::Mutex::new(None);
-
 #[derive(Clone)]
 pub(crate) struct RefreshDrainBarrier {
     reached: std::sync::Arc<tokio::sync::Notify>,
@@ -138,21 +131,31 @@ impl RefreshDrainBarrier {
     }
 }
 
-pub(crate) fn install_refresh_drain_barrier(shutdown: ShutdownToken) -> RefreshDrainBarrier {
+pub(crate) fn install_refresh_drain_barrier(
+    runtime: &crate::runtime::CommandRuntime,
+    shutdown: ShutdownToken,
+) -> RefreshDrainBarrier {
     let barrier = RefreshDrainBarrier {
         reached: std::sync::Arc::new(tokio::sync::Notify::new()),
         release: std::sync::Arc::new(tokio::sync::Notify::new()),
         shutdown,
     };
-    *REFRESH_DRAIN_BARRIER
+    *runtime
+        .test_hooks()
+        .refresh_drain
         .lock()
         .expect("refresh drain barrier lock") = Some(barrier.clone());
     barrier
 }
 
-pub(crate) async fn observe_refresh_drain_wait(shutdown: &ShutdownToken) {
+pub(crate) async fn observe_refresh_drain_wait(
+    runtime: &crate::runtime::CommandRuntime,
+    shutdown: &ShutdownToken,
+) {
     let barrier = {
-        let mut barrier = REFRESH_DRAIN_BARRIER
+        let mut barrier = runtime
+            .test_hooks()
+            .refresh_drain
             .lock()
             .expect("refresh drain barrier lock");
         if barrier
@@ -170,38 +173,8 @@ pub(crate) async fn observe_refresh_drain_wait(shutdown: &ShutdownToken) {
     }
 }
 
-pub(crate) struct ScopedEnv {
-    name: &'static str,
-    previous: Option<OsString>,
-}
-
-impl ScopedEnv {
-    pub(crate) fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
-        let previous = std::env::var_os(name);
-        // SAFETY: cancellation tests hold MOCK_PROVIDER_ENV_LOCK for the
-        // lifetime of every ScopedEnv value.
-        unsafe {
-            std::env::set_var(name, value);
-        }
-        Self { name, previous }
-    }
-}
-
-impl Drop for ScopedEnv {
-    fn drop(&mut self) {
-        // SAFETY: cancellation tests hold MOCK_PROVIDER_ENV_LOCK until after
-        // their fixture (and therefore these guards) is dropped.
-        unsafe {
-            if let Some(previous) = &self.previous {
-                std::env::set_var(self.name, previous);
-            } else {
-                std::env::remove_var(self.name);
-            }
-        }
-    }
-}
-
 pub(crate) struct CancellationFixtureBase {
+    runtime: crate::test_support::TestCommandRuntime,
     _dir: TempDir,
     config_path: PathBuf,
     crn_path: PathBuf,
@@ -225,6 +198,7 @@ impl CancellationFixtureBase {
 
         let (shutdown_trigger, shutdown) = shutdown_channel();
         Self {
+            runtime: crate::test_support::TestCommandRuntime::new(),
             _dir: dir,
             config_path,
             crn_path,
@@ -234,6 +208,26 @@ impl CancellationFixtureBase {
             shutdown_trigger,
             shutdown,
         }
+    }
+
+    pub(crate) fn runtime(&self) -> &crate::runtime::CommandRuntime {
+        &self.runtime
+    }
+    pub(crate) fn configure_mock(
+        &mut self,
+        behavior: carina_provider_mock::MockBehavior,
+        scope: carina_provider_mock::MockScope,
+    ) {
+        self.runtime.set_mock(behavior, scope);
+    }
+    pub(crate) fn update_mock(
+        &mut self,
+        update: impl FnOnce(
+            &mut carina_provider_mock::MockBehavior,
+            &mut carina_provider_mock::MockScope,
+        ),
+    ) {
+        self.runtime.update_mock(update);
     }
 
     pub(crate) fn write_crn(&self, content: impl AsRef<str>) {

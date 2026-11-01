@@ -21,11 +21,11 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::error::AppError;
 
-struct ProcessExit;
+struct ProcessExit(crate::cursor::CursorState);
 
 impl ExitProcess for ProcessExit {
     fn exit(&self, code: i32) {
-        crate::cursor::restore_cursor();
+        self.0.restore();
         std::process::exit(code);
     }
 }
@@ -75,13 +75,13 @@ impl ShutdownEvents for SignalEvents {
 }
 
 /// Run a command under unified SIGINT/SIGTERM supervision.
-pub async fn run_with_shutdown<F, Fut, T>(command: F) -> T
+pub async fn run_with_shutdown<F, Fut, T>(cursor: &crate::cursor::CursorState, command: F) -> T
 where
     F: FnOnce(ShutdownToken) -> Fut,
     Fut: Future<Output = T>,
 {
     let events = SignalEvents::unix().expect("install unix signal handlers");
-    match supervise_shutdown_events(command, events, ProcessExit).await {
+    match supervise_shutdown_events(command, events, ProcessExit(cursor.clone())).await {
         Supervised::Completed(output) => output,
         Supervised::ExitRequested(_) => {
             unreachable!("ProcessExit must not return after std::process::exit")

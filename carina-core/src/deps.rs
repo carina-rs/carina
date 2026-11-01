@@ -28,11 +28,11 @@ pub fn get_resource_dependencies<S, P: crate::resource::PlaceholderKind, B: Bind
     // transit_gateway_id is itself `tgw.id`. In this case, collect_dependencies
     // finds "tgw" but misses "tgw_attach". The typed dependency_bindings field
     // (saved before resolution) correctly records the original direct dependency.
-    for name in &resource.dependency_bindings {
+    for name in &resource.dependencies.value_bindings {
         deps.insert(name.clone());
     }
-    for name in &resource.directives.depends_on {
-        deps.insert(name.clone());
+    for name in &resource.dependencies.depends_on {
+        deps.insert(name.binding_reference());
     }
     deps
 }
@@ -79,11 +79,11 @@ pub fn get_data_source_dependencies<S, P: crate::resource::PlaceholderKind, B: B
     for value in data_source.attributes.values() {
         collect_dependencies(value, &mut deps);
     }
-    for name in &data_source.dependency_bindings {
+    for name in &data_source.dependencies.value_bindings {
         deps.insert(name.clone());
     }
-    for name in &data_source.directives.depends_on {
-        deps.insert(name.clone());
+    for name in &data_source.dependencies.depends_on {
+        deps.insert(name.binding_reference());
     }
     deps
 }
@@ -262,7 +262,7 @@ mod tests {
     use crate::resource::{
         AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
         ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource,
-        ExpandedValue as Value, RelativeBindingName, ResourceId, ResourceIdentity, RootScope,
+        ExpandedValue as Value, RelativeBindingName, ResourceId, RootScope,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
@@ -272,9 +272,11 @@ mod tests {
 
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
-            identity: absolute_binding("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: crate::wait::ManagedWaitTarget::new(
-                &crate::resource::ResolvedResource::new(Resource::new("acm.Certificate", "cert")),
+                &crate::resource::ResolvedResource::new(
+                    Resource::new("acm.Certificate", "cert").with_dependency_phase(()),
+                ),
             ),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -284,7 +286,15 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: binding.into_iter().map(absolute_binding).collect(),
+            explicit_dependencies: binding
+                .into_iter()
+                .map(|binding| {
+                    crate::resource::ResolvedResourceId::with_identity(
+                        "test",
+                        crate::resource::ResourceIdentity::new(binding),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -444,7 +454,7 @@ mod tests {
             Value::root_resource_ref("rt", "route_table_id", vec![]),
         );
         // dependency_bindings was saved before resolution with the CORRECT deps
-        resource.dependency_bindings = std::collections::BTreeSet::from([
+        resource.dependencies.value_bindings = std::collections::BTreeSet::from([
             absolute_binding("rt"),
             absolute_binding("tgw_attach"),
         ]);
@@ -526,14 +536,14 @@ mod tests {
     }
 
     #[test]
-    fn wait_blocking_bindings_include_target_before_explicit_dependencies() {
+    fn wait_blocking_dependencies_include_target_and_explicit_dependencies() {
         let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
         assert_eq!(
             effect.blocking_keys(),
-            vec![
-                SchedulerKey::Resource(ResourceIdentity::new("cert")),
-                SchedulerKey::Binding(absolute_binding("other_failed")),
-            ]
+            crate::resource::ResolvedDependencies::from_iter([
+                SchedulerKey::with_identity("acm.Certificate", "cert"),
+                SchedulerKey::with_identity("test", "other_failed")
+            ])
         );
     }
 
@@ -727,7 +737,7 @@ mod tests {
     #[test]
     fn directives_depends_on_is_unioned_into_resource_dependencies() {
         let mut bucket: Resource = Resource::new("s3.Bucket", "bucket");
-        bucket.directives.depends_on = vec![absolute_binding("role")];
+        bucket.dependencies.depends_on = vec![absolute_binding("role")].into();
 
         let deps = get_resource_dependencies(&bucket);
         assert!(
@@ -744,7 +754,7 @@ mod tests {
             "encryption_key".to_string(),
             Value::root_resource_ref("key", "arn", vec![]),
         );
-        bucket.directives.depends_on = vec![absolute_binding("role")];
+        bucket.dependencies.depends_on = vec![absolute_binding("role")].into();
 
         let deps = get_resource_dependencies(&bucket);
         assert!(

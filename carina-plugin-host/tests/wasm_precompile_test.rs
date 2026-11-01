@@ -116,20 +116,20 @@ fn build_protocol_v2_component() -> Vec<u8> {
         .expect("copy provider types");
     let mut provider_wit =
         std::fs::read_to_string(current_wit.join("provider.wit")).expect("read provider WIT");
-    let resource_result = ") -> result<list<resource-def>, provider-error>;";
+    let resource_result = ") -> result<list<desired-resource>, provider-error>;";
     let state_result = ") -> result<list<tuple<string, persisted-state>>, provider-error>;";
     assert_eq!(
         provider_wit.matches(resource_result).count(),
         1,
-        "v4 WIT must have a result channel for desired-resource normalization"
+        "current WIT must have a result channel for desired-resource normalization"
     );
     assert_eq!(
         provider_wit.matches(state_result).count(),
         2,
-        "v4 WIT must have result channels for both state normalizers"
+        "current WIT must have result channels for both state normalizers"
     );
     provider_wit = provider_wit
-        .replace(resource_result, ") -> list<resource-def>;")
+        .replace(resource_result, ") -> list<desired-resource>;")
         .replace(state_result, ") -> list<tuple<string, persisted-state>>;");
     std::fs::write(wit_dir.join("provider.wit"), provider_wit).expect("write v2 provider WIT");
     std::fs::write(

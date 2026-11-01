@@ -10,7 +10,8 @@
 //! `resolve_refs_with_state_and_remote(&mut [Resource], …)` shim is
 //! unchanged.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
@@ -50,7 +51,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(absolute_binding(binding)),
-        dependency_bindings: BTreeSet::new(),
+        dependencies: Default::default(),
         module_source: None,
         default_tag_keys: Default::default(),
         loop_provenance: Default::default(),
@@ -132,10 +133,11 @@ fn resolve_managed_refs_records_dependency_bindings() {
 
     assert!(
         managed[1]
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .contains(&absolute_binding("a")),
         "expected dependency on `a`, got {:?}",
-        managed[1].dependency_bindings,
+        managed[1].dependencies.value_bindings,
     );
 }
 
@@ -182,7 +184,9 @@ fn resolve_live_composition_refs_post_apply_uses_provided_bindings() {
     // that the post-apply entry resolves `LiveComposition` refs
     // against the supplied view.
     let referenced = make_managed("a", &[("value", s("post_apply_value"))]);
-    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+        crate::resource::UnexpandedDependencyFields,
+    > {
         managed: std::slice::from_ref(&referenced),
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -200,7 +204,10 @@ fn resolve_live_composition_refs_post_apply_uses_provided_bindings() {
         .attributes
         .get("forwarded")
         .expect("forwarded present");
-    assert_eq!(forwarded.to_value(), s("post_apply_value"));
+    assert_eq!(
+        forwarded.value().expect("value composition attribute"),
+        s("post_apply_value")
+    );
 }
 
 #[test]
@@ -231,7 +238,7 @@ fn resolve_live_composition_refs_post_apply_picks_post_apply_value_not_pre_apply
         .get("role_arn")
         .expect("role_arn present");
     assert_eq!(
-        role_arn.to_value(),
+        role_arn.value().expect("value composition attribute"),
         s("post_apply_arn"),
         "expected post-apply ARN, got {role_arn:?}",
     );
@@ -241,7 +248,9 @@ fn resolve_live_composition_refs_post_apply_picks_post_apply_value_not_pre_apply
 fn resolve_live_composition_refs_post_apply_leaves_non_ref_values_intact() {
     // A literal attribute on a `LiveComposition` should be preserved
     // verbatim by the post-apply pass.
-    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
+    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+        crate::resource::UnexpandedDependencyFields,
+    > {
         managed: &[],
         compositions: &[],
         managed_current: &HashMap::new(),
@@ -259,7 +268,10 @@ fn resolve_live_composition_refs_post_apply_leaves_non_ref_values_intact() {
         .attributes
         .get("literal")
         .expect("literal present");
-    assert_eq!(literal.to_value(), s("kept"));
+    assert_eq!(
+        literal.value().expect("value composition attribute"),
+        s("kept")
+    );
 }
 
 #[test]
@@ -283,7 +295,7 @@ fn resolve_managed_refs_with_empty_slice_is_ok() {
 #[test]
 fn resolve_live_composition_refs_post_apply_with_empty_slice_is_ok() {
     let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-        managed: &[],
+        managed: &[] as &[Resource],
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &crate::data_source_value::DataSourceValues::empty(),
@@ -343,8 +355,8 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
         // pipeline performs; the bridge's writeback contract names
         // both fields, so the equivalence guard does too.
         assert_eq!(
-            m.dependency_bindings,
-            l.dependency_bindings,
+            m.dependencies.value_bindings,
+            l.dependencies.value_bindings,
             "managed/legacy dependency_bindings divergence for {}",
             m.id.identity_str().expect("resolved identity"),
         );

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
@@ -26,6 +26,7 @@ pub enum OutputFormat {
 
 /// Run the `carina export` command.
 pub async fn run_export(
+    color_mode: crate::output_style::ColorMode,
     path: &Path,
     state_url: Option<&str>,
     name: Option<String>,
@@ -51,6 +52,7 @@ pub async fn run_export(
             .map(carina_core::parser::BackendConfig::into_expanded)
             .transpose()?;
         let backend = resolve_backend_for_read(
+            color_mode,
             base_dir,
             path,
             backend_config.as_ref(),
@@ -71,12 +73,13 @@ pub async fn run_export(
     };
 
     match name {
-        Some(key) => print_single_export(&key, exports.values(), &format),
-        None => print_all_exports(exports.values(), &format),
+        Some(key) => print_single_export(color_mode, &key, exports.values(), &format),
+        None => print_all_exports(color_mode, exports.values(), &format),
     }
 }
 
 fn print_single_export(
+    color_mode: crate::output_style::ColorMode,
     key: &str,
     exports: &HashMap<String, PersistedExportValue>,
     format: &OutputFormat,
@@ -109,8 +112,8 @@ fn print_single_export(
         OutputFormat::Human => {
             println!(
                 "{} = {}",
-                key.bold(),
-                colored_value(&render_export_json_value(value))
+                key.bold(color_mode),
+                colored_value(color_mode, &render_export_json_value(value))
             );
         }
     }
@@ -119,6 +122,7 @@ fn print_single_export(
 }
 
 fn print_all_exports(
+    color_mode: crate::output_style::ColorMode,
     exports: &HashMap<String, PersistedExportValue>,
     format: &OutputFormat,
 ) -> Result<(), AppError> {
@@ -126,7 +130,7 @@ fn print_all_exports(
         if matches!(format, OutputFormat::Json) {
             println!("{{}}");
         } else {
-            println!("{}", "No exports defined.".dimmed());
+            println!("{}", "No exports defined.".dimmed(color_mode));
         }
         return Ok(());
     }
@@ -153,8 +157,8 @@ fn print_all_exports(
             for key in keys {
                 println!(
                     "{} = {}",
-                    key.bold(),
-                    colored_value(&render_export_json_value(&exports[key]))
+                    key.bold(color_mode),
+                    colored_value(color_mode, &render_export_json_value(&exports[key]))
                 );
             }
         }
@@ -242,23 +246,26 @@ mod tests {
 
     #[test]
     fn print_single_export_found() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut exports = HashMap::new();
         exports.insert(
             "vpc_id".to_string(),
             persisted(serde_json::json!("vpc-0abc123")),
         );
-        let result = print_single_export("vpc_id", &exports, &OutputFormat::Human);
+        let result = print_single_export(color_mode, "vpc_id", &exports, &OutputFormat::Human);
         assert!(result.is_ok());
     }
 
     #[test]
     fn print_single_export_not_found() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut exports = HashMap::new();
         exports.insert(
             "vpc_id".to_string(),
             persisted(serde_json::json!("vpc-0abc123")),
         );
-        let err = print_single_export("missing", &exports, &OutputFormat::Human).unwrap_err();
+        let err =
+            print_single_export(color_mode, "missing", &exports, &OutputFormat::Human).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("missing"));
         assert!(msg.contains("vpc_id"));
@@ -266,37 +273,43 @@ mod tests {
 
     #[test]
     fn print_single_export_not_found_empty() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let exports = HashMap::new();
-        let err = print_single_export("missing", &exports, &OutputFormat::Human).unwrap_err();
+        let err =
+            print_single_export(color_mode, "missing", &exports, &OutputFormat::Human).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("(none)"));
     }
 
     #[test]
     fn print_all_exports_empty_human() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let exports = HashMap::new();
-        let result = print_all_exports(&exports, &OutputFormat::Human);
+        let result = print_all_exports(color_mode, &exports, &OutputFormat::Human);
         assert!(result.is_ok());
     }
 
     #[test]
     fn print_all_exports_empty_json() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let exports = HashMap::new();
-        let result = print_all_exports(&exports, &OutputFormat::Json);
+        let result = print_all_exports(color_mode, &exports, &OutputFormat::Json);
         assert!(result.is_ok());
     }
 
     #[test]
     fn print_all_exports_raw_requires_name() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut exports = HashMap::new();
         exports.insert("key".to_string(), persisted(serde_json::json!("value")));
-        let err = print_all_exports(&exports, &OutputFormat::Raw).unwrap_err();
+        let err = print_all_exports(color_mode, &exports, &OutputFormat::Raw).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("--raw requires"));
     }
 
     #[test]
     fn print_all_exports_human() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut exports = HashMap::new();
         exports.insert(
             "vpc_id".to_string(),
@@ -306,18 +319,19 @@ mod tests {
             "accounts".to_string(),
             persisted(serde_json::json!(["459524413166"])),
         );
-        let result = print_all_exports(&exports, &OutputFormat::Human);
+        let result = print_all_exports(color_mode, &exports, &OutputFormat::Human);
         assert!(result.is_ok());
     }
 
     #[test]
     fn print_all_exports_json() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut exports = HashMap::new();
         exports.insert(
             "vpc_id".to_string(),
             persisted(serde_json::json!("vpc-0abc123")),
         );
-        let result = print_all_exports(&exports, &OutputFormat::Json);
+        let result = print_all_exports(color_mode, &exports, &OutputFormat::Json);
         assert!(result.is_ok());
     }
 }

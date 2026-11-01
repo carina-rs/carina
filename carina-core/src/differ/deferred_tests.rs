@@ -1,5 +1,6 @@
 use super::*;
 use crate::parser::parse;
+use crate::resource::ResourceIdentity;
 use crate::resource::absolute_binding_address_for_test as absolute_binding;
 
 fn test_identity(value: &str) -> ResourceIdentity {
@@ -42,9 +43,14 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
         generation: crate::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(absolute_binding(binding)),
-        dependencies: std::collections::HashSet::from([absolute_binding("cert")]),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: std::collections::HashSet::new(),
+        dependencies: crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+            "aws",
+            "acm.Certificate",
+            "cert",
+            None,
+        )]),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     }
 }
 
@@ -56,13 +62,15 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
 
     add_deferred_create_effects(
         &mut plan,
-        DeferredCreateTargets::partition_for_expansion(
-            crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
-                target.clone()
-            ]),
-            |_| DeferredForExpansionChoice::Retain,
-        )
-        .1,
+        crate::test_support::resolved_targets(
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    target.clone()
+                ]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
     );
 
     let mut deferred_replaces = plan.effects().iter().filter_map(|effect| match effect {
@@ -149,9 +157,9 @@ fn delete_effect_for_unbound_child(
         generation: crate::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: binding.map(absolute_binding),
-        dependencies: std::collections::HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: std::collections::HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     };
     (id, effect)
 }
@@ -166,11 +174,13 @@ fn unbound_deferred_create_absorbs_exact_legacy_current_delete() {
 
     add_deferred_create_effects(
         &mut plan,
-        DeferredCreateTargets::partition_for_expansion(
-            crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([target]),
-            |_| DeferredForExpansionChoice::Retain,
-        )
-        .1,
+        crate::test_support::resolved_targets(
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([target]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
     );
 
     let payload = plan
@@ -213,11 +223,13 @@ fn unbound_deferred_create_keeps_unrelated_anonymous_delete_plain() {
 
     add_deferred_create_effects(
         &mut plan,
-        DeferredCreateTargets::partition_for_expansion(
-            crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([target]),
-            |_| DeferredForExpansionChoice::Retain,
-        )
-        .1,
+        crate::test_support::resolved_targets(
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([target]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
     );
 
     assert!(
@@ -253,13 +265,15 @@ fn deferred_create_targets_absorb_matching_map_key_orphan_deletes() {
 
     add_deferred_create_effects(
         &mut plan,
-        DeferredCreateTargets::partition_for_expansion(
-            crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
-                target.clone()
-            ]),
-            |_| DeferredForExpansionChoice::Retain,
-        )
-        .1,
+        crate::test_support::resolved_targets(
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    target.clone()
+                ]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
     );
 
     let payload = plan
@@ -301,13 +315,15 @@ fn deferred_create_targets_do_not_absorb_deposed_deletes() {
 
     add_deferred_create_effects(
         &mut plan,
-        DeferredCreateTargets::partition_for_expansion(
-            crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
-                target.clone()
-            ]),
-            |_| DeferredForExpansionChoice::Retain,
-        )
-        .1,
+        crate::test_support::resolved_targets(
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    target.clone()
+                ]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
     );
 
     assert!(
@@ -346,13 +362,15 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
 
     add_deferred_create_effects(
         &mut plan,
-        DeferredCreateTargets::partition_for_expansion(
-            crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
-                target.clone()
-            ]),
-            |_| DeferredForExpansionChoice::Retain,
-        )
-        .1,
+        crate::test_support::resolved_targets(
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    target.clone()
+                ]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
     );
 
     assert!(

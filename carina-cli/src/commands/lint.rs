@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 
 use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
@@ -62,6 +62,29 @@ enum LintFile {
 }
 
 impl LintFile {
+    fn resolve_type_exprs_best_effort(&mut self, context: &carina_core::parser::ProviderContext) {
+        match self {
+            Self::Blocked(parsed) => {
+                parsed.resolve_type_exprs_report(context);
+            }
+            Self::Resolved(parsed) => {
+                carina_core::validation::resolve_file_type_exprs_best_effort(parsed, context);
+            }
+        }
+    }
+    fn export_handle_errors(&self) -> Option<Vec<carina_core::validation::ExportBoundaryError>> {
+        match self {
+            Self::Blocked(parsed) => {
+                carina_core::validation::validate_export_handle_boundaries(&parsed.export_params)
+                    .err()
+            }
+            Self::Resolved(parsed) => {
+                carina_core::validation::validate_export_handle_boundaries(&parsed.export_params)
+                    .err()
+            }
+        }
+    }
+
     fn collect_list_struct_attrs(
         &self,
         schemas: &carina_core::schema::SchemaRegistry,
@@ -135,10 +158,11 @@ fn collect_list_struct_attrs_for_population<E, D, B: carina_core::resource::Bind
 }
 
 pub fn run_lint(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -156,7 +180,7 @@ pub fn run_lint(
     module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
 
     let (providers, provider_factory_error) =
-        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+        ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
     let loaded_provider_context = if provider_factory_error.is_none() {
         providers.loaded_provider_context()
     } else {
@@ -175,7 +199,7 @@ pub fn run_lint(
     // blocked; retaining these findings and the schema-independent text scans
     // is more useful than aborting lint entirely. Full schema-backed
     // suggestions return once the blocking finding is fixed.
-    let parsed = if module_boundary_findings.is_empty() {
+    let mut parsed = if module_boundary_findings.is_empty() {
         let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
             module_resolver::resolve_module_template_with_config(
                 parsed,
@@ -200,6 +224,11 @@ pub fn run_lint(
     } else {
         LintFile::Blocked(parsed)
     };
+
+    if let Some(loaded_provider_context) = loaded_provider_context {
+        parsed.resolve_type_exprs_best_effort(loaded_provider_context);
+    }
+    let export_handle_errors = parsed.export_handle_errors();
 
     // Collect source texts for each .crn file
     let source_texts: Vec<(PathBuf, String)> = {
@@ -238,6 +267,13 @@ pub fn run_lint(
             message: finding.to_string(),
         })
         .collect();
+    if let Some(boundary_errors) = export_handle_errors {
+        warnings.extend(boundary_errors.into_iter().map(|error| LintWarning {
+            file: error.source_file().to_path_buf(),
+            line: error.source_span().start_line(),
+            message: error.to_string(),
+        }));
+    }
     if let Some(message) = provider_factory_error {
         warnings.push(LintWarning {
             file: path.to_path_buf(),
@@ -333,13 +369,16 @@ pub fn run_lint(
     warnings.extend(parsed.mixed_tag_key_style_warnings(&source_texts, base_dir));
 
     if warnings.is_empty() {
-        println!("{}", "No lint warnings found.".green().bold());
+        println!(
+            "{}",
+            "No lint warnings found.".green(color_mode).bold(color_mode)
+        );
         Ok(())
     } else {
         for w in &warnings {
             eprintln!(
                 "{} {}:{}  {}",
-                "warning:".yellow().bold(),
+                "warning:".yellow(color_mode).bold(color_mode),
                 w.file.display(),
                 w.line,
                 w.message
@@ -360,7 +399,7 @@ mod tests {
 
     #[test]
     fn lint_preserves_imported_module_pest_syntax_diagnostic() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let temp = tempfile::tempdir().unwrap();
         let module_dir = temp.path().join("broken");
         std::fs::create_dir_all(&module_dir).unwrap();
@@ -371,7 +410,7 @@ mod tests {
         .unwrap();
         std::fs::write(module_dir.join("main.crn"), "let =\n").unwrap();
 
-        let error = run_lint(&user_dirs, temp.path(), &ProviderContext::default())
+        let error = run_lint(&runtime, temp.path(), &ProviderContext::default())
             .expect_err("invalid imported module syntax must fail lint");
         let rendered = error.to_string();
 
@@ -394,7 +433,7 @@ mod tests {
 
     #[test]
     fn lint_accepts_a_standalone_module_with_an_argument_dependent_if() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("main.crn"),
@@ -406,7 +445,7 @@ attributes {
         )
         .unwrap();
 
-        run_lint(&user_dirs, temp.path(), &ProviderContext::default())
+        run_lint(&runtime, temp.path(), &ProviderContext::default())
             .expect("lint must inspect reusable module templates without publishing them");
     }
 

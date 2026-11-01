@@ -402,8 +402,8 @@ struct ValueCursor<'a, P: PlaceholderKind, B: BindingAddress> {
 
 /// Resolve authored ignore paths against the effective schema and the values
 /// written in the same resource block.
-pub fn resolve_ignore_changes<S, P: PlaceholderKind, B: BindingAddress>(
-    resource: &Resource<S, P, B>,
+pub fn resolve_ignore_changes<S, P: PlaceholderKind, B: BindingAddress, D>(
+    resource: &Resource<S, P, B, D>,
     schema: &ValidatedResourceSchema,
 ) -> Result<ResolvedIgnoreChanges, Vec<IgnoreChangeError>> {
     let mut errors = Vec::new();
@@ -431,8 +431,8 @@ pub fn resolve_ignore_changes<S, P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn resolve_one_ignore_change<S, P: PlaceholderKind, B: BindingAddress>(
-    resource: &Resource<S, P, B>,
+fn resolve_one_ignore_change<S, P: PlaceholderKind, B: BindingAddress, D>(
+    resource: &Resource<S, P, B, D>,
     schema: &ValidatedResourceSchema,
     path: &ParsedIgnorePath,
 ) -> Result<Vec<ResolvedIgnorePath>, IgnoreChangeError> {

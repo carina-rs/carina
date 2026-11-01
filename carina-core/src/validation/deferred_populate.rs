@@ -616,7 +616,7 @@ mod tests {
                 )),
             },
             timeout_secs: None,
-            depends_on: vec![],
+            depends_on: Default::default(),
             line: 0,
         });
         let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());

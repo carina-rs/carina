@@ -145,6 +145,7 @@ fn cli_validated_file(
     let parsed = loaded.parsed;
     let duplicate_declarations = loaded.duplicate_declarations;
     let providers = carina_cli::wiring::ProviderLoad::for_test_with_provider_phase(
+        &carina_cli::test_support::TestCommandRuntime::new(),
         carina_cli::wiring::LoadedProviderFactory::for_test(factories),
         &parsed.providers,
     );
@@ -1735,7 +1736,7 @@ inner { x = a }
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let expected = "Type mismatch: expected Int, got mock.test.resource (from a)";
+    let expected = "expected Int, got mock.test.resource (from a)";
 
     let root_cli = cli_diagnostics(factories_for(&schemas), &fixture);
     assert!(
@@ -1745,7 +1746,7 @@ inner { x = a }
     let module_cli = cli_diagnostics_at(factories_for(&schemas), &outer);
     assert!(
         module_cli.iter().any(|message| {
-            message.contains("Type mismatch: expected Int, got mock.test.resource (from a)")
+            message.contains("expected Int, got mock.test.resource (from a)")
                 && message.contains("main.crn")
                 && message.contains("line 3")
         }),
@@ -1761,7 +1762,11 @@ inner { x = a }
         Some(&outer_path),
     );
     assert!(
-        lsp_messages_contain(&lsp, expected),
+        lsp.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("'a' is a resource handle, not a value")
+        }),
         "LSP must reject Ref -> Int forwarding: {lsp:#?}"
     );
 
@@ -1777,17 +1782,19 @@ inner { x = a }
         ),
         Some(&outer_path),
     );
+    let bare_handle = "'a' is a resource handle, not a value";
+    let typed_mismatch = "expected String, got mock.test.resource (from a)";
     assert!(
         root_cli
             .iter()
-            .chain(&module_cli)
-            .all(|message| { !message.contains("cannot assign mock.test.resource to 'x'") })
-            && lsp.iter().all(|diagnostic| {
-                !diagnostic
-                    .message
-                    .contains("cannot assign mock.test.resource to 'x'")
-            }),
-        "Ref -> String must preserve id-string compatibility; root={root_cli:#?}, module={module_cli:#?}, lsp={lsp:#?}"
+            .any(|message| { message.contains(bare_handle) || message.contains(typed_mismatch) })
+            && module_cli
+                .iter()
+                .any(|message| message.contains(typed_mismatch))
+            && lsp
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(bare_handle)),
+        "a resource handle must not flow into a String parameter; root={root_cli:#?}, module={module_cli:#?}, lsp={lsp:#?}"
     );
 }
 

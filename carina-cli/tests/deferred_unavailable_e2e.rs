@@ -156,8 +156,10 @@ fn unavailable_env_arguments_keep_anonymous_resource_identities_distinct() {
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Create(resource) if resource.get_attr("replacement_key").is_some() => {
-                resource.id.identity_str().map(str::to_string)
+            Effect::Create(resource)
+                if resource.as_resource().get_attr("replacement_key").is_some() =>
+            {
+                resource.id().identity_str().map(str::to_string)
             }
             _ => None,
         })

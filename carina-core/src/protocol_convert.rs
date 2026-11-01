@@ -502,7 +502,7 @@ impl Error for SchemaDecodeError {
     }
 }
 
-/// Convert a validated resource schema into its version-16 protocol record.
+/// Convert a validated resource schema into its version-19 protocol record.
 pub fn resource_schema_to_protocol(
     schema: &ValidatedResourceSchema,
 ) -> Result<protocol::ResourceSchema, ProtocolConvertError> {
@@ -520,10 +520,10 @@ pub fn resource_schema_to_protocol(
         default_wait_interval,
         defs,
     } = schema.parts();
-    // Protocol v16 has no resource wait-default fields. These are host-side
+    // Protocol v19 has no resource wait-default fields. These are host-side
     // execution policy, not provider metadata; projection intentionally omits
     // them and round-trip tests pin that one-way behavior.
-    let _v16_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
+    let _v18_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
 
     let attributes = attributes
         .iter()
@@ -589,7 +589,7 @@ fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
     TypeIdentity::from_dotted(identity)
 }
 
-/// Project one aggregate provider-schema witness onto the version-16 envelope.
+/// Project one aggregate provider-schema witness onto the version-19 envelope.
 pub fn provider_schema_to_protocol(
     witness: &ValidatedProviderSchemaWitness,
 ) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
@@ -615,7 +615,7 @@ pub fn provider_schema_to_protocol(
     })
 }
 
-/// Decode the version-16 provider-schema envelope and jointly admit resource,
+/// Decode the version-19 provider-schema envelope and jointly admit resource,
 /// config, and reference-form declarations.
 pub fn protocol_to_provider_schema_witness(
     envelope: &protocol::ProviderSchemaEnvelope,
@@ -677,9 +677,9 @@ pub fn attribute_schema_to_protocol(
         identity_mode,
         deferred_populate,
     } = attribute.parts();
-    // Protocol v16 has no completion field. Completions are an in-process
+    // Protocol v19 has no completion field. Completions are an in-process
     // authoring aid, so JSON metadata projection intentionally omits them.
-    let _v16_omits_host_completions = completions;
+    let _v18_omits_host_completions = completions;
     let (required, read_only) = input_mode_to_protocol(declared_input_mode);
     let default = default
         .map(try_core_to_protocol_value)
@@ -2141,7 +2141,7 @@ pub fn protocol_to_core_persisted_value_map(
 }
 
 /// Encode a core resource id. Provider-instance routing is host-local and the
-/// version-16 protocol deliberately has no corresponding field.
+/// version-19 protocol deliberately has no corresponding field.
 pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     let ResourceId {
         provider,
@@ -2160,7 +2160,7 @@ pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     }
 }
 
-/// Decode a version-16 resource id. The wire's empty identity is the pending
+/// Decode a version-19 resource id. The wire's empty identity is the pending
 /// sentinel, and provider-instance routing cannot be reconstructed.
 pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
     let protocol::ResourceId {
@@ -2211,8 +2211,13 @@ fn protocol_to_directives(directives: &protocol::Directives) -> ProviderDirectiv
 }
 
 /// Encode a managed resource for the ordinary provider boundary.
-pub fn try_resource_to_protocol<S>(
-    resource: &Resource<S>,
+pub fn try_resource_to_protocol<S, D>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     directives: &ProviderDirectives,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let Resource {
@@ -2224,7 +2229,7 @@ pub fn try_resource_to_protocol<S>(
         resolved_ignore_changes: _resolved_ignore_changes,
         prefixes: _prefixes,
         binding: _binding,
-        dependency_bindings: _dependency_bindings,
+        dependencies: _dependencies,
         module_source: _module_source,
         default_tag_keys: _default_tag_keys,
         loop_provenance: _loop_provenance,
@@ -2246,8 +2251,13 @@ pub fn try_resource_to_protocol<S>(
 }
 
 /// Encode a data source using the protocol's shared Resource record.
-pub fn try_data_source_to_protocol(
-    data_source: &DataSource,
+pub fn try_data_source_to_protocol<S, D>(
+    data_source: &DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     provider_directives: &ProviderDirectives,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let DataSource {
@@ -2255,7 +2265,7 @@ pub fn try_data_source_to_protocol(
         attributes,
         directives: _authored_directives,
         binding: _binding,
-        dependency_bindings: _dependency_bindings,
+        dependencies: _dependencies,
         module_source: _module_source,
         quoted_string_attrs: _quoted_string_attrs,
     } = data_source;

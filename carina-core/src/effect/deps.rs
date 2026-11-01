@@ -1,21 +1,48 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::effect::{Effect, EffectInstanceKey, ScheduleEdge, SchedulerKey};
+use crate::effect::{Effect, EffectInstanceKey, ScheduleEdge};
 use crate::non_empty::NonEmptyVec;
-use crate::parser::ResourceRef;
-use crate::resource::{AbsoluteBindingAddress, Resource, ResourceId, ResourceIdentity};
+#[cfg(test)]
+use crate::resource::ResourceId;
+use crate::resource::{ResolvedDependencies, ResolvedResourceId, Resource};
 
 #[derive(Debug, Clone)]
-pub struct UnresolvedResource<S = crate::resource::ModuleSource>(Resource<S>);
+pub struct UnresolvedResource<S = crate::resource::ModuleSource>(
+    Resource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, ()>,
+);
 
 impl<S> UnresolvedResource<S> {
     /// Pre-resolution snapshot used by dependency analysis and apply-time
     /// reference re-resolution.
-    pub fn from_pre_resolve(resource: Resource<S>) -> Self {
+    pub fn from_pre_resolve<D>(
+        resource: Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Self {
+        Self(resource.into_value_snapshot())
+    }
+
+    /// Test adapter for display/executor fixtures whose authored dependency
+    /// snapshot is intentionally empty.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_resolved_for_test(
+        resource: Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >,
+    ) -> Self {
         Self(resource)
     }
 
-    pub fn as_resource(&self) -> &Resource<S> {
+    pub fn as_resource(
+        &self,
+    ) -> &Resource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, ()>
+    {
         &self.0
     }
 }
@@ -26,21 +53,43 @@ impl<S> UnresolvedResource<S> {
 /// `Apply` follows the apply scheduler's rules (resource refs become edges
 /// and meta effects contribute `DependsOn` edges). `Destroy` ignores
 /// resource-ref edges and instead lets each effect's [`Effect::destroy_edges`] drive the
-/// graph; the typed `aliases` slot carries `wait`-binding bridges that
-/// would otherwise be dropped from the destroy plan, and the variant shape
-/// makes it impossible to pass aliases into an apply run.
+/// graph. The typed `aliases` slot carries `wait`-binding bridges that
+/// would otherwise be dropped from the destroy plan. `kept_targets` names
+/// graph nodes that intentionally have no destroy effect; distinguishing them
+/// from an absent address keeps missing targets fallible without inventing
+/// no-op effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleInputs<'a> {
     Apply,
-    Destroy { aliases: &'a [DestroyWaitAlias] },
+    Destroy {
+        aliases: &'a [DestroyWaitAlias],
+        kept_targets: &'a KeptDestroyTargets,
+    },
+}
+
+/// Resolved dependency targets that exist in the expanded graph but are not
+/// being operated on by this destroy run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeptDestroyTargets(HashSet<ResolvedResourceId>);
+
+impl FromIterator<ResolvedResourceId> for KeptDestroyTargets {
+    fn from_iter<T: IntoIterator<Item = ResolvedResourceId>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl KeptDestroyTargets {
+    fn iter(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.0.iter()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestroyWaitAlias {
-    pub binding: AbsoluteBindingAddress,
-    pub target_binding: AbsoluteBindingAddress,
-    pub explicit_dependencies: HashSet<AbsoluteBindingAddress>,
-    pub consumers: NonEmptyVec<ResourceIdentity>,
+    pub id: ResolvedResourceId,
+    pub target_id: ResolvedResourceId,
+    pub explicit_dependencies: ResolvedDependencies,
+    pub consumers: NonEmptyVec<ResolvedResourceId>,
 }
 
 impl DestroyWaitAlias {
@@ -50,38 +99,29 @@ impl DestroyWaitAlias {
     /// consumers carries no scheduling information, so callers should
     /// drop it rather than treat the `None` as an error.
     pub fn new(
-        binding: AbsoluteBindingAddress,
-        target_binding: AbsoluteBindingAddress,
-        explicit_dependencies: HashSet<AbsoluteBindingAddress>,
-        consumers: Vec<ResourceIdentity>,
+        id: ResolvedResourceId,
+        target_id: ResolvedResourceId,
+        explicit_dependencies: ResolvedDependencies,
+        consumers: Vec<ResolvedResourceId>,
     ) -> Option<Self> {
         Some(Self {
-            binding,
-            target_binding,
+            id,
+            target_id,
             explicit_dependencies,
             consumers: NonEmptyVec::from_vec(consumers)?,
         })
     }
 
     fn destroy_edges(&self) -> Vec<ScheduleEdge> {
-        let mut edges = vec![ScheduleEdge::BlockedBy(SchedulerKey::Binding(
-            self.target_binding.clone(),
-        ))];
+        let mut edges = vec![ScheduleEdge::BlockedBy(self.target_id.clone())];
         edges.extend(
             self.explicit_dependencies
                 .iter()
-                .filter(|dependency| *dependency != &self.target_binding)
+                .filter(|dependency| *dependency != &self.target_id)
                 .cloned()
-                .map(SchedulerKey::Binding)
                 .map(ScheduleEdge::BlockedBy),
         );
-        edges.extend(
-            self.consumers
-                .iter()
-                .cloned()
-                .map(SchedulerKey::Resource)
-                .map(ScheduleEdge::DependsOn),
-        );
+        edges.extend(self.consumers.iter().cloned().map(ScheduleEdge::DependsOn));
         edges
     }
 }
@@ -108,8 +148,6 @@ impl WritesSet {
 pub(crate) mod reads {
     use std::collections::BTreeSet;
 
-    use crate::resource::AccessPath;
-
     use super::WritesSet;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,10 +156,10 @@ pub(crate) mod reads {
     }
 
     impl KnownReads {
-        pub(crate) fn from_walker(path: &AccessPath) -> Self {
-            let mut attrs = BTreeSet::new();
-            attrs.insert(path.attribute().to_string());
-            Self { attrs }
+        pub(crate) fn from_attributes(attrs: &BTreeSet<String>) -> Self {
+            Self {
+                attrs: attrs.clone(),
+            }
         }
 
         #[cfg(test)]
@@ -185,6 +223,7 @@ pub struct DependencyAnalysis {
     dependents_of: HashMap<usize, HashSet<usize>>,
     reads_by_edge: HashMap<usize, HashMap<usize, ReadsSet>>,
     unresolved_required: Vec<UnresolvedRequiredDependency>,
+    unresolved_delete_ordering: Vec<UnresolvedDeleteOrderingDependency>,
 }
 
 impl DependencyAnalysis {
@@ -196,6 +235,7 @@ impl DependencyAnalysis {
             dependents_of,
             reads_by_edge: HashMap::new(),
             unresolved_required: Vec::new(),
+            unresolved_delete_ordering: Vec::new(),
         }
     }
 
@@ -239,6 +279,34 @@ impl DependencyAnalysis {
     pub fn into_deps_of(self) -> HashMap<usize, HashSet<usize>> {
         self.deps_of
     }
+
+    pub fn unresolved_delete_ordering(&self) -> &[UnresolvedDeleteOrderingDependency] {
+        &self.unresolved_delete_ordering
+    }
+}
+
+/// A persisted ordering edge attached to a Delete whose target no longer has
+/// either a configured effect or a state row. The Delete remains schedulable
+/// using its known edges; callers surface this typed notice to the operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedDeleteOrderingDependency {
+    delete_id: ResolvedResourceId,
+    generation: crate::effect::EffectGeneration,
+    dependency: ResolvedResourceId,
+}
+
+impl UnresolvedDeleteOrderingDependency {
+    pub fn delete_id(&self) -> &ResolvedResourceId {
+        &self.delete_id
+    }
+
+    pub fn generation(&self) -> &crate::effect::EffectGeneration {
+        &self.generation
+    }
+
+    pub fn dependency(&self) -> &ResolvedResourceId {
+        &self.dependency
+    }
 }
 
 /// A scheduling edge whose producer is required by construction but absent
@@ -246,7 +314,7 @@ impl DependencyAnalysis {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnresolvedRequiredDependency {
     effect_index: usize,
-    identity: ResourceIdentity,
+    id: ResolvedResourceId,
 }
 
 impl UnresolvedRequiredDependency {
@@ -254,8 +322,8 @@ impl UnresolvedRequiredDependency {
         self.effect_index
     }
 
-    pub fn identity(&self) -> &ResourceIdentity {
-        &self.identity
+    pub fn id(&self) -> &ResolvedResourceId {
+        &self.id
     }
 }
 
@@ -264,7 +332,7 @@ impl std::fmt::Display for UnresolvedRequiredDependency {
         write!(
             f,
             "effect {} requires missing scheduling target `{}`",
-            self.effect_index, self.identity
+            self.effect_index, self.id
         )
     }
 }
@@ -336,54 +404,82 @@ impl IdentityTargets {
     }
 }
 
-struct DependencyAnalyzer<'a> {
-    targets_by_key: HashMap<SchedulerKey, IdentityTargets>,
-    delete_blockers_by_key: HashMap<SchedulerKey, Vec<usize>>,
-    compositions_by_binding:
-        HashMap<AbsoluteBindingAddress, crate::resource::CompositionRuntimeRef<'a>>,
+struct DependencyAnalyzer {
+    instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
+    delete_blockers_by_id: HashMap<ResolvedResourceId, Vec<usize>>,
+    known_graph_ids: HashSet<ResolvedResourceId>,
 }
 
-impl<'a> DependencyAnalyzer<'a> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyTargetOutcome {
+    Scheduled(usize),
+    Kept,
+    Missing,
+}
+
+impl DependencyAnalyzer {
     fn new(
-        targets_by_key: HashMap<SchedulerKey, IdentityTargets>,
-        delete_blockers_by_key: HashMap<SchedulerKey, Vec<usize>>,
-        compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'a>>,
+        instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
+        delete_blockers_by_id: HashMap<ResolvedResourceId, Vec<usize>>,
+        known_graph_ids: HashSet<ResolvedResourceId>,
     ) -> Self {
-        let compositions_by_binding = compositions
-            .into_iter()
-            .filter_map(|composition| {
-                composition
-                    .binding_address()
-                    .cloned()
-                    .map(|binding| (binding, composition))
-            })
-            .collect();
         Self {
-            targets_by_key,
-            delete_blockers_by_key,
-            compositions_by_binding,
+            instance_to_idx,
+            delete_blockers_by_id,
+            known_graph_ids,
         }
     }
 
-    fn lookup_by_key(&self, key: &SchedulerKey) -> Option<usize> {
-        self.targets_by_key
-            .get(key)
+    fn lookup_by_id(&self, id: &ResolvedResourceId) -> Option<usize> {
+        self.instance_to_idx
+            .get(&EffectInstanceKey::current(id.clone()))
             .and_then(IdentityTargets::lookup)
     }
 
-    fn lookup_by_identity(&self, identity: &ResourceIdentity) -> Option<usize> {
-        self.lookup_by_key(&SchedulerKey::Resource(identity.clone()))
+    fn target_outcome(&self, id: &ResolvedResourceId) -> DependencyTargetOutcome {
+        if let Some(index) = self.lookup_by_id(id) {
+            DependencyTargetOutcome::Scheduled(index)
+        } else if self.known_graph_ids.contains(id) {
+            DependencyTargetOutcome::Kept
+        } else {
+            DependencyTargetOutcome::Missing
+        }
     }
 
-    fn lookup_by_binding(&self, binding: &AbsoluteBindingAddress) -> Option<usize> {
-        self.lookup_by_key(&SchedulerKey::Binding(binding.clone()))
-    }
-
-    fn lookup_deletes_by_key(&self, key: &SchedulerKey) -> Vec<usize> {
-        self.delete_blockers_by_key
-            .get(key)
+    fn lookup_deletes_by_id(&self, id: &ResolvedResourceId) -> Vec<usize> {
+        self.delete_blockers_by_id
+            .get(id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn record_missing(
+        &self,
+        analysis: &mut DependencyAnalysis,
+        effect_index: usize,
+        id: ResolvedResourceId,
+    ) {
+        analysis
+            .unresolved_required
+            .push(UnresolvedRequiredDependency { effect_index, id });
+    }
+
+    fn record_unresolved_delete_ordering<S>(
+        &self,
+        analysis: &mut DependencyAnalysis,
+        effect: &Effect<S>,
+        dependency: ResolvedResourceId,
+    ) {
+        let Effect::Delete { id, generation, .. } = effect else {
+            unreachable!("only Delete edges can be non-fatal destroy-ordering warnings")
+        };
+        analysis
+            .unresolved_delete_ordering
+            .push(UnresolvedDeleteOrderingDependency {
+                delete_id: id.clone(),
+                generation: generation.clone(),
+                dependency,
+            });
     }
 
     fn collect_from_schedule_edges<S, E: AsRef<Effect<S>>>(
@@ -395,133 +491,100 @@ impl<'a> DependencyAnalyzer<'a> {
     ) {
         for edge in edges {
             match edge {
-                ScheduleEdge::DependsOn(key) => {
-                    if let Some(parent) = self.lookup_by_key(&key) {
-                        analysis.add_edge(self_idx, parent, ReadsSet::unknown());
-                    }
-                }
-                ScheduleEdge::RequiredDependsOn(identity) => {
-                    if let Some(parent) = self.lookup_by_identity(&identity) {
-                        analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                ScheduleEdge::DependsOn(id) => {
+                    let delete_parents = if self_idx >= effects.len() {
+                        self.lookup_deletes_by_id(&id)
                     } else {
-                        analysis
-                            .unresolved_required
-                            .push(UnresolvedRequiredDependency {
-                                effect_index: self_idx,
-                                identity,
-                            });
+                        Vec::new()
+                    };
+                    if !delete_parents.is_empty() {
+                        for parent in delete_parents {
+                            analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                        }
+                    } else {
+                        match self.target_outcome(&id) {
+                            DependencyTargetOutcome::Scheduled(parent) => {
+                                let reads = effects
+                                    .get(self_idx)
+                                    .and_then(|effect| effect.as_ref().known_dependency_reads(&id))
+                                    .map(KnownReads::from_attributes)
+                                    .map(ReadsSet::from_walker)
+                                    .unwrap_or_else(ReadsSet::unknown);
+                                analysis.add_edge(self_idx, parent, reads);
+                            }
+                            DependencyTargetOutcome::Kept => {}
+                            DependencyTargetOutcome::Missing => {
+                                self.record_missing(analysis, self_idx, id);
+                            }
+                        }
                     }
                 }
-                ScheduleEdge::BlockedBy(key) => {
+                ScheduleEdge::RequiredDependsOn(id) => match self.target_outcome(&id) {
+                    DependencyTargetOutcome::Scheduled(parent) => {
+                        analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                    }
+                    DependencyTargetOutcome::Kept => {}
+                    DependencyTargetOutcome::Missing => {
+                        self.record_missing(analysis, self_idx, id);
+                    }
+                },
+                ScheduleEdge::BlockedBy(id) => {
                     let is_delete_fanout_source = self_idx >= effects.len()
                         || matches!(effects[self_idx].as_ref(), Effect::Delete { .. });
                     if is_delete_fanout_source {
-                        for blocked_idx in self.lookup_deletes_by_key(&key) {
-                            if blocked_idx != self_idx {
-                                analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
+                        let blocked = self.lookup_deletes_by_id(&id);
+                        for blocked_idx in &blocked {
+                            if *blocked_idx != self_idx {
+                                analysis.add_edge(*blocked_idx, self_idx, ReadsSet::unknown());
                             }
                         }
-                    } else if let Some(blocked_idx) = self.lookup_by_key(&key) {
-                        analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
-                    }
-                }
-                ScheduleEdge::BlockedByIfDelete(binding) => {
-                    let key = SchedulerKey::Binding(binding);
-                    for blocked_idx in self.lookup_deletes_by_key(&key) {
-                        if blocked_idx != self_idx
-                            && blocked_idx < effects.len()
-                            && matches!(effects[blocked_idx].as_ref(), Effect::Delete { .. })
+                        if blocked.is_empty()
+                            && matches!(self.target_outcome(&id), DependencyTargetOutcome::Missing)
                         {
-                            analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
+                            if self_idx < effects.len()
+                                && matches!(effects[self_idx].as_ref(), Effect::Delete { .. })
+                            {
+                                self.record_unresolved_delete_ordering(
+                                    analysis,
+                                    effects[self_idx].as_ref(),
+                                    id,
+                                );
+                            } else {
+                                self.record_missing(analysis, self_idx, id);
+                            }
+                        }
+                    } else {
+                        match self.target_outcome(&id) {
+                            DependencyTargetOutcome::Scheduled(blocked_idx) => {
+                                analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
+                            }
+                            DependencyTargetOutcome::Kept => {}
+                            DependencyTargetOutcome::Missing => {
+                                self.record_missing(analysis, self_idx, id);
+                            }
                         }
                     }
                 }
-            }
-        }
-    }
-
-    fn collect_from_resource_ref<S, P: crate::resource::PlaceholderKind>(
-        &self,
-        resource: ResourceRef<'_, S, P>,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-    ) {
-        let attrs = resource.attributes();
-        let mut bindings_seen_in_values = HashSet::new();
-        for value in attrs.values() {
-            value.visit_resource_refs(&mut |path| {
-                bindings_seen_in_values.insert(path.binding_address().clone());
-                self.record_binding_edge(
-                    path.binding_address(),
-                    ReadsSet::from_walker(KnownReads::from_walker(path)),
-                    analysis,
-                    child,
-                );
-            });
-            value.visit_binding_refs(&mut |binding| {
-                bindings_seen_in_values.insert(binding.clone());
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
-            });
-        }
-        for binding in resource.dependency_bindings() {
-            if !bindings_seen_in_values.contains(binding) {
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
-            }
-        }
-        for binding in resource.directive_dependencies() {
-            self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
-        }
-    }
-
-    fn collect_from_resource<S>(
-        &self,
-        resource: &Resource<S>,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-    ) {
-        self.collect_from_resource_ref(ResourceRef::Resource(resource), analysis, child);
-    }
-
-    fn record_binding_edge(
-        &self,
-        binding: &AbsoluteBindingAddress,
-        reads: ReadsSet,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-    ) {
-        let mut visited = HashSet::new();
-        self.record_binding_edge_inner(binding, reads, analysis, child, &mut visited);
-    }
-
-    fn record_binding_edge_inner(
-        &self,
-        binding: &AbsoluteBindingAddress,
-        reads: ReadsSet,
-        analysis: &mut DependencyAnalysis,
-        child: usize,
-        visited: &mut HashSet<AbsoluteBindingAddress>,
-    ) {
-        if !visited.insert(binding.clone()) {
-            return;
-        }
-        if let Some(parent) = self.lookup_by_binding(binding) {
-            analysis.add_edge(child, parent, reads);
-            return;
-        }
-        let Some(composition) = self.compositions_by_binding.get(binding) else {
-            return;
-        };
-        for inner in crate::deps::get_composition_runtime_dependencies(*composition) {
-            if self.compositions_by_binding.contains_key(&inner)
-                || self.lookup_by_binding(&inner).is_some()
-            {
-                self.record_binding_edge_inner(
-                    &inner,
-                    ReadsSet::unknown(),
-                    analysis,
-                    child,
-                    visited,
-                );
+                ScheduleEdge::BlockedByIfDelete(id) => {
+                    let blocked = self.lookup_deletes_by_id(&id);
+                    for blocked_idx in &blocked {
+                        if *blocked_idx != self_idx
+                            && *blocked_idx < effects.len()
+                            && matches!(effects[*blocked_idx].as_ref(), Effect::Delete { .. })
+                        {
+                            analysis.add_edge(*blocked_idx, self_idx, ReadsSet::unknown());
+                        }
+                    }
+                    if blocked.is_empty()
+                        && matches!(self.target_outcome(&id), DependencyTargetOutcome::Missing)
+                    {
+                        self.record_unresolved_delete_ordering(
+                            analysis,
+                            effects[self_idx].as_ref(),
+                            id,
+                        );
+                    }
+                }
             }
         }
     }
@@ -535,123 +598,81 @@ impl<'a> DependencyAnalyzer<'a> {
 /// resulting [`DependencyAnalysis`] is indexed by effect position, with
 /// any destroy `aliases` appearing at indices `effects.len()..` so callers
 /// can distinguish real effects from wait-binding bridges.
-pub fn build_effect_dependency_analysis<S>(
-    effects: &[Effect<S>],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
-    compositions: &[crate::resource::LiveComposition],
-    inputs: ScheduleInputs<'_>,
-) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
-    build_effect_dependency_analysis_with_lookup(
-        effects,
-        compositions
-            .iter()
-            .map(crate::resource::CompositionRuntimeRef::Live),
-        inputs,
-        |id| {
-            unresolved_resources
-                .get(id)
-                .map(UnresolvedResource::as_resource)
-        },
-    )
-}
-
-pub fn build_saved_effect_dependency_analysis<S>(
-    effects: &[Effect<S>],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
-    compositions: &[crate::resource::SavedComposition],
-    inputs: ScheduleInputs<'_>,
-) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
-    build_effect_dependency_analysis_with_lookup(
-        effects,
-        compositions
-            .iter()
-            .map(crate::resource::CompositionRuntimeRef::Saved),
-        inputs,
-        |id| {
-            unresolved_resources
-                .get(id)
-                .map(UnresolvedResource::as_resource)
-        },
-    )
-}
-
-/// Borrowed-resource form of [`build_effect_dependency_analysis`].
-///
-/// Display-only graph builders can preserve the scheduler's exact ordering
-/// semantics without cloning unresolved resources and their attribute values.
-pub(crate) fn build_effect_dependency_analysis_from_resources(
-    effects: &[&Effect],
-    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::LiveComposition],
-    inputs: ScheduleInputs<'_>,
-) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
-    build_effect_dependency_analysis_with_lookup(
-        effects,
-        compositions
-            .iter()
-            .map(crate::resource::CompositionRuntimeRef::Live),
-        inputs,
-        |id| {
-            unresolved_resources
-                .get(id)
-                .map(|resource| resource.as_resource())
-        },
-    )
-}
-
-fn build_effect_dependency_analysis_with_lookup<'a, 'composition, E, F, S: 'a>(
+pub fn build_effect_dependency_analysis<'a, S, E>(
     effects: &[E],
-    compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'composition>>,
+    unresolved_resource_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
     inputs: ScheduleInputs<'_>,
-    unresolved_resource: F,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
 where
     E: AsRef<Effect<S>>,
-    F: Fn(&ResourceId) -> Option<&'a Resource<S>>,
 {
-    let mut targets_by_key: HashMap<SchedulerKey, IdentityTargets> = HashMap::new();
+    let mut known_graph_ids = unresolved_resource_ids
+        .into_iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
-        ScheduleInputs::Destroy { aliases } => aliases,
+        ScheduleInputs::Destroy {
+            aliases,
+            kept_targets,
+        } => {
+            known_graph_ids.extend(kept_targets.iter().cloned());
+            aliases
+        }
     };
     for (idx, effect) in effects.iter().enumerate() {
         let effect = effect.as_ref();
-        if matches!(effect, Effect::ReleaseListKeys { .. }) {
-            continue;
-        }
-        for key in effect.scheduling_keys() {
-            let targets = targets_by_key.entry(key).or_default();
-            if matches!(effect, Effect::Delete { .. }) {
-                targets.insert_delete(idx);
-            } else {
-                targets.insert_preferred(idx);
-            }
+        match effect {
+            Effect::Delete { .. } => instance_to_idx
+                .entry(effect.instance_key())
+                .or_default()
+                .insert_delete(idx),
+            // A release changes only the authoring record in locked state. It
+            // neither produces provider-visible values nor represents a
+            // provider operation that consumers should wait for. When the
+            // same resource also updates, that Update remains the scheduling
+            // target regardless of effect order.
+            Effect::ReleaseListKeys { .. } => {}
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => instance_to_idx
+                .entry(effect.instance_key())
+                .or_default()
+                .insert_preferred(idx),
         }
     }
     let alias_offset = effects.len();
     for (alias_idx, alias) in aliases.iter().enumerate() {
-        targets_by_key
-            .entry(SchedulerKey::Binding(alias.binding.clone()))
+        instance_to_idx
+            .entry(EffectInstanceKey::current(alias.id.clone()))
             .or_default()
             .insert_alias_preferred(alias_offset + alias_idx);
     }
 
-    let mut delete_blockers_by_key: HashMap<SchedulerKey, Vec<usize>> = HashMap::new();
-    for (key, targets) in &targets_by_key {
+    let mut delete_blockers_by_id: HashMap<ResolvedResourceId, Vec<usize>> = HashMap::new();
+    for (key, targets) in &instance_to_idx {
         let blockers = targets.lookup_delete_blockers();
         if !blockers.is_empty() {
-            delete_blockers_by_key
-                .entry(key.clone())
+            delete_blockers_by_id
+                .entry(key.id().clone())
                 .or_default()
                 .extend(blockers);
         }
     }
-    for blockers in delete_blockers_by_key.values_mut() {
+    for blockers in delete_blockers_by_id.values_mut() {
         blockers.sort_unstable();
         blockers.dedup();
     }
 
-    let analyzer = DependencyAnalyzer::new(targets_by_key, delete_blockers_by_key, compositions);
+    let analyzer = DependencyAnalyzer::new(instance_to_idx, delete_blockers_by_id, known_graph_ids);
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
     add_same_identity_replacement_order_edges(effects, &mut analysis);
 
@@ -659,22 +680,6 @@ where
         let effect = effect.as_ref();
         match inputs {
             ScheduleInputs::Apply => {
-                if effect.is_scheduler_meta() {
-                    analyzer.collect_from_schedule_edges(
-                        effects,
-                        effect.apply_edges(),
-                        &mut analysis,
-                        idx,
-                    );
-                    continue;
-                }
-                if effect.as_resource_ref().is_some() {
-                    if let Some(unresolved) = unresolved_resource(effect.resource_id()) {
-                        analyzer.collect_from_resource(unresolved, &mut analysis, idx);
-                    } else if let Some(resource) = effect.as_resource_ref() {
-                        analyzer.collect_from_resource_ref(resource, &mut analysis, idx);
-                    }
-                }
                 analyzer.collect_from_schedule_edges(
                     effects,
                     effect.apply_edges(),
@@ -757,8 +762,9 @@ pub fn relax_update_update_edges<S, E: AsRef<Effect<S>>>(
 mod tests {
     use super::*;
     use crate::resource::{
-        AuthoredValue, ExpandedResource as Resource, ExpandedValue as Value, RelativeBindingName,
-        ResolvedResource, ResolvedResourceId, ResourceIdentity, RootScope, State,
+        AbsoluteBindingAddress, AuthoredValue, ExpandedResource as Resource,
+        ExpandedValue as Value, RelativeBindingName, ResolvedDependencyReads, ResolvedResource,
+        ResolvedResourceId, ResourceIdentity, RootScope, State,
     };
 
     fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
@@ -778,25 +784,35 @@ mod tests {
     }
 
     fn update_effect(binding: &'static str, refs: &[(&str, &str)], changed: &[&str]) -> Effect {
-        let mut resource: Resource = Resource::new("test", binding);
+        let mut resource = Resource::new("test", binding);
         resource.binding = Some(absolute_binding(binding));
+        let mut dependencies = ResolvedDependencies::default();
+        let mut reads = ResolvedDependencyReads::default();
         for (dep, attr) in refs {
             resource.set_attr(format!("{}_{}", dep, attr), root_resource_ref(dep, attr));
+            let id = test_id(dep);
+            dependencies.insert(id.clone());
+            reads.insert_known(id, *attr);
         }
         Effect::Update {
             identifier: crate::effect::fixture_applied_identifier(
                 resource.id.identity_display().to_string(),
             ),
             from: Box::new(state_for(&resource.id)),
-            to: ResolvedResource::new(resource),
+            to: ResolvedResource::from_resolved_parts_with_reads(
+                resource.with_dependency_phase(()),
+                dependencies,
+                ResolvedDependencies::default(),
+                reads,
+            ),
             changed_attributes: changed.iter().map(|s| (*s).to_string()).collect(),
         }
     }
 
     fn create_effect(binding: &'static str) -> Effect {
-        let mut resource: Resource = Resource::new("test", binding);
+        let mut resource = Resource::new("test", binding);
         resource.binding = Some(absolute_binding(binding));
-        Effect::Create(ResolvedResource::new(resource))
+        Effect::Create(ResolvedResource::new(resource.with_dependency_phase(())))
     }
 
     fn delete_effect(
@@ -805,21 +821,14 @@ mod tests {
         blocked_by_updates: &[&str],
     ) -> Effect {
         Effect::Delete {
-            id: ResolvedResourceId::new(ResourceId::with_identity("test", identity)),
+            id: test_id(identity),
             identifier: crate::effect::fixture_applied_identifier(format!("{identity}-id")),
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some(absolute_binding(identity)),
-            dependencies: dependencies
-                .iter()
-                .map(|dependency| absolute_binding(dependency))
-                .collect(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: blocked_by_updates
-                .iter()
-                .cloned()
-                .map(ResourceIdentity::new)
-                .collect(),
+            dependencies: crate::test_support::persisted(resolved_dependencies(dependencies)),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: resolved_dependencies(blocked_by_updates),
         }
     }
 
@@ -833,23 +842,14 @@ mod tests {
     }
 
     fn analyzer_from_targets(
-        targets_by_key: HashMap<SchedulerKey, IdentityTargets>,
-    ) -> DependencyAnalyzer<'static> {
-        let mut delete_blockers_by_key: HashMap<SchedulerKey, Vec<usize>> = HashMap::new();
-        for (key, targets) in &targets_by_key {
-            let blockers = targets.lookup_delete_blockers();
-            if !blockers.is_empty() {
-                delete_blockers_by_key
-                    .entry(key.clone())
-                    .or_default()
-                    .extend(blockers);
-            }
-        }
-        for blockers in delete_blockers_by_key.values_mut() {
-            blockers.sort_unstable();
-            blockers.dedup();
-        }
-        DependencyAnalyzer::new(targets_by_key, delete_blockers_by_key, std::iter::empty())
+        targets: HashMap<ResolvedResourceId, IdentityTargets>,
+    ) -> DependencyAnalyzer {
+        analyzer_from_instance_to_idx(
+            targets
+                .into_iter()
+                .map(|(id, targets)| (EffectInstanceKey::current(id), targets))
+                .collect(),
+        )
     }
 
     fn total_edges(deps: &HashMap<usize, HashSet<usize>>) -> usize {
@@ -858,9 +858,9 @@ mod tests {
 
     #[test]
     fn effect_identity_returns_let_binding_for_named_effect() {
-        let mut resource: Resource = Resource::new("test", "named");
+        let mut resource = Resource::new("test", "named");
         resource.binding = Some(absolute_binding("named"));
-        let effect = Effect::Create(ResolvedResource::new(resource));
+        let effect = Effect::Create(ResolvedResource::new(resource.with_dependency_phase(())));
 
         assert_eq!(effect.identity(), ResourceIdentity::new("named"));
     }
@@ -873,13 +873,15 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
-        let mut named_resource: Resource = Resource::new("test", "named");
+        let mut named_resource = Resource::new("test", "named");
         named_resource.binding = Some(absolute_binding("named"));
-        let named = Effect::Create(ResolvedResource::new(named_resource));
+        let named = Effect::Create(ResolvedResource::new(
+            named_resource.with_dependency_phase(()),
+        ));
 
         assert_eq!(anonymous.identity(), ResourceIdentity::new("anon_1234"));
         assert_ne!(anonymous.identity(), named.identity());
@@ -887,19 +889,18 @@ mod tests {
 
     #[test]
     fn scheduler_index_keeps_equal_spelling_binding_and_identity_distinct() {
-        let identity = ResourceIdentity::new("same");
-        let binding = absolute_binding("same");
-        let mut identity_targets = IdentityTargets::default();
-        identity_targets.insert_preferred(0);
-        let mut binding_targets = IdentityTargets::default();
-        binding_targets.insert_preferred(1);
+        let managed = test_id("same");
+        let wait = ResolvedResourceId::with_identity("__wait", "same");
+        let mut managed_targets = IdentityTargets::default();
+        managed_targets.insert_preferred(0);
+        let mut wait_targets = IdentityTargets::default();
+        wait_targets.insert_preferred(1);
         let analyzer = analyzer_from_targets(HashMap::from([
-            (SchedulerKey::Resource(identity.clone()), identity_targets),
-            (SchedulerKey::Binding(binding.clone()), binding_targets),
+            (managed.clone(), managed_targets),
+            (wait.clone(), wait_targets),
         ]));
-
-        assert_eq!(analyzer.lookup_by_identity(&identity), Some(0));
-        assert_eq!(analyzer.lookup_by_binding(&binding), Some(1));
+        assert_eq!(analyzer.lookup_by_id(&managed), Some(0));
+        assert_eq!(analyzer.lookup_by_id(&wait), Some(1));
     }
 
     #[test]
@@ -908,8 +909,7 @@ mod tests {
         let dependent_delete = delete_effect("dependent", &["foo"], &[]);
         let deps = build_effect_dependency_analysis(
             &[delete_target, dependent_delete],
-            &HashMap::new(),
-            &[],
+            std::iter::empty(),
             ScheduleInputs::Apply,
         )
         .expect("dependency analysis must resolve")
@@ -925,8 +925,7 @@ mod tests {
         let dependent_delete = delete_effect("dependent", &["foo"], &[]);
         let deps = build_effect_dependency_analysis(
             &[create_target, dependent_delete],
-            &HashMap::new(),
-            &[],
+            std::iter::empty(),
             ScheduleInputs::Apply,
         )
         .expect("dependency analysis must resolve")
@@ -941,8 +940,7 @@ mod tests {
         let dependent_delete = delete_effect("dependent", &["foo"], &[]);
         let deps = build_effect_dependency_analysis(
             &[update_target, dependent_delete],
-            &HashMap::new(),
-            &[],
+            std::iter::empty(),
             ScheduleInputs::Apply,
         )
         .expect("dependency analysis must resolve")
@@ -955,14 +953,58 @@ mod tests {
     }
 
     #[test]
+    fn apply_orphan_delete_with_missing_persisted_dependency_is_a_typed_warning() {
+        let delete = delete_effect("orphan", &["vanished"], &[]);
+
+        let analysis =
+            build_effect_dependency_analysis(&[delete], std::iter::empty(), ScheduleInputs::Apply)
+                .expect("a vanished persisted destroy dependency must not abort apply");
+
+        assert!(analysis.deps_of(0).expect("delete analysis").is_empty());
+        let [warning] = analysis.unresolved_delete_ordering() else {
+            panic!("expected one typed destroy-ordering warning");
+        };
+        assert_eq!(warning.delete_id(), &test_id("orphan"));
+        assert_eq!(
+            warning.generation(),
+            &crate::effect::EffectGeneration::Current
+        );
+        assert_eq!(warning.dependency(), &test_id("vanished"));
+    }
+
+    #[test]
+    fn dependency_analysis_api_does_not_require_compositions() {
+        let effects = [create_effect("standalone")];
+        let analysis =
+            build_effect_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
+                .expect("composition-independent dependency analysis must resolve");
+
+        assert_eq!(analysis.deps_of(0), Some(&HashSet::new()));
+    }
+
+    #[test]
+    fn dependency_analysis_origin_keys_are_resolved_resource_ids() {
+        let effect = create_effect("resolved");
+        let Effect::Create(resource) = &effect else {
+            unreachable!("fixture is a create effect")
+        };
+        let origins = HashMap::from([(
+            resource.resolved_id(),
+            UnresolvedResource::from_pre_resolve(Resource::from_id(resource.id.clone())),
+        )]);
+
+        build_effect_dependency_analysis(&[effect], origins.keys(), ScheduleInputs::Apply)
+            .expect("resolved origin keys must be accepted without a runtime conversion");
+    }
+
+    #[test]
     fn deposed_delete_dependency_edges_resolve_target_deposed_generation() {
         let parent_delete = deposed_delete_effect("parent", &[]);
         let child_delete = deposed_delete_effect("child", &["parent"]);
 
         let deps = build_effect_dependency_analysis(
             &[parent_delete, child_delete],
-            &HashMap::new(),
-            &[],
+            std::iter::empty(),
             ScheduleInputs::Apply,
         )
         .expect("dependency analysis must resolve")
@@ -981,8 +1023,7 @@ mod tests {
 
         let deps = build_effect_dependency_analysis(
             &[consumer, delete],
-            &HashMap::new(),
-            &[],
+            std::iter::empty(),
             ScheduleInputs::Apply,
         )
         .expect("dependency analysis must resolve")
@@ -999,20 +1040,13 @@ mod tests {
     fn delete_apply_edge_for_blocked_by_updates_rejects_missing_target() {
         let delete = delete_effect("old_web_acl", &[], &["missing_consumer"]);
 
-        let failure = build_effect_dependency_analysis(
-            &[delete],
-            &HashMap::new(),
-            &[],
-            ScheduleInputs::Apply,
-        )
-        .expect_err("a required delete gate must not be silently dropped");
+        let failure =
+            build_effect_dependency_analysis(&[delete], std::iter::empty(), ScheduleInputs::Apply)
+                .expect_err("a required delete gate must not be silently dropped");
 
         assert_eq!(failure.unresolved().len(), 1);
         assert_eq!(failure.unresolved()[0].effect_index(), 0);
-        assert_eq!(
-            failure.unresolved()[0].identity(),
-            &ResourceIdentity::new("missing_consumer")
-        );
+        assert_eq!(failure.unresolved()[0].id(), &test_id("missing_consumer"));
     }
 
     #[test]
@@ -1023,9 +1057,11 @@ mod tests {
 
         let deps = build_effect_dependency_analysis(
             &[parent, consumer, child],
-            &HashMap::new(),
-            &[],
-            ScheduleInputs::Destroy { aliases: &[] },
+            std::iter::empty(),
+            ScheduleInputs::Destroy {
+                aliases: &[],
+                kept_targets: &KeptDestroyTargets::default(),
+            },
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1049,8 +1085,7 @@ mod tests {
 
         let deps = build_effect_dependency_analysis(
             &[create, consumer, delete],
-            &HashMap::new(),
-            &[],
+            std::iter::empty(),
             ScheduleInputs::Apply,
         )
         .expect("dependency analysis must resolve")
@@ -1075,25 +1110,24 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some(absolute_binding("foo")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut blocker_resource = Resource::new("test", "blocker");
         blocker_resource.binding = Some(absolute_binding("blocker"));
-        let blocker = Effect::Create(ResolvedResource::new(blocker_resource));
+        let blocker = Effect::Create(ResolvedResource::new(
+            blocker_resource.with_dependency_phase(()),
+        ));
         let effects = vec![delete, blocker];
         let mut foo_targets = IdentityTargets::default();
         foo_targets.insert_delete(0);
-        let analyzer = analyzer_from_targets(HashMap::from([(
-            SchedulerKey::Binding(absolute_binding("foo")),
-            foo_targets,
-        )]));
+        let analyzer = analyzer_from_targets(HashMap::from([(test_id("foo"), foo_targets)]));
         let mut analysis = DependencyAnalysis::new(effects.len());
 
         analyzer.collect_from_schedule_edges(
             &effects,
-            vec![ScheduleEdge::BlockedByIfDelete(absolute_binding("foo"))],
+            vec![ScheduleEdge::BlockedByIfDelete(test_id("foo"))],
             &mut analysis,
             1,
         );
@@ -1106,35 +1140,19 @@ mod tests {
 
     #[test]
     fn binding_ref_does_not_resolve_to_anonymous_delete_via_identity_match() {
-        let delete: Effect = Effect::Delete {
-            id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
-            identifier: crate::effect::fixture_applied_identifier("foo-id"),
-            generation: crate::effect::EffectGeneration::Current,
-            directives: Default::default(),
-            binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
-        };
-        let mut consumer_resource = Resource::new("test", "consumer");
-        consumer_resource.binding = Some(absolute_binding("consumer"));
-        consumer_resource
-            .dependency_bindings
+        let anonymous = Resource::new("test", "foo");
+        let mut consumer = Resource::new("test", "consumer").with_root_binding("consumer");
+        consumer
+            .dependencies
+            .value_bindings
             .insert(absolute_binding("foo"));
-        let consumer = Effect::Create(ResolvedResource::new(consumer_resource));
-
-        let deps = build_effect_dependency_analysis(
-            &[delete, consumer],
-            &HashMap::new(),
-            &[],
-            ScheduleInputs::Apply,
-        )
-        .expect("dependency analysis must resolve")
-        .into_deps_of();
-
+        let configuration = crate::parser::ExpandedParsedFile {
+            resources: vec![anonymous, consumer.clone()],
+            ..Default::default()
+        };
+        let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into());
         assert!(
-            deps[&1].is_empty(),
-            "a typed binding dependency must not match an anonymous resource identity"
+            matches!(graph, Err(crate::resolved_graph::ExpandedGraphResolutionError::MissingDependency { reference, .. }) if reference == "foo")
         );
     }
 
@@ -1148,9 +1166,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some(absolute_binding("parent")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let child = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1160,17 +1178,19 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some(absolute_binding("child")),
-            dependencies: HashSet::from([absolute_binding("parent")]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: crate::test_support::persisted(resolved_dependencies(&["parent"])),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let effects = vec![parent, child];
 
         let deps = build_effect_dependency_analysis(
             &effects,
-            &HashMap::new(),
-            &[],
-            ScheduleInputs::Destroy { aliases: &[] },
+            std::iter::empty(),
+            ScheduleInputs::Destroy {
+                aliases: &[],
+                kept_targets: &KeptDestroyTargets::default(),
+            },
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1186,9 +1206,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some(absolute_binding("cert")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let listener = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1198,24 +1218,26 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some(absolute_binding("listener")),
-            dependencies: HashSet::from([absolute_binding("cert_issued")]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: crate::test_support::persisted(resolved_dependencies(&["cert_issued"])),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let wait = DestroyWaitAlias::new(
-            absolute_binding("cert_issued"),
-            absolute_binding("cert"),
-            HashSet::new(),
-            vec![ResourceIdentity::new("listener")],
+            test_id("cert_issued"),
+            test_id("cert"),
+            ResolvedDependencies::default(),
+            vec![test_id("listener")],
         )
         .expect("test alias has a consumer");
         let effects = vec![cert, listener];
 
         let deps = build_effect_dependency_analysis(
             &effects,
-            &HashMap::new(),
-            &[],
-            ScheduleInputs::Destroy { aliases: &[wait] },
+            std::iter::empty(),
+            ScheduleInputs::Destroy {
+                aliases: &[wait],
+                kept_targets: &KeptDestroyTargets::default(),
+            },
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1229,19 +1251,21 @@ mod tests {
         let cert = delete_effect("cert", &[], &[]);
         let listener = deposed_delete_effect("listener", &["cert_issued"]);
         let wait = DestroyWaitAlias::new(
-            absolute_binding("cert_issued"),
-            absolute_binding("cert"),
-            HashSet::new(),
-            vec![ResourceIdentity::new("listener")],
+            test_id("cert_issued"),
+            test_id("cert"),
+            ResolvedDependencies::default(),
+            vec![test_id("listener")],
         )
         .expect("test alias has a deposed consumer");
         let effects = vec![cert, listener];
 
         let deps = build_effect_dependency_analysis(
             &effects,
-            &HashMap::new(),
-            &[],
-            ScheduleInputs::Destroy { aliases: &[wait] },
+            std::iter::empty(),
+            ScheduleInputs::Destroy {
+                aliases: &[wait],
+                kept_targets: &KeptDestroyTargets::default(),
+            },
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1261,19 +1285,21 @@ mod tests {
         let cert = deposed_delete_effect("cert", &[]);
         let listener = delete_effect("listener", &["cert_issued"], &[]);
         let wait = DestroyWaitAlias::new(
-            absolute_binding("cert_issued"),
-            absolute_binding("cert"),
-            HashSet::new(),
-            vec![ResourceIdentity::new("listener")],
+            test_id("cert_issued"),
+            test_id("cert"),
+            ResolvedDependencies::default(),
+            vec![test_id("listener")],
         )
         .expect("test alias has a consumer");
         let effects = vec![cert, listener];
 
         let deps = build_effect_dependency_analysis(
             &effects,
-            &HashMap::new(),
-            &[],
-            ScheduleInputs::Destroy { aliases: &[wait] },
+            std::iter::empty(),
+            ScheduleInputs::Destroy {
+                aliases: &[wait],
+                kept_targets: &KeptDestroyTargets::default(),
+            },
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1289,9 +1315,9 @@ mod tests {
     fn destroy_wait_alias_rejects_empty_consumers() {
         assert!(
             DestroyWaitAlias::new(
-                absolute_binding("w"),
-                absolute_binding("t"),
-                HashSet::new(),
+                test_id("w"),
+                test_id("t"),
+                ResolvedDependencies::default(),
                 vec![],
             )
             .is_none()
@@ -1299,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_destroy_dependency_names_are_dropped() {
+    fn unknown_destroy_dependency_address_is_a_typed_warning() {
         let orphan: Effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test", "listener",
@@ -1308,20 +1334,58 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: Some(absolute_binding("listener")),
-            dependencies: HashSet::from([absolute_binding("missing_wait")]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: crate::test_support::persisted(resolved_dependencies(&["missing_wait"])),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
-        let deps = build_effect_dependency_analysis(
+        let analysis = build_effect_dependency_analysis(
             &[orphan],
-            &HashMap::new(),
-            &[],
-            ScheduleInputs::Destroy { aliases: &[] },
+            std::iter::empty(),
+            ScheduleInputs::Destroy {
+                aliases: &[],
+                kept_targets: &KeptDestroyTargets::default(),
+            },
         )
-        .expect("dependency analysis must resolve")
-        .into_deps_of();
+        .expect("an orphan Delete remains schedulable with its known edges");
 
-        assert!(deps[&0].is_empty());
+        assert_eq!(analysis.unresolved_delete_ordering().len(), 1);
+        let warning = &analysis.unresolved_delete_ordering()[0];
+        assert_eq!(warning.delete_id(), &test_id("listener"));
+        assert_eq!(
+            warning.generation(),
+            &crate::effect::EffectGeneration::Current
+        );
+        assert_eq!(warning.dependency(), &test_id("missing_wait"));
+    }
+
+    #[test]
+    fn destroy_accepts_resolved_non_effect_dependency_target() {
+        let query = test_id("query");
+        let consumer: Effect = Effect::Delete {
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test", "consumer",
+            )),
+            identifier: crate::effect::fixture_applied_identifier("consumer-id"),
+            generation: crate::effect::EffectGeneration::Current,
+            directives: Default::default(),
+            binding: Some(absolute_binding("consumer")),
+            dependencies: crate::test_support::persisted([query.clone()]),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
+        let kept_targets = std::iter::once(query).collect();
+
+        let analysis = build_effect_dependency_analysis(
+            &[consumer],
+            std::iter::empty(),
+            ScheduleInputs::Destroy {
+                aliases: &[],
+                kept_targets: &kept_targets,
+            },
+        )
+        .expect("a known data-source-like graph node is not a missing delete target");
+
+        assert!(analysis.into_deps_of()[&0].is_empty());
     }
 
     #[test]
@@ -1334,16 +1398,15 @@ mod tests {
             ),
             directives: Default::default(),
             binding: Some(absolute_binding("thing")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let create = create_effect("thing");
 
         let deps = build_effect_dependency_analysis(
             &[delete, create],
-            &HashMap::new(),
-            &[],
+            std::iter::empty(),
             ScheduleInputs::Apply,
         )
         .expect("dependency analysis must resolve")
@@ -1376,12 +1439,12 @@ mod tests {
             update_effect("parent", &[], &["settings"]),
             update_effect("child", &[("parent", "id")], &["name"]),
         ];
-        let unresolved: HashMap<ResourceId, UnresolvedResource> = effects
+        let unresolved: HashMap<ResolvedResourceId, UnresolvedResource> = effects
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Update { to, .. } => Some((
-                    effect.resource_id().clone(),
-                    UnresolvedResource::from_pre_resolve(to.as_inner().clone()),
+                    to.resolved_id(),
+                    UnresolvedResource::from_pre_resolve(Resource::from_id(to.id.clone())),
                 )),
                 Effect::Read { .. }
                 | Effect::Create(_)
@@ -1392,13 +1455,13 @@ mod tests {
                 | Effect::Move { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate(_)
+                | Effect::DeferredCreate { .. }
                 | Effect::DeferredReplace(_) => None,
             })
             .collect();
 
         let deps =
-            build_effect_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+            build_effect_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve")
                 .into_deps_of();
 
@@ -1418,21 +1481,148 @@ mod tests {
             update_effect("parent", &[], &["tags"]),
             update_effect("child", &[("parent", "id")], &["tags"]),
         ];
-        let unresolved: HashMap<ResourceId, UnresolvedResource> = effects
+        let unresolved: HashMap<ResolvedResourceId, UnresolvedResource> = effects
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Update { to, .. } => Some((
-                    effect.resource_id().clone(),
-                    UnresolvedResource::from_pre_resolve(to.as_inner().clone()),
+                    to.resolved_id(),
+                    UnresolvedResource::from_pre_resolve(Resource::from_id(to.id.clone())),
                 )),
                 _ => None,
             })
             .collect();
         let mut analysis =
-            build_effect_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+            build_effect_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
                 .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
 
         assert!(!analysis.into_deps_of()[&1].contains(&0));
+    }
+    fn test_id(identity: &str) -> ResolvedResourceId {
+        ResolvedResourceId::with_identity(
+            "test",
+            ResourceIdentity::try_from(identity.to_string())
+                .expect("test identity must be non-empty"),
+        )
+    }
+
+    fn resolved_dependencies(names: &[&str]) -> ResolvedDependencies {
+        names.iter().map(|name| test_id(name)).collect()
+    }
+
+    fn analyzer_from_instance_to_idx(
+        instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
+    ) -> DependencyAnalyzer {
+        let mut delete_blockers_by_id: HashMap<ResolvedResourceId, Vec<usize>> = HashMap::new();
+        for (key, targets) in &instance_to_idx {
+            let blockers = targets.lookup_delete_blockers();
+            if !blockers.is_empty() {
+                delete_blockers_by_id
+                    .entry(key.id().clone())
+                    .or_default()
+                    .extend(blockers);
+            }
+        }
+        for blockers in delete_blockers_by_id.values_mut() {
+            blockers.sort_unstable();
+            blockers.dedup();
+        }
+        DependencyAnalyzer::new(instance_to_idx, delete_blockers_by_id, HashSet::new())
+    }
+
+    #[test]
+    fn scheduler_index_keys_on_full_resolved_id() {
+        let first = test_id("first");
+        let second = test_id("second");
+        let mut first_targets = IdentityTargets::default();
+        first_targets.insert_preferred(0);
+        let mut second_targets = IdentityTargets::default();
+        second_targets.insert_preferred(1);
+        let analyzer = analyzer_from_instance_to_idx(HashMap::from([
+            (
+                crate::effect::EffectInstanceKey::current(first.clone()),
+                first_targets,
+            ),
+            (
+                crate::effect::EffectInstanceKey::current(second.clone()),
+                second_targets,
+            ),
+        ]));
+
+        assert_eq!(analyzer.lookup_by_id(&first), Some(0));
+        assert_eq!(analyzer.lookup_by_id(&second), Some(1));
+    }
+
+    #[test]
+    fn blocked_by_if_delete_resolves_anonymous_delete_through_identity_index() {
+        let delete = Effect::Delete {
+            id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
+            identifier: crate::effect::fixture_applied_identifier("foo-id"),
+            generation: crate::effect::EffectGeneration::Current,
+            directives: Default::default(),
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
+        let mut blocker_resource = Resource::new("test", "blocker");
+        blocker_resource.binding = Some(absolute_binding("blocker"));
+        let blocker = Effect::Create(ResolvedResource::new(
+            blocker_resource.with_dependency_phase(()),
+        ));
+        let effects = vec![delete, blocker];
+        let mut foo_targets = IdentityTargets::default();
+        foo_targets.insert_delete(0);
+        let analyzer = analyzer_from_instance_to_idx(HashMap::from([(
+            crate::effect::EffectInstanceKey::current(test_id("foo")),
+            foo_targets,
+        )]));
+        let mut analysis = DependencyAnalysis::new(effects.len());
+
+        analyzer.collect_from_schedule_edges(
+            &effects,
+            vec![ScheduleEdge::BlockedByIfDelete(test_id("foo"))],
+            &mut analysis,
+            1,
+        );
+
+        assert!(
+            analysis.into_deps_of()[&0].contains(&1),
+            "anonymous delete must wait for the effect that blocks its identity"
+        );
+    }
+
+    #[test]
+    fn typed_dependency_resolves_to_anonymous_delete_by_full_address() {
+        let delete = Effect::Delete {
+            id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
+            identifier: crate::effect::fixture_applied_identifier("foo-id"),
+            generation: crate::effect::EffectGeneration::Current,
+            directives: Default::default(),
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
+        let mut consumer_resource = Resource::new("test", "consumer");
+        consumer_resource.binding = Some(absolute_binding("consumer"));
+        let consumer = Effect::Create(ResolvedResource::from_resolved_parts(
+            consumer_resource.with_dependency_phase(()),
+            resolved_dependencies(&["foo"]),
+            ResolvedDependencies::default(),
+        ));
+
+        let deps = build_effect_dependency_analysis(
+            &[delete, consumer],
+            std::iter::empty(),
+            ScheduleInputs::Apply,
+        )
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
+
+        assert!(
+            deps[&1].contains(&0),
+            "typed dependencies resolve by exact ResolvedResourceId match"
+        );
     }
 }

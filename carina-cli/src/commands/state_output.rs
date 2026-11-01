@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use carina_core::provider::{NestedWriteOnlyRecord, PersistedAttributes};
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{LeafPath, LeafPathSegment};
-use carina_state::{CurrentInstance, ResourceState, StateFile};
+use carina_state::{CurrentInstance, LegacyDependencyNames, ResourceState, StateFile};
 use serde::Serialize;
 
 const STATE_SHOW_SCHEMA_VERSION: u32 = 1;
@@ -29,8 +29,22 @@ pub(crate) struct StateShowResource {
     pub(crate) provider: String,
     pub(crate) resource_type: String,
     pub(crate) protected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dependency_migration: Option<StateShowDependencyMigration>,
     pub(crate) current: StateShowCurrent,
     pub(crate) deposed: Vec<StateShowDeposed>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct StateShowDependencyMigration {
+    pub(crate) status: StateShowDependencyMigrationStatus,
+    pub(crate) legacy_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateShowDependencyMigrationStatus {
+    NotYetMigrated,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,7 +84,7 @@ impl StateShowDocument {
         let resources = state
             .resources()
             .iter()
-            .map(StateShowResource::from_row)
+            .map(|row| StateShowResource::from_row(row, state.legacy_dependency_names_for(row)))
             .collect::<Result<Vec<_>, StateShowOutputError>>()?;
 
         Ok(Self {
@@ -90,7 +104,10 @@ impl StateShowDocument {
 }
 
 impl StateShowResource {
-    pub(crate) fn from_row(row: &ResourceState) -> Result<Self, StateShowOutputError> {
+    pub(crate) fn from_row(
+        row: &ResourceState,
+        legacy_dependencies: Option<LegacyDependencyNames>,
+    ) -> Result<Self, StateShowOutputError> {
         let resource = row
             .binding
             .as_ref()
@@ -153,6 +170,10 @@ impl StateShowResource {
             provider: row.provider.clone(),
             resource_type: row.resource_type.clone(),
             protected: row.protected,
+            dependency_migration: legacy_dependencies.map(|legacy| StateShowDependencyMigration {
+                status: StateShowDependencyMigrationStatus::NotYetMigrated,
+                legacy_names: legacy.iter().map(str::to_owned).collect(),
+            }),
             current,
             deposed: row
                 .deposed
@@ -318,12 +339,12 @@ fn redact_nested_write_only_leaf(value: &mut serde_json::Value, path: &LeafPath)
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     use carina_core::provider::{
         CreateAttempt, CreateFailureKind, EgressSent, ProviderError, Sent,
     };
-    use carina_core::resource::{ResolvedResource, Resource, ResourceId};
+    use carina_core::resource::{ResolvedResource, ResolvedResourceId, Resource, ResourceId};
     use carina_core::schema::{LeafPath, LeafPathSegment};
     use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
     use serde_json::{Value, json};
@@ -392,7 +413,14 @@ mod tests {
             "mock-deposed-id".to_string(),
             Some("secondary".to_string()),
             HashMap::from([("name".to_string(), json!("old"))]),
-            BTreeSet::from(["dependency".to_string()]),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity(
+                    "mock",
+                    "test.resource",
+                    "dependency",
+                    None,
+                ),
+            ]),
         ));
         let applied = crate::fixture_resource_state_metadata(
             applied,
@@ -404,7 +432,7 @@ mod tests {
         let pending_id =
             ResourceId::with_provider_identity("mock", "test.resource", "pending-resource", None);
         let pending_resource: ResolvedResource =
-            ResolvedResource::new(Resource::from_id(pending_id.clone()));
+            ResolvedResource::new((Resource::from_id(pending_id.clone())).into_value_snapshot());
         let pending = crate::fixture_in_flight_create(
             &pending_id,
             "resume-token",
@@ -425,7 +453,7 @@ mod tests {
         let unknown_id =
             ResourceId::with_provider_identity("mock", "test.resource", "unknown-resource", None);
         let unknown_resource: ResolvedResource =
-            ResolvedResource::new(Resource::from_id(unknown_id.clone()));
+            ResolvedResource::new((Resource::from_id(unknown_id.clone())).into_value_snapshot());
         let failure = CreateAttempt::for_test(unknown_id).outcome_unknown(
             EgressSent::for_test(),
             ProviderError::api_error("guest trapped"),

@@ -3,12 +3,10 @@
 //! Renders the TUI to an in-memory buffer and snapshots the output,
 //! ensuring the plan viewer displays correctly.
 
-use std::collections::HashSet;
-
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
+use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::plan::Plan;
 use carina_core::resource::{
@@ -22,7 +20,7 @@ use crate::test_utils::buffer_to_string;
 use crate::ui::draw;
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::new((resource).into_value_snapshot())
 }
 
 fn create(resource: Resource) -> Effect {
@@ -67,21 +65,16 @@ fn render_tui_with_schemas(
 
 /// Build a plan with VPC + route table + subnet (all Create effects with dependencies).
 fn build_all_create_plan() -> Plan {
-    let mut plan = Plan::new();
-    plan.add(create(
+    let resources = vec![
         Resource::new("ec2.Vpc", "my-vpc")
             .with_absolute_binding(absolute("vpc"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
-    ));
-    plan.add(create(
         Resource::new("ec2.RouteTable", "my-rt")
             .with_absolute_binding(absolute("rt"))
             .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-    ));
-    plan.add(create(
         Resource::new("ec2.Subnet", "my-subnet")
             .with_absolute_binding(absolute("subnet"))
             .with_attribute(
@@ -89,12 +82,32 @@ fn build_all_create_plan() -> Plan {
                 Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
             )
             .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-    ));
-    plan
+    ];
+    crate::create_plan_fixture(resources)
 }
 
 /// Build a plan with mixed operations: VPC Update + SG Create + Subnet Delete.
 fn build_mixed_operations_plan() -> Plan {
+    let mut managed = ResolvedResource::collect_resolved([
+        Resource::new("ec2.Vpc", "my-vpc")
+            .with_absolute_binding(absolute("vpc"))
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+            )
+            .with_attribute(
+                "enable_dns_support",
+                Value::Concrete(ConcreteValue::Bool(true)),
+            ),
+        Resource::new("ec2.SecurityGroup", "my-sg")
+            .with_absolute_binding(absolute("sg"))
+            .with_attribute(
+                "group_description",
+                Value::Concrete(ConcreteValue::String("Web security group".into())),
+            )
+            .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
+    ])
+    .expect("mixed TUI fixture graph");
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("my-vpc-id"),
@@ -110,29 +123,10 @@ fn build_mixed_operations_plan() -> Plan {
             )
             .with_identifier("my-vpc-id"),
         ),
-        to: resolved(
-            Resource::new("ec2.Vpc", "my-vpc")
-                .with_absolute_binding(absolute("vpc"))
-                .with_attribute(
-                    "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-                )
-                .with_attribute(
-                    "enable_dns_support",
-                    Value::Concrete(ConcreteValue::Bool(true)),
-                ),
-        ),
+        to: managed.remove(0),
         changed_attributes: vec!["enable_dns_support".to_string()],
     });
-    plan.add(create(
-        Resource::new("ec2.SecurityGroup", "my-sg")
-            .with_absolute_binding(absolute("sg"))
-            .with_attribute(
-                "group_description",
-                Value::Concrete(ConcreteValue::String("Web security group".into())),
-            )
-            .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-    ));
+    plan.add(Effect::Create(managed.remove(0)));
     plan.add(Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "ec2.Subnet",
@@ -142,9 +136,9 @@ fn build_mixed_operations_plan() -> Plan {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(absolute("old_subnet")),
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
     plan
 }
@@ -161,9 +155,9 @@ fn build_deposed_delete_plan() -> Plan {
         ),
         directives: Directives::default(),
         binding: Some(absolute("main")),
-        dependencies: HashSet::new(),
-        explicit_dependencies: HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
     plan
 }
@@ -262,9 +256,9 @@ fn build_deferred_for_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(create(certificate_resource()));
-    plan.add(Effect::DeferredCreate(
-        carina_core::effect::DeferredCreatePayload::new(Box::new(deferred)),
-    ));
+    plan.add(Effect::DeferredCreate(crate::compiled_loop_fixture(
+        Box::new(deferred),
+    )));
     plan
 }
 
@@ -309,9 +303,9 @@ fn build_anonymous_deferred_for_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(create(certificate_resource()));
-    plan.add(Effect::DeferredCreate(
-        carina_core::effect::DeferredCreatePayload::new(Box::new(deferred)),
-    ));
+    plan.add(Effect::DeferredCreate(crate::compiled_loop_fixture(
+        Box::new(deferred),
+    )));
     plan
 }
 
@@ -337,22 +331,37 @@ fn build_deferred_replace_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(create(certificate_resource()));
-    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "route53.Record",
-                "old-record-0",
-            )),
-            identifier: crate::fixture_applied_identifier("record-0"),
-            directives: Directives::default(),
-            binding: Some(absolute("validation_records[0]")),
-            dependencies: HashSet::from([absolute("cert")]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
-        }])
-        .expect("fixture has one delete"),
-        template: Box::new(deferred),
-    })));
+    plan.add(Effect::DeferredReplace(Box::new(
+        crate::compiled_replace_fixture(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "route53.Record",
+                    "old-record-0",
+                )),
+                identifier: crate::fixture_applied_identifier("record-0"),
+                directives: Directives::default(),
+                binding: Some(absolute("validation_records[0]")),
+                dependencies:
+                    carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                        [
+                            carina_core::resource::ResolvedResourceId::with_provider_identity(
+                                "aws",
+                                "acm.Certificate",
+                                "cert",
+                                None,
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )
+                    .unwrap(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+            }])
+            .expect("fixture has one delete"),
+            Box::new(deferred),
+        ),
+    )));
     plan
 }
 
@@ -630,6 +639,42 @@ fn snapshot_filter_mode_route_table() {
 
 /// Build a plan with Move + Update for the same target (Move should be suppressed).
 fn build_moved_with_changes_plan() -> Plan {
+    let vpc = Resource::new("ec2.Vpc", "new_vpc")
+        .with_binding("new_vpc")
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+        )
+        .with_attribute(
+            "tags",
+            Value::Concrete(ConcreteValue::Map(
+                [(
+                    "Name".to_string(),
+                    Value::Concrete(ConcreteValue::String("updated".into())),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+        );
+    let subnet = Resource::new("ec2.Subnet", "my-subnet")
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
+        )
+        .with_attribute(
+            "vpc_id",
+            Value::resource_ref("new_vpc".to_string(), "vpc_id".to_string(), vec![]),
+        );
+    let mut desired = ResolvedResource::collect_resolved(
+        vec![vpc, subnet]
+            .into_iter()
+            .map(|resource| resource.resolve_root_for_test()),
+    )
+    .expect("fixture graph")
+    .into_iter();
+    let vpc = desired.next().expect("resolved moved VPC fixture");
+    let subnet = desired.next().expect("resolved moved subnet fixture");
+
     let mut plan = Plan::new();
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -654,35 +699,10 @@ fn build_moved_with_changes_plan() -> Plan {
             )
             .with_identifier("new-vpc-id"),
         ),
-        to: resolved(
-            Resource::new("ec2.Vpc", "new_vpc")
-                .with_absolute_binding(absolute("new_vpc"))
-                .with_attribute(
-                    "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-                )
-                .with_attribute(
-                    "tags",
-                    Value::Concrete(ConcreteValue::Map(
-                        [(
-                            "Name".to_string(),
-                            Value::Concrete(ConcreteValue::String("updated".into())),
-                        )]
-                        .into_iter()
-                        .collect(),
-                    )),
-                ),
-        ),
+        to: vpc,
         changed_attributes: vec!["tags".to_string()],
     });
-    plan.add(create(
-        Resource::new("ec2.Subnet", "my-subnet")
-            .with_attribute(
-                "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
-            )
-            .with_attribute("vpc_id", root_ref("new_vpc", "vpc_id")),
-    ));
+    plan.add(Effect::Create(subnet));
     plan
 }
 

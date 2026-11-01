@@ -1,7 +1,34 @@
 use super::*;
 use crate::explicit::ExplicitFields;
-use crate::parser::SourceSpan;
+use crate::parser::{RelativeBindingName, SourceSpan};
 use crate::schema::PatternResourceSchema;
+
+#[test]
+fn resolved_dependency_reads_use_typed_json_entries_and_round_trip() {
+    let id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "producer.record",
+        Some("secondary".to_string()),
+    );
+    let mut reads = ResolvedDependencyReads::default();
+    reads.insert_known(id.clone(), "comment");
+
+    let encoded = serde_json::to_value(&reads).expect("serialize typed dependency reads");
+    assert!(
+        encoded.is_array(),
+        "dependency reads must not use object keys"
+    );
+    assert_eq!(encoded[0]["id"]["identity"], "producer.record");
+    assert_eq!(encoded[0]["id"]["provider_instance"], "secondary");
+    let decoded: ResolvedDependencyReads =
+        serde_json::from_value(encoded).expect("deserialize typed dependency reads");
+    assert_eq!(decoded, reads);
+    assert_eq!(
+        decoded.known_attributes(&id),
+        Some(&BTreeSet::from(["comment".to_string()]))
+    );
+}
 
 type Value = ExpandedValue;
 type ConcreteValue = ExpandedConcreteValue;
@@ -20,6 +47,36 @@ type LoopDeferredValue = super::DeferredValue<LoopSlot, AbsoluteBindingAddress>;
 
 fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
     RootScope::new().resolve(RelativeBindingName::new(binding))
+}
+
+#[test]
+fn desired_leaf_deferral_keeps_containers_structural() {
+    let reference = Value::root_resource_ref("peer", "id", vec![]);
+    let unknown = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: absolute_binding("peer"),
+        },
+    ));
+    let known = Value::Concrete(ConcreteValue::String("known".into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(known.clone())));
+    for value in [reference, unknown, secret] {
+        assert!(is_deferred_desired_leaf(&value));
+        let list = Value::Concrete(ConcreteValue::List(vec![known.clone(), value]));
+        assert!(!is_deferred_desired_leaf(&list));
+        let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("known".into(), known.clone()),
+            ("nested".into(), list),
+        ])));
+        assert!(!is_deferred_desired_leaf(&map));
+    }
+    for value in [
+        known.clone(),
+        Value::Concrete(ConcreteValue::List(vec![known.clone()])),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([("key".into(), known)]))),
+        Value::Concrete(ConcreteValue::StringList(vec!["known".into()])),
+    ] {
+        assert!(!is_deferred_desired_leaf(&value));
+    }
 }
 
 fn module_argument_diagnostic_at(
@@ -729,7 +786,7 @@ fn pending_resource_id_and_resource_reject_serialization() {
     let resource = Resource::pending_with_provider("aws", "ec2.Subnet", None);
 
     assert!(serde_json::to_string(&id).is_err());
-    assert!(serde_json::to_string(&resource).is_err());
+    assert!(serde_json::to_string(&resource.into_value_snapshot()).is_err());
 }
 
 #[test]
@@ -812,18 +869,22 @@ fn resolved_resource_id_serde_round_trips_as_resource_id() {
 #[test]
 #[should_panic(expected = "ResolvedResource requires identity")]
 fn resolved_resource_new_panics_without_identity() {
-    ResolvedResource::new(Resource::pending("s3.Bucket"));
+    ResolvedResource::new(Resource::pending("s3.Bucket").with_dependency_phase(()));
 }
 
 #[test]
 fn resolved_resource_try_new_returns_none_without_identity() {
-    assert!(ResolvedResource::try_new(Resource::pending("s3.Bucket")).is_none());
+    assert!(
+        ResolvedResource::try_new(Resource::pending("s3.Bucket").with_dependency_phase(()))
+            .is_none()
+    );
 }
 
 #[test]
 fn resolved_resource_try_new_returns_some_with_identity() {
     let resolved =
-        ResolvedResource::try_new(Resource::new("s3.Bucket", "logs")).expect("identity is present");
+        ResolvedResource::try_new(Resource::new("s3.Bucket", "logs").with_dependency_phase(()))
+            .expect("identity is present");
     assert_eq!(resolved.id.identity_str(), Some("logs"));
     assert_eq!(resolved.as_inner().id.identity_str(), Some("logs"));
     assert_eq!(
@@ -846,8 +907,9 @@ fn resolved_resource_error_preserves_typed_ignore_errors() {
             .expect("valid test schema"),
     );
 
-    let error = ResolvedResource::resolve_with_schemas(resource, &registry)
-        .expect_err("the authored path is not in the schema");
+    let error =
+        ResolvedResource::resolve_with_schemas(resource.with_dependency_phase(()), &registry)
+            .expect_err("the authored path is not in the schema");
     let rendered = error.to_string();
     let ResolvedResourceError::InvalidIgnoreChanges { errors, .. } = error else {
         panic!("expected typed ignore_changes errors");
@@ -863,12 +925,10 @@ fn resolved_resource_error_preserves_typed_ignore_errors() {
 
 #[test]
 fn resolved_resource_serde_round_trips_as_resource() {
-    let resolved = ResolvedResource::new(Resource::with_provider(
-        "aws",
-        "s3.Bucket",
-        "logs",
-        Some("primary".to_string()),
-    ));
+    let resolved = ResolvedResource::new(
+        Resource::with_provider("aws", "s3.Bucket", "logs", Some("primary".to_string()))
+            .with_dependency_phase(()),
+    );
     let json = serde_json::to_string(&resolved).unwrap();
     let decoded = serde_json::from_str::<SavedResolvedResource>(&json).unwrap();
     assert_eq!(decoded, SavedResolvedResource::from(resolved));
@@ -877,7 +937,8 @@ fn resolved_resource_serde_round_trips_as_resource() {
 
 #[test]
 fn resolved_resource_deserialize_rejects_absent_identity() {
-    let mut value = serde_json::to_value(Resource::new("s3.Bucket", "logs")).unwrap();
+    let mut value =
+        serde_json::to_value(Resource::new("s3.Bucket", "logs").into_value_snapshot()).unwrap();
     value["id"].as_object_mut().unwrap().remove("identity");
     let err = serde_json::from_value::<SavedResolvedResource>(value).unwrap_err();
     assert!(err.to_string().contains("identity is required"));
@@ -885,7 +946,9 @@ fn resolved_resource_deserialize_rejects_absent_identity() {
 
 #[test]
 fn resource_deserialization_cannot_restore_resolved_ignore_changes() {
-    let resource: SavedResource = Resource::new("Widget", "example").into();
+    let resource: SavedResource = Resource::new("Widget", "example")
+        .into_value_snapshot()
+        .into();
     let mut value = serde_json::to_value(resource).expect("serialize saved resource");
     value["resolved_ignore_changes"] = serde_json::json!([{
         "attribute": "secret",
@@ -905,18 +968,22 @@ fn resource_deserialization_cannot_restore_resolved_ignore_changes() {
 #[test]
 #[should_panic(expected = "ResolvedDataSource requires identity")]
 fn resolved_data_source_new_panics_without_identity() {
-    ResolvedDataSource::new(DataSource::pending("aws_ami"));
+    ResolvedDataSource::new(DataSource::pending("aws_ami").with_dependency_phase(()));
 }
 
 #[test]
 fn resolved_data_source_try_new_returns_none_without_identity() {
-    assert!(ResolvedDataSource::try_new(DataSource::pending("aws_ami")).is_none());
+    assert!(
+        ResolvedDataSource::try_new(DataSource::pending("aws_ami").with_dependency_phase(()),)
+            .is_none()
+    );
 }
 
 #[test]
 fn resolved_data_source_try_new_returns_some_with_identity() {
     let resolved =
-        ResolvedDataSource::try_new(DataSource::new("aws_ami", "ubuntu")).expect("identity");
+        ResolvedDataSource::try_new(DataSource::new("aws_ami", "ubuntu").with_dependency_phase(()))
+            .expect("identity");
     assert_eq!(resolved.id.identity_str(), Some("ubuntu"));
     assert_eq!(resolved.as_inner().id.identity_str(), Some("ubuntu"));
     assert_eq!(
@@ -927,12 +994,10 @@ fn resolved_data_source_try_new_returns_some_with_identity() {
 
 #[test]
 fn resolved_data_source_serde_round_trips_as_data_source() {
-    let resolved = ResolvedDataSource::new(DataSource::with_provider(
-        "aws",
-        "ami",
-        "ubuntu",
-        Some("primary".to_string()),
-    ));
+    let resolved = ResolvedDataSource::new(
+        DataSource::with_provider("aws", "ami", "ubuntu", Some("primary".to_string()))
+            .with_dependency_phase(()),
+    );
     let json = serde_json::to_string(&resolved).unwrap();
     let decoded = serde_json::from_str::<SavedResolvedDataSource>(&json).unwrap();
     assert_eq!(decoded, SavedResolvedDataSource::from(resolved));
@@ -941,7 +1006,8 @@ fn resolved_data_source_serde_round_trips_as_data_source() {
 
 #[test]
 fn resolved_data_source_deserialize_rejects_absent_identity() {
-    let mut value = serde_json::to_value(DataSource::new("aws_ami", "ubuntu")).unwrap();
+    let mut value =
+        serde_json::to_value(DataSource::new("aws_ami", "ubuntu").into_value_snapshot()).unwrap();
     value["id"].as_object_mut().unwrap().remove("identity");
     let err = serde_json::from_value::<SavedResolvedDataSource>(value).unwrap_err();
     assert!(err.to_string().contains("identity is required"));
@@ -1105,18 +1171,21 @@ fn prevent_destroy_resolution_reports_source_and_fails_safe_for_expressions() {
 
 #[test]
 fn directives_depends_on_defaults_to_empty() {
-    let d = Directives::default();
+    let d = PersistedDirectives::default();
     assert!(d.depends_on.is_empty());
 }
 
 #[test]
 fn directives_depends_on_round_trips_serde() {
-    let d = Directives {
-        depends_on: vec![absolute_binding("role"), absolute_binding("key")],
-        ..Directives::default()
+    let d = PersistedDirectives {
+        depends_on: crate::test_support::persisted([
+            ResolvedResourceId::with_provider_identity("mock", "test.Role", "role", None),
+            ResolvedResourceId::with_provider_identity("mock", "test.Key", "key", None),
+        ]),
+        ..Default::default()
     };
     let json = serde_json::to_string(&d).unwrap();
-    let back: Directives = serde_json::from_str(&json).unwrap();
+    let back: PersistedDirectives = serde_json::from_str(&json).unwrap();
     assert_eq!(back.depends_on, d.depends_on);
 }
 
@@ -1125,7 +1194,7 @@ fn directives_serialises_without_depends_on_when_empty() {
     // Avoid state-file noise: an empty depends_on must not appear as
     // `"depends_on": []` in serialised JSON, otherwise every legacy
     // state file will gain a meaningless key on first re-write.
-    let d = Directives::default();
+    let d = PersistedDirectives::default();
     let json = serde_json::to_string(&d).unwrap();
     assert!(
         !json.contains("depends_on"),
@@ -1141,7 +1210,7 @@ fn directives_depends_on_deserialises_from_legacy_json_without_field() {
         "create_before_destroy": false,
         "prevent_destroy": {"kind": "unspecified"}
     }"#;
-    let d: Directives = serde_json::from_str(without_depends_on).unwrap();
+    let d: PersistedDirectives = serde_json::from_str(without_depends_on).unwrap();
     assert!(d.depends_on.is_empty());
 }
 
@@ -2850,7 +2919,10 @@ fn unavailable_canonical_hash_matches_function_call_and_ignores_diagnostics() {
 fn resource_typed_binding_field() {
     let resource: AuthoredResource =
         AuthoredResource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
-    assert_eq!(resource.binding.as_deref(), Some("my_bucket"));
+    assert_eq!(
+        resource.binding.as_ref().map(|binding| binding.as_str()),
+        Some("my_bucket")
+    );
     // binding should NOT be in attributes
     assert!(!resource.attributes.contains_key("_binding"));
 }
@@ -2859,8 +2931,8 @@ fn resource_typed_binding_field() {
 fn resource_typed_dependency_bindings_field() {
     let resource: AuthoredResource = AuthoredResource::new("ec2.Subnet", "my-subnet")
         .with_dependency_bindings(["vpc".to_string()].into_iter().collect());
-    assert!(resource.dependency_bindings.contains("vpc"));
-    assert_eq!(resource.dependency_bindings.len(), 1);
+    assert!(resource.dependencies.value_bindings.contains("vpc"));
+    assert_eq!(resource.dependencies.value_bindings.len(), 1);
     // dependency_bindings should NOT be in attributes
     assert!(!resource.attributes.contains_key("_dependency_bindings"));
 }
@@ -2870,10 +2942,10 @@ fn resource_typed_dependency_bindings_field() {
 #[test]
 fn resource_dependency_bindings_dedup_on_duplicate_insert() {
     let mut resource: AuthoredResource = AuthoredResource::new("ec2.Subnet", "my-subnet");
-    resource.dependency_bindings.insert("vpc".into());
-    resource.dependency_bindings.insert("vpc".into());
-    assert_eq!(resource.dependency_bindings.len(), 1);
-    assert!(resource.dependency_bindings.contains("vpc"));
+    resource.dependencies.value_bindings.insert("vpc".into());
+    resource.dependencies.value_bindings.insert("vpc".into());
+    assert_eq!(resource.dependencies.value_bindings.len(), 1);
+    assert!(resource.dependencies.value_bindings.contains("vpc"));
 }
 
 /// Iteration order is deterministic (sorted) regardless of insertion
@@ -2881,13 +2953,17 @@ fn resource_dependency_bindings_dedup_on_duplicate_insert() {
 #[test]
 fn resource_dependency_bindings_iteration_is_sorted() {
     let mut resource: AuthoredResource = AuthoredResource::new("ec2.Route", "my-route");
-    resource.dependency_bindings.insert("rt".into());
-    resource.dependency_bindings.insert("tgw_attach".into());
-    resource.dependency_bindings.insert("vpc".into());
+    resource.dependencies.value_bindings.insert("rt".into());
+    resource
+        .dependencies
+        .value_bindings
+        .insert("tgw_attach".into());
+    resource.dependencies.value_bindings.insert("vpc".into());
     let order: Vec<&str> = resource
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .iter()
-        .map(AsRef::as_ref)
+        .map(|binding| binding.as_str())
         .collect();
     assert_eq!(order, vec!["rt", "tgw_attach", "vpc"]);
 }
@@ -2897,8 +2973,26 @@ fn resource_dependency_bindings_iteration_is_sorted() {
 #[test]
 fn state_dependency_bindings_dedup_on_duplicate_insert() {
     let mut state = State::not_found(ResourceId::with_identity("ec2.Subnet", "my-subnet"));
-    state.dependency_bindings.insert(absolute_binding("vpc"));
-    state.dependency_bindings.insert(absolute_binding("vpc"));
+    state
+        .dependency_bindings
+        .extend_projected(&crate::test_support::persisted([
+            ResolvedResourceId::with_provider_identity(
+                "aws",
+                "ec2.Vpc",
+                ResourceIdentity::new("vpc"),
+                None,
+            ),
+        ]));
+    state
+        .dependency_bindings
+        .extend_projected(&crate::test_support::persisted([
+            ResolvedResourceId::with_provider_identity(
+                "aws",
+                "ec2.Vpc",
+                ResourceIdentity::new("vpc"),
+                None,
+            ),
+        ]));
     assert_eq!(state.dependency_bindings.len(), 1);
 }
 
@@ -2906,7 +3000,7 @@ fn state_dependency_bindings_dedup_on_duplicate_insert() {
 fn resource_default_metadata_fields() {
     let resource = Resource::new("s3.Bucket", "my-bucket");
     assert_eq!(resource.binding, None);
-    assert!(resource.dependency_bindings.is_empty());
+    assert!(resource.dependencies.value_bindings.is_empty());
 }
 
 #[test]
@@ -3187,7 +3281,8 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
     );
     let resource =
         Resource::new("fixture.Resource", "instance.resource").with_module_source(live.clone());
-    let encoded = serde_json::to_value(&resource).expect("serialize live resource metadata");
+    let encoded = serde_json::to_value(resource.into_value_snapshot())
+        .expect("serialize live resource metadata");
     assert_eq!(
         encoded["module_source"],
         serde_json::json!({
@@ -3210,7 +3305,8 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
 
     let mut data_source = DataSource::new("fixture.Lookup", "instance.lookup");
     data_source.module_source = Some(live);
-    let encoded = serde_json::to_value(&data_source).expect("serialize live data-source metadata");
+    let encoded = serde_json::to_value(data_source.into_value_snapshot())
+        .expect("serialize live data-source metadata");
     assert_eq!(
         encoded["module_source"],
         serde_json::json!({
@@ -3231,7 +3327,8 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
     );
 
     let root = Resource::new("fixture.Resource", "root").with_module_source(ModuleSource::Root);
-    let encoded = serde_json::to_value(&root).expect("serialize live root metadata");
+    let encoded =
+        serde_json::to_value(root.into_value_snapshot()).expect("serialize live root metadata");
     assert_eq!(
         encoded["module_source"],
         serde_json::json!("Root"),
@@ -4125,7 +4222,7 @@ fn directives_provider_instance_round_trips_serde() {
         ..Directives::default()
     };
     let json = serde_json::to_string(&d).unwrap();
-    let back: Directives = serde_json::from_str(&json).unwrap();
+    let back: PersistedDirectives = serde_json::from_str(&json).unwrap();
     assert_eq!(back.provider_instance, d.provider_instance);
 }
 
@@ -4286,4 +4383,50 @@ mod navigate_value_path_tests {
             Some(Value::Deferred(DeferredValue::Secret(Box::new(s("n")))))
         );
     }
+}
+
+#[test]
+fn unexpanded_dependency_fields_default_to_empty() {
+    let dependencies = UnexpandedDependencyFields::<RelativeBindingName>::default();
+    assert!(dependencies.depends_on.is_empty());
+    assert!(dependencies.value_bindings.is_empty());
+}
+#[test]
+fn unexpanded_dependencies_are_parser_only_and_do_not_serialize() {
+    let mut resource = Resource::with_provider("mock", "test.resource", "example", None);
+    resource.dependencies.depends_on =
+        vec![absolute_binding("role"), absolute_binding("key")].into();
+    let saved: SavedResource = resource.into_value_snapshot().into();
+    let json = serde_json::to_string(&saved).unwrap();
+    let back: SavedResource = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.dependencies, ());
+    assert!(!json.contains("role") && !json.contains("key"));
+}
+#[test]
+fn provider_normalization_boundary_strips_then_restores_host_dependencies() {
+    let mut resource = Resource::new("test.resource", "consumer");
+    resource
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("value_source"));
+    resource.dependencies.depends_on = vec![absolute_binding("explicit_source")].into();
+    let mut provider = resource.clone().into_provider_resource();
+    assert_eq!(provider.dependencies, ());
+    provider.attributes.insert(
+        "normalized".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    resource.apply_provider_resource(provider);
+    assert_eq!(
+        resource.dependencies.value_bindings,
+        BTreeSet::from([absolute_binding("value_source")])
+    );
+    assert_eq!(
+        resource.dependencies.depends_on.diagnostic_references(),
+        ["explicit_source"]
+    );
+    assert_eq!(
+        resource.attributes.get("normalized"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
 }

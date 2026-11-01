@@ -1155,6 +1155,7 @@ fn escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::resolved;
     use std::collections::HashMap;
 
     use carina_core::effect::Effect;
@@ -1181,8 +1182,14 @@ mod tests {
         .resolve_root_for_test()
     }
 
-    fn fixture_svg_with_theme(name: &str, theme: SvgTheme) -> String {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name(name);
+    fn fixture_svg_with_theme(
+        color_mode: crate::output_style::ColorMode,
+        name: &str,
+        theme: SvgTheme,
+    ) -> String {
+        let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(&runtime, name)
+            .expect("fixture mock inputs must be valid");
         let state = fixture.state_file.as_ref().map(|state| StateMetadata {
             lineage: &state.lineage,
             serial: state.serial,
@@ -1201,16 +1208,21 @@ mod tests {
         render_svg(&model, &layout, theme).text
     }
 
-    fn fixture_svg(name: &str) -> String {
-        fixture_svg_with_theme(name, SvgTheme::Fixed(Theme::Light))
+    fn fixture_svg(color_mode: crate::output_style::ColorMode, name: &str) -> String {
+        fixture_svg_with_theme(color_mode, name, SvgTheme::Fixed(Theme::Light))
     }
 
     #[test]
     fn exports_only_summary_is_not_no_changes() {
-        let fixture =
-            crate::fixture_plan::build_plan_from_fixture_name("exports_multifile_let_chain");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(
+            &runtime,
+            "exports_multifile_let_chain",
+        )
+        .expect("fixture mock inputs must be valid");
         assert!(fixture.plan.effects().is_empty());
-        let svg = fixture_svg("exports_multifile_let_chain");
+        let svg = fixture_svg(color_mode, "exports_multifile_let_chain");
 
         assert!(svg.contains("1 export to change"));
         assert!(!svg.contains("No changes"));
@@ -1218,9 +1230,12 @@ mod tests {
 
     #[test]
     fn residual_deferred_only_summary_is_not_no_changes() {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name("deferred_for");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(&runtime, "deferred_for")
+            .expect("fixture mock inputs must be valid");
         assert!(fixture.plan.effects().is_empty());
-        let svg = fixture_svg("deferred_for");
+        let svg = fixture_svg(color_mode, "deferred_for");
 
         assert!(svg.contains("1 deferred loop pending"));
         assert!(!svg.contains("No changes"));
@@ -1228,7 +1243,8 @@ mod tests {
 
     #[test]
     fn snapshot_state_only_directive_change_svg() {
-        let svg = fixture_svg("state_only_directive_change");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let svg = fixture_svg(color_mode, "state_only_directive_change");
 
         assert!(svg.contains("1 resource directive change"));
         assert!(!svg.contains(">No changes</tspan>"));
@@ -1253,10 +1269,10 @@ mod tests {
         plan.add(Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new("credential-id").unwrap(),
-            to: ResolvedResource::new(resource.clone()),
+            to: resolved(resource.clone()),
             changed_attributes: vec!["secret_token".to_string(), "write_only_token".to_string()],
         });
-        let desired = vec![ResolvedResource::new(resource)];
+        let desired = vec![resolved(resource)];
         let summary = crate::plan_summary::PlanChangeSummary::new(
             &plan,
             &[],
@@ -1282,7 +1298,8 @@ mod tests {
 
     #[test]
     fn anonymous_cards_show_type_and_discriminator_without_attribute_values() {
-        let svg = fixture_svg("plan_image_anonymous");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let svg = fixture_svg(color_mode, "plan_image_anonymous");
 
         assert_eq!(svg.matches(">Widget</text>").count(), 2);
         assert!(svg.contains("anonymous #3b61ad0d"));
@@ -1291,7 +1308,7 @@ mod tests {
         assert!(!svg.contains("anonymous-one"));
         assert!(!svg.contains("anonymous-two"));
 
-        let module_svg = fixture_svg("module_anonymous_resource");
+        let module_svg = fixture_svg(color_mode, "module_anonymous_resource");
         assert!(module_svg.contains(">bootstrap.RolePolicy</text>"));
         assert!(module_svg.contains("anonymous #968c7070"));
     }
@@ -1308,10 +1325,10 @@ mod tests {
         plan.add(Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new("long-label-id").unwrap(),
-            to: ResolvedResource::new(resource.clone()),
+            to: resolved(resource.clone()),
             changed_attributes,
         });
-        let desired = vec![ResolvedResource::new(resource)];
+        let desired = vec![resolved(resource)];
         let summary = crate::plan_summary::PlanChangeSummary::new(
             &plan,
             &[],
@@ -1342,7 +1359,8 @@ mod tests {
 
     #[test]
     fn svg_has_explicit_white_background_and_vendored_font_family() {
-        let svg = fixture_svg("mixed_operations");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let svg = fixture_svg(color_mode, "mixed_operations");
         assert!(svg.contains(&format!(
             r#"id="background" fill="{}""#,
             LIGHT_PALETTE.background
@@ -1352,7 +1370,8 @@ mod tests {
 
     #[test]
     fn auto_svg_contains_both_palettes_and_dark_media_query() {
-        let svg = fixture_svg_with_theme("plan_image_module_cascade", SvgTheme::Auto);
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let svg = fixture_svg_with_theme(color_mode, "plan_image_module_cascade", SvgTheme::Auto);
 
         assert!(svg.contains("@media (prefers-color-scheme: dark)"));
         assert!(svg.contains(LIGHT_PALETTE.background));
@@ -1361,7 +1380,12 @@ mod tests {
 
     #[test]
     fn fixed_dark_svg_uses_no_light_background() {
-        let svg = fixture_svg_with_theme("plan_image_module_cascade", SvgTheme::Fixed(Theme::Dark));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let svg = fixture_svg_with_theme(
+            color_mode,
+            "plan_image_module_cascade",
+            SvgTheme::Fixed(Theme::Dark),
+        );
 
         assert!(svg.contains(DARK_PALETTE.background));
         assert!(!svg.contains(LIGHT_PALETTE.background));
@@ -1370,7 +1394,8 @@ mod tests {
 
     #[test]
     fn legend_contains_only_visible_kinds_and_applicable_semantics() {
-        let mixed = fixture_svg("mixed_operations");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let mixed = fixture_svg(color_mode, "mixed_operations");
         assert!(mixed.contains(">create</text>"));
         assert!(mixed.contains(">update</text>"));
         assert!(mixed.contains(">delete</text>"));
@@ -1380,10 +1405,10 @@ mod tests {
         assert!(!mixed.contains(">unchanged</text>"));
         assert!(!mixed.contains("halo = downstream blast radius"));
 
-        let delete = fixture_svg("delete_orphan");
+        let delete = fixture_svg(color_mode, "delete_orphan");
         assert!(!delete.contains(">runs before</text>"));
 
-        let cascade = fixture_svg("plan_image_module_cascade");
+        let cascade = fixture_svg(color_mode, "plan_image_module_cascade");
         assert!(cascade.contains(">unchanged</text>"));
         assert!(cascade.contains(">references</text>"));
         assert!(cascade.contains("halo = downstream blast radius"));
@@ -1399,24 +1424,20 @@ mod tests {
         let mut b = Resource::new("test.Widget", "b");
         b.binding = Some(absolute_binding("b"));
         b.set_attr("input", root_resource_ref("connector", "id"));
+        let desired = ResolvedResource::collect_resolved([a, connector, b]).unwrap();
         let mut plan = Plan::new();
-        for resource in [a.clone(), b.clone()] {
+        for resource in [&desired[0], &desired[2]] {
             plan.add(Effect::Update {
                 from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
                 identifier: AppliedIdentifier::new(format!(
                     "{}-id",
-                    resource
-                        .binding
-                        .as_ref()
-                        .expect("test resource is bound")
-                        .as_str()
+                    resource.binding.as_ref().unwrap()
                 ))
                 .unwrap(),
-                to: ResolvedResource::new(resource),
+                to: resource.clone(),
                 changed_attributes: vec!["description".to_string()],
             });
         }
-        let desired = ResolvedResource::collect_resolved([a, connector, b]).unwrap();
         let unresolved: Vec<_> = desired
             .iter()
             .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
@@ -1464,11 +1485,12 @@ mod tests {
 
     #[test]
     fn module_labels_overlay_reference_edges_with_opaque_theme_surface() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         for (theme, surface) in [
             (SvgTheme::Fixed(Theme::Light), LIGHT_PALETTE.surface),
             (SvgTheme::Fixed(Theme::Dark), DARK_PALETTE.surface),
         ] {
-            let svg = fixture_svg_with_theme("plan_image_reference_layout", theme);
+            let svg = fixture_svg_with_theme(color_mode, "plan_image_reference_layout", theme);
             let label = "module &quot;app&quot; (./app-module)";
             let label_position = svg.find(label).expect("app module label");
             let dashed_edge_position = svg
@@ -1496,8 +1518,9 @@ mod tests {
 
     #[test]
     fn svg_is_identical_when_the_fixture_plan_is_built_twice() {
-        let left = fixture_svg("plan_image_module_cascade");
-        let right = fixture_svg("plan_image_module_cascade");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let left = fixture_svg(color_mode, "plan_image_module_cascade");
+        let right = fixture_svg(color_mode, "plan_image_module_cascade");
         if left != right {
             for (index, (left_line, right_line)) in left.lines().zip(right.lines()).enumerate() {
                 if left_line != right_line {
@@ -1513,32 +1536,39 @@ mod tests {
 
     #[test]
     fn snapshot_mixed_operations_svg() {
-        insta::assert_snapshot!(fixture_svg("mixed_operations"));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        insta::assert_snapshot!(fixture_svg(color_mode, "mixed_operations"));
     }
 
     #[test]
     fn snapshot_replace_create_only_svg() {
-        insta::assert_snapshot!(fixture_svg("replace_create_only"));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        insta::assert_snapshot!(fixture_svg(color_mode, "replace_create_only"));
     }
 
     #[test]
     fn snapshot_delete_svg() {
-        insta::assert_snapshot!(fixture_svg("delete_orphan"));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        insta::assert_snapshot!(fixture_svg(color_mode, "delete_orphan"));
     }
 
     #[test]
     fn snapshot_module_svg() {
-        insta::assert_snapshot!(fixture_svg("module_anonymous_resource"));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        insta::assert_snapshot!(fixture_svg(color_mode, "module_anonymous_resource"));
     }
 
     #[test]
     fn snapshot_module_cascade_svg() {
-        insta::assert_snapshot!(fixture_svg("plan_image_module_cascade"));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        insta::assert_snapshot!(fixture_svg(color_mode, "plan_image_module_cascade"));
     }
 
     #[test]
     fn snapshot_module_cascade_dark_svg() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         insta::assert_snapshot!(fixture_svg_with_theme(
+            color_mode,
             "plan_image_module_cascade",
             SvgTheme::Fixed(Theme::Dark),
         ));
@@ -1546,7 +1576,9 @@ mod tests {
 
     #[test]
     fn snapshot_module_cascade_auto_svg() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         insta::assert_snapshot!(fixture_svg_with_theme(
+            color_mode,
             "plan_image_module_cascade",
             SvgTheme::Auto,
         ));
@@ -1554,18 +1586,25 @@ mod tests {
 
     #[test]
     fn snapshot_reference_layout_svg() {
-        insta::assert_snapshot!(fixture_svg("plan_image_reference_layout"));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        insta::assert_snapshot!(fixture_svg(color_mode, "plan_image_reference_layout"));
     }
 
     #[test]
     fn snapshot_anonymous_svg() {
-        insta::assert_snapshot!(fixture_svg("plan_image_anonymous"));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        insta::assert_snapshot!(fixture_svg(color_mode, "plan_image_anonymous"));
     }
 
     #[test]
     fn snapshot_anonymous_loop_origin_labels_in_plan_image() {
-        let fixture =
-            crate::fixture_plan::build_plan_from_fixture_name("anonymous_loop_insert_before");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(
+            &runtime,
+            "anonymous_loop_insert_before",
+        )
+        .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
             plan: &fixture.plan,

@@ -363,7 +363,17 @@ impl CompletionProvider {
         let import_path = self.find_module_import_path(module_name, text, base_path)?;
         let base = base_path?;
         let module_path = base.join(&import_path);
-        carina_core::module_resolver::load_module(&module_path)
+        let provider_context = carina_core::parser::ProviderContext {
+            resource_types:
+                carina_core::parser::ProviderContext::resource_types_from_schema_registry(
+                    &self.schemas,
+                ),
+            ..carina_core::parser::ProviderContext::default()
+        };
+        carina_core::config_loader::parse_directory(&module_path, &provider_context)
+            .ok()
+            .map(|directory| directory.into_parsed())
+            .filter(|parsed| !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty())
     }
 
     pub(super) fn module_parameter_completions(

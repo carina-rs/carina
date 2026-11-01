@@ -279,7 +279,9 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
             return Ok(());
         }
         Value::Deferred(DeferredValue::ResourceRef { .. }) => match expected {
-            TypeExpr::StringLiteral(_) => return Err(mismatch(expected, value)),
+            TypeExpr::StringLiteral(_) | TypeExpr::Ref(_) => {
+                return Err(mismatch(expected, value));
+            }
             TypeExpr::Union(_) => {}
             TypeExpr::String
             | TypeExpr::Bool
@@ -289,7 +291,6 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
             | TypeExpr::Simple(_)
             | TypeExpr::List(_)
             | TypeExpr::Map(_)
-            | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::Struct { .. } => return Ok(()),
@@ -488,21 +489,7 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
             }
             _ => Err(mismatch(expected, value)),
         },
-        TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) => match value {
-            // Ref annotations are also the established boundary type for
-            // provider IDs. Real modules pass both literal IDs and resource
-            // attributes such as `vpc.vpc_id`; the latter defers in the
-            // ResourceRef arm above and a resolved ID arrives here as String.
-            // Structural handles take a separate typed ModuleArgument /
-            // EvalValue path and must not be conflated with this value case.
-            Value::Concrete(ConcreteValue::String(_) | ConcreteValue::CanonicalEnum(_)) => Ok(()),
-            Value::Concrete(ConcreteValue::EnumIdentifier(identifier))
-                if is_qualified_enum_identifier(identifier.as_str()) =>
-            {
-                Ok(())
-            }
-            _ => Err(mismatch(expected, value)),
-        },
+        TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) => Err(mismatch(expected, value)),
         TypeExpr::SchemaType { owned } => match value {
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -617,6 +604,40 @@ fn mismatch<P: PlaceholderKind, B: BindingAddress>(
         actual: Box::new(ValueDescription::of(value)),
         validator_message: None,
         hint,
+    }
+}
+
+pub(crate) fn value_kind_name<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> &'static str {
+    match value {
+        Value::Concrete(ConcreteValue::String(_)) => "String",
+        Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "enum",
+        Value::Concrete(ConcreteValue::Int(_)) => "Int",
+        Value::Concrete(ConcreteValue::Float(_)) => "Float",
+        Value::Concrete(ConcreteValue::Bool(_)) => "Bool",
+        Value::Concrete(ConcreteValue::Duration(_)) => "Duration",
+        Value::Concrete(ConcreteValue::List(_)) | Value::Concrete(ConcreteValue::StringList(_)) => {
+            "list"
+        }
+        Value::Concrete(ConcreteValue::Map(_)) => "map",
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource attribute value",
+        Value::Deferred(DeferredValue::BindingRef { .. }) => "binding value",
+        Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce value",
+        Value::Deferred(DeferredValue::Interpolation(_)) => "String",
+        Value::Deferred(
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+        ) => "function result",
+        Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable value",
+        Value::Deferred(DeferredValue::Access(_)) => "access value",
+        Value::Deferred(DeferredValue::ModuleIf(_)) => "conditional value",
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int",
+        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
+            "secret value"
+        }
+        Value::Deferred(DeferredValue::Unknown(_)) => "unknown value",
+        Value::Deferred(DeferredValue::Placeholder(_)) => "module argument value",
     }
 }
 
@@ -857,11 +878,25 @@ mod tests {
     }
 
     #[test]
-    fn ref_parameter_accepts_literal_and_attribute_string_values() {
+    fn ref_parameter_rejects_literal_and_attribute_values() {
         let expected = TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.Vpc"));
-        check(&expected, &string("vpc-123")).expect("literal provider ID");
-        check(&expected, &Value::resource_ref("vpc", "vpc_id", Vec::new()))
-            .expect("resource attribute provider ID");
+        for value in [
+            string("vpc-123"),
+            Value::resource_ref("vpc", "vpc_id", Vec::new()),
+        ] {
+            assert!(
+                matches!(
+                    check(&expected, &value),
+                    Err(TypeExprValueError::Mismatch {
+                        expected,
+                        ..
+                    }) if expected.as_ref() == &TypeExpr::Ref(
+                        ResourceTypePath::new("awscc", "ec2.Vpc")
+                    )
+                ),
+                "resource-type annotations accept handles only: {value:?}",
+            );
+        }
     }
 
     fn check_with_config(
@@ -1218,7 +1253,6 @@ mod tests {
             TypeExpr::Simple("ipv4_address".to_string()),
             TypeExpr::List(Box::new(TypeExpr::String)),
             TypeExpr::Map(Box::new(TypeExpr::String)),
-            TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
             TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "VpcId")),
             TypeExpr::SchemaType {
                 owned: crate::parser::OwnedTypeIdentity::provider(
@@ -1233,6 +1267,14 @@ mod tests {
                 "resource reference should defer for {expected}"
             );
         }
+        assert!(
+            check(
+                &TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
+                &resource_ref,
+            )
+            .is_err(),
+            "a runtime resource reference is not a structural resource handle"
+        );
         assert!(check(&TypeExpr::StringLiteral("dev".to_string()), &resource_ref).is_err());
         assert!(
             check(
@@ -1261,7 +1303,6 @@ mod tests {
         for expected in [
             TypeExpr::String,
             TypeExpr::Simple("ipv4_address".to_string()),
-            TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
             TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "VpcId")),
             TypeExpr::SchemaType {
                 owned: crate::parser::OwnedTypeIdentity::provider(
@@ -1295,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_and_reference_types_accept_string_values_and_schema_validates() {
+    fn schema_identity_values_validate_but_handle_and_unresolved_types_reject_values() {
         let identity = TypeIdentity::from_schema_type("test", "network", "Id");
         let schema_type = TypeExpr::SchemaType {
             owned: crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
@@ -1368,21 +1409,18 @@ mod tests {
             check_with_config(&schema_type, &canonical, &config).is_ok(),
             "canonical enum should satisfy {schema_type}"
         );
-        for expected in [
-            TypeExpr::Ref(ResourceTypePath::new("test", "network")),
-            TypeExpr::DottedUnresolved(ResourceTypePath::new("test", "network.Id")),
-        ] {
+        let handle = TypeExpr::Ref(ResourceTypePath::new("test", "network"));
+        for value in [&raw, &qualified, &canonical] {
             assert!(
-                check_with_config(&expected, &raw, &config).is_err(),
-                "bare enum identifier must not satisfy {expected}"
+                check_with_config(&handle, value, &config).is_err(),
+                "no value representation may satisfy handle type {handle}"
             );
+        }
+        let identity = TypeExpr::DottedUnresolved(ResourceTypePath::new("test", "network.Id"));
+        for value in [&raw, &qualified, &canonical] {
             assert!(
-                check_with_config(&expected, &qualified, &config).is_ok(),
-                "qualified enum identifier should satisfy {expected}"
-            );
-            assert!(
-                check_with_config(&expected, &canonical, &config).is_ok(),
-                "canonical enum should satisfy {expected}"
+                check_with_config(&identity, value, &config).is_err(),
+                "unresolved dotted types must be resolved before value checking: {identity}"
             );
         }
     }

@@ -12,3 +12,7 @@ let cert = awscc.s3.Bucket {
     provider = us
   }
 }
+
+attributes {
+  cert = cert
+}

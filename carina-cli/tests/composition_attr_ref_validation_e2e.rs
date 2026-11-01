@@ -675,11 +675,11 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
         carina_core::validation::inference::format_inference_error(failure.name, failure.error)
     })
     .collect::<Vec<_>>();
-    if let Err(message) = carina_core::validation::validate_export_param_ref_types_with_bindings(
+    if let Err(errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
         inferred_exports.parameters(),
         &bindings,
     ) {
-        diagnostics.extend(message.lines().map(str::to_owned));
+        diagnostics.extend(errors.into_iter().map(|error| error.to_string()));
     }
 
     assert_eq!(
