@@ -81,13 +81,16 @@ A partition the instance cannot reach is `InvalidReference`, not a guess.
 Extend the [comparison projection](../../carina-core/src/resource/mod.rs)
 with exactly these rules:
 
-- Both sides concrete and byte-equal: equal, no lookup.
+- Both sides concrete and byte-equal: equal; the comparison needs no evidence.
 - Otherwise canonicalize each side: key ARN as-is; any other form through
-  `DescribeKey` to a key ARN. Compare ARNs.
+  its `DescribeKey` outcome to a key ARN. Compare ARNs.
 - Unknown/deferred on either side: existing unknown handling, no lookup.
 
-Lookups happen only for pairs the differ actually compares, which can include
-saved-side pairing of lists.
+The comparator never calls the resolver itself; it reads outcomes prepared
+under D5. Preparation is not limited to the pairs the differ compares: after
+a first-pass miss it resolves every concrete reference value in the
+computation's inputs, then replays once. Only outcomes a comparison uses
+are judged under D6, including saved-side pairing of lists.
 
 SQS, SNS and S3 retain echoed aliases; KMS resolves them on every encrypt
 call, so the resource follows the alias. Identical raw aliases compare
@@ -250,7 +253,10 @@ requirement together.
 - **Core:** all three D4 rules, alias/ID/ARN equivalence, account/region
   distinctions, ARN-returning repoints, echoed-alias equality, saved/write-only
   fallbacks and unchanged raw values. Require the witness for differ and
-  binding-stability callers; missing needed entries are typed errors.
+  binding-stability callers. A first-pass miss resolves every concrete
+  reference value and replays exactly once; a miss after the replay is
+  `UnpreparedAfterReplay`. Failed batches are cached and not retried, and a
+  failure for a value no comparison uses does not fail planning.
   Every D6 table cell: compared desired `NotFound` and `ReferenceError` abort
   planning with the source chain; current `NotFound` becomes a diff.
   Instance region/account scope for bare forms; ARN forms keep their own

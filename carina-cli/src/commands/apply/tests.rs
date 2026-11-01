@@ -1942,10 +1942,6 @@ impl ProviderFactory for FailBCreateFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -2702,10 +2698,6 @@ impl ProviderFactory for ApplyTimeReadFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -2911,10 +2903,6 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(

@@ -6,13 +6,11 @@
 use std::sync::Arc;
 
 use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
-use carina_core::resource::Value;
 use carina_core::schema::{
     ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedResourceSchema,
 };
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
-use indexmap::IndexMap;
 use tempfile::TempDir;
 use tower_lsp::lsp_types::Diagnostic;
 
@@ -39,10 +37,6 @@ impl ProviderFactory for SchemaFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        String::new()
     }
 
     fn create_provider(

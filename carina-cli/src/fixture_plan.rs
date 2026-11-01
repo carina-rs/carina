@@ -934,10 +934,6 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -989,10 +985,6 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test".to_string()
     }
 
     fn create_provider(
@@ -1055,10 +1047,6 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test-region".to_string()
     }
 
     fn create_provider(
@@ -1140,10 +1128,6 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -1216,10 +1200,6 @@ impl ProviderFactory for PlanImageFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -1282,10 +1262,6 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -1345,10 +1321,6 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -1420,10 +1392,6 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -1479,10 +1447,6 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test".to_string()
     }
 
     fn create_provider(

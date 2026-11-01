@@ -6634,7 +6634,7 @@ impl std::fmt::Display for CanonicalCustomTypeValue {
 /// Factory for creating and configuring a Provider.
 ///
 /// Each provider crate implements this trait to encapsulate provider-specific
-/// logic (region validation, region extraction, provider instantiation, schemas).
+/// logic (configuration validation, provider instantiation, schemas).
 /// The CLI uses factories instead of hardcoded provider name matching.
 pub trait ProviderFactory: Send + Sync {
     /// Provider name (e.g., "aws", "awscc")
@@ -6703,10 +6703,6 @@ pub trait ProviderFactory: Send + Sync {
     ) -> ProviderResult<()> {
         Ok(())
     }
-
-    /// Extract region from config in SDK format (e.g., "ap-northeast-1").
-    /// Returns a default region if none is configured.
-    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String;
 
     /// Create a provider instance from configuration attributes.
     ///
@@ -8141,10 +8137,6 @@ mod tests {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -8233,10 +8225,6 @@ mod tests {
             _attributes: &CanonicalProviderConfigAttributes,
         ) -> ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
         }
 
         fn create_provider(
@@ -11814,9 +11802,6 @@ mod tests {
             ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
-            fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
-                "us-east-1".to_string()
-            }
             fn create_provider(
                 &self,
                 _binding: Option<&str>,
@@ -11908,9 +11893,6 @@ mod tests {
                 _attrs: &CanonicalProviderConfigAttributes,
             ) -> crate::provider::ProviderResult<()> {
                 Ok(())
-            }
-            fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
-                "ap-northeast-1".to_string()
             }
             fn create_provider(
                 &self,

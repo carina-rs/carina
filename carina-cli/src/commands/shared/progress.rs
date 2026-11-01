@@ -47,6 +47,10 @@ impl RecordedProgressLines {
     pub(crate) fn len(&self) -> usize {
         self.0.lock().unwrap().len()
     }
+
+    pub(crate) fn snapshot(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
