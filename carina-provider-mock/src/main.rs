@@ -10,8 +10,8 @@ use carina_core::schema::{
 };
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
-    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, DesiredAttribute,
-    DesiredResource, FoundRead, NormalizedResource, Pending, PendingDelete, Poll, PollRequest,
+    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, DesiredResource,
+    DesiredValue, FoundRead, NormalizedResource, Pending, PendingDelete, Poll, PollRequest,
     PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
@@ -1669,26 +1669,71 @@ impl CarinaProvider for MockProcessProvider {
         {
             return Err(Self::operation_error("normalize_desired", resource.id()));
         }
-        if let Some(resource) = resources.iter().find(|resource| {
-            resource.id().resource_type == "test.normalize_required_together"
-                && matches!(resource.attribute("primary"), DesiredAttribute::Known(_))
-                && matches!(resource.attribute("companion"), DesiredAttribute::Absent)
-        }) {
-            return Err(ProviderError {
-                kind: ProviderErrorKind::InvalidInput,
-                message:
-                    "test.normalize_required_together companion is required when primary is present"
-                        .to_string(),
-                resource_id: Some(resource.id().clone()),
-                cause: None,
-                provider_name: Some("mock".to_string()),
-                operation: None,
-                status: None,
-                code: None,
-                request_id: None,
-            });
+        let mut normalized = Vec::with_capacity(resources.len());
+        for resource in resources {
+            let id = resource.id().clone();
+            let mut owner = resource.into_normalization().map_err(ProviderError::from)?;
+            let mut view = owner.view();
+            if id.resource_type == "test.normalize_required_together"
+                && matches!(view.attribute("primary"), Some(DesiredValue::Known(_)))
+                && view.attribute("companion").is_none()
+            {
+                return Err(ProviderError { kind: ProviderErrorKind::InvalidInput,
+                    message: "test.normalize_required_together companion is required when primary is present".into(),
+                    resource_id: Some(id), cause: None, provider_name: Some("mock".into()), operation: None, status: None, code: None, request_id: None });
+            }
+            if id.resource_type == "test.normalize_leaf" {
+                use carina_plugin_sdk::{DesiredMap, DesiredScalar, DesiredValueMut};
+                let apex = match view.attribute("domain_name") {
+                    Some(DesiredValue::Known(value)) => value.as_str().map(str::to_owned),
+                    _ => None,
+                };
+                if let Some(DesiredValueMut::List(names)) =
+                    view.attribute_mut("subject_alternative_names")
+                {
+                    names.retain_known(|value| {
+                        if let DesiredScalar::String(name) = value {
+                            *name = name
+                                .expose_plaintext()
+                                .trim_end_matches('.')
+                                .to_ascii_lowercase()
+                                .into();
+                            return apex.as_deref() != Some(name.expose_plaintext());
+                        }
+                        true
+                    });
+                }
+                if let Some(DesiredValueMut::List(rules)) = view.attribute_mut("rules") {
+                    for rule in rules.iter_mut() {
+                        if let DesiredValueMut::Map(rule) = rule
+                            && rule.get("delete_marker_replication").is_none()
+                        {
+                            let mut default = DesiredMap::new();
+                            default
+                                .insert_absent(
+                                    "status",
+                                    DesiredValue::Known(DesiredScalar::String("Disabled".into())),
+                                )
+                                .expect("new default map");
+                            rule.insert_absent(
+                                "delete_marker_replication",
+                                DesiredValue::Map(default),
+                            )
+                            .expect("absence was checked");
+                        }
+                    }
+                }
+                if let Some(DesiredValueMut::Map(alias)) = view.attribute_mut("alias_target")
+                    && let Some(DesiredValueMut::Known(DesiredScalar::String(name))) =
+                        alias.get_mut("dns_name")
+                    && let Some(stripped) = name.expose_plaintext().strip_suffix('.')
+                {
+                    *name = stripped.to_string().into();
+                }
+            }
+            normalized.push(owner.finish().map_err(ProviderError::from)?);
         }
-        Ok(resources.into_iter().map(DesiredResource::finish).collect())
+        Ok(normalized)
     }
 
     fn normalize_state(

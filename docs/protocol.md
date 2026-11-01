@@ -1,20 +1,74 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **16**.
+The current protocol and minimum supported provider protocol are both **17**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 17 | 17 | Per-leaf desired normalization with scoped, exactly-once deferred handles. |
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
 
+## Version 17
+
+Protocol v17 replaces top-level deferred-name metadata with structural desired
+value trees. `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both
+17; providers built for earlier protocols must be rebuilt.
+
+`normalize-desired` receives and returns `list<desired-resource>`. Each record
+has an `id` and `attributes: list<tuple<string, desired-value>>`. The separate
+`desired-value` WIT variant contains scalars, JSON-backed lists/maps, and
+`deferred-val(u32)`. Ordinary `value` and `persisted-value` have no handle arm.
+Concrete containers stay visible even when they contain opaque leaves, so a
+normalizer can canonicalize known SANs and remove a known apex, add defaults
+inside known replication rules, or trim a known alias DNS name beside a secret
+or reference.
+
+The host replaces every deferred core leaf with a per-call slot number. This
+includes secrets, resource references, unknowns and other unresolved
+expressions. A secret wrapping a complete container remains one opaque leaf;
+its inner values are never exposed. Providers cannot inspect or fabricate
+leaves through the SDK view. Every issued slot must occur **exactly once** in
+the result, in its original resource and top-level attribute. Reordering within
+that attribute is allowed; dropping, duplicating, inventing or moving a handle
+across resources or attributes is an error. Resources correspond by list
+position, including pending or duplicate ids. The returned count must match, and
+each returned id must equal the id sent at that position.
+
+Within normalization `list-val`/`map-val` JSON, a handle is the singleton object
+`{"$carina_deferred": 0}` with an unsigned 32-bit slot. User object keys beginning
+with `$` gain one leading `$`: a literal `$carina_deferred` key is transported as
+`$$carina_deferred`. The decoder unescapes user keys once and does not reinterpret
+the resulting literal map as a handle. Duplicate object/attribute keys and
+malformed handle objects are rejected rather than silently collapsed.
+
+This escaping and handle interpretation apply **only** to desired normalization
+input/output. CRUD, configuration and persisted-state payloads/decoders remain
+unchanged. Create/update still receive actual secret values: top-level secrets
+use ordinary `secret-val`, and nested secrets use their operational JSON values.
+The ordinary protocol value type cannot contain a normalization handle.
+
+The host validates and decodes the entire result before writing any changes.
+It restores original deferred values at their returned positions and preserves
+resource identity and host metadata. Unchanged known leaves keep their original
+core scalar metadata at the same path, reserving those originals before any
+other matches. A moved leaf may reuse an unclaimed equal wire projection within
+its top-level attribute only when the paths have the same keys in the same
+positions; list index values may differ. Each original is consumed at most once.
+Thus list reordering preserves nested enum kinds and sensitivity without moving
+metadata between different fields. Renamed or edited known fields become plain
+values unless they match an unchanged original at the same path.
+Missing, duplicate, unknown, foreign or malformed handles, duplicate keys,
+resource-id mismatches and resource-count mismatches produce typed
+errors with resource/attribute/path context. Conversion errors preserve their
+typed source chains; secret payloads are never included in diagnostics.
+
 ## Version 16
 
-Protocol v16 makes declared anonymous identity a closed schema mode and changes
-its address semantics. `PROTOCOL_VERSION` and
-`MIN_SUPPORTED_PROTOCOL_VERSION` are both 16. A v16 host therefore rejects a
-v15 provider through the existing version check before attempting to decode
-its schemas. This is required because the v15 top-level `identity` boolean
+The historical v16 development snapshot made declared anonymous identity a
+closed schema mode and changed its address semantics. That snapshot set both
+protocol constants to 16 and rejected v15 providers before schema decoding.
+This was required because the v15 top-level `identity` boolean
 meant “add this value to the configured create-only hash inputs” and earlier
 providers could set it on mutable attributes. Interpreting that boolean with
 v16 semantics would silently change addresses or produce a misleading schema
@@ -73,7 +127,7 @@ not a create-only change. Adding an element with an authored create-only leaf
 is a create-only change and therefore replaces the resource.
 
 The WIT world is unchanged in v16; the incompatible representation is in the
-schema JSON records. Hosts and providers must both use protocol v16.
+schema JSON records. These requirements remain in protocol v17.
 
 ## Version 15
 
@@ -165,12 +219,9 @@ version is 14.
 Protocol v13 makes initialized reference scope, provider-declared reference
 forms, and recoverable create failures explicit transport data.
 
-The `normalize-desired` input is now
-`list<desired-resource { resource, deferred }>` rather than a plain resource
-list. `deferred` names the top-level attributes whose unresolved values the
-host withheld from `resource`. A returned resource must not contain an
-attribute named in its input's `deferred` list; the host rejects such a result
-and restores the original unresolved value (carina#4120).
+Version 13 introduced top-level deferred-name metadata for `normalize-desired`.
+Version 17 replaces that record shape with structural, exactly-once handles;
+the old deferred-name boundary is no longer accepted.
 
 `initialize` now returns an `initialize-result` containing a closed
 `reference-scope`: either the provider instance's `partition`, `region`, and

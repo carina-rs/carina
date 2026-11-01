@@ -6853,6 +6853,14 @@ pub fn contains_resource_ref<P: PlaceholderKind, B: BindingAddress>(value: &Valu
     found
 }
 
+/// Whether a desired value is an opaque leaf during normalization.
+///
+/// Concrete lists/maps remain structural even when they contain deferred children.
+/// Every deferred expression, including a secret wrapping a container, is opaque.
+pub fn is_deferred_desired_leaf(value: &Value) -> bool {
+    matches!(value, Value::Deferred(_))
+}
+
 /// Return whether `value` recursively contains
 /// `Value::Deferred(DeferredValue::Unknown)`.
 pub fn value_contains_unknown(value: &Value) -> bool {

@@ -532,7 +532,7 @@ Treat "already gone" as success. Carina does not special-case a `NotFound` error
 
 ## Secrets
 
-Attribute values reach the provider in plain text, including values the configuration wrapped in `secret(...)`. Carina masks them in plan output and stores only a hash in state, but inside the provider they are ordinary strings. Never put attribute values into error messages, `cause`, logs or pending tokens. That includes API error text that repeats request values back, which many validation errors do; replace it with your own message when the request contains a secret. Error messages and causes are printed, and create tokens are written to state.
+Create, update and data-source input attributes reach the provider in plain text, including values the configuration wrapped in `secret(...)`. Desired normalization keeps secret leaves opaque, as described below. Carina masks them in plan output and stores only a hash in state, but inside the provider they are ordinary strings. Never put attribute values into error messages, `cause`, logs or pending tokens. That includes API error text that repeats request values back, which many validation errors do; replace it with your own message when the request contains a secret. Error messages and causes are printed, and create tokens are written to state.
 
 ## Data sources
 
@@ -542,7 +542,89 @@ A schema with `kind: SchemaKind::DataSource` declares a data source. The host ca
 
 `reference_forms` is required; return `ReferenceForms::new()` when the provider declares no short-to-long reference forms. `required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
 
-Desired normalization has a three-way attribute contract. `DesiredResource::attribute` and `attributes` distinguish a `Known` value from an `Absent` attribute and a `Deferred` value that the host withheld until its dependency resolves. A deferred attribute is not absent: mutate only `Known` values, use `insert_absent` when adding a default, and return the opaque result from `finish`. This prevents normalization from replacing a deferred value by treating its missing map entry as user-authored absence.
+Desired normalization uses the same `DesiredView` on both routes. Each route stages its edits in an owner and applies them only after a successful `finish()`. A failed finish leaves the original resource unchanged.
+
+`DesiredView::attribute` returns `None` for an absent attribute. A present `DesiredValue` is a `Known` scalar, a structural `List` or `Map`, or an opaque `Deferred(DeferredLeaf)`. References, unknowns and secrets are deferred leaves; known siblings inside the same container remain editable. Providers cannot construct, clone or inspect deferred leaves. Every received leaf must survive exactly once in its original resource and top-level attribute. Reordering within that attribute is allowed; dropping, duplicating or moving a leaf across that boundary fails at finish. Use `DesiredView::insert_absent` for top-level defaults and `DesiredMap::insert_absent` for nested defaults; an existing deferred leaf is occupied, not absent.
+
+Use `DesiredInputs` for shared cross-field checks. Call this validator with `view.inputs()` during normalization or `DesiredInputs::from_core(resource)?` during native create/update validation:
+
+```rust
+use carina_plugin_sdk::{DesiredInputs, DesiredValue};
+
+fn required_together(inputs: DesiredInputs<'_>) -> bool {
+    !matches!(inputs.attribute("kms_data_key_reuse_period_seconds"), Some(DesiredValue::Known(_)))
+        || inputs.attribute("kms_master_key_id").is_some()
+}
+```
+
+Secrets, references and unknowns appear as `Deferred` in this read-only projection. It does not change the CRUD request: create/update bodies still receive actual secret values. A validator can defer checks that need an opaque value instead of treating it as absent.
+
+`remove` returns the node, so it can be moved with `insert_absent` inside the same top-level attribute. `move_within` reorders a list element, including a whole map with deferred descendants:
+
+```rust
+use carina_plugin_sdk::{DesiredEditError, DesiredValueMut, DesiredView};
+
+fn move_values(view: &mut DesiredView<'_>) -> Result<(), DesiredEditError> {
+    if let Some(DesiredValueMut::Map(settings)) = view.attribute_mut("settings")
+        && let Some(value) = settings.remove("old")
+    {
+        settings.insert_absent("new", value)?;
+    }
+    if let Some(DesiredValueMut::List(rules)) = view.attribute_mut("rules") {
+        rules.move_within(1, 0)?;
+    }
+    Ok(())
+}
+```
+
+Dropping a removed deferred leaf fails at finish with `MissingHandle`. Moving it into a different top-level attribute or resource fails with `ForeignHandle`.
+
+For example, a certificate normalizer can lowercase known SANs and remove the known apex while retaining every deferred element:
+
+```rust
+use carina_plugin_sdk::{DesiredScalar, DesiredValueMut, DesiredView};
+
+fn normalize_sans(view: &mut DesiredView<'_>, apex: &str) {
+    if let Some(DesiredValueMut::List(sans)) = view.attribute_mut("subject_alternative_names") {
+        sans.retain_known(|scalar| {
+            let DesiredScalar::String(name) = scalar else { return true };
+            let canonical = name.expose_plaintext().trim_end_matches('.').to_ascii_lowercase();
+            let keep = canonical != apex;
+            *name = canonical.into();
+            keep
+        });
+    }
+}
+```
+
+With apex `example.com`, a list shaped like `["EXAMPLE.COM", <deferred>, "WWW.EXAMPLE.COM"]` becomes `[<deferred>, "www.example.com"]`. `retain_known` never calls the closure on the deferred element, so it stays opaque and survives exactly once.
+
+Wire the same normalizer into native resources with `NativeDesiredNormalization::from_core`, then `view()` and `finish()`:
+
+```rust
+use carina_plugin_sdk::{NativeDesiredNormalization, core::{provider::ProviderResult, resource::ProviderResource}};
+
+fn normalize_native(resource: &mut ProviderResource) -> ProviderResult<()> {
+    let mut desired = NativeDesiredNormalization::from_core(resource)?;
+    normalize_sans(&mut desired.view(), "example.com");
+    desired.finish()?;
+    Ok(())
+}
+```
+
+On WASM, use `into_normalization()` and the same function, then collect the checked results for `CarinaProvider::normalize_desired`:
+
+```rust
+use carina_plugin_sdk::{DesiredResource, NormalizedResource, types::ProviderError};
+
+fn normalize_wasm(resource: DesiredResource) -> Result<NormalizedResource, ProviderError> {
+    let mut desired = resource.into_normalization()?;
+    normalize_sans(&mut desired.view(), "example.com");
+    Ok(desired.finish()?)
+}
+```
+
+Native builders and `finish()` return core `ProviderResult`, attaching the original resource id including its provider instance. Use `?` to propagate them; the terminal `ProviderError` retains the typed `NormalizationError` through `detail().cause()`, with nested conversion errors reachable through that cause's `source()`. Guest normalization errors convert through `?` to the protocol's string-only diagnostic channel.
 
 ## Next steps
 

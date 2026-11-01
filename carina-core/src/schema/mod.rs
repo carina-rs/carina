@@ -9550,7 +9550,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has a DSL transform that protocol v16 cannot represent"
+                                "closed enum `{identity}` has a DSL transform that protocol v17 cannot represent"
                             ),
                         );
                     }
@@ -9568,7 +9568,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has base metadata that protocol v16 cannot represent"
+                                "closed enum `{identity}` has base metadata that protocol v17 cannot represent"
                             ),
                         );
                     }
@@ -9579,7 +9579,7 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "open enum `{identity}` has DSL aliases that protocol v16 cannot represent"
+                                "open enum `{identity}` has DSL aliases that protocol v17 cannot represent"
                             ),
                         );
                     }
@@ -9587,7 +9587,7 @@ fn validate_identified_scalar_kind_consistency(
                         push_schema_issue(
                             issues,
                             &location,
-                            format!("open enum `{identity}` has no namespace for protocol v16"),
+                            format!("open enum `{identity}` has no namespace for protocol v17"),
                         );
                     }
                 }
@@ -10041,7 +10041,7 @@ fn validate_type_definition(
                     fields.iter().find(|field| field.name == name).map(|field| {
                         FieldGroupMemberAdmission {
                             input_mode: field.declared_input_mode,
-                            // StructField has no default in the core or v16
+                            // StructField has no default in the core or current
                             // protocol grammar. Keeping this explicit makes a
                             // future addition inherit the shared rejection.
                             has_default: false,
