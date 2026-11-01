@@ -5,7 +5,7 @@ description: "Build a minimal Carina provider with carina-plugin-sdk, compile it
 
 This page builds `hello`, a provider with one resource type, `hello.greeting`. It calls no API: a greeting's message is derived from its name. That keeps the example small enough to read in full while still going through every call the host makes, so you can run `plan`, `apply` and `destroy` against it.
 
-The code on this page was compiled and run against the carina repository at commit `6726a1cc`, with `carina-plugin-wit` at `5ebd5ce6`.
+The SDK supplies the WIT bindings and their generator from the Carina revision you pin. Your provider needs no WIT checkout or `wit-bindgen` dependency.
 
 ## Prerequisites
 
@@ -17,29 +17,20 @@ The code on this page was compiled and run against the carina repository at comm
 ```text
 carina-provider-hello/          # repository root
 ├── Cargo.toml                  # workspace
-├── carina-plugin-wit/          # git submodule
 └── carina-provider-hello/
     ├── Cargo.toml
     └── src/main.rs
 ```
 
-The provider crate sits one directory below the repository root because `export_provider!` reads the WIT files from `../carina-plugin-wit/wit`, relative to the crate. The official providers use the same layout.
+This example uses a workspace with one provider crate. A standalone crate works too: the SDK resolves its own WIT files, so your provider can use any directory layout.
 
-Create the repository and add the WIT definitions as a submodule:
+Create the repository and the provider's source directory:
 
 ```bash
 mkdir carina-provider-hello && cd carina-provider-hello
 git init
-git submodule add https://github.com/carina-rs/carina-plugin-wit.git carina-plugin-wit
+mkdir -p carina-provider-hello/src
 ```
-
-The WIT files must match the SDK. Check out the `carina-plugin-wit` commit that the carina repository pins at the revision you depend on. For `6726a1cc`, that is `5ebd5ce6`:
-
-```bash
-git -C carina-plugin-wit checkout 5ebd5ce6
-```
-
-For another revision, look up the pinned commit with the GitHub CLI: `gh api "repos/carina-rs/carina/contents/carina-plugin-wit?ref=<rev>" --jq .sha`.
 
 ## Cargo manifests
 
@@ -60,15 +51,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-carina-plugin-sdk = { git = "https://github.com/carina-rs/carina", rev = "6726a1cc" }
+carina-plugin-sdk = { git = "https://github.com/carina-rs/carina", rev = "<carina-rev>" }
 serde = "1"
 serde_json = "1"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wit-bindgen = { version = "0.54", default-features = false, features = ["macros"] }
 ```
 
-The SDK is not on crates.io; depend on it from git and pin `rev`. `serde`, `serde_json` and `wit-bindgen` are needed because the code that `export_provider!` generates uses them from your crate.
+The SDK is not on crates.io; depend on it from git. Replace `<carina-rev>` with the full commit SHA of a Carina revision containing SDK-owned provider bindings. `serde` and `serde_json` are needed because the adapter that `export_provider!` generates uses them from your crate. The SDK chooses the binding generator and WIT revision for you.
 
 ## The provider
 
@@ -79,7 +67,7 @@ The SDK is not on crates.io; depend on it from git and pin `rev`. `serde`, `serd
 // nothing calls it.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use carina_plugin_sdk::core::schema::{
     AttributeSchema, AttributeType, ReferenceForms, ResourceSchema, ValidatedConfigSchema,
@@ -87,8 +75,8 @@ use carina_plugin_sdk::core::schema::{
 };
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
-    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending, Poll,
-    PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+    CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
+    PendingDelete, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 
 /// A provider with one resource, `hello.greeting`. It talks to no API:
@@ -110,8 +98,8 @@ fn error(kind: ProviderErrorKind, message: impl Into<String>) -> ProviderError {
     }
 }
 
-fn greeting(name: &str) -> HashMap<String, Value> {
-    HashMap::from([
+fn greeting(name: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([
         ("name".to_string(), Value::String(name.to_string())),
         ("message".to_string(), Value::String(format!("Hello, {name}!"))),
     ])
@@ -225,6 +213,7 @@ impl CarinaProvider for HelloProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         resume: Resume<Never>,
+        _poll_request: PollRequest,
     ) -> Result<ResumeStep<Never>, ResumeVerdict<Never>> {
         match resume {
             Resume::Unissued(_, token) | Resume::Issued(_, token) => match token {},
@@ -267,7 +256,7 @@ impl CarinaProvider for HelloProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: DeleteRequest,
-        pending: Pending<Never>,
+        pending: PendingDelete<Never>,
     ) -> Result<DeleteOutcome<Never>, ProviderError> {
         match pending.token {}
     }

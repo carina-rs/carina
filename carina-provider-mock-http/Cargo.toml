@@ -30,4 +30,3 @@ aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x", "test
 futures = "0.3"
 serde_json = "1"
 wasi = "0.14"
-wit-bindgen = { workspace = true }

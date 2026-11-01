@@ -8,11 +8,20 @@ pub use carina_provider_protocol::types;
 
 pub mod aws_credentials;
 
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub mod __private;
+
 /// The "Schemas" page of the provider guide on carina-rs.dev. Its Rust
 /// examples run as doctests of this crate so they cannot drift from the SDK.
 #[cfg(doctest)]
 #[doc = include_str!("../../site/src/content/providers/writing/schemas.md")]
 pub struct ProviderGuideSchemasPage;
+
+/// The complete provider example from the provider guide, checked against this SDK.
+#[cfg(doctest)]
+#[doc = include_str!("../../site/src/content/providers/writing/getting-started.md")]
+pub struct ProviderGuideGettingStartedPage;
 
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod wasm_guest;
