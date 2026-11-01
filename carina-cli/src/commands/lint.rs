@@ -134,185 +134,275 @@ fn collect_list_struct_attrs_for_population<E, D, B: carina_core::resource::Bind
     }
 }
 
+struct LintResult {
+    checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<
+        Result<Vec<LintWarning>, AppError>,
+    >,
+}
+
+impl LintResult {
+    fn settle(
+        checks: carina_core::validation::deferred_types::DeferredProviderTypeChecks,
+        catalog: &ProviderContext,
+        findings: Result<Vec<LintWarning>, AppError>,
+    ) -> Self {
+        Self {
+            checks: carina_core::validation::deferred_types::ProviderTypeCheckResult::settle(
+                checks, catalog, findings,
+            ),
+        }
+    }
+
+    fn publish(self, path: &Path) -> Result<(), AppError> {
+        let (result, diagnostics) = self.checks.into_parts();
+        let mut warnings = Vec::new();
+        for diagnostic in diagnostics {
+            let warning = match diagnostic {
+                carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning)
+                | carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning,
+            };
+            warnings.push(LintWarning {
+                file: warning
+                    .file
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| path.to_path_buf()),
+                line: warning.line,
+                message: warning.message,
+            });
+        }
+        let result = match result {
+            Ok(findings) => {
+                warnings.extend(findings);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        if warnings.is_empty() {
+            result?;
+            println!("{}", "No lint warnings found.".green().bold());
+            return Ok(());
+        }
+        for warning in &warnings {
+            eprintln!(
+                "{} {}:{}  {}",
+                "warning:".yellow().bold(),
+                warning.file.display(),
+                warning.line,
+                warning.message
+            );
+        }
+        result?;
+        Err(AppError::Validation(format!(
+            "Found {} lint warning(s).",
+            warnings.len()
+        )))
+    }
+}
+
 pub fn run_lint(
     user_dirs: &carina_core::UserDirs,
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let loaded = load_configuration_with_config(
-        path,
-        provider_context,
-        &carina_core::schema::SchemaRegistry::new(),
-    )?;
-    let duplicate_declarations = loaded.duplicate_declarations;
-    let parsed = loaded.parsed;
+    lint_result(user_dirs, path, provider_context).publish(path)
+}
 
-    let base_dir = get_base_dir(path);
-    let module_walk = ModuleWalk::load(&parsed, base_dir);
-    let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
-    module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_backend_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
+fn lint_result(
+    user_dirs: &carina_core::UserDirs,
+    path: &Path,
+    provider_context: &ProviderContext,
+) -> LintResult {
+    let mut catalog = None;
+    let result = (|| -> Result<Vec<LintWarning>, AppError> {
+        let loaded = load_configuration_with_config(
+            path,
+            provider_context,
+            &carina_core::schema::SchemaRegistry::new(),
+        )?;
+        let duplicate_declarations = loaded.duplicate_declarations;
+        let mut parsed = loaded.parsed;
 
-    let (providers, provider_factory_error) =
-        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
-    let loaded_provider_context = if provider_factory_error.is_none() {
-        providers.loaded_provider_context()
-    } else {
-        None
-    };
-    let provider_factory_error = provider_factory_error.map(|error| error.to_string());
-    let schemas = providers.schemas();
-    let provider_type_warnings = if loaded_provider_context.is_none() {
-        let mut warnings =
-            carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
-                parsed.parsed(),
-                ProviderContext::unloaded(),
-                &base_dir.join("main.crn"),
+        let base_dir = get_base_dir(path);
+        let module_walk = ModuleWalk::load(&parsed, base_dir);
+        let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
+        module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
+        module_boundary_findings.extend(validate_no_backend_in_modules(&module_walk));
+        module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
+        module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
+
+        let (providers, provider_factory_error) =
+            ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+        let loaded_provider_context = if provider_factory_error.is_none() {
+            providers.loaded_provider_context()
+        } else {
+            None
+        };
+        let provider_factory_error = provider_factory_error.map(|error| error.to_string());
+        let schemas = providers.schemas();
+        let load_findings = if provider_factory_error.is_none() {
+            providers.load_findings(&parsed.providers)
+        } else {
+            Vec::new()
+        };
+        catalog = Some(providers.reporting_catalog(&parsed.providers));
+        let catalog = catalog
+            .as_ref()
+            .expect("catalog established by provider loading");
+        let loaded_provider_context =
+            loaded_provider_context.filter(|_| catalog.custom_types_loaded());
+        let mut type_findings = parsed
+            .resolve_type_exprs_report(catalog)
+            .into_diagnostics()
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        if type_findings.is_empty()
+            && let Err(error) = carina_core::validation::validate_attribute_params_with_context(
+                &parsed.attribute_params,
+                catalog,
             )
-            .report();
+        {
+            type_findings.push(error);
+        }
+        if type_findings.is_empty()
+            && let Err(error) = parsed.resolve_resource_refs_with_config(catalog)
+        {
+            type_findings.push(error.to_string());
+        }
         for module in module_walk.iter() {
-            warnings.extend(
-                carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
-                    &module.loaded().parsed,
-                    ProviderContext::unloaded(),
-                    &module.module_path().join("main.crn"),
+            type_findings.extend(
+                carina_core::validation::resolve_file_type_exprs(
+                    &mut module.loaded().parsed.clone(),
+                    catalog,
                 )
-                .report(),
+                .into_iter()
+                .map(|error| error.to_string()),
             );
         }
-        warnings
-    } else {
-        Vec::new()
-    };
 
-    // Report invalid root-owned module blocks through lint's collected,
-    // path-prefixed output. The resolver enforces the same invariants as
-    // expansion backstops, so do not expand after this gate fails or lint
-    // would abort before rendering the findings below. This deliberately
-    // degrades schema-dependent checks: `iter_top_level_resources` then sees
-    // only root-declared resources, so List<Struct> block-syntax suggestions
-    // can disappear even from root files. The configuration is already
-    // blocked; retaining these findings and the schema-independent text scans
-    // is more useful than aborting lint entirely. Full schema-backed
-    // suggestions return once the blocking finding is fixed.
-    let parsed = if module_boundary_findings.is_empty() {
-        let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
-            module_resolver::resolve_module_template_with_config(
-                parsed,
-                base_dir,
-                loaded_provider_context,
-                schemas,
-            )
+        // Report invalid root-owned module blocks through lint's collected,
+        // path-prefixed output. The resolver enforces the same invariants as
+        // expansion backstops, so do not expand after this gate fails or lint
+        // would abort before rendering the findings below. This deliberately
+        // degrades schema-dependent checks: `iter_top_level_resources` then sees
+        // only root-declared resources, so List<Struct> block-syntax suggestions
+        // can disappear even from root files. The configuration is already
+        // blocked; retaining these findings and the schema-independent text scans
+        // is more useful than aborting lint entirely. Full schema-backed
+        // suggestions return once the blocking finding is fixed.
+        let parsed = if module_boundary_findings.is_empty() && type_findings.is_empty() {
+            let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
+                module_resolver::resolve_module_template_with_config(
+                    parsed,
+                    base_dir,
+                    loaded_provider_context,
+                    schemas,
+                )
+            } else {
+                module_resolver::resolve_module_template_with_providerless_config(
+                    parsed, base_dir, catalog, schemas,
+                )
+            };
+            LintFile::Resolved(resolution.map_err(|e| {
+                format!(
+                    "Module resolution error: {}",
+                    e.display_relative_to(base_dir)
+                )
+            })?)
         } else {
-            module_resolver::resolve_module_template_with_providerless_config(
-                parsed,
-                base_dir,
-                provider_context,
-                schemas,
-            )
+            LintFile::Blocked(parsed)
         };
-        LintFile::Resolved(resolution.map_err(|e| {
-            format!(
-                "Module resolution error: {}",
-                e.display_relative_to(base_dir)
-            )
-        })?)
-    } else {
-        LintFile::Blocked(parsed)
-    };
 
-    // Collect source texts for each .crn file
-    let source_texts: Vec<(PathBuf, String)> = {
-        let files = find_crn_files_in_dir(path)?;
-        let mut texts = Vec::new();
-        for file in files {
-            let content = fs::read_to_string(&file)
-                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            texts.push((file, content));
-        }
-        texts
-    };
+        // Collect source texts for each .crn file
+        let source_texts: Vec<(PathBuf, String)> = {
+            let files = find_crn_files_in_dir(path)?;
+            let mut texts = Vec::new();
+            for file in files {
+                let content = fs::read_to_string(&file)
+                    .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+                texts.push((file, content));
+            }
+            texts
+        };
 
-    // Collect all List<Struct> attribute names from schemas of parsed resources
-    // and build a map of attr_name -> block_name for lint suggestions
-    let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
-    let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
-    // carina#3181: walk every top-level resource — managed and data
-    // source schemas can both carry List<Struct> attributes. compositions
-    // have no schema, so `get_for` returns `None` for them.
-    parsed.collect_list_struct_attrs(
-        schemas,
-        &mut all_list_struct_attrs,
-        &mut block_name_suggestions,
-    );
+        // Collect all List<Struct> attribute names from schemas of parsed resources
+        // and build a map of attr_name -> block_name for lint suggestions
+        let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
+        let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
+        // carina#3181: walk every top-level resource — managed and data
+        // source schemas can both carry List<Struct> attributes. compositions
+        // have no schema, so `get_for` returns `None` for them.
+        parsed.collect_list_struct_attrs(
+            schemas,
+            &mut all_list_struct_attrs,
+            &mut block_name_suggestions,
+        );
 
-    // Scan each source file for list literal usage of List<Struct> attributes
-    let mut warnings: Vec<LintWarning> = module_boundary_findings
-        .into_iter()
-        .map(|finding| LintWarning {
-            // The merged module parse does not retain an offending declaration
-            // span. Keep lint's file:line convention at the caller boundary;
-            // the finding itself retains the recursive module-path prefix.
-            file: path.to_path_buf(),
-            line: 1,
-            message: finding.to_string(),
-        })
-        .collect();
-    if let Some(message) = provider_factory_error {
-        warnings.push(LintWarning {
-            file: path.to_path_buf(),
-            line: 1,
-            message,
-        });
-    }
-    warnings.extend(provider_type_warnings.into_iter().map(|warning| {
-        LintWarning {
-            file: warning
-                .file
-                .map(PathBuf::from)
-                .unwrap_or_else(|| path.to_path_buf()),
-            line: warning.line,
-            message: warning.message,
-        }
-    }));
-    for duplicate in &duplicate_declarations {
-        let file = duplicate
-            .first_file()
-            .map(|relative| path.join(relative))
-            .unwrap_or_else(|| path.to_path_buf());
-        warnings.push(LintWarning {
-            file,
-            // Declaration AST nodes do not carry spans. Keep the finding in
-            // lint's normal file:line shape and anchor it at the file start;
-            // the message retains exact per-file provenance.
-            line: 1,
-            message: duplicate.to_string(),
-        });
-    }
-    for module in module_walk.iter() {
-        for duplicate in &module.loaded().duplicate_declarations {
-            let file = duplicate
-                .first_file()
-                .map(|relative| module.module_path().join(relative))
-                .unwrap_or_else(|| module.module_path().to_path_buf());
-            warnings.push(LintWarning {
-                file,
+        // Scan each source file for list literal usage of List<Struct> attributes
+        let mut warnings: Vec<LintWarning> = module_boundary_findings
+            .into_iter()
+            .map(|finding| LintWarning {
+                // The merged module parse does not retain an offending declaration
+                // span. Keep lint's file:line convention at the caller boundary;
+                // the finding itself retains the recursive module-path prefix.
+                file: path.to_path_buf(),
                 line: 1,
-                message: format!("{}: {duplicate}", module.diagnostic_path().display()),
+                message: finding.to_string(),
+            })
+            .collect();
+        if let Some(message) = provider_factory_error {
+            warnings.push(LintWarning {
+                file: path.to_path_buf(),
+                line: 1,
+                message,
             });
         }
-    }
-    for (file_path, source) in &source_texts {
-        // Check for list literal syntax on List<Struct> attributes
-        let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
-        for (attr_name, line) in hits {
-            let suggested_name = block_name_suggestions
-                .get(&attr_name)
-                .map(|s| s.as_str())
-                .unwrap_or(&attr_name);
+        for message in type_findings
+            .into_iter()
+            .chain(load_findings.into_iter().map(|error| error.to_string()))
+        {
             warnings.push(LintWarning {
+                file: path.to_path_buf(),
+                line: 1,
+                message,
+            });
+        }
+        for duplicate in &duplicate_declarations {
+            let file = duplicate
+                .first_file()
+                .map(|relative| path.join(relative))
+                .unwrap_or_else(|| path.to_path_buf());
+            warnings.push(LintWarning {
+                file,
+                // Declaration AST nodes do not carry spans. Keep the finding in
+                // lint's normal file:line shape and anchor it at the file start;
+                // the message retains exact per-file provenance.
+                line: 1,
+                message: duplicate.to_string(),
+            });
+        }
+        for module in module_walk.iter() {
+            for duplicate in &module.loaded().duplicate_declarations {
+                let file = duplicate
+                    .first_file()
+                    .map(|relative| module.module_path().join(relative))
+                    .unwrap_or_else(|| module.module_path().to_path_buf());
+                warnings.push(LintWarning {
+                    file,
+                    line: 1,
+                    message: format!("{}: {duplicate}", module.diagnostic_path().display()),
+                });
+            }
+        }
+        for (file_path, source) in &source_texts {
+            // Check for list literal syntax on List<Struct> attributes
+            let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
+            for (attr_name, line) in hits {
+                let suggested_name = block_name_suggestions
+                    .get(&attr_name)
+                    .map(|s| s.as_str())
+                    .unwrap_or(&attr_name);
+                warnings.push(LintWarning {
                 file: file_path.clone(),
                 line,
                 message: format!(
@@ -320,12 +410,12 @@ pub fn run_lint(
                     attr_name, suggested_name, attr_name
                 ),
             });
-        }
+            }
 
-        // Check for duplicate attribute keys within the same block
-        let duplicates = find_duplicate_attrs(source);
-        for dup in duplicates {
-            warnings.push(LintWarning {
+            // Check for duplicate attribute keys within the same block
+            let duplicates = find_duplicate_attrs(source);
+            for dup in duplicates {
+                warnings.push(LintWarning {
                 file: file_path.clone(),
                 line: dup.line,
                 message: format!(
@@ -333,25 +423,25 @@ pub fn run_lint(
                     dup.name, dup.first_line
                 ),
             });
-        }
+            }
 
-        // Check for direct calls to pipe-preferred functions
-        let pipe_warnings = find_pipe_preferred_direct_calls(source);
-        for pw in pipe_warnings {
-            warnings.push(LintWarning {
-                file: file_path.clone(),
-                line: pw.line,
-                message: format!(
-                    "Consider using pipe form for '{}': data |> {}(...)",
-                    pw.name, pw.name
-                ),
-            });
-        }
+            // Check for direct calls to pipe-preferred functions
+            let pipe_warnings = find_pipe_preferred_direct_calls(source);
+            for pw in pipe_warnings {
+                warnings.push(LintWarning {
+                    file: file_path.clone(),
+                    line: pw.line,
+                    message: format!(
+                        "Consider using pipe form for '{}': data |> {}(...)",
+                        pw.name, pw.name
+                    ),
+                });
+            }
 
-        // Check for non-snake_case binding names
-        let naming_warnings = find_non_snake_case_bindings(source);
-        for nw in naming_warnings {
-            warnings.push(LintWarning {
+            // Check for non-snake_case binding names
+            let naming_warnings = find_non_snake_case_bindings(source);
+            for nw in naming_warnings {
+                warnings.push(LintWarning {
                 file: file_path.clone(),
                 line: nw.line,
                 message: format!(
@@ -359,29 +449,15 @@ pub fn run_lint(
                     nw.name
                 ),
             });
+            }
         }
-    }
 
-    warnings.extend(parsed.mixed_tag_key_style_warnings(&source_texts, base_dir));
+        warnings.extend(parsed.mixed_tag_key_style_warnings(&source_texts, base_dir));
 
-    if warnings.is_empty() {
-        println!("{}", "No lint warnings found.".green().bold());
-        Ok(())
-    } else {
-        for w in &warnings {
-            eprintln!(
-                "{} {}:{}  {}",
-                "warning:".yellow().bold(),
-                w.file.display(),
-                w.line,
-                w.message
-            );
-        }
-        Err(AppError::Validation(format!(
-            "Found {} lint warning(s).",
-            warnings.len()
-        )))
-    }
+        Ok(warnings)
+    })();
+    let catalog = catalog.as_ref().unwrap_or(provider_context);
+    LintResult::settle(catalog.type_checks().take(), catalog, result)
 }
 
 #[cfg(test)]
@@ -397,7 +473,7 @@ mod tests {
         let user_dirs = carina_core::TestUserDirs::new();
         let error = run_lint(&user_dirs, fixture.path(), ProviderContext::unloaded()).unwrap_err();
         assert!(
-            matches!(&error, AppError::Validation(message) if message == "Found 2 lint warning(s)."),
+            matches!(&error, AppError::Validation(message) if message == "Found 4 lint warning(s)."),
             "{error}"
         );
     }

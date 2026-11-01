@@ -488,6 +488,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     mut parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &Path,
     ctx: &WiringContext,
+    enriched_context: &carina_core::parser::LoadedProviderContext,
     load_errors: &HashMap<String, String>,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
@@ -588,7 +589,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
 
     // Provider validation minted this loaded context from the exact factories
     // and schemas retained by `ctx`.
-    let enriched_context = ctx.provider_context();
 
     // carina#3239: reject `arguments { foo: TotallyMadeUpType }`-shaped
     // unknown bare custom-type names in the root parse. The root
@@ -1054,6 +1054,7 @@ mod tests {
             carina_core::config_loader::InferredRootDirectory,
             &Path,
             &WiringContext,
+            &carina_core::parser::LoadedProviderContext,
             &HashMap<String, String>,
             bool,
             &[DuplicateDeclaration],

@@ -431,11 +431,26 @@ pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: Bind
                     })
                 })
         }
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            match placeholder.inference_type_authority() {
+                crate::resource::PlaceholderTypeAuthority::MissingExpression => {
+                    Err(InferenceError::UnknownType {
+                        reason: placeholder.to_string(),
+                    }
+                    .into())
+                }
+                crate::resource::PlaceholderTypeAuthority::Binding(_)
+                | crate::resource::PlaceholderTypeAuthority::AwaitingSubstitution => Err(
+                    InferenceIssue::NotInferable(NotInferableReason::PlaceholderTypeUnavailable {
+                        placeholder: placeholder.to_string(),
+                    }),
+                ),
+            }
+        }
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_))
-        | Value::Deferred(DeferredValue::Placeholder(_)) => Err(InferenceError::UnknownType {
+        | Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
             reason: "value requires binding/schema authority".to_string(),
         }
         .into()),
@@ -599,23 +614,32 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
             })
         }
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            let Some(name) = placeholder.inference_binding_name() else {
-                return Err(InferenceError::UnknownType {
-                    reason: "parser placeholder has no inferable type authority".to_string(),
+            let binding = match placeholder.inference_type_authority() {
+                crate::resource::PlaceholderTypeAuthority::Binding(name) => bindings.get(name),
+                crate::resource::PlaceholderTypeAuthority::AwaitingSubstitution => None,
+                crate::resource::PlaceholderTypeAuthority::MissingExpression => {
+                    return Err(InferenceError::UnknownType {
+                        reason: placeholder.to_string(),
+                    }
+                    .into());
                 }
-                .into());
             };
-            match bindings.get(name) {
+            match binding {
                 Some(InferenceBinding::Argument { type_expr }) => Ok(type_expr.clone()),
+                // Anonymous loop slots intentionally have no lexical binding
+                // name. Named parser slots can also precede the scope that
+                // supplies their declaration. Neither case proves bad access;
+                // substitution/materialization supplies the value authority.
                 Some(InferenceBinding::Resource { .. })
                 | Some(InferenceBinding::UpstreamState)
                 | Some(InferenceBinding::Virtual { .. })
                 | Some(InferenceBinding::ModuleCall)
                 | Some(InferenceBinding::UserFunction { .. })
-                | None => Err(InferenceError::UnknownType {
-                    reason: format!("parser binding `{name}` has no type authority"),
-                }
-                .into()),
+                | None => Err(InferenceIssue::NotInferable(
+                    NotInferableReason::PlaceholderTypeUnavailable {
+                        placeholder: placeholder.to_string(),
+                    },
+                )),
             }
         }
         Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
@@ -1375,7 +1399,10 @@ where
     for parameter in &mut parsed.export_params {
         let retry = match &parameter.static_type {
             ExportStaticType::Inferred(StaticType::Unchecked(
-                InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
+                InferredUncheckedReason::NotInferable(
+                    NotInferableReason::MissingValue
+                    | NotInferableReason::PlaceholderTypeUnavailable { .. },
+                ),
             )) => false,
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::NotInferable(
@@ -1438,6 +1465,63 @@ mod tests {
     use crate::schema::{
         CompiledAttributeType as AttributeType, SchemaRegistry, TypeIdentity, legacy_validator,
     };
+
+    #[test]
+    fn parser_placeholders_without_type_authority_are_not_inferable() {
+        use crate::resource::{AccessMissPolicy, LoopSlot, PathSegment, apply_postfix_access};
+
+        fn assert_pending<P: PlaceholderKind>(placeholder: P) {
+            let value: crate::resource::Value<P, RelativeBindingName> = apply_postfix_access(
+                crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                    placeholder,
+                )),
+                PathSegment::Field {
+                    name: "action".into(),
+                },
+                1,
+                AccessMissPolicy::Defer,
+            )
+            .unwrap();
+            let inferred =
+                infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+            assert!(
+                matches!(
+                    inferred,
+                    Err(InferenceIssue::NotInferable(
+                        NotInferableReason::PlaceholderTypeUnavailable { .. }
+                    ))
+                ),
+                "a placeholder without authority cannot prove an invalid type: {inferred:?}"
+            );
+            assert!(matches!(
+                infer_type_from_value_without_bindings(&value),
+                Err(InferenceIssue::NotInferable(
+                    NotInferableReason::PlaceholderTypeUnavailable { .. }
+                ))
+            ));
+        }
+
+        for placeholder in [
+            ParserPlaceholder::Loop(LoopSlot::Value),
+            ParserPlaceholder::Loop(LoopSlot::Key),
+            ParserPlaceholder::Loop(LoopSlot::Index),
+            ParserPlaceholder::FnParam {
+                name: "item".into(),
+            },
+            ParserPlaceholder::FnLocal {
+                name: "local".into(),
+            },
+            ParserPlaceholder::ModuleArgument {
+                name: "argument".into(),
+                diagnostic: Default::default(),
+            },
+        ] {
+            assert_pending(placeholder);
+        }
+        for slot in [LoopSlot::Value, LoopSlot::Key, LoopSlot::Index] {
+            assert_pending(slot);
+        }
+    }
 
     fn noop(_v: &crate::resource::ExpandedValue) -> Result<(), String> {
         Ok(())

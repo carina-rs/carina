@@ -2497,6 +2497,15 @@ impl DiagnosticEngine {
                 if let Some(type_expr) = &attr_param.static_type
                     && let Some(semantic_value) = semantic_view.value_for_typecheck(attr_param)
                 {
+                    // Declaration resolution owns an unnameable annotation. Value
+                    // checking starts only after that producer can classify it.
+                    let Ok(resolved_type) = carina_core::validation::resolve_type_expr(
+                        type_expr,
+                        &self.provider_context,
+                    ) else {
+                        continue;
+                    };
+                    let type_expr = &resolved_type;
                     let type_error = match self.provider_context.loaded() {
                         Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
@@ -2518,7 +2527,14 @@ impl DiagnosticEngine {
                                 schemas: &self.schemas,
                             },
                         )
-                        .allow_deferred()
+                        .record_at(
+                            self.provider_context.type_checks(),
+                            carina_core::validation::deferred_types::ProviderTypeCheckSite::new(
+                                attr_param.source_file(),
+                                attr_param.source_span(),
+                                format!("attribute '{}'", attr_param.name),
+                            ),
+                        )
                         .err(),
                     };
                     if let Some(type_error) = type_error

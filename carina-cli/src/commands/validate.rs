@@ -32,6 +32,16 @@ struct ValidateWarning {
     file: Option<String>,
 }
 
+pub(crate) fn print_provider_type_warning(warning: &carina_core::parser::ParseWarning) {
+    eprintln!(
+        "  ⚠ {}:{}:{}: {}",
+        warning.file.as_deref().unwrap_or("<config>"),
+        warning.line,
+        warning.span.as_ref().map_or(1, |span| span.start_column),
+        warning.message
+    );
+}
+
 /// Test-only entry point for the validate pipeline (#2247).
 ///
 /// Runs the same pipeline `run_validate` runs (parse → resolve →
@@ -286,12 +296,7 @@ pub fn run_validate(
     // Publish unresolved provider checks even if another validation/load error
     // prevents a resolved file from being returned.
     for warning in validation_report.provider_type_warnings() {
-        eprintln!(
-            "  ⚠ {}:{}: {}",
-            warning.file.as_deref().unwrap_or("<config>"),
-            warning.line,
-            warning.message
-        );
+        print_provider_type_warning(warning);
     }
     let (validation_result, schemas) = validation_report.into_parts();
     let parsed = match validation_result {
@@ -461,8 +466,12 @@ mod tests {
         );
         let report = providers.validation_report(&loaded.parsed, fixture.path(), false, &[]);
         let warnings = report.provider_type_warnings();
-        assert_eq!(warnings.len(), 2, "{warnings:#?}");
-        for (warning, name, line) in [(&warnings[0], "Arn", 3), (&warnings[1], "AwsAccountId", 5)] {
+        assert_eq!(warnings.len(), 3, "{warnings:#?}");
+        for (warning, name, line) in [
+            (&warnings[0], "Arn", 2),
+            (&warnings[1], "Arn", 3),
+            (&warnings[2], "AwsAccountId", 5),
+        ] {
             assert_eq!(
                 warning.kind,
                 carina_core::parser::WarningKind::ProviderSchemasNotLoaded

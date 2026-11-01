@@ -720,10 +720,15 @@ where
 #[derive(Clone)]
 pub struct ProviderCustomTypes {
     state: std::sync::Arc<ProviderCustomTypeState>,
+    checks: std::sync::Arc<crate::validation::deferred_types::ProviderTypeCheckRecorder>,
 }
 
 enum ProviderCustomTypeState {
     Unloaded,
+    Partial {
+        loaded: ProviderCustomTypes,
+        failed_providers: BTreeSet<String>,
+    },
     Loaded {
         known: BTreeSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
@@ -735,6 +740,7 @@ impl Default for ProviderCustomTypes {
     fn default() -> Self {
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Unloaded),
+            checks: Default::default(),
         }
     }
 }
@@ -748,6 +754,7 @@ impl ProviderCustomTypes {
         resolver: CustomTypeValidatorFn,
     ) -> Self {
         Self {
+            checks: Default::default(),
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known: known.into_iter().collect(),
                 resolver,
@@ -761,11 +768,54 @@ impl ProviderCustomTypes {
         let source = std::sync::Arc::new(source);
         let validation_source = std::sync::Arc::clone(&source);
         Self {
+            checks: Default::default(),
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known,
                 resolver: Box::new(move |target, value| validation_source.validate(target, value)),
                 enum_lookup: Box::new(move |owned| source.enum_declaration(owned)),
             }),
+        }
+    }
+
+    /// Mark an otherwise loaded snapshot as non-authoritative for these owners.
+    pub fn with_failed_providers(&self, failed_providers: BTreeSet<String>) -> Self {
+        if failed_providers.is_empty() {
+            return self.clone();
+        }
+        Self {
+            state: std::sync::Arc::new(ProviderCustomTypeState::Partial {
+                loaded: self.clone(),
+                failed_providers,
+            }),
+            checks: Default::default(),
+        }
+    }
+
+    pub fn is_partial(&self) -> bool {
+        matches!(self.state.as_ref(), ProviderCustomTypeState::Partial { .. })
+    }
+
+    /// Whether a missing identity may belong to an unavailable provider.
+    pub fn may_defer(&self, provider: Option<&str>) -> bool {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Unloaded => true,
+            ProviderCustomTypeState::Loaded { .. } => false,
+            ProviderCustomTypeState::Partial {
+                failed_providers, ..
+            } => provider.map_or(!failed_providers.is_empty(), |owner| {
+                failed_providers.contains(owner)
+            }),
+        }
+    }
+
+    pub fn type_checks(&self) -> &crate::validation::deferred_types::ProviderTypeCheckRecorder {
+        &self.checks
+    }
+
+    pub fn fresh_type_checks(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            checks: Default::default(),
         }
     }
 
@@ -782,6 +832,7 @@ impl ProviderCustomTypes {
 
     pub fn known(&self) -> &BTreeSet<OwnedTypeIdentity> {
         match self.state.as_ref() {
+            ProviderCustomTypeState::Partial { loaded, .. } => loaded.known(),
             ProviderCustomTypeState::Unloaded => {
                 static EMPTY: std::sync::LazyLock<BTreeSet<OwnedTypeIdentity>> =
                     std::sync::LazyLock::new(BTreeSet::new);
@@ -803,6 +854,24 @@ impl CustomTypeResolver for ProviderCustomTypes {
         value: &'a Value,
     ) -> Result<(), CustomTypeValidationError> {
         match self.state.as_ref() {
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                let unavailable = match target {
+                    CustomTypeValidationTarget::Annotation(owned) => owned
+                        .provider_names()
+                        .any(|owner| failed_providers.contains(owner)),
+                    CustomTypeValidationTarget::Declaration { owner, .. } => {
+                        failed_providers.contains(owner)
+                    }
+                };
+                if unavailable {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.validate(target, value)
+                }
+            }
             ProviderCustomTypeState::Loaded {
                 known: _known,
                 resolver,
@@ -817,6 +886,19 @@ impl CustomTypeResolver for ProviderCustomTypes {
         owned: &OwnedTypeIdentity,
     ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
         match self.state.as_ref() {
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                if owned
+                    .provider_names()
+                    .any(|owner| failed_providers.contains(owner))
+                {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.enum_declaration(owned)
+                }
+            }
             ProviderCustomTypeState::Loaded {
                 known: _known,
                 resolver: _resolver,
@@ -841,10 +923,9 @@ pub type DecryptorFn = Box<dyn Fn(&str, Option<&str>) -> Result<String, String> 
 pub struct ProviderContext {
     /// Optional decryptor for the `decrypt()` built-in function.
     pub decryptor: Option<DecryptorFn>,
-    /// Provider custom types are either unavailable or loaded together with
-    /// both their owner-qualified recognition keys and resolver. When loaded,
-    /// unknown PascalCase type names are rejected; the default unloaded state
-    /// preserves bootstrap parsing before provider registration.
+    /// The catalog is unloaded, fully loaded, or partial with explicit failed owners.
+    /// Recognition and validation share one snapshot. Missing names defer only
+    /// when they may belong to an unavailable owner.
     pub custom_types: ProviderCustomTypes,
     /// Resource kinds loaded from provider schemas, keyed by `(provider,
     /// resource_type)` such as `("aws", "iam.Role")`.
@@ -857,6 +938,25 @@ impl ProviderContext {
         static CONTEXT: std::sync::LazyLock<ProviderContext> =
             std::sync::LazyLock::new(ProviderContext::default);
         &CONTEXT
+    }
+
+    pub fn type_checks(&self) -> &crate::validation::deferred_types::ProviderTypeCheckRecorder {
+        self.custom_types.type_checks()
+    }
+
+    /// A new validation pass shares catalog authority, but owns fresh pending evidence.
+    pub fn type_check_session(self: &std::sync::Arc<Self>) -> Self {
+        let original = self.clone();
+        let decryptor: Option<DecryptorFn> = self.decryptor.as_ref().map(|_| {
+            Box::new(move |value: &str, key: Option<&str>| {
+                original.decryptor.as_ref().expect("retained decryptor")(value, key)
+            }) as DecryptorFn
+        });
+        Self {
+            decryptor,
+            custom_types: self.custom_types.fresh_type_checks(),
+            resource_types: self.resource_types.clone(),
+        }
     }
 
     pub fn custom_types_loaded(&self) -> bool {
@@ -928,6 +1028,21 @@ impl LoadedProviderContext {
         &self.0
     }
 
+    pub fn type_check_session(&self) -> Self {
+        Self::new(self.0.type_check_session())
+    }
+
+    /// Retain this catalog's authority while preserving the caller's runtime hooks.
+    pub fn type_check_session_with_runtime(
+        &self,
+        runtime: &std::sync::Arc<ProviderContext>,
+    ) -> Self {
+        let mut session = runtime.type_check_session();
+        session.custom_types = self.custom_types.fresh_type_checks();
+        session.resource_types = self.resource_types.clone();
+        Self::new(session)
+    }
+
     /// Test-only constructor for fixtures that deliberately inject a loaded
     /// custom-type resolver without a provider factory.
     #[cfg(any(test, feature = "test-utils"))]
@@ -945,6 +1060,7 @@ impl LoadedProviderContext {
     pub fn empty_for_test() -> Self {
         Self::new(ProviderContext {
             custom_types: ProviderCustomTypes {
+                checks: Default::default(),
                 state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                     known: BTreeSet::new(),
                     resolver: Box::new(|_target, _value| Ok(())),
@@ -994,6 +1110,14 @@ impl std::fmt::Debug for ProviderCustomTypes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.state.as_ref() {
             ProviderCustomTypeState::Unloaded => formatter.write_str("Unloaded"),
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => formatter
+                .debug_struct("Partial")
+                .field("loaded", loaded)
+                .field("failed_providers", failed_providers)
+                .finish(),
             ProviderCustomTypeState::Loaded {
                 known,
                 resolver: _resolver,

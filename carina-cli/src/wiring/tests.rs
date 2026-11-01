@@ -13779,3 +13779,30 @@ exports { team_prefix: String = "x" }"#,
         assert!(!rendered.contains("Secret("), "{rendered}");
     }
 }
+
+#[test]
+fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
+    use carina_core::validation::deferred_types::{
+        DeferredProviderTypeChecks, ProviderTypeCheckSite,
+    };
+    let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
+    let mut checks = DeferredProviderTypeChecks::default();
+    let expected = carina_core::parser::parse_type_expr_str(
+        "Typo",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .unwrap();
+    checks.record(
+        ProviderTypeCheckSite::at_line(Path::new("/project/main.crn"), 2, 3, "attribute 'x'"),
+        &expected,
+    );
+    let schemas = SchemaRegistry::new();
+    let report = ValidationReport::settle(checks, &catalog, Ok(Default::default()), &schemas);
+    let errors = report.into_errors();
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .to_string()
+            .contains("remained deferred in a fully loaded provider catalog")
+    );
+}

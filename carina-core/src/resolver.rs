@@ -726,6 +726,23 @@ fn user_function_runtime_error(
     }
 }
 
+fn function_annotation_site<B: BindingAddress>(
+    function: &crate::parser::UserFunction<B>,
+    span: Option<crate::parser::SourceSpan>,
+    context: String,
+) -> crate::validation::deferred_types::ProviderTypeCheckSite {
+    use crate::validation::deferred_types::ProviderTypeCheckSite;
+    let source = function
+        .annotation_source_file
+        .as_deref()
+        .or(function.body.source_file.as_deref())
+        .unwrap_or_else(|| std::path::Path::new("<config>"));
+    match span {
+        Some(span) => ProviderTypeCheckSite::new(source, span, context),
+        None => ProviderTypeCheckSite::at_line(source, function.body.source_line, 1, context),
+    }
+}
+
 fn evaluate_runtime_user_function<B: BindingAddress>(
     function: &crate::parser::UserFunction<B>,
     args: &[crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>],
@@ -796,23 +813,30 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
             } else if argument.pending_parameter().is_none()
                 && let Some(value) = argument.value()
             {
-                crate::validation::typecheck::check_type_expr_value_providerless(
-                    &resolved_parameter
-                        .map_or_else(|| expected.clone(), |resolved| resolved.as_type_expr()),
-                    value,
-                    provider_config,
-                    crate::validation::typecheck::TypecheckInference::Unavailable,
-                )
-                .allow_deferred()
-                .map_err(|error| {
-                    user_function_runtime_error(
-                        call_line,
-                        format!(
-                            "function '{}': parameter '{}': {error}",
-                            function.name, parameter.name
+                crate::validation::typecheck::TypecheckProviderContext::for_parser(provider_config)
+                    .check_at(
+                        &resolved_parameter
+                            .map_or_else(|| expected.clone(), |resolved| resolved.as_type_expr()),
+                        value,
+                        crate::validation::typecheck::TypecheckInference::Unavailable,
+                        function_annotation_site(
+                            function,
+                            parameter.type_span,
+                            format!(
+                                "function '{}' parameter '{}'",
+                                function.name, parameter.name
+                            ),
                         ),
                     )
-                })?;
+                    .map_err(|error| {
+                        user_function_runtime_error(
+                            call_line,
+                            format!(
+                                "function '{}': parameter '{}': {error}",
+                                function.name, parameter.name
+                            ),
+                        )
+                    })?;
             }
         }
         substitutions.insert(parameter.name.clone(), argument);
@@ -841,20 +865,24 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
         .map_err(|message| user_function_runtime_error(function.body.source_line, message))
         .map_err(|error| locate_user_function_error(function, error))?;
     if let Some(expected) = &function.return_type {
-        crate::validation::typecheck::check_type_expr_value_providerless(
-            expected,
-            &result,
-            provider_config,
-            crate::validation::typecheck::TypecheckInference::Unavailable,
-        )
-        .allow_deferred()
-        .map_err(|error| {
-            user_function_runtime_error(
-                function.body.source_line,
-                format!("function '{}': return value: {error}", function.name),
+        crate::validation::typecheck::TypecheckProviderContext::for_parser(provider_config)
+            .check_at(
+                expected,
+                &result,
+                crate::validation::typecheck::TypecheckInference::Unavailable,
+                function_annotation_site(
+                    function,
+                    function.return_type_span,
+                    format!("function '{}' return value", function.name),
+                ),
             )
-        })
-        .map_err(|error| locate_user_function_error(function, error))?;
+            .map_err(|error| {
+                user_function_runtime_error(
+                    function.body.source_line,
+                    format!("function '{}': return value: {error}", function.name),
+                )
+            })
+            .map_err(|error| locate_user_function_error(function, error))?;
     }
 
     Ok(result)
@@ -3889,5 +3917,73 @@ mod tests {
             resolved, ref_value,
             "no alias when target absent → ref stays intact (existing PlanError surfaces it)"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_provider_type_tests {
+    use super::*;
+    use crate::parser::{OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, parse_file};
+    use crate::schema::{RefinedScalarKind, TypeIdentity};
+    use crate::validation::deferred_types::{ProviderTypeCheckDiagnostic, ProviderTypeCheckResult};
+
+    #[test]
+    fn settlement_runtime_function_arguments_and_returns_use_catalog_authority() {
+        for source in ["fn f(x: ReadyId) { x }", "fn f(x: String): ReadyId { x }"] {
+            let mut parsed = parse_file(
+                source,
+                std::path::Path::new("/project/functions.crn"),
+                &ProviderContext::default(),
+            )
+            .unwrap();
+            let mut function = parsed.user_functions.remove("f").unwrap();
+            function.body.source_file = Some(std::path::PathBuf::from("/project/functions.crn"));
+            let arguments = [crate::resource::FunctionArgument::from_value(
+                crate::resource::AuthoredValue::Concrete(
+                    crate::resource::AuthoredConcreteValue::String("bad".into()),
+                ),
+            )];
+            let bindings = ResolvedBindings::for_authored_validation(&parsed);
+            let loaded = ProviderContext {
+                custom_types: ProviderCustomTypes::loaded(
+                    std::collections::HashSet::from([OwnedTypeIdentity::provider(
+                        "ready",
+                        TypeIdentity::bare("ReadyId"),
+                        RefinedScalarKind::String,
+                    )]),
+                    Box::new(|target, _| {
+                        Err(crate::parser::fixture_custom_type_rejection(
+                            target,
+                            "rejected by ready",
+                        ))
+                    }),
+                ),
+                ..Default::default()
+            };
+            let error =
+                evaluate_runtime_user_function(&function, &arguments, &bindings, Some(&loaded), 8)
+                    .unwrap_err();
+            assert!(error.to_string().contains("rejected by ready"), "{error}");
+            let partial = ProviderContext {
+                custom_types: loaded
+                    .custom_types
+                    .with_failed_providers(std::collections::BTreeSet::from(["broken".into()])),
+                ..Default::default()
+            };
+            let error =
+                evaluate_runtime_user_function(&function, &arguments, &bindings, Some(&partial), 8)
+                    .unwrap_err();
+            assert!(error.to_string().contains("rejected by ready"), "{error}");
+            let unloaded = ProviderContext::default();
+            evaluate_runtime_user_function(&function, &arguments, &bindings, Some(&unloaded), 8)
+                .unwrap();
+            let result =
+                ProviderTypeCheckResult::settle(unloaded.type_checks().take(), &unloaded, ());
+            assert!(
+                matches!(result.diagnostics(), [ProviderTypeCheckDiagnostic::Deferred(warning)] if warning.file.as_deref() == Some("/project/functions.crn")),
+                "{:?}",
+                result.diagnostics()
+            );
+        }
     }
 }

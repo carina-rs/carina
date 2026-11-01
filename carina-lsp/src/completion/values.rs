@@ -231,7 +231,7 @@ fn type_expr_source_is_assignable_to(
         // exclude the candidate rather than suggest an unproven assignment.
         assignment.require_loaded().unwrap_or(false)
     } else {
-        assignment.allow_unchecked()
+        assignment.record_unchecked(provider_ctx.type_checks())
     }
 }
 

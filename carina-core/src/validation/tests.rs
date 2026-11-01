@@ -1192,9 +1192,7 @@ fn lift_unloaded_schema_nominals_preserves_identity_without_guessing_kind() {
         );
         assert!(matches!(
             source.assignment_to(crate::schema::TypeInSchema::schemaless(&sink)),
-            crate::schema::TypeAssignability::Unchecked(
-                crate::parser::CustomTypeValidationError::ProvidersNotLoaded
-            )
+            crate::schema::TypeAssignability::Unchecked(_)
         ));
     }
 }
@@ -9433,4 +9431,64 @@ fn module_type_resolution_dedup_uses_typed_identity_not_display_text() {
         first, second,
         "deduplication must retain distinct typed type-resolution failures",
     );
+}
+
+#[test]
+fn deferred_loop_placeholder_access_checks_after_materialization() {
+    use crate::resource::{AccessMissPolicy, LoopSlot, PathSegment, apply_postfix_access};
+    let parsed = ParsedFile::default();
+    let schemas = SchemaRegistry::new();
+    let provider = crate::parser::LoadedProviderContext::empty_for_test();
+    let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
+    let inference = inference::bindings_from_parsed(&parsed);
+    let expected = crate::schema::CompiledAttributeType::string();
+    let field = PathSegment::Field {
+        name: "action".into(),
+    };
+    let pending = apply_postfix_access(
+        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::Loop(
+            LoopSlot::Value,
+        ))),
+        field.clone(),
+        1,
+        AccessMissPolicy::Defer,
+    )
+    .unwrap();
+    assert_eq!(
+        check_deferred_access_type(
+            &pending,
+            crate::schema::TypeInSchema::schemaless(&expected),
+            &inference,
+            &schemas,
+            &index
+        ),
+        Ok(())
+    );
+    for (action, assignable) in [
+        (Value::Concrete(ConcreteValue::String("part".into())), true),
+        (Value::Concrete(ConcreteValue::Int(42)), false),
+    ] {
+        let materialized = apply_postfix_access(
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "action".into(),
+                action,
+            )]))),
+            field.clone(),
+            1,
+            AccessMissPolicy::Defer,
+        )
+        .unwrap();
+        let result = check_deferred_access_type(
+            &materialized,
+            crate::schema::TypeInSchema::schemaless(&expected),
+            &inference,
+            &schemas,
+            &index,
+        );
+        assert_eq!(
+            result.is_ok(),
+            assignable,
+            "materialized values must be checked against the sink: {result:?}"
+        );
+    }
 }

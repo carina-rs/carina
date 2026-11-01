@@ -862,7 +862,7 @@ fn render_value_type_error(
             &engine.provider_context,
             carina_core::validation::typecheck::TypecheckInference::Unavailable,
         )
-        .allow_deferred(),
+        .record_deferred(ProviderContext::unloaded().type_checks()),
     };
     result.err().map(|error| error.to_string())
 }
@@ -5508,7 +5508,7 @@ attributes {
 }
 
 #[test]
-fn orphan_export_dotted_unresolved_literal_mismatch_warns_without_loaded_providers() {
+fn orphan_export_dotted_annotation_defers_ambiguous_scalar_kind() {
     let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
         r#"exports {
@@ -5517,18 +5517,19 @@ fn orphan_export_dotted_unresolved_literal_mismatch_warns_without_loaded_provide
     );
 
     let diagnostics = engine.analyze(&doc, None);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        diagnostics[0].code,
+        Some(tower_lsp::lsp_types::NumberOrString::String(
+            "providers_not_loaded".into()
+        ))
+    );
     assert!(
-        diagnostics.iter().any(|diagnostic| {
-            diagnostic.severity == Some(DiagnosticSeverity::WARNING)
-                && diagnostic
-                    .message
-                    .contains("expected aws.AccountId, got int")
-        }),
-        "providerless dotted export annotations must retain literal mismatch warnings: {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>()
+        diagnostics[0]
+            .message
+            .contains("type check for aws.AccountId was deferred"),
+        "{diagnostics:#?}"
     );
 }
 
@@ -14764,12 +14765,26 @@ fn providerless_orphan_reports_deferred_function_and_attribute_type_checks() {
     let source = "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes {\n  x: AwsAccountId = '123'\n}\n";
     let path = std::path::PathBuf::from("/orphan/main.crn");
     let doc = create_document_at(source, path.clone());
-    let expected = carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
-        doc.parsed().unwrap(),
-        &ProviderContext::default(),
-        &path,
-    )
-    .report();
+    let context = ProviderContext::default();
+    let mut parsed = doc.parsed().unwrap().clone();
+    assert!(carina_core::validation::resolve_file_type_exprs(&mut parsed, &context).is_empty());
+    carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
+    let terminal = carina_core::validation::deferred_types::ProviderTypeCheckResult::settle(
+        context.type_checks().take(),
+        &context,
+        (),
+    );
+    let expected = terminal
+        .into_parts()
+        .1
+        .into_iter()
+        .map(|diagnostic| match diagnostic {
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(
+                warning,
+            ) => warning,
+            other => panic!("unexpected diagnostic: {other:?}"),
+        })
+        .collect::<Vec<_>>();
     let diagnostics = test_engine().analyze(&doc, None);
     let warnings = diagnostics
         .iter()
@@ -14780,7 +14795,7 @@ fn providerless_orphan_reports_deferred_function_and_attribute_type_checks() {
                 ))
         })
         .collect::<Vec<_>>();
-    assert_eq!(warnings.len(), 2, "{diagnostics:#?}");
+    assert_eq!(warnings.len(), 3, "{diagnostics:#?}");
     for (diagnostic, warning) in warnings.iter().zip(expected) {
         assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(diagnostic.source.as_deref(), Some("carina"));
@@ -14790,7 +14805,7 @@ fn providerless_orphan_reports_deferred_function_and_attribute_type_checks() {
 }
 
 #[test]
-fn providerless_directory_reports_deferred_type_checks_once() {
+fn providerless_directory_is_an_empty_loaded_catalog() {
     let fixture = tempfile::tempdir().unwrap();
     let path = fixture.path().join("main.crn");
     let source = "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes {\n  x: AwsAccountId = '123'\n}\n";
@@ -14806,7 +14821,19 @@ fn providerless_directory_reports_deferred_type_checks_once() {
                 ))
         })
         .collect::<Vec<_>>();
-    assert_eq!(warnings.len(), 2, "{diagnostics:#?}");
+    assert!(warnings.is_empty(), "{diagnostics:#?}");
+    for name in ["Arn", "AwsAccountId"] {
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains(&format!("unknown custom type '{name}'")))
+                .count(),
+            1,
+            "{diagnostics:#?}"
+        );
+    }
     assert!(warnings.iter().all(
         |warning| warning.severity == Some(DiagnosticSeverity::WARNING)
             && warning.source.as_deref() == Some("carina")
@@ -14859,4 +14886,135 @@ fn loaded_catalog_settles_type_checks_and_keeps_typos_as_unknown_types() {
         == Some(tower_lsp::lsp_types::NumberOrString::String(
             "providers_not_loaded".into()
         ))));
+}
+
+#[test]
+fn settlement_reviewer_fixtures_a_b_c_d_have_cli_parity() {
+    let failed = "provider broken { source = 'file:///definitely-missing/broken.wasm' }\n";
+    let attribute = "attributes {\n  x: AwsAccountId = '123'\n}\n";
+    let functions = "fn f(x: Arnn) { x }\nfn g(): Bogus { 'x' }\n";
+    for (name, source, warnings, errors) in [
+        ("a", format!("{failed}{attribute}"), 1, 0),
+        ("b", format!("{failed}{functions}"), 2, 0),
+        ("c", attribute.to_string(), 0, 1),
+        (
+            "d",
+            format!("{functions}attributes {{\n  y: AwsAccountId = '1'\n}}\n"),
+            0,
+            3,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.crn");
+        std::fs::write(&path, &source).unwrap();
+        let doc = create_document_at(&source, path.clone());
+        let engine = if warnings > 0 {
+            test_engine().with_provider_errors(HashMap::from([(
+                "broken".into(),
+                "Provider 'broken' failed to load".into(),
+            )]))
+        } else {
+            test_engine()
+        };
+        let diagnostics = engine.analyze(&doc, Some(&path));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "providers_not_loaded".into()
+                    )))
+                .count(),
+            warnings,
+            "fixture {name}: {diagnostics:#?}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("unknown custom type"))
+                .count(),
+            errors,
+            "fixture {name}: {diagnostics:#?}"
+        );
+        let type_diagnostics = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.message.contains("type check for")
+                    || diagnostic.message.contains("unknown custom type")
+            })
+            .collect::<Vec<_>>();
+        let mut sites = type_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.range.start.line,
+                    diagnostic.range.start.character,
+                )
+            })
+            .collect::<Vec<_>>();
+        sites.sort_unstable();
+        let expected_sites = match name {
+            "a" => vec![(2, 2)],
+            "b" => vec![(1, 8), (2, 8)],
+            "c" => vec![(1, 2)],
+            "d" => vec![(0, 8), (1, 8), (3, 2)],
+            _ => unreachable!("fixture table"),
+        };
+        assert_eq!(sites, expected_sites, "fixture {name}: {diagnostics:#?}");
+        assert_eq!(
+            type_diagnostics.len(),
+            warnings + errors,
+            "exact fixture {name} type diagnostics: {diagnostics:#?}"
+        );
+        assert!(
+            type_diagnostics.iter().all(|diagnostic| diagnostic.severity
+                == Some(if warnings > 0 {
+                    DiagnosticSeverity::WARNING
+                } else {
+                    DiagnosticSeverity::ERROR
+                })),
+            "fixture {name}: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn settlement_partial_catalog_does_not_warn_for_a_loaded_owner() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "ready",
+        ResourceSchema::new("Types")
+            .attribute(
+                AttributeSchema::optional(
+                    "id",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::bare("ReadyId")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas).with_provider_errors(HashMap::from([(
+        "broken".into(),
+        "Provider 'broken' failed to load".into(),
+    )]));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source =
+        "provider broken { source = 'file:///missing.wasm' }\nattributes { x: ReadyId = 'ok' }\n";
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("was deferred")
+                && !diagnostic.message.contains("unknown custom type")),
+        "{diagnostics:#?}"
+    );
 }

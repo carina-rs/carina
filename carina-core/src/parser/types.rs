@@ -125,7 +125,7 @@ pub(crate) fn resolve_custom_type_identity(
     if let Some(resolved) = merge_custom_type_candidates(&matches)? {
         return Ok(Some(resolved));
     }
-    if !config.custom_types_loaded() {
+    if config.custom_types.may_defer(identity.provider.as_deref()) {
         return Ok(Some(TypeExpr::UnloadedSchemaType(UnloadedSchemaType(
             identity.clone(),
         ))));
@@ -381,7 +381,6 @@ fn parse_type_expr_atom(
     warnings: &mut Vec<ParseWarning>,
     preprocessed_file: Option<&super::PreprocessedFile>,
 ) -> Result<TypeExpr, ParseError> {
-    let _ = warnings;
     let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
         Rule::type_string_literal => {

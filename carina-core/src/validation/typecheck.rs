@@ -38,8 +38,8 @@ impl<P: PlaceholderKind, B: BindingAddress> Clone for TypecheckInference<'_, P, 
 /// Provider authority available to internal value-checking pipelines.
 ///
 /// Construction is crate-private: loaded paths retain the opaque production
-/// witness, while explicitly providerless paths use a recursive checker that
-/// never invokes the provider custom-type resolver.
+/// witness. Incomplete catalogs defer unavailable owners while retaining
+/// strict validation for owners whose schemas loaded successfully.
 #[derive(Clone, Copy)]
 pub(crate) enum TypecheckProviderContext<'a> {
     Loaded(&'a LoadedProviderContext),
@@ -92,12 +92,27 @@ impl<'a> TypecheckProviderContext<'a> {
             }
             Self::Providerless(config) => {
                 check_type_expr_value_providerless(expected, value, config, inference)
-                    .allow_deferred()
+                    .record_deferred(config.type_checks())
             }
             Self::LoadedParserCatalog(_) => {
                 check_type_expr_value_inner(expected, value, self, inference)
                     .require_provider_schemas()
             }
+        }
+    }
+
+    pub(crate) fn check_at<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        expected: &TypeExpr,
+        value: &Value<P, B>,
+        inference: TypecheckInference<'_, P, B>,
+        site: super::deferred_types::ProviderTypeCheckSite,
+    ) -> Result<(), TypeExprValueError> {
+        let check = check_type_expr_value_inner(expected, value, self, inference);
+        if self.requires_provider_schemas() {
+            check.require_provider_schemas()
+        } else {
+            check.record_at(self.as_provider_context().type_checks(), site)
         }
     }
 
@@ -122,15 +137,70 @@ pub struct TypeExprValueDeferral {
     pub expected: Box<TypeExpr>,
     pub actual: Box<ValueDescription>,
     pub reason: crate::parser::CustomTypeValidationError,
+    provider_types: Vec<TypeExpr>,
+    additional: Vec<TypeExprValueDeferral>,
+}
+
+impl TypeExprValueDeferral {
+    fn merge(mut self, other: Self) -> Self {
+        self.additional.push(other);
+        self
+    }
+
+    fn into_checks(mut self) -> Vec<Self> {
+        let additional = std::mem::take(&mut self.additional);
+        let mut checks = vec![self];
+        for check in additional {
+            checks.extend(check.into_checks());
+        }
+        checks
+    }
+
+    fn prepend(&mut self, segment: TypeExprValuePathSegment) {
+        self.path.insert(0, segment.clone());
+        for check in &mut self.additional {
+            check.prepend(segment.clone());
+        }
+    }
 }
 
 impl TypeExprValueCheck {
     /// Intermediate bootstrap/editor checks may retain unavailable evidence.
     /// A terminal providerless pipeline must settle its sites through
     /// [`super::deferred_types::DeferredProviderTypeChecks`].
-    pub fn allow_deferred(self) -> Result<(), TypeExprValueError> {
+    pub fn record_deferred(
+        self,
+        sink: &super::deferred_types::ProviderTypeCheckRecorder,
+    ) -> Result<(), TypeExprValueError> {
         match self {
-            Self::Assignable | Self::Deferred(_) => Ok(()),
+            Self::Assignable => Ok(()),
+            Self::Deferred(deferred) => {
+                for check in deferred.into_checks() {
+                    for expected in check.provider_types {
+                        sink.record_type(&expected, &format!("value check ({})", check.reason));
+                    }
+                }
+                Ok(())
+            }
+            Self::Mismatch(error) => Err(error),
+        }
+    }
+
+    pub fn record_at(
+        self,
+        sink: &super::deferred_types::ProviderTypeCheckRecorder,
+        site: super::deferred_types::ProviderTypeCheckSite,
+    ) -> Result<(), TypeExprValueError> {
+        match self {
+            Self::Assignable => Ok(()),
+            Self::Deferred(deferred) => {
+                for check in deferred.into_checks() {
+                    for expected in check.provider_types {
+                        sink.record(&expected, site.clone());
+                    }
+                }
+                Ok(())
+            }
             Self::Mismatch(error) => Err(error),
         }
     }
@@ -161,7 +231,7 @@ impl TypeExprValueCheck {
             Self::Assignable => Self::Assignable,
             Self::Mismatch(error) => Self::Mismatch(error.prepend(segment)),
             Self::Deferred(mut deferred) => {
-                deferred.path.insert(0, segment);
+                deferred.prepend(segment);
                 Self::Deferred(deferred)
             }
         }
@@ -172,7 +242,12 @@ impl TypeExprValueCheck {
         for check in checks {
             match check {
                 Self::Mismatch(_) => return check,
-                Self::Deferred(_) => result = check,
+                Self::Deferred(evidence) => {
+                    result = Self::Deferred(match result {
+                        Self::Deferred(previous) => previous.merge(evidence),
+                        Self::Assignable | Self::Mismatch(_) => evidence,
+                    })
+                }
                 Self::Assignable => {}
             }
         }
@@ -184,7 +259,12 @@ impl TypeExprValueCheck {
         for check in checks {
             match check {
                 Self::Assignable => return Self::Assignable,
-                Self::Deferred(_) => result = check,
+                Self::Deferred(evidence) => {
+                    result = Self::Deferred(match result {
+                        Self::Deferred(previous) => previous.merge(evidence),
+                        Self::Assignable | Self::Mismatch(_) => evidence,
+                    })
+                }
                 Self::Mismatch(_) => {}
             }
         }
@@ -333,8 +413,8 @@ pub fn check_type_expr_value<P: PlaceholderKind, B: BindingAddress>(
 /// Check a value without loaded providers.
 ///
 /// Structural checks and provider-independent leaves run normally. A
-/// provider-owned custom-type leaf is accepted only after its scalar shape is
-/// checked; the provider resolver is never called.
+/// provider-owned custom-type leaf defers when its owner is unavailable.
+/// Partial catalogs still invoke the resolver for successfully loaded owners.
 pub fn check_type_expr_value_providerless<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
@@ -384,6 +464,8 @@ fn deferred_provider_check<P: PlaceholderKind, B: BindingAddress>(
         expected: Box::new(expected.clone()),
         actual: Box::new(ValueDescription::of(value)),
         reason: crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
+        provider_types: vec![expected.clone()],
+        additional: Vec::new(),
     })
 }
 
@@ -500,6 +582,7 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
                 )) => deferred_provider_check(expected, value),
                 Err(crate::static_type::InferenceIssue::NotInferable(
                     crate::static_type::NotInferableReason::MissingValue
+                    | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
                     | crate::static_type::NotInferableReason::NonInferableBinding { .. }
                     | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
                 )) => Assignable,
@@ -523,7 +606,11 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
                 }
                 Err(crate::static_type::InferenceIssue::NotInferable(
                     crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
-                )) if inferred_type_fits(expected, &TypeExpr::Int) => {
+                )) if !matches!(
+                    inferred_type_assignment(expected, &TypeExpr::Int),
+                    crate::schema::TypeAssignability::Mismatch
+                ) =>
+                {
                     deferred_provider_check(expected, value)
                 }
                 Err(crate::static_type::InferenceIssue::NotInferable(_)) => {
@@ -613,7 +700,12 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
             }
             _ => Mismatch(mismatch(expected, value)),
         },
-        TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) => match value {
+        TypeExpr::DottedUnresolved(_) => match super::resolve_type_expr(expected, config) {
+            Ok(TypeExpr::DottedUnresolved(_)) => deferred_provider_check(expected, value),
+            Ok(resolved) => check(&resolved, value),
+            Err(error) => Mismatch(validation_mismatch(expected, value, error.to_string())),
+        },
+        TypeExpr::Ref(_) => match value {
             Value::Concrete(ConcreteValue::String(_) | ConcreteValue::CanonicalEnum(_)) => {
                 Assignable
             }
@@ -650,6 +742,25 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
                 ProviderCustomTypeValidation::Loaded => {
                     match validate_schema_custom_type_with_context(owned, value, config) {
                         Ok(()) => Assignable,
+                        Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded) => {
+                            deferred_provider_check(expected, value)
+                        }
+                        Err(error) => {
+                            Mismatch(custom_type_validation_mismatch(expected, value, error))
+                        }
+                    }
+                }
+                ProviderCustomTypeValidation::Providerless if config.custom_types.is_partial() => {
+                    match validate_schema_custom_type_with_context(owned, value, config) {
+                        Ok(()) => Assignable,
+                        Err(
+                            error @ crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
+                        ) if owned
+                            .provider_names()
+                            .all(|owner| !config.custom_types.may_defer(Some(owner))) =>
+                        {
+                            Mismatch(custom_type_validation_mismatch(expected, value, error))
+                        }
                         Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded) => {
                             deferred_provider_check(expected, value)
                         }
@@ -711,7 +822,16 @@ fn inferred_value_check<P: PlaceholderKind, B: BindingAddress>(
         crate::schema::TypeAssignability::Mismatch => {
             TypeExprValueCheck::Mismatch(mismatch(expected, value))
         }
-        crate::schema::TypeAssignability::Unchecked(_) => deferred_provider_check(expected, value),
+        crate::schema::TypeAssignability::Unchecked(evidence) => {
+            TypeExprValueCheck::Deferred(TypeExprValueDeferral {
+                path: Vec::new(),
+                expected: Box::new(expected.clone()),
+                actual: Box::new(ValueDescription::of(value)),
+                reason: crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
+                provider_types: evidence.into_types().collect(),
+                additional: Vec::new(),
+            })
+        }
     }
 }
 
@@ -794,13 +914,16 @@ fn inferred_type_assignment(
         (Some(actual), Some(expected)) => crate::schema::TypeInSchema::schemaless(&actual)
             .assignment_to(crate::schema::TypeInSchema::schemaless(&expected)),
         (None, _) | (_, None) => crate::schema::TypeAssignability::Unchecked(
-            crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
+            crate::schema::TypeAssignmentDeferral::new(actual.clone()),
         ),
     }
 }
 
+#[cfg(test)]
 fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
-    inferred_type_assignment(expected, actual).allow_unchecked()
+    inferred_type_assignment(expected, actual)
+        .require_loaded()
+        .unwrap_or(false)
 }
 
 /// Directional compatibility for a declared source flowing into a declared sink.
@@ -1540,7 +1663,11 @@ mod tests {
         let checked_identity = identity.clone();
         let config = ProviderContext {
             custom_types: crate::parser::ProviderCustomTypes::loaded(
-                Default::default(),
+                std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                    "test",
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::String,
+                )]),
                 Box::new(move |target, value| {
                     if target.identity() != &checked_identity {
                         return Ok(());
@@ -1605,10 +1732,8 @@ mod tests {
             check_with_config(&schema_type, &canonical, &config).is_ok(),
             "canonical enum should satisfy {schema_type}"
         );
-        for expected in [
-            TypeExpr::Ref(ResourceTypePath::new("test", "network")),
-            TypeExpr::DottedUnresolved(ResourceTypePath::new("test", "network.Id")),
-        ] {
+        {
+            let expected = TypeExpr::Ref(ResourceTypePath::new("test", "network"));
             assert!(
                 check_with_config(&expected, &raw, &config).is_err(),
                 "bare enum identifier must not satisfy {expected}"
@@ -1622,6 +1747,13 @@ mod tests {
                 "canonical enum should satisfy {expected}"
             );
         }
+        let dotted = TypeExpr::DottedUnresolved(ResourceTypePath::new("test", "network.Id"));
+        assert!(check_with_config(&dotted, &raw, &config).is_ok());
+        assert!(check_with_config(&dotted, &canonical, &config).is_ok());
+        assert!(
+            check_with_config(&dotted, &qualified, &config).is_err(),
+            "a loaded custom type must run its validator rather than pass as an unchecked handle"
+        );
     }
 
     #[test]

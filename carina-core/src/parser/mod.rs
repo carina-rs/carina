@@ -3,6 +3,7 @@
 //! Convert DSL to AST using pest
 
 mod ast;
+pub(crate) use ast::ParserSeedMetadata;
 mod blocks;
 mod config;
 mod context;

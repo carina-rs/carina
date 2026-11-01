@@ -9,7 +9,36 @@ use crate::parser::CustomTypeValidationError;
 pub enum TypeAssignability {
     Assignable,
     Mismatch,
-    Unchecked(CustomTypeValidationError),
+    Unchecked(TypeAssignmentDeferral),
+}
+
+/// The actual annotation identities whose scalar evidence is missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeAssignmentDeferral {
+    first: crate::parser::TypeExpr,
+    additional: Vec<crate::parser::TypeExpr>,
+}
+
+impl TypeAssignmentDeferral {
+    pub(crate) fn new(expected: crate::parser::TypeExpr) -> Self {
+        Self {
+            first: expected,
+            additional: Vec::new(),
+        }
+    }
+    fn merge(mut self, other: Self) -> Self {
+        self.additional.push(other.first);
+        self.additional.extend(other.additional);
+        self
+    }
+    pub(crate) fn into_types(self) -> impl Iterator<Item = crate::parser::TypeExpr> {
+        std::iter::once(self.first).chain(self.additional)
+    }
+    fn record(self, sink: &crate::validation::deferred_types::ProviderTypeCheckRecorder) {
+        for expected in self.into_types() {
+            sink.record_type(&expected, "assignment");
+        }
+    }
 }
 
 impl TypeAssignability {
@@ -18,14 +47,21 @@ impl TypeAssignability {
         match self {
             Self::Assignable => Ok(true),
             Self::Mismatch => Ok(false),
-            Self::Unchecked(reason) => Err(reason),
+            Self::Unchecked(_) => Err(CustomTypeValidationError::ProvidersNotLoaded),
         }
     }
 
-    /// Bootstrap/editor consumers explicitly permit missing scalar evidence.
-    pub fn allow_unchecked(self) -> bool {
+    /// Record missing evidence before permitting a provisional assignment.
+    pub fn record_unchecked(
+        self,
+        sink: &crate::validation::deferred_types::ProviderTypeCheckRecorder,
+    ) -> bool {
         match self {
-            Self::Assignable | Self::Unchecked(_) => true,
+            Self::Assignable => true,
+            Self::Unchecked(evidence) => {
+                evidence.record(sink);
+                true
+            }
             Self::Mismatch => false,
         }
     }
@@ -35,7 +71,12 @@ impl TypeAssignability {
         for next in results {
             match next {
                 Self::Mismatch => return Self::Mismatch,
-                Self::Unchecked(reason) => result = Self::Unchecked(reason),
+                Self::Unchecked(evidence) => {
+                    result = Self::Unchecked(match result {
+                        Self::Unchecked(previous) => previous.merge(evidence),
+                        Self::Assignable | Self::Mismatch => evidence,
+                    })
+                }
                 Self::Assignable => {}
             }
         }
@@ -47,7 +88,12 @@ impl TypeAssignability {
         for next in results {
             match next {
                 Self::Assignable => return Self::Assignable,
-                Self::Unchecked(reason) => result = Self::Unchecked(reason),
+                Self::Unchecked(evidence) => {
+                    result = Self::Unchecked(match result {
+                        Self::Unchecked(previous) => previous.merge(evidence),
+                        Self::Assignable | Self::Mismatch => evidence,
+                    })
+                }
                 Self::Mismatch => {}
             }
         }
@@ -114,7 +160,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     left.assignment_on_paths(member.in_schema(sink.defs), source_refs, sink_refs)
                 }))
             }
-            (UnloadedSchemaType(_), _) | (_, UnloadedSchemaType(_)) => {
+            (UnloadedSchemaType(unloaded), _) | (_, UnloadedSchemaType(unloaded)) => {
                 match (identity(&source.attr.kind), identity(&target.attr.kind)) {
                     (Some(left), Some(right)) => {
                         if left.assignable_to(right) {
@@ -124,7 +170,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                         }
                     }
                     (None, Some(_)) => Mismatch,
-                    (_, None) => Unchecked(CustomTypeValidationError::ProvidersNotLoaded),
+                    (_, None) => Unchecked(TypeAssignmentDeferral::new(
+                        crate::parser::TypeExpr::UnloadedSchemaType(unloaded.clone()),
+                    )),
                 }
             }
             (
@@ -205,13 +253,16 @@ mod tests {
             (TypeAssignability::Mismatch, false),
         ] {
             assert_eq!(assignment.clone().require_loaded(), Ok(expected));
-            assert_eq!(assignment.allow_unchecked(), expected);
+            assert_eq!(assignment.record_unchecked(&Default::default()), expected);
         }
-        let unchecked = TypeAssignability::Unchecked(CustomTypeValidationError::ProvidersNotLoaded);
+        let unchecked = TypeAssignability::Unchecked(TypeAssignmentDeferral::new(
+            crate::parser::parse_type_expr_str("Arn", &crate::parser::ProviderContext::default())
+                .unwrap(),
+        ));
         assert_eq!(
             unchecked.clone().require_loaded(),
             Err(CustomTypeValidationError::ProvidersNotLoaded)
         );
-        assert!(unchecked.allow_unchecked());
+        assert!(unchecked.record_unchecked(&Default::default()));
     }
 }

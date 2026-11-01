@@ -823,7 +823,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         if self.provider_context.custom_types_loaded() {
             assignment.require_loaded()
         } else {
-            Ok(assignment.allow_unchecked())
+            Ok(assignment.record_unchecked(self.provider_context.type_checks()))
         }
     }
 

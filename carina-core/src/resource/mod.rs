@@ -5499,6 +5499,14 @@ impl std::fmt::Display for ParserPlaceholder {
     }
 }
 
+/// The authority that can establish a parser/template placeholder's type.
+#[doc(hidden)]
+pub enum PlaceholderTypeAuthority<'a> {
+    Binding(&'a str),
+    AwaitingSubstitution,
+    MissingExpression,
+}
+
 /// Internal behavior shared by the three stage marker types.
 #[doc(hidden)]
 pub trait PlaceholderKind:
@@ -5508,10 +5516,7 @@ pub trait PlaceholderKind:
         None
     }
 
-    /// Lexical binding whose declared type can prove this parser slot's type.
-    fn inference_binding_name(&self) -> Option<&str> {
-        self.module_argument_name()
-    }
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_>;
 
     fn loop_slot(&self) -> Option<LoopSlot> {
         None
@@ -5538,7 +5543,11 @@ pub trait PlaceholderKind:
     }
 }
 
-impl PlaceholderKind for NoPlaceholder {}
+impl PlaceholderKind for NoPlaceholder {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
+        match *self {}
+    }
+}
 
 impl fmt::Display for NoPlaceholder {
     fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -5557,6 +5566,10 @@ impl fmt::Display for LoopSlot {
 }
 
 impl PlaceholderKind for LoopSlot {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
+        PlaceholderTypeAuthority::AwaitingSubstitution
+    }
+
     fn loop_slot(&self) -> Option<LoopSlot> {
         Some(*self)
     }
@@ -5585,12 +5598,13 @@ impl PlaceholderKind for ParserPlaceholder {
         }
     }
 
-    fn inference_binding_name(&self) -> Option<&str> {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
         match self {
             Self::FnParam { name } | Self::FnLocal { name } | Self::ModuleArgument { name, .. } => {
-                Some(name)
+                PlaceholderTypeAuthority::Binding(name)
             }
-            Self::Loop(_) | Self::EmptyInterpolation { .. } => None,
+            Self::Loop(_) => PlaceholderTypeAuthority::AwaitingSubstitution,
+            Self::EmptyInterpolation { .. } => PlaceholderTypeAuthority::MissingExpression,
         }
     }
 

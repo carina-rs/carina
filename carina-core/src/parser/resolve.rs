@@ -969,7 +969,7 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
     structural: &HashSet<&'a str>,
     module_parameters: &HashSet<&'a str>,
     variables: &'a IndexMap<String, Value>,
-    metadata: &'a super::ast::ParserBindingMetadata,
+    metadata: &'a impl super::ast::BindingSeedMetadata,
 ) -> Vec<BindingSeed<'a>> {
     let mut names: Vec<&'a str> = structural.iter().copied().collect();
     names.extend(variables.keys().map(String::as_str));

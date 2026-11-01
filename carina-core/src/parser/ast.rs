@@ -3223,6 +3223,7 @@ impl UseStatement {
 pub struct FnParam<B: BindingAddress = RelativeBindingName> {
     pub name: String,
     pub param_type: Option<TypeExpr>,
+    pub type_span: Option<SourceSpan>,
     pub default: Option<Value<ParserPlaceholder, B>>,
 }
 
@@ -3243,6 +3244,9 @@ pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
     pub params: Vec<FnParam<B>>,
     /// Optional return type annotation
     pub return_type: Option<TypeExpr>,
+    pub return_type_span: Option<SourceSpan>,
+    /// Authored owner of parameter and return annotations, including orphan documents.
+    pub annotation_source_file: Option<PathBuf>,
     /// Local let bindings inside the function body (name, expression)
     pub local_lets: Vec<(String, Value<ParserPlaceholder, B>, usize)>,
     /// The body of the function
@@ -3262,10 +3266,13 @@ impl<B: BindingAddress> UserFunction<B> {
                 .map(|param| FnParam {
                     name: param.name,
                     param_type: param.param_type,
+                    type_span: param.type_span,
                     default: param.default.map(|value| value.map_bindings(map)),
                 })
                 .collect(),
             return_type: self.return_type,
+            return_type_span: self.return_type_span,
+            annotation_source_file: self.annotation_source_file,
             local_lets: self
                 .local_lets
                 .into_iter()
@@ -4435,6 +4442,64 @@ pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
     pending_function_type_checks: Vec<PendingFunctionTypeCheck<B>>,
 }
 
+/// Only lexical seed data participates in the directory fixed point.
+/// Pending checks belong to the final pass's file, never to a seed snapshot.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct ParserSeedMetadata {
+    structural_handles: IndexMap<RelativeBindingName, StructuralHandle>,
+    structural_aliases: IndexMap<RelativeBindingName, StructuralHandle>,
+    value_structural_handles: IndexMap<RelativeBindingName, StructuralHandleMetadata>,
+}
+
+pub(crate) trait BindingSeedMetadata {
+    fn structural_handles(&self) -> &IndexMap<RelativeBindingName, StructuralHandle>;
+    fn structural_aliases(&self) -> &IndexMap<RelativeBindingName, StructuralHandle>;
+    fn value_structural_handles_by_name(&self, name: &str) -> Option<&StructuralHandleMetadata>;
+}
+
+impl BindingSeedMetadata for ParserBindingMetadata {
+    fn structural_handles(&self) -> &IndexMap<RelativeBindingName, StructuralHandle> {
+        &self.structural_handles
+    }
+    fn structural_aliases(&self) -> &IndexMap<RelativeBindingName, StructuralHandle> {
+        &self.structural_aliases
+    }
+    fn value_structural_handles_by_name(&self, name: &str) -> Option<&StructuralHandleMetadata> {
+        self.value_structural_handles.get(name)
+    }
+}
+
+impl BindingSeedMetadata for ParserSeedMetadata {
+    fn structural_handles(&self) -> &IndexMap<RelativeBindingName, StructuralHandle> {
+        &self.structural_handles
+    }
+    fn structural_aliases(&self) -> &IndexMap<RelativeBindingName, StructuralHandle> {
+        &self.structural_aliases
+    }
+    fn value_structural_handles_by_name(&self, name: &str) -> Option<&StructuralHandleMetadata> {
+        self.value_structural_handles.get(name)
+    }
+}
+
+impl ParserSeedMetadata {
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.structural_handles.extend(other.structural_handles);
+        self.structural_aliases.extend(other.structural_aliases);
+        self.value_structural_handles
+            .extend(other.value_structural_handles);
+    }
+}
+
+impl ParserBindingMetadata {
+    pub(crate) fn binding_seed_snapshot(&self) -> ParserSeedMetadata {
+        ParserSeedMetadata {
+            structural_handles: self.structural_handles.clone(),
+            structural_aliases: self.structural_aliases.clone(),
+            value_structural_handles: self.value_structural_handles.clone(),
+        }
+    }
+}
+
 impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
     fn default() -> Self {
         Self {
@@ -4466,10 +4531,6 @@ pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingNa
 impl<B: BindingAddress> ParserBindingMetadata<B> {
     pub(crate) fn structural_handles(&self) -> &IndexMap<B, StructuralHandle<B>> {
         &self.structural_handles
-    }
-
-    pub(crate) fn structural_aliases(&self) -> &IndexMap<B, StructuralHandle<B>> {
-        &self.structural_aliases
     }
 
     pub(crate) fn insert_resource_source_file(&mut self, id: ResourceId, path: PathBuf) {
@@ -4588,10 +4649,6 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
         }
     }
 
-    pub(crate) fn clear_pending_function_type_checks(&mut self) {
-        self.pending_function_type_checks.clear();
-    }
-
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&B) -> bool) {
         self.structural_handles.retain(|name, _| keep(name));
         self.structural_aliases.retain(|name, _| keep(name));
@@ -4633,13 +4690,6 @@ impl ParserBindingMetadata<RelativeBindingName> {
     ) {
         self.structural_aliases
             .insert(RelativeBindingName::new(name), handle);
-    }
-
-    pub(crate) fn value_structural_handles_by_name(
-        &self,
-        name: &str,
-    ) -> Option<&StructuralHandleMetadata<RelativeBindingName>> {
-        self.value_structural_handles.get(name)
     }
 
     pub(crate) fn insert_value_structural_handles(
@@ -8288,6 +8338,8 @@ mod substitute_placeholder_tests {
                 name: "function_name".to_string(),
                 params: Vec::new(),
                 return_type: None,
+                return_type_span: None,
+                annotation_source_file: None,
                 local_lets: Vec::new(),
                 body: UserFunctionBody {
                     value: Value::Concrete(ConcreteValue::Int(1)),

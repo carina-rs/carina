@@ -43,10 +43,13 @@ pub(super) fn parse_fn_def(
                     .to_string();
                 // Parse optional type annotation (: type_expr)
                 let mut param_type = None;
+                let mut type_span = None;
                 let mut default = None;
                 for remaining in param_inner {
                     match remaining.as_rule() {
                         Rule::type_expr => {
+                            type_span =
+                                Some(super::SourceSpan::from_pest(&remaining, preprocessed_file));
                             param_type = Some(parse_type_expr(
                                 remaining,
                                 ctx.config,
@@ -75,6 +78,7 @@ pub(super) fn parse_fn_def(
                 params.push(FnParam {
                     name: param_name,
                     param_type,
+                    type_span,
                     default,
                 });
             }
@@ -85,7 +89,9 @@ pub(super) fn parse_fn_def(
     };
 
     // Parse optional return type annotation (: type_expr)
+    let mut return_type_span = None;
     let (return_type, body_pair) = if next_token.as_rule() == Rule::type_expr {
+        return_type_span = Some(super::SourceSpan::from_pest(&next_token, preprocessed_file));
         let rt = parse_type_expr(next_token, ctx.config, warnings, Some(preprocessed_file))?;
         let bp = next_pair(&mut inner, "fn_body", "fn_def")?;
         (Some(rt), bp)
@@ -158,6 +164,8 @@ pub(super) fn parse_fn_def(
         name,
         params,
         return_type,
+        return_type_span,
+        annotation_source_file: Some(ctx.source_file().to_path_buf()),
         local_lets,
         body,
     })
@@ -234,7 +242,15 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
         };
         // Type-check if the parameter has a type annotation
         if let Some(ref type_expr) = param.param_type {
-            match check_fn_arg_type(fn_name, &param.name, type_expr, &argument, ctx, call_line)? {
+            match check_fn_arg_type(
+                fn_name,
+                &param.name,
+                type_expr,
+                &argument,
+                ctx,
+                call_line,
+                None,
+            )? {
                 FunctionArgumentTypeCheck::Complete => {}
                 FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded => {
                     has_deferred_type_check = true;
@@ -694,6 +710,7 @@ fn check_fn_arg_type<Source: Clone>(
     argument: &FunctionArgument,
     ctx: &ParseContext<'_, Source>,
     call_line: usize,
+    site: Option<crate::validation::deferred_types::ProviderTypeCheckSite>,
 ) -> Result<FunctionArgumentTypeCheck, ParseError> {
     if argument.pending_parameter().is_some() {
         return Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded);
@@ -707,6 +724,9 @@ fn check_fn_arg_type<Source: Clone>(
         match crate::validation::resolve_parameter_type_for_check(type_expr, ctx.config) {
             Ok(Some(resolved)) => resolved,
             Ok(None) => {
+                if let Some(site) = site {
+                    ctx.config.type_checks().record(type_expr, site);
+                }
                 return Ok(if argument.handle().is_some() {
                     FunctionArgumentTypeCheck::DeferredHandleAnnotation
                 } else {
@@ -742,13 +762,14 @@ fn check_fn_arg_type<Source: Clone>(
         provider_context,
         crate::validation::typecheck::TypecheckInference::Unavailable,
     );
-    finish_function_type_check(check, provider_context)
+    finish_function_type_check(check, provider_context, site)
         .map_err(|mismatch| function_argument_type_error(fn_name, param_name, mismatch))
 }
 
 fn finish_function_type_check(
     check: crate::validation::typecheck::TypeExprValueCheck,
     provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
+    site: Option<crate::validation::deferred_types::ProviderTypeCheckSite>,
 ) -> Result<FunctionArgumentTypeCheck, crate::validation::typecheck::TypeExprValueError> {
     use crate::validation::typecheck::TypeExprValueCheck;
     match check {
@@ -761,7 +782,12 @@ fn finish_function_type_check(
                 .require_provider_schemas()
                 .map(|()| FunctionArgumentTypeCheck::Complete)
         }
-        TypeExprValueCheck::Deferred(_) => {
+        deferred @ TypeExprValueCheck::Deferred(_) => {
+            let recorder = provider_context.as_provider_context().type_checks();
+            match site {
+                Some(site) => deferred.record_at(recorder, site)?,
+                None => deferred.record_deferred(recorder)?,
+            }
             Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded)
         }
     }
@@ -873,6 +899,20 @@ pub(crate) fn validate_pending_function_type_check<Source: Clone>(
             argument,
             ctx,
             check.source_line,
+            Some(
+                crate::validation::deferred_types::ProviderTypeCheckSite::at_line(
+                    check
+                        .source_file
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new("<config>")),
+                    check.source_line,
+                    check.source_column.unwrap_or(1),
+                    format!(
+                        "function '{}' parameter '{}'",
+                        function.name, parameter.name
+                    ),
+                ),
+            ),
         );
         match result {
             Ok(FunctionArgumentTypeCheck::Complete)
@@ -910,7 +950,7 @@ fn check_fn_return_type(
         config,
         crate::validation::typecheck::TypecheckInference::Unavailable,
     );
-    finish_function_type_check(check, config)
+    finish_function_type_check(check, config, None)
         .map_err(|mismatch| function_return_type_error(fn_name, mismatch))
 }
 

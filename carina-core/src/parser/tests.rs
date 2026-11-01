@@ -1,3 +1,4 @@
+use super::ast::BindingSeedMetadata;
 use super::*;
 use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, ResolvedBindings};
 use crate::resolver::resolve_refs_for_plan;

@@ -1081,7 +1081,7 @@ pub(crate) fn merge_parsed_file<E, B: BindingAddress>(
 #[derive(Clone, PartialEq)]
 struct DirectorySeedState {
     variables: IndexMap<String, parser::ParsedValue>,
-    metadata: crate::parser::ParserBindingMetadata,
+    metadata: crate::parser::ParserSeedMetadata,
 }
 
 #[derive(Debug)]
@@ -1208,8 +1208,7 @@ pub(crate) fn parse_directory_files_located_from_root(
         .collect();
     parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
         .map_err(LocatedParseError::directory_wide)?;
-    let mut seed_metadata = pass1_union.parser_binding_metadata.clone();
-    seed_metadata.clear_pending_function_type_checks();
+    let seed_metadata = pass1_union.parser_binding_metadata.binding_seed_snapshot();
     let mut bindings_current = DirectorySeedState {
         variables: pass1_union.variables.clone(),
         metadata: seed_metadata,
@@ -1421,7 +1420,7 @@ fn parse_local_variable_union(
     user_functions: &HashMap<String, parser::UserFunction>,
 ) -> Result<DirectorySeedState, LocatedParseError> {
     let mut variables = IndexMap::new();
-    let mut metadata = crate::parser::ParserBindingMetadata::default();
+    let mut metadata = crate::parser::ParserSeedMetadata::default();
     for ((path, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
         let mut parsed = parser::parse_with_directory_context(
             content,
@@ -1438,11 +1437,8 @@ fn parse_local_variable_union(
         parsed
             .parser_binding_metadata
             .retain(|name| local_variables.contains(name.as_str()));
-        parsed
-            .parser_binding_metadata
-            .clear_pending_function_type_checks();
         variables.extend(parsed.variables);
-        metadata.extend(parsed.parser_binding_metadata);
+        metadata.extend(parsed.parser_binding_metadata.binding_seed_snapshot());
     }
     Ok(DirectorySeedState {
         variables,

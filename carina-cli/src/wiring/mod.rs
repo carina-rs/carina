@@ -748,21 +748,39 @@ impl NonEmptyValidationErrors {
     }
 }
 
-/// Validation outcome plus the read-only schemas used by warning-only checks.
+/// Terminal validation output. Construction consumes all provider-type evidence.
 pub(crate) struct ValidationReport<'a> {
-    result: Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
+    checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<
+        Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
+    >,
     schemas: &'a SchemaRegistry,
-    provider_type_warnings: Vec<carina_core::parser::ParseWarning>,
-    config_state: std::marker::PhantomData<TemplateConfig>,
 }
 
 impl<'a> ValidationReport<'a> {
-    pub(crate) fn provider_type_warnings(&self) -> &[carina_core::parser::ParseWarning] {
-        &self.provider_type_warnings
+    fn settle(
+        checks: carina_core::validation::deferred_types::DeferredProviderTypeChecks,
+        catalog: &carina_core::parser::ProviderContext,
+        result: Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
+        schemas: &'a SchemaRegistry,
+    ) -> Self {
+        Self {
+            checks: carina_core::validation::deferred_types::ProviderTypeCheckResult::settle(
+                checks, catalog, result,
+            ),
+            schemas,
+        }
     }
+
+    pub(crate) fn provider_type_warnings(&self) -> Vec<&carina_core::parser::ParseWarning> {
+        self.checks.diagnostics().iter().filter_map(|diagnostic| match diagnostic {
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => Some(warning),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(_) => None,
+        }).collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn errors(&self) -> &[AppError] {
-        match &self.result {
+        match self.checks.output() {
             Ok(_) => &[],
             Err(errors) => errors.as_slice(),
         }
@@ -770,7 +788,7 @@ impl<'a> ValidationReport<'a> {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_errors(self) -> Vec<AppError> {
-        match self.result {
+        match self.into_parts().0 {
             Ok(_) => Vec::new(),
             Err(errors) => errors.into_vec(),
         }
@@ -780,7 +798,7 @@ impl<'a> ValidationReport<'a> {
     pub(crate) fn into_result(
         self,
     ) -> Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors> {
-        self.result
+        self.into_parts().0
     }
 
     pub(crate) fn into_parts(
@@ -789,7 +807,17 @@ impl<'a> ValidationReport<'a> {
         Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
         &'a SchemaRegistry,
     ) {
-        (self.result, self.schemas)
+        let (mut result, diagnostics) = self.checks.into_parts();
+        for diagnostic in diagnostics {
+            if let carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) = diagnostic {
+                let error = AppError::Validation(error.message);
+                match &mut result {
+                    Err(errors) => errors.extend([error]),
+                    Ok(_) => result = Err(NonEmptyValidationErrors::try_from(vec![error]).expect("one settlement error")),
+                }
+            }
+        }
+        (result, self.schemas)
     }
 
     #[cfg(test)]
@@ -807,40 +835,62 @@ fn validation_report_from<'a>(
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> ValidationReport<'a> {
-    let provider_type_warnings = if !load_errors.is_empty()
-        || parsed.providers.iter().any(|provider| {
-            !context
-                .factories()
-                .iter()
-                .any(|factory| factory.name() == provider.name)
-        }) {
-        let mut warnings =
-            carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
-                parsed.parsed(),
-                carina_core::parser::ProviderContext::unloaded(),
-                &base_dir.join("main.crn"),
-            )
-            .report();
+    let failed_providers = context.unavailable_provider_kinds(&parsed.providers, load_errors);
+    if !failed_providers.is_empty() {
+        // The loaded subset remains strict, while missing owners remain non-authoritative.
+        // This very catalog supplies both the producers and settlement.
+        let loaded = context.provider_context();
+        let catalog = carina_core::parser::ProviderContext {
+            custom_types: loaded.custom_types.with_failed_providers(failed_providers),
+            resource_types: loaded.resource_types.clone(),
+            ..Default::default()
+        };
+        let mut root = parsed.parsed().clone();
+        let mut errors = partial_catalog_type_errors(&mut root, &catalog);
         let modules = crate::module_walk::ModuleWalk::load(parsed.parsed(), base_dir);
         for module in modules.iter() {
-            warnings.extend(
-                carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
-                    &module.loaded().parsed,
-                    carina_core::parser::ProviderContext::unloaded(),
-                    &module.module_path().join("main.crn"),
-                )
-                .report(),
-            );
+            errors.extend(partial_catalog_type_errors(
+                &mut module.loaded().parsed.clone(),
+                &catalog,
+            ));
         }
-        warnings
-    } else {
-        Vec::new()
-    };
+        if let Err(message) =
+            carina_core::validation::validate_no_backend_in_module(parsed.parsed())
+        {
+            errors.push(AppError::Validation(message));
+        } else if let Err(message) =
+            carina_core::validation::validate_no_arguments_in_root(parsed.parsed())
+        {
+            errors.push(AppError::Validation(message));
+        }
+        errors.extend(sorted_provider_load_errors(load_errors));
+        for provider in &parsed.providers {
+            if provider.is_default()
+                && !context.known_providers.contains(&provider.name)
+                && !load_errors.contains_key(&provider.name)
+            {
+                errors.push(AppError::Validation(if provider.source.is_none() {
+                    crate::commands::missing_provider_source_message(&provider.name)
+                } else {
+                    format!("Provider '{}' schemas are unavailable", provider.name)
+                }));
+            }
+        }
+        return ValidationReport::settle(
+            catalog.type_checks().take(),
+            &catalog,
+            Err(NonEmptyValidationErrors::try_from(errors)
+                .expect("an incomplete provider catalog always has a load finding")),
+            context.schemas(),
+        );
+    }
+    let catalog = context.provider_context().type_check_session();
     let result = match crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
         parsed.clone(),
         base_dir,
         context,
+        &catalog,
         load_errors,
         skip_resource_validation,
         duplicate_declarations,
@@ -852,12 +902,36 @@ fn validation_report_from<'a>(
         }
         Err(errors) => Err(errors),
     };
-    ValidationReport {
+    ValidationReport::settle(
+        catalog.type_checks().take(),
+        &catalog,
         result,
-        schemas: context.schemas(),
-        provider_type_warnings,
-        config_state: std::marker::PhantomData,
+        context.schemas(),
+    )
+}
+
+/// Run the ordinary declaration/value producers with incomplete provider authority.
+fn partial_catalog_type_errors<E: carina_core::parser::ExportParamLike>(
+    parsed: &mut carina_core::parser::File<E>,
+    catalog: &carina_core::parser::ProviderContext,
+) -> Vec<AppError> {
+    let mut errors = carina_core::validation::resolve_file_type_exprs(parsed, catalog)
+        .into_iter()
+        .map(|error| AppError::TypeResolution(Box::new(error)))
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
+        return errors;
     }
+    if let Err(error) = carina_core::validation::validate_attribute_params_with_context(
+        &parsed.attribute_params,
+        catalog,
+    ) {
+        errors.push(AppError::Validation(error));
+    }
+    if let Err(error) = carina_core::parser::resolve_resource_refs_with_config(parsed, catalog) {
+        errors.push(AppError::Config(error.to_string()));
+    }
+    errors
 }
 
 fn sorted_provider_load_errors(load_errors: &HashMap<String, String>) -> Vec<AppError> {
@@ -882,16 +956,59 @@ fn resolve_config_pair_errors_with_context(
     ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam>,
     NonEmptyValidationErrors,
 > {
-    match crate::commands::validate_and_resolve_errors_inner(
+    if !context
+        .unavailable_provider_kinds(&parsed.providers, load_errors)
+        .is_empty()
+    {
+        let report = validation_report_from(
+            context,
+            load_errors,
+            &parsed,
+            base_dir,
+            skip_resource_validation,
+            duplicate_declarations,
+        );
+        for warning in report.provider_type_warnings() {
+            crate::commands::validate::print_provider_type_warning(warning);
+        }
+        let (result, schemas) = report.into_parts();
+        debug_assert_eq!(schemas.len(), context.schemas().len());
+        return Err(result.expect_err("an incomplete catalog cannot validate an executable pair"));
+    }
+    let catalog = context.provider_context().type_check_session();
+    let result = crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
         parsed,
         base_dir,
         context,
+        &catalog,
         load_errors,
         skip_resource_validation,
         duplicate_declarations,
         crate::commands::ConfigNameResolution::Paired(Box::new(unresolved)),
-    )? {
+    );
+    let terminal = carina_core::validation::deferred_types::ProviderTypeCheckResult::settle(
+        catalog.type_checks().take(),
+        &catalog,
+        result,
+    );
+    let (mut result, diagnostics) = terminal.into_parts();
+    for diagnostic in diagnostics {
+        let warning = match diagnostic {
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => { crate::commands::validate::print_provider_type_warning(&warning); continue; }
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => error,
+        };
+        let error = AppError::Validation(warning.message);
+        match &mut result {
+            Err(errors) => errors.extend([error]),
+            Ok(_) => {
+                result =
+                    Err(NonEmptyValidationErrors::try_from(vec![error])
+                        .expect("one settlement error"))
+            }
+        }
+    }
+    match result? {
         crate::commands::ResolvedConfig::Paired { resources } => Ok(*resources),
         crate::commands::ResolvedConfig::Evaluated { .. } => {
             unreachable!("paired validation returned evaluated-only")
@@ -1072,12 +1189,7 @@ impl ProviderLoad {
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig<ExpandedInferredFile>, AppError> {
-        let ValidationReport {
-            result,
-            schemas: _,
-            provider_type_warnings: _,
-            config_state: _,
-        } = validation_report_from(
+        let report = validation_report_from(
             &self.context,
             &self.load_errors,
             &parsed,
@@ -1085,22 +1197,17 @@ impl ProviderLoad {
             skip_resource_validation,
             duplicate_declarations,
         );
+        for warning in report.provider_type_warnings() {
+            crate::commands::validate::print_provider_type_warning(warning);
+        }
+        let (result, schemas) = report.into_parts();
+        debug_assert_eq!(schemas.len(), self.context.schemas().len());
         let parsed = match result {
             Ok(parsed) => parsed,
-            Err(mut errors) => {
-                if skip_resource_validation {
-                    errors.extend(sorted_provider_load_errors(&self.load_errors));
-                }
+            Err(errors) => {
                 return Err(crate::commands::collapse_errors(errors.into_vec()));
             }
         };
-        // The resource-skipping pipeline omits provider-load diagnostics.
-        if skip_resource_validation {
-            let errors = sorted_provider_load_errors(&self.load_errors);
-            if !errors.is_empty() {
-                return Err(crate::commands::collapse_errors(errors));
-            }
-        }
         require_expanded_config(&parsed, base_dir)?;
         let parsed = resolve_file_binding_uses(parsed, base_dir, &self.context)?;
 
@@ -1133,22 +1240,8 @@ impl ProviderLoad {
             skip_resource_validation,
             duplicate_declarations,
         ) {
-            Ok(canonical_resources) => {
-                let load_errors = if skip_resource_validation {
-                    sorted_provider_load_errors(&self.load_errors)
-                } else {
-                    Vec::new()
-                };
-                if !load_errors.is_empty() {
-                    return Err(crate::commands::collapse_errors(load_errors));
-                }
-                canonical_resources
-            }
-            Err(mut errors) => {
-                // Keep validation findings ahead of the provider-load causes.
-                if skip_resource_validation {
-                    errors.extend(sorted_provider_load_errors(&self.load_errors));
-                }
+            Ok(canonical_resources) => canonical_resources,
+            Err(errors) => {
                 return Err(crate::commands::collapse_errors(errors.into_vec()));
             }
         };
@@ -1321,6 +1414,43 @@ impl ReportingProviderLoad {
 
     pub(crate) fn schemas(&self) -> &SchemaRegistry {
         self.context.schemas()
+    }
+
+    pub(crate) fn reporting_catalog<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        providers: &[carina_core::parser::ProviderConfig<P, B>],
+    ) -> carina_core::parser::ProviderContext {
+        let loaded = self.context.provider_context();
+        let failed = self
+            .context
+            .unavailable_provider_kinds(providers, &self.load_errors);
+        carina_core::parser::ProviderContext {
+            custom_types: loaded.custom_types.with_failed_providers(failed),
+            resource_types: loaded.resource_types.clone(),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn load_findings<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        providers: &[ProviderConfig<P, B>],
+    ) -> Vec<AppError> {
+        let mut errors = sorted_provider_load_errors(&self.load_errors);
+        let missing = providers
+            .iter()
+            .filter(|provider| {
+                provider.is_default()
+                    && !self.context.known_providers.contains(&provider.name)
+                    && !self.load_errors.contains_key(&provider.name)
+            })
+            .map(|provider| provider.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for provider in missing {
+            errors.push(AppError::Validation(format!(
+                "Provider '{provider}' schemas are unavailable"
+            )));
+        }
+        errors
     }
 
     pub(crate) fn loaded_provider_context(
@@ -2172,6 +2302,24 @@ impl WiringContext {
 
     pub fn known_providers(&self) -> &HashSet<String> {
         &self.known_providers
+    }
+
+    fn unavailable_provider_kinds<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        providers: &[ProviderConfig<P, B>],
+        load_errors: &HashMap<String, String>,
+    ) -> BTreeSet<String> {
+        // Only kind-level declarations request a plugin. A named instance
+        // inherits its kind's factory and does not itself imply a load attempt
+        // (or a missing-source error) when no kind default was declared.
+        providers
+            .iter()
+            .filter(|provider| {
+                provider.is_default() && !self.known_providers.contains(&provider.name)
+            })
+            .map(|provider| provider.name.clone())
+            .chain(load_errors.keys().cloned())
+            .collect()
     }
 
     pub fn provider_artifacts(&self) -> &BTreeMap<String, LoadedProviderArtifact> {

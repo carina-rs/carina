@@ -3302,6 +3302,8 @@ mod tests {
             name: "fixture".to_string(),
             params: Vec::new(),
             return_type: None,
+            return_type_span: None,
+            annotation_source_file: None,
             local_lets: Vec::new(),
             body: crate::parser::UserFunctionBody {
                 value: Value::Concrete(ConcreteValue::Int(1)),

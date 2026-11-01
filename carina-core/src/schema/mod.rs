@@ -223,7 +223,7 @@ mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 
-pub use assignability::TypeAssignability;
+pub use assignability::{TypeAssignability, TypeAssignmentDeferral};
 pub use carina_provider_protocol::types::{
     DslTransform, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };

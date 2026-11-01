@@ -126,6 +126,11 @@ pub enum NotInferableReason {
     NonInferableBinding { binding: String },
     #[error("schema is unavailable for binding `{binding}`")]
     SchemaUnavailable { binding: String },
+    /// The parser slot has not yet been substituted and no declaration in the
+    /// current inference scope establishes its type. This is unavailable
+    /// authority, not evidence of an invalid type or invalid postfix access.
+    #[error("type authority is unavailable for parser placeholder `{placeholder}`")]
+    PlaceholderTypeUnavailable { placeholder: String },
     #[error("provider schema is unavailable for type `{identity}`")]
     CustomTypeSchemaUnavailable {
         identity: crate::schema::TypeIdentity,

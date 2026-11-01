@@ -121,14 +121,10 @@ pub enum ResidualModuleResolutionDiagnostic<'a> {
 }
 
 impl ResidualModuleResolutionError {
-    fn new(
-        error: ModuleError,
-        findings: &[crate::validation::ModuleCallFinding],
-        config: &ProviderContext,
-    ) -> Option<Self> {
+    fn new(error: ModuleError, findings: &[crate::validation::ModuleCallFinding]) -> Option<Self> {
         let error = without_covered_reference_type_members(error, findings)?;
         let residual = Self(Box::new(error));
-        (!residual.is_covered_by(findings, config)).then_some(residual)
+        (!residual.is_covered_by(findings)).then_some(residual)
     }
 
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
@@ -247,11 +243,7 @@ impl ResidualModuleResolutionError {
         }
     }
 
-    fn is_covered_by(
-        &self,
-        findings: &[crate::validation::ModuleCallFinding],
-        config: &ProviderContext,
-    ) -> bool {
+    fn is_covered_by(&self, findings: &[crate::validation::ModuleCallFinding]) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
             ModuleError::WithProviderTypeWarnings { .. } => {
@@ -308,7 +300,6 @@ impl ResidualModuleResolutionError {
             ModuleError::Parse(error) => match error {
                 ParseError::Located { path, error } => {
                     crate::validation::type_resolution_parser_error_is_covered(
-                        config,
                         findings
                             .iter()
                             .filter_map(|finding| finding.message().type_resolution_diagnostic()),
@@ -393,7 +384,6 @@ impl ResidualModuleResolutionError {
             },
             ModuleError::ParseInFile { path, error } => {
                 crate::validation::type_resolution_parser_error_is_covered(
-                    config,
                     findings
                         .iter()
                         .filter_map(|finding| finding.message().type_resolution_diagnostic()),
@@ -648,7 +638,7 @@ mod diagnostic_status_tests {
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
         assert!(
-            ResidualModuleResolutionError::new(error, &[], &provider_context).is_some(),
+            ResidualModuleResolutionError::new(error, &[]).is_some(),
             "a resolver error cannot be hidden before a concrete finding covers it",
         );
         let unrelated = ModuleError::MissingArgument {
@@ -657,7 +647,7 @@ mod diagnostic_status_tests {
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
         assert!(
-            ResidualModuleResolutionError::new(unrelated, &findings, &provider_context).is_some(),
+            ResidualModuleResolutionError::new(unrelated, &findings).is_some(),
             "a finding for another argument must not claim this resolver error",
         );
         let covered = ModuleError::MissingArgument {
@@ -666,7 +656,7 @@ mod diagnostic_status_tests {
         }
         .with_failing_call(parsed.module_calls[0].id().clone());
         assert!(
-            ResidualModuleResolutionError::new(covered, &findings, &provider_context).is_none(),
+            ResidualModuleResolutionError::new(covered, &findings).is_none(),
             "the exact call-owner finding must cover the resolver backstop",
         );
     }
@@ -1140,11 +1130,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         // argument-dependent `if` must derive dependencies only after its
         // call-site branch is selected.
         merged.capture_template_dependency_values();
-        crate::validation::deferred_types::finalize_provider_type_checks(
-            &mut merged,
-            self.config(),
-            &dir_path.join("main.crn"),
-        );
 
         // Resolve references while the module's own binding namespace is still
         // intact. Besides folding module-local values, this records the direct
@@ -1306,6 +1291,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         parsed: &'parsed mut crate::parser::File<E>,
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
+        StrictTypeResolution::resolve_file_type_exprs(parsed, resolver.config())?;
         resolver
             .process_imports(&parsed.uses, &parsed.module_calls)
             .map_err(|error| {
@@ -1370,11 +1356,6 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Result<Self, ModuleError> {
-        crate::validation::deferred_types::finalize_provider_type_checks(
-            parsed,
-            config,
-            &base_dir.join("main.crn"),
-        );
         let mut resolver =
             ModuleResolver::<DeferredUpstreamTypeResolution>::for_providerless_upstream(
                 base_dir, config, schemas,
@@ -1522,11 +1503,6 @@ pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<Par
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let mut parsed = parsed.into_parsed();
-    crate::validation::deferred_types::finalize_provider_type_checks(
-        &mut parsed,
-        config,
-        &base_dir.join("main.crn"),
-    );
     let warnings = parsed
         .warnings
         .iter()
@@ -1567,11 +1543,6 @@ pub fn resolve_module_template_with_providerless_config<
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let mut parsed = parsed.into_parsed();
-    crate::validation::deferred_types::finalize_provider_type_checks(
-        &mut parsed,
-        config,
-        &base_dir.join("main.crn"),
-    );
     let warnings = parsed
         .warnings
         .iter()
@@ -1632,12 +1603,7 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlace
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
-    resolve_modules_with_diagnostics_and_resolver(
-        parsed.parsed(),
-        resolver,
-        config.as_provider_context(),
-        covered_findings,
-    )
+    resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
 }
 
 /// Editor/bootstrap diagnostic expansion with provider-owned value checks
@@ -1652,12 +1618,7 @@ pub fn resolve_modules_with_providerless_diagnostics<
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let resolver = ModuleResolver::with_providerless_constraint_reports(base_dir, config, schemas);
-    resolve_modules_with_diagnostics_and_resolver(
-        parsed.parsed(),
-        resolver,
-        config,
-        covered_findings,
-    )
+    resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
 }
 
 fn resolve_modules_with_diagnostics_and_resolver<
@@ -1665,15 +1626,9 @@ fn resolve_modules_with_diagnostics_and_resolver<
 >(
     parsed: &crate::parser::File<E>,
     mut resolver: ModuleResolver<'_, StrictTypeResolution>,
-    config: &ProviderContext,
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let mut graph = parsed.clone();
-    crate::validation::deferred_types::finalize_provider_type_checks(
-        &mut graph,
-        config,
-        &resolver.base_dir.join("main.crn"),
-    );
     let root = root_expansion_scope();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
     let mut contributions = Vec::new();
@@ -1707,7 +1662,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     let resolution_failed = !errors.is_empty();
     let errors = errors
         .into_iter()
-        .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings, config))
+        .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings))
         .collect::<Vec<_>>();
     if !findings.is_empty() {
         ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
@@ -2131,7 +2086,6 @@ mod type_resolution_policy_tests {
                 ),
             ),
             &[],
-            &ProviderContext::default(),
         )
         .expect("a non-call reference error remains residual");
 

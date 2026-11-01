@@ -437,8 +437,8 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     }
 
     /// Build the validation view used by bootstrap/editor callers that have
-    /// no loaded provider custom-type catalog. Structural checks still run,
-    /// while provider-owned leaves never reach the resolver.
+    /// an incomplete provider custom-type catalog. Structural checks and
+    /// successfully loaded owners remain strict; unavailable owners defer.
     pub fn new_providerless<E, D>(
         file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         schemas: &'a SchemaRegistry,
@@ -777,7 +777,7 @@ fn declared_value_assignable_to_sink(
             .require_loaded()
             .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))?
     } else {
-        assignment.allow_unchecked()
+        assignment.record_unchecked(config.type_checks())
     };
     if assignable {
         return Ok(());
@@ -1913,6 +1913,7 @@ pub fn check_deferred_access_type<B: BindingAddress>(
         ))
         | Err(crate::static_type::InferenceIssue::NotInferable(
             crate::static_type::NotInferableReason::MissingValue
+            | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
             | crate::static_type::NotInferableReason::NonInferableBinding { .. }
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. }
             | crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
@@ -4459,6 +4460,7 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         ))
         | Err(crate::static_type::InferenceIssue::NotInferable(
             crate::static_type::NotInferableReason::MissingValue
+            | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
             | crate::static_type::NotInferableReason::NonInferableBinding { .. }
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. }
             | crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
@@ -5015,6 +5017,9 @@ fn resolve_dotted_unresolved(
         return Ok(resolved);
     }
 
+    if config.custom_types.may_defer(Some(&path.provider)) {
+        return Ok(TypeExpr::DottedUnresolved(path.clone()));
+    }
     Err(unknown_type_resolution_error(&path.to_string(), config))
 }
 
@@ -5175,6 +5180,9 @@ pub fn resolve_parameter_type(
 ) -> Result<ResolvedParameterType, StaticTypeResolutionError> {
     match resolve_type_expr(ty, config)? {
         TypeExpr::Ref(path) => Ok(ResolvedParameterType::Handle(path)),
+        TypeExpr::DottedUnresolved(path) => {
+            Err(unknown_type_resolution_error(&path.to_string(), config))
+        }
         resolved @ (TypeExpr::String
         | TypeExpr::Bool
         | TypeExpr::Int
@@ -5184,7 +5192,6 @@ pub fn resolve_parameter_type(
         | TypeExpr::UnloadedSchemaType(_)
         | TypeExpr::List(_)
         | TypeExpr::Map(_)
-        | TypeExpr::DottedUnresolved(_)
         | TypeExpr::SchemaType { .. }
         | TypeExpr::Struct { .. }
         | TypeExpr::StringLiteral(_)
@@ -5192,18 +5199,21 @@ pub fn resolve_parameter_type(
     }
 }
 
-/// Resolve a parameter type when the provider catalog is authoritative.
-/// Bootstrap parsing deliberately defers an unresolved dotted annotation;
-/// the enriched validation pass repeats the check after schemas are loaded.
+/// Resolve a parameter type with the available catalog. An unavailable dotted
+/// annotation is neither a proven value type nor a proven resource handle.
+/// Record it while preserving that uncertainty for later substitution.
 pub fn resolve_parameter_type_for_check(
     ty: &TypeExpr,
     config: &ProviderContext,
 ) -> Result<Option<ResolvedParameterType>, StaticTypeResolutionError> {
-    match resolve_parameter_type(ty, config) {
-        Ok(resolved) => Ok(Some(resolved)),
-        Err(_error) if !config.custom_types_loaded() => Ok(None),
-        Err(error) => Err(error),
+    let resolved = resolve_type_expr(ty, config)?;
+    if matches!(resolved, TypeExpr::DottedUnresolved(_)) {
+        config
+            .type_checks()
+            .record_type(&resolved, "parameter annotation");
+        return Ok(None);
     }
+    resolve_parameter_type(&resolved, config).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -5365,14 +5375,12 @@ impl<'a> TypeResolutionParserError<'a> {
 /// The sole decision point for replacing a parser backstop with typed
 /// declaration diagnostics. Both resolver/CLI and LSP paths use this gate.
 pub(crate) fn type_resolution_parser_error_is_covered<'a>(
-    config: &ProviderContext,
     diagnostics: impl IntoIterator<Item = &'a TypeResolutionDiagnostic>,
     parser_error: TypeResolutionParserError<'_>,
 ) -> bool {
-    config.custom_types_loaded()
-        && diagnostics.into_iter().any(|diagnostic| {
-            diagnostic.covers_parser_error(parser_error.source_file, parser_error.error)
-        })
+    diagnostics.into_iter().any(|diagnostic| {
+        diagnostic.covers_parser_error(parser_error.source_file, parser_error.error)
+    })
 }
 
 /// Core-owned declaration-resolution outcome consumed by CLI and LSP.
@@ -5403,19 +5411,29 @@ impl FileTypeResolutionReport {
 fn resolve_declaration_type(
     ty: &mut TypeExpr,
     config: &ProviderContext,
+    site: &deferred_types::ProviderTypeCheckSite,
 ) -> Vec<TypeResolutionError> {
     match ty {
-        TypeExpr::List(inner) | TypeExpr::Map(inner) => resolve_declaration_type(inner, config),
+        TypeExpr::List(inner) | TypeExpr::Map(inner) => {
+            resolve_declaration_type(inner, config, site)
+        }
         TypeExpr::Union(members) => members
             .iter_mut()
-            .flat_map(|member| resolve_declaration_type(member, config))
+            .flat_map(|member| resolve_declaration_type(member, config, site))
             .collect(),
         TypeExpr::Struct { fields } => fields
             .iter_mut()
-            .flat_map(|(_, field)| resolve_declaration_type(field, config))
+            .flat_map(|(_, field)| resolve_declaration_type(field, config, site))
             .collect(),
         _ => match resolve_type_expr(ty, config) {
             Ok(resolved) => {
+                config.type_checks().declaration(&resolved, site.clone());
+                if matches!(
+                    resolved,
+                    TypeExpr::UnloadedSchemaType(_) | TypeExpr::DottedUnresolved(_)
+                ) {
+                    config.type_checks().record(&resolved, site.clone());
+                }
                 *ty = resolved;
                 Vec::new()
             }
@@ -5428,29 +5446,28 @@ fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike>(
     parsed: &mut crate::parser::File<E>,
     config: &ProviderContext,
 ) -> Vec<TypeResolutionDiagnostic> {
+    use deferred_types::ProviderTypeCheckSite;
     let mut errors = Vec::new();
-    let argument_sources = parsed
-        .arguments
-        .iter()
-        .filter_map(|argument| {
-            parsed
-                .parser_binding_metadata
-                .argument_type_source(&argument.name)
-                .map(|(source_file, span)| {
-                    (
-                        argument.name.clone(),
-                        TypeResolutionSource::new(source_file.clone(), span),
-                    )
-                })
-        })
-        .collect::<IndexMap<_, _>>();
     for arg in &mut parsed.arguments {
-        for error in resolve_declaration_type(&mut arg.static_type, config) {
+        let source = parsed
+            .parser_binding_metadata
+            .argument_type_source(&arg.name)
+            .map(|(file, span)| TypeResolutionSource::new(file.clone(), span));
+        let context = format!("argument '{}'", arg.name);
+        let site = source
+            .as_ref()
+            .map(|source| {
+                ProviderTypeCheckSite::new(source.source_file.path(), source.span, &context)
+            })
+            .unwrap_or_else(|| {
+                ProviderTypeCheckSite::at_line(std::path::Path::new("<config>"), 1, 1, &context)
+            });
+        for error in resolve_declaration_type(&mut arg.static_type, config, &site) {
             errors.push(TypeResolutionDiagnostic::declaration(
                 TypeResolutionDeclarationKind::Argument,
                 arg.name.clone(),
                 error,
-                argument_sources.get(&arg.name).cloned(),
+                source.clone(),
             ));
         }
     }
@@ -5459,8 +5476,13 @@ fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike>(
             SourceFileId::new(ap.source_file().to_path_buf()),
             ap.source_span(),
         );
+        let site = ProviderTypeCheckSite::new(
+            ap.source_file(),
+            ap.source_span(),
+            format!("attribute '{}'", ap.name),
+        );
         if let Some(ty) = &mut ap.static_type {
-            for error in resolve_declaration_type(ty, config) {
+            for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::Attribute,
                     ap.name.clone(),
@@ -5472,37 +5494,86 @@ fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike>(
     }
     for ep in &mut parsed.export_params {
         let export_name = ep.name().to_string();
+        let source = ep
+            .source_location()
+            .map(|(path, span)| {
+                TypeResolutionSource::new(SourceFileId::new(path.to_path_buf()), span)
+            })
+            .or_else(|| {
+                parsed
+                    .parser_binding_metadata
+                    .export_type_source(&export_name)
+                    .map(|(file, span)| TypeResolutionSource::new(file.clone(), span))
+            });
+        let context = format!("export '{export_name}'");
+        let site = source
+            .as_ref()
+            .map(|source| {
+                ProviderTypeCheckSite::new(source.source_file.path(), source.span, &context)
+            })
+            .unwrap_or_else(|| {
+                ProviderTypeCheckSite::at_line(std::path::Path::new("<config>"), 1, 1, &context)
+            });
         if let Some(ty) = ep.type_expr_opt_mut() {
-            for error in resolve_declaration_type(ty, config) {
+            for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::Export,
                     export_name.clone(),
                     error,
-                    None,
+                    source.clone(),
                 ));
             }
         }
     }
+    // Definitions are checked whether or not a call survives evaluation.
     for function in parsed.user_functions.values_mut() {
+        let path = function
+            .annotation_source_file
+            .as_deref()
+            .or(function.body.source_file.as_deref())
+            .unwrap_or_else(|| std::path::Path::new("<config>"));
         for parameter in &mut function.params {
             if let Some(ty) = &mut parameter.param_type {
-                for error in resolve_declaration_type(ty, config) {
+                let context = format!(
+                    "function '{}' parameter '{}'",
+                    function.name, parameter.name
+                );
+                let source = parameter.type_span.map(|span| {
+                    TypeResolutionSource::new(SourceFileId::new(path.to_path_buf()), span)
+                });
+                let site = source
+                    .as_ref()
+                    .map(|source| ProviderTypeCheckSite::new(path, source.span, &context))
+                    .unwrap_or_else(|| {
+                        ProviderTypeCheckSite::at_line(path, function.body.source_line, 1, &context)
+                    });
+                for error in resolve_declaration_type(ty, config, &site) {
                     errors.push(TypeResolutionDiagnostic::declaration(
                         TypeResolutionDeclarationKind::FunctionParameter,
                         format!("{}' parameter '{}", function.name, parameter.name),
                         error,
-                        None,
+                        source.clone(),
                     ));
                 }
             }
         }
         if let Some(ty) = &mut function.return_type {
-            for error in resolve_declaration_type(ty, config) {
+            let context = format!("function '{}' return value", function.name);
+            let source = function
+                .return_type_span
+                .map(|span| TypeResolutionSource::new(SourceFileId::new(path.to_path_buf()), span));
+            let site = source
+                .as_ref()
+                .map(|source| ProviderTypeCheckSite::new(path, source.span, &context))
+                .unwrap_or_else(|| {
+                    ProviderTypeCheckSite::at_line(path, function.body.source_line, 1, &context)
+                });
+            for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::FunctionReturn,
                     function.name.clone(),
                     error,
-                    None,
+                    source.clone(),
                 ));
             }
         }
@@ -5539,7 +5610,7 @@ pub fn resolve_file_type_exprs_report<E: crate::parser::ExportParamLike>(
 ) -> FileTypeResolutionReport {
     let diagnostics = resolve_file_type_exprs_impl(parsed, config);
     let covered_parser_error = parser_error.is_some_and(|parser_error| {
-        type_resolution_parser_error_is_covered(config, &diagnostics, parser_error)
+        type_resolution_parser_error_is_covered(&diagnostics, parser_error)
     });
     FileTypeResolutionReport {
         diagnostics,
@@ -5560,11 +5631,39 @@ pub(crate) fn resolve_consumer_static_type(
     config: &ProviderContext,
 ) -> ConsumerStaticType {
     match resolve_type_expr(type_expr, config) {
-        Ok(resolved) => StaticType::Known(ConsumerResolvedType::new(resolved)),
+        Ok(resolved) => match unresolved_dotted_annotation(&resolved) {
+            Some(path) => StaticType::Unchecked(UnnameableInConsumer::new(
+                type_expr.clone(),
+                unknown_type_resolution_error(&path.to_string(), config),
+            )),
+            None => StaticType::Known(ConsumerResolvedType::new(resolved)),
+        },
         Err(resolution_error) => StaticType::Unchecked(UnnameableInConsumer::new(
             type_expr.clone(),
             resolution_error,
         )),
+    }
+}
+
+/// An opaque consumer-resolved type cannot contain an unclassified dotted leaf.
+fn unresolved_dotted_annotation(ty: &TypeExpr) -> Option<&crate::parser::ResourceTypePath> {
+    match ty {
+        TypeExpr::DottedUnresolved(path) => Some(path),
+        TypeExpr::List(inner) | TypeExpr::Map(inner) => unresolved_dotted_annotation(inner),
+        TypeExpr::Union(members) => members.iter().find_map(unresolved_dotted_annotation),
+        TypeExpr::Struct { fields } => fields
+            .iter()
+            .find_map(|(_, field)| unresolved_dotted_annotation(field)),
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Simple(_)
+        | TypeExpr::UnloadedSchemaType(_)
+        | TypeExpr::SchemaType { .. }
+        | TypeExpr::Ref(_)
+        | TypeExpr::StringLiteral(_) => None,
     }
 }
 
@@ -5599,13 +5698,11 @@ pub fn resolve_export_static_type_for_consumer(
             ConsumerExportStaticType::Declared(resolve_consumer_static_type(&type_expr, config))
         }
         ExportStaticType::Inferred(StaticType::Known(type_expr)) => {
-            let resolved = match resolve_type_expr(&type_expr, config) {
-                Ok(type_expr) => StaticType::Known(ConsumerResolvedType::new(type_expr)),
-                Err(resolution_error) => {
-                    StaticType::Unchecked(ConsumerInferredUncheckedReason::UnnameableInConsumer(
-                        UnnameableInConsumer::new(type_expr, resolution_error),
-                    ))
-                }
+            let resolved = match resolve_consumer_static_type(&type_expr, config) {
+                StaticType::Known(resolved) => StaticType::Known(resolved),
+                StaticType::Unchecked(reason) => StaticType::Unchecked(
+                    ConsumerInferredUncheckedReason::UnnameableInConsumer(reason),
+                ),
             };
             ConsumerExportStaticType::Inferred(resolved)
         }
@@ -7614,17 +7711,22 @@ pub fn validate_attribute_params<P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
     config: &LoadedProviderContext,
 ) -> Result<(), String> {
+    validate_attribute_params_with_context(attribute_params, config.as_provider_context())
+}
+
+pub fn validate_attribute_params_with_context<P: PlaceholderKind, B: BindingAddress>(
+    attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
+    config: &ProviderContext,
+) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for param in attribute_params {
         if let (Some(type_expr), Some(value)) = (&param.static_type, &param.value)
-            && let Err(error) = typecheck::check_type_expr_value(
+            && let Err(error) = typecheck::TypecheckProviderContext::for_parser(config).check(
                 type_expr,
                 value,
-                config,
                 typecheck::TypecheckInference::Unavailable,
             )
-            .require_provider_schemas()
         {
             errors.push(format!("attribute '{}': {}", param.name, error));
         }

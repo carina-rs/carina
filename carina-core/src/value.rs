@@ -6822,7 +6822,11 @@ mod tests {
         }
     }
 
-    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {}
+    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {
+        fn inference_type_authority(&self) -> crate::resource::PlaceholderTypeAuthority<'_> {
+            crate::resource::PlaceholderTypeAuthority::AwaitingSubstitution
+        }
+    }
 
     #[test]
     fn placeholder_secret_material_uses_structured_serde_not_display_wording() {
