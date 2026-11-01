@@ -22,6 +22,8 @@ mod replace;
 pub(super) mod scheduler;
 pub(crate) mod wait;
 
+pub use deferred_dispatch::{AnonymousIdentityCollisionSource, DeferredCreateFailure};
+pub use parallel::classify_stalled_effects;
 pub use wait::StartMarker;
 
 pub use crate::data_source_value::UnresolvedDataSourceInput;
@@ -120,7 +122,8 @@ use crate::provider::{
 };
 use crate::resource::{
     ApplyTimeUnknown, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
-    ModuleSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
+    ModuleSource, ResolvedResource, Resource, ResourceId, ResourceIdentity, SavedModuleSource,
+    State, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -405,10 +408,16 @@ impl AcceptedRequest {
 pub fn complete_create_for_writeback(
     outcome: CreateOutcome,
     request: AcceptedRequest,
-) -> (State, AcceptedRequest, Option<PartialReadDiagnostic>) {
+) -> (
+    State,
+    AcceptedRequest,
+    Option<PartialReadDiagnostic>,
+    crate::provider::ReadBackEnd,
+) {
     let diagnostic = outcome.diagnostic().cloned();
+    let read_back_end = outcome.read_back_end();
     let state = outcome.into_state_for_writeback();
-    (state, request, diagnostic)
+    (state, request, diagnostic, read_back_end)
 }
 
 /// Provenance-preserving result of one effect. State writeback must classify
@@ -868,11 +877,531 @@ impl<S> std::fmt::Debug for ExecutionCheckpointSink<S> {
     }
 }
 
+/// Cloneable ownership wrapper for a typed execution error.
+#[derive(Clone)]
+pub struct ReportedError {
+    inner: Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl ReportedError {
+    pub fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Arc::new(error),
+        }
+    }
+
+    pub fn message(message: impl Into<String>) -> Self {
+        Self::new(MessageError(message.into()))
+    }
+
+    pub fn context(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(source).with_context(context)
+    }
+
+    pub fn with_context(self, context: impl Into<String>) -> Self {
+        Self::new(ContextError {
+            context: context.into(),
+            source: self,
+        })
+    }
+
+    pub fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.inner.as_ref()
+    }
+}
+
+impl std::fmt::Debug for ReportedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ReportedError")
+            .field(&self.inner.to_string())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ReportedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(formatter)
+    }
+}
+
+/// Render a diagnostic and each typed cause without flattening its ownership.
+pub fn render_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        rendered.push_str("\ncaused by: ");
+        rendered.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    rendered
+}
+
+#[derive(Debug)]
+struct MessageError(String);
+
+impl std::fmt::Display for MessageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MessageError {}
+
+#[derive(Debug)]
+struct ContextError {
+    context: String,
+    source: ReportedError,
+}
+
+impl std::fmt::Display for ContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.context)
+    }
+}
+
+impl std::error::Error for ContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_error())
+    }
+}
+
+/// Operation component of an owned effect endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectOperation {
+    Read,
+    Create,
+    ResumeCreate,
+    Update,
+    Delete,
+    Import,
+    Remove,
+    Move,
+    ReleaseListKeys,
+    Wait,
+    DeferredCreate,
+    DeferredReplace,
+}
+
+impl std::fmt::Display for EffectOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Read => "read",
+            Self::Create => "create",
+            Self::ResumeCreate => "resume create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Import => "import",
+            Self::Remove => "remove",
+            Self::Move => "move",
+            Self::ReleaseListKeys => "release list keys",
+            Self::Wait => "wait",
+            Self::DeferredCreate => "deferred create",
+            Self::DeferredReplace => "deferred replace",
+        })
+    }
+}
+
+/// Owned identity of an effect that can outlive the borrowed execution event.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EffectEndpoint {
+    resource_id: ResourceId,
+    operation: EffectOperation,
+}
+
+impl EffectEndpoint {
+    pub fn from_effect<S>(effect: &Effect<S>) -> Self {
+        let operation = match effect {
+            Effect::Read { .. } => EffectOperation::Read,
+            Effect::Create(_) => EffectOperation::Create,
+            Effect::ResumeCreate { .. } => EffectOperation::ResumeCreate,
+            Effect::Update { .. } => EffectOperation::Update,
+            Effect::Delete { .. } => EffectOperation::Delete,
+            Effect::Import { .. } => EffectOperation::Import,
+            Effect::Remove { .. } => EffectOperation::Remove,
+            Effect::Move { .. } => EffectOperation::Move,
+            Effect::ReleaseListKeys { .. } => EffectOperation::ReleaseListKeys,
+            Effect::Wait { .. } => EffectOperation::Wait,
+            Effect::DeferredCreate(_) => EffectOperation::DeferredCreate,
+            Effect::DeferredReplace(_) => EffectOperation::DeferredReplace,
+        };
+        Self {
+            resource_id: effect.resource_id().clone(),
+            operation,
+        }
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn operation(&self) -> EffectOperation {
+        self.operation
+    }
+}
+
+impl std::fmt::Display for EffectEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} {}", self.operation, self.resource_id)
+    }
+}
+
+/// A strongly connected component that prevented scheduler progress.
+#[derive(Debug, Clone)]
+pub struct DependencyCycle {
+    members: Vec<EffectEndpoint>,
+}
+
+impl DependencyCycle {
+    pub fn new(members: Vec<EffectEndpoint>) -> Self {
+        Self { members }
+    }
+
+    pub fn members(&self) -> &[EffectEndpoint] {
+        &self.members
+    }
+}
+
+impl std::fmt::Display for DependencyCycle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let members = self
+            .members
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(formatter, "dependency cycle among {{{members}}}")
+    }
+}
+
+/// An unfinished scheduling dependency, including a malformed missing index.
+#[derive(Debug, Clone)]
+pub enum UnsatisfiedDependency {
+    Effect(EffectEndpoint),
+    MissingEffect { index: usize },
+}
+
+impl std::fmt::Display for UnsatisfiedDependency {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Effect(endpoint) => endpoint.fmt(formatter),
+            Self::MissingEffect { index } => write!(formatter, "missing effect #{index}"),
+        }
+    }
+}
+
+/// Typed reason an effect did not complete successfully.
+#[derive(Debug, Clone)]
+pub enum EffectFailureKind {
+    Provider {
+        error: ReportedError,
+        note: Option<String>,
+    },
+    Execution {
+        error: ReportedError,
+    },
+    DeferredMaterialization {
+        failure: Arc<DeferredCreateFailure>,
+    },
+    MissingDependency {
+        identity: ResourceIdentity,
+    },
+    DependencyCycle {
+        cycle: Arc<DependencyCycle>,
+    },
+    BlockedByDependencyCycle {
+        cycle: Arc<DependencyCycle>,
+    },
+    NoProgress {
+        waiting_on: Vec<UnsatisfiedDependency>,
+    },
+    ModuleConstraint {
+        failure: Box<ModuleConstraintFailure>,
+    },
+}
+
+impl EffectFailureKind {
+    /// Short final-summary label. The observer renders the full cause once.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Provider { .. } => "provider error",
+            Self::Execution { .. } => "execution error",
+            Self::DeferredMaterialization { .. } => "deferred materialization failure",
+            Self::MissingDependency { .. } => "missing dependency",
+            Self::DependencyCycle { .. } => "dependency cycle",
+            Self::BlockedByDependencyCycle { .. } => "blocked by dependency cycle",
+            Self::NoProgress { .. } => "no scheduler progress",
+            Self::ModuleConstraint { .. } => "module constraint failure",
+        }
+    }
+
+    pub fn provider(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Provider {
+            error: ReportedError::new(error),
+            note: None,
+        }
+    }
+
+    pub fn provider_with_context(
+        context: impl Into<String>,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Provider {
+            error: ReportedError::context(context, error),
+            note: None,
+        }
+    }
+
+    pub fn provider_with_note(
+        error: impl std::error::Error + Send + Sync + 'static,
+        note: impl Into<String>,
+    ) -> Self {
+        Self::Provider {
+            error: ReportedError::new(error),
+            note: Some(note.into()),
+        }
+    }
+
+    pub fn execution(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Execution {
+            error: ReportedError::new(error),
+        }
+    }
+
+    pub fn execution_with_context(
+        context: impl Into<String>,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Execution {
+            error: ReportedError::context(context, error),
+        }
+    }
+
+    pub fn message(message: impl Into<String>) -> Self {
+        Self::Execution {
+            error: ReportedError::message(message),
+        }
+    }
+
+    pub fn deferred(failure: DeferredCreateFailure) -> Self {
+        Self::DeferredMaterialization {
+            failure: Arc::new(failure),
+        }
+    }
+
+    fn render(&self) -> String {
+        let Some(error) = self.reported_error() else {
+            return self.to_string();
+        };
+        let mut rendered = render_error_chain(error);
+        if let Self::Provider {
+            note: Some(note), ..
+        } = self
+        {
+            rendered.push('\n');
+            rendered.push_str(note);
+        }
+        rendered
+    }
+
+    fn reported_error(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Provider { error, .. } | Self::Execution { error } => Some(error.as_error()),
+            Self::DeferredMaterialization { failure } => Some(failure.as_ref()),
+            Self::MissingDependency { .. }
+            | Self::DependencyCycle { .. }
+            | Self::BlockedByDependencyCycle { .. }
+            | Self::NoProgress { .. }
+            | Self::ModuleConstraint { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for EffectFailureKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider { error, note } => {
+                error.fmt(formatter)?;
+                if let Some(note) = note {
+                    write!(formatter, "\n{note}")?;
+                }
+                Ok(())
+            }
+            Self::Execution { error } => error.fmt(formatter),
+            Self::DeferredMaterialization { failure } => failure.fmt(formatter),
+            Self::MissingDependency { identity } => {
+                write!(
+                    formatter,
+                    "required scheduling target `{identity}` is missing"
+                )
+            }
+            Self::DependencyCycle { cycle } => cycle.fmt(formatter),
+            Self::BlockedByDependencyCycle { cycle } => match cycle.members().first() {
+                Some(member) => write!(
+                    formatter,
+                    "blocked by the dependency cycle containing {member}"
+                ),
+                None => write!(formatter, "blocked by {cycle}"),
+            },
+            Self::NoProgress { waiting_on } => {
+                if waiting_on.is_empty() {
+                    formatter.write_str("no progress: effect was not dispatched despite all dependencies completing")
+                } else {
+                    write!(
+                        formatter,
+                        "no progress: waiting on {}",
+                        waiting_on
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+            Self::ModuleConstraint { failure } => failure.fmt(formatter),
+        }
+    }
+}
+
+/// One failed effect and its retained typed cause.
+#[derive(Debug, Clone)]
+pub struct EffectFailure {
+    endpoint: Option<EffectEndpoint>,
+    kind: EffectFailureKind,
+}
+
+impl EffectFailure {
+    pub fn new<S>(effect: &Effect<S>, kind: EffectFailureKind) -> Self {
+        Self {
+            endpoint: Some(EffectEndpoint::from_effect(effect)),
+            kind,
+        }
+    }
+
+    pub fn module_constraint(failure: impl Into<Box<ModuleConstraintFailure>>) -> Self {
+        Self {
+            endpoint: None,
+            kind: EffectFailureKind::ModuleConstraint {
+                failure: failure.into(),
+            },
+        }
+    }
+
+    pub fn endpoint(&self) -> Option<&EffectEndpoint> {
+        self.endpoint.as_ref()
+    }
+
+    pub fn kind(&self) -> &EffectFailureKind {
+        &self.kind
+    }
+}
+
+impl std::fmt::Display for EffectFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.kind.render())
+    }
+}
+
+/// Proof that a failure has been retained by a [`FailureSink`]. Only the sink
+/// can issue this borrowed token, and it only lends it to the observer.
+pub struct RecordedFailure<'a> {
+    failure: &'a EffectFailure,
+}
+
+impl std::ops::Deref for RecordedFailure<'_> {
+    type Target = EffectFailure;
+
+    fn deref(&self) -> &Self::Target {
+        self.failure
+    }
+}
+
+impl std::fmt::Display for RecordedFailure<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(formatter)
+    }
+}
+
+/// Private-storage failure ledger. Recording retains the failure and emits
+/// its typed event together; there is no observer-free insertion API.
+///
+/// An unretained effect failure cannot be reported by constructing an event:
+///
+/// ```compile_fail
+/// use carina_core::effect::Effect;
+/// use carina_core::executor::{EffectFailure, ExecutionEvent, ProgressInfo};
+/// fn unretained<'a>(effect: &'a Effect, failure: &'a EffectFailure) -> ExecutionEvent<'a> {
+///     ExecutionEvent::EffectFailed {
+///         effect, failure, recovery: None, duration: std::time::Duration::ZERO,
+///         progress: ProgressInfo { completed: 1, total: 1 },
+///     }
+/// }
+/// ```
+///
+/// Module constraint failures must use the same ledger:
+///
+/// ```compile_fail
+/// use carina_core::executor::{EffectFailure, ExecutionEvent};
+/// fn unretained(failure: &EffectFailure) -> ExecutionEvent<'_> {
+///     ExecutionEvent::ModuleConstraintFailed { failure }
+/// }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct FailureSink {
+    failures: Vec<EffectFailure>,
+}
+
+pub enum FailureReport<'a, S> {
+    Effect {
+        effect: &'a Effect<S>,
+        kind: EffectFailureKind,
+        context: FailureEventContext<'a>,
+    },
+    ModuleConstraint(Box<ModuleConstraintFailure>),
+}
+
+impl FailureSink {
+    pub fn failures(&self) -> &[EffectFailure] {
+        &self.failures
+    }
+
+    pub fn record<S>(&mut self, observer: &dyn ExecutionObserver<S>, report: FailureReport<'_, S>) {
+        let (failure, effect_context) = match report {
+            FailureReport::Effect {
+                effect,
+                kind,
+                context,
+            } => (EffectFailure::new(effect, kind), Some((effect, context))),
+            FailureReport::ModuleConstraint(failure) => {
+                (EffectFailure::module_constraint(failure), None)
+            }
+        };
+        self.failures.push(failure);
+        let recorded = RecordedFailure {
+            failure: self.failures.last().expect("just retained a failure"),
+        };
+        if let Some((effect, context)) = effect_context {
+            observer.on_event(&ExecutionEvent::EffectFailed {
+                effect,
+                failure: &recorded,
+                recovery: context.recovery,
+                duration: context.duration,
+                progress: context.progress,
+            });
+        } else {
+            observer.on_event(&ExecutionEvent::ModuleConstraintFailed { failure: &recorded });
+        }
+    }
+}
+
 /// Result of executing a plan's effects.
 #[derive(Clone)]
 pub struct ExecutionResult<S = ModuleSource> {
     pub success_count: usize,
-    pub failure_count: usize,
+    failures: FailureSink,
     pub partial_count: usize,
     pub partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub skip_count: usize,
@@ -887,6 +1416,39 @@ pub struct ExecutionResult<S = ModuleSource> {
     pub failed_refreshes: HashSet<ResourceId>,
 }
 
+impl<S> ExecutionResult<S> {
+    pub fn empty() -> Self {
+        Self {
+            success_count: 0,
+            failures: FailureSink::default(),
+            partial_count: 0,
+            partial_diagnostics: Vec::new(),
+            skip_count: 0,
+            interrupted_count: 0,
+            applied_states: HashMap::new(),
+            runtime_synthesized_resources: Vec::new(),
+            successfully_deleted: HashSet::new(),
+            permanent_name_overrides: HashMap::new(),
+            managed_current: HashMap::new(),
+            data_source_states: HashMap::new(),
+            bindings: ResolvedBindings::default(),
+            failed_refreshes: HashSet::new(),
+        }
+    }
+
+    pub fn failure_count(&self) -> usize {
+        self.failures().len()
+    }
+
+    pub fn failures(&self) -> &[EffectFailure] {
+        self.failures.failures()
+    }
+
+    pub fn failure_sink(&mut self) -> &mut FailureSink {
+        &mut self.failures
+    }
+}
+
 /// Mutable execution-result fields other than applied states.
 ///
 /// Keeping `applied_states` out of this mutation view makes it impossible for
@@ -895,7 +1457,7 @@ pub struct ExecutionResult<S = ModuleSource> {
 #[derive(Clone)]
 pub(super) struct ExecutionResultFields<S = ModuleSource> {
     pub(super) success_count: usize,
-    pub(super) failure_count: usize,
+    failures: FailureSink,
     pub(super) partial_count: usize,
     pub(super) partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub(super) skip_count: usize,
@@ -910,13 +1472,17 @@ pub(super) struct ExecutionResultFields<S = ModuleSource> {
 }
 
 impl<S> ExecutionResultFields<S> {
+    pub(super) fn failure_count(&self) -> usize {
+        self.failures.failures().len()
+    }
+
     fn into_result(
         self,
         applied_states: std::collections::HashMap<ResourceId, Applied>,
     ) -> ExecutionResult<S> {
         let Self {
             success_count,
-            failure_count,
+            failures,
             partial_count,
             partial_diagnostics,
             skip_count,
@@ -931,7 +1497,7 @@ impl<S> ExecutionResultFields<S> {
         } = self;
         ExecutionResult {
             success_count,
-            failure_count,
+            failures,
             partial_count,
             partial_diagnostics,
             skip_count,
@@ -961,7 +1527,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
     pub(super) fn new(result: ExecutionResult<S>) -> (Self, wait::SharedWaitIdentifiers) {
         let ExecutionResult {
             success_count,
-            failure_count,
+            failures,
             partial_count,
             partial_diagnostics,
             skip_count,
@@ -983,7 +1549,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
         let accumulator = Self {
             fields: ExecutionResultFields {
                 success_count,
-                failure_count,
+                failures,
                 partial_count,
                 partial_diagnostics,
                 skip_count,
@@ -1150,7 +1716,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     },
     EffectFailed {
         effect: &'a Effect<S>,
-        error: &'a str,
+        failure: &'a RecordedFailure<'a>,
         recovery: Option<&'a crate::plan::PlanError>,
         duration: Duration,
         progress: ProgressInfo,
@@ -1191,12 +1757,50 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     },
     RefreshFailed {
         id: &'a ResourceId,
-        error: &'a str,
+        error: &'a ProviderError,
     },
     /// A terminal module constraint failed without an owning provider effect.
     ModuleConstraintFailed {
-        error: &'a str,
+        failure: &'a RecordedFailure<'a>,
     },
+}
+
+pub struct FailureEventContext<'a> {
+    pub recovery: Option<&'a crate::plan::PlanError>,
+    pub duration: Duration,
+    pub progress: ProgressInfo,
+}
+
+/// The only executor path that both publishes and retains an effect failure.
+pub(super) fn record_effect_failure<S: Clone>(
+    accumulator: &mut ExecutionAccumulator<S>,
+    observer: &dyn ExecutionObserver<S>,
+    effect: &Effect<S>,
+    kind: EffectFailureKind,
+    context: FailureEventContext<'_>,
+) {
+    accumulator.mutate(|result| {
+        result.failures.record(
+            observer,
+            FailureReport::Effect {
+                effect,
+                kind,
+                context,
+            },
+        );
+    });
+}
+
+fn record_module_constraint_failure<S: Clone>(
+    accumulator: &mut ExecutionAccumulator<S>,
+    observer: &dyn ExecutionObserver<S>,
+    failure: ModuleConstraintFailure,
+) {
+    accumulator.mutate(|result| {
+        result
+            .failures
+            .record(observer, FailureReport::ModuleConstraint(Box::new(failure)))
+    });
 }
 
 impl<'a, S> ExecutionEvent<'a, S> {
@@ -1215,6 +1819,15 @@ impl<'a, S> ExecutionEvent<'a, S> {
 /// Use interior mutability (e.g., `Mutex`) if mutable state is needed.
 pub trait ExecutionObserver<S = ModuleSource>: Send + Sync {
     fn on_event(&self, event: &ExecutionEvent<S>);
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub struct NoopExecutionObserver;
+
+#[cfg(any(test, feature = "test-utils"))]
+impl<S> ExecutionObserver<S> for NoopExecutionObserver {
+    fn on_event(&self, _event: &ExecutionEvent<S>) {}
 }
 
 /// Execute a plan by dispatching effects to a provider.

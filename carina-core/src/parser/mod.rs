@@ -79,7 +79,7 @@ pub use ast::{
 };
 pub(crate) use ast::{
     BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
-    ParsedDeferredForIterableState,
+    ParsedDeferredForIterableState, ParsedDeferredForParts,
 };
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{

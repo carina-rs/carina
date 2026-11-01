@@ -52,13 +52,13 @@ impl<'a, S> PureMetaStep<'a, S> {
 pub(super) enum PureMetaOutcome<S> {
     NotPureMeta,
     Materialized(Vec<Effect<S>>),
-    Failed,
+    Failed(super::DeferredCreateFailure),
 }
 
 pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
     effect: &Effect<S>,
     bindings: &ResolvedBindings,
-    ctx: &PureMetaCtx<'_, S>,
+    ctx: &PureMetaCtx<'_>,
 ) -> PureMetaOutcome<S> {
     let Some(step) = PureMetaStep::from_effect(effect) else {
         return PureMetaOutcome::NotPureMeta;
@@ -66,7 +66,7 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
 
     match dispatch_deferred_create(step.effect, step.template, bindings, ctx) {
         DeferredDispatchResult::Materialized(children) => PureMetaOutcome::Materialized(children),
-        DeferredDispatchResult::MaterializeFailed => PureMetaOutcome::Failed,
+        DeferredDispatchResult::MaterializeFailed(failure) => PureMetaOutcome::Failed(failure),
     }
 }
 

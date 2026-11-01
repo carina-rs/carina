@@ -1,7 +1,7 @@
 {
-  "version": 36,
+  "version": 37,
   "carina_version": "0.9.0",
-  "timestamp": "2026-11-01T04:10:54.035021+00:00",
+  "timestamp": "2026-11-01T06:22:22.693250+00:00",
   "source_path": "carina-cli/tests/fixtures/module_binding_wire_compat",
   "state_lineage": null,
   "state_serial": null,
@@ -181,7 +181,7 @@
             },
             "comment": {
               "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$jYvwA3NDgRAYjJs/f7axkw$ghTkQvIvNlYXa0OU4CJLsczvABSzq5hUwrZETXWHKWQ"
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$2ghf0jP4fsTZ4M0eURm8fQ$2uhND2u6b84XOSrM8aAUax6Dij5iOjoxu9IFAyKorgM"
               }
             }
           },
@@ -315,7 +315,7 @@
             },
             "comment": {
               "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$n+KFZTqwMWNhtWT46ua29g$FQKn8yhNT8cgNOkQ0uhdHNFReO08OvxBvMBwmYWSk58"
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$3/lNzuUAZ4XAthQClVHa9g$URnTIHskUKGM/K//WRKaDQ/jhSXH9P2Mf2sGPzeVwM0"
               }
             }
           },
@@ -384,6 +384,8 @@
             "identity": "direct.children"
           },
           "template": {
+            "file": "modules/app/deferred.crn",
+            "line": 5,
             "header": "for key, value in deferred_source.tags ?? {first: 'child'}",
             "resource_type": "mock.test.resource",
             "target": {
@@ -471,6 +473,8 @@
             "identity": "looped[0].children"
           },
           "template": {
+            "file": "modules/app/deferred.crn",
+            "line": 5,
             "header": "for key, value in deferred_source.tags ?? {first: 'child'}",
             "resource_type": "mock.test.resource",
             "target": {
@@ -644,7 +648,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$jYvwA3NDgRAYjJs/f7axkw$ghTkQvIvNlYXa0OU4CJLsczvABSzq5hUwrZETXWHKWQ"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$2ghf0jP4fsTZ4M0eURm8fQ$2uhND2u6b84XOSrM8aAUax6Dij5iOjoxu9IFAyKorgM"
           }
         }
       },
@@ -770,7 +774,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$n+KFZTqwMWNhtWT46ua29g$FQKn8yhNT8cgNOkQ0uhdHNFReO08OvxBvMBwmYWSk58"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$3/lNzuUAZ4XAthQClVHa9g$URnTIHskUKGM/K//WRKaDQ/jhSXH9P2Mf2sGPzeVwM0"
           }
         }
       },
@@ -921,7 +925,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$F6fhOXkGf12MCJM3Mp3lpA$nnbC5C4hF9Jc7A3lwqDKdeIJw726ONcL5eRLKFtfB+M"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$kXwLTXItXDBbvW7AN5/iFA$dUBJKDuTYGAT9I5UqVHC8aZuXV2PYU+Sg8GITRYTVBk"
           }
         }
       },
@@ -1047,7 +1051,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$vFpOOKcFfQvU0fK3Nd7nwQ$6z1PoUcJZSJZXTo/DS38GXyrxoP3ftlCRldmaKNEijw"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$GIkkoCb6MLgx69eK9LIHUQ$oqRqn76En45acsfSGGloe4VZa/B3VMBi9VtwBmRP7Ew"
           }
         }
       },
@@ -1480,6 +1484,138 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
+        "identity": "direct.seed"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.seed"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.nested.leaf"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.nested.leaf"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.deferred_source"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.deferred_source"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "root"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "root"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].nested.leaf"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].nested.leaf"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].deferred_source"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].deferred_source"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
         "identity": "looped[0].consumer"
       },
       "current": {
@@ -1524,116 +1660,6 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
-        "identity": "looped[0].nested.leaf"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "looped[0].nested.leaf"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "root"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "root"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "looped[0].deferred_source"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "looped[0].deferred_source"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.deferred_source"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.deferred_source"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.seed"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.seed"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
         "identity": "direct.consumer"
       },
       "current": {
@@ -1643,28 +1669,6 @@
             "provider": "mock",
             "resource_type": "test.resource",
             "identity": "direct.consumer"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.nested.leaf"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.nested.leaf"
           },
           "identifier": null,
           "attributes": {},
@@ -1695,14 +1699,14 @@
             "kind": "resource",
             "resource_type": "test.resource",
             "fingerprint": {
-              "present": "ebe39904297c3428437d065e907bda92d239cdf7cc469f33ebf16503dace865c"
+              "present": "321cbb2f021eebc69d35b25d91c379e6fe3729e3f30bb678be24f73cf5e3ed0d"
             }
           },
           {
             "kind": "data_source",
             "resource_type": "iam.Roles",
             "fingerprint": {
-              "present": "7e4c0cd4c98f7ced2cf325fefe56203597382a097fbd24c96d9bccc6aa663786"
+              "present": "f6c3844462d443406977b12722c0c18a6d316b2d6961642195be341877001238"
             }
           }
         ]

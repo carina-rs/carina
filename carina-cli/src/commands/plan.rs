@@ -480,7 +480,7 @@ mod provider_scope_evidence_tests {
     }
 
     #[test]
-    fn format_35_saved_plan_round_trips_provider_scopes_and_integer_arithmetic() {
+    fn format_37_saved_plan_round_trips_provider_scopes_and_integer_arithmetic() {
         let mut default_config = provider_config("unused");
         default_config.binding = None;
         default_config.source = Some("file:///test-provider.wasm".parse().unwrap());
@@ -659,6 +659,9 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 37 requires relative diagnostic files (or null) and line
+    /// numbers on every deferred-for template.
+    ///
     /// Plan format 36 adds typed deferred-for templates, stage-specific
     /// placeholder types, and template attributes stored only on
     /// `template_resource`.
@@ -936,6 +939,9 @@ struct ProviderEvidence {
 /// that passed the same validation while decoding. Decode requires the schema
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
+///
+/// Format 37 requires relative diagnostic files (or null) and line numbers
+/// on every deferred-for template.
 ///
 /// Format 36 adds typed deferred-for templates, stage-specific placeholder
 /// types, and template attributes stored only on `template_resource`.
@@ -1957,7 +1963,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 36;
+    pub const CURRENT_VERSION: u32 = 37;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -4241,6 +4247,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4174: bumped 36→37 — deferred-for templates require file
+        // (relative path or null) and line for apply-time diagnostics.
         // carina#4094: bumped 35→36 — saved plans use typed deferred-for
         // templates and stage-specific placeholder types, with template
         // attributes stored only on `template_resource`.

@@ -1,12 +1,10 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
-use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::{
-    DeferredForExpansionError, DeferredForExpression, ShapeMismatch, expand_deferred_children,
+    DeferredForExpansionError, DeferredForExpression, DeferredForTarget, ShapeMismatch,
+    expand_deferred_children,
 };
 use crate::resource::{ResolvedResource, ResolvedResourceError, ResourceId};
 #[cfg(test)]
@@ -25,25 +23,34 @@ pub(super) struct DeferredIdentityInputs<'a> {
 /// Failure while expanding a deferred-for create half against apply-time
 /// upstream state.
 #[derive(Debug)]
-pub(super) enum DeferredCreateFailure {
+pub enum DeferredCreateFailure {
     /// Every candidate was complete, but a direct iterable reference was
     /// absent and there was no coalesce fallback.
     IterableAbsent {
+        file: Option<String>,
+        line: usize,
+        binding: Box<DeferredForTarget>,
         expression: String,
         candidates: Vec<String>,
     },
     /// The iterable still depends on an incomplete producer even though the
     /// scheduler attempted to dispatch the deferred effect.
     IterableUnknown {
+        file: Option<String>,
+        line: usize,
+        binding: Box<DeferredForTarget>,
         expression: String,
         candidates: Vec<String>,
     },
     /// The iterable attribute exists but is not a collection shape supported
     /// by deferred-for expansion.
     ShapeMismatch {
+        file: Option<String>,
+        line: usize,
+        binding: Box<DeferredForTarget>,
         expression: String,
         candidates: Vec<String>,
-        mismatch: ShapeMismatch,
+        mismatch: Box<ShapeMismatch>,
     },
     ValueAccess {
         error: DeferredForExpansionError,
@@ -67,7 +74,7 @@ pub(super) enum DeferredCreateFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AnonymousIdentityCollisionSource {
+pub enum AnonymousIdentityCollisionSource {
     DesiredPlan,
     CurrentState,
     DeferredChild,
@@ -102,7 +109,9 @@ impl DeferredAnonymousIdentityGuard {
     ) -> Result<(), DeferredCreateFailure> {
         if !matches!(
             template.target(),
-            crate::parser::DeferredForTarget::Unbound { .. }
+            crate::parser::DeferredForTarget::Unbound {
+                template: _template
+            }
         ) {
             return Ok(());
         }
@@ -138,42 +147,66 @@ impl DeferredAnonymousIdentityGuard {
     }
 }
 
-impl DeferredCreateFailure {
-    pub(super) fn message(&self) -> String {
+impl std::fmt::Display for DeferredCreateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DeferredCreateFailure::IterableAbsent {
+                file,
+                line,
+                binding,
                 expression,
                 candidates,
-            } => {
-                format!(
-                    "deferred-for iterable `{expression}` is absent after resolving candidates: {}",
-                    candidates.join(", ")
-                )
-            }
+            } => write!(
+                formatter,
+                "{}deferred-for iterable `{expression}` is absent for binding `{binding}` after resolving candidates: {}",
+                source_location(file.as_deref(), *line),
+                candidates.join(", "),
+                binding = binding.scheduler_key(),
+            ),
             DeferredCreateFailure::ShapeMismatch {
+                file,
+                line,
+                binding,
                 expression,
                 candidates,
                 mismatch,
-            } => {
-                format!(
-                    "deferred-for expansion expected {} for `{expression}` but got {} (candidates: {})",
-                    mismatch.expected_kind(),
-                    mismatch.got_kind(),
-                    candidates.join(", ")
-                )
-            }
+            } => write!(
+                formatter,
+                "{}deferred-for expansion for binding `{binding}` expected {} for `{expression}` but got {} (candidates: {})",
+                source_location(file.as_deref(), *line),
+                mismatch.expected_kind(),
+                mismatch.got_kind(),
+                candidates.join(", "),
+                binding = binding.scheduler_key(),
+            ),
             DeferredCreateFailure::IterableUnknown {
+                file,
+                line,
+                binding,
                 expression,
                 candidates,
-            } => format!(
-                "deferred-for iterable `{expression}` is still unknown at dispatch (candidates: {})",
-                candidates.join(", ")
+            } => write!(
+                formatter,
+                "{}deferred-for iterable `{expression}` for binding `{binding}` is still unknown at dispatch (candidates: {})",
+                source_location(file.as_deref(), *line),
+                candidates.join(", "),
+                binding = binding.scheduler_key(),
             ),
-            DeferredCreateFailure::ValueAccess { error } => error.to_string(),
-            DeferredCreateFailure::ResolveResource { error } => error.to_string(),
-            DeferredCreateFailure::ProviderConfig { error } => error.to_string(),
-            DeferredCreateFailure::EnumCanonicalization { error } => error.to_string(),
-            DeferredCreateFailure::AnonymousIdentity { error } => error.to_string(),
+            DeferredCreateFailure::ValueAccess { error: _error } => {
+                formatter.write_str("deferred-for value resolution failed")
+            }
+            DeferredCreateFailure::ResolveResource { error: _error } => {
+                formatter.write_str("deferred-for resource resolution failed")
+            }
+            DeferredCreateFailure::ProviderConfig { error: _error } => {
+                formatter.write_str("deferred-for provider configuration failed")
+            }
+            DeferredCreateFailure::EnumCanonicalization { error: _error } => {
+                formatter.write_str("deferred-for enum canonicalization failed")
+            }
+            DeferredCreateFailure::AnonymousIdentity { error: _error } => {
+                formatter.write_str("deferred-for anonymous identity failed")
+            }
             DeferredCreateFailure::AnonymousIdentityCollision { id, occupied_by } => {
                 let owner = match occupied_by {
                     AnonymousIdentityCollisionSource::DesiredPlan => "a desired plan resource",
@@ -184,7 +217,8 @@ impl DeferredCreateFailure {
                         "another apply-time deferred child"
                     }
                 };
-                format!(
+                write!(
+                    formatter,
                     "anonymous deferred-loop identity collided at `{id}`: the address is already owned by {owner}"
                 )
             }
@@ -192,9 +226,11 @@ impl DeferredCreateFailure {
     }
 }
 
-impl std::fmt::Display for DeferredCreateFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message())
+fn source_location(file: Option<&str>, line: usize) -> String {
+    match file {
+        Some(file) => format!("{file}:{line}: "),
+        None if line > 0 => format!("line {line}: "),
+        None => String::new(),
     }
 }
 
@@ -206,10 +242,32 @@ impl std::error::Error for DeferredCreateFailure {
             Self::ProviderConfig { error } => Some(error),
             Self::EnumCanonicalization { error } => Some(error),
             Self::AnonymousIdentity { error } => Some(error),
-            Self::IterableAbsent { .. }
-            | Self::IterableUnknown { .. }
-            | Self::ShapeMismatch { .. }
-            | Self::AnonymousIdentityCollision { .. } => None,
+            Self::IterableAbsent {
+                file: _file,
+                line: _line,
+                binding: _binding,
+                expression: _expression,
+                candidates: _candidates,
+            }
+            | Self::IterableUnknown {
+                file: _file,
+                line: _line,
+                binding: _binding,
+                expression: _expression,
+                candidates: _candidates,
+            } => None,
+            Self::ShapeMismatch {
+                file: _file,
+                line: _line,
+                binding: _binding,
+                expression: _expression,
+                candidates: _candidates,
+                mismatch: _mismatch,
+            } => None,
+            Self::AnonymousIdentityCollision {
+                id: _id,
+                occupied_by: _occupied_by,
+            } => None,
         }
     }
 }
@@ -231,7 +289,7 @@ pub(super) fn materialize_deferred_create<
     let iterable = match crate::resolver::resolve_ref_value_status(&template.iterable, bindings)
         .map_err(|message| DeferredCreateFailure::ValueAccess {
             error: DeferredForExpansionError::Resolution {
-                line: template.line,
+                line: template.line(),
                 expression: crate::value::format_value(&template.iterable),
                 message,
             },
@@ -239,12 +297,18 @@ pub(super) fn materialize_deferred_create<
         crate::resolver::ValueResolution::Present(value) => value,
         crate::resolver::ValueResolution::Absent => {
             return Err(DeferredCreateFailure::IterableAbsent {
+                file: template.file().map(str::to_owned),
+                line: template.line(),
+                binding: Box::new(template.target().clone()),
                 expression,
                 candidates,
             });
         }
         crate::resolver::ValueResolution::Unknown(_) => {
             return Err(DeferredCreateFailure::IterableUnknown {
+                file: template.file().map(str::to_owned),
+                line: template.line(),
+                binding: Box::new(template.target().clone()),
                 expression,
                 candidates,
             });
@@ -256,9 +320,12 @@ pub(super) fn materialize_deferred_create<
         |error| match error {
             DeferredForExpansionError::ShapeMismatch(mismatch) => {
                 DeferredCreateFailure::ShapeMismatch {
+                    file: template.file().map(str::to_owned),
+                    line: template.line(),
+                    binding: Box::new(template.target().clone()),
                     expression: crate::value::format_value(&template.iterable),
                     candidates: template.reference_candidates().into_iter().collect(),
-                    mismatch,
+                    mismatch: Box::new(mismatch),
                 }
             }
             error @ DeferredForExpansionError::ValueAccess { .. } => {
@@ -271,7 +338,9 @@ pub(super) fn materialize_deferred_create<
     )?;
     if matches!(
         template.target(),
-        crate::parser::DeferredForTarget::Unbound { .. }
+        crate::parser::DeferredForTarget::Unbound {
+            template: _template
+        }
     ) {
         let canonical_resources = crate::value::canonicalize_resources_with_schemas(
             &mut resources,
@@ -317,53 +386,27 @@ pub(super) enum DeferredDispatchResult<S> {
     /// should be appended to the scheduler queue.
     Materialized(Vec<Effect<S>>),
     /// Deferred-for materialization failed before any child effects existed.
-    /// Callers must increment `failure_count` for this meta-effect failure.
-    MaterializeFailed,
+    MaterializeFailed(DeferredCreateFailure),
 }
 
 /// Shared inputs required to materialize deferred scheduler-meta effects.
-pub(super) struct PureMetaCtx<'a, S> {
-    pub(super) completed: &'a AtomicUsize,
-    pub(super) total: usize,
-    pub(super) observer: &'a dyn ExecutionObserver<S>,
+pub(super) struct PureMetaCtx<'a> {
     pub(super) identity_inputs: DeferredIdentityInputs<'a>,
 }
 
-pub(super) fn report_deferred_create_failure<S>(
-    effect: &Effect<S>,
-    error: &DeferredCreateFailure,
-    ctx: &PureMetaCtx<'_, S>,
-) {
-    let message = error.message();
-    ctx.observer.on_event(&ExecutionEvent::EffectFailed {
-        effect,
-        error: &message,
-        recovery: None,
-        duration: Duration::ZERO,
-        progress: ProgressInfo {
-            completed: ctx.completed.load(Ordering::Relaxed),
-            total: ctx.total,
-        },
-    });
-}
-
 /// Dispatch a DeferredCreate meta-effect by materializing its runtime
-/// `Effect::Create` children, or emitting the meta-effect failure event when
-/// upstream state is missing or has the wrong shape.
+/// `Effect::Create` children or returning the typed materialization failure.
 pub(super) fn dispatch_deferred_create<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
-    effect: &Effect<S>,
+    _effect: &Effect<S>,
     template: &DeferredForExpression<S>,
     bindings: &ResolvedBindings,
-    ctx: &PureMetaCtx<'_, S>,
+    ctx: &PureMetaCtx<'_>,
 ) -> DeferredDispatchResult<S> {
     match materialize_deferred_create(template, bindings, &ctx.identity_inputs) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
-        Err(err) => {
-            report_deferred_create_failure(effect, &err, ctx);
-            DeferredDispatchResult::MaterializeFailed
-        }
+        Err(err) => DeferredDispatchResult::MaterializeFailed(err),
     }
 }
 
@@ -757,7 +800,7 @@ mod tests {
             candidates,
             &["fallback.items".to_string(), "primary.items".to_string()],
         );
-        let message = error.message();
+        let message = error.to_string();
         assert!(message.contains("fallback.items"), "{message}");
         assert!(message.contains("primary.items"), "{message}");
     }

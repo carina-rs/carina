@@ -438,11 +438,85 @@ fn deferred_effect_id<S, P: PlaceholderKind, B: BindingAddress>(
     )
 }
 
+/// Immutable diagnostic provenance for one authored deferred loop. Display and
+/// source paths are derived together; callers cannot edit either independently.
+/// Only the display path and line cross the saved-plan wire boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticLocation {
+    display_file: Option<String>,
+    source_file: Option<PathBuf>,
+    line: usize,
+}
+
+impl DiagnosticLocation {
+    fn new(file: Option<String>, line: usize) -> Self {
+        Self {
+            source_file: file.as_ref().map(PathBuf::from),
+            display_file: file,
+            line,
+        }
+    }
+
+    fn from_source(source: &Path, project_root: &Path, line: usize) -> Self {
+        let display = source
+            .strip_prefix(project_root)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|relative| relative.to_string_lossy().into_owned())
+            .or_else(|| {
+                source
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| source.display().to_string());
+        Self {
+            display_file: Some(display),
+            source_file: Some(source.to_path_buf()),
+            line,
+        }
+    }
+
+    fn into_saved(self) -> Self {
+        // Saved plans have no parse-warning owner. Normalize the entire value
+        // to the portable location that deserialization can reconstruct.
+        Self::new(self.display_file, self.line)
+    }
+
+    pub fn display_file(&self) -> Option<&str> {
+        self.display_file.as_deref()
+    }
+
+    pub fn source_file(&self) -> Option<&Path> {
+        self.source_file.as_deref()
+    }
+
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    /// Match warning ownership against the original source, not the portable
+    /// display path. Same-line warnings from other files or kinds are unrelated.
+    pub fn matches_deferred_warning(&self, warning: &ParseWarning) -> bool {
+        warning.kind == WarningKind::DeferredFor
+            && warning.line == self.line
+            && warning.file.as_deref().map(Path::new) == self.source_file()
+    }
+}
+
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
 ///
 /// Parser-side deferred loops use [`ParsedDeferredForExpression`] instead.
 /// This resource-only shape is the resolved typestate consumed by planning,
 /// execution, display, and state persistence.
+///
+/// Diagnostic filenames cannot be edited independently of their source:
+///
+/// ```compile_fail
+/// use carina_core::parser::DeferredForExpression;
+/// fn mutate_file(expression: &mut DeferredForExpression) {
+///     expression.file = Some("unrelated.crn".into());
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredForExpression<
     S = ModuleSource,
@@ -450,8 +524,7 @@ pub struct DeferredForExpression<
     T: PlaceholderKind = LoopSlot,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
-    pub file: Option<String>,
-    pub line: usize,
+    location: DiagnosticLocation,
     pub header: String,
     target: DeferredForTarget<B>,
     pub iterable: Value<P, B>,
@@ -474,8 +547,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
     ) -> Self {
         let template_resource = DeferredForTemplateResource::new(template_resource);
         Self::from_template_resource(
-            file,
-            line,
+            DiagnosticLocation::new(file, line),
             header,
             target,
             iterable,
@@ -485,8 +557,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
     }
 
     fn from_template_resource(
-        file: Option<String>,
-        line: usize,
+        location: DiagnosticLocation,
         header: String,
         target: DeferredForTarget<B>,
         iterable: Value<P, B>,
@@ -496,8 +567,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
         let template_resource = template_resource.into_materialized_for_target(&target);
         let deferred_effect_id = deferred_effect_id(&target, &template_resource);
         Self {
-            file,
-            line,
+            location,
             header,
             target,
             iterable,
@@ -505,6 +575,18 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
             template_resource,
             deferred_effect_id,
         }
+    }
+
+    pub fn location(&self) -> &DiagnosticLocation {
+        &self.location
+    }
+
+    pub fn file(&self) -> Option<&str> {
+        self.location.display_file()
+    }
+
+    pub fn line(&self) -> usize {
+        self.location.line()
     }
 
     pub fn target(&self) -> &DeferredForTarget<B> {
@@ -570,8 +652,8 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
 
     pub fn site(&self) -> DeferredForSite<'_, P, B> {
         DeferredForSite {
-            file: self.file.as_deref(),
-            line: self.line,
+            file: self.file(),
+            line: self.line(),
             header: &self.header,
             binding: &self.binding,
             iterable: &self.iterable,
@@ -626,13 +708,19 @@ pub(crate) enum DeferredForResourceExpressionError {
 }
 
 /// Parser-side typestate for a deferred `for` expression.
+///
+/// ```compile_fail
+/// use carina_core::parser::ParsedDeferredForExpression;
+/// fn mutate_file(expression: &mut ParsedDeferredForExpression) {
+///     expression.file = Some("unrelated.crn".into());
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ParsedDeferredForExpression<
     P: PlaceholderKind = ParserPlaceholder,
     B: BindingAddress = RelativeBindingName,
 > {
-    pub file: Option<String>,
-    pub line: usize,
+    location: DiagnosticLocation,
     pub span: SourceSpan,
     pub header: String,
     pub(crate) target: DeferredForTarget<B>,
@@ -642,7 +730,42 @@ pub struct ParsedDeferredForExpression<
     pub(crate) body: DeferredForBody<P, B>,
 }
 
+/// Read-only exhaustive projection used by the module binding-phase seam.
+pub(crate) struct ParsedDeferredForParts<'a, P: PlaceholderKind, B: BindingAddress> {
+    pub location: &'a DiagnosticLocation,
+    pub span: SourceSpan,
+    pub header: &'a str,
+    pub target: &'a DeferredForTarget<B>,
+    pub iterable: &'a Value<P, B>,
+    pub iterable_state: &'a ParsedDeferredForIterableState,
+    pub binding: &'a ForBinding,
+    pub body: &'a DeferredForBody<P, B>,
+}
+
 impl<P: PlaceholderKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
+    pub(crate) fn parts(&self) -> ParsedDeferredForParts<'_, P, B> {
+        let Self {
+            location,
+            span,
+            header,
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        } = self;
+        ParsedDeferredForParts {
+            location,
+            span: *span,
+            header,
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        }
+    }
+
     pub(crate) fn new(
         site: (Option<String>, usize, SourceSpan, String),
         target: DeferredForTarget<B>,
@@ -652,10 +775,28 @@ impl<P: PlaceholderKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
         body: DeferredForBody<P, B>,
     ) -> Self {
         let (file, line, span, header) = site;
+        Self::from_location(
+            (DiagnosticLocation::new(file, line), span, header),
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        )
+    }
+
+    pub(crate) fn from_location(
+        site: (DiagnosticLocation, SourceSpan, String),
+        target: DeferredForTarget<B>,
+        iterable: Value<P, B>,
+        iterable_state: ParsedDeferredForIterableState,
+        binding: ForBinding,
+        body: DeferredForBody<P, B>,
+    ) -> Self {
+        let (location, span, header) = site;
         let body = body.into_materialized_for_target(&target);
         Self {
-            file,
-            line,
+            location,
             span,
             header,
             target,
@@ -664,6 +805,27 @@ impl<P: PlaceholderKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             binding,
             body,
         }
+    }
+
+    pub fn location(&self) -> &DiagnosticLocation {
+        &self.location
+    }
+
+    pub fn file(&self) -> Option<&str> {
+        self.location.display_file()
+    }
+
+    pub fn line(&self) -> usize {
+        self.location.line()
+    }
+
+    /// Called once by the loader after parsing, before any module rebuilds.
+    pub(crate) fn record_source_location(&mut self, source: &Path, project_root: &Path) {
+        assert!(
+            self.location.source_file().is_none(),
+            "deferred diagnostic source was already recorded"
+        );
+        self.location = DiagnosticLocation::from_source(source, project_root, self.line());
     }
 
     pub fn target(&self) -> &DeferredForTarget<B> {
@@ -712,8 +874,8 @@ impl<P: PlaceholderKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
 
     pub fn site(&self) -> DeferredForSite<'_, P, B> {
         DeferredForSite {
-            file: self.file.as_deref(),
-            line: self.line,
+            file: self.file(),
+            line: self.line(),
             header: &self.header,
             binding: &self.binding,
             iterable: &self.iterable,
@@ -727,11 +889,11 @@ impl<P: PlaceholderKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
         };
         let error = ParseError::undefined_deferred_iterable(
             name.clone(),
-            self.line,
+            self.line(),
             known_bindings.to_vec(),
             self.span,
         );
-        Some(match &self.file {
+        Some(match self.location.source_file() {
             Some(path) => error.in_file(path),
             None => error,
         })
@@ -750,8 +912,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             return Err(DeferredForResourceExpressionError::UndefinedIterable(error));
         }
         let Self {
-            file,
-            line,
+            location,
             span,
             header,
             target,
@@ -783,9 +944,11 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             DeferredForBody::Resource(resource) => *resource,
             DeferredForBody::Read(data_source) => {
                 return Err(DeferredForResourceExpressionError::Unsupported {
-                    file,
+                    file: location
+                        .source_file()
+                        .map(|file| file.display().to_string()),
                     error: Box::new(DeferredForBodyUnsupportedError {
-                        line,
+                        line: location.line(),
                         header,
                         body: DeferredForBodyKind::Read {
                             resource_type: data_source.id.display_type(),
@@ -797,9 +960,11 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             }
             DeferredForBody::ModuleCall(call) => {
                 return Err(DeferredForResourceExpressionError::Unsupported {
-                    file,
+                    file: location
+                        .source_file()
+                        .map(|file| file.display().to_string()),
                     error: Box::new(DeferredForBodyUnsupportedError {
-                        line,
+                        line: location.line(),
                         header,
                         body: DeferredForBodyKind::ModuleCall {
                             name: call.module_name,
@@ -811,8 +976,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             }
         };
         Ok(DeferredForExpression::from_template_resource(
-            file,
-            line,
+            location,
             header,
             target,
             iterable,
@@ -828,8 +992,7 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P, RelativeBindingName> {
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
     ) -> ParsedDeferredForExpression<P, AbsoluteBindingAddress> {
         let Self {
-            file,
-            line,
+            location,
             span,
             header,
             target,
@@ -839,8 +1002,7 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P, RelativeBindingName> {
             body,
         } = self;
         ParsedDeferredForExpression {
-            file,
-            line,
+            location,
             span,
             header,
             target: match target {
@@ -873,8 +1035,7 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P, AbsoluteBindingAddress> 
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
         let Self {
-            file: _file,
-            line: _line,
+            location: _location,
             span: _span,
             header: _header,
             target,
@@ -911,8 +1072,7 @@ impl<P: PlaceholderKind, T: PlaceholderKind>
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
         let Self {
-            file: _file,
-            line: _line,
+            location: _location,
             header: _header,
             target,
             iterable,
@@ -963,8 +1123,7 @@ pub type ExpandedDeferredForExpression =
 impl From<DeferredForExpression> for SavedDeferredForExpression {
     fn from(expression: DeferredForExpression) -> Self {
         let DeferredForExpression {
-            file,
-            line,
+            location,
             header,
             target,
             iterable,
@@ -973,8 +1132,7 @@ impl From<DeferredForExpression> for SavedDeferredForExpression {
             deferred_effect_id: _,
         } = expression;
         Self::from_template_resource(
-            file,
-            line,
+            location.into_saved(),
             header,
             target,
             iterable,
@@ -1188,6 +1346,8 @@ where
             serialize = "S: serde::Serialize, P: PlaceholderKind + serde::Serialize, T: PlaceholderKind + serde::Serialize, B: BindingAddress + serde::Serialize"
         ))]
         struct WireRef<'a, S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> {
+            file: Option<&'a str>,
+            line: usize,
             header: &'a str,
             resource_type: &'a str,
             target: &'a DeferredForTarget<B>,
@@ -1198,6 +1358,10 @@ where
 
         serde::Serialize::serialize(
             &WireRef {
+                file: self
+                    .file()
+                    .filter(|file| std::path::Path::new(file).is_relative()),
+                line: self.line(),
                 header: &self.header,
                 resource_type: self.resource_type(),
                 target: &self.target,
@@ -1229,6 +1393,9 @@ where
             deserialize = "S: serde::Deserialize<'de>, P: PlaceholderKind + serde::Deserialize<'de>, T: PlaceholderKind + serde::Deserialize<'de>, B: BindingAddress + serde::Deserialize<'de>"
         ))]
         struct Wire<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> {
+            #[serde(deserialize_with = "deserialize_relative_diagnostic_file")]
+            file: Option<String>,
+            line: usize,
             header: String,
             resource_type: String,
             target: DeferredForTarget<B>,
@@ -1288,8 +1455,7 @@ where
 
         let template_resource = DeferredForTemplateResource::new(template_resource);
         Ok(Self::from_template_resource(
-            None,
-            0,
+            DiagnosticLocation::new(wire.file, wire.line),
             wire.header,
             wire.target,
             wire.iterable,
@@ -1297,6 +1463,22 @@ where
             template_resource,
         ))
     }
+}
+
+fn deserialize_relative_diagnostic_file<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let file = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    if file
+        .as_deref()
+        .is_some_and(|file| std::path::Path::new(file).is_absolute())
+    {
+        return Err(serde::de::Error::custom(
+            "deferred-for diagnostic file must be relative",
+        ));
+    }
+    Ok(file)
 }
 
 impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
@@ -1345,8 +1527,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
         crate::resource::LeftoverPlaceholder,
     > {
         let Self {
-            file,
-            line,
+            location,
             header,
             target,
             iterable,
@@ -1357,8 +1538,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
         let template_resource = template_resource
             .try_map_resource(Resource::<S, ParserPlaceholder, B>::into_loop_template)?;
         Ok(DeferredForExpression::from_template_resource(
-            file,
-            line,
+            location,
             header,
             target,
             iterable.into_expanded()?,
@@ -5173,7 +5353,7 @@ impl<P: PlaceholderKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
     }
 
     fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize {
-        deferred.line
+        deferred.line()
     }
 }
 
@@ -5258,7 +5438,7 @@ impl<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress> DeferredForPhase
         P: 'a,
         T: 'a,
     {
-        deferred.line
+        deferred.line()
     }
 }
 
@@ -7301,7 +7481,7 @@ impl<E> ExpandedFile<E> {
                 match bindings
                     .resolve_value(&deferred.iterable)
                     .map_err(|message| DeferredForExpansionError::Resolution {
-                        line: deferred.line,
+                        line: deferred.line(),
                         expression: crate::value::format_value(&deferred.iterable),
                         message,
                     })? {
@@ -7344,8 +7524,11 @@ impl<E> ExpandedFile<E> {
                 (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::List(_))) => {
                     mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
-                        file: deferred.file.clone(),
-                        line: deferred.line,
+                        file: deferred
+                            .location()
+                            .source_file()
+                            .map(|file| file.display().to_string()),
+                        line: deferred.line(),
                         kind: WarningKind::DeferredFor,
                         span: None,
                         message: format!(
@@ -7359,8 +7542,11 @@ impl<E> ExpandedFile<E> {
                 | (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
                     mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
-                        file: deferred.file.clone(),
-                        line: deferred.line,
+                        file: deferred
+                            .location()
+                            .source_file()
+                            .map(|file| file.display().to_string()),
+                        line: deferred.line(),
                         kind: WarningKind::DeferredFor,
                         span: None,
                         message: format!(
@@ -7405,9 +7591,7 @@ fn retain_non_matching_deferred_for_warnings(
     warnings: &mut Vec<ParseWarning>,
     deferred: &DeferredForExpression,
 ) {
-    warnings.retain(|w| {
-        w.kind != WarningKind::DeferredFor || w.line != deferred.line || w.file != deferred.file
-    });
+    warnings.retain(|warning| !deferred.location().matches_deferred_warning(warning));
 }
 
 pub fn expand_deferred_children<S: Clone>(
@@ -8304,7 +8488,7 @@ mod substitute_placeholder_tests {
     }
 
     #[test]
-    fn deferred_for_expression_serde_skips_diagnostic_location() {
+    fn deferred_for_expression_serde_omits_absolute_file_but_preserves_line() {
         let deferred: DeferredForExpression = DeferredForExpression::new(
             Some("/abs/path.crn".to_string()),
             42,
@@ -8327,9 +8511,122 @@ mod substitute_placeholder_tests {
 
         let decoded = serde_json::from_str::<SavedDeferredForExpression>(&json)
             .expect("deserialize deferred for expression");
-        assert_eq!(decoded.file, None);
-        assert_eq!(decoded.line, 0);
+        assert_eq!(decoded.file(), None);
+        assert_eq!(decoded.line(), 42);
         assert_eq!(decoded.iterable, deferred.iterable);
+    }
+
+    #[test]
+    fn deferred_for_expression_serde_preserves_relative_diagnostic_location() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            Some("modules/child/main.crn".to_string()),
+            17,
+            "for opt in cert.options".to_string(),
+            DeferredForTarget::bound(absolute_binding("children"))
+                .expect("fixture binding is valid"),
+            Value::root_resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            Resource::new("mock.Target", "children"),
+        );
+
+        let json = serde_json::to_string(&deferred).expect("serialize deferred for expression");
+        let decoded = serde_json::from_str::<SavedDeferredForExpression>(&json)
+            .expect("deserialize deferred for expression");
+
+        assert_eq!(decoded.file(), Some("modules/child/main.crn"));
+        assert_eq!(decoded.line(), 17);
+    }
+
+    #[test]
+    fn deferred_for_wire_requires_both_diagnostic_location_fields() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            None,
+            0,
+            "for opt in cert.options".into(),
+            DeferredForTarget::bound(absolute_binding("children")).unwrap(),
+            Value::root_resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".into()),
+            Resource::new("mock.Target", "children"),
+        );
+        let wire = serde_json::to_value(&deferred).unwrap();
+        for field in ["file", "line"] {
+            assert!(
+                wire.get(field).is_some(),
+                "required field {field} must be serialized even when empty: {wire}"
+            );
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SavedDeferredForExpression>(missing).is_err(),
+                "missing {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_for_wire_rejects_absolute_diagnostic_file() {
+        let deferred: DeferredForExpression = DeferredForExpression::new(
+            Some("main.crn".into()),
+            1,
+            "for opt in cert.options".into(),
+            DeferredForTarget::bound(absolute_binding("children")).unwrap(),
+            Value::root_resource_ref("cert", "options", Vec::new()),
+            ForBinding::Simple("opt".into()),
+            Resource::new("mock.Target", "children"),
+        );
+        let mut wire = serde_json::to_value(&deferred).unwrap();
+        wire["file"] = serde_json::json!("/machine/local/main.crn");
+        assert!(
+            serde_json::from_value::<SavedDeferredForExpression>(wire).is_err(),
+            "saved diagnostic files must be relative"
+        );
+    }
+
+    #[test]
+    fn deferred_diagnostic_location_moves_through_resolution_and_saved_conversion() {
+        let source = Path::new("/project/modules/child/main.crn");
+        let mut parsed = ParsedDeferredForExpression::new(
+            (
+                None,
+                17,
+                SourceSpan::dummy(),
+                "for item in upstream.items".into(),
+            ),
+            DeferredForTarget::bound(RelativeBindingName::new("rows")).unwrap(),
+            Value::resource_ref("upstream", "items", vec![]),
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".into()),
+            DeferredForBody::resource(Resource::new("mock.test.resource", "rows")),
+        );
+        parsed.record_source_location(source, Path::new("/project"));
+        let location = parsed.location().clone();
+        let expression = parsed
+            .resolve_bindings(&mut |binding| RootScope::new().resolve(binding))
+            .into_resource_expression(&[])
+            .unwrap()
+            .into_expanded()
+            .unwrap();
+        assert_eq!(expression.location(), &location);
+        assert_eq!(expression.file(), Some("modules/child/main.crn"));
+        assert_eq!(expression.line(), 17);
+        assert_eq!(expression.location().source_file(), Some(source));
+        let warning = ParseWarning {
+            file: Some(source.display().to_string()),
+            line: 17,
+            kind: WarningKind::DeferredFor,
+            span: None,
+            message: "deferred".into(),
+        };
+        assert!(expression.location().matches_deferred_warning(&warning));
+        let saved = SavedDeferredForExpression::from(expression);
+        let wire = serde_json::to_value(&saved).unwrap();
+        assert_eq!(wire["file"], "modules/child/main.crn");
+        assert_eq!(wire["line"], 17);
+        assert!(!wire.to_string().contains("/project"));
+        assert_eq!(
+            serde_json::from_value::<SavedDeferredForExpression>(wire).unwrap(),
+            saved
+        );
     }
 
     #[test]
@@ -8728,6 +9025,8 @@ mod substitute_placeholder_tests {
     fn bound_deferred_for_wire_matches_resource_shape_byte_for_byte() {
         #[derive(serde::Serialize)]
         struct ResourceShapedWire<'a> {
+            file: Option<&'a str>,
+            line: usize,
             header: &'a str,
             resource_type: &'a str,
             target: &'a DeferredForTarget,
@@ -8786,6 +9085,8 @@ mod substitute_placeholder_tests {
         assert_eq!(expression.template_resource_binding(), Some("children[?]"));
         let resource_type = expression.resource_type();
         let resource_shaped = ResourceShapedWire {
+            file: expression.file(),
+            line: expression.line(),
             header: &expression.header,
             resource_type,
             target: expression.target(),

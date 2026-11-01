@@ -3720,9 +3720,8 @@ fn expand_parsed_deferred_for_expression(
     ParsedDeferredForExpression<ParserPlaceholder, AbsoluteBindingAddress>,
     ArgumentSubstitutionError,
 > {
-    let ParsedDeferredForExpression {
-        file,
-        line,
+    let crate::parser::ParsedDeferredForParts {
+        location,
         span,
         header,
         target,
@@ -3730,7 +3729,7 @@ fn expand_parsed_deferred_for_expression(
         iterable_state,
         binding,
         body,
-    } = deferred;
+    } = deferred.parts();
     let instance_identity = ResourceIdentity::try_from(resolver.scope.key().to_string())
         .expect("module instance prefix is non-empty");
     let legacy_parent = module_call
@@ -3794,8 +3793,8 @@ fn expand_parsed_deferred_for_expression(
         }
     };
 
-    Ok(ParsedDeferredForExpression::new(
-        (file.clone(), *line, *span, header.clone()),
+    Ok(ParsedDeferredForExpression::from_location(
+        (location.clone(), span, header.to_owned()),
         target,
         iterable,
         iterable_state,

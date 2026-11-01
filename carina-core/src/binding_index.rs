@@ -1482,6 +1482,60 @@ pub enum BindingValueSource<B: BindingAddress = AbsoluteBindingAddress> {
 /// parallel maps) so the type system enforces "every name has attributes,
 /// provenance, and an explicit completeness state".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedOperation {
+    Create,
+    Update,
+}
+
+impl AppliedOperation {
+    pub(crate) fn past_tense(self) -> &'static str {
+        match self {
+            Self::Create => "created",
+            Self::Update => "updated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialReadBack {
+    operation: AppliedOperation,
+    reason: String,
+    missing_attributes: HashSet<String>,
+    end: crate::provider::ReadBackEnd,
+}
+
+impl PartialReadBack {
+    pub(crate) fn from_diagnostic(
+        operation: AppliedOperation,
+        diagnostic: &crate::provider::PartialReadDiagnostic,
+        end: crate::provider::ReadBackEnd,
+    ) -> Self {
+        Self {
+            operation,
+            reason: diagnostic.reason().to_string(),
+            missing_attributes: diagnostic.missing_attributes().iter().cloned().collect(),
+            end,
+        }
+    }
+
+    pub fn operation(&self) -> AppliedOperation {
+        self.operation
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub(crate) fn attribute_is_missing(&self, attribute: &str) -> bool {
+        self.missing_attributes.contains(attribute)
+    }
+
+    pub(crate) fn end(&self) -> crate::provider::ReadBackEnd {
+        self.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingCompleteness {
     /// The snapshot was successfully loaded/read/applied. A missing key is
     /// definitive absence and may select a coalesce default.
@@ -1489,6 +1543,22 @@ pub enum BindingCompleteness {
     /// The snapshot is provisional or unavailable. A missing key is unknown
     /// and must not select a coalesce default.
     Incomplete,
+    /// A create or update finished, but its read-back left values unresolved.
+    PartialReadBack(PartialReadBack),
+}
+
+impl BindingCompleteness {
+    fn attribute_known(&self, attribute: &str) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Incomplete => false,
+            Self::PartialReadBack(partial) => !partial.attribute_is_missing(attribute),
+        }
+    }
+
+    fn all_attributes_known(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
 }
 
 /// Plan-derived knowledge about a managed resource's refreshed attributes.
@@ -1543,6 +1613,14 @@ pub struct ResolvedBinding<
     /// which validate required pre-apply references must retain the taint so
     /// an unresolved reference cannot make a secret export appear public.
     removed_sensitive_attributes: HashSet<String>,
+}
+
+impl<P: PlaceholderKind, B: BindingAddress> ResolvedBinding<P, B> {
+    /// Changed authored values describe the desired view, not a provider
+    /// snapshot: nested provider-filled fields can still be unpublished.
+    fn attribute_snapshot_is_known(&self, attribute: &str) -> bool {
+        !self.changed_attributes.contains(attribute) && self.completeness.attribute_known(attribute)
+    }
 }
 
 /// Attribute values whose provider plaintext has been reconciled with the
@@ -1616,16 +1694,15 @@ impl<P: PlaceholderKind, B: BindingAddress> ResolvedBindings<P, B> {
         self.by_name.get(name).map(|binding| &binding.source)
     }
 
-    pub fn completeness(&self, name: &str) -> Option<BindingCompleteness> {
-        self.by_name.get(name).map(|binding| binding.completeness)
+    pub fn completeness(&self, name: &str) -> Option<&BindingCompleteness> {
+        self.by_name.get(name).map(|binding| &binding.completeness)
     }
 
     /// Whether a present attribute value can be consumed before apply.
     pub fn attribute_value_is_definitive(&self, name: &str, attribute: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
             binding.definitive_attributes.contains(attribute)
-                || (!binding.changed_attributes.contains(attribute)
-                    && binding.completeness == BindingCompleteness::Complete)
+                || binding.attribute_snapshot_is_known(attribute)
         })
     }
 
@@ -1647,8 +1724,7 @@ impl<P: PlaceholderKind, B: BindingAddress> ResolvedBindings<P, B> {
 
     pub fn binding_is_fully_definitive(&self, name: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
-            binding.completeness == BindingCompleteness::Complete
-                && binding.refreshable_attributes.is_empty()
+            binding.completeness.all_attributes_known() && binding.refreshable_attributes.is_empty()
         })
     }
 
@@ -2151,7 +2227,7 @@ impl ResolvedBindings {
                 continue;
             };
             let snapshot = target_entry.attributes.clone();
-            let completeness = target_entry.completeness;
+            let completeness = target_entry.completeness.clone();
             let definitive_attributes = target_entry.definitive_attributes.clone();
             let changed_attributes = target_entry.changed_attributes.clone();
             let refreshable_attributes = target_entry.refreshable_attributes.clone();
@@ -2440,13 +2516,17 @@ impl ResolvedBindings {
     }
 
     pub fn access_miss_policy_for_value(&self, value: &Value) -> crate::resource::AccessMissPolicy {
-        let complete = value.root_bindings().iter().all(|name| {
-            self.by_name.get(name.as_str()).is_some_and(|binding| {
-                binding.completeness == BindingCompleteness::Complete
-                    && binding.refreshable_attributes.is_empty()
-            })
+        let mut definitive = true;
+        value.visit_resource_refs(&mut |path| {
+            definitive &= self.by_name.get(path.binding()).is_some_and(|binding| {
+                binding.attribute_snapshot_is_known(path.attribute())
+                    && !binding.refreshable_attributes.contains(path.attribute())
+            });
         });
-        if complete {
+        value.visit_binding_refs(&mut |name| {
+            definitive &= self.binding_is_fully_definitive(name.as_str());
+        });
+        if definitive {
             crate::resource::AccessMissPolicy::Error
         } else {
             crate::resource::AccessMissPolicy::Defer
@@ -2470,6 +2550,7 @@ impl ResolvedBindings {
         binding: Option<&str>,
         resource_attrs: &SecretPreservingAttributes,
         state: &State,
+        completeness: BindingCompleteness,
     ) {
         let Some(name) = binding else {
             return;
@@ -2487,7 +2568,7 @@ impl ResolvedBindings {
             ResolvedBinding {
                 attributes: merged,
                 source: BindingValueSource::Local,
-                completeness: BindingCompleteness::Complete,
+                completeness,
                 definitive_attributes: HashSet::new(),
                 changed_attributes: HashSet::new(),
                 refreshable_attributes: HashSet::new(),
@@ -4027,7 +4108,12 @@ mod resolved_bindings_tests {
             partial_read: None,
         };
 
-        resolved.record_applied(Some("vpc"), &secret_preserving(&resource_attrs), &state);
+        resolved.record_applied(
+            Some("vpc"),
+            &secret_preserving(&resource_attrs),
+            &state,
+            BindingCompleteness::Complete,
+        );
 
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
@@ -4069,7 +4155,12 @@ mod resolved_bindings_tests {
             partial_read: None,
         };
 
-        resolved.record_applied(Some("secret"), &secret_preserving(&resource_attrs), &state);
+        resolved.record_applied(
+            Some("secret"),
+            &secret_preserving(&resource_attrs),
+            &state,
+            BindingCompleteness::Complete,
+        );
 
         assert_eq!(
             resolved
@@ -4095,7 +4186,12 @@ mod resolved_bindings_tests {
             partial_read: None,
         };
 
-        resolved.record_applied(None, &secret_preserving(&attrs), &state);
+        resolved.record_applied(
+            None,
+            &secret_preserving(&attrs),
+            &state,
+            BindingCompleteness::Complete,
+        );
         assert!(resolved.get("anon").is_none());
     }
 
@@ -4148,6 +4244,7 @@ mod resolved_bindings_tests {
             Some("subnet"),
             &secret_preserving(&HashMap::new()),
             &extra_state,
+            BindingCompleteness::Complete,
         );
 
         assert!(child.get("subnet").is_some());
@@ -4485,7 +4582,7 @@ mod resolved_bindings_tests {
         });
         assert_eq!(
             resolved.completeness("lookup"),
-            Some(BindingCompleteness::Complete),
+            Some(&BindingCompleteness::Complete),
         );
 
         let fallback = Value::Concrete(ConcreteValue::String("fallback".into()));

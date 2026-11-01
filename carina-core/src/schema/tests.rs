@@ -13094,6 +13094,7 @@ enum FingerprintChange {
     SchemaKind,
     UniqueName,
     OperationConfig,
+    ReadBackBudget,
     FieldGroup,
     WaitTimeout,
     WaitInterval,
@@ -13187,6 +13188,13 @@ fn schema_fingerprint_fixture_with(
         } else {
             Some(17)
         },
+        read_back: ReadBackBudget::from_secs(
+            if change == Some(FingerprintChange::ReadBackBudget) {
+                23
+            } else {
+                19
+            },
+        ),
     };
     let mut schema = ResourceSchema::new(if change == Some(FingerprintChange::ResourceType) {
         "test.WidgetV2"
@@ -13250,6 +13258,7 @@ fn schema_fingerprint_fixture_with(
             | FingerprintChange::SchemaKind
             | FingerprintChange::UniqueName
             | FingerprintChange::OperationConfig
+            | FingerprintChange::ReadBackBudget
             | FingerprintChange::FieldGroup
             | FingerprintChange::WaitTimeout
             | FingerprintChange::WaitInterval
@@ -13441,6 +13450,7 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
         ("schema kind", FingerprintChange::SchemaKind),
         ("unique name", FingerprintChange::UniqueName),
         ("operation config", FingerprintChange::OperationConfig),
+        ("read-back budget", FingerprintChange::ReadBackBudget),
         ("field group", FingerprintChange::FieldGroup),
         ("wait timeout", FingerprintChange::WaitTimeout),
         ("wait interval", FingerprintChange::WaitInterval),

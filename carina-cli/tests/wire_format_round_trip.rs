@@ -105,7 +105,7 @@ fn json_strings(value: &Value) -> BTreeSet<String> {
 }
 
 #[test]
-fn base_binary_deferred_effects_keep_v36_ids_and_typed_template_addresses() {
+fn base_binary_deferred_effects_keep_v37_ids_and_typed_template_addresses() {
     for (fixture, variant) in [
         (
             include_str!("fixtures/module_binding_wire_compat/carina.plan.json"),
@@ -117,7 +117,7 @@ fn base_binary_deferred_effects_keep_v36_ids_and_typed_template_addresses() {
         ),
     ] {
         let round_tripped = assert_json_value_round_trip::<PlanFile>(fixture);
-        assert_eq!(round_tripped["version"], 36);
+        assert_eq!(round_tripped["version"], 37);
         let deferred = round_tripped["plan"]["effects"]
             .as_array()
             .expect("saved effects")
@@ -133,7 +133,7 @@ fn base_binary_deferred_effects_keep_v36_ids_and_typed_template_addresses() {
             bindings.insert(binding.to_owned());
             assert_eq!(
                 effect["id"]["identity"], binding,
-                "v36 wire identity remains the bound spelling"
+                "v37 wire identity remains the bound spelling"
             );
             assert_eq!(
                 effect["template"]["template_resource"]["id"]["identity"],

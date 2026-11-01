@@ -9,7 +9,7 @@ use carina_plugin_sdk::core::schema::{
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
-    PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, UpdateOutcome,
+    PendingDelete, PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, UpdateOutcome,
 };
 
 use carina_provider_mock_http::send_phase::{self, PreparedCreate, ProbeKind};
@@ -152,6 +152,7 @@ impl CarinaProvider for MockHttpAwsProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         poll: Poll<Self::CreateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         match poll {
             Poll::Unissued(_, token) | Poll::Issued(_, token) => match token {},
@@ -163,6 +164,7 @@ impl CarinaProvider for MockHttpAwsProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         resume: Resume<Self::CreateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         match resume {
             Resume::Unissued(_, token) | Resume::Issued(_, token) => match token {},
@@ -188,6 +190,7 @@ impl CarinaProvider for MockHttpAwsProvider {
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
         match pending.token {}
     }
@@ -206,7 +209,7 @@ impl CarinaProvider for MockHttpAwsProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: DeleteRequest,
-        pending: Pending<Self::DeleteToken>,
+        pending: PendingDelete<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
         match pending.token {}
     }

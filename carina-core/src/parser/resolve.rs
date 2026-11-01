@@ -1382,7 +1382,7 @@ fn accumulate_deferred_iterable_errors(
             errors.push(undefined_identifier_error(
                 known,
                 root.to_string(),
-                deferred.line,
+                deferred.line(),
             ));
         }
     }
@@ -1395,12 +1395,33 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
+    resolve_value_with_binding_lookup(
+        value,
+        &|binding: &B, attribute: &str| {
+            binding_map
+                .get(binding.as_str())
+                .and_then(|attributes| attributes.get(attribute))
+                .cloned()
+        },
+        config,
+        defer_unknown_functions,
+        preserve_failed_user_calls,
+    )
+}
+
+fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
+    value: &GenericValue<ParserPlaceholder, B>,
+    binding_lookup: &impl Fn(&B, &str) -> Option<GenericValue<ParserPlaceholder, B>>,
+    config: &ProviderContext,
+    defer_unknown_functions: bool,
+    preserve_failed_user_calls: bool,
+) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     match value {
         GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
             let deferred = deferred.try_map(|value| {
-                resolve_value_with_config(
+                resolve_value_with_binding_lookup(
                     value,
-                    binding_map,
+                    binding_lookup,
                     config,
                     defer_unknown_functions,
                     preserve_failed_user_calls,
@@ -1414,9 +1435,9 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
             value: left,
             default,
         }) => {
-            let left = resolve_value_with_config(
+            let left = resolve_value_with_binding_lookup(
                 left,
-                binding_map,
+                binding_lookup,
                 config,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
@@ -1427,7 +1448,8 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
                 // Carry the fallback through the same directory fixed point as
                 // the left operand, while preserving failures as deferred calls
                 // until absence actually selects it.
-                let default = resolve_value_with_config(default, binding_map, config, true, true)?;
+                let default =
+                    resolve_value_with_binding_lookup(default, binding_lookup, config, true, true)?;
                 Ok(GenericValue::Deferred(DeferredValue::Coalesce {
                     value: Box::new(left),
                     default: Box::new(default),
@@ -1435,16 +1457,16 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
             }
         }
         GenericValue::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = resolve_value_with_config(
+            let lhs = resolve_value_with_binding_lookup(
                 expression.lhs(),
-                binding_map,
+                binding_lookup,
                 config,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
             )?;
-            let rhs = resolve_value_with_config(
+            let rhs = resolve_value_with_binding_lookup(
                 expression.rhs(),
-                binding_map,
+                binding_lookup,
                 config,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
@@ -1465,32 +1487,16 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
             if !path.segments().is_empty() {
                 return Ok(value.clone());
             }
-            match binding_map.get(path.binding()) {
-                Some(attributes) => match attributes.get(path.attribute()) {
-                    Some(attr_value) => {
-                        // Recursively resolve in case the attribute itself is a reference
-                        resolve_value_with_config(
-                            attr_value,
-                            binding_map,
-                            config,
-                            defer_unknown_functions,
-                            preserve_failed_user_calls,
-                        )
-                    }
-                    None => {
-                        // Attribute not found, keep as reference (might be resolved at runtime)
-                        Ok(value.clone())
-                    }
-                },
-                // Binding not found in *this* file's binding_map. The same
-                // resolver runs both per-file (config_loader.rs L93) and on
-                // the merged `ParsedFile` (L178); a per-file miss may be a
-                // legitimate cross-file ref (`upstream_state` declared in a
-                // sibling `.crn`, resource binding from another file).
-                // Keep the ref as-is and let the post-merge
-                // `check_identifier_scope` walk surface any genuine
-                // undefined identifiers — that walk has full directory
-                // context plus did-you-mean suggestions.
+            match binding_lookup(path.binding_address(), path.attribute()) {
+                Some(attribute_value) => resolve_value_with_binding_lookup(
+                    &attribute_value,
+                    binding_lookup,
+                    config,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                ),
+                // A missing binding or attribute may become available later.
+                // The directory-wide scope check owns undefined identifiers.
                 None => Ok(value.clone()),
             }
         }
@@ -1498,9 +1504,9 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
             let resolved: Result<Vec<_>, ParseError> = items
                 .iter()
                 .map(|item| {
-                    resolve_value_with_config(
+                    resolve_value_with_binding_lookup(
                         item,
-                        binding_map,
+                        binding_lookup,
                         config,
                         defer_unknown_functions,
                         preserve_failed_user_calls,
@@ -1514,9 +1520,9 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
-                    resolve_value_with_config(
+                    resolve_value_with_binding_lookup(
                         v,
-                        binding_map,
+                        binding_lookup,
                         config,
                         defer_unknown_functions,
                         preserve_failed_user_calls,
@@ -1530,9 +1536,9 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => {
-                        Ok(InterpolationPart::Expr(resolve_value_with_config(
+                        Ok(InterpolationPart::Expr(resolve_value_with_binding_lookup(
                             v,
-                            binding_map,
+                            binding_lookup,
                             config,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
@@ -1568,9 +1574,9 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
-                        resolve_value_with_config(
+                        resolve_value_with_binding_lookup(
                             value,
-                            binding_map,
+                            binding_lookup,
                             config,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
@@ -1600,9 +1606,9 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
-                        resolve_value_with_config(
+                        resolve_value_with_binding_lookup(
                             value,
-                            binding_map,
+                            binding_lookup,
                             config,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
@@ -1650,9 +1656,9 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
             }
         }
         GenericValue::Deferred(DeferredValue::Access(access)) => {
-            let resolved_base = resolve_value_with_config(
+            let resolved_base = resolve_value_with_binding_lookup(
                 access.base(),
-                binding_map,
+                binding_lookup,
                 config,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
@@ -1968,8 +1974,32 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
         for section in [&mut provider.attributes, &mut provider.default_tags] {
             let mut resolved = IndexMap::new();
             for (key, expr) in section.iter() {
-                let value = crate::resolver::resolve_ref_value_with_config(expr, &bindings, config)
-                    .map_err(|message| ParseError::InvalidExpression { line: 0, message })?;
+                // Evaluate authored functions through the typed parse-error
+                // path before the runtime resolver's string diagnostic seam.
+                // Only the placeholder stage changes; addresses stay absolute.
+                let parser_expr = expr.clone().into_placeholder_type::<ParserPlaceholder>();
+                let parser_resolved = resolve_value_with_binding_lookup(
+                    &parser_expr,
+                    &|binding: &AbsoluteBindingAddress, attribute: &str| {
+                        bindings
+                            .get(binding.as_str())
+                            .and_then(|attributes| attributes.get(attribute))
+                            .cloned()
+                            .map(RuntimeValue::into_placeholder_type)
+                    },
+                    config,
+                    false,
+                    false,
+                )?;
+                let expanded = parser_resolved.into_expanded().map_err(|error| {
+                    ParseError::InvalidExpression {
+                        line: 0,
+                        message: error.to_string(),
+                    }
+                })?;
+                let value =
+                    crate::resolver::resolve_ref_value_with_config(&expanded, &bindings, config)
+                        .map_err(|message| ParseError::InvalidExpression { line: 0, message })?;
                 resolved.insert(key.clone(), value);
             }
             *section = resolved;

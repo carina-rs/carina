@@ -1411,12 +1411,13 @@ mod tests {
             .pop()
             .expect("fixture contains one deferred loop");
         assert_eq!(template.target().display_name(), "main.crn:2");
+        assert_eq!(template.file(), Some("main.crn"));
         assert!(
             template
-                .file
-                .as_deref()
-                .is_some_and(|file| file.contains(fixture.path().to_string_lossy().as_ref())),
-            "the live diagnostic path should be machine-local before serialization"
+                .location()
+                .source_file()
+                .is_some_and(|source| source.starts_with(fixture.path())),
+            "the original source should remain machine-local for parser diagnostics"
         );
 
         let saved = carina_core::parser::SavedDeferredForExpression::from(template);

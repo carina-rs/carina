@@ -4,15 +4,15 @@ use carina_core::resource::{
     ResourceIdentity as CoreResourceIdentity, ResourceIdentityError as CoreResourceIdentityError,
 };
 use carina_core::schema::{
-    AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
+    AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType, ReadBackBudget,
     ResourceSchema as CoreResourceSchema, ValidatedConfigSchema as CoreValidatedConfigSchema,
     ValidatedResourceSchema as CoreValidatedResourceSchema, legacy_validator,
 };
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, DesiredAttribute,
-    DesiredResource, FoundRead, NormalizedResource, Pending, Poll, PollVerdict, Resume, ResumeStep,
-    ResumeVerdict, Sent, UpdateOutcome,
+    DesiredResource, FoundRead, NormalizedResource, Pending, PendingDelete, Poll, PollRequest,
+    PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -35,63 +35,47 @@ enum CreateMode {
 
 const UNENCODABLE_CREATE_TOKEN_POLLS: u32 = u32::MAX;
 
-#[derive(Debug)]
-struct CreateToken {
-    remaining: u32,
-    polls_served: u32,
-    mode: CreateMode,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum CreateToken {
+    Operation {
+        remaining: u32,
+        #[serde(serialize_with = "encode_create_poll_count")]
+        polls_served: u32,
+        #[serde(default, deserialize_with = "decode_create_mode")]
+        mode: CreateMode,
+    },
+    ReadBack,
 }
 
-#[derive(Serialize, Deserialize)]
-struct EncodedCreateToken {
-    remaining: u32,
-    polls_served: u32,
-    #[serde(default)]
-    mode: CreateMode,
-}
-
-impl Serialize for CreateToken {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        if self.polls_served == UNENCODABLE_CREATE_TOKEN_POLLS {
-            return Err(serde::ser::Error::custom(
-                "intentional mock create-token encode failure",
-            ));
-        }
-        EncodedCreateToken {
-            remaining: self.remaining,
-            polls_served: self.polls_served,
-            mode: self.mode,
-        }
-        .serialize(serializer)
+fn encode_create_poll_count<S: serde::Serializer>(
+    polls_served: &u32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if *polls_served == UNENCODABLE_CREATE_TOKEN_POLLS {
+        return Err(serde::ser::Error::custom(
+            "intentional mock create-token encode failure",
+        ));
     }
+    serializer.serialize_u32(*polls_served)
 }
 
-impl<'de> Deserialize<'de> for CreateToken {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let encoded = EncodedCreateToken::deserialize(deserializer)?;
-        if encoded.mode == CreateMode::MalformedPending {
-            return Err(serde::de::Error::custom(
-                "intentional mock create-token decode failure",
-            ));
-        }
-        Ok(Self {
-            remaining: encoded.remaining,
-            polls_served: encoded.polls_served,
-            mode: encoded.mode,
-        })
+fn decode_create_mode<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<CreateMode, D::Error> {
+    match CreateMode::deserialize(deserializer)? {
+        CreateMode::MalformedPending => Err(serde::de::Error::custom(
+            "intentional mock create-token decode failure",
+        )),
+        mode => Ok(mode),
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct UpdateToken {
-    remaining: u32,
-    polls_served: u32,
+#[serde(rename_all = "snake_case")]
+enum UpdateToken {
+    Operation { remaining: u32, polls_served: u32 },
+    ReadBack,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,13 +84,29 @@ struct DeleteToken {
 }
 
 struct MockProcessProvider {
-    states: Mutex<HashMap<String, BTreeMap<String, Value>>>,
+    states: Mutex<HashMap<String, MockState>>,
+    read_back_polls: Mutex<HashMap<String, u32>>,
+}
+
+enum MockState {
+    Present(BTreeMap<String, Value>),
+    Deleted,
+}
+
+const MOCK_IDENTIFIER_PREFIX: &str = "mock-v1:";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MockIdentifierPayload {
+    nonce: String,
+    read_back: bool,
+    delete_pending_polls: u32,
 }
 
 impl Default for MockProcessProvider {
     fn default() -> Self {
         Self {
             states: Mutex::new(HashMap::new()),
+            read_back_polls: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -117,10 +117,6 @@ impl MockProcessProvider {
             .with_description("Mock create/resume test control")
             .identity()
             .build()
-    }
-
-    fn resource_key(id: &ResourceId) -> String {
-        format!("{}.{}", id.resource_type, id.identity)
     }
 
     fn resource_id_wire_key(id: &ResourceId) -> String {
@@ -167,6 +163,110 @@ impl MockProcessProvider {
                 | Value::Map(_) => None,
             })
             .unwrap_or(0)
+    }
+
+    fn exact_pending_polls(attributes: &BTreeMap<String, Value>, key: &str) -> u32 {
+        attributes
+            .get(key)
+            .and_then(|value| match value {
+                Value::Int(value) => u32::try_from(*value).ok(),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    fn bool_attribute(attributes: &BTreeMap<String, Value>, key: &str) -> bool {
+        matches!(attributes.get(key), Some(Value::Bool(true)))
+    }
+
+    fn mint_identifier(attributes: &BTreeMap<String, Value>) -> AppliedIdentifier {
+        let payload = MockIdentifierPayload {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            // The WASM boundary has already decrypted secret inputs. Only
+            // typed lifecycle controls may enter a persisted identifier;
+            // arbitrary request values have no secrecy provenance here.
+            read_back: Self::exact_pending_polls(attributes, "create_read_back_pending_polls") > 0
+                || Self::exact_pending_polls(attributes, "update_read_back_pending_polls") > 0
+                || attributes.contains_key("computed"),
+            delete_pending_polls: Self::pending_polls(attributes, "delete_pending_polls"),
+        };
+        let payload = serde_json::to_string(&payload)
+            .expect("mock lifecycle controls must be JSON encodable");
+        AppliedIdentifier::new(format!("{MOCK_IDENTIFIER_PREFIX}{payload}"))
+            .expect("the encoded mock identifier is non-empty")
+    }
+
+    fn decode_identifier(identifier: &AppliedIdentifier) -> Option<BTreeMap<String, Value>> {
+        let payload = identifier.as_str().strip_prefix(MOCK_IDENTIFIER_PREFIX)?;
+        serde_json::from_str::<MockIdentifierPayload>(payload)
+            .ok()
+            .map(|payload| {
+                let mut attributes = BTreeMap::new();
+                if payload.delete_pending_polls > 0 {
+                    attributes.insert(
+                        "delete_pending_polls".to_string(),
+                        Value::Int(i64::from(payload.delete_pending_polls)),
+                    );
+                }
+                if payload.read_back {
+                    attributes.insert("computed".to_string(), Value::String("ready".to_string()));
+                    attributes.insert(
+                        "read_identifier".to_string(),
+                        Value::String(identifier.as_str().to_string()),
+                    );
+                }
+                attributes
+            })
+    }
+
+    fn remember_state(&self, identifier: &AppliedIdentifier, attributes: &BTreeMap<String, Value>) {
+        self.states.lock().unwrap().insert(
+            identifier.as_str().to_string(),
+            MockState::Present(attributes.clone()),
+        );
+    }
+
+    fn restore_attributes(
+        states: &HashMap<String, MockState>,
+        identifier: &AppliedIdentifier,
+    ) -> Option<BTreeMap<String, Value>> {
+        match states.get(identifier.as_str()) {
+            Some(MockState::Present(attributes)) => Some(attributes.clone()),
+            // A completed delete takes precedence over the identifier's
+            // fallback payload, just as a present in-process snapshot does.
+            Some(MockState::Deleted) => None,
+            None => Self::decode_identifier(identifier),
+        }
+    }
+
+    fn read_back_poll_number(&self, identifier: &AppliedIdentifier, operation: &str) -> u32 {
+        let key = format!("{operation}:{}", identifier.as_str());
+        let mut polls = self.read_back_polls.lock().unwrap();
+        let count = polls.entry(key).or_default();
+        *count += 1;
+        *count
+    }
+
+    fn complete_read_back(&self, identifier: &AppliedIdentifier) -> BTreeMap<String, Value> {
+        let mut states = self.states.lock().unwrap();
+        let mut attributes = Self::restore_attributes(&states, identifier).unwrap_or_default();
+        attributes.insert("computed".to_string(), Value::String("ready".to_string()));
+        states.insert(
+            identifier.as_str().to_string(),
+            MockState::Present(attributes.clone()),
+        );
+        attributes
+    }
+
+    fn read_back_attributes(&self, identifier: &AppliedIdentifier) -> BTreeMap<String, Value> {
+        Self::restore_attributes(&self.states.lock().unwrap(), identifier).unwrap_or_default()
+    }
+
+    fn partial_read_diagnostic() -> PartialReadDiagnostic {
+        PartialReadDiagnostic {
+            reason: "mock read-back is still pending".to_string(),
+            missing_attributes: vec!["computed".to_string()],
+        }
     }
 
     fn create_mode(attributes: &BTreeMap<String, Value>) -> CreateMode {
@@ -281,11 +381,14 @@ impl MockProcessProvider {
         }
     }
 
-    fn found_read(id: &ResourceId, attributes: BTreeMap<String, Value>) -> FoundRead {
+    fn found_read(
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        attributes: BTreeMap<String, Value>,
+    ) -> FoundRead {
         FoundRead::from_applied_state(AppliedState {
             id: id.clone(),
-            identifier: AppliedIdentifier::new("mock-read-id")
-                .expect("the mock read identifier is non-empty"),
+            identifier: identifier.clone(),
             attributes,
         })
     }
@@ -330,9 +433,31 @@ impl MockProcessProvider {
             .unwrap_or(0)
     }
 
-    fn create_done(
-        &self,
-        id: &ResourceId,
+    fn update_exact_pending_polls(request: &UpdateRequest, key: &str) -> u32 {
+        request
+            .patch
+            .ops
+            .iter()
+            .find(|op| op.key() == key)
+            .and_then(PatchOp::sent_value)
+            .and_then(|value| match value {
+                Value::Int(value) => u32::try_from(*value).ok(),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    fn update_bool_attribute(request: &UpdateRequest, key: &str) -> bool {
+        request
+            .patch
+            .ops
+            .iter()
+            .find(|op| op.key() == key)
+            .and_then(PatchOp::sent_value)
+            .is_some_and(|value| matches!(value, Value::Bool(true)))
+    }
+
+    fn created_attributes(
         mut request: CreateRequest,
         polls_served: Option<u32>,
     ) -> BTreeMap<String, Value> {
@@ -342,17 +467,34 @@ impl MockProcessProvider {
                 Value::Int(i64::from(polls_served)),
             );
         }
-        let mut states = self.states.lock().unwrap();
-        let key = Self::resource_key(id);
-        let resource = request.resource;
-        states.insert(key, resource.attributes.clone());
+        request.resource.attributes
+    }
 
-        resource.attributes
+    fn create_done(
+        &self,
+        request: CreateRequest,
+        polls_served: Option<u32>,
+    ) -> (AppliedIdentifier, BTreeMap<String, Value>) {
+        let attributes = Self::created_attributes(request, polls_served);
+        let identifier = Self::mint_identifier(&attributes);
+        self.remember_state(&identifier, &attributes);
+        (identifier, attributes)
+    }
+
+    fn create_done_with_identifier(
+        &self,
+        identifier: &AppliedIdentifier,
+        request: CreateRequest,
+        polls_served: Option<u32>,
+    ) -> BTreeMap<String, Value> {
+        let attributes = Self::created_attributes(request, polls_served);
+        self.remember_state(identifier, &attributes);
+        attributes
     }
 
     fn update_done(
         &self,
-        id: &ResourceId,
+        _id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
         polls_served: Option<u32>,
@@ -383,14 +525,9 @@ impl MockProcessProvider {
                 Value::Int(i64::from(polls_served)).into(),
             );
         }
-        let state = AppliedPersistedState {
-            id: state.id,
-            identifier: identifier.clone(),
-            attributes: state.attributes,
-        };
-
         let mut states = self.states.lock().unwrap();
-        let cloud_attributes = states.entry(Self::resource_key(id)).or_default();
+        let mut cloud_attributes =
+            Self::restore_attributes(&states, identifier).unwrap_or_default();
         // The fake cloud retains its existing ordinary values and receives
         // only the checked patch. Never rebuild it from persisted `from` state:
         // that would either send redacted digests to the cloud or discard an
@@ -415,11 +552,65 @@ impl MockProcessProvider {
             );
         }
 
+        // Fresh instances recover synthetic read-back/delete behavior from
+        // this version of the identifier rather than create-time controls.
+        let updated_identifier = Self::mint_identifier(&cloud_attributes);
+        states.insert(
+            identifier.as_str().to_string(),
+            MockState::Present(cloud_attributes.clone()),
+        );
+        states.insert(
+            updated_identifier.as_str().to_string(),
+            MockState::Present(cloud_attributes),
+        );
+        let state = AppliedPersistedState {
+            id: state.id,
+            identifier: updated_identifier,
+            attributes: state.attributes,
+        };
+
         carina_provider_protocol::UpdateOutcome::Success { state }
     }
 
-    fn delete_done(&self, id: &ResourceId) {
-        self.states.lock().unwrap().remove(&Self::resource_key(id));
+    fn update_read_back_done(
+        &self,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        request: UpdateRequest,
+    ) -> carina_provider_protocol::UpdateOutcome {
+        let outcome = self.update_done(id, identifier, request, None);
+        let carina_provider_protocol::UpdateOutcome::Success { mut state } = outcome else {
+            unreachable!("mock update_done always succeeds")
+        };
+        state.attributes.insert(
+            "computed".to_string(),
+            Value::String("ready".to_string()).into(),
+        );
+        let _attributes = self.complete_read_back(&state.identifier);
+        carina_provider_protocol::UpdateOutcome::Success { state }
+    }
+
+    fn update_read_back_partial(
+        &self,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        request: UpdateRequest,
+    ) -> carina_provider_protocol::UpdateOutcome {
+        let outcome = self.update_done(id, identifier, request, None);
+        let carina_provider_protocol::UpdateOutcome::Success { state } = outcome else {
+            unreachable!("mock update_done always succeeds")
+        };
+        carina_provider_protocol::UpdateOutcome::PartialSuccess {
+            state,
+            diagnostic: Self::partial_read_diagnostic(),
+        }
+    }
+
+    fn delete_done(&self, identifier: &AppliedIdentifier) {
+        self.states
+            .lock()
+            .unwrap()
+            .insert(identifier.as_str().to_string(), MockState::Deleted);
     }
 }
 
@@ -439,6 +630,46 @@ impl CarinaProvider for MockProcessProvider {
 
     fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
         vec![
+            CoreResourceSchema::new("test.read_back")
+                .attribute(
+                    CoreAttributeSchema::optional(
+                        "create_read_back_pending_polls",
+                        CoreAttributeType::int(),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional("present", CoreAttributeType::string()).build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional("from_read_back", CoreAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::provider_populated(
+                        "computed",
+                        CoreAttributeType::string(),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::provider_populated(
+                        "read_identifier",
+                        CoreAttributeType::string(),
+                    )
+                    .build(),
+                )
+                .with_description("Mock resource for host-owned read-back polling")
+                .with_operation_config(OperationConfig {
+                    create_timeout_secs: Some(5),
+                    update_timeout_secs: Some(5),
+                    delete_timeout_secs: Some(5),
+                    create_max_retries: None,
+                    delete_max_retries: None,
+                    read_back: ReadBackBudget::from_secs(2),
+                })
+                .validate()
+                .expect("mock read-back schema must be valid"),
             CoreResourceSchema::new("test.short_budget")
                 .attribute(Self::optional_string_attribute("create_mode"))
                 .with_description("Mock resource with short operation budgets")
@@ -448,6 +679,7 @@ impl CarinaProvider for MockProcessProvider {
                     delete_timeout_secs: Some(2),
                     create_max_retries: None,
                     delete_max_retries: None,
+                    read_back: ReadBackBudget::from_secs(1),
                 })
                 .validate()
                 .expect("mock process schema must be valid"),
@@ -575,10 +807,10 @@ impl CarinaProvider for MockProcessProvider {
         identifier: &AppliedIdentifier,
         _request: ReadRequest,
     ) -> Result<ReadOutcome, ProviderError> {
-        if id.identity == "__mock_read_error__" {
+        if identifier.as_str() == "__mock_read_error__" {
             return Err(Self::operation_error("read", id));
         }
-        if id.identity == "__mock_non_finite_read__" {
+        if identifier.as_str() == "__mock_non_finite_read__" {
             return Ok(ReadOutcome::Found {
                 state: AppliedState {
                     id: id.clone(),
@@ -591,20 +823,31 @@ impl CarinaProvider for MockProcessProvider {
             });
         }
 
-        let states = self.states.lock().unwrap();
-        let key = Self::resource_key(id);
-
-        if let Some(attrs) = states.get(&key) {
-            Ok(ReadOutcome::Found {
-                state: AppliedState {
-                    id: id.clone(),
-                    identifier: identifier.clone(),
-                    attributes: attrs.clone(),
-                },
-            })
-        } else {
-            Ok(ReadOutcome::NotFound { id: id.clone() })
+        let mut states = self.states.lock().unwrap();
+        let key = identifier.as_str().to_string();
+        let Some(mut attributes) = Self::restore_attributes(&states, identifier) else {
+            return Ok(ReadOutcome::NotFound { id: id.clone() });
+        };
+        let read_back_was_requested =
+            Self::exact_pending_polls(&attributes, "create_read_back_pending_polls") > 0
+                || Self::exact_pending_polls(&attributes, "update_read_back_pending_polls") > 0;
+        if read_back_was_requested {
+            attributes
+                .entry("computed".to_string())
+                .or_insert_with(|| Value::String("ready".to_string()));
+            attributes.insert(
+                "read_identifier".to_string(),
+                Value::String(identifier.as_str().to_string()),
+            );
         }
+        states.insert(key, MockState::Present(attributes.clone()));
+        Ok(ReadOutcome::Found {
+            state: AppliedState {
+                id: id.clone(),
+                identifier: identifier.clone(),
+                attributes,
+            },
+        })
     }
 
     /// Exercise the `read_data_source` path end-to-end through the WASM
@@ -669,37 +912,35 @@ impl CarinaProvider for MockProcessProvider {
         let sent = Self::sent_attributes(&request.resource.attributes);
         let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
         if unencodable_created {
-            let mut attributes = self.create_done(id, request, None);
+            let (identifier, mut attributes) = self.create_done(request, None);
             attributes.insert(
                 "__mock_unencodable__".to_string(),
                 Value::List(vec![Value::Float(f64::NAN)]),
             );
-            let identifier =
-                AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
             return Ok(attempt.issued(identifier, sent).succeeded(attributes));
         }
         if unencodable_pending || unencodable_pending_issued {
-            let token = CreateToken {
+            let token = CreateToken::Operation {
                 remaining: 100,
                 polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
                 mode: CreateMode::Pending,
             };
             if unencodable_pending_issued {
-                let identifier =
-                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                let identifier = Self::mint_identifier(&request.resource.attributes);
+                self.remember_state(&identifier, &request.resource.attributes);
                 return Ok(attempt.issued(identifier, sent).pending(token, 1));
             }
             return Ok(attempt.pending(token, sent, 1));
         }
         if unencodable_poll || unencodable_poll_issued {
-            let token = CreateToken {
+            let token = CreateToken::Operation {
                 remaining: 100,
                 polls_served: 0,
                 mode: CreateMode::Pending,
             };
             if unencodable_poll_issued {
-                let identifier =
-                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                let identifier = Self::mint_identifier(&request.resource.attributes);
+                self.remember_state(&identifier, &request.resource.attributes);
                 return Ok(attempt.issued(identifier, sent).pending(token, 1));
             }
             return Ok(attempt.pending(token, sent, 1));
@@ -735,12 +976,14 @@ impl CarinaProvider for MockProcessProvider {
         }
         let pending_polls =
             Self::pending_polls(&request.resource.attributes, "create_pending_polls");
+        let read_back_pending_polls = Self::exact_pending_polls(
+            &request.resource.attributes,
+            "create_read_back_pending_polls",
+        );
         match mode {
             CreateMode::Untracked => Err(attempt.untracked(Self::create_mode_error(id, mode))),
             CreateMode::Created => {
-                let attributes = self.create_done(id, request, None);
-                let identifier =
-                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                let (identifier, attributes) = self.create_done(request, None);
                 let observation = Observation::Read(ReadOutcome::Found {
                     state: AppliedState {
                         id: id.clone(),
@@ -756,10 +999,14 @@ impl CarinaProvider for MockProcessProvider {
                     None => issued.failed(observation, Self::create_mode_error(id, mode)),
                 })
             }
+            CreateMode::Normal if pending_polls == 0 && read_back_pending_polls > 0 => {
+                let (identifier, _attributes) = self.create_done(request, None);
+                Ok(attempt
+                    .issued(identifier, sent)
+                    .pending_read_back(CreateToken::ReadBack, 1))
+            }
             CreateMode::Normal if pending_polls == 0 => {
-                let attributes = self.create_done(id, request, None);
-                let identifier =
-                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                let (identifier, attributes) = self.create_done(request, None);
                 let issued = attempt.issued(identifier, sent);
                 Ok(match canonical_identifier {
                     Some(identifier) => issued.canonicalize(identifier).succeeded(attributes),
@@ -767,7 +1014,7 @@ impl CarinaProvider for MockProcessProvider {
                 })
             }
             CreateMode::Normal => Ok(attempt.pending(
-                CreateToken {
+                CreateToken::Operation {
                     remaining: pending_polls - 1,
                     polls_served: 0,
                     mode,
@@ -776,10 +1023,10 @@ impl CarinaProvider for MockProcessProvider {
                 1,
             )),
             CreateMode::Resumed | CreateMode::Discarded => {
-                let identifier =
-                    AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
+                let identifier = Self::mint_identifier(&request.resource.attributes);
+                self.remember_state(&identifier, &request.resource.attributes);
                 Ok(attempt.issued(identifier, sent).pending(
-                    CreateToken {
+                    CreateToken::Operation {
                         remaining: 100,
                         polls_served: 0,
                         mode,
@@ -791,7 +1038,7 @@ impl CarinaProvider for MockProcessProvider {
             | CreateMode::Undetermined
             | CreateMode::MalformedPending
             | CreateMode::Resend => Ok(attempt.pending(
-                CreateToken {
+                CreateToken::Operation {
                     remaining: 100,
                     polls_served: 0,
                     mode,
@@ -807,6 +1054,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         poll: Poll<Self::CreateToken>,
+        poll_request: PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         let unencodable_poll = matches!(
             request.resource.attributes.get("create_mode"),
@@ -814,7 +1062,7 @@ impl CarinaProvider for MockProcessProvider {
                 if mode == "unencodable_poll" || mode == "unencodable_poll_issued"
         );
         if unencodable_poll {
-            let token = CreateToken {
+            let token = CreateToken::Operation {
                 remaining: 100,
                 polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
                 mode: CreateMode::Pending,
@@ -826,22 +1074,35 @@ impl CarinaProvider for MockProcessProvider {
         }
         let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
         match poll {
-            Poll::Unissued(attempt, token) => match token.mode {
+            Poll::Unissued(
+                attempt,
+                CreateToken::Operation {
+                    remaining,
+                    polls_served,
+                    mode,
+                },
+            ) => match mode {
                 CreateMode::Normal => {
-                    if token.remaining > 0 {
+                    if remaining > 0 {
                         return Ok(attempt.pending(
-                            CreateToken {
-                                remaining: token.remaining - 1,
-                                polls_served: token.polls_served + 1,
-                                mode: token.mode,
+                            CreateToken::Operation {
+                                remaining: remaining - 1,
+                                polls_served: polls_served + 1,
+                                mode,
                             },
                             1,
                         ));
                     }
-                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
-                    let identifier = AppliedIdentifier::new("mock-id")
-                        .expect("the mock identifier is non-empty");
+                    let read_back_pending_polls = Self::exact_pending_polls(
+                        &request.resource.attributes,
+                        "create_read_back_pending_polls",
+                    );
+                    let (identifier, attributes) =
+                        self.create_done(request, Some(polls_served + 1));
                     let issued = attempt.issued(identifier);
+                    if read_back_pending_polls > 0 {
+                        return Ok(issued.pending_read_back(CreateToken::ReadBack, 1));
+                    }
                     Ok(match canonical_identifier {
                         Some(identifier) => issued.canonicalize(identifier).succeeded(attributes),
                         None => issued.succeeded(attributes),
@@ -852,15 +1113,19 @@ impl CarinaProvider for MockProcessProvider {
                 | CreateMode::Discarded
                 | CreateMode::Undetermined
                 | CreateMode::Resend) => Ok(attempt.pending(
-                    CreateToken {
-                        remaining: token.remaining,
-                        polls_served: token.polls_served + 1,
+                    CreateToken::Operation {
+                        remaining,
+                        polls_served: polls_served + 1,
                         mode,
                     },
                     1,
                 )),
                 CreateMode::MalformedPending => Err(attempt.preserve(
-                    token,
+                    CreateToken::Operation {
+                        remaining,
+                        polls_served,
+                        mode,
+                    },
                     1,
                     Self::create_mode_error(id, CreateMode::MalformedPending),
                 )),
@@ -868,8 +1133,8 @@ impl CarinaProvider for MockProcessProvider {
                     Err(attempt.untracked(Self::create_mode_error(id, CreateMode::Untracked)))
                 }
                 CreateMode::Created => {
-                    let identifier = AppliedIdentifier::new("mock-id")
-                        .expect("the mock identifier is non-empty");
+                    let identifier = Self::mint_identifier(&request.resource.attributes);
+                    self.remember_state(&identifier, &request.resource.attributes);
                     let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
                     let issued = attempt.issued(identifier);
                     Err(match canonical_identifier {
@@ -889,19 +1154,38 @@ impl CarinaProvider for MockProcessProvider {
                     })
                 }
             },
-            Poll::Issued(issued, token) => match token.mode {
+            Poll::Issued(
+                issued,
+                CreateToken::Operation {
+                    remaining,
+                    polls_served,
+                    mode,
+                },
+            ) => match mode {
                 CreateMode::Normal => {
-                    if token.remaining > 0 {
+                    if remaining > 0 {
                         return Ok(issued.pending(
-                            CreateToken {
-                                remaining: token.remaining - 1,
-                                polls_served: token.polls_served + 1,
-                                mode: token.mode,
+                            CreateToken::Operation {
+                                remaining: remaining - 1,
+                                polls_served: polls_served + 1,
+                                mode,
                             },
                             1,
                         ));
                     }
-                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    let read_back_pending_polls = Self::exact_pending_polls(
+                        &request.resource.attributes,
+                        "create_read_back_pending_polls",
+                    );
+                    let identifier = issued.identifier().clone();
+                    let attributes = self.create_done_with_identifier(
+                        &identifier,
+                        request,
+                        Some(polls_served + 1),
+                    );
+                    if read_back_pending_polls > 0 {
+                        return Ok(issued.pending_read_back(CreateToken::ReadBack, 1));
+                    }
                     Ok(match canonical_identifier {
                         Some(identifier) => issued.canonicalize(identifier).succeeded(attributes),
                         None => issued.succeeded(attributes),
@@ -912,16 +1196,16 @@ impl CarinaProvider for MockProcessProvider {
                 | CreateMode::Discarded
                 | CreateMode::Undetermined
                 | CreateMode::Resend) => Ok(issued.pending(
-                    CreateToken {
-                        remaining: token.remaining,
-                        polls_served: token.polls_served + 1,
+                    CreateToken::Operation {
+                        remaining,
+                        polls_served: polls_served + 1,
                         mode,
                     },
                     1,
                 )),
-                CreateMode::MalformedPending | CreateMode::Untracked => Err(issued
-                    .discarded(Self::create_mode_error(id, token.mode))
-                    .into()),
+                CreateMode::MalformedPending | CreateMode::Untracked => {
+                    Err(issued.discarded(Self::create_mode_error(id, mode)).into())
+                }
                 CreateMode::Created => {
                     let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
                     Err(match canonical_identifier {
@@ -941,6 +1225,37 @@ impl CarinaProvider for MockProcessProvider {
                     })
                 }
             },
+            Poll::Unissued(attempt, CreateToken::ReadBack) => {
+                Err(attempt.untracked(Self::operation_error("unissued read-back", id)))
+            }
+            Poll::Issued(issued, CreateToken::ReadBack) => {
+                if poll_request.finality == carina_plugin_sdk::PollFinality::FinalAttempt {
+                    if Self::bool_attribute(
+                        &request.resource.attributes,
+                        "create_read_back_operation_after_final",
+                    ) {
+                        return Ok(issued.pending(CreateToken::ReadBack, 1));
+                    }
+                    if Self::bool_attribute(
+                        &request.resource.attributes,
+                        "create_read_back_pending_after_final",
+                    ) {
+                        return Ok(issued.pending_read_back(CreateToken::ReadBack, 1));
+                    }
+                    let attributes = self.read_back_attributes(issued.identifier());
+                    return Ok(issued.partial(attributes, Self::partial_read_diagnostic()));
+                }
+                let target = Self::exact_pending_polls(
+                    &request.resource.attributes,
+                    "create_read_back_pending_polls",
+                );
+                if self.read_back_poll_number(issued.identifier(), "create") >= target {
+                    let attributes = self.complete_read_back(issued.identifier());
+                    Ok(issued.succeeded(attributes))
+                } else {
+                    Ok(issued.pending_read_back(CreateToken::ReadBack, 1))
+                }
+            }
         }
     }
 
@@ -949,13 +1264,14 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         resume: Resume<Self::CreateToken>,
+        poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         let unencodable_repending = matches!(
             request.resource.attributes.get("create_mode"),
             Some(Value::String(mode)) if mode == "unencodable_repending"
         );
         if unencodable_repending {
-            let token = CreateToken {
+            let token = CreateToken::Operation {
                 remaining: 100,
                 polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
                 mode: CreateMode::Pending,
@@ -967,66 +1283,76 @@ impl CarinaProvider for MockProcessProvider {
         }
         let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
         match resume {
-            Resume::Unissued(attempt, token) => match token.mode {
+            Resume::Unissued(
+                attempt,
+                CreateToken::Operation {
+                    remaining,
+                    polls_served,
+                    mode,
+                },
+            ) => match mode {
                 CreateMode::Normal => {
-                    if token.remaining > 0 {
+                    if remaining > 0 {
                         return Ok(attempt.pending(
-                            CreateToken {
-                                remaining: token.remaining - 1,
-                                polls_served: token.polls_served + 1,
-                                mode: token.mode,
+                            CreateToken::Operation {
+                                remaining: remaining - 1,
+                                polls_served: polls_served + 1,
+                                mode,
                             },
                             1,
                         ));
                     }
-                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
-                    let identifier = AppliedIdentifier::new("mock-id")
-                        .expect("the mock identifier is non-empty");
+                    let (identifier, attributes) =
+                        self.create_done(request, Some(polls_served + 1));
                     let resumed = attempt.issued(identifier);
+                    let found = Self::found_read(id, resumed.identifier(), attributes);
                     Ok(match canonical_identifier {
-                        Some(identifier) => resumed
-                            .canonicalize(identifier)
-                            .completed(Self::found_read(id, attributes)),
-                        None => resumed.completed(Self::found_read(id, attributes)),
+                        Some(identifier) => resumed.canonicalize(identifier).completed(found),
+                        None => resumed.completed(found),
                     })
                 }
                 CreateMode::Pending => Ok(attempt.pending(
-                    CreateToken {
-                        remaining: token.remaining,
-                        polls_served: token.polls_served + 1,
-                        mode: token.mode,
+                    CreateToken::Operation {
+                        remaining,
+                        polls_served: polls_served + 1,
+                        mode,
                     },
                     1,
                 )),
                 CreateMode::Resumed => {
-                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
-                    let identifier = AppliedIdentifier::new("mock-id")
-                        .expect("the mock identifier is non-empty");
+                    let (identifier, attributes) =
+                        self.create_done(request, Some(polls_served + 1));
                     let resumed = attempt.issued(identifier);
+                    let found = Self::found_read(id, resumed.identifier(), attributes);
                     Ok(match canonical_identifier {
-                        Some(identifier) => resumed
-                            .canonicalize(identifier)
-                            .completed(Self::found_read(id, attributes)),
-                        None => resumed.completed(Self::found_read(id, attributes)),
+                        Some(identifier) => resumed.canonicalize(identifier).completed(found),
+                        None => resumed.completed(found),
                     })
                 }
                 CreateMode::Discarded | CreateMode::Untracked => {
-                    Err(attempt.untracked(Self::create_mode_error(id, token.mode)))
+                    Err(attempt.untracked(Self::create_mode_error(id, mode)))
                 }
                 CreateMode::Undetermined => Err(attempt.preserve(
-                    token,
+                    CreateToken::Operation {
+                        remaining,
+                        polls_served,
+                        mode,
+                    },
                     1,
                     Self::create_mode_error(id, CreateMode::Undetermined),
                 )),
                 CreateMode::MalformedPending => Err(attempt.preserve(
-                    token,
+                    CreateToken::Operation {
+                        remaining,
+                        polls_served,
+                        mode,
+                    },
                     1,
                     Self::create_mode_error(id, CreateMode::MalformedPending),
                 )),
                 CreateMode::Resend => {
-                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
-                    let identifier = AppliedIdentifier::new("mock-id")
-                        .expect("the mock identifier is non-empty");
+                    let (identifier, attributes) =
+                        self.create_done(request, Some(polls_served + 1));
                     let issued = attempt
                         .resend()
                         .issued(identifier, Sent::AllRequestAttributes);
@@ -1038,8 +1364,8 @@ impl CarinaProvider for MockProcessProvider {
                     })
                 }
                 CreateMode::Created => {
-                    let identifier = AppliedIdentifier::new("mock-id")
-                        .expect("the mock identifier is non-empty");
+                    let identifier = Self::mint_identifier(&request.resource.attributes);
+                    self.remember_state(&identifier, &request.resource.attributes);
                     let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
                     let resumed = attempt.issued(identifier);
                     Err(match canonical_identifier {
@@ -1054,58 +1380,87 @@ impl CarinaProvider for MockProcessProvider {
                     })
                 }
             },
-            Resume::Issued(resumed, token) => match token.mode {
+            Resume::Issued(
+                resumed,
+                CreateToken::Operation {
+                    remaining,
+                    polls_served,
+                    mode,
+                },
+            ) => match mode {
                 CreateMode::Normal => {
-                    if token.remaining > 0 {
+                    if remaining > 0 {
                         return Ok(resumed.pending(
-                            CreateToken {
-                                remaining: token.remaining - 1,
-                                polls_served: token.polls_served + 1,
-                                mode: token.mode,
+                            CreateToken::Operation {
+                                remaining: remaining - 1,
+                                polls_served: polls_served + 1,
+                                mode,
                             },
                             1,
                         ));
                     }
-                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    let identifier = resumed.identifier().clone();
+                    let attributes = self.create_done_with_identifier(
+                        &identifier,
+                        request,
+                        Some(polls_served + 1),
+                    );
+                    let found = Self::found_read(id, resumed.identifier(), attributes);
                     Ok(match canonical_identifier {
-                        Some(identifier) => resumed
-                            .canonicalize(identifier)
-                            .completed(Self::found_read(id, attributes)),
-                        None => resumed.completed(Self::found_read(id, attributes)),
+                        Some(identifier) => resumed.canonicalize(identifier).completed(found),
+                        None => resumed.completed(found),
                     })
                 }
                 CreateMode::Pending => Ok(resumed.pending(
-                    CreateToken {
-                        remaining: token.remaining,
-                        polls_served: token.polls_served + 1,
-                        mode: token.mode,
+                    CreateToken::Operation {
+                        remaining,
+                        polls_served: polls_served + 1,
+                        mode,
                     },
                     1,
                 )),
                 CreateMode::Resumed | CreateMode::Resend => {
-                    let attributes = self.create_done(id, request, Some(token.polls_served + 1));
+                    let identifier = resumed.identifier().clone();
+                    let attributes = self.create_done_with_identifier(
+                        &identifier,
+                        request,
+                        Some(polls_served + 1),
+                    );
+                    let found = Self::found_read(id, resumed.identifier(), attributes);
                     Ok(match canonical_identifier {
-                        Some(identifier) => resumed
-                            .canonicalize(identifier)
-                            .completed(Self::found_read(id, attributes)),
-                        None => resumed.completed(Self::found_read(id, attributes)),
+                        Some(identifier) => resumed.canonicalize(identifier).completed(found),
+                        None => resumed.completed(found),
                     })
                 }
                 CreateMode::Discarded | CreateMode::Untracked | CreateMode::MalformedPending => {
-                    Err(resumed.discarded(Self::create_mode_error(id, token.mode)))
+                    Err(resumed.discarded(Self::create_mode_error(id, mode)))
                 }
                 CreateMode::Undetermined | CreateMode::Created => {
                     let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
                     Err(match canonical_identifier {
                         Some(identifier) => resumed
                             .canonicalize(identifier)
-                            .failed(observation, Self::create_mode_error(id, token.mode)),
-                        None => {
-                            resumed.failed(observation, Self::create_mode_error(id, token.mode))
-                        }
+                            .failed(observation, Self::create_mode_error(id, mode)),
+                        None => resumed.failed(observation, Self::create_mode_error(id, mode)),
                     })
                 }
             },
+            Resume::Unissued(attempt, CreateToken::ReadBack) => {
+                Err(attempt.untracked(Self::operation_error("unissued read-back", id)))
+            }
+            Resume::Issued(resumed, CreateToken::ReadBack) => {
+                if poll_request.finality == carina_plugin_sdk::PollFinality::FinalAttempt {
+                    if Self::bool_attribute(
+                        &request.resource.attributes,
+                        "create_read_back_pending_after_final",
+                    ) {
+                        return Ok(resumed.pending_read_back(CreateToken::ReadBack, 1));
+                    }
+                    let attributes = self.read_back_attributes(resumed.identifier());
+                    return Ok(resumed.partial(attributes, Self::partial_read_diagnostic()));
+                }
+                Ok(resumed.pending_read_back(CreateToken::ReadBack, 1))
+            }
         }
     }
 
@@ -1117,13 +1472,20 @@ impl CarinaProvider for MockProcessProvider {
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
         let pending_polls = Self::update_pending_polls(&request);
         if pending_polls > 0 {
-            return Ok(UpdateOutcome::Pending(Pending {
-                token: UpdateToken {
+            return Ok(UpdateOutcome::Pending(Pending::operation(
+                UpdateToken::Operation {
                     remaining: pending_polls - 1,
                     polls_served: 0,
                 },
-                poll_after_secs: 1,
-            }));
+                1,
+            )));
+        }
+        if Self::update_exact_pending_polls(&request, "update_read_back_pending_polls") > 0 {
+            let _outcome = self.update_done(id, identifier, request, None);
+            return Ok(UpdateOutcome::Pending(Pending::read_back(
+                UpdateToken::ReadBack,
+                1,
+            )));
         }
         Ok(UpdateOutcome::Done(
             self.update_done(id, identifier, request, None),
@@ -1136,65 +1498,112 @@ impl CarinaProvider for MockProcessProvider {
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
         pending: Pending<Self::UpdateToken>,
+        poll_request: PollRequest,
     ) -> Result<UpdateOutcome<Self::UpdateToken>, ProviderError> {
-        if pending.token.remaining > 0 {
-            return Ok(UpdateOutcome::Pending(Pending {
-                token: UpdateToken {
-                    remaining: pending.token.remaining - 1,
-                    polls_served: pending.token.polls_served + 1,
+        match pending.token {
+            UpdateToken::Operation {
+                remaining,
+                polls_served,
+            } if remaining > 0 => Ok(UpdateOutcome::Pending(Pending::operation(
+                UpdateToken::Operation {
+                    remaining: remaining - 1,
+                    polls_served: polls_served + 1,
                 },
-                poll_after_secs: 1,
-            }));
+                1,
+            ))),
+            UpdateToken::Operation {
+                remaining: _,
+                polls_served,
+            } => {
+                if Self::update_exact_pending_polls(&request, "update_read_back_pending_polls") > 0
+                {
+                    let _outcome =
+                        self.update_done(id, identifier, request, Some(polls_served + 1));
+                    return Ok(UpdateOutcome::Pending(Pending::read_back(
+                        UpdateToken::ReadBack,
+                        1,
+                    )));
+                }
+                Ok(UpdateOutcome::Done(self.update_done(
+                    id,
+                    identifier,
+                    request,
+                    Some(polls_served + 1),
+                )))
+            }
+            UpdateToken::ReadBack
+                if poll_request.finality == carina_plugin_sdk::PollFinality::FinalAttempt =>
+            {
+                if Self::update_bool_attribute(&request, "update_read_back_operation_after_final") {
+                    return Ok(UpdateOutcome::Pending(Pending::operation(
+                        UpdateToken::ReadBack,
+                        1,
+                    )));
+                }
+                if Self::update_bool_attribute(&request, "update_read_back_pending_after_final") {
+                    return Ok(UpdateOutcome::Pending(Pending::read_back(
+                        UpdateToken::ReadBack,
+                        1,
+                    )));
+                }
+                Ok(UpdateOutcome::Done(
+                    self.update_read_back_partial(id, identifier, request),
+                ))
+            }
+            UpdateToken::ReadBack => {
+                let target =
+                    Self::update_exact_pending_polls(&request, "update_read_back_pending_polls");
+                if self.read_back_poll_number(identifier, "update") >= target {
+                    Ok(UpdateOutcome::Done(
+                        self.update_read_back_done(id, identifier, request),
+                    ))
+                } else {
+                    Ok(UpdateOutcome::Pending(Pending::read_back(
+                        UpdateToken::ReadBack,
+                        1,
+                    )))
+                }
+            }
         }
-        Ok(UpdateOutcome::Done(self.update_done(
-            id,
-            identifier,
-            request,
-            Some(pending.token.polls_served + 1),
-        )))
     }
 
     fn delete(
         &self,
-        id: &ResourceId,
-        _identifier: &AppliedIdentifier,
+        _id: &ResourceId,
+        identifier: &AppliedIdentifier,
         _request: DeleteRequest,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
-        let pending_polls = self
-            .states
-            .lock()
-            .unwrap()
-            .get(&Self::resource_key(id))
-            .map(|attributes| Self::pending_polls(attributes, "delete_pending_polls"))
+        let pending_polls = Self::restore_attributes(&self.states.lock().unwrap(), identifier)
+            .map(|attributes| Self::pending_polls(&attributes, "delete_pending_polls"))
             .unwrap_or(0);
         if pending_polls > 0 {
-            return Ok(DeleteOutcome::Pending(Pending {
-                token: DeleteToken {
+            return Ok(DeleteOutcome::Pending(PendingDelete::new(
+                DeleteToken {
                     remaining: pending_polls - 1,
                 },
-                poll_after_secs: 1,
-            }));
+                1,
+            )));
         }
-        self.delete_done(id);
+        self.delete_done(identifier);
         Ok(DeleteOutcome::Deleted)
     }
 
     fn poll_delete(
         &self,
-        id: &ResourceId,
-        _identifier: &AppliedIdentifier,
+        _id: &ResourceId,
+        identifier: &AppliedIdentifier,
         _request: DeleteRequest,
-        pending: Pending<Self::DeleteToken>,
+        pending: PendingDelete<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
         if pending.token.remaining > 0 {
-            return Ok(DeleteOutcome::Pending(Pending {
-                token: DeleteToken {
+            return Ok(DeleteOutcome::Pending(PendingDelete::new(
+                DeleteToken {
                     remaining: pending.token.remaining - 1,
                 },
-                poll_after_secs: 1,
-            }));
+                1,
+            )));
         }
-        self.delete_done(id);
+        self.delete_done(identifier);
         Ok(DeleteOutcome::Deleted)
     }
 

@@ -1358,10 +1358,9 @@ fn parsed_deferred_resource(
         RelativeBindingName,
     >,
 ) -> ParsedDeferredForExpression {
-    ParsedDeferredForExpression::new(
+    ParsedDeferredForExpression::from_location(
         (
-            expression.file.clone(),
-            expression.line,
+            expression.location().clone(),
             SourceSpan::dummy(),
             expression.header.clone(),
         ),

@@ -252,7 +252,7 @@ async fn create_checked_bootstrap_resource(
     match outcome {
         Ok(outcome) => {
             let identifier = outcome.identifier().as_str().to_string();
-            let (state, accepted_request, diagnostic) =
+            let (state, accepted_request, diagnostic, _read_back_end) =
                 carina_core::executor::complete_create_for_writeback(outcome, accepted_request);
             let row = carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                 &resolved,
@@ -639,7 +639,7 @@ async fn execute_effects_with_observer(
     checkpoint_sink: ExecutionCheckpointSink,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
-    observer: Box<dyn ExecutionObserver>,
+    observer: &dyn ExecutionObserver,
 ) -> ExecutionOutcome {
     let input = LiveExecutionInput {
         plan,
@@ -660,8 +660,7 @@ async fn execute_effects_with_observer(
         checkpoint_sink,
     };
 
-    let outcome =
-        carina_core::executor::execute_live_plan(provider, input, &*observer, cancel).await;
+    let outcome = carina_core::executor::execute_live_plan(provider, input, observer, cancel).await;
 
     // Write back the updated current views so callers see refreshes.
     let result = match &outcome {
@@ -694,7 +693,7 @@ async fn execute_rehydrated_saved_plan(
     checkpoint_sink: ExecutionCheckpointSink<SavedModuleSource>,
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
-    observer: Box<dyn ExecutionObserver<SavedModuleSource>>,
+    observer: &dyn ExecutionObserver<SavedModuleSource>,
 ) -> ExecutionOutcome<SavedModuleSource> {
     let input = SavedExecutionInput {
         plan: plan_file.plan(),
@@ -715,7 +714,7 @@ async fn execute_rehydrated_saved_plan(
         checkpoint_sink,
     };
     let outcome =
-        carina_core::executor::execute_saved_plan(provider, input, &*observer, cancel).await;
+        carina_core::executor::execute_saved_plan(provider, input, observer, cancel).await;
     let result = match &outcome {
         ExecutionOutcome::Completed(result) | ExecutionOutcome::Cancelled(result) => result,
     };
@@ -2409,7 +2408,7 @@ async fn run_apply_locked_owned(
                 checkpoint_sink.clone(),
                 cancel.clone(),
                 parallelism,
-                observer,
+                observer.as_ref(),
             )
             .await;
             let (mut result, cancelled) = split_execution_outcome(outcome);
@@ -2424,6 +2423,7 @@ async fn run_apply_locked_owned(
                 &mut result,
                 &cancel,
                 &checkpoint_sink,
+                observer.as_ref(),
             )
             .await;
             let state_base = saver.stop(&cancel).await;
@@ -3075,8 +3075,10 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 36
-    // adds typed deferred-for templates and stage-specific placeholder types.
+    // Validate version compatibility before decoding the payload. Format 37
+    // requires a relative diagnostic file (or null) and line on each deferred-for
+    // template. Format 36 adds typed deferred-for templates and stage-specific
+    // placeholder types.
     // Format 35 stores tri-state prevent_destroy directives, so format 34
     // plans must be regenerated. Format 34 adds typed deferred integer
     // arithmetic expressions. Format 33 adds the typed keyed-list release
@@ -3808,7 +3810,7 @@ async fn run_apply_from_plan_locked_owned(
                 checkpoint_sink.clone(),
                 cancel.clone(),
                 parallelism,
-                observer,
+                observer.as_ref(),
             )
             .await;
             let (mut result, cancelled) = split_execution_outcome(outcome);
@@ -3823,6 +3825,7 @@ async fn run_apply_from_plan_locked_owned(
                 &mut result,
                 &cancel,
                 &checkpoint_sink,
+                observer.as_ref(),
             )
             .await;
             let state_base = saver.stop(&cancel).await;
@@ -4014,7 +4017,7 @@ fn finish_apply<S>(
 ) -> Result<Option<Duration>, AppError> {
     println!();
     let exit_code = apply_exit_code_for_counts(
-        result.failure_count + result.skip_count + result.interrupted_count,
+        result.failure_count() + result.skip_count + result.interrupted_count,
         result.partial_count,
     );
     if exit_code == ApplyExitCode::Success && skipped_exports.is_empty() {
@@ -4031,8 +4034,8 @@ fn finish_apply<S>(
     if result.partial_count > 0 {
         parts.push(format!("{} partial", result.partial_count));
     }
-    if result.failure_count > 0 {
-        parts.push(format!("{} failed", result.failure_count));
+    if result.failure_count() > 0 {
+        parts.push(format!("{} failed", result.failure_count()));
     }
     if result.skip_count > 0 {
         parts.push(format!("{} skipped", result.skip_count));
@@ -4061,7 +4064,7 @@ fn finish_apply<S>(
     if exit_code == ApplyExitCode::PartialSuccess {
         Err(AppError::PartialSuccess(message))
     } else {
-        Err(AppError::Config(message))
+        Err(crate::error::ExecutionFailureReport::new(message, result.failures()).into())
     }
 }
 
