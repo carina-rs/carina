@@ -3,9 +3,16 @@
 ## Version 15
 
 Protocol v15 separates an asynchronous mutation from its post-mutation
-read-back. Every `pending-operation` now carries a `pending-phase`, either
-`operation` or `read-back`. `poll-create` and `poll-update` also receive a
-`poll-request` whose `finality` is `continue` or `final-attempt`.
+read-back. Create and resume continuations carry a single `create-progress`
+variant: `operating(option<string>)` while the mutation is in progress, or
+`reading-back(string)` once the mutation completed and its identifier is
+required. `pending-create` and `resume-pending` have no separate identifier or
+phase, so read-back without an identifier cannot be represented on the wire.
+Update uses `pending-update` with a `pending-phase` of `operation` or
+`read-back`; its request always supplies the identifier. These continuations
+share the phase-less `pending-operation` record for the token and poll interval.
+`poll-create`, `resume-create`, and `poll-update` receive a `poll-request`
+whose `finality` is `continue` or `final-attempt`.
 
 The host starts the operation's existing deadline before the initial call.
 The read-back deadline starts only when the first `read-back` pending result
@@ -37,7 +44,8 @@ refresh.
 host never fabricates the `sent` values that are absent from a persisted
 `resume-pending`. Persisted state retains the resume token and identifier, but
 not scheduling metadata, so the first resume call's inbound phase and delay are
-non-authoritative. The provider recovers the operation from its token and any
+non-authoritative: the host sends `operating` with the persisted optional
+identifier. The provider recovers the operation from its token and any
 pending result it returns establishes the phase used by later polls. Delete
 continuations use the phase-less `pending-delete` record because delete has no
 post-apply read-back phase.

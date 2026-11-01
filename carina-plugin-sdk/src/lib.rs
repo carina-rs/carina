@@ -229,7 +229,7 @@ pub struct Pending<T> {
     pub phase: carina_provider_protocol::PendingPhase,
 }
 
-pub use carina_provider_protocol::types::{PendingDelete, PendingToken, Sent};
+pub use carina_provider_protocol::types::{CreateProgress, PendingDelete, PendingToken, Sent};
 pub use carina_provider_protocol::{PendingPhase, PollFinality, PollRequest};
 
 impl<T> Pending<T> {
@@ -289,10 +289,9 @@ impl CreateAttempt {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
                 token,
-                identifier: None,
+                progress: CreateProgress::Operating { identifier: None },
                 sent,
                 poll_after_secs,
-                phase: PendingPhase::Operation,
             },
         ))
     }
@@ -308,10 +307,9 @@ impl CreateAttempt {
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
                     token,
-                    identifier: None,
+                    progress: CreateProgress::Operating { identifier: None },
                     sent,
                     poll_after_secs,
-                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -364,10 +362,9 @@ impl PollAttempt {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
                 token,
-                identifier: None,
+                progress: CreateProgress::Operating { identifier: None },
                 sent: self.sent,
                 poll_after_secs,
-                phase: PendingPhase::Operation,
             },
         ))
     }
@@ -382,10 +379,9 @@ impl PollAttempt {
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
                     token,
-                    identifier: None,
+                    progress: CreateProgress::Operating { identifier: None },
                     sent: self.sent,
                     poll_after_secs,
-                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -434,10 +430,16 @@ impl IssuedCreate {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
                 token,
-                identifier: Some(self.identifier),
+                progress: match phase {
+                    PendingPhase::Operation => CreateProgress::Operating {
+                        identifier: Some(self.identifier),
+                    },
+                    PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                        identifier: self.identifier,
+                    },
+                },
                 sent: self.sent,
                 poll_after_secs,
-                phase,
             },
         ))
     }
@@ -452,10 +454,11 @@ impl IssuedCreate {
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
                     token,
-                    identifier: Some(self.identifier),
+                    progress: CreateProgress::Operating {
+                        identifier: Some(self.identifier),
+                    },
                     sent: self.sent,
                     poll_after_secs,
-                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -586,9 +589,8 @@ impl ResumeAttempt {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
             carina_provider_protocol::types::ResumePending {
                 token,
-                identifier: None,
+                progress: CreateProgress::Operating { identifier: None },
                 poll_after_secs,
-                phase: PendingPhase::Operation,
             },
         ))
     }
@@ -603,9 +605,8 @@ impl ResumeAttempt {
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
                     token,
-                    identifier: None,
+                    progress: CreateProgress::Operating { identifier: None },
                     poll_after_secs,
-                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -687,9 +688,15 @@ impl ResumedCreate {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
             carina_provider_protocol::types::ResumePending {
                 token,
-                identifier: Some(self.identifier),
+                progress: match phase {
+                    PendingPhase::Operation => CreateProgress::Operating {
+                        identifier: Some(self.identifier),
+                    },
+                    PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                        identifier: self.identifier,
+                    },
+                },
                 poll_after_secs,
-                phase,
             },
         ))
     }
@@ -704,9 +711,10 @@ impl ResumedCreate {
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
                     token,
-                    identifier: Some(self.identifier),
+                    progress: CreateProgress::Operating {
+                        identifier: Some(self.identifier),
+                    },
                     poll_after_secs,
-                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -1786,6 +1794,33 @@ mod tests {
             .expect_err("a validated schema must always be projectable to protocol v13");
 
         assert!(error.to_string().contains("protocol v13"), "{error}");
+    }
+
+    #[test]
+    fn read_back_create_and_resume_progress_keep_the_issued_identifier() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let create = CreateAttempt::new()
+            .issued(identifier.clone(), Sent::only(["name"]))
+            .pending_read_back("create-token", 7)
+            .into_protocol();
+        let carina_provider_protocol::types::CreateStep::Pending(create) = create else {
+            panic!("issued create must remain pending")
+        };
+        assert_eq!(
+            create.progress,
+            CreateProgress::ReadingBack {
+                identifier: identifier.clone()
+            }
+        );
+        assert_eq!(create.sent, Sent::only(["name"]));
+        let resume = ResumeAttempt::new()
+            .issued(identifier.clone())
+            .pending_read_back("resume-token", 9)
+            .into_protocol();
+        let carina_provider_protocol::types::ResumeStep::Pending(resume) = resume else {
+            panic!("issued resume must remain pending")
+        };
+        assert_eq!(resume.progress, CreateProgress::ReadingBack { identifier });
     }
 
     #[test]

@@ -296,10 +296,14 @@ fn poll_create(
                 // and tell Carina which value still needs a later refresh.
                 Err(_) if poll_request.finality == PollFinality::FinalAttempt => {
                     Ok(issued.partial(
-                        request.resource.attributes,
+                        BTreeMap::new(),
                         PartialReadDiagnostic {
                             reason: "widget read-back is still pending".to_string(),
-                            missing_attributes: vec!["status".to_string()],
+                            missing_attributes: vec![
+                                "name".to_string(),
+                                "size".to_string(),
+                                "status".to_string(),
+                            ],
                         },
                     ))
                 }
@@ -346,10 +350,14 @@ fn poll_create(
                         // The operation completed at its deadline. Keep the
                         // identifier and settle without starting another poll.
                         Ok(issued.partial(
-                            request.resource.attributes,
+                            BTreeMap::new(),
                             PartialReadDiagnostic {
                                 reason: "widget read-back is still pending".to_string(),
-                                missing_attributes: vec!["status".to_string()],
+                                missing_attributes: vec![
+                                    "name".to_string(),
+                                    "size".to_string(),
+                                    "status".to_string(),
+                                ],
                             },
                         ))
                     } else {
@@ -400,11 +408,13 @@ A rejected retry is `preserve`, not `untracked`. The first call may have created
 
 When the operation finishes, the provider calls `attempt.issued(identifier)`. On an ordinary poll it returns `pending_read_back`, which records the identifier, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. If the operation completes on the final attempt, the example settles with `partial` immediately, preserving the identifier for the next refresh.
 
-`poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. The example also returns `partial` when the issued read-back receives the final attempt and still cannot read the widget. `resume_create` receives the same poll request when Carina resumes a persisted continuation; on its first call, the persisted token and identifier are authoritative but the inbound phase and delay are not.
+`poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. The example also returns `partial` when the issued read-back receives the final attempt and still cannot read the widget. Neither final-attempt branch has observed attributes, so both return an empty map and mark the unread attributes as missing. `resume_create` receives the same poll request when Carina resumes a persisted continuation; on its first call, the persisted token and identifier are authoritative but the inbound phase and delay are not.
+
+On the wire, create and resume use `create-progress`: `operating(option<string>)` while the mutation is in progress, or `reading-back(string)` once it has completed. Read-back therefore always carries an identifier. Updates carry their phase in `pending-update`; their request already includes the identifier.
 
 A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict<CreateToken>`, and `.into()` turns it into the `PollVerdict<CreateToken>` that `poll_create` returns.
 
-Two outcomes after `issued` are not used here. `partial` finishes a create whose read-back was incomplete, with a `PartialReadDiagnostic` naming the missing attributes. `discarded` reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. When a provider call has a usable continuation but also needs to report an error, `preserve` returns the error-bearing in-flight verdict. Provider code does not produce `undetermined`; guest transport glue reserves that wire arm for a request or token it cannot decode, when it has no newer continuation to return.
+`discarded` is not used here. It reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. When a provider call has a usable continuation but also needs to report an error, `preserve` returns the error-bearing in-flight verdict. Provider code does not produce `undetermined`; guest transport glue reserves that wire arm for a request or token it cannot decode, when it has no newer continuation to return.
 
 ## resume_create
 

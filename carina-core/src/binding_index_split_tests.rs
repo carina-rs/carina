@@ -24,7 +24,7 @@ fn s(s: &str) -> Value {
 }
 
 #[test]
-fn round3_updating_changed_iterable_defers_missing_element_output() {
+fn updating_changed_iterable_defers_missing_element_output() {
     use crate::binding_index::{LivePreApplyInputs, ManagedBindingStability};
     use crate::parser::{ProviderContext, parse};
 

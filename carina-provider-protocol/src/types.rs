@@ -944,45 +944,68 @@ pub enum Observation<R, E> {
     ReadFailed(E),
 }
 
+/// Progress of an initial or resumed create. Read-back always has an identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum CreateProgress {
+    Operating {
+        identifier: Option<AppliedIdentifier>,
+    },
+    ReadingBack {
+        identifier: AppliedIdentifier,
+    },
+}
+
+impl CreateProgress {
+    pub fn identifier(&self) -> Option<&AppliedIdentifier> {
+        match self {
+            Self::Operating { identifier } => identifier.as_ref(),
+            Self::ReadingBack { identifier } => Some(identifier),
+        }
+    }
+
+    pub fn phase(&self) -> crate::PendingPhase {
+        match self {
+            Self::Operating { .. } => crate::PendingPhase::Operation,
+            Self::ReadingBack { .. } => crate::PendingPhase::ReadBack,
+        }
+    }
+
+    pub fn into_identifier(self) -> Option<AppliedIdentifier> {
+        match self {
+            Self::Operating { identifier } => identifier,
+            Self::ReadingBack { identifier } => Some(identifier),
+        }
+    }
+}
+
 /// An unfinished initial create, including the immutable `sent` declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCreate<T> {
     pub token: T,
-    pub identifier: Option<AppliedIdentifier>,
+    pub progress: CreateProgress,
     pub sent: Sent,
     pub poll_after_secs: u32,
-    pub phase: crate::PendingPhase,
 }
 
 impl<T> PendingCreate<T> {
     pub fn token(&self) -> &T {
         &self.token
     }
-
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
-
     pub fn sent(&self) -> &Sent {
         &self.sent
     }
-
     pub fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
-
     pub fn phase(&self) -> crate::PendingPhase {
-        self.phase
+        self.progress.phase()
     }
-
-    pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, Sent, u32, crate::PendingPhase) {
-        (
-            self.token,
-            self.identifier,
-            self.sent,
-            self.poll_after_secs,
-            self.phase,
-        )
+    pub fn into_parts(self) -> (T, CreateProgress, Sent, u32) {
+        (self.token, self.progress, self.sent, self.poll_after_secs)
     }
 }
 
@@ -997,35 +1020,25 @@ pub struct CreateInFlight<T, E> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumePending<T> {
     pub token: T,
-    pub identifier: Option<AppliedIdentifier>,
+    pub progress: CreateProgress,
     pub poll_after_secs: u32,
-    pub phase: crate::PendingPhase,
 }
 
 impl<T> ResumePending<T> {
     pub fn token(&self) -> &T {
         &self.token
     }
-
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
-
     pub fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
-
     pub fn phase(&self) -> crate::PendingPhase {
-        self.phase
+        self.progress.phase()
     }
-
-    pub fn into_parts(self) -> (T, Option<AppliedIdentifier>, u32, crate::PendingPhase) {
-        (
-            self.token,
-            self.identifier,
-            self.poll_after_secs,
-            self.phase,
-        )
+    pub fn into_parts(self) -> (T, CreateProgress, u32) {
+        (self.token, self.progress, self.poll_after_secs)
     }
 }
 
@@ -2175,10 +2188,11 @@ mod tests {
     fn in_flight_verdict_conversions_preserve_the_continuation() {
         let pending = PendingCreate {
             token: "next-token".to_string(),
-            identifier: Some(AppliedIdentifier::new("resource-123").unwrap()),
+            progress: CreateProgress::ReadingBack {
+                identifier: AppliedIdentifier::new("resource-123").unwrap(),
+            },
             sent: Sent::only(["name"]),
             poll_after_secs: 7,
-            phase: crate::PendingPhase::ReadBack,
         };
         let create: CreateVerdict<String, String, String> =
             CreateVerdict::InFlight(CreateInFlight {
@@ -2210,9 +2224,10 @@ mod tests {
         let in_flight = ResumeInFlight {
             pending: ResumePending {
                 token: "resume-token".to_string(),
-                identifier: Some(AppliedIdentifier::new("resource-456").unwrap()),
+                progress: CreateProgress::Operating {
+                    identifier: Some(AppliedIdentifier::new("resource-456").unwrap()),
+                },
                 poll_after_secs: 11,
-                phase: crate::PendingPhase::Operation,
             },
             error: "resume interrupted".to_string(),
         };

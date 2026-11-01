@@ -1777,7 +1777,7 @@ mod assert_fully_resolved_tests {
     }
 
     #[test]
-    fn round3_unlisted_attribute_of_partial_binding_uses_ordinary_guidance() {
+    fn unlisted_attribute_of_partial_binding_uses_ordinary_guidance() {
         for end in [ReadBackEnd::ProviderReported, ReadBackEnd::HostDeadline] {
             let diagnostic = PartialReadDiagnostic::new(
                 "DVO is not populated yet".into(),

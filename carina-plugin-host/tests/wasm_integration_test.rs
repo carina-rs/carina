@@ -2094,7 +2094,7 @@ async fn test_wasm_resumed_create_read_back_final_attempt_returns_partial_succes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_round3_fresh_delete_recovers_pending_controls_from_identifier() {
+async fn test_wasm_fresh_delete_recovers_pending_controls_from_identifier() {
     let path = wasm_path().expect("build the WASM mock before running this test");
     let (factory, _cache) = load_factory(&path).await;
     let config = ready_config(&factory, &indexmap::IndexMap::new());
@@ -2133,7 +2133,7 @@ async fn test_wasm_round3_fresh_delete_recovers_pending_controls_from_identifier
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_round3_fresh_read_uses_updated_read_back_controls() {
+async fn test_wasm_fresh_read_uses_updated_read_back_controls() {
     let path = wasm_path().expect("build the WASM mock before running this test");
     let (factory, _cache) = load_factory(&path).await;
     let config = ready_config(&factory, &indexmap::IndexMap::new());

@@ -114,14 +114,11 @@ fn assert_string_attribute(
 }
 
 #[test]
-fn round3_secret_plaintext_never_appears_in_state_or_identifier() {
+fn secret_plaintext_never_appears_in_state_or_identifier() {
     let wasm_path = wasm_mock_path();
     let scenario = Scenario::from_fixture("read_back_within_budget", &wasm_path);
     scenario.init();
-    let plaintexts = [
-        "round3-create-secret-plaintext",
-        "round3-update-secret-plaintext",
-    ];
+    let plaintexts = ["create-secret-plaintext", "update-secret-plaintext"];
     for plaintext in plaintexts {
         fs::write(
             scenario.project.join("producer.crn"),

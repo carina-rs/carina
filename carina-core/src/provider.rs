@@ -19,8 +19,8 @@ use carina_provider_protocol::CompletedOperation;
 pub use carina_provider_protocol::ReadBackEnd;
 use carina_provider_protocol::types as protocol_types;
 pub use carina_provider_protocol::types::{
-    AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, ReferenceScope, ReferenceScopeError,
-    ReferenceScopeField, ReferenceScopeValues, Sent,
+    AppliedIdentifier, CreateProgress, EmptyAppliedIdentifier, PendingToken, ReferenceScope,
+    ReferenceScopeError, ReferenceScopeField, ReferenceScopeValues, Sent,
 };
 use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
@@ -2188,10 +2188,9 @@ fn validate_utc_rfc3339(value: &str) -> Result<(), InvalidTimestamp> {
 pub struct PendingCreate {
     id: ResourceId,
     token: PendingToken,
-    identifier: Option<AppliedIdentifier>,
+    progress: CreateProgress,
     sent: Sent,
     poll_after_secs: u32,
-    phase: carina_provider_protocol::PendingPhase,
     /// Time the current create request first returned a pending step. A
     /// re-pend preserves it; a create sent after `resend` receives a new one.
     started_at: Timestamp,
@@ -2203,10 +2202,9 @@ pub struct PendingCreate {
 pub struct FreshPendingCreate {
     id: ResourceId,
     token: PendingToken,
-    identifier: Option<AppliedIdentifier>,
+    progress: CreateProgress,
     sent: Sent,
     poll_after_secs: u32,
-    phase: carina_provider_protocol::PendingPhase,
     started_at: Timestamp,
 }
 
@@ -2215,10 +2213,9 @@ impl From<PendingCreate> for FreshPendingCreate {
         Self {
             id: pending.id,
             token: pending.token,
-            identifier: pending.identifier,
+            progress: pending.progress,
             sent: pending.sent,
             poll_after_secs: pending.poll_after_secs,
-            phase: pending.phase,
             started_at: pending.started_at,
         }
     }
@@ -2230,7 +2227,7 @@ impl FreshPendingCreate {
     }
 
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
 
     pub fn sent(&self) -> &Sent {
@@ -2252,8 +2249,12 @@ impl FreshPendingCreate {
         self.poll_after_secs
     }
 
+    pub fn progress(&self) -> &CreateProgress {
+        &self.progress
+    }
+
     pub fn phase(&self) -> carina_provider_protocol::PendingPhase {
-        self.phase
+        self.progress.phase()
     }
 
     pub fn started_at(&self) -> &Timestamp {
@@ -2269,7 +2270,7 @@ impl FreshPendingCreate {
             id: self.id.clone(),
             pending: PendingRecord::Persisted(PendingEnvelope::new(
                 self.token.clone(),
-                self.identifier.clone(),
+                self.identifier().cloned(),
                 write_only,
                 secrets,
             )),
@@ -2282,10 +2283,9 @@ impl FreshPendingCreate {
         PendingCreate {
             id: self.id,
             token: self.token,
-            identifier: self.identifier,
+            progress: self.progress,
             sent: self.sent,
             poll_after_secs: self.poll_after_secs,
-            phase: self.phase,
             started_at: self.started_at,
         }
     }
@@ -2295,19 +2295,17 @@ impl PendingCreate {
     fn new(
         id: ResourceId,
         token: PendingToken,
-        identifier: Option<AppliedIdentifier>,
+        progress: CreateProgress,
         sent: Sent,
         poll_after_secs: u32,
-        phase: carina_provider_protocol::PendingPhase,
         started_at: Timestamp,
     ) -> Self {
         Self {
             id,
             token,
-            identifier,
+            progress,
             sent,
             poll_after_secs,
-            phase,
             started_at,
         }
     }
@@ -2317,7 +2315,7 @@ impl PendingCreate {
     }
 
     pub fn identifier(&self) -> Option<&AppliedIdentifier> {
-        self.identifier.as_ref()
+        self.progress.identifier()
     }
 
     pub fn sent(&self) -> &Sent {
@@ -2328,8 +2326,12 @@ impl PendingCreate {
         self.poll_after_secs
     }
 
+    pub fn progress(&self) -> &CreateProgress {
+        &self.progress
+    }
+
     pub fn phase(&self) -> carina_provider_protocol::PendingPhase {
-        self.phase
+        self.progress.phase()
     }
 
     pub fn started_at(&self) -> &Timestamp {
@@ -2340,7 +2342,7 @@ impl PendingCreate {
     /// create when the provider reports that it can no longer track it.
     /// Consuming the witness makes the two outcomes mutually exclusive.
     pub fn untracked(self, error: ProviderError) -> CreateFailure {
-        if self.identifier.is_some() {
+        if self.identifier().is_some() {
             InFlightCreate::from_pending(self).into_create_failure(error)
         } else {
             CreateFailure::from_kind(CreateFailureKind::Untracked(error))
@@ -2362,7 +2364,7 @@ impl PendingCreate {
             id: self.id.clone(),
             pending: PendingRecord::Persisted(PendingEnvelope::new(
                 self.token.clone(),
-                self.identifier.clone(),
+                self.identifier().cloned(),
                 write_only,
                 secrets,
             )),
@@ -2373,7 +2375,7 @@ impl PendingCreate {
     /// Consume the continuation and recover the only poll witness valid for
     /// its identifier state.
     pub fn into_poll(self) -> Poll {
-        match self.identifier {
+        match self.progress.into_identifier() {
             Some(identifier) => Poll::Issued(IssuedCreate {
                 id: self.id,
                 identifier,
@@ -2428,10 +2430,9 @@ impl PollAttempt {
         PendingCreate::new(
             self.id,
             token,
-            None,
+            CreateProgress::Operating { identifier: None },
             self.sent,
             poll_after_secs,
-            carina_provider_protocol::PendingPhase::Operation,
             self.started_at,
         )
     }
@@ -2988,18 +2989,16 @@ impl InFlightCreate {
             PendingRecord::Fresh(FreshPendingCreate {
                 id,
                 token: _old_token,
-                identifier,
+                progress,
                 sent,
                 poll_after_secs,
-                phase,
                 started_at,
             }) => PendingRecord::Fresh(FreshPendingCreate {
                 id,
                 token,
-                identifier,
+                progress,
                 sent,
                 poll_after_secs,
-                phase,
                 started_at,
             }),
             PendingRecord::Persisted(envelope) => {
@@ -3019,18 +3018,23 @@ impl InFlightCreate {
             PendingRecord::Fresh(FreshPendingCreate {
                 id,
                 token,
-                identifier: _old_identifier,
+                progress,
                 sent,
                 poll_after_secs,
-                phase,
                 started_at,
             }) => PendingRecord::Fresh(FreshPendingCreate {
                 id,
                 token,
-                identifier: Some(identifier),
+                progress: match progress {
+                    CreateProgress::Operating { .. } => CreateProgress::Operating {
+                        identifier: Some(identifier),
+                    },
+                    CreateProgress::ReadingBack { .. } => {
+                        CreateProgress::ReadingBack { identifier }
+                    }
+                },
                 sent,
                 poll_after_secs,
-                phase,
                 started_at,
             }),
             PendingRecord::Persisted(envelope) => {
@@ -3956,10 +3960,9 @@ impl CreateAttempt {
         PendingCreate::new(
             self.id,
             token,
-            None,
+            CreateProgress::Operating { identifier: None },
             sent,
             poll_after_secs,
-            carina_provider_protocol::PendingPhase::Operation,
             self.started_at,
         )
     }
@@ -4012,10 +4015,16 @@ impl IssuedCreate {
         PendingCreate::new(
             self.id,
             token,
-            Some(self.identifier),
+            match phase {
+                carina_provider_protocol::PendingPhase::Operation => CreateProgress::Operating {
+                    identifier: Some(self.identifier),
+                },
+                carina_provider_protocol::PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                    identifier: self.identifier,
+                },
+            },
             self.sent,
             poll_after_secs,
-            phase,
             self.started_at.unwrap_or_else(Timestamp::now),
         )
     }
@@ -4453,10 +4462,9 @@ impl ResentCreateAttempt {
         ResentPendingCreate(PendingCreate::new(
             self.previous.id().clone(),
             token,
-            None,
+            CreateProgress::Operating { identifier: None },
             sent,
             poll_after_secs,
-            carina_provider_protocol::PendingPhase::Operation,
             Timestamp::now(),
         ))
     }
@@ -4571,6 +4579,10 @@ impl ResentPendingCreate {
 
     pub fn poll_after_secs(&self) -> u32 {
         self.0.poll_after_secs()
+    }
+
+    pub fn progress(&self) -> &CreateProgress {
+        self.0.progress()
     }
 
     pub fn phase(&self) -> carina_provider_protocol::PendingPhase {
@@ -8279,10 +8291,9 @@ mod tests {
         let first = PendingCreate::new(
             id,
             PendingToken::new("first-token"),
-            None,
+            CreateProgress::Operating { identifier: None },
             Sent::AllRequestAttributes,
             1,
-            carina_provider_protocol::PendingPhase::Operation,
             started_at.clone(),
         );
         let second = match first.into_poll() {
@@ -8306,10 +8317,11 @@ mod tests {
         let pending = PendingCreate::new(
             id,
             PendingToken::new("first-token"),
-            Some(original.clone()),
+            CreateProgress::Operating {
+                identifier: Some(original.clone()),
+            },
             Sent::AllRequestAttributes,
             1,
-            carina_provider_protocol::PendingPhase::Operation,
             started_at,
         );
         let resumed = ResumedCreate {
@@ -8336,10 +8348,11 @@ mod tests {
         let pending = PendingCreate::new(
             id,
             PendingToken::new("persisted-token"),
-            Some(identifier.clone()),
+            CreateProgress::ReadingBack {
+                identifier: identifier.clone(),
+            },
             Sent::AllRequestAttributes,
             1,
-            carina_provider_protocol::PendingPhase::ReadBack,
             started_at,
         )
         .persist(

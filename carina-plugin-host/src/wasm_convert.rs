@@ -1119,12 +1119,12 @@ struct PendingOperation {
 }
 
 impl PendingOperation {
-    fn from_wit(pending: wit::PendingOperation) -> Self {
+    fn from_wit(pending: wit::PendingUpdate) -> Self {
+        let wit::PendingUpdate { operation, phase } = pending;
         let wit::PendingOperation {
             token,
             poll_after_secs,
-            phase,
-        } = pending;
+        } = operation;
         Self {
             token: PendingToken(token),
             poll_after_secs,
@@ -1135,20 +1135,21 @@ impl PendingOperation {
     fn poll_after_secs(&self) -> u32 {
         self.poll_after_secs
     }
-
     fn phase(&self) -> proto::PendingPhase {
         self.phase
     }
 
-    fn into_wit(self) -> wit::PendingOperation {
+    fn into_wit(self) -> wit::PendingUpdate {
         let Self {
             token: PendingToken(token),
             poll_after_secs,
             phase,
         } = self;
-        wit::PendingOperation {
-            token,
-            poll_after_secs,
+        wit::PendingUpdate {
+            operation: wit::PendingOperation {
+                token,
+                poll_after_secs,
+            },
             phase: core_to_wit_pending_phase(phase),
         }
     }
@@ -1188,7 +1189,7 @@ impl UpdatePendingOperation {
         self.0.phase()
     }
 
-    pub(crate) fn into_wit(self) -> wit::PendingOperation {
+    pub(crate) fn into_wit(self) -> wit::PendingUpdate {
         self.0.into_wit()
     }
 }
@@ -1331,22 +1332,47 @@ fn decode_created_attributes(
     }
 }
 
+fn core_to_wit_create_progress(progress: &proto::CreateProgress) -> wit::CreateProgress {
+    match progress {
+        proto::CreateProgress::Operating { identifier } => {
+            wit::CreateProgress::Operating(identifier.as_ref().map(ToString::to_string))
+        }
+        proto::CreateProgress::ReadingBack { identifier } => {
+            wit::CreateProgress::ReadingBack(identifier.to_string())
+        }
+    }
+}
+
+fn wit_to_core_create_progress(
+    progress: wit::CreateProgress,
+    id: &CoreResourceId,
+) -> Result<proto::CreateProgress, WasmAppliedStateDecodeError> {
+    Ok(match progress {
+        wit::CreateProgress::Operating(identifier) => proto::CreateProgress::Operating {
+            identifier: identifier
+                .map(|identifier| decode_create_identifier(identifier, id))
+                .transpose()?,
+        },
+        wit::CreateProgress::ReadingBack(identifier) => proto::CreateProgress::ReadingBack {
+            identifier: decode_create_identifier(identifier, id)?,
+        },
+    })
+}
+
 pub(crate) fn core_to_wit_pending_create(pending: &CorePendingCreate) -> wit::PendingCreate {
     core_to_wit_pending_create_parts(
         pending.token(),
-        pending.identifier(),
+        pending.progress(),
         pending.sent(),
         pending.poll_after_secs(),
-        pending.phase(),
     )
 }
 
 pub(crate) fn core_to_wit_pending_create_parts(
     token: &proto::PendingToken,
-    identifier: Option<&proto::AppliedIdentifier>,
+    progress: &proto::CreateProgress,
     sent: &proto::Sent,
     poll_after_secs: u32,
-    phase: proto::PendingPhase,
 ) -> wit::PendingCreate {
     let sent = match sent {
         proto::Sent::AllRequestAttributes => wit::SentAttributes::All,
@@ -1358,26 +1384,23 @@ pub(crate) fn core_to_wit_pending_create_parts(
         operation: wit::PendingOperation {
             token: token.expose_for_provider_call().to_string(),
             poll_after_secs,
-            phase: core_to_wit_pending_phase(phase),
         },
-        identifier: identifier.map(ToString::to_string),
+        progress: core_to_wit_create_progress(progress),
         sent,
     }
 }
 
 pub(crate) fn core_to_wit_resume_pending(
     token: &proto::PendingToken,
-    identifier: Option<&proto::AppliedIdentifier>,
+    progress: &proto::CreateProgress,
     poll_after_secs: u32,
-    phase: proto::PendingPhase,
 ) -> wit::ResumePending {
     wit::ResumePending {
         operation: wit::PendingOperation {
             token: token.expose_for_provider_call().to_string(),
             poll_after_secs,
-            phase: core_to_wit_pending_phase(phase),
         },
-        identifier: identifier.map(ToString::to_string),
+        progress: core_to_wit_create_progress(progress),
     }
 }
 
@@ -1387,23 +1410,18 @@ fn wit_to_core_pending_create(
 ) -> Result<proto::PendingCreate<proto::PendingToken>, WasmAppliedStateDecodeError> {
     let wit::PendingCreate {
         operation,
-        identifier,
+        progress,
         sent,
     } = pending;
     let wit::PendingOperation {
         token,
         poll_after_secs,
-        phase,
     } = operation;
-    let identifier = identifier
-        .map(|identifier| decode_create_identifier(identifier, id))
-        .transpose()?;
     Ok(proto::PendingCreate {
         token: proto::PendingToken::new(token),
-        identifier,
+        progress: wit_to_core_create_progress(progress, id)?,
         sent: wit_to_core_sent(sent),
         poll_after_secs,
-        phase: wit_to_core_pending_phase(phase),
     })
 }
 
@@ -1413,21 +1431,16 @@ fn wit_to_core_resume_pending(
 ) -> Result<proto::ResumePending<proto::PendingToken>, WasmAppliedStateDecodeError> {
     let wit::ResumePending {
         operation,
-        identifier,
+        progress,
     } = pending;
     let wit::PendingOperation {
         token,
         poll_after_secs,
-        phase,
     } = operation;
-    let identifier = identifier
-        .map(|identifier| decode_create_identifier(identifier, id))
-        .transpose()?;
     Ok(proto::ResumePending {
         token: proto::PendingToken::new(token),
-        identifier,
+        progress: wit_to_core_create_progress(progress, id)?,
         poll_after_secs,
-        phase: wit_to_core_pending_phase(phase),
     })
 }
 
@@ -2097,6 +2110,37 @@ mod tests {
     }
 
     #[test]
+    fn create_progress_roundtrips_through_create_and_resume_wit() {
+        let id = CoreResourceId::with_identity("test", "example");
+        let token = proto::PendingToken::new("opaque-token");
+        let identifier = proto::AppliedIdentifier::new("created-id").unwrap();
+        for progress in [
+            proto::CreateProgress::Operating { identifier: None },
+            proto::CreateProgress::Operating {
+                identifier: Some(identifier.clone()),
+            },
+            proto::CreateProgress::ReadingBack { identifier },
+        ] {
+            let create = core_to_wit_pending_create_parts(
+                &token,
+                &progress,
+                &proto::Sent::only(["name"]),
+                7,
+            );
+            let create = wit_to_core_pending_create(create, &id).unwrap();
+            assert_eq!(create.progress, progress);
+            assert_eq!(create.token, token);
+            assert_eq!(create.sent, proto::Sent::only(["name"]));
+            assert_eq!(create.poll_after_secs, 7);
+            let resume = core_to_wit_resume_pending(&token, &progress, 9);
+            let resume = wit_to_core_resume_pending(resume, &id).unwrap();
+            assert_eq!(resume.progress, progress);
+            assert_eq!(resume.token, token);
+            assert_eq!(resume.poll_after_secs, 9);
+        }
+    }
+
+    #[test]
     fn pending_phase_and_poll_request_roundtrip_through_wit() {
         for phase in [
             proto::PendingPhase::Operation,
@@ -2166,9 +2210,8 @@ mod tests {
             operation: wit::PendingOperation {
                 token: token.to_string(),
                 poll_after_secs: 7,
-                phase: wit::PendingPhase::Operation,
             },
-            identifier: Some("resource-123".to_string()),
+            progress: wit::CreateProgress::ReadingBack("resource-123".to_string()),
             sent: wit::SentAttributes::Only(vec!["name".to_string()]),
         };
 
@@ -2201,14 +2244,12 @@ mod tests {
         let proto::CreateInFlight { pending, error } = create;
         assert_eq!(pending.token.expose_for_provider_call(), "create-token");
         assert_eq!(
-            pending
-                .identifier
-                .as_ref()
-                .map(proto::AppliedIdentifier::as_str),
+            pending.identifier().map(proto::AppliedIdentifier::as_str),
             Some("resource-123")
         );
         assert_eq!(pending.sent, proto::Sent::only(["name"]));
         assert_eq!(pending.poll_after_secs, 7);
+        assert_eq!(pending.phase(), proto::PendingPhase::ReadBack);
         assert!(error.to_string().contains("create interrupted"));
 
         let poll = wit_to_core_poll_verdict(
@@ -2250,9 +2291,8 @@ mod tests {
                     operation: wit::PendingOperation {
                         token: "resume-token".to_string(),
                         poll_after_secs: 11,
-                        phase: wit::PendingPhase::Operation,
                     },
-                    identifier: Some("resource-456".to_string()),
+                    progress: wit::CreateProgress::ReadingBack("resource-456".to_string()),
                 },
                 error: wit_internal_error("resume interrupted"),
             }),
@@ -2286,13 +2326,11 @@ mod tests {
         let proto::ResumeInFlight { pending, error } = resume;
         assert_eq!(pending.token.expose_for_provider_call(), "resume-token");
         assert_eq!(
-            pending
-                .identifier
-                .as_ref()
-                .map(proto::AppliedIdentifier::as_str),
+            pending.identifier().map(proto::AppliedIdentifier::as_str),
             Some("resource-456")
         );
         assert_eq!(pending.poll_after_secs, 11);
+        assert_eq!(pending.phase(), proto::PendingPhase::ReadBack);
         assert!(error.to_string().contains("resume interrupted"));
     }
 
