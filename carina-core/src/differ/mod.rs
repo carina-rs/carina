@@ -26,7 +26,7 @@ use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
 #[doc(hidden)]
 pub use plan::create_plan_for_test;
 pub use plan::{
-    CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice,
+    CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice, PendingCascadePlan,
     block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades,
 };
 

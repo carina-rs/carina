@@ -6053,7 +6053,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     );
     let plan_input_desired =
         carina_core::resource::plan_input_desired_resources(&resolved_resources, context.schemas());
-    let mut plan = create_plan_with_cascades(
+    let plan = create_plan_with_cascades(
         &plan_input_desired,
         CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets),
         &data_sources_for_plan,
@@ -6066,21 +6066,23 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         &wait_bindings,
         &outcome_unknown_import_replacements,
     )?;
-    add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
-    block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
-    override_aware_resources.apply_plan_stability(&plan_input_current, &plan, context.schemas());
+    let plan = plan.finish(|plan| {
+        add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
+        block_deletes_on_prior_consumer_updates(plan, &directives_map);
+        override_aware_resources.apply_plan_stability(&plan_input_current, plan, context.schemas());
 
-    // State blocks run after differ/deposed identifier errors so `removed`
-    // remains the explicit recovery that can suppress those diagnostics.
-    add_state_block_effects(
-        &mut plan,
-        &parsed.state_blocks,
-        state_file,
-        &addressed.moved_pairs,
-        override_aware_resources.resources(),
-        override_aware_resources.bindings(),
-        state_block_upstream_bindings,
-    );
+        // State blocks run after differ/deposed identifier errors so `removed`
+        // remains the explicit recovery that can suppress those diagnostics.
+        add_state_block_effects(
+            plan,
+            &parsed.state_blocks,
+            state_file,
+            &addressed.moved_pairs,
+            override_aware_resources.resources(),
+            override_aware_resources.bindings(),
+            state_block_upstream_bindings,
+        );
+    });
 
     let moved_origins = addressed
         .moved_pairs

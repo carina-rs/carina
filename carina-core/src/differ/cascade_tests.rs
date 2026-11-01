@@ -167,6 +167,7 @@ fn plan_for(
         &HashSet::new(),
     )
     .expect("test provider hints should succeed")
+    .finish(|_| {})
 }
 
 fn standard_states() -> HashMap<ResourceId, State> {
@@ -784,7 +785,8 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         &[],
         &HashSet::new(),
     )
-    .expect("test provider hints should succeed");
+    .expect("test provider hints should succeed")
+    .finish(|_| {});
 
     let deferred_replace = plan
         .effects()
@@ -903,7 +905,8 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
             &[],
             &HashSet::new(),
         )
-        .unwrap();
+        .unwrap()
+        .finish(|_| {});
         assert!(
             !replacement_metadata(&plan, &id).create_before_destroy,
             "the loop-local vpc must not refer to the top-level producer"
@@ -967,7 +970,8 @@ fn deferred_create_cbd_plan(
         &[],
         &HashSet::new(),
     )
-    .unwrap();
+    .unwrap()
+    .finish(|_| {});
     (plan, id)
 }
 

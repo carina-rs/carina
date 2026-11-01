@@ -50,9 +50,10 @@ pub enum DeferredForExpansionChoice {
 /// The complete apply-time target set retained by deferred-loop expansion.
 ///
 /// Partition the configuration's finalized loops with [`Self::partition_for_expansion`],
-/// including configurations without deferred loops. There is deliberately no
-/// empty/default constructor, mutable access, or clone: the planner consumes
-/// this owner and uses the same templates for cascading and effect emission.
+/// which may produce an empty set. The invariant is that cascading and deferred
+/// effect emission consume the same target set, once. Its private representation
+/// and non-cloneable owner prevent callers from supplying independent subsets
+/// for those two planning stages.
 ///
 /// ```compile_fail,E0423
 /// use carina_core::differ::DeferredCreateTargets;
@@ -121,6 +122,43 @@ pub struct CascadeDependents<'a> {
 impl<'a> CascadeDependents<'a> {
     pub fn new(managed: &'a [ResolvedResource], deferred: DeferredCreateTargets) -> Self {
         Self { managed, deferred }
+    }
+}
+
+/// Cascaded diff awaiting the remaining, caller-owned planning effects.
+///
+/// The retained targets stay with this builder until [`Self::finish`] adds their
+/// effects last, after deposed cleanup and state-block adjustments. Its fields
+/// are private; finalization consumes the builder and returns the completed plan.
+///
+/// ```compile_fail,E0616
+/// use carina_core::differ::PendingCascadePlan;
+/// use carina_core::plan::Plan;
+/// fn bypass(builder: PendingCascadePlan) -> Plan { builder.plan }
+/// ```
+///
+/// ```compile_fail,E0382
+/// use carina_core::differ::PendingCascadePlan;
+/// fn finish_twice(builder: PendingCascadePlan) {
+///     let first = builder.finish(|_| {});
+///     let second = builder.finish(|_| {});
+/// }
+/// ```
+#[must_use = "finish planning to emit the retained deferred targets"]
+pub struct PendingCascadePlan {
+    plan: Plan,
+    deferred: DeferredCreateTargets,
+}
+
+impl PendingCascadePlan {
+    /// Complete the remaining planning steps, then emit the very same deferred
+    /// targets already consulted during CBD promotion. The callback sees only
+    /// the diff plan, preserving the historical ancillary-effect ordering.
+    pub fn finish(self, complete: impl FnOnce(&mut Plan)) -> Plan {
+        let Self { mut plan, deferred } = self;
+        complete(&mut plan);
+        add_deferred_create_effects(&mut plan, deferred);
+        plan
     }
 }
 
@@ -496,8 +534,9 @@ pub(crate) fn create_plan_with_provider(
     Ok(build.plan)
 }
 
-/// Build replacements and deferred effects together from the retained target owner.
-/// Deferred effects cannot be added through a separate public planning pass.
+/// Cascade replacements and retain their deferred targets in the returned
+/// builder. Finalization emits those targets after the remaining planning
+/// effects; they cannot be added through a separate public planning pass.
 ///
 /// ```compile_fail,E0432
 /// use carina_core::differ::add_deferred_create_effects;
@@ -515,7 +554,7 @@ pub fn create_plan_with_cascades(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[WaitBinding],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<Plan> {
+) -> ProviderResult<PendingCascadePlan> {
     let managed_current = prior_states.materialize_current_states(managed.authored(), registry);
     let mut build = create_plan_parts(
         managed,
@@ -540,8 +579,10 @@ pub fn create_plan_with_cascades(
     );
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
-    add_deferred_create_effects(&mut build.plan, dependents.deferred);
-    Ok(build.plan)
+    Ok(PendingCascadePlan {
+        plan: build.plan,
+        deferred: dependents.deferred,
+    })
 }
 
 /// Add apply-time deferred-for re-expansion effects to the plan.

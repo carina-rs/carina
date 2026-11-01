@@ -207,6 +207,78 @@ fn output_text(output: &Output) -> String {
 }
 
 #[test]
+fn deferred_effects_follow_deposed_deletes_and_state_blocks_in_saved_plan() {
+    for prior_children in [true, false] {
+        let housekeeping = r#"
+let old = mock.test.resource { name = "moving" }
+let retired = mock.test.resource { name = "retired" }
+"#;
+        let initial = if prior_children {
+            replacement_config("zz")
+        } else {
+            "let src = mock.test.resource { name = \"zz\" }\n".into()
+        };
+        let scenario = Scenario::new(&format!("{initial}{housekeeping}"));
+        assert_success("initial apply", &scenario.apply_config());
+        let mut state = scenario.state();
+        let old = state["resources"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["identity"] == "old")
+            .unwrap();
+        old["deposed"] = serde_json::json!([{
+            "key": "old-generation",
+            "identifier": "older-moving",
+            "attributes": { "name": "older-moving" },
+            "dependency_bindings": []
+        }]);
+        fs::write(
+            scenario.project.join("carina.state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        scenario.write_main(&format!(
+            r#"{}
+let renamed = mock.test.resource {{ name = "moving" }}
+moved {{
+  from = mock.test.resource 'old'
+  to = mock.test.resource 'renamed'
+}}
+removed {{ from = mock.test.resource 'retired' }}
+"#,
+            replacement_config("yy")
+        ));
+        assert_success("carina plan --out", &scenario.save_plan());
+
+        let saved = read_json(&scenario.project.join("p.plan"));
+        let effects = saved["plan"]["effects"].as_array().unwrap();
+        let kinds = effects
+            .iter()
+            .map(|effect| effect.as_object().unwrap().keys().next().unwrap().as_str())
+            .collect::<Vec<_>>();
+        let deferred = if prior_children {
+            "DeferredReplace"
+        } else {
+            "DeferredCreate"
+        };
+        assert_eq!(
+            kinds,
+            ["Create", "Delete", "Delete", "Remove", "Move", deferred],
+            "deferred effects must remain after deposed cleanup and state-only effects: {effects:#?}"
+        );
+        assert_eq!(effects[2]["Delete"]["id"]["identity"], "old");
+        assert_eq!(
+            effects[2]["Delete"]["generation"]["Deposed"],
+            "old-generation"
+        );
+        assert_eq!(effects[3]["Remove"]["id"]["identity"], "retired");
+        assert_eq!(effects[4]["Move"]["from"]["identity"], "old");
+        assert_eq!(effects[4]["Move"]["to"]["identity"], "renamed");
+    }
+}
+
+#[test]
 fn deferred_replace_dependency_direct_apply_converges() {
     let scenario = Scenario::new(&replacement_config("zz"));
     assert_success("initial apply", &scenario.apply_config());

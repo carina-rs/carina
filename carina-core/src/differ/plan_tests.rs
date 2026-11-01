@@ -504,7 +504,8 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &[],
         &HashSet::from([replacement]),
     )
-    .unwrap();
+    .unwrap()
+    .finish(|_| {});
 
     assert!(plan.effects().is_empty());
     assert_eq!(plan.errors().len(), 1);

@@ -8995,7 +8995,8 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &[],
         &std::collections::HashSet::new(),
     )
-    .expect("test provider hints should succeed");
+    .expect("test provider hints should succeed")
+    .finish(|_| {});
     assert_eq!(plan.replace_display_info().count(), 2);
 
     let deps = build_dependency_analysis(
