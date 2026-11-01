@@ -620,7 +620,7 @@ impl IgnoredChangeSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "S: Serialize + Clone",
-    deserialize = "S: Deserialize<'de>"
+    deserialize = "S: serde::de::DeserializeOwned"
 ))]
 pub struct Plan<S = ModuleSource> {
     effects: Vec<EffectWithSource<S>>,
@@ -1145,7 +1145,7 @@ impl<S> Plan<S> {
                 Effect::Move { .. } => summary.moved += 1,
                 Effect::ReleaseListKeys { keys, .. } => summary.release += keys.len(),
                 Effect::Wait { .. } => summary.wait += 1,
-                Effect::DeferredCreate { .. } => {}
+                Effect::DeferredCreate(_) => {}
             }
         }
         summary.deferred = deferred_summary.entries;
@@ -1279,7 +1279,7 @@ impl std::fmt::Display for PlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::DeferredReplacePayload;
+    use crate::effect::{DeferredCreatePayload, DeferredReplacePayload};
     use crate::resource::{
         DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity,
     };
@@ -1487,32 +1487,24 @@ mod tests {
     #[test]
     fn plan_summary_records_deferred_adds() {
         use crate::parser::ForBinding;
-        use crate::resource::ResourceId;
-
-        let template_resource = Resource::new("route53.RecordSet", "validation_records[?]");
-        let deferred = crate::parser::DeferredForExpression {
-            file: None,
-            line: 1,
-            header: "for opt in cert.domain_validation_options".to_string(),
-            resource_type: "aws.route53.RecordSet".to_string(),
-            target: crate::parser::DeferredForTarget::Bound {
-                binding: "validation_records".to_string(),
-            },
-            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            binding: ForBinding::Simple("opt".to_string()),
+        let template_resource = Resource::new("aws.route53.RecordSet", "ignored");
+        let deferred = crate::parser::DeferredForExpression::new(
+            None,
+            1,
+            "for opt in cert.domain_validation_options".to_string(),
+            crate::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
             template_resource,
-        };
+        );
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(
             Resource::new("acm.Certificate", "cert").with_binding("cert"),
         )));
-        plan.add(Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "route53.RecordSet",
-                "validation_records",
-            )),
-            template: Box::new(deferred),
-        });
+        plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+            Box::new(deferred),
+        )));
 
         let summary = plan.summary();
         assert_eq!(summary.create, 1);
@@ -1533,19 +1525,17 @@ mod tests {
         use crate::resource::{Directives, ResourceId};
         use std::collections::HashSet;
 
-        let template_resource = Resource::new("route53.RecordSet", "validation_records[?]");
-        let template = DeferredForExpression {
-            file: None,
-            line: 1,
-            header: "for opt in cert.domain_validation_options".to_string(),
-            resource_type: "aws.route53.RecordSet".to_string(),
-            target: crate::parser::DeferredForTarget::Bound {
-                binding: "validation_records".to_string(),
-            },
-            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            binding: ForBinding::Simple("opt".to_string()),
+        let template_resource = Resource::new("aws.route53.RecordSet", "ignored");
+        let template = DeferredForExpression::new(
+            None,
+            1,
+            "for opt in cert.domain_validation_options".to_string(),
+            crate::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
             template_resource,
-        };
+        );
         let deletes = (0..3)
             .map(|idx| DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1567,10 +1557,6 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(deletes).expect("fixture has deletes"),
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "route53.RecordSet",
-                "validation_records",
-            )),
             template: Box::new(template),
         })));
 

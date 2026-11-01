@@ -317,7 +317,7 @@ fn coalesced_upstream_iterable_uses_present_export_then_defaults_when_absent() {
             .plan
             .effects()
             .iter()
-            .all(|effect| !matches!(effect, Effect::DeferredCreate { .. })),
+            .all(|effect| !matches!(effect, Effect::DeferredCreate(_))),
         "the absent export must not leave a deferred create",
     );
 }
@@ -343,7 +343,7 @@ fn coalesced_upstream_iterable_stays_deferred_when_state_is_unavailable() {
             .plan
             .effects()
             .iter()
-            .filter(|effect| matches!(effect, Effect::DeferredCreate { .. }))
+            .filter(|effect| matches!(effect, Effect::DeferredCreate(_)))
             .count(),
         1,
         "an unavailable upstream snapshot must not turn the loop into zero resources: {:#?}",
@@ -510,7 +510,7 @@ fn updating_authored_list_iterable_expands_before_apply_and_converges() {
                 .plan
                 .effects()
                 .iter()
-                .all(|effect| !matches!(effect, Effect::DeferredCreate { .. })),
+                .all(|effect| !matches!(effect, Effect::DeferredCreate(_))),
             "an authored desired list is definitive during its producer update: {:#?}",
             update.plan.effects(),
         );
@@ -545,7 +545,7 @@ fn updating_authored_map_iterable_keeps_stable_children_and_converges() {
                 .plan
                 .effects()
                 .iter()
-                .all(|effect| !matches!(effect, Effect::DeferredCreate { .. })),
+                .all(|effect| !matches!(effect, Effect::DeferredCreate(_))),
             "an authored desired map is definitive during its producer update: {:#?}",
             update.plan.effects(),
         );

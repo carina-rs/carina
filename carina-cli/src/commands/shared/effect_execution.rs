@@ -180,7 +180,7 @@ fn format_state_only_effect_line<S>(effect: &Effect<S>) -> Option<String> {
         | Effect::Delete { .. }
         | Effect::Import { .. }
         | Effect::Wait { .. }
-        | Effect::DeferredCreate { .. }
+        | Effect::DeferredCreate(_)
         | Effect::DeferredReplace(_) => None,
     }
 }

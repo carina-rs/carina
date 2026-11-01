@@ -630,7 +630,7 @@ where
             | Effect::Remove { .. }
             | Effect::Move { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => instance_to_idx
                 .entry(effect.instance_key())
                 .or_default()
@@ -1399,7 +1399,7 @@ mod tests {
                 | Effect::Move { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => None,
             })
             .collect();

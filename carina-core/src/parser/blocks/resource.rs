@@ -6,7 +6,6 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::eval_value::{EvalValue, ParsedSinkValue, StructuralHandleKind};
-use crate::parser::Rule;
 use crate::parser::context::{
     ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
 };
@@ -15,6 +14,7 @@ use crate::parser::error::{
     WarningKind,
 };
 use crate::parser::util::expression_is_plain_string_literal;
+use crate::parser::{BoundDeferredTarget, Rule};
 use crate::parser::{
     ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
 };
@@ -44,6 +44,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
 pub(crate) enum ResourceParseTarget {
     Pending { origin: Option<LoopElementOrigin> },
     Bound { binding: String },
+    DeferredForTemplate { target: BoundDeferredTarget },
 }
 
 pub(crate) fn parse_resource_for_target(
@@ -81,6 +82,9 @@ pub(crate) fn parse_resource_for_target(
             ResourceIdentity::new(binding.clone()),
             None,
         ),
+        ResourceParseTarget::DeferredForTemplate { target } => {
+            target.template_resource_id(provider, &resource_type, None)
+        }
     };
     let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
@@ -113,6 +117,15 @@ pub(crate) fn parse_resource_for_target(
                 directives.provider_instance.clone(),
             ),
             Some(binding),
+            LoopProvenance::default(),
+        ),
+        ResourceParseTarget::DeferredForTemplate { target } => (
+            target.template_resource_id(
+                provider,
+                &resource_type,
+                directives.provider_instance.clone(),
+            ),
+            Some(target.template_address().to_string()),
             LoopProvenance::default(),
         ),
     };

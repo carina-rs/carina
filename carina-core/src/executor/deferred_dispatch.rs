@@ -98,7 +98,7 @@ impl DeferredAnonymousIdentityGuard {
         children: &[Effect<S>],
     ) -> Result<(), DeferredCreateFailure> {
         if !matches!(
-            template.target,
+            template.target(),
             crate::parser::DeferredForTarget::Unbound { .. }
         ) {
             return Ok(());
@@ -267,7 +267,7 @@ pub(super) fn materialize_deferred_create<
         },
     )?;
     if matches!(
-        template.target,
+        template.target(),
         crate::parser::DeferredForTarget::Unbound { .. }
     ) {
         let canonical_resources = crate::value::canonicalize_resources_with_schemas(
@@ -384,21 +384,18 @@ mod tests {
             "name",
             Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         );
-        DeferredForExpression {
-            file: None,
-            line: 1,
-            header: "for account in (up.accounts ?? [])".to_string(),
-            resource_type: "test.Child".to_string(),
-            target: crate::parser::DeferredForTarget::Bound {
-                binding: "children".to_string(),
-            },
-            iterable: Value::Deferred(DeferredValue::Coalesce {
+        DeferredForExpression::new(
+            None,
+            1,
+            "for account in (up.accounts ?? [])".to_string(),
+            crate::parser::DeferredForTarget::bound("children").expect("fixture binding is valid"),
+            Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::resource_ref("up", "accounts", vec![])),
                 default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
             }),
-            binding: ForBinding::Simple("account".to_string()),
+            ForBinding::Simple("account".to_string()),
             template_resource,
-        }
+        )
     }
 
     fn materialize_for_test(
@@ -442,8 +439,10 @@ mod tests {
     fn deferred_create_resolves_authored_ignore_changes() {
         let mut template = coalesced_template();
         let comment = Value::Concrete(ConcreteValue::String("managed-elsewhere".into()));
-        template.template_resource.set_attr("comment", comment);
-        template.template_resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+        template
+            .template_attributes_mut()
+            .insert("comment".to_string(), comment);
+        template.template_directives_mut().ignore_changes = vec![ParsedIgnorePath::new(vec![
             ParsedIgnorePathSegment::Attribute("comment".to_string()),
         ])];
         let mut bindings = ResolvedBindings::default();

@@ -7477,13 +7477,13 @@ import {
         &crate::parser::ProviderContext::default(),
     )
     .expect("bound discard loop and state blocks parse");
-    assert!(matches!(
-        parsed.parsed_deferred_for_expressions(),
-        [crate::parser::ParsedDeferredForExpression {
-            target: crate::parser::DeferredForTarget::Bound { binding },
-            ..
-        }] if binding == "_"
-    ));
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+    assert_eq!(
+        parsed.parsed_deferred_for_expressions()[0]
+            .target()
+            .bound_binding(),
+        Some("_")
+    );
 
     let errors =
         check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &parsed.resources);
