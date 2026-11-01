@@ -67,7 +67,7 @@ This guide walks you through creating an AWS VPC using Carina.
   carina plan
   ```
 
-  The plan output shows each resource and the action Carina will take (Create, Update, Delete, or Replace). `plan` and `apply` talk to AWS, so run them with credentials available. Profiles and IAM Identity Center are supported, for example `AWS_PROFILE=development carina plan`; establish an expired SSO session first with `aws sso login --profile development`. See [AWS Credentials](/guides/aws-credentials/).
+  The plan output shows each resource and the action Carina will take (Create, Update, Delete, or Replace). `plan` and `apply` talk to AWS, so run them with credentials available. Profiles and IAM Identity Center are supported, for example `AWS_PROFILE=development carina plan`; if the SSO session has expired, run `aws sso login --profile development` first. See [AWS Credentials](/guides/aws-credentials/).
 
   </Step>
 

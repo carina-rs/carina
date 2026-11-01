@@ -23,6 +23,18 @@ fn aws_fixture_path() -> PathBuf {
     })
 }
 
+fn system_ca_bundle() -> Option<&'static Path> {
+    [
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file())
+}
+
 fn isolated_command(
     project: &Path,
     home: &Path,
@@ -37,13 +49,19 @@ fn isolated_command(
         .env("CARINA_TEST_HOME", home)
         .env("CARINA_TRUST_RECORD_DIR", home.join(".carina/trust"))
         .env("CARINA_PLUGIN_CACHE_DIR", home.join(".carina/plugin-cache"))
-        .env("SSL_CERT_FILE", "/etc/ssl/cert.pem")
         .env("NO_COLOR", "1")
         .env_remove("CLICOLOR_FORCE")
         .env(
             "CARINA_TRUST_LOCAL_PROVIDER",
             format!("{}=aws", provider_source.display()),
         );
+    // The AWS SDK eagerly constructs its rustls client even though this test
+    // disables metadata and expects credential lookup to fail before I/O.
+    // Point it at the platform CA bundle so isolated macOS and Ubuntu test
+    // processes reach that credential assertion instead of CA preflight.
+    if let Some(ca_bundle) = system_ca_bundle() {
+        command.env("SSL_CERT_FILE", ca_bundle);
+    }
     for name in std::env::vars_os()
         .map(|(name, _)| name)
         .filter(|name| name.to_string_lossy().starts_with("AWS_"))

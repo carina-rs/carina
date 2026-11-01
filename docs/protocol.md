@@ -1,5 +1,35 @@
 # Provider protocol versions
 
+## Version 15
+
+Protocol v15 adds the `carina-provider-aws` world for AWS-kind providers. It
+imports both `wasi:http/outgoing-handler` and the new `aws-credentials`
+interface, then exports the same provider interface as the existing worlds.
+
+The `aws-credentials` interface defines an `aws-credentials` record containing
+`access-key-id`, `secret-access-key`, an optional `session-token`, and an
+optional `expires-at` Unix timestamp in seconds. Its `aws-credential-error`
+variant distinguishes `not-found(string)` from `provider-failed(string)`, and
+`current-credentials` returns either the current record or one of those typed,
+host-rendered errors. The host owns default-chain lookup, caching, and refresh;
+credential secrets do not cross the component boundary except through this
+typed call.
+
+An AWS-kind runtime load must import `aws-credentials`. GitHub-kind and
+untrusted runtime loads must not import it, so changing only the trust kind
+cannot give a non-AWS component access to credentials. Schema-only loading
+links the interface without resolving credentials, while an attempted call
+during schema loading fails with `provider-failed`.
+
+AWS credential environment variables are no longer passed to AWS guests.
+Cloud metadata addresses are also withheld from guest networking, preventing
+guest access to ECS or EC2 metadata credentials. The host may still use those
+environment variables, profiles, SSO, ECS, or EC2 metadata as part of its own
+AWS SDK credential chain.
+
+Hosts and providers must both use protocol v15. The minimum supported protocol
+version is 15.
+
 ## Version 13
 
 Protocol v13 makes initialized reference scope, provider-declared reference

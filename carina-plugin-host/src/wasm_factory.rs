@@ -1292,7 +1292,7 @@ impl std::error::Error for EgressDeniedCall {}
 /// Its fields are private so only [`check_host`] can create it. Resolution is
 /// still required before this value can become a [`VettedDestination`].
 struct AllowedHost {
-    capabilities: Option<RuntimeCapabilities>,
+    private_address_policy: Option<PrivateAddressPolicy>,
     host: String,
 }
 
@@ -1476,7 +1476,9 @@ impl ResolvedAddressClass {
 }
 
 fn check_host(network: &GuestNetwork, host: &str) -> Result<AllowedHost, DestinationDenied> {
-    let capabilities = network.runtime_capabilities();
+    let private_address_policy = network
+        .runtime_capabilities()
+        .map(RuntimeCapabilities::private_address_policy);
     let target = match ip_literal(host) {
         Some(address) => {
             let canonical_address = canonical_policy_address(address);
@@ -1509,7 +1511,7 @@ fn check_host(network: &GuestNetwork, host: &str) -> Result<AllowedHost, Destina
     };
 
     Ok(AllowedHost {
-        capabilities: capabilities.cloned(),
+        private_address_policy,
         host: target,
     })
 }
@@ -1519,11 +1521,11 @@ fn vet_resolved_destination(
     first: SocketAddr,
     rest: &[SocketAddr],
 ) -> Result<VettedDestination, (DestinationDenied, String)> {
-    let AllowedHost { capabilities, host } = allowed_host;
-    let private_address_policy = match &capabilities {
-        Some(capabilities) => capabilities.private_address_policy(),
-        None => PrivateAddressPolicy::Deny,
-    };
+    let AllowedHost {
+        private_address_policy,
+        host,
+    } = allowed_host;
+    let private_address_policy = private_address_policy.unwrap_or(PrivateAddressPolicy::Deny);
     for address in std::iter::once(&first).chain(rest) {
         let canonical_ip = canonical_policy_address(address.ip());
         match ResolvedAddressClass::classify(canonical_ip) {
@@ -9917,7 +9919,7 @@ mod tests {
         };
         vet_resolved_destination(
             AllowedHost {
-                capabilities: Some(capabilities),
+                private_address_policy: Some(capabilities.private_address_policy()),
                 host: "x.amazonaws.com".to_string(),
             },
             SocketAddr::new(address, 443),
@@ -10681,7 +10683,7 @@ mod tests {
             };
         let destination = VettedDestination::from_http_test_route(
             AllowedHost {
-                capabilities: Some(RuntimeCapabilities::Untrusted),
+                private_address_policy: Some(PrivateAddressPolicy::Deny),
                 host: "phase-test.invalid".to_string(),
             },
             test_destination,

@@ -1801,14 +1801,6 @@ impl CliAwsCredentialProvisioner {
             source: tokio::sync::OnceCell::new(),
         }
     }
-
-    #[cfg(test)]
-    fn with_source_for_test(source: Arc<dyn carina_plugin_host::AwsCredentialSource>) -> Self {
-        let cell = tokio::sync::OnceCell::new();
-        cell.set(source)
-            .unwrap_or_else(|_| unreachable!("a new OnceCell must be empty"));
-        Self { source: cell }
-    }
 }
 
 impl carina_plugin_host::AwsCredentialProvisioner for CliAwsCredentialProvisioner {
@@ -2196,8 +2188,7 @@ fn build_factories_from_providers_impl(
                     }
                     ProviderFactoryNetwork::Runtime => {
                         let locked_egress =
-                            carina_provider_resolver::load_locked_egress(&project_dir, &verified)
-                                .map_err(carina_plugin_host::WasmProviderLoadError::from)?;
+                            carina_provider_resolver::load_locked_egress(&project_dir, &verified)?;
                         carina_plugin_host::WasmProviderFactory::from_bytes_with_egress(
                             verified,
                             &user_dirs,

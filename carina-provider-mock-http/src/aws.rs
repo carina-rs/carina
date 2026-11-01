@@ -31,7 +31,7 @@ impl MockHttpAwsProvider {
             message: message.into(),
             resource_id: Some(id.clone()),
             cause: None,
-            provider_name: Some("mock_http".to_string()),
+            provider_name: Some("aws".to_string()),
             operation: Some("current_credentials".to_string()),
             status: None,
             code: None,
@@ -47,7 +47,7 @@ impl CarinaProvider for MockHttpAwsProvider {
 
     fn info(&self) -> ProviderInfo {
         ProviderInfo {
-            name: "mock_http".to_string(),
+            name: "aws".to_string(),
             display_name: "Mock HTTP AWS Credentials Provider".to_string(),
             capabilities: Vec::new(),
             version: env!("CARGO_PKG_VERSION").to_string(),

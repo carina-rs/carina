@@ -742,7 +742,7 @@ macro_rules! export_provider {
     ($provider_type:ty) => {
         $crate::export_provider!(@internal $provider_type, {
             world: "carina-provider",
-        });
+        }, {});
     };
     ($provider_type:ty, http, egress: [$($host:literal),* $(,)?] $(,)?) => {
         const _: () = {
@@ -766,7 +766,7 @@ macro_rules! export_provider {
                 "wasi:http/types@0.2.6": ::wasi::http::types,
                 "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
             },
-        });
+        }, {});
     };
     ($provider_type:ty, aws, egress: [$($host:literal),* $(,)?] $(,)?) => {
         const _: () = {
@@ -790,11 +790,24 @@ macro_rules! export_provider {
                 "wasi:http/types@0.2.6": ::wasi::http::types,
                 "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
             },
+        }, {
+            // Keep the AWS-world import in the component even when the
+            // provider never calls it. The host uses the import itself as the
+            // type-safe proof that an AWS-kind provider selected this world.
+            #[used]
+            static __CARINA_AWS_CREDENTIALS_IMPORT: fn() =
+                __carina_keep_aws_credentials_import;
+
+            fn __carina_keep_aws_credentials_import() {
+                let _ = carina::provider::aws_credentials::current_credentials();
+            }
         });
     };
-    (@internal $provider_type:ty, { $($bindgen:tt)* }) => {
+    (@internal $provider_type:ty, { $($bindgen:tt)* }, { $($world_items:item)* }) => {
         mod __carina_wasm_guest {
             $crate::__carina_wit_bindgen!({ $($bindgen)* });
+
+            $($world_items)*
 
             use super::*;
             use $crate::types as proto;

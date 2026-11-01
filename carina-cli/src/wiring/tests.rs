@@ -18,26 +18,6 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
-struct FailingAwsCredentialSource {
-    calls: Arc<AtomicUsize>,
-}
-
-impl carina_plugin_host::AwsCredentialSource for FailingAwsCredentialSource {
-    fn current(
-        &self,
-    ) -> BoxFuture<
-        '_,
-        Result<carina_plugin_host::AwsCredentials, carina_plugin_host::AwsCredentialError>,
-    > {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async {
-            Err(carina_plugin_host::AwsCredentialError::NotFound(
-                "CLI credential preflight sentinel".to_string(),
-            ))
-        })
-    }
-}
-
 fn comparison_provider_for_resources(
     schemas: &SchemaRegistry,
     resources: &[Resource],
@@ -1706,7 +1686,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn failing_aws_provision_is_typed_and_stops_before_guest_loading() {
+async fn aws_credential_load_error_maps_to_typed_startup_error() {
     let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().unwrap();
     let source_path = tmp.path().join("aws-provider.wasm");
@@ -1727,37 +1707,22 @@ async fn failing_aws_provision_is_typed_and_stops_before_guest_loading() {
         default_tags: IndexMap::new(),
     };
     let grants = TrustedLocalGrantInputs::new(vec![format!("{}=aws", source_path.display())], None);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let credential_provisioner = Arc::new(CliAwsCredentialProvisioner::with_source_for_test(
-        Arc::new(FailingAwsCredentialSource {
-            calls: Arc::clone(&calls),
-        }),
-    ));
-    let guest_started = Arc::new(AtomicBool::new(false));
-    let observed_guest = Arc::clone(&guest_started);
-
     let result = build_factories_from_providers_impl_using(
         &user_dirs,
         &[config],
         tmp.path(),
         true,
         &grants,
-        move |verified| {
+        |verified| {
             assert_eq!(
                 verified.identity().trust().class(),
                 carina_provider_resolver::ProviderTrustClass::Aws
             );
-            let credential_provisioner = Arc::clone(&credential_provisioner);
-            let observed_guest = Arc::clone(&observed_guest);
             async move {
-                carina_plugin_host::AwsCredentialProvisioner::provision(
-                    credential_provisioner.as_ref(),
-                )
-                .await
-                .map_err(carina_plugin_host::WasmProviderLoadError::AwsCredentials)?;
-                observed_guest.store(true, Ordering::SeqCst);
-                Err(carina_plugin_host::WasmProviderLoadError::Other(
-                    "guest loader should not be reached".to_string(),
+                Err(carina_plugin_host::WasmProviderLoadError::AwsCredentials(
+                    carina_plugin_host::AwsCredentialError::NotFound(
+                        "CLI credential preflight sentinel".to_string(),
+                    ),
                 ))
             }
         },
@@ -1775,8 +1740,6 @@ async fn failing_aws_provision_is_typed_and_stops_before_guest_loading() {
     assert!(rendered.contains("AWS_PROFILE"));
     assert!(rendered.contains("aws sso login"));
     assert!(rendered.contains("AWS_ACCESS_KEY_ID"));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(!guest_started.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -2340,13 +2303,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
         tmp.path(),
         true,
         &trusted_inputs,
-        |_verified| async {
-            panic!("trusted identity mismatch must fail before the WASM loader");
-            #[allow(unreachable_code)]
-            Err(carina_plugin_host::WasmProviderLoadError::Other(
-                "unreachable loader result".to_string(),
-            ))
-        },
+        |_verified| async { panic!("trusted identity mismatch must fail before the WASM loader") },
     );
     let Err(error) = result else {
         panic!("trusted provider kind mismatch must be fatal")

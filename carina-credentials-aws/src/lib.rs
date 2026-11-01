@@ -33,9 +33,11 @@ impl AwsSdkCredentialSource {
     ///
     /// # Errors
     ///
-    /// Returns [`AwsCredentialError::ProviderFailed`] if loading the SDK
-    /// configuration exceeds the credential-resolution timeout.
+    /// Returns [`AwsCredentialError::ProviderFailed`] if the native CA bundle
+    /// has no usable roots or loading the SDK configuration exceeds the
+    /// credential-resolution timeout.
     pub async fn new() -> Result<Self, AwsCredentialError> {
+        validate_native_ca_roots()?;
         let loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         let config = tokio::time::timeout(CREDENTIAL_RESOLUTION_TIMEOUT, loader.load())
             .await
@@ -188,6 +190,31 @@ fn credential_resolution_timeout(operation: &str) -> AwsCredentialError {
     ))
 }
 
+fn validate_native_ca_roots() -> Result<(), AwsCredentialError> {
+    let loaded = rustls_native_certs::load_native_certs();
+    let mut roots = rustls::RootCertStore::empty();
+    // Match the AWS SDK's rustls acceptance check without replacing its
+    // client, roots, or certificate verification policy.
+    let (valid, invalid) = roots.add_parsable_certificates(loaded.certs);
+    if valid > 0 {
+        return Ok(());
+    }
+
+    let detail = loaded.errors.first().map_or_else(
+        || {
+            if invalid == 0 {
+                String::new()
+            } else {
+                format!("; {invalid} certificate(s) could not be parsed")
+            }
+        },
+        |error| format!("; {error}"),
+    );
+    Err(AwsCredentialError::ProviderFailed(format!(
+        "failed to load the native CA bundle: no usable root certificates were found{detail}"
+    )))
+}
+
 fn map_credentials_error(error: CredentialsError) -> AwsCredentialError {
     let not_found = matches!(error, CredentialsError::CredentialsNotLoaded(_));
     let mut message = render_error_chain(&error);
@@ -231,6 +258,18 @@ mod tests {
     use sha1::{Digest, Sha1};
 
     use super::*;
+
+    fn system_ca_bundle() -> Option<&'static Path> {
+        [
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+        ]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+    }
 
     #[tokio::test]
     async fn static_provider_returns_credentials_without_exposing_secrets() {
@@ -633,10 +672,17 @@ mod tests {
                     "AWS_ENDPOINT_URL_SSO_OIDC",
                     OsStr::new("http://127.0.0.1:9"),
                 ),
-                ("SSL_CERT_FILE", OsStr::new("/etc/ssl/cert.pem")),
             ] {
                 // SAFETY: see the process isolation above.
                 unsafe { std::env::set_var(name, value) };
+            }
+            // The AWS SDK constructs its rustls client before this isolated
+            // credential lookup can fail without network I/O. Use the native
+            // macOS or Ubuntu CA bundle when present so the test reaches the
+            // intended credential assertion instead of CA preflight.
+            if let Some(ca_bundle) = system_ca_bundle() {
+                // SAFETY: see the process isolation above.
+                unsafe { std::env::set_var("SSL_CERT_FILE", ca_bundle) };
             }
             if let Some(profile) = profile {
                 // SAFETY: see the process isolation above.
@@ -671,6 +717,30 @@ mod tests {
         std::fs::create_dir_all(&aws_dir).unwrap();
         std::fs::write(aws_dir.join("config"), config).unwrap();
         std::fs::write(aws_dir.join("credentials"), "").unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_ca_bundle_returns_typed_provider_failure() {
+        let home = tempfile::tempdir().unwrap();
+        write_aws_files(home.path(), "");
+        let _environment = EnvironmentGuard::isolated(home.path(), None);
+        let empty_ca_bundle = home.path().join("empty-ca.pem");
+        std::fs::write(&empty_ca_bundle, "").unwrap();
+        // SAFETY: nextest runs this test in a separate process on a
+        // single-threaded runtime, as required by `EnvironmentGuard`.
+        unsafe { std::env::set_var("SSL_CERT_FILE", empty_ca_bundle) };
+
+        let error = AwsSdkCredentialSource::new()
+            .await
+            .expect_err("an unusable CA bundle must be a typed startup failure");
+
+        assert!(matches!(error, AwsCredentialError::ProviderFailed(_)));
+        let rendered = error.to_string();
+        assert!(rendered.contains("CA bundle"), "{rendered}");
+        assert!(
+            rendered.contains("no usable root certificates"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
