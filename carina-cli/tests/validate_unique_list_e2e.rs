@@ -63,6 +63,7 @@ fn validate_rejects_duplicate_canonical_list_elements() {
         assert!(stderr.contains("Duplicate list element"), "{stderr}");
         assert!(stderr.contains("repo"), "{stderr}");
         assert!(stderr.contains("claim_keys"), "{stderr}");
+        assert!(!stderr.contains("List item at index"), "{stderr}");
     }
 }
 

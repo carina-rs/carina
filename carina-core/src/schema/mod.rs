@@ -224,7 +224,8 @@ pub use carina_provider_protocol::types::{
 ///
 /// Elements containing secrets or diagnostic-sensitive strings are skipped for
 /// uniqueness, like unresolved elements, to avoid revealing equality. The
-/// provider remains the final authority for such values.
+/// same applies when a secret encloses the list. Provider output and persisted
+/// state skip uniqueness as well; length constraints always apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListConstraints {
     length: Option<(Option<u64>, Option<u64>)>,
@@ -1125,20 +1126,23 @@ impl StructField {
     }
 }
 
-/// An internal cursor describing the mode inherited by fields of the current
-/// type. Keeping ancestry in a type forces every schema/value walker to choose
-/// a concrete reference path before consulting field mode or block aliases.
+/// An internal cursor describing inherited field mode and secret sensitivity.
+/// Keeping ancestry in a type forces every schema/value walker to choose a
+/// concrete reference path before consulting field mode or block aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FieldAncestry {
     provider_populated: bool,
+    in_secret: bool,
 }
 
 impl FieldAncestry {
     pub(crate) const WRITABLE: Self = Self {
         provider_populated: false,
+        in_secret: false,
     };
     pub(crate) const PROVIDER_POPULATED: Self = Self {
         provider_populated: true,
+        in_secret: false,
     };
 
     pub(crate) fn from_input_mode(mode: InputMode) -> Self {
@@ -1164,7 +1168,17 @@ impl FieldAncestry {
     }
 
     pub(crate) fn descend(self, field: &StructField) -> Self {
-        Self::from_input_mode(self.effective_input_mode(field))
+        Self {
+            in_secret: self.in_secret,
+            ..Self::from_input_mode(self.effective_input_mode(field))
+        }
+    }
+
+    fn inside_secret(self) -> Self {
+        Self {
+            in_secret: true,
+            ..self
+        }
     }
 }
 
@@ -2219,7 +2233,7 @@ impl Schema {
                 defs,
                 path,
                 inner,
-                ancestry,
+                ancestry.inside_secret(),
                 &mut secret_errors,
                 visited_refs,
             );
@@ -2583,8 +2597,14 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<(), TypeError> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return validation_error_with_defs_on_path(attr, inner, defs, ancestry, visited_refs)
-            .map_err(TypeError::masked_for_secret);
+        return validation_error_with_defs_on_path(
+            attr,
+            inner,
+            defs,
+            ancestry.inside_secret(),
+            visited_refs,
+        )
+        .map_err(TypeError::masked_for_secret);
     }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
         validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)?;
@@ -2644,6 +2664,7 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
                 let (i, fit) = result.map_err(|failure| {
                     let error = *failure.error;
                     match failure.index {
+                        Some(_) if matches!(error, TypeError::DuplicateListElement { .. }) => error,
                         Some(index) => error.at_list_index(index),
                         None => error,
                     }
@@ -4817,6 +4838,11 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
 /// for the active purpose. Unresolved elements and elements containing secrets
 /// or diagnostic-sensitive strings are not comparable: even a masked duplicate
 /// would reveal equality. The provider remains the final authority for them.
+/// Canonicalization preserves integer/float spellings and struct block aliases,
+/// so those spellings remain distinct keys: uniqueness can miss duplicates but
+/// must never invent them (including by rounding large integers to floats).
+/// WaitRhs does not rewrite enums, so its enum spellings can remain distinct.
+/// Nested unordered lists compare in order, another possible missed duplicate.
 #[derive(PartialEq, Eq, Hash)]
 struct KnownListElement(serde_json::Value);
 
@@ -4825,13 +4851,12 @@ impl KnownListElement {
         value: &Value<P, B>,
         fit: &Fit<'_>,
         defs: &BTreeMap<String, AttributeType>,
-        ancestry: FieldAncestry,
         purpose: CanonicalizationPurpose<'_>,
     ) -> Option<Self> {
         if crate::value::contains_secret(value) || value.contains_diagnostic_sensitive_string() {
             return None;
         }
-        crate::value::canonical_json_with_fit(value.clone(), fit, defs, ancestry, purpose).map(Self)
+        crate::value::canonical_json_with_fit(value.clone(), fit, defs, purpose).map(Self)
     }
 }
 
@@ -4876,16 +4901,24 @@ impl ListConstraints {
             )
         });
         let mut seen: HashMap<KnownListElement, usize> = HashMap::new();
+        let authored = match purpose {
+            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl)
+            | CanonicalizationPurpose::ProviderConfig { .. }
+            | CanonicalizationPurpose::WaitRhs => true,
+            CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput)
+            | CanonicalizationPurpose::State => false,
+        };
         length_error
             .into_iter()
             .map(Err)
             .chain(items.enumerate().map(move |(index, item)| {
                 let value = std::borrow::Borrow::borrow(&item);
                 let fit = fit_item(value);
-                if self.elements == ListElements::Unique
+                if authored
+                    && !ancestry.in_secret
+                    && self.elements == ListElements::Unique
                     && let Some(fit) = &fit
-                    && let Some(key) =
-                        KnownListElement::from_fit(value, fit, defs, ancestry, purpose)
+                    && let Some(key) = KnownListElement::from_fit(value, fit, defs, purpose)
                 {
                     if let Some(first_index) = seen.get(&key) {
                         return Err(ListConstraintError {
@@ -4976,8 +5009,14 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
     use AttrTypeKind as AT;
 
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let inner =
-            fit_value_to_resolved_type_on_path(attr, inner, defs, ancestry, purpose, visited_refs)?;
+        let inner = fit_value_to_resolved_type_on_path(
+            attr,
+            inner,
+            defs,
+            ancestry.inside_secret(),
+            purpose,
+            visited_refs,
+        )?;
         let exactness = inner.exactness;
         return Some(Fit::with_kind(
             exactness,

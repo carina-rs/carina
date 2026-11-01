@@ -29,20 +29,13 @@ type ParserDataSource = crate::resource::DataSource<
     crate::resource::RelativeBindingName,
 >;
 
-/// The first-error validator and collector must identify the same later item.
-fn assert_indexed_duplicate(error: TypeError) -> TypeError {
-    let TypeError::ListItemError { index, inner } = error else {
-        panic!("duplicate is missing its list-item path: {error:?}");
-    };
-    let TypeError::DuplicateListElement {
-        index: duplicate_index,
-        ..
-    } = &*inner
-    else {
-        panic!("expected a duplicate list element, got {inner:?}");
-    };
-    assert_eq!(index, *duplicate_index);
-    *inner
+/// Duplicates carry their own index and need no extra list-item wrapper.
+fn assert_duplicate(error: TypeError) -> TypeError {
+    assert!(
+        matches!(error, TypeError::DuplicateListElement { .. }),
+        "{error:?}"
+    );
+    error
 }
 
 /// Exercise the portable declaration, including the protocol/core boundary.
@@ -81,7 +74,7 @@ fn unique_enum_list_rejects_duplicate_canonical_values() {
                 .validate(&value)
                 .expect_err("unique enum list must reject duplicate canonical values");
             assert!(matches!(
-                assert_indexed_duplicate(error.clone()),
+                assert_duplicate(error.clone()),
                 TypeError::DuplicateListElement {
                     index: 2,
                     first_index: 0,
@@ -130,9 +123,7 @@ fn unique_list_accepts_distinct_enum_values_and_resolves_aliases() {
         let duplicate = values(&["repo", alias]);
         assert!(
             matches!(
-                unique
-                    .validate(&duplicate)
-                    .map_err(assert_indexed_duplicate),
+                unique.validate(&duplicate).map_err(assert_duplicate),
                 Err(TypeError::DuplicateListElement { .. })
             ),
             "alias {alias}: {:?}",
@@ -175,7 +166,7 @@ fn unique_lists_validate_strings_ints_and_legacy_string_lists() {
                 Value::Concrete(first),
             ]));
             assert!(matches!(
-                list.validate(&duplicate).map_err(assert_indexed_duplicate),
+                list.validate(&duplicate).map_err(assert_duplicate),
                 Err(TypeError::DuplicateListElement {
                     index: 2,
                     first_index: 0,
@@ -190,7 +181,7 @@ fn unique_lists_validate_strings_ints_and_legacy_string_lists() {
             "repo".into(),
         ]));
         assert!(matches!(
-            list.validate(&duplicate).map_err(assert_indexed_duplicate),
+            list.validate(&duplicate).map_err(assert_duplicate),
             Err(TypeError::DuplicateListElement { .. })
         ));
         assert_eq!(Schema::flat(list).validate_collect(&duplicate).len(), 1);
@@ -229,7 +220,7 @@ fn unique_lists_skip_unresolved_elements_but_check_known_elements() {
             Value::Concrete(ConcreteValue::String("repo".into())),
         ]));
         assert!(matches!(
-            list.validate(&value).map_err(assert_indexed_duplicate),
+            list.validate(&value).map_err(assert_duplicate),
             Err(TypeError::DuplicateListElement {
                 index: 3,
                 first_index: 1,
@@ -263,7 +254,7 @@ fn unique_list_collector_reports_all_duplicates_and_item_errors() {
 }
 
 #[test]
-fn unique_enum_list_checks_api_spellings_in_state_fit() {
+fn unique_enum_list_read_side_fits_and_canonicalizes_duplicate_api_spellings() {
     let element = AttributeType::enum_(
         TypeIdentity::new(Some("mock"), ["test", "Subject"], "ClaimKey"),
         Some(vec!["REPO".into()]),
@@ -277,10 +268,10 @@ fn unique_enum_list_checks_api_spellings_in_state_fit() {
     let list = unique_list_from_protocol(element, true);
     let authored = Value::Concrete(ConcreteValue::List(vec![
         Value::Concrete(ConcreteValue::enum_identifier("repo")),
-        Value::Concrete(ConcreteValue::CanonicalEnum(canonical)),
+        Value::Concrete(ConcreteValue::CanonicalEnum(canonical.clone())),
     ]));
     assert!(matches!(
-        list.validate(&authored).map_err(assert_indexed_duplicate),
+        list.validate(&authored).map_err(assert_duplicate),
         Err(TypeError::DuplicateListElement { .. })
     ));
     for state in [
@@ -293,17 +284,41 @@ fn unique_enum_list_checks_api_spellings_in_state_fit() {
             "repo".into(),
         ])),
     ] {
-        assert!(
-            fit_value_to_type_on_path(
+        for purpose in [
+            CanonicalizationPurpose::State,
+            CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
+        ] {
+            let fit = fit_value_to_type_on_path(
                 &list,
                 &state,
                 empty_defs_for_schema_walks(),
                 FieldAncestry::WRITABLE,
-                CanonicalizationPurpose::State,
+                purpose,
                 &mut Vec::new(),
             )
-            .is_none(),
-            "state fit must enforce uniqueness after resolving aliases"
+            .expect("read-side duplicates must still fit");
+            assert_eq!(
+                crate::value::canonical_json_with_fit(
+                    state.clone(),
+                    &fit,
+                    empty_defs_for_schema_walks(),
+                    purpose,
+                ),
+                Some(serde_json::json!(["REPO", "REPO"])),
+                "read-side values still canonicalize each element",
+            );
+        }
+        let expected = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(
+                ConcreteValue::CanonicalEnum(canonical.clone())
+            );
+            2
+        ]));
+        assert_eq!(
+            Schema::flat(list.clone())
+                .canonicalize_state(state.clone())
+                .into_present(),
+            Some(expected),
         );
     }
 }
@@ -342,9 +357,7 @@ fn unique_lists_compare_nested_canonical_values_and_skip_partial_objects() {
         object("mock.test.Mode.allow"),
     ]));
     assert!(matches!(
-        schema
-            .validate(&duplicate)
-            .map_err(assert_indexed_duplicate),
+        schema.validate(&duplicate).map_err(assert_duplicate),
         Err(TypeError::DuplicateListElement { .. })
     ));
     assert_eq!(schema.validate_collect(&duplicate).len(), 1);
@@ -363,29 +376,15 @@ fn unique_lists_compare_nested_canonical_values_and_skip_partial_objects() {
 }
 
 #[test]
-fn duplicate_list_element_diagnostics_preserve_context_and_mask_secrets() {
+fn unique_list_skips_whole_secrets_and_diagnostic_sensitive_elements() {
     let list = unique_list_from_protocol(AttributeType::string(), true);
     let duplicate = Value::Concrete(ConcreteValue::List(vec![
         Value::Concrete(ConcreteValue::String("private-claim".into())),
         Value::Concrete(ConcreteValue::String("private-claim".into())),
     ]));
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(duplicate)));
-    let error = list
-        .validate(&secret)
-        .unwrap_err()
-        .with_attribute("claim_keys");
-    assert!(matches!(
-        assert_indexed_duplicate(error.clone()),
-        TypeError::DuplicateListElement {
-            value: DiagnosticValue::Masked,
-            ..
-        }
-    ));
-    assert_eq!(error.attribute_name(), Some("claim_keys"));
-    assert!(!format!("{error:?}: {error}").contains("private-claim"));
-    let collected = Schema::flat(list).validate_collect(&secret);
-    assert_eq!(collected.len(), 1);
-    assert!(!format!("{collected:?}").contains("private-claim"));
+    assert!(list.validate(&secret).is_ok());
+    assert!(Schema::flat(list).validate_collect(&secret).is_empty());
 
     let sensitive = Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
         "env-private-claim",
@@ -394,6 +393,76 @@ fn duplicate_list_element_diagnostics_preserve_context_and_mask_secrets() {
     let list = unique_list_from_protocol(AttributeType::string(), true);
     assert!(list.validate(&duplicate).is_ok());
     assert!(Schema::flat(list).validate_collect(&duplicate).is_empty());
+}
+
+#[test]
+fn unique_list_only_checks_authored_purposes_and_always_checks_length() {
+    let list = AttributeType::refined_list(
+        AttributeType::string(),
+        true,
+        Some((Some(1), Some(2))),
+        ListElements::Unique,
+    );
+    let duplicate = Value::Concrete(ConcreteValue::StringList(vec!["x".into(); 2]));
+    for (purpose, authored) in [
+        (
+            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+            true,
+        ),
+        (
+            CanonicalizationPurpose::ProviderConfig {
+                provider_name: "mock",
+            },
+            true,
+        ),
+        (CanonicalizationPurpose::WaitRhs, true),
+        (
+            CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
+            false,
+        ),
+        (CanonicalizationPurpose::State, false),
+    ] {
+        let fits = |value: &Value| {
+            fit_value_to_type_on_path(
+                &list,
+                value,
+                empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+                purpose,
+                &mut Vec::new(),
+            )
+            .is_some()
+        };
+        assert_eq!(fits(&duplicate), !authored);
+        for count in [0, 3] {
+            assert!(!fits(&Value::Concrete(ConcreteValue::StringList(
+                vec!["x".into(); count]
+            ))));
+        }
+    }
+}
+
+#[test]
+fn unique_list_whole_secret_still_checks_length_and_element_types() {
+    let list = AttributeType::refined_list(
+        AttributeType::string(),
+        true,
+        Some((None, Some(2))),
+        ListElements::Unique,
+    );
+    for items in [
+        vec![string_value("private"); 3],
+        vec![Value::Concrete(ConcreteValue::Int(1)); 2],
+    ] {
+        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::List(items),
+        ))));
+        assert!(list.validate(&value).is_err());
+        let collected = Schema::flat(list.clone()).validate_collect(&value);
+        assert!(!collected.is_empty());
+        assert!(!format!("{collected:?}").contains("DuplicateListElement"));
+        assert!(!format!("{collected:?}").contains("private"));
+    }
 }
 
 #[test]
@@ -553,15 +622,75 @@ fn unique_list_first_error_keeps_the_collected_item_path() {
     let value = Value::Concrete(ConcreteValue::List(vec![string_value("x"); 2]));
     let collected = schema.validate_collect(&value);
     let error = schema.validate(&value).unwrap_err();
-    let TypeError::ListItemError { index, inner } = error else {
-        panic!("first error lost its item path: {error:?}");
+    let TypeError::DuplicateListElement { index, .. } = &error else {
+        panic!("expected an unwrapped duplicate: {error:?}");
     };
-    assert_eq!(collected[0].0.steps(), &[FieldPathStep::Index(index)]);
+    assert_eq!(collected[0].0.steps(), &[FieldPathStep::Index(*index)]);
+    assert_eq!(error.to_string(), collected[0].1.to_string());
+    assert_eq!(
+        error.to_string(),
+        "Duplicate list element 'x' at index 1 (first at index 0)"
+    );
+    let error = error.with_attribute("values");
+    assert_eq!(error.attribute_name(), Some("values"));
+    assert!(error.to_string().ends_with("for 'values'"));
+}
+
+#[test]
+fn unique_list_nested_duplicate_only_wraps_the_outer_index() {
+    let schema = Schema::flat(AttributeType::list(unique_list_from_protocol(
+        AttributeType::string(),
+        true,
+    )));
+    let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::List(vec![string_value("x"); 2]),
+    )]));
+    let collected = schema.validate_collect(&value);
+    let TypeError::ListItemError { index: 0, inner } = schema.validate(&value).unwrap_err() else {
+        panic!("expected the outer list-item path");
+    };
+    assert!(matches!(
+        *inner,
+        TypeError::DuplicateListElement { index: 1, .. }
+    ));
+    assert_eq!(
+        collected[0].0.steps(),
+        &[FieldPathStep::Index(0), FieldPathStep::Index(1)]
+    );
     assert_eq!(inner.to_string(), collected[0].1.to_string());
 }
 
 #[test]
-fn unique_list_state_comparison_uses_absent_struct_fields() {
+fn unique_list_inside_whole_secret_struct_does_not_report_equality() {
+    let schema = Schema::flat(AttributeType::struct_(
+        "Secret",
+        vec![
+            StructField::required(
+                "items",
+                unique_list_from_protocol(AttributeType::string(), true),
+            )
+            .build(),
+            StructField::required("enabled", AttributeType::bool()).build(),
+        ],
+    ));
+    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([
+            (
+                "items".into(),
+                Value::Concrete(ConcreteValue::List(vec![string_value("private"); 2])),
+            ),
+            ("enabled".into(), string_value("invalid")),
+        ])),
+    ))));
+    let error = schema.validate(&value).unwrap_err();
+    let collected = schema.validate_collect(&value);
+    assert_eq!(collected.len(), 1, "{collected:?}");
+    assert!(!format!("{error:?} {collected:?}").contains("DuplicateListElement"));
+    assert!(!format!("{error:?} {collected:?}").contains("private"));
+}
+
+#[test]
+fn unique_list_state_preserves_duplicates_after_dropping_absent_struct_fields() {
     let element = AttributeType::struct_(
         "Item",
         vec![
@@ -602,8 +731,8 @@ fn unique_list_state_comparison_uses_absent_struct_fields() {
             CanonicalizationPurpose::State,
             &mut Vec::new()
         )
-        .is_none(),
-        "state drops an absent struct field before comparison"
+        .is_some(),
+        "state duplicates must fit even after absent fields are dropped"
     );
 }
 
@@ -659,24 +788,25 @@ fn unique_list_compares_canonical_string_or_list_containers() {
 }
 
 #[test]
-fn unique_float_list_compares_integers_as_floats() {
+fn unique_float_list_keeps_integer_and_float_spellings_distinct() {
     let list = unique_list_from_protocol(AttributeType::float(), true);
     for items in [
         vec![ConcreteValue::Int(1), ConcreteValue::Float(1.0)],
         vec![ConcreteValue::Float(1.0), ConcreteValue::Int(1)],
+        vec![
+            ConcreteValue::Int(9_007_199_254_740_992),
+            ConcreteValue::Int(9_007_199_254_740_993),
+        ],
     ] {
         let value = Value::Concrete(ConcreteValue::List(
             items.into_iter().map(Value::Concrete).collect(),
         ));
-        assert!(matches!(
-            list.validate(&value).map_err(assert_indexed_duplicate),
-            Err(TypeError::DuplicateListElement {
-                index: 1,
-                first_index: 0,
-                ..
-            })
-        ));
-        assert_eq!(Schema::flat(list.clone()).validate_collect(&value).len(), 1);
+        assert!(list.validate(&value).is_ok());
+        assert!(
+            Schema::flat(list.clone())
+                .validate_collect(&value)
+                .is_empty()
+        );
         for purpose in [
             CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
             CanonicalizationPurpose::State,
@@ -690,14 +820,14 @@ fn unique_float_list_compares_integers_as_floats() {
                     purpose,
                     &mut Vec::new()
                 )
-                .is_none()
+                .is_some()
             );
         }
     }
 }
 
 #[test]
-fn unique_struct_list_compares_block_aliases_by_canonical_field_name() {
+fn unique_struct_list_keeps_block_alias_and_canonical_keys_distinct() {
     let element = AttributeType::struct_(
         "Item",
         vec![
@@ -719,15 +849,12 @@ fn unique_struct_list_compares_block_aliases_by_canonical_field_name() {
                 })
                 .collect(),
         ));
-        assert!(matches!(
-            list.validate(&value).map_err(assert_indexed_duplicate),
-            Err(TypeError::DuplicateListElement {
-                index: 1,
-                first_index: 0,
-                ..
-            })
-        ));
-        assert_eq!(Schema::flat(list.clone()).validate_collect(&value).len(), 1);
+        assert!(list.validate(&value).is_ok());
+        assert!(
+            Schema::flat(list.clone())
+                .validate_collect(&value)
+                .is_empty()
+        );
         assert!(
             fit_value_to_type_on_path(
                 &list,
@@ -737,7 +864,7 @@ fn unique_struct_list_compares_block_aliases_by_canonical_field_name() {
                 CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
                 &mut Vec::new()
             )
-            .is_none()
+            .is_some()
         );
     }
 }

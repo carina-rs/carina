@@ -18,13 +18,23 @@ encoding may omit the field. The core API exposes the same policy as
 `AttributeType::refined_list(element_type, ordered, length, elements)` to choose
 explicitly. The `list` and `unordered_list` constructors allow duplicates.
 
-The shared schema validator checks uniqueness wherever it checks list length,
-including collect-all diagnostics and purpose-aware value fitting. Comparison
-uses resolved enum API values, so bare identifiers, qualified identifiers, and
-accepted aliases compare equally. Only fully known elements participate.
-Duplicate errors carry the value, duplicate index, first index, and attribute
-context through CLI and LSP diagnostics. Semantic schema fingerprints use
-encoding v8 to include this constraint.
+The shared schema validator checks uniqueness for authored desired values and
+provider configuration, including collect-all diagnostics and purpose-aware
+value fitting. Comparison uses canonical values, including resolved enum API
+values, so bare identifiers, qualified identifiers, and accepted enum aliases
+compare equally. Integer versus float spellings and struct block aliases versus
+canonical field keys remain distinct because canonicalization preserves them.
+Wait-condition right-hand sides do not rewrite enums, so enum spellings can also
+remain distinct there. Nested unordered lists inside an element compare in order.
+
+Elements containing secrets, environment-derived (diagnostic-sensitive) values,
+or unresolved values are excluded from duplicate comparison; known,
+nonsensitive elements in the same list are still checked. A secret wrapping the
+whole list is also excluded. Read-side values (provider read-back and persisted
+state) are not checked for uniqueness. List length constraints remain enforced
+in every case. Duplicate errors carry the value, duplicate index, first index,
+and attribute context through CLI and LSP diagnostics. Semantic schema
+fingerprints use encoding v8 to include this constraint.
 
 `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 17. A v17 host
 rejects v16 providers before decoding schemas, and providers must be rebuilt

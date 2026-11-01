@@ -200,14 +200,21 @@ let schema = ResourceSchema::new("actions.OidcSubject")
     .expect("the subject schema is valid");
 ```
 
-The shared schema validator enforces this declaration in `carina validate`,
-planning, and LSP diagnostics. It compares canonical values, so `[repo, repo]`
-and `[repo, github.actions.OidcSubject.ClaimKey.repo]` both fail. Enum aliases
-resolve to the same API value before comparison. Strings, integers, and nested
-values also support uniqueness. An element containing an unresolved value is
-excluded from duplicate comparison until it becomes known; known elements in
-the same list are still checked. `list()` and `unordered_list()` allow
-duplicates.
+The shared schema validator enforces this declaration for authored desired
+values and provider configuration in `carina validate`, planning, and LSP
+diagnostics. It compares canonical values, so `[repo, repo]` and
+`[repo, github.actions.OidcSubject.ClaimKey.repo]` both fail. Enum aliases
+resolve to the same API value before comparison. Canonicalization preserves
+integer versus float spellings and struct block aliases versus canonical field
+keys, so those spellings compare as distinct. Strings, integers, and nested
+values also support uniqueness.
+
+Elements containing secrets, environment-derived (diagnostic-sensitive) values,
+or unresolved values are excluded from duplicate comparison; known,
+nonsensitive elements in the same list are still checked. A secret wrapping the
+whole list is also excluded. Provider read-back and persisted state values are
+not checked for uniqueness. List length constraints still apply in all these
+cases. `list()` and `unordered_list()` allow duplicates.
 
 Protocol v17 requires every list schema JSON record to carry `elements` as
 `"allow_duplicates"` or `"unique"`, including ordinary lists. There is no
