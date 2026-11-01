@@ -590,9 +590,9 @@ A struct type represents a nested object with typed fields.
   pointer-identical callbacks only as an optimization. Callback-free sibling
   declarations share the identity's callback set, and separately allocated
   callbacks from repeated type-constructor calls are valid. This is the honest
-  protocol-13 behavior: the wire names an identity, not a schema declaration,
-  so the identity is the guest-side type and its constraints are per provider.
-  Protocol-13 WIT keeps
+  current-protocol (`PROTOCOL_VERSION`) behavior: the wire names an identity,
+  not a schema declaration, so the identity is the guest-side type and its
+  constraints are per provider. The current WIT keeps
   `validate-custom-type(TypeIdentity, string)`: the guest parses canonical text
   with the binding's stored kind, and aggregate schema admission rejects an
   identity reused with another scalar kind. Resource/config schema walks pass
@@ -619,7 +619,7 @@ A struct type represents a nested object with typed fields.
   every identified type without a scalar base and every enum shape that the protocol
   cannot represent; conversion retains typed defensive errors. The protocol's
   `StringEnum` cannot carry a closed enum's DSL transform or non-plain-String
-  base. Protocol 13 also has no fields for attribute completions or resource
+  base. The current protocol also has no fields for attribute completions or resource
   wait defaults: those are host-only authoring/execution metadata and are the
   two intentional one-way omissions pinned by projection tests. The legacy
   `Custom` decoder preserves the first outer record's name as the only
@@ -636,7 +636,8 @@ A struct type represents a nested object with typed fields.
   conversion: carina-core re-exports the protocol type, carina#3907), and
   `AttributeType` conversion patterns name every variant field. The nested
   `write_only` flag is required in schema JSON (no `#[serde(default)]`), and the
-  protocol minimum is 13, so a host and provider that disagree about it
+  protocol minimum (`MIN_SUPPORTED_PROTOCOL_VERSION`) requires it, so a host
+  and provider that disagree about it
   fail at load instead of silently dropping nested write-only members. Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
