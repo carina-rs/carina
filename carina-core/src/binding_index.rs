@@ -1454,19 +1454,20 @@ pub struct PartialReadBack {
     operation: AppliedOperation,
     pending: crate::resource::PendingReRead,
     missing_attributes: HashSet<String>,
-    read_back_budget_exhausted: bool,
+    end: crate::provider::ReadBackEnd,
 }
 
 impl PartialReadBack {
     pub(crate) fn from_diagnostic(
         operation: AppliedOperation,
         diagnostic: &crate::provider::PartialReadDiagnostic,
+        end: crate::provider::ReadBackEnd,
     ) -> Self {
         Self {
             operation,
             pending: crate::resource::PendingReRead::incomplete(diagnostic.reason().to_string()),
             missing_attributes: diagnostic.missing_attributes().iter().cloned().collect(),
-            read_back_budget_exhausted: diagnostic.read_back_budget_exhausted(),
+            end,
         }
     }
 
@@ -1490,8 +1491,8 @@ impl PartialReadBack {
         self.missing_attributes.contains(attribute)
     }
 
-    pub(crate) fn read_back_budget_exhausted(&self) -> bool {
-        self.read_back_budget_exhausted
+    pub(crate) fn end(&self) -> crate::provider::ReadBackEnd {
+        self.end
     }
 }
 
@@ -1505,6 +1506,20 @@ pub enum BindingCompleteness {
     Incomplete,
     /// A create or update finished, but its read-back left values unresolved.
     PartialReadBack(PartialReadBack),
+}
+
+impl BindingCompleteness {
+    fn attribute_known(&self, attribute: &str) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Incomplete => false,
+            Self::PartialReadBack(partial) => !partial.attribute_is_missing(attribute),
+        }
+    }
+
+    fn all_attributes_known(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
 }
 
 /// Plan-derived knowledge about a managed resource's refreshed attributes.
@@ -1635,7 +1650,7 @@ impl<P: PlaceholderKind> ResolvedBindings<P> {
         self.by_name.get(name).is_some_and(|binding| {
             binding.definitive_attributes.contains(attribute)
                 || (!binding.changed_attributes.contains(attribute)
-                    && binding.completeness == BindingCompleteness::Complete)
+                    && binding.completeness.attribute_known(attribute))
         })
     }
 
@@ -1657,8 +1672,7 @@ impl<P: PlaceholderKind> ResolvedBindings<P> {
 
     pub fn binding_is_fully_definitive(&self, name: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
-            binding.completeness == BindingCompleteness::Complete
-                && binding.refreshable_attributes.is_empty()
+            binding.completeness.all_attributes_known() && binding.refreshable_attributes.is_empty()
         })
     }
 }
@@ -2352,13 +2366,17 @@ impl ResolvedBindings {
     }
 
     pub fn access_miss_policy_for_value(&self, value: &Value) -> crate::resource::AccessMissPolicy {
-        let complete = value.root_bindings().iter().all(|name| {
-            self.by_name.get(name).is_some_and(|binding| {
-                binding.completeness == BindingCompleteness::Complete
-                    && binding.refreshable_attributes.is_empty()
-            })
+        let mut definitive = true;
+        value.visit_resource_refs(&mut |path| {
+            definitive &= self.by_name.get(path.binding()).is_some_and(|binding| {
+                binding.completeness.attribute_known(path.attribute())
+                    && !binding.refreshable_attributes.contains(path.attribute())
+            });
         });
-        if complete {
+        value.visit_binding_refs(&mut |name| {
+            definitive &= self.binding_is_fully_definitive(name);
+        });
+        if definitive {
             crate::resource::AccessMissPolicy::Error
         } else {
             crate::resource::AccessMissPolicy::Defer

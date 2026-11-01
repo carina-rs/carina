@@ -2245,7 +2245,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v13_state_json_bytes() {
+    fn ordered_maps_preserve_v14_state_json_bytes() {
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),

@@ -18,7 +18,7 @@ use crate::executor::provider_ready::{
 use crate::provider::{
     AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
     PartialReadDiagnostic, PartialResume, Provider, ProviderReadyResource, ProviderRouter,
-    ReadRequest, ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome,
+    ReadBackEnd, ReadRequest, ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind,
     UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
@@ -54,6 +54,7 @@ pub(super) enum BasicEffectResult {
         completed: CompletedEffect,
         resource_id: ResourceId,
         diagnostic: PartialReadDiagnostic,
+        read_back_end: ReadBackEnd,
         resolved_attrs: Option<SecretPreservingAttributes>,
         binding: Option<String>,
     },
@@ -558,7 +559,7 @@ fn unresolved_binding_message(
 
     let remediation = match bindings.completeness(referenced_binding) {
         Some(BindingCompleteness::PartialReadBack(partial))
-            if partial.read_back_budget_exhausted() =>
+            if partial.end() == ReadBackEnd::HostDeadline =>
         {
             format!(
                 "`{referenced_binding}` was {} but its read-back did not complete within the configured budget: {}. \
@@ -753,10 +754,13 @@ fn process_basic_outcome<S: Clone>(
             resolved_attrs,
             binding,
         } => {
-            let (created, state, diagnostic) = partial.into_parts();
-            let completeness = BindingCompleteness::PartialReadBack(
-                PartialReadBack::from_diagnostic(AppliedOperation::Create, &diagnostic),
-            );
+            let (created, state, diagnostic, read_back_end) = partial.into_parts();
+            let completeness =
+                BindingCompleteness::PartialReadBack(PartialReadBack::from_diagnostic(
+                    AppliedOperation::Create,
+                    &diagnostic,
+                    read_back_end,
+                ));
             exec.accumulator.mutate(|accumulated| {
                 accumulated.partial_count += 1;
                 accumulated.bindings.record_applied(
@@ -792,6 +796,7 @@ fn process_basic_outcome<S: Clone>(
             completed: CompletedEffect { state, request },
             resource_id,
             diagnostic,
+            read_back_end,
             resolved_attrs,
             binding,
         } => {
@@ -800,7 +805,7 @@ fn process_basic_outcome<S: Clone>(
                 super::AcceptedRequestKind::Update { .. } => AppliedOperation::Update,
             };
             let completeness = BindingCompleteness::PartialReadBack(
-                PartialReadBack::from_diagnostic(operation, &diagnostic),
+                PartialReadBack::from_diagnostic(operation, &diagnostic, read_back_end),
             );
             exec.accumulator.mutate(|accumulated| {
                 accumulated.partial_count += 1;
@@ -919,7 +924,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             started_effect.track_create_cancellation(cancellation);
             match create.await {
                 Ok(outcome) => {
-                    let (state, request, diagnostic) =
+                    let (state, request, diagnostic, read_back_end) =
                         super::complete_create_for_writeback(outcome, accepted_request);
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
@@ -929,6 +934,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             },
                             resource_id: resource.id.clone(),
                             diagnostic,
+                            read_back_end,
                             resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
                         }
@@ -1063,7 +1069,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     }
                 }
                 Ok(ResumeOutcomeKind::Resent(outcome)) => {
-                    let (state, request, diagnostic) =
+                    let (state, request, diagnostic, read_back_end) =
                         super::complete_create_for_writeback(*outcome, accepted_request);
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
@@ -1073,6 +1079,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             },
                             resource_id: resource.id.clone(),
                             diagnostic,
+                            read_back_end,
                             resolved_attrs: Some(resolved_attrs),
                             binding: resource.binding.clone(),
                         }
@@ -1264,12 +1271,8 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 AcceptedRequest::from_update_request(&request, resolved_desired_attributes.clone());
             match provider.update(id, identifier, request).await {
                 Ok(outcome) => {
-                    let diagnostic = match &outcome {
-                        UpdateOutcome::Success { .. } => None,
-                        UpdateOutcome::PartialSuccess { diagnostic, .. } => {
-                            Some(diagnostic.clone())
-                        }
-                    };
+                    let diagnostic = outcome.diagnostic().cloned();
+                    let read_back_end = outcome.read_back_end();
                     let state = outcome.into_state_for_writeback();
                     if let Some(diagnostic) = diagnostic {
                         BasicEffectResult::PartialSuccess {
@@ -1279,6 +1282,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             },
                             resource_id: id.clone(),
                             diagnostic,
+                            read_back_end,
                             resolved_attrs: Some(resolved_desired_attributes),
                             binding: to.binding.clone(),
                         }
@@ -1444,6 +1448,7 @@ mod process_basic_result_tests {
                 },
                 resource_id: id.clone(),
                 diagnostic: diagnostic.clone(),
+                read_back_end: ReadBackEnd::ProviderReported,
                 resolved_attrs: Some(resolved_attrs),
                 binding: Some("upstream".to_string()),
             },
@@ -1494,6 +1499,7 @@ mod process_basic_result_tests {
                 crate::binding_index::PartialReadBack::from_diagnostic(
                     crate::binding_index::AppliedOperation::Create,
                     &diagnostic,
+                    ReadBackEnd::ProviderReported,
                 ),
             )),
             "a partial read-back must not publish a complete binding snapshot",
@@ -1536,6 +1542,7 @@ mod process_basic_result_tests {
                 },
                 resource_id: id,
                 diagnostic: diagnostic.clone(),
+                read_back_end: ReadBackEnd::ProviderReported,
                 resolved_attrs: Some(SecretPreservingAttributes::from_provider_values(
                     &HashMap::new(),
                     &HashMap::new(),
@@ -1553,6 +1560,70 @@ mod process_basic_result_tests {
         assert!(
             !bindings.attribute_value_is_definitive("source", "computed"),
             "the explicitly missing attribute remains unknown",
+        );
+    }
+
+    #[test]
+    fn partial_success_treats_unlisted_absent_attribute_as_definitive() {
+        let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let id = resource.id.clone();
+        let state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "present".to_string(),
+                Value::Concrete(ConcreteValue::String("value".into())),
+            )]),
+        )
+        .with_identifier("mock-id");
+        let diagnostic = PartialReadDiagnostic::new(
+            "computed is not visible yet".to_string(),
+            vec!["computed".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+        let writeback_state = diagnostic.clone().into_state_for_writeback(state);
+        let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
+        let mut failed_indices = HashSet::new();
+        let mut pending_refreshes = HashMap::new();
+        let mut exec = ExecutionState {
+            idx: 0,
+            accumulator: &mut accumulator,
+            failed_indices: &mut failed_indices,
+            pending_refreshes: &mut pending_refreshes,
+        };
+
+        process_basic_outcome(
+            BasicEffectResult::PartialSuccess {
+                completed: CompletedEffect {
+                    state: Box::new(writeback_state),
+                    request: AcceptedRequest::create_for_test(),
+                },
+                resource_id: id,
+                diagnostic,
+                read_back_end: ReadBackEnd::ProviderReported,
+                resolved_attrs: Some(SecretPreservingAttributes::from_provider_values(
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )),
+                binding: Some("source".to_string()),
+            },
+            &mut exec,
+        );
+
+        let bindings = &accumulator.result().bindings;
+        let fallback = Value::Concrete(ConcreteValue::String("fallback".into()));
+        let expression = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("source", "optional_unset", vec![])),
+            default: Box::new(fallback.clone()),
+        });
+        assert_eq!(
+            crate::resolver::resolve_ref_value_status(&expression, bindings),
+            Ok(crate::resolver::ValueResolution::Present(fallback)),
+            "an absent attribute not listed as missing is definitively absent",
+        );
+        assert_eq!(
+            bindings.access_miss_policy_for_value(&expression),
+            crate::resource::AccessMissPolicy::Error,
+            "known attributes of a partial binding use strict access misses",
         );
     }
 
@@ -1584,6 +1655,7 @@ mod process_basic_result_tests {
                 },
                 resource_id: id,
                 diagnostic,
+                read_back_end: ReadBackEnd::ProviderReported,
                 resolved_attrs: None,
                 binding: None,
             },
@@ -1703,7 +1775,11 @@ mod assert_fully_resolved_tests {
                 HashMap::new(),
                 BindingValueSource::Local,
                 crate::binding_index::BindingCompleteness::PartialReadBack(
-                    crate::binding_index::PartialReadBack::from_diagnostic(operation, &diagnostic),
+                    crate::binding_index::PartialReadBack::from_diagnostic(
+                        operation,
+                        &diagnostic,
+                        ReadBackEnd::ProviderReported,
+                    ),
                 ),
             );
 
@@ -1728,12 +1804,11 @@ mod assert_fully_resolved_tests {
 
     #[test]
     fn final_attempt_partial_read_back_reports_budget_without_wait_hint() {
-        let mut diagnostic = crate::provider::PartialReadDiagnostic::new(
+        let diagnostic = crate::provider::PartialReadDiagnostic::new(
             "DVO is not populated yet".to_string(),
             vec!["domain_validation_options".to_string()],
         )
         .expect("missing attributes are non-empty");
-        diagnostic.mark_read_back_budget_exhausted();
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
             "cert",
@@ -1743,6 +1818,7 @@ mod assert_fully_resolved_tests {
                 crate::binding_index::PartialReadBack::from_diagnostic(
                     crate::binding_index::AppliedOperation::Create,
                     &diagnostic,
+                    ReadBackEnd::HostDeadline,
                 ),
             ),
         );

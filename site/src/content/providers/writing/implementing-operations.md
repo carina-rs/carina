@@ -228,7 +228,7 @@ fn create(
     let client_token = self.api.new_client_token();
     match self.api.start_create(&client_token, &name, size) {
         Ok(operation) => Ok(attempt.pending(
-            CreateToken::Operation(operation),
+            CreateToken::OperationId(operation),
             Sent::AllRequestAttributes,
             5,
         )),
@@ -263,7 +263,7 @@ pub enum CreateToken {
     /// first call started.
     Starting { client_token: String },
     /// The API accepted the request and returned an operation to follow.
-    Operation(String),
+    OperationId(String),
 }
 ```
 
@@ -321,7 +321,7 @@ fn poll_create(
                 }
             };
             match self.api.start_create(&client_token, &name, size) {
-                Ok(operation) => Ok(attempt.pending(CreateToken::Operation(operation), 5)),
+                Ok(operation) => Ok(attempt.pending(CreateToken::OperationId(operation), 5)),
                 // A rejected retry does not prove the first call created
                 // nothing: the API may refuse a reused client token, for
                 // example because the configuration changed in between.
@@ -335,18 +335,18 @@ fn poll_create(
                 Err(_) => Ok(attempt.pending(CreateToken::Starting { client_token }, 5)),
             }
         }
-        CreateToken::Operation(operation) => match self.api.create_status(&operation) {
+        CreateToken::OperationId(operation) => match self.api.create_status(&operation) {
             Ok(CreateStatus::InProgress) => {
-                Ok(attempt.pending(CreateToken::Operation(operation), 5))
+                Ok(attempt.pending(CreateToken::OperationId(operation), 5))
             }
             Ok(CreateStatus::Done { id: widget_id }) => match identifier(&widget_id) {
                 // Record the identifier now and read the widget on the
                 // next poll, through the Poll::Issued arm above.
                 Ok(identifier) => Ok(attempt
                     .issued(identifier)
-                    .pending_read_back(CreateToken::Operation(operation), 0)),
+                    .pending_read_back(CreateToken::OperationId(operation), 1)),
                 Err(err) => Err(attempt.preserve(
-                    CreateToken::Operation(operation),
+                    CreateToken::OperationId(operation),
                     5,
                     err,
                 )),
@@ -368,7 +368,7 @@ fn poll_create(
                         .into())
                 }
                 Err(err) => Err(attempt.preserve(
-                    CreateToken::Operation(operation),
+                    CreateToken::OperationId(operation),
                     5,
                     err,
                 )),
@@ -377,7 +377,7 @@ fn poll_create(
                 Err(attempt.untracked(error(ProviderErrorKind::ApiError, reason)))
             }
             // The status call failed; the operation is still there.
-            Err(_) => Ok(attempt.pending(CreateToken::Operation(operation), 5)),
+            Err(_) => Ok(attempt.pending(CreateToken::OperationId(operation), 5)),
         },
     }
 }
@@ -387,7 +387,7 @@ A `Starting` token retries the create with the same client token. Because the AP
 
 A rejected retry is `preserve`, not `untracked`. The first call may have created the widget, and the API can refuse the reused token for reasons of its own, for example because the configuration changed before a later apply resumed the create. `preserve` carries the same continuation plus the error, so Carina keeps the attempt while surfacing why this poll stopped. Any other failure keeps the attempt pending.
 
-When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending_read_back` once more. That records the identifier right away, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. `poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Before that deadline a failed read remains `pending_read_back`; on the final attempt the provider must return success, partial success, or an error. Once read-back has begun, returning pending in either phase on that final attempt is a protocol violation, as is regressing to operation phase on an earlier poll, so this example returns `partial` with the known state and missing attributes. `resume_create` receives the same poll request when Carina resumes a persisted continuation.
+When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending_read_back` once more. That records the identifier right away, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. `poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. This example therefore returns `partial` when the issued read-back receives the final attempt. `resume_create` receives the same poll request when Carina resumes a persisted continuation; on its first call, the persisted token and identifier are authoritative but the inbound phase and delay are not.
 
 A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict<CreateToken>`, and `.into()` turns it into the `PollVerdict<CreateToken>` that `poll_create` returns.
 

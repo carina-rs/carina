@@ -16,21 +16,30 @@ minutes. The read-back budget never extends or adds to the 15-minute default
 operation budget. Poll delays remain clamped to 1–300 seconds against the
 active deadline.
 
-At the active deadline the host sends exactly one `final-attempt`. A create or
-update provider must finish with success, partial success, or an error; it
-must not return `pending` in either phase after read-back has begun. Returning
-from `read-back` to `operation` at any point is also a protocol violation. For
-create, the host retains the known identifier and continuation in recovery
-state. Providers should return partial success when the mutation is known to
-have completed but the final read still lacks attributes. Core records the
+At the active deadline the host sends exactly one `final-attempt`. The phase of
+the continuation that receives that request determines the result of another
+pending response. A final attempt sent to an `operation` continuation may
+return pending in either phase; the host reports that the operation exceeded
+its budget. For create, the host preserves the returned continuation and any
+known identifier. For update, it preserves the pre-update state row, which the
+next plan refreshes from the cloud. A final attempt sent to a `read-back`
+continuation must finish with success, partial success, or an error; pending in
+either phase is a protocol violation.
+Returning from `read-back` to `operation` at any point is also a protocol
+violation. Providers should return partial success when the mutation is known
+to have completed but the final read still lacks attributes. Core records the
 partial-read marker, publishes returned attributes while keeping only the
 reported missing attributes unknown, and retries the read on the next apply or
 refresh.
 
 `resume-create` receives the same `poll-request` finality as `poll-create`; the
 host never fabricates the `sent` values that are absent from a persisted
-`resume-pending`. Delete continuations use the phase-less `pending-delete`
-record because delete has no post-apply read-back phase.
+`resume-pending`. Persisted state retains the resume token and identifier, but
+not scheduling metadata, so the first resume call's inbound phase and delay are
+non-authoritative. The provider recovers the operation from its token and any
+pending result it returns establishes the phase used by later polls. Delete
+continuations use the phase-less `pending-delete` record because delete has no
+post-apply read-back phase.
 
 `OperationConfig.read_back` participates in semantic schema fingerprint
 encoding v6. Provider protocol and minimum supported protocol are both 14;

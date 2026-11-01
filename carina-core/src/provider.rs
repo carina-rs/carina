@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use tokio::sync::Notify;
 
+use carina_provider_protocol::CompletedOperation;
+pub use carina_provider_protocol::ReadBackEnd;
 use carina_provider_protocol::types as protocol_types;
 pub use carina_provider_protocol::types::{
     AppliedIdentifier, EmptyAppliedIdentifier, PendingToken, ReferenceScope, ReferenceScopeError,
@@ -2068,8 +2070,13 @@ pub(crate) fn fixture_read_outcome_for_identifier(
 ///     CreateOutcome::Success { state }
 /// }
 /// ```
-#[derive(Debug, PartialEq, Serialize)]
-pub struct CreateOutcome(CreateOutcomeKind);
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct CreateOutcome {
+    kind: CreateOutcomeKind,
+    #[serde(skip)]
+    read_back_end: ReadBackEnd,
+}
 
 /// Read-only classification exposed by an opaque [`CreateOutcome`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -2084,8 +2091,17 @@ pub enum CreateOutcomeKind {
 }
 
 /// Result of a provider update operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UpdateOutcome {
+    kind: UpdateOutcomeKind,
+    #[serde(skip)]
+    read_back_end: ReadBackEnd,
+}
+
+/// Read-only classification exposed by an opaque [`UpdateOutcome`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdateOutcome {
+pub enum UpdateOutcomeKind {
     /// Update completed and the returned state is complete.
     Success { state: AppliedState },
     /// Update completed but the provider could not fully observe state.
@@ -2095,15 +2111,23 @@ pub enum UpdateOutcome {
     },
 }
 
+impl PartialEq for CreateOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+impl PartialEq for UpdateOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
 /// Diagnostic details for a partial post-mutation read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartialReadDiagnostic {
     pub(crate) reason: String,
     pub(crate) missing_attributes: Vec<String>,
-    /// Host-only provenance for same-run guidance; never part of provider or
-    /// persisted diagnostic formats.
-    #[serde(skip)]
-    pub(crate) read_back_budget_exhausted: bool,
 }
 
 /// Validated UTC RFC3339 timestamp used only to describe when a persisted
@@ -3584,7 +3608,9 @@ impl CreateFailure {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ResumeOutcome(ResumeOutcomeKind);
+pub struct ResumeOutcome {
+    kind: ResumeOutcomeKind,
+}
 
 /// A resumed create that completed with an applied state.
 ///
@@ -3645,6 +3671,7 @@ impl CompletedResume {
 pub struct PartialResume {
     completed: CompletedResume,
     diagnostic: PartialReadDiagnostic,
+    read_back_end: ReadBackEnd,
 }
 
 impl PartialResume {
@@ -3659,6 +3686,7 @@ impl PartialResume {
         Self {
             completed: CompletedResume::new(pending, identifier, state),
             diagnostic,
+            read_back_end: ReadBackEnd::ProviderReported,
         }
     }
 
@@ -3687,19 +3715,21 @@ impl PartialResume {
         Self {
             completed: self.completed.with_resolved_desired_attributes(attributes),
             diagnostic: self.diagnostic,
+            read_back_end: self.read_back_end,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (ObservedCreate, State, PartialReadDiagnostic) {
+    pub(crate) fn into_parts(self) -> (ObservedCreate, State, PartialReadDiagnostic, ReadBackEnd) {
         let Self {
             completed,
             diagnostic,
+            read_back_end,
         } = self;
         let created = completed
             .into_observed_create()
             .with_partial_read(diagnostic.clone());
         let state = created.observed_state();
-        (created, state, diagnostic)
+        (created, state, diagnostic, read_back_end)
     }
 }
 
@@ -3716,27 +3746,48 @@ pub enum ResumeOutcomeKind {
 
 impl ResumeOutcome {
     fn resumed(completed: CompletedResume) -> Self {
-        Self(ResumeOutcomeKind::Resumed(Box::new(completed)))
+        Self {
+            kind: ResumeOutcomeKind::Resumed(Box::new(completed)),
+        }
     }
 
     fn resent(outcome: CreateOutcome) -> Self {
-        Self(ResumeOutcomeKind::Resent(Box::new(outcome)))
+        Self {
+            kind: ResumeOutcomeKind::Resent(Box::new(outcome)),
+        }
     }
 
     fn partial(outcome: PartialResume) -> Self {
-        Self(ResumeOutcomeKind::PartialSuccess(Box::new(outcome)))
+        Self {
+            kind: ResumeOutcomeKind::PartialSuccess(Box::new(outcome)),
+        }
+    }
+
+    /// Attach host-owned polling provenance from the pending driver.
+    pub fn from_host_completion(completed: CompletedOperation<Self>) -> Self {
+        let (mut outcome, read_back_end) = completed.into_parts();
+        match &mut outcome.kind {
+            ResumeOutcomeKind::Resumed(_) => {}
+            ResumeOutcomeKind::PartialSuccess(partial) => {
+                partial.read_back_end = read_back_end;
+            }
+            ResumeOutcomeKind::Resent(resent) => {
+                resent.read_back_end = read_back_end;
+            }
+        }
+        outcome
     }
 
     pub fn kind(&self) -> &ResumeOutcomeKind {
-        &self.0
+        &self.kind
     }
 
     pub fn into_kind(self) -> ResumeOutcomeKind {
-        self.0
+        self.kind
     }
 
     pub fn id(&self) -> &ResourceId {
-        match &self.0 {
+        match &self.kind {
             ResumeOutcomeKind::Resumed(completed) => completed.id(),
             ResumeOutcomeKind::PartialSuccess(outcome) => outcome.id(),
             ResumeOutcomeKind::Resent(outcome) => outcome.id(),
@@ -3991,7 +4042,7 @@ impl IssuedCreate {
     }
 
     pub fn succeeded(self, attributes: HashMap<String, Value>) -> CreateOutcome {
-        CreateOutcome(CreateOutcomeKind::Success {
+        CreateOutcome::provider_reported(CreateOutcomeKind::Success {
             state: AppliedState::from_identifier(self.id, self.identifier, attributes),
         })
     }
@@ -4001,7 +4052,7 @@ impl IssuedCreate {
         attributes: HashMap<String, Value>,
         diagnostic: PartialReadDiagnostic,
     ) -> CreateOutcome {
-        CreateOutcome(CreateOutcomeKind::PartialSuccess {
+        CreateOutcome::provider_reported(CreateOutcomeKind::PartialSuccess {
             state: AppliedState::from_identifier(self.id, self.identifier, attributes),
             diagnostic,
         })
@@ -4034,7 +4085,7 @@ pub struct FinishingCreate {
 
 impl FinishingCreate {
     pub fn succeeded(self, attributes: HashMap<String, Value>) -> CreateOutcome {
-        CreateOutcome(CreateOutcomeKind::Success {
+        CreateOutcome::provider_reported(CreateOutcomeKind::Success {
             state: AppliedState::from_identifier(self.id, self.identifier, attributes),
         })
     }
@@ -4044,7 +4095,7 @@ impl FinishingCreate {
         attributes: HashMap<String, Value>,
         diagnostic: PartialReadDiagnostic,
     ) -> CreateOutcome {
-        CreateOutcome(CreateOutcomeKind::PartialSuccess {
+        CreateOutcome::provider_reported(CreateOutcomeKind::PartialSuccess {
             state: AppliedState::from_identifier(self.id, self.identifier, attributes),
             diagnostic,
         })
@@ -4592,9 +4643,23 @@ impl ResentPollAttempt {
 }
 
 impl CreateOutcome {
+    fn provider_reported(kind: CreateOutcomeKind) -> Self {
+        Self {
+            kind,
+            read_back_end: ReadBackEnd::ProviderReported,
+        }
+    }
+
+    /// Attach host-owned polling provenance from the pending driver.
+    pub fn from_host_completion(completed: CompletedOperation<Self>) -> Self {
+        let (mut outcome, read_back_end) = completed.into_parts();
+        outcome.read_back_end = read_back_end;
+        outcome
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture_success(state: AppliedState) -> Self {
-        Self(CreateOutcomeKind::Success { state })
+        Self::provider_reported(CreateOutcomeKind::Success { state })
     }
 
     #[cfg(test)]
@@ -4604,21 +4669,27 @@ impl CreateOutcome {
         missing_attributes: Vec<String>,
     ) -> Self {
         match PartialReadDiagnostic::new(reason, missing_attributes) {
-            Some(diagnostic) => Self(CreateOutcomeKind::PartialSuccess { state, diagnostic }),
-            None => Self(CreateOutcomeKind::Success { state }),
+            Some(diagnostic) => {
+                Self::provider_reported(CreateOutcomeKind::PartialSuccess { state, diagnostic })
+            }
+            None => Self::provider_reported(CreateOutcomeKind::Success { state }),
         }
     }
 
     pub fn kind(&self) -> &CreateOutcomeKind {
-        &self.0
+        &self.kind
     }
 
     pub fn into_kind(self) -> CreateOutcomeKind {
-        self.0
+        self.kind
+    }
+
+    pub fn read_back_end(&self) -> ReadBackEnd {
+        self.read_back_end
     }
 
     pub fn id(&self) -> &ResourceId {
-        match &self.0 {
+        match &self.kind {
             CreateOutcomeKind::Success { state }
             | CreateOutcomeKind::PartialSuccess {
                 state,
@@ -4629,7 +4700,7 @@ impl CreateOutcome {
 
     /// Provider-assigned identifier carried by every successful create.
     pub fn identifier(&self) -> &AppliedIdentifier {
-        match &self.0 {
+        match &self.kind {
             CreateOutcomeKind::Success { state }
             | CreateOutcomeKind::PartialSuccess {
                 state,
@@ -4640,7 +4711,7 @@ impl CreateOutcome {
 
     /// Consume the outcome and produce a State ready for writeback.
     pub(crate) fn into_state_for_writeback(self) -> State {
-        match self.0 {
+        match self.kind {
             CreateOutcomeKind::Success { state } => state.into_state_for_writeback(),
             CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
                 diagnostic.into_state_for_writeback(state.into_state_for_writeback())
@@ -4649,7 +4720,7 @@ impl CreateOutcome {
     }
 
     pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
-        match &self.0 {
+        match &self.kind {
             CreateOutcomeKind::Success { .. } => None,
             CreateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
         }
@@ -4657,31 +4728,67 @@ impl CreateOutcome {
 }
 
 impl UpdateOutcome {
+    pub fn success(state: AppliedState) -> Self {
+        Self::provider_reported(UpdateOutcomeKind::Success { state })
+    }
+
     pub fn partial_success(
         state: AppliedState,
         reason: String,
         missing_attributes: Vec<String>,
     ) -> Self {
         match PartialReadDiagnostic::new(reason, missing_attributes) {
-            Some(diagnostic) => UpdateOutcome::PartialSuccess { state, diagnostic },
-            None => UpdateOutcome::Success { state },
+            Some(diagnostic) => {
+                Self::provider_reported(UpdateOutcomeKind::PartialSuccess { state, diagnostic })
+            }
+            None => Self::success(state),
         }
+    }
+
+    pub fn from_parts(state: AppliedState, diagnostic: PartialReadDiagnostic) -> Self {
+        Self::provider_reported(UpdateOutcomeKind::PartialSuccess { state, diagnostic })
+    }
+
+    fn provider_reported(kind: UpdateOutcomeKind) -> Self {
+        Self {
+            kind,
+            read_back_end: ReadBackEnd::ProviderReported,
+        }
+    }
+
+    /// Attach host-owned polling provenance from the pending driver.
+    pub fn from_host_completion(completed: CompletedOperation<Self>) -> Self {
+        let (mut outcome, read_back_end) = completed.into_parts();
+        outcome.read_back_end = read_back_end;
+        outcome
+    }
+
+    pub fn kind(&self) -> &UpdateOutcomeKind {
+        &self.kind
+    }
+
+    pub fn into_kind(self) -> UpdateOutcomeKind {
+        self.kind
+    }
+
+    pub fn read_back_end(&self) -> ReadBackEnd {
+        self.read_back_end
     }
 
     /// Consume the outcome and produce a State ready for writeback.
     pub fn into_state_for_writeback(self) -> State {
-        match self {
-            UpdateOutcome::Success { state } => state.into_state_for_writeback(),
-            UpdateOutcome::PartialSuccess { state, diagnostic } => {
+        match self.kind {
+            UpdateOutcomeKind::Success { state } => state.into_state_for_writeback(),
+            UpdateOutcomeKind::PartialSuccess { state, diagnostic } => {
                 diagnostic.into_state_for_writeback(state.into_state_for_writeback())
             }
         }
     }
 
     pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
-        match self {
-            UpdateOutcome::Success { .. } => None,
-            UpdateOutcome::PartialSuccess { diagnostic, .. } => Some(diagnostic),
+        match &self.kind {
+            UpdateOutcomeKind::Success { .. } => None,
+            UpdateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
         }
     }
 }
@@ -4694,7 +4801,6 @@ impl PartialReadDiagnostic {
             Some(Self {
                 reason,
                 missing_attributes,
-                read_back_budget_exhausted: false,
             })
         }
     }
@@ -4705,15 +4811,6 @@ impl PartialReadDiagnostic {
 
     pub fn missing_attributes(&self) -> &[String] {
         &self.missing_attributes
-    }
-
-    pub fn read_back_budget_exhausted(&self) -> bool {
-        self.read_back_budget_exhausted
-    }
-
-    #[doc(hidden)]
-    pub fn mark_read_back_budget_exhausted(&mut self) {
-        self.read_back_budget_exhausted = true;
     }
 
     /// Merge another partial-read diagnostic into this one.
@@ -8294,7 +8391,7 @@ mod tests {
         let ResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
             panic!("resumed partial read-back must remain distinct from a resent create")
         };
-        let (created, state, actual_diagnostic) = partial.into_parts();
+        let (created, state, actual_diagnostic, read_back_end) = partial.into_parts();
 
         let SentRecord::Persisted(envelope) = created.sent() else {
             panic!("resumed partial read-back fabricated request sent authority")
@@ -8305,6 +8402,7 @@ mod tests {
         );
         assert_eq!(envelope.identifier(), Some(&identifier));
         assert_eq!(actual_diagnostic, diagnostic);
+        assert_eq!(read_back_end, ReadBackEnd::ProviderReported);
         assert_eq!(
             state
                 .partial_read
@@ -9411,10 +9509,10 @@ mod tests {
                 }
             }
             Box::pin(async move {
-                Ok(UpdateOutcome::Success {
-                    state: AppliedState::new(id, identifier, attrs)
+                Ok(UpdateOutcome::success(
+                    AppliedState::new(id, identifier, attrs)
                         .expect("provider input identifier is non-empty"),
-                })
+                ))
             })
         }
 
@@ -9613,6 +9711,91 @@ mod tests {
                 "shared".to_string(),
                 "create_attr".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn host_deadline_provenance_is_not_provider_diagnostic_identity() {
+        let provider_reported = PartialReadDiagnostic::new(
+            "read-back remained incomplete".to_string(),
+            vec!["computed".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+        let encoded = serde_json::to_value(&provider_reported).unwrap();
+        let round_tripped: PartialReadDiagnostic = serde_json::from_value(encoded.clone()).unwrap();
+
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "reason": "read-back remained incomplete",
+                "missing_attributes": ["computed"],
+            }),
+            "provider diagnostic formats must not carry host provenance",
+        );
+        assert_eq!(
+            provider_reported, round_tripped,
+            "a persisted diagnostic retains only provider-reported data",
+        );
+
+        let id = ResourceId::with_identity("test", "deadline-roundtrip");
+        let state = AppliedState::new(id, "provider-id", HashMap::new())
+            .expect("the fixture identifier is non-empty");
+        let mut provider_outcome = Some(UpdateOutcome::partial_success(
+            state,
+            "read-back remained incomplete".to_string(),
+            vec!["computed".to_string()],
+        ));
+        let driven =
+            futures::executor::block_on(carina_provider_protocol::drive_pending_infallible(
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(30),
+                std::future::ready(carina_provider_protocol::OperationStep::<
+                    UpdateOutcome,
+                    (),
+                    (),
+                >::Pending {
+                    pending: (),
+                    poll_after_secs: 1,
+                    phase: carina_provider_protocol::PendingPhase::ReadBack,
+                }),
+                |(), finality| {
+                    assert_eq!(
+                        finality,
+                        carina_provider_protocol::PollFinality::FinalAttempt
+                    );
+                    std::future::ready(carina_provider_protocol::OperationStep::Done(
+                        provider_outcome
+                            .take()
+                            .expect("the final attempt runs exactly once"),
+                    ))
+                },
+                |_| std::future::ready(()),
+            ));
+        let carina_provider_protocol::DriveOutcome::Done(completed) = driven else {
+            panic!("the final attempt must complete with a partial update")
+        };
+        let host_outcome = UpdateOutcome::from_host_completion(completed);
+        assert_eq!(host_outcome.read_back_end(), ReadBackEnd::HostDeadline);
+
+        let encoded_outcome = serde_json::to_value(&host_outcome).unwrap();
+        let round_tripped_outcome: UpdateOutcome = serde_json::from_value(encoded_outcome).unwrap();
+        assert_eq!(
+            round_tripped_outcome.read_back_end(),
+            ReadBackEnd::ProviderReported,
+            "serialized provider outcomes must not retain same-run host provenance",
+        );
+        assert_eq!(
+            host_outcome, round_tripped_outcome,
+            "host provenance is not part of provider outcome identity",
+        );
+
+        let writeback = host_outcome.into_state_for_writeback();
+        let encoded_state = serde_json::to_string(&writeback).unwrap();
+        assert!(!encoded_state.contains("HostDeadline"));
+        let round_tripped_state: State = serde_json::from_str(&encoded_state).unwrap();
+        assert!(
+            round_tripped_state.partial_read.is_some(),
+            "the partial-read marker survives without same-run budget provenance",
         );
     }
 
@@ -11801,10 +11984,10 @@ mod tests {
                 let id = id.clone();
                 let identifier = identifier.to_string();
                 Box::pin(async move {
-                    Ok(UpdateOutcome::Success {
-                        state: AppliedState::new(id, identifier, HashMap::new())
+                    Ok(UpdateOutcome::success(
+                        AppliedState::new(id, identifier, HashMap::new())
                             .expect("provider input identifier is non-empty"),
-                    })
+                    ))
                 })
             }
 

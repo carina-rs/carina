@@ -165,11 +165,25 @@ fn exhausted_read_back_is_retried_by_the_next_real_apply() {
         .partial_read()
         .expect("partial source must retain its read marker");
     assert!(marker.missing_attributes().contains("computed"));
+    let first_source_identifier = source
+        .identifier()
+        .expect("partial source must retain its provider identifier")
+        .as_str()
+        .to_string();
     assert_string_attribute(
         &first_state,
         "budget_present_dependent",
         "from_read_back",
         "present",
+    );
+    let present_dependent_identifier = first_state
+        .find_resource("mock", "test.read_back", "budget_present_dependent")
+        .and_then(|row| row.identifier())
+        .expect("the first-run dependent must have a provider identifier");
+    assert_ne!(
+        first_source_identifier,
+        present_dependent_identifier.as_str(),
+        "two creates must receive distinct provider identifiers",
     );
     assert!(
         first_state
@@ -189,6 +203,12 @@ fn exhausted_read_back_is_retried_by_the_next_real_apply() {
         "successful re-read must clear the partial marker",
     );
     assert_string_attribute(&second_state, "budget_source", "computed", "ready");
+    assert_string_attribute(
+        &second_state,
+        "budget_source",
+        "read_identifier",
+        &first_source_identifier,
+    );
     assert_string_attribute(
         &second_state,
         "budget_missing_dependent",

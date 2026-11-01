@@ -1298,11 +1298,13 @@ pub trait CarinaProvider {
     /// Perform one short poll step for a pending create operation.
     ///
     /// The host passes the original request on every poll. This method may
-    /// return a pending step again and must not wait in-call. When
-    /// `poll_request.finality` is [`PollFinality::FinalAttempt`] after
-    /// read-back has begun, it must not return pending in either phase; finish
-    /// with success, partial success, or an error. A read-back continuation
-    /// must never regress to operation phase.
+    /// return a pending step again and must not wait in-call. A
+    /// [`PollFinality::FinalAttempt`] sent to a read-back continuation must
+    /// finish with success, partial success, or an error; pending in either
+    /// phase is a protocol violation. Pending after a final attempt sent to an
+    /// operation continuation is instead reported as over budget, even if the
+    /// response moves to read-back. A read-back continuation must never regress
+    /// to operation phase.
     fn poll_create(
         &self,
         id: &ResourceId,
@@ -1313,7 +1315,11 @@ pub trait CarinaProvider {
 
     /// Continue a create operation loaded from state. `poll_request` has the
     /// same host-owned finality and monotonic read-back semantics as
-    /// [`CarinaProvider::poll_create`].
+    /// [`CarinaProvider::poll_create`]. On the first call after loading state,
+    /// the WIT transport's inbound phase and delay are non-authoritative because
+    /// state retains only the token and optional identifier; the SDK does not
+    /// expose those scheduling fields here. Recover the actual phase from the
+    /// token or cloud operation and set it on any pending result returned.
     fn resume_create(
         &self,
         id: &ResourceId,
@@ -1342,9 +1348,11 @@ pub trait CarinaProvider {
     ///
     /// The host passes the original request and identifier on every poll. This
     /// method may return [`UpdateOutcome::Pending`] again and must not wait
-    /// in-call. A [`PollFinality::FinalAttempt`] request after read-back has
-    /// begun must not return pending in either phase, and read-back must never
-    /// regress to operation phase.
+    /// in-call. A [`PollFinality::FinalAttempt`] sent to a read-back
+    /// continuation must not return pending in either phase. Pending after a
+    /// final attempt sent to an operation continuation is instead reported as
+    /// over budget, even if the response moves to read-back. Read-back must
+    /// never regress to operation phase.
     fn poll_update(
         &self,
         id: &ResourceId,

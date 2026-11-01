@@ -4912,6 +4912,12 @@ struct PendingCreateBoundaryError {
     error: ProviderError,
 }
 
+enum UnissuedPendingCreateBoundary {
+    Operation,
+    IssuedOperation(AppliedIdentifier),
+    IssuedReadBack(AppliedIdentifier),
+}
+
 enum PendingResume {
     Resume {
         id: ResourceId,
@@ -5160,7 +5166,7 @@ impl WasmProvider {
 
     fn read_back_protocol_violation(operation: &'static str, id: ResourceId) -> ProviderError {
         ProviderError::internal(format!(
-            "WASM provider {operation} violated the read-back polling protocol by returning pending after read-back began (after final-attempt or by regressing to operation)"
+            "WASM provider {operation} violated the read-back polling protocol by returning pending after a final-attempt sent to a read-back continuation or by regressing to operation"
         ))
         .for_resource(id)
     }
@@ -5201,7 +5207,7 @@ impl WasmProvider {
         budgets: OperationBudgets,
         initial: Initial,
         mut poll: Poll,
-    ) -> ProviderResult<Progress::Output>
+    ) -> ProviderResult<carina_provider_protocol::CompletedOperation<Progress::Output>>
     where
         Progress: OperationProgress<Verdict = std::convert::Infallible>,
         Progress::PendingState: Clone,
@@ -5300,6 +5306,26 @@ impl WasmProvider {
             },
             error: Self::create_boundary_error(id, detail),
         })
+    }
+
+    fn unissued_pending_create_boundary(
+        id: &ResourceId,
+        identifier: Option<AppliedIdentifier>,
+        phase: proto::PendingPhase,
+    ) -> Result<UnissuedPendingCreateBoundary, ProviderError> {
+        match (identifier, phase) {
+            (None, proto::PendingPhase::Operation) => Ok(UnissuedPendingCreateBoundary::Operation),
+            (Some(identifier), proto::PendingPhase::Operation) => {
+                Ok(UnissuedPendingCreateBoundary::IssuedOperation(identifier))
+            }
+            (Some(identifier), proto::PendingPhase::ReadBack) => {
+                Ok(UnissuedPendingCreateBoundary::IssuedReadBack(identifier))
+            }
+            (None, proto::PendingPhase::ReadBack) => Err(Self::create_boundary_error(
+                id,
+                "read-back pending create did not include an identifier",
+            )),
+        }
     }
 
     /// Turn a boundary decode failure that happened after a valid create
@@ -5419,20 +5445,20 @@ impl WasmProvider {
             poll_after_secs,
             phase,
         } = parts;
-        let pending = match (identifier, phase) {
-            (Some(identifier), proto::PendingPhase::Operation) => attempt
+        let boundary = match Self::unissued_pending_create_boundary(id, identifier, phase) {
+            Ok(boundary) => boundary,
+            Err(error) => return Err(attempt.untracked(error)),
+        };
+        let pending = match boundary {
+            UnissuedPendingCreateBoundary::Operation => {
+                attempt.pending(token, sent, poll_after_secs)
+            }
+            UnissuedPendingCreateBoundary::IssuedOperation(identifier) => attempt
                 .issued(identifier, sent)
                 .pending(token, poll_after_secs),
-            (Some(identifier), proto::PendingPhase::ReadBack) => attempt
+            UnissuedPendingCreateBoundary::IssuedReadBack(identifier) => attempt
                 .issued(identifier, sent)
                 .pending_read_back(token, poll_after_secs),
-            (None, proto::PendingPhase::Operation) => attempt.pending(token, sent, poll_after_secs),
-            (None, proto::PendingPhase::ReadBack) => {
-                return Err(attempt.untracked(Self::create_boundary_error(
-                    id,
-                    "read-back pending create did not include an identifier",
-                )));
-            }
         };
         if let Some(error) = boundary_error {
             return Err(pending.preserve(error));
@@ -5541,21 +5567,24 @@ impl WasmProvider {
             phase,
         } = parts;
         let pending = match poll {
-            CorePoll::Unissued(attempt) => match (identifier, phase) {
-                (Some(identifier), proto::PendingPhase::Operation) => {
-                    attempt.issued(identifier).pending(token, poll_after_secs)
+            CorePoll::Unissued(attempt) => {
+                let boundary =
+                    match Self::unissued_pending_create_boundary(&starting.id, identifier, phase) {
+                        Ok(boundary) => boundary,
+                        Err(error) => return Err(attempt.untracked(error)),
+                    };
+                match boundary {
+                    UnissuedPendingCreateBoundary::Operation => {
+                        attempt.pending(token, poll_after_secs)
+                    }
+                    UnissuedPendingCreateBoundary::IssuedOperation(identifier) => {
+                        attempt.issued(identifier).pending(token, poll_after_secs)
+                    }
+                    UnissuedPendingCreateBoundary::IssuedReadBack(identifier) => attempt
+                        .issued(identifier)
+                        .pending_read_back(token, poll_after_secs),
                 }
-                (Some(identifier), proto::PendingPhase::ReadBack) => attempt
-                    .issued(identifier)
-                    .pending_read_back(token, poll_after_secs),
-                (None, proto::PendingPhase::Operation) => attempt.pending(token, poll_after_secs),
-                (None, proto::PendingPhase::ReadBack) => {
-                    return Err(attempt.untracked(Self::create_boundary_error(
-                        &starting.id,
-                        "read-back pending create did not include an identifier",
-                    )));
-                }
-            },
+            }
             CorePoll::Issued(issued) => {
                 drop(identifier);
                 drop(sent);
@@ -5578,7 +5607,6 @@ impl WasmProvider {
     fn polled_create_step(
         starting: PendingCreate,
         step: wasm_convert::DecodedCreateStep,
-        read_back_budget_exhausted: bool,
     ) -> CreateProgress {
         match step {
             proto::CreateStep::Success {
@@ -5596,11 +5624,8 @@ impl WasmProvider {
             proto::CreateStep::PartialSuccess {
                 identifier,
                 attributes,
-                mut diagnostic,
+                diagnostic,
             } => {
-                if read_back_budget_exhausted {
-                    diagnostic.mark_read_back_budget_exhausted();
-                }
                 let poll = starting.pending.into_poll();
                 CreateProgress::Done(Box::new(match poll {
                     CorePoll::Unissued(attempt) => {
@@ -5699,21 +5724,24 @@ impl WasmProvider {
             phase,
         } = parts;
         let pending = match poll {
-            CoreResentPoll::Unissued(attempt) => match (identifier, phase) {
-                (Some(identifier), proto::PendingPhase::Operation) => {
-                    attempt.issued(identifier).pending(token, poll_after_secs)
+            CoreResentPoll::Unissued(attempt) => {
+                let boundary =
+                    match Self::unissued_pending_create_boundary(&starting.id, identifier, phase) {
+                        Ok(boundary) => boundary,
+                        Err(error) => return Err(attempt.untracked(error)),
+                    };
+                match boundary {
+                    UnissuedPendingCreateBoundary::Operation => {
+                        attempt.pending(token, poll_after_secs)
+                    }
+                    UnissuedPendingCreateBoundary::IssuedOperation(identifier) => {
+                        attempt.issued(identifier).pending(token, poll_after_secs)
+                    }
+                    UnissuedPendingCreateBoundary::IssuedReadBack(identifier) => attempt
+                        .issued(identifier)
+                        .pending_read_back(token, poll_after_secs),
                 }
-                (Some(identifier), proto::PendingPhase::ReadBack) => attempt
-                    .issued(identifier)
-                    .pending_read_back(token, poll_after_secs),
-                (None, proto::PendingPhase::Operation) => attempt.pending(token, poll_after_secs),
-                (None, proto::PendingPhase::ReadBack) => {
-                    return Err(attempt.untracked(Self::create_boundary_error(
-                        &starting.id,
-                        "read-back pending create did not include an identifier",
-                    )));
-                }
-            },
+            }
             CoreResentPoll::Issued(issued) => {
                 drop(identifier);
                 drop(sent);
@@ -5736,7 +5764,6 @@ impl WasmProvider {
     fn polled_resent_step(
         starting: PendingResentCreate,
         step: wasm_convert::DecodedCreateStep,
-        read_back_budget_exhausted: bool,
     ) -> ResumeProgress {
         match step {
             proto::CreateStep::Success {
@@ -5756,11 +5783,8 @@ impl WasmProvider {
             proto::CreateStep::PartialSuccess {
                 identifier,
                 attributes,
-                mut diagnostic,
+                diagnostic,
             } => {
-                if read_back_budget_exhausted {
-                    diagnostic.mark_read_back_budget_exhausted();
-                }
                 let poll = starting.pending.into_poll();
                 ResumeProgress::Done(match poll {
                     CoreResentPoll::Unissued(attempt) => {
@@ -5892,7 +5916,6 @@ impl WasmProvider {
         wit_request: wit_types::CreateRequest,
         starting: CoreResume,
         step: wasm_convert::DecodedResumeStep,
-        read_back_budget_exhausted: bool,
     ) -> ResumeProgress {
         match step {
             proto::ResumeStep::Completed {
@@ -5911,11 +5934,8 @@ impl WasmProvider {
             proto::ResumeStep::PartialSuccess {
                 identifier,
                 attributes,
-                mut diagnostic,
+                diagnostic,
             } => {
-                if read_back_budget_exhausted {
-                    diagnostic.mark_read_back_budget_exhausted();
-                }
                 let outcome = match starting {
                     CoreResume::Unissued(attempt) => {
                         attempt.issued(identifier).partial(attributes, diagnostic)
@@ -5976,20 +5996,20 @@ impl WasmProvider {
             poll_after_secs,
             phase,
         } = parts;
-        Ok(match (identifier, phase) {
-            (Some(identifier), proto::PendingPhase::Operation) => attempt
+        let boundary = match Self::unissued_pending_create_boundary(id, identifier, phase) {
+            Ok(boundary) => boundary,
+            Err(error) => return Err(attempt.untracked(error)),
+        };
+        Ok(match boundary {
+            UnissuedPendingCreateBoundary::Operation => {
+                attempt.pending(token, sent, poll_after_secs)
+            }
+            UnissuedPendingCreateBoundary::IssuedOperation(identifier) => attempt
                 .issued(identifier, sent)
                 .pending(token, poll_after_secs),
-            (Some(identifier), proto::PendingPhase::ReadBack) => attempt
+            UnissuedPendingCreateBoundary::IssuedReadBack(identifier) => attempt
                 .issued(identifier, sent)
                 .pending_read_back(token, poll_after_secs),
-            (None, proto::PendingPhase::Operation) => attempt.pending(token, sent, poll_after_secs),
-            (None, proto::PendingPhase::ReadBack) => {
-                return Err(attempt.untracked(Self::create_boundary_error(
-                    id,
-                    "read-back pending create did not include an identifier",
-                )));
-            }
         })
     }
 
@@ -6178,15 +6198,9 @@ impl WasmProvider {
         };
         match result {
             Ok(step) => match wasm_convert::wit_to_core_resume_step(step, &id) {
-                Ok(wasm_convert::DecodedIssued::Decoded(step)) => Self::resumed_create_step(
-                    id,
-                    wit_id,
-                    wit_request,
-                    resume,
-                    step,
-                    poll.phase == proto::PendingPhase::ReadBack
-                        && poll.finality == proto::PollFinality::FinalAttempt,
-                ),
+                Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
+                    Self::resumed_create_step(id, wit_id, wit_request, resume, step)
+                }
                 Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
                     Self::resumed_created_read_decode_failure(id, wit_request, resume, failure)
                 }
@@ -6322,8 +6336,6 @@ impl WasmProvider {
         finality: proto::PollFinality,
     ) -> CreateProgress {
         let id = starting.id.clone();
-        let read_back_budget_exhausted = starting.pending.phase() == proto::PendingPhase::ReadBack
-            && finality == proto::PollFinality::FinalAttempt;
         let wit_pending = wasm_convert::core_to_wit_pending_create(&starting.pending);
         let wit_poll = wasm_convert::core_to_wit_poll_request(proto::PollRequest { finality });
         let call_id = starting.wit_id.clone();
@@ -6346,7 +6358,7 @@ impl WasmProvider {
         match result {
             Ok(step) => match wasm_convert::wit_to_core_create_step(step, &id) {
                 Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
-                    Self::polled_create_step(starting, step, read_back_budget_exhausted)
+                    Self::polled_create_step(starting, step)
                 }
                 Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
                     Self::polled_step_created_read_decode_failure(starting, failure)
@@ -6376,8 +6388,6 @@ impl WasmProvider {
         starting: PendingResentCreate,
         finality: proto::PollFinality,
     ) -> ResumeProgress {
-        let read_back_budget_exhausted = starting.pending.phase() == proto::PendingPhase::ReadBack
-            && finality == proto::PollFinality::FinalAttempt;
         let wit_pending = wasm_convert::core_to_wit_pending_create_parts(
             starting.pending.token(),
             starting.pending.identifier(),
@@ -6406,7 +6416,7 @@ impl WasmProvider {
         match result {
             Ok(step) => match wasm_convert::wit_to_core_create_step(step, &starting.id) {
                 Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
-                    Self::polled_resent_step(starting, step, read_back_budget_exhausted)
+                    Self::polled_resent_step(starting, step)
                 }
                 Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
                     Self::polled_resent_created_read_decode_failure(starting, failure)
@@ -6462,7 +6472,9 @@ impl WasmProvider {
         )
         .await;
         match outcome {
-            carina_provider_protocol::DriveOutcome::Done(outcome) => Ok(outcome),
+            carina_provider_protocol::DriveOutcome::Done(outcome) => {
+                Ok(CreateOutcome::from_host_completion(outcome))
+            }
             carina_provider_protocol::DriveOutcome::Verdict(failure) => Err(*failure),
             carina_provider_protocol::DriveOutcome::OverBudget { last_pending } => {
                 Err(last_pending
@@ -6493,6 +6505,10 @@ impl WasmProvider {
                 ));
             }
         };
+        // Persisted resume state has no scheduling metadata, while WIT requires
+        // both fields. The WIT/SDK contract marks these first-call values as
+        // non-authoritative; the provider's returned pending phase drives the
+        // host from this point onward.
         let initial = self.call_resume_record(
             id.clone(),
             wit_id,
@@ -6515,7 +6531,9 @@ impl WasmProvider {
         )
         .await;
         match outcome {
-            carina_provider_protocol::DriveOutcome::Done(outcome) => Ok(outcome),
+            carina_provider_protocol::DriveOutcome::Done(outcome) => {
+                Ok(ResumeOutcome::from_host_completion(outcome))
+            }
             carina_provider_protocol::DriveOutcome::Verdict(failure) => Err(*failure),
             carina_provider_protocol::DriveOutcome::OverBudget { last_pending } => {
                 Err((*last_pending).into_failure(Self::over_budget("resume_create", id)))
@@ -6581,8 +6599,6 @@ impl WasmProvider {
             wit_request,
             operation,
         } = pending;
-        let read_back_budget_exhausted = operation.phase() == proto::PendingPhase::ReadBack
-            && finality == proto::PollFinality::FinalAttempt;
         let wit_pending = operation.into_wit();
         let wit_poll = wasm_convert::core_to_wit_poll_request(proto::PollRequest { finality });
         let call_id = wit_id.clone();
@@ -6606,13 +6622,7 @@ impl WasmProvider {
                 })
             },
             move |outcome, id| {
-                let mut outcome = wasm_convert::wit_to_core_update_outcome(outcome, &id)?;
-                if read_back_budget_exhausted
-                    && let wasm_convert::WasmUpdateOutcome::Done(outcome) = &mut outcome
-                    && let UpdateOutcome::PartialSuccess { diagnostic, .. } = outcome.as_mut()
-                {
-                    diagnostic.mark_read_back_budget_exhausted();
-                }
+                let outcome = wasm_convert::wit_to_core_update_outcome(outcome, &id)?;
                 Ok::<_, wasm_convert::WasmAppliedStateDecodeError>(match outcome {
                     wasm_convert::WasmUpdateOutcome::Done(outcome) => UpdateProgress::Done(outcome),
                     wasm_convert::WasmUpdateOutcome::Pending(operation) => {
@@ -6819,6 +6829,7 @@ impl Provider for WasmProvider {
                 self.call_poll_update(*pending, finality)
             })
             .await
+            .map(UpdateOutcome::from_host_completion)
         })
     }
 
@@ -6837,6 +6848,7 @@ impl Provider for WasmProvider {
                 self.call_poll_delete(*pending)
             })
             .await
+            .map(carina_provider_protocol::CompletedOperation::into_output)
         })
     }
 
@@ -8263,7 +8275,7 @@ mod tests {
                 phase: proto::PendingPhase::Operation,
             }));
         let ResumeProgress::Pending(pending) =
-            WasmProvider::resumed_create_step(id, wit_id, wit_request, resume, step, false)
+            WasmProvider::resumed_create_step(id, wit_id, wit_request, resume, step)
         else {
             panic!("resent pending step must retain a pollable continuation")
         };
@@ -8394,7 +8406,7 @@ mod tests {
             let starting = pending_create_with_issued_identifier().await;
             let step: wasm_convert::DecodedCreateStep = proto::CreateStep::Pending(next);
             assert_issued_poll_repended_with_original_identifier(WasmProvider::polled_create_step(
-                starting, step, false,
+                starting, step,
             ));
         }
 
@@ -8410,7 +8422,7 @@ mod tests {
                 phase: proto::PendingPhase::Operation,
             });
         assert_original_polled_record(
-            WasmProvider::polled_create_step(starting, changed_sent, false),
+            WasmProvider::polled_create_step(starting, changed_sent),
             &expected_id,
             &expected_started_at,
         );
@@ -8521,7 +8533,7 @@ mod tests {
             let resume = resume_witness(persisted_resume_with_issued_identifier()).await;
             let step: wasm_convert::DecodedResumeStep = proto::ResumeStep::Pending(next);
             assert_issued_resume_repended_with_original_identifier(
-                WasmProvider::resumed_create_step(id, wit_id, wit_request, resume, step, false),
+                WasmProvider::resumed_create_step(id, wit_id, wit_request, resume, step),
             );
         }
     }

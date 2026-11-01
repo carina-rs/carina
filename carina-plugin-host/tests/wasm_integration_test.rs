@@ -49,6 +49,13 @@ fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
 }
 
+fn assert_minted_mock_identifier(identifier: &str) {
+    assert!(
+        identifier.starts_with("mock-v1:"),
+        "expected a uniquely minted mock identifier, got {identifier}"
+    );
+}
+
 fn delete_request_without_schema() -> DeleteRequest {
     DeleteRequest::resolve(
         &carina_core::resource::Directives::default(),
@@ -1413,7 +1420,12 @@ async fn test_wasm_pending_create_polls_until_success() {
             .expect("pending create should settle"),
     );
 
-    assert_eq!(state.identifier.as_deref(), Some("mock-id"));
+    assert_minted_mock_identifier(
+        state
+            .identifier
+            .as_deref()
+            .expect("a completed create has an identifier"),
+    );
     assert!(state.exists);
     assert_eq!(
         state.attributes.get("__mock_create_polls_served__"),
@@ -1486,11 +1498,18 @@ async fn test_wasm_create_read_back_budget_returns_partial_then_refresh_complete
     assert_eq!(diagnostic.missing_attributes(), &["computed".to_string()]);
     let partial = create_state_for_writeback(outcome);
     assert!(partial.partial_read.is_some());
-    assert_eq!(partial.identifier.as_deref(), Some("mock-id"));
+    let partial_identifier = AppliedIdentifier::new(
+        partial
+            .identifier
+            .clone()
+            .expect("a partial create retains its identifier"),
+    )
+    .expect("the retained identifier is non-empty");
+    assert_minted_mock_identifier(partial_identifier.as_str());
 
     let refreshed = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &partial_identifier, ReadRequest)
         .await
         .expect("the next refresh should re-read the created resource")
         .into_state();
@@ -1535,9 +1554,11 @@ async fn test_wasm_create_read_back_pending_after_final_preserves_identifier() {
     let CreateFailureKind::InFlight { pending, error } = failure else {
         panic!("an issued read-back violation must remain recoverable")
     };
-    assert_eq!(
-        pending.identifier().map(AppliedIdentifier::as_str),
-        Some("mock-id")
+    assert_minted_mock_identifier(
+        pending
+            .identifier()
+            .expect("the violation retains its identifier")
+            .as_str(),
     );
     assert!(error.to_string().contains("final-attempt"), "{error}");
 }
@@ -1576,9 +1597,11 @@ async fn test_wasm_create_read_back_cannot_regress_to_operation_phase() {
     let CreateFailureKind::InFlight { pending, error } = failure else {
         panic!("a phase regression must retain the issued create")
     };
-    assert_eq!(
-        pending.identifier().map(AppliedIdentifier::as_str),
-        Some("mock-id")
+    assert_minted_mock_identifier(
+        pending
+            .identifier()
+            .expect("the phase regression retains its identifier")
+            .as_str(),
     );
     assert!(error.to_string().contains("polling protocol"), "{error}");
 }
@@ -2064,7 +2087,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         panic!("created mode returned the wrong failure variant");
     };
     drop(error);
-    assert_eq!(created.identifier().as_str(), "mock-id");
+    assert_minted_mock_identifier(created.identifier().as_str());
     match created.sent() {
         SentRecord::Request(Sent::Only(attributes)) => {
             assert_eq!(
@@ -2138,7 +2161,7 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
         .into_kind();
     match failure {
         CreateFailureKind::Created { created, error } => {
-            assert_eq!(created.identifier().as_str(), "mock-id");
+            assert_minted_mock_identifier(created.identifier().as_str());
             assert!(!error.to_string().is_empty());
         }
         CreateFailureKind::Untracked(error) => {
@@ -2228,7 +2251,7 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
         .into_kind()
     {
         CreateFailureKind::Created { created, error } => {
-            assert_eq!(created.identifier().as_str(), "mock-id");
+            assert_minted_mock_identifier(created.identifier().as_str());
             let read_error = match created.observation() {
                 CreateObservation::Observed(state) => {
                     panic!("token encoding failure became an observed create: {state:?}")
@@ -2338,9 +2361,11 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
                 serde_json::from_str(pending.token().expose_for_provider_call())
                     .expect("the previous continuation must remain decodable");
             assert_eq!(token["polls_served"], 0);
-            assert_eq!(
-                pending.identifier().map(AppliedIdentifier::as_str),
-                Some("mock-id")
+            assert_minted_mock_identifier(
+                pending
+                    .identifier()
+                    .expect("the previous issued continuation retains its identifier")
+                    .as_str(),
             );
             assert!(error.to_string().contains("poll_create pending token"));
         }
@@ -2475,7 +2500,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             }
             ("resent", Ok(ResumeOutcomeKind::Resent(outcome))) => match outcome.into_kind() {
                 CreateOutcomeKind::Success { state } => {
-                    assert_eq!(state.identifier().as_str(), "mock-id");
+                    assert_minted_mock_identifier(state.identifier().as_str());
                 }
                 CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
                     panic!(
@@ -3458,7 +3483,14 @@ async fn test_wasm_mock_provider_create_and_read() {
             .await
             .expect("create should succeed"),
     );
-    assert_eq!(created.identifier, Some("mock-id".into()));
+    let created_identifier = AppliedIdentifier::new(
+        created
+            .identifier
+            .clone()
+            .expect("a successful create has an identifier"),
+    )
+    .expect("the created identifier is non-empty");
+    assert_minted_mock_identifier(created_identifier.as_str());
     assert_eq!(
         created.attributes.get("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -3477,11 +3509,14 @@ async fn test_wasm_mock_provider_create_and_read() {
     // Read back - should return the created state
     let read_state = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &created_identifier, ReadRequest)
         .await
         .expect("read should not error")
         .into_state();
-    assert_eq!(read_state.identifier, Some("mock-id".into()));
+    assert_eq!(
+        read_state.identifier.as_deref(),
+        Some(created_identifier.as_str())
+    );
     assert_eq!(
         read_state.attributes.get("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -3506,16 +3541,13 @@ async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error(
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
-    let id = ResourceId::with_provider_identity(
-        "mock",
-        "test.resource",
-        "__mock_non_finite_read__",
-        None,
-    );
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "non-finite-read", None);
+    let identifier = AppliedIdentifier::new("__mock_non_finite_read__")
+        .expect("the non-finite read fixture identifier is non-empty");
 
     let error = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &identifier, ReadRequest)
         .await
         .expect_err("guest output containing nested NaN must be a provider error");
 
@@ -4807,12 +4839,13 @@ async fn test_wasm_provider_returned_wit_error_does_not_poison_fail_fast_instanc
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
-    let error_id =
-        ResourceId::with_provider_identity("mock", "test.resource", "__mock_read_error__", None);
+    let error_id = ResourceId::with_provider_identity("mock", "test.resource", "read-error", None);
+    let error_identifier = AppliedIdentifier::new("__mock_read_error__")
+        .expect("the read-error fixture identifier is non-empty");
 
     let error = provider
         .provider()
-        .read(&error_id, &mock_identifier(), ReadRequest)
+        .read(&error_id, &error_identifier, ReadRequest)
         .await
         .expect_err("the mock read hook must return a WIT provider-error");
     assert_eq!(error.variant_name(), "internal");

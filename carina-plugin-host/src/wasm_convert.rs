@@ -1176,15 +1176,6 @@ pub(crate) fn core_to_wit_poll_request(request: proto::PollRequest) -> wit::Poll
     wit::PollRequest { finality }
 }
 
-#[cfg(test)]
-pub(crate) fn wit_to_core_poll_request(request: wit::PollRequest) -> proto::PollRequest {
-    let finality = match request.finality {
-        wit::PollFinality::Continue => proto::PollFinality::Continue,
-        wit::PollFinality::FinalAttempt => proto::PollFinality::FinalAttempt,
-    };
-    proto::PollRequest { finality }
-}
-
 #[derive(Clone)]
 pub(crate) struct UpdatePendingOperation(PendingOperation);
 
@@ -1712,9 +1703,7 @@ pub(crate) fn wit_to_core_update_outcome(
 ) -> Result<WasmUpdateOutcome, WasmAppliedStateDecodeError> {
     match outcome {
         wit::UpdateOutcome::Success(state) => Ok(WasmUpdateOutcome::Done(Box::new(
-            CoreUpdateOutcome::Success {
-                state: wit_to_core_applied_persisted_state(state, id)?,
-            },
+            CoreUpdateOutcome::success(wit_to_core_applied_persisted_state(state, id)?),
         ))),
         wit::UpdateOutcome::PartialSuccess(partial) => {
             let wit::UpdatePartialSuccess { state, diagnostic } = partial;
@@ -2075,6 +2064,14 @@ fn proto_struct_field_to_core(
 mod tests {
     use super::*;
     use carina_core::resource::NoPlaceholder;
+
+    fn wit_to_core_poll_request(request: wit::PollRequest) -> proto::PollRequest {
+        let finality = match request.finality {
+            wit::PollFinality::Continue => proto::PollFinality::Continue,
+            wit::PollFinality::FinalAttempt => proto::PollFinality::FinalAttempt,
+        };
+        proto::PollRequest { finality }
+    }
 
     fn find_error_in_chain<'a, T: std::error::Error + 'static>(
         error: &'a (dyn std::error::Error + 'static),

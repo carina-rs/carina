@@ -435,12 +435,11 @@ impl MockProvider {
     }
 
     fn push_update(&self, result: ProviderResult<State>) {
-        self.update_results
-            .lock()
-            .unwrap()
-            .push(result.map(|state| crate::provider::UpdateOutcome::Success {
-                state: applied_state_for_test(state),
-            }));
+        self.update_results.lock().unwrap().push(
+            result.map(|state| {
+                crate::provider::UpdateOutcome::success(applied_state_for_test(state))
+            }),
+        );
     }
 
     fn push_read(&self, result: ProviderResult<State>) {
@@ -1434,10 +1433,10 @@ impl Provider for DelayedCountingProvider {
                 "finalized".to_string(),
                 Value::Concrete(ConcreteValue::Bool(true)),
             );
-            Ok(crate::provider::UpdateOutcome::Success {
-                state: AppliedState::new(id, "finalized-id", attrs)
+            Ok(crate::provider::UpdateOutcome::success(
+                AppliedState::new(id, "finalized-id", attrs)
                     .expect("fixture identifier is non-empty"),
-            })
+            ))
         })
     }
 
@@ -7647,10 +7646,10 @@ impl Provider for YieldingUpdateProvider {
                     Value::Concrete(ConcreteValue::String("provider-violated-id".into())),
                 );
             }
-            Ok(crate::provider::UpdateOutcome::Success {
-                state: AppliedState::new(id, identifier, attrs)
+            Ok(crate::provider::UpdateOutcome::success(
+                AppliedState::new(id, identifier, attrs)
                     .expect("provider input identifier is non-empty"),
-            })
+            ))
         })
     }
 

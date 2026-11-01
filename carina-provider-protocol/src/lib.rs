@@ -40,6 +40,47 @@ pub struct PollRequest {
     pub finality: PollFinality,
 }
 
+/// Why a completed post-mutation read stopped being polled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ReadBackEnd {
+    /// No host-final read-back attempt produced this result.
+    #[default]
+    ProviderReported,
+    /// The provider returned a partial result to the host's final read-back poll.
+    HostDeadline,
+}
+
+/// A completed operation together with host-owned polling provenance.
+///
+/// Construction is private so `HostDeadline` can enter core only through a
+/// result returned by [`drive_pending`] or [`drive_pending_infallible`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedOperation<D> {
+    output: D,
+    read_back_end: ReadBackEnd,
+}
+
+impl<D> CompletedOperation<D> {
+    fn new(output: D, read_back_end: ReadBackEnd) -> Self {
+        Self {
+            output,
+            read_back_end,
+        }
+    }
+
+    pub fn read_back_end(&self) -> ReadBackEnd {
+        self.read_back_end
+    }
+
+    pub fn into_parts(self) -> (D, ReadBackEnd) {
+        (self.output, self.read_back_end)
+    }
+
+    pub fn into_output(self) -> D {
+        self.output
+    }
+}
+
 /// The operation whose schema budget should be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
@@ -63,13 +104,13 @@ pub enum OperationStep<D, V, P> {
 /// Result of driving a pending provider operation within its total budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriveOutcome<D, V, P> {
-    Done(D),
+    Done(CompletedOperation<D>),
     Verdict(V),
     OverBudget {
         last_pending: P,
     },
-    /// A provider returned any pending continuation after a final read-back
-    /// attempt, or regressed from read-back to operation phase.
+    /// A provider returned any pending continuation after a final attempt sent
+    /// to a read-back continuation, or regressed from read-back to operation.
     ProtocolViolation {
         last_pending: P,
     },
@@ -139,8 +180,10 @@ impl PollDeadlines {
 /// The total budget starts before `initial` is polled. Provider-requested
 /// delays are clamped to 1–300 seconds and never sleep past the budget. When a
 /// sleep reaches the deadline, the driver performs one final poll. A further
-/// operation-phase pending result becomes [`DriveOutcome::OverBudget`]; a
-/// further read-back pending result is a [`DriveOutcome::ProtocolViolation`].
+/// pending result after a final attempt sent to an operation-phase
+/// continuation becomes [`DriveOutcome::OverBudget`]. Any pending result after
+/// a final attempt sent to a read-back continuation is a
+/// [`DriveOutcome::ProtocolViolation`].
 /// The caller supplies the sleep future so this crate stays independent of an
 /// async runtime.
 pub async fn drive_pending<D, V, P, E, Initial, Poll, PollFuture, Sleep, SleepFuture>(
@@ -348,11 +391,21 @@ where
 {
     let started = now();
     let mut deadlines = PollDeadlines::new(operation_budget, read_back_budget);
-    let mut preceding_poll = None;
+    let mut final_attempt_phase = None;
     let mut step = initial.await?;
     loop {
         let (pending, poll_after_secs, phase) = match step {
-            OperationStep::Done(done) => return Ok(DriveOutcome::Done(done)),
+            OperationStep::Done(done) => {
+                let read_back_end = if final_attempt_phase == Some(PendingPhase::ReadBack) {
+                    ReadBackEnd::HostDeadline
+                } else {
+                    ReadBackEnd::ProviderReported
+                };
+                return Ok(DriveOutcome::Done(CompletedOperation::new(
+                    done,
+                    read_back_end,
+                )));
+            }
             OperationStep::Verdict(verdict) => return Ok(DriveOutcome::Verdict(verdict)),
             OperationStep::Pending {
                 pending,
@@ -365,15 +418,14 @@ where
                 last_pending: pending,
             });
         }
-        if preceding_poll == Some(PollFinality::FinalAttempt) {
-            return Ok(if phase == PendingPhase::ReadBack {
-                DriveOutcome::ProtocolViolation {
+        if let Some(final_attempt_phase) = final_attempt_phase {
+            return Ok(match final_attempt_phase {
+                PendingPhase::Operation => DriveOutcome::OverBudget {
                     last_pending: pending,
-                }
-            } else {
-                DriveOutcome::OverBudget {
+                },
+                PendingPhase::ReadBack => DriveOutcome::ProtocolViolation {
                     last_pending: pending,
-                }
+                },
             });
         }
         let elapsed = now().saturating_duration_since(started);
@@ -385,7 +437,9 @@ where
         step = poll(pending, next.finality)
             .await
             .map_err(|error| retention.poll_error(error, retained))?;
-        preceding_poll = Some(next.finality);
+        if next.finality == PollFinality::FinalAttempt {
+            final_attempt_phase = Some(phase);
+        }
     }
 }
 
@@ -402,8 +456,8 @@ mod operation_poll_tests {
     use std::time::Duration;
 
     use super::{
-        DriveOutcome, NextPoll, OperationStep, PendingPhase, PollFinality,
-        drive_pending_infallible_with_clock, drive_pending_with_clock, next_poll,
+        CompletedOperation, DriveOutcome, NextPoll, OperationStep, PendingPhase, PollFinality,
+        ReadBackEnd, drive_pending_infallible_with_clock, drive_pending_with_clock, next_poll,
     };
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
@@ -489,7 +543,10 @@ mod operation_poll_tests {
         ))
         .expect("driver should not produce a provider error");
 
-        assert_eq!(result, DriveOutcome::Done(()));
+        assert_eq!(
+            result,
+            DriveOutcome::Done(CompletedOperation::new((), ReadBackEnd::ProviderReported,))
+        );
         assert_eq!(polls.get(), 1);
     }
 
@@ -522,7 +579,13 @@ mod operation_poll_tests {
         ))
         .expect("driver should not produce a provider error");
 
-        assert_eq!(result, DriveOutcome::Done("settled"));
+        assert_eq!(
+            result,
+            DriveOutcome::Done(CompletedOperation::new(
+                "settled",
+                ReadBackEnd::ProviderReported,
+            ))
+        );
         assert_eq!(polls.get(), 1);
         assert_eq!(*sleeps.borrow(), vec![Duration::from_secs(5)]);
     }
@@ -655,7 +718,13 @@ mod operation_poll_tests {
         ))
         .expect("driver should not produce a provider error");
 
-        assert_eq!(result, DriveOutcome::Done("settled"));
+        assert_eq!(
+            result,
+            DriveOutcome::Done(CompletedOperation::new(
+                "settled",
+                ReadBackEnd::HostDeadline,
+            ))
+        );
         assert_eq!(
             *sleeps.borrow(),
             vec![Duration::from_secs(2), Duration::from_secs(5)]
@@ -707,7 +776,13 @@ mod operation_poll_tests {
         ))
         .expect("driver should not produce a provider error");
 
-        assert_eq!(result, DriveOutcome::Done("settled"));
+        assert_eq!(
+            result,
+            DriveOutcome::Done(CompletedOperation::new(
+                "settled",
+                ReadBackEnd::HostDeadline,
+            ))
+        );
         assert_eq!(
             *sleeps.borrow(),
             vec![Duration::from_secs(4), Duration::from_secs(1)]
@@ -757,7 +832,13 @@ mod operation_poll_tests {
         ))
         .expect("driver should not produce a provider error");
 
-        assert_eq!(result, DriveOutcome::Done("settled"));
+        assert_eq!(
+            result,
+            DriveOutcome::Done(CompletedOperation::new(
+                "settled",
+                ReadBackEnd::ProviderReported,
+            ))
+        );
         assert_eq!(
             finalities
                 .borrow()
@@ -802,6 +883,41 @@ mod operation_poll_tests {
             result,
             DriveOutcome::ProtocolViolation {
                 last_pending: "known-id:token-2".to_string(),
+            }
+        );
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn read_back_pending_after_operation_final_attempt_is_over_budget() {
+        let clock_epoch = std::time::Instant::now();
+        let polls = Cell::new(0);
+        let result = block_on_ready(drive_pending_with_clock(
+            Duration::ZERO,
+            Duration::from_secs(30),
+            ready(Ok::<_, ()>(OperationStep::<(), (), String>::Pending {
+                pending: "known-id:operation-token".to_string(),
+                poll_after_secs: 1,
+                phase: super::PendingPhase::Operation,
+            })),
+            |_pending, finality| {
+                assert_eq!(finality, super::PollFinality::FinalAttempt);
+                polls.set(polls.get() + 1);
+                ready(Ok(OperationStep::Pending {
+                    pending: "known-id:read-back-token".to_string(),
+                    poll_after_secs: 1,
+                    phase: super::PendingPhase::ReadBack,
+                }))
+            },
+            |_| ready(()),
+            || clock_epoch,
+        ))
+        .expect("driver should not produce a provider error");
+
+        assert_eq!(
+            result,
+            DriveOutcome::OverBudget {
+                last_pending: "known-id:read-back-token".to_string(),
             }
         );
         assert_eq!(polls.get(), 1);
@@ -873,7 +989,13 @@ mod operation_poll_tests {
             || clock_epoch + elapsed.get(),
         ));
 
-        assert_eq!(result, DriveOutcome::Done("settled"));
+        assert_eq!(
+            result,
+            DriveOutcome::Done(CompletedOperation::new(
+                "settled",
+                ReadBackEnd::HostDeadline,
+            ))
+        );
         assert_eq!(elapsed.get(), Duration::from_secs(4));
     }
 

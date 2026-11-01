@@ -1663,7 +1663,7 @@ impl Provider for MockProvider {
                 ));
             }
 
-            Ok(UpdateOutcome::Success { state })
+            Ok(UpdateOutcome::success(state))
         })
     }
 
