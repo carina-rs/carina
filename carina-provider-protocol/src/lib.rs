@@ -1,4 +1,5 @@
 mod host_pattern;
+pub mod http_trace;
 pub mod types;
 
 pub use host_pattern::{HostPattern, HostPatternError};
