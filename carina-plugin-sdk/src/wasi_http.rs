@@ -38,8 +38,8 @@ use aws_smithy_types::body::SdkBody;
 
 use wasi::http::outgoing_handler;
 use wasi::http::types::{
-    ErrorCode, Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
-    http_error_code,
+    ErrorCode, Fields, IncomingBody, IncomingResponse, Method, OutgoingBody, OutgoingRequest,
+    RequestOptions, Scheme, http_error_code,
 };
 use wasi::io::streams::StreamError;
 
@@ -141,6 +141,22 @@ impl PreSendError {
     }
 }
 
+/// An error produced after receiving a response head.
+#[derive(Debug)]
+struct ResponseBodyError {
+    code: Option<ErrorCode>,
+    message: String,
+}
+
+impl ResponseBodyError {
+    fn new(message: impl Into<String>, code: Option<ErrorCode>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
 /// A typed wasi:http transport failure retained as an AWS connector source.
 #[derive(Debug)]
 pub struct TransportFailure {
@@ -182,6 +198,17 @@ impl From<PreSendError> for TransportFailure {
         Self {
             phase: SendPhase::NotSent,
             code: None,
+            message: error.message,
+        }
+    }
+}
+
+impl From<ResponseBodyError> for TransportFailure {
+    fn from(error: ResponseBodyError) -> Self {
+        // A response proves the request was sent, regardless of its error code.
+        Self {
+            phase: SendPhase::MaybeSent,
+            code: error.code,
             message: error.message,
         }
     }
@@ -519,35 +546,10 @@ fn execute(
     pollable.block();
     let t_pollable_block_done = req_start.map(|s| s.elapsed());
 
-    let response = future_response.get();
-    let response = if let Some(error) = write_error.or(finish_error) {
-        response_after_body_failure(response, error)?
-    } else {
-        response
-            .ok_or_else(|| TransportFailure::maybe_sent("Response not ready after block", None))?
-            .map_err(|()| TransportFailure::maybe_sent("Response already taken", None))?
-            .map_err(|e| TransportFailure::from_code(format!("HTTP error: {e:?}"), e))?
-    };
+    let response = resolve_response(future_response.get(), write_error.or(finish_error))?;
     let t_get_response_done = req_start.map(|s| s.elapsed());
 
-    // Read response status
-    let status = response.status();
-
-    // Read response headers
-    let response_headers = response.headers();
-    let header_entries: Vec<(String, String)> = response_headers
-        .entries()
-        .into_iter()
-        .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
-        .collect();
-    drop(response_headers);
-
-    // Read response body
-    let incoming_body = response
-        .consume()
-        .map_err(|()| TransportFailure::maybe_sent("Failed to consume response body", None))?;
-    let response_bytes = response_body_outcome(read_body(&incoming_body))?;
-    let _trailers = IncomingBody::finish(incoming_body);
+    let response = read_response(response)?;
     let t_read_body_done = req_start.map(|s| s.elapsed());
 
     if trace {
@@ -563,9 +565,9 @@ fn execute(
              pollable_block_ms={} get_response_ms={} read_body_ms={}",
             trace_method,
             trace_uri,
-            status,
+            response.status,
             body_len,
-            response_bytes.len(),
+            response.body.len(),
             ms(t_setup_done),
             ms(t_handle_done),
             ms(t_write_body_done),
@@ -576,11 +578,7 @@ fn execute(
         );
     }
 
-    Ok(WasiResponse {
-        status,
-        headers: header_entries,
-        body: response_bytes,
-    })
+    Ok(response)
 }
 
 /// Issue a plain HTTP request over wasi:http, using only `http`-crate
@@ -610,15 +608,19 @@ pub fn send_request(
         body,
     };
 
-    let wasi_resp = execute(wasi_req, None)?;
+    build_http_response(execute(wasi_req, None)?).map_err(Into::into)
+}
 
+fn build_http_response(
+    wasi_resp: WasiResponse,
+) -> Result<http::Response<Vec<u8>>, ResponseBodyError> {
     let mut builder = http::Response::builder().status(wasi_resp.status);
     for (key, value) in wasi_resp.headers {
         builder = builder.header(key, value);
     }
     builder
         .body(wasi_resp.body)
-        .map_err(|e| TransportFailure::maybe_sent(format!("Failed to build response: {e}"), None))
+        .map_err(|e| ResponseBodyError::new(format!("Failed to build response: {e}"), None))
 }
 
 /// Convert an AWS SDK HttpRequest to a [`WasiRequest`], run it through the
@@ -641,14 +643,14 @@ fn make_request(
     };
 
     let wasi_resp = execute(wasi_req, options).map_err(connector_error)?;
+    build_sdk_response(wasi_resp).map_err(|error| connector_error(error.into()))
+}
 
+fn build_sdk_response(wasi_resp: WasiResponse) -> Result<Response<SdkBody>, ResponseBodyError> {
     // Build the AWS SDK Response
     let mut sdk_response = Response::new(
         aws_smithy_runtime_api::http::StatusCode::try_from(wasi_resp.status).map_err(|e| {
-            connector_error(TransportFailure::maybe_sent(
-                format!("Failed to convert response status: {e}"),
-                None,
-            ))
+            ResponseBodyError::new(format!("Failed to convert response status: {e}"), None)
         })?,
         SdkBody::from(wasi_resp.body),
     );
@@ -658,17 +660,14 @@ fn make_request(
             .headers_mut()
             .try_append(key, value)
             .map_err(|e| {
-                connector_error(TransportFailure::maybe_sent(
-                    format!("Failed to append response header: {e}"),
-                    None,
-                ))
+                ResponseBodyError::new(format!("Failed to append response header: {e}"), None)
             })?;
     }
 
     Ok(sdk_response)
 }
 
-/// Resolve a body write/finish failure against the response future's state.
+/// Resolve the response future's state and any body write/finish failure.
 ///
 /// A pre-send host failure drops the outgoing-body receiver, so a request with
 /// a body can observe a closed stream before the future exposes the real DNS,
@@ -676,14 +675,23 @@ fn make_request(
 /// whole request body, closing that same receiver. Preserve either the host
 /// error or the response; only fall back to the body error if neither exists.
 /// The generic response keeps this decision testable without WASI resources.
-fn response_after_body_failure<T>(
+fn resolve_response<T>(
     response: Option<Result<Result<T, ErrorCode>, ()>>,
-    fallback: TransportFailure,
+    body_failure: Option<TransportFailure>,
 ) -> Result<T, TransportFailure> {
-    match response {
-        Some(Ok(Ok(response))) => Ok(response),
-        Some(Ok(Err(code))) => Err(body_failure_from_code(code, fallback)),
-        None | Some(Err(())) => Err(fallback),
+    match (response, body_failure) {
+        (Some(Ok(Ok(response))), _) => Ok(response),
+        (Some(Ok(Err(code))), Some(fallback)) => Err(body_failure_from_code(code, fallback)),
+        (Some(Ok(Err(code))), None) => Err(TransportFailure::from_code(
+            format!("HTTP error: {code:?}"),
+            code,
+        )),
+        (None | Some(Err(())), Some(fallback)) => Err(fallback),
+        (None, None) => Err(TransportFailure::maybe_sent(
+            "Response not ready after block",
+            None,
+        )),
+        (Some(Err(())), None) => Err(TransportFailure::maybe_sent("Response already taken", None)),
     }
 }
 
@@ -692,12 +700,27 @@ fn body_failure_from_code(code: ErrorCode, fallback: TransportFailure) -> Transp
     TransportFailure::from_code(message, code)
 }
 
-/// A response-body failure follows an observed response, so its code cannot
-/// establish that the request was never sent. Retain the code for diagnostics.
-fn response_body_outcome<T>(result: Result<T, TransportFailure>) -> Result<T, TransportFailure> {
-    result.map_err(|mut failure| {
-        failure.phase = SendPhase::MaybeSent;
-        failure
+/// Read a received response. Every failure here is structurally post-response.
+fn read_response(response: IncomingResponse) -> Result<WasiResponse, ResponseBodyError> {
+    let status = response.status();
+    let response_headers = response.headers();
+    let headers = response_headers
+        .entries()
+        .into_iter()
+        .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
+        .collect();
+    drop(response_headers);
+
+    let incoming_body = response
+        .consume()
+        .map_err(|()| ResponseBodyError::new("Failed to consume response body", None))?;
+    let body = read_body(&incoming_body)?;
+    let _trailers = IncomingBody::finish(incoming_body);
+
+    Ok(WasiResponse {
+        status,
+        headers,
+        body,
     })
 }
 
@@ -741,10 +764,10 @@ fn write_body(body: &OutgoingBody, data: &[u8]) -> Result<(), TransportFailure> 
 ///
 /// The host reports truncation/framing errors as `LastOperationFailed` before
 /// `Closed`, so only a clean end of stream returns the accumulated bytes.
-fn read_body(body: &IncomingBody) -> Result<Vec<u8>, TransportFailure> {
+fn read_body(body: &IncomingBody) -> Result<Vec<u8>, ResponseBodyError> {
     let stream = body
         .stream()
-        .map_err(|()| TransportFailure::maybe_sent("Failed to get input stream", None))?;
+        .map_err(|()| ResponseBodyError::new("Failed to get input stream", None))?;
     let mut buf = Vec::new();
     loop {
         match stream.blocking_read(64 * 1024) {
@@ -753,10 +776,7 @@ fn read_body(body: &IncomingBody) -> Result<Vec<u8>, TransportFailure> {
                 StreamError::Closed => break,
                 error => {
                     let message = format!("Read error: {error:?}");
-                    return Err(TransportFailure::maybe_sent(
-                        message,
-                        stream_error_code(&error),
-                    ));
+                    return Err(ResponseBodyError::new(message, stream_error_code(&error)));
                 }
             },
         }
@@ -945,94 +965,114 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_response_code_is_in_body_failure_message() {
-        let failure = body_failure_from_code(
-            ErrorCode::HttpProtocolError,
-            TransportFailure::maybe_sent("Write error: Closed", None),
-        );
-
-        assert_eq!(failure.phase(), SendPhase::MaybeSent);
-        assert!(matches!(failure.code(), Some(ErrorCode::HttpProtocolError)));
-        assert_eq!(
-            failure.to_string(),
-            "HTTP error: ErrorCode::HttpProtocolError (after body write/finish failed: Write error: Closed)"
-        );
-    }
-
-    #[test]
-    fn body_failure_preserves_early_response_status_headers_and_body() {
+    fn response_resolution_preserves_status_headers_and_body() {
         // Both a successful HTTP status and an HTTP error are complete transport
         // responses, even if the server stopped accepting the request body.
         for status in [200, 413] {
-            let response = http::Response::builder()
-                .status(status)
-                .header("x-early-response", "preserved")
-                .body(b"early response body".to_vec())
-                .unwrap();
-            let response = response_after_body_failure(
-                Some(Ok(Ok(response))),
-                TransportFailure::maybe_sent("Write error: Closed", None),
-            )
-            .expect("an available HTTP response must survive a body write failure");
+            for body_failure in [
+                None,
+                Some(TransportFailure::maybe_sent("Write error: Closed", None)),
+                Some(TransportFailure::from_code(
+                    "Write error",
+                    ErrorCode::ConnectionRefused,
+                )),
+            ] {
+                let response = http::Response::builder()
+                    .status(status)
+                    .header("x-early-response", "preserved")
+                    .body(b"early response body".to_vec())
+                    .unwrap();
+                let response = resolve_response(Some(Ok(Ok(response))), body_failure)
+                    .expect("an available HTTP response must survive any body write failure");
 
-            assert_eq!(response.status(), status);
-            assert_eq!(response.headers()["x-early-response"], "preserved");
-            assert_eq!(response.body(), b"early response body");
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()["x-early-response"], "preserved");
+                assert_eq!(response.body(), b"early response body");
+            }
         }
     }
 
     #[test]
-    fn body_failure_prefers_host_error_to_body_error() {
-        let failure = response_after_body_failure::<()>(
-            Some(Ok(Err(ErrorCode::ConnectionRefused))),
-            TransportFailure::from_code(
-                "Failed to finish body",
-                ErrorCode::HttpRequestBodySize(Some(4096)),
-            ),
-        )
-        .unwrap_err();
+    fn response_resolution_uses_host_error_with_or_without_body_failure() {
+        for body_failed in [false, true] {
+            for code in [
+                ErrorCode::DnsTimeout,
+                ErrorCode::ConnectionRefused,
+                ErrorCode::HttpProtocolError,
+            ] {
+                let expected_phase = send_phase(&code);
+                let expected_code = format!("{code:?}");
+                let mut expected_message = format!("HTTP error: {code:?}");
+                let body_failure = body_failed.then(|| {
+                    expected_message
+                        .push_str(" (after body write/finish failed: Failed to finish body)");
+                    TransportFailure::from_code(
+                        "Failed to finish body",
+                        ErrorCode::HttpRequestBodySize(Some(4096)),
+                    )
+                });
+                let failure =
+                    resolve_response::<()>(Some(Ok(Err(code))), body_failure).unwrap_err();
 
-        assert_eq!(failure.phase(), SendPhase::NotSent);
-        assert!(matches!(failure.code(), Some(ErrorCode::ConnectionRefused)));
-        assert_eq!(
-            failure.to_string(),
-            "HTTP error: ErrorCode::ConnectionRefused (after body write/finish failed: Failed to finish body)"
-        );
+                assert_eq!(failure.phase(), expected_phase);
+                assert_eq!(
+                    failure.code().map(|code| format!("{code:?}")),
+                    Some(expected_code)
+                );
+                assert_eq!(failure.to_string(), expected_message);
+            }
+        }
     }
 
     #[test]
-    fn body_failure_keeps_fallback_when_response_is_pending_or_taken() {
-        for response in [None, Some(Err(()))] {
-            let failure = response_after_body_failure::<()>(
-                response,
+    fn response_resolution_keeps_body_failure_when_response_is_pending_or_taken() {
+        for pending in [false, true] {
+            for body_failure in [
                 TransportFailure::maybe_sent("Write error: Closed", None),
-            )
-            .unwrap_err();
+                TransportFailure::from_code("Write error", ErrorCode::ConnectionRefused),
+                TransportFailure::from_code(
+                    "Failed to finish body",
+                    ErrorCode::HttpRequestBodySize(Some(4096)),
+                ),
+            ] {
+                let expected_phase = body_failure.phase();
+                let expected_code = format!("{:?}", body_failure.code());
+                let expected_message = body_failure.to_string();
+                let response = if pending { None } else { Some(Err(())) };
+                let failure = resolve_response::<()>(response, Some(body_failure)).unwrap_err();
+
+                assert_eq!(failure.phase(), expected_phase);
+                assert_eq!(format!("{:?}", failure.code()), expected_code);
+                assert_eq!(failure.to_string(), expected_message);
+            }
+        }
+    }
+
+    #[test]
+    fn response_resolution_without_body_failure_reports_pending_or_taken() {
+        for (response, message) in [
+            (None, "Response not ready after block"),
+            (Some(Err(())), "Response already taken"),
+        ] {
+            let failure = resolve_response::<()>(response, None).unwrap_err();
 
             assert_eq!(failure.phase(), SendPhase::MaybeSent);
             assert!(failure.code().is_none());
-            assert_eq!(failure.to_string(), "Write error: Closed");
+            assert_eq!(failure.to_string(), message);
         }
     }
 
     #[test]
-    fn response_body_outcome_preserves_complete_body() {
-        let body = response_body_outcome(Ok(b"complete response body".to_vec())).unwrap();
-
-        assert_eq!(body, b"complete response body");
-    }
-
-    #[test]
-    fn response_body_failure_is_maybe_sent_regardless_of_code() {
-        for failure in [
-            TransportFailure::from_code("Read error", ErrorCode::ConnectionRefused),
-            TransportFailure::from_code("Read error", ErrorCode::TlsCertificateError),
-            TransportFailure::from_code("Read error", ErrorCode::HttpProtocolError),
-            TransportFailure::maybe_sent("Read error", None),
-            PreSendError::new("Read error").into(),
+    fn response_body_error_conversion_is_maybe_sent_regardless_of_code() {
+        for code in [
+            None,
+            Some(ErrorCode::DnsTimeout),
+            Some(ErrorCode::ConnectionRefused),
+            Some(ErrorCode::TlsCertificateError),
+            Some(ErrorCode::HttpProtocolError),
         ] {
-            let original_code = format!("{:?}", failure.code());
-            let failure = response_body_outcome::<()>(Err(failure)).unwrap_err();
+            let original_code = format!("{code:?}");
+            let failure = TransportFailure::from(ResponseBodyError::new("Read error", code));
 
             assert_eq!(failure.phase(), SendPhase::MaybeSent);
             assert_eq!(format!("{:?}", failure.code()), original_code);

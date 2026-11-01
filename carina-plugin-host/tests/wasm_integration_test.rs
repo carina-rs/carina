@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1785,13 +1785,14 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
 }
 
 async fn probe_early_http_response(response: &'static [u8], check_outcome: impl FnOnce(&str)) {
-    const BODY_BYTES: usize = 8 * 1024 * 1024;
+    const BODY_BYTES: usize = 32 * 1024 * 1024;
 
     let path = skip_if_no_http_wasm!();
     let listener = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
         // Bound the receive window before listen/accept so it is inherited by
-        // the connection. The body exceeds this window, the client's socket
-        // buffer, and the host's two-chunk outgoing-body channel combined.
+        // the connection. Early-response ordering relies on the body exceeding
+        // the kernel send/receive buffers (Linux tcp_wmem max is 4 MiB by
+        // default), plus the host's two-chunk outgoing-body channel.
         socket.set_recv_buffer_size(16 * 1024)?;
         socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
         socket.listen(1)?.into_std()
@@ -1854,7 +1855,21 @@ async fn probe_early_http_response(response: &'static [u8], check_outcome: impl 
         stream
             .write_all(response)
             .expect("send response before reading the request body");
-        // Dropping the stream closes it while the request body is incomplete.
+        // Drain after shutting down writes so unread request data cannot cause
+        // an RST on drop that destroys the buffered response. After the complete
+        // Connection: close response, hyper stops sending the request body and
+        // drops its body receiver, so the guest's write still fails with Closed.
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("finish response before draining the request body");
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        let mut discarded = [0_u8; 8192];
+        while Instant::now() < drain_deadline {
+            match stream.read(&mut discarded) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
     });
 
     let outcome = provider.provider().create_for_test(&id, request).await;
@@ -1901,6 +1916,101 @@ async fn wasm_guest_early_response_with_truncated_body_is_maybe_sent() {
         },
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_guest_connection_reset_after_request_head_is_maybe_sent() {
+    const BODY_BYTES: usize = 32 * 1024 * 1024;
+
+    let path = skip_if_no_http_wasm!();
+    let listener = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
+        // Keep the large body in flight when the server resets the connection.
+        socket.set_recv_buffer_size(16 * 1024)?;
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
+        socket.listen(1)?.into_std()
+    }) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the connection-reset test server: {error}");
+            return;
+        }
+    };
+    let server_address = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "wasi-http-reset-after-head",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "wasi-http-reset-after-head",
+        &format!("http://phase-test.invalid:{}/", server_address.port()),
+        "POST",
+        &"x".repeat(BODY_BYTES),
+    );
+    let request = create_request_for_test(resource).await;
+
+    // Start the accept deadline after compilation and request preparation.
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "server accept timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("server accept failed: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("set accepted socket blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set server read timeout");
+
+        let head = read_http_request_head(&mut stream);
+        assert_eq!(
+            http_request_content_length(&head),
+            BODY_BYTES,
+            "the guest must dispatch the entire large body"
+        );
+
+        // No response bytes exist, so even an RST observed before the client's
+        // first read must yield a transport failure after request delivery.
+        let socket = tokio::net::TcpSocket::from_std_stream(stream);
+        // Tokio deprecates linger because nonzero durations can block on drop;
+        // zero is intentional here to force an immediate RST.
+        #[allow(deprecated)]
+        socket
+            .set_linger(Some(Duration::ZERO))
+            .expect("force an RST when the stream is dropped");
+        drop(socket);
+    });
+
+    let outcome = provider.provider().create_for_test(&id, request).await;
+    server
+        .join()
+        .expect("connection-reset server should finish");
+    let state = create_state_for_writeback(outcome.expect("the probe must report its outcome"));
+    let outcome = http_probe_outcome(&state);
+    let (phase, code) = outcome
+        .split_once(':')
+        .expect("a connection reset must report a transport failure");
+    eprintln!("connection reset after request head: phase={phase} code={code}");
+    assert_eq!(
+        phase, "maybe_sent",
+        "the server received the request head before resetting: {outcome}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
