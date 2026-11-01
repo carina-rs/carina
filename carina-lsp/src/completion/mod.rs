@@ -19,7 +19,8 @@ use crate::enclosing_block::{
     EnclosingBlock, ResourceTypePatterns, StructPath, cursor_line_segment, enclosing_block,
 };
 use carina_core::schema::{
-    AttributeType, CompletionValue, SchemaKind, SchemaRegistry, Shape, ValidatedResourceSchema,
+    CompiledAttributeType as AttributeType, CompletionValue, SchemaKind, SchemaRegistry, Shape,
+    ValidatedResourceSchema,
 };
 
 pub struct CompletionProvider {

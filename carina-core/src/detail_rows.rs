@@ -25,7 +25,10 @@ use crate::resource::{
     CanonicalComparisonAttributes, ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, Value,
     pair_list_elements,
 };
-use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
+use crate::schema::{
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    SchemaRegistry, empty_defs_for_schema_walks,
+};
 use crate::value::{
     PrettyValue, RenderedKey, RenderedValue, is_list_of_maps, render_enum_text, render_other,
     render_string_text, render_value,
@@ -2574,6 +2577,10 @@ fn string_list_inner_type<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
     use crate::effect::{ChangedCreateOnly, EffectGeneration};
     use crate::explicit::{ExplicitFields, PendingPaths};
@@ -2718,8 +2725,11 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "",
-            ResourceSchema::new("test.Widget")
-                .attribute(AttributeSchema::optional("password", AttributeType::string()).build())
+            PatternResourceSchema::new("test.Widget")
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
+                        .build(),
+                )
                 .validate()
                 .expect("secret fixture schema must be valid"),
         );
@@ -2822,26 +2832,28 @@ mod tests {
     }
 
     fn empty_struct_comparison_registry() -> SchemaRegistry {
-        use crate::schema::{AttributeSchema, StructField};
-
-        let config = AttributeType::struct_(
+        let config = PatternAttributeType::struct_(
             "Config",
-            vec![StructField::optional("label", AttributeType::string()).build()],
+            vec![PatternStructField::optional("label", PatternAttributeType::string()).build()],
         );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "",
-            ResourceSchema::new("test.Widget")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-                .attribute(AttributeSchema::optional("config", config.clone()).build())
+            PatternResourceSchema::new("test.Widget")
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(PatternAttributeSchema::optional("config", config.clone()).build())
+                .attribute(
+                    PatternAttributeSchema::optional(
                         "settings",
-                        AttributeType::struct_(
+                        PatternAttributeType::struct_(
                             "Settings",
                             vec![
-                                StructField::optional("x", AttributeType::int()).build(),
-                                StructField::optional("config", config).build(),
+                                PatternStructField::optional("x", PatternAttributeType::int())
+                                    .build(),
+                                PatternStructField::optional("config", config).build(),
                             ],
                         ),
                     )
@@ -3005,8 +3017,6 @@ mod tests {
 
     #[test]
     fn update_rows_canonicalize_persisted_list_elements_before_projection() {
-        use crate::schema::{AttributeSchema, StructField};
-
         let rule = |include_empty_options| {
             let mut fields =
                 IndexMap::from([("port".to_string(), Value::Concrete(ConcreteValue::Int(80)))]);
@@ -3024,22 +3034,29 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "",
-            ResourceSchema::new("test.Widget")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            PatternResourceSchema::new("test.Widget")
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional(
                         "rules",
-                        AttributeType::list(AttributeType::struct_(
+                        PatternAttributeType::list(PatternAttributeType::struct_(
                             "Rule",
                             vec![
-                                StructField::required("port", AttributeType::int()).build(),
-                                StructField::optional(
+                                PatternStructField::required("port", PatternAttributeType::int())
+                                    .build(),
+                                PatternStructField::optional(
                                     "opts",
-                                    AttributeType::struct_(
+                                    PatternAttributeType::struct_(
                                         "Options",
                                         vec![
-                                            StructField::optional("label", AttributeType::string())
-                                                .build(),
+                                            PatternStructField::optional(
+                                                "label",
+                                                PatternAttributeType::string(),
+                                            )
+                                            .build(),
                                         ],
                                     ),
                                 )
@@ -3193,10 +3210,10 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
-            (ResourceSchema::new("test.Widget").attribute(
-                crate::schema::AttributeSchema::optional(
+            (PatternResourceSchema::new("test.Widget").attribute(
+                PatternAttributeSchema::optional(
                     "tags",
-                    crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                    PatternAttributeType::map(PatternAttributeType::string()),
                 )
                 .build(),
             ))
@@ -3285,10 +3302,10 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (ResourceSchema::new("s3.Bucket").attribute(
-                crate::schema::AttributeSchema::optional(
+            (PatternResourceSchema::new("s3.Bucket").attribute(
+                PatternAttributeSchema::optional(
                     "tags",
-                    crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                    PatternAttributeType::map(PatternAttributeType::string()),
                 )
                 .build(),
             ))
@@ -5327,7 +5344,9 @@ mod tests {
 
     // --- carina#3073: schema-aware Update/Replace renderer ---
 
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+    use crate::schema::{
+        CompiledAttributeType as AttributeType, CompiledStructField as StructField,
+    };
 
     /// Build a registry whose `iam.Role.policy` attribute is the
     /// IAM-policy-doc shape: a Struct with a Enum `version` and a
@@ -5335,7 +5354,7 @@ mod tests {
     /// map the API spelling to the DSL alias, mirroring the real
     /// provider schema (`Allow`↔`allow`, `2012-10-17`↔`2012_10_17`).
     fn iam_policy_registry() -> SchemaRegistry {
-        let effect = AttributeType::enum_(
+        let effect = PatternAttributeType::enum_(
             crate::schema::TypeIdentity::bare("Effect"),
             Some(vec!["Allow".to_string(), "Deny".to_string()]),
             vec![
@@ -5345,7 +5364,7 @@ mod tests {
             None,
             None,
         );
-        let version = AttributeType::enum_(
+        let version = PatternAttributeType::enum_(
             crate::schema::TypeIdentity::bare("Version"),
             Some(vec!["2012-10-17".to_string(), "2008-10-17".to_string()]),
             vec![
@@ -5355,24 +5374,29 @@ mod tests {
             None,
             None,
         );
-        let statement = AttributeType::unordered_list(AttributeType::struct_(
+        let statement = PatternAttributeType::unordered_list(PatternAttributeType::struct_(
             "Statement".to_string(),
             vec![
-                StructField::optional("effect", effect).build(),
-                StructField::optional("action", AttributeType::string()).build(),
+                PatternStructField::optional("effect", effect).build(),
+                PatternStructField::optional("action", PatternAttributeType::string()).build(),
             ],
         ));
-        let policy = AttributeType::struct_(
+        let policy = PatternAttributeType::struct_(
             "PolicyDocument".to_string(),
             vec![
-                StructField::optional("version", version).build(),
-                StructField::optional("statement", statement).build(),
+                PatternStructField::optional("version", version).build(),
+                PatternStructField::optional("statement", statement).build(),
             ],
         );
-        let schema = ResourceSchema::new("iam.Role")
-            .attribute(AttributeSchema::optional("policy", policy).build())
-            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("region", AttributeType::string()).build());
+        let schema = PatternResourceSchema::new("iam.Role")
+            .attribute(PatternAttributeSchema::optional("policy", policy).build())
+            .attribute(
+                PatternAttributeSchema::optional("description", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("region", PatternAttributeType::string()).build(),
+            );
         let mut registry = SchemaRegistry::new();
         registry.insert("", schema.validate().expect("schema fixture must be valid"));
         registry
@@ -5446,9 +5470,10 @@ mod tests {
         use crate::schema::{ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity};
 
         let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
-        let attr_type = AttributeType::refined_string(Some(identity.clone()), None, None, None);
-        let schema = ResourceSchema::new("lambda.Permission")
-            .attribute(AttributeSchema::optional("function_name", attr_type).build());
+        let attr_type =
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let schema = PatternResourceSchema::new("lambda.Permission")
+            .attribute(PatternAttributeSchema::optional("function_name", attr_type).build());
         let forms = ReferenceForms::from([(
             identity,
             ReferenceForm::Template {
@@ -5707,7 +5732,7 @@ mod tests {
     /// whose only change is an enum-equal value must produce no row.
     #[test]
     fn update_map_of_enum_enum_equal_value_no_phantom() {
-        let enum_t = AttributeType::enum_(
+        let enum_t = PatternAttributeType::enum_(
             crate::schema::TypeIdentity::bare("Mode"),
             Some(vec!["On".to_string(), "Off".to_string()]),
             vec![
@@ -5717,9 +5742,9 @@ mod tests {
             None,
             None,
         );
-        let map_t = AttributeType::map_with_key(AttributeType::string(), enum_t);
-        let schema = ResourceSchema::new("x.Thing")
-            .attribute(AttributeSchema::optional("modes", map_t).build());
+        let map_t = PatternAttributeType::map_with_key(PatternAttributeType::string(), enum_t);
+        let schema = PatternResourceSchema::new("x.Thing")
+            .attribute(PatternAttributeSchema::optional("modes", map_t).build());
         let mut registry = SchemaRegistry::new();
         registry.insert("", schema.validate().expect("schema fixture must be valid"));
 
@@ -5882,7 +5907,7 @@ mod tests {
     }
 
     fn modes_registry() -> SchemaRegistry {
-        let mode = AttributeType::enum_(
+        let mode = PatternAttributeType::enum_(
             crate::schema::TypeIdentity::bare("Mode"),
             Some(vec!["Allow".to_string(), "Deny".to_string()]),
             vec![
@@ -5892,8 +5917,9 @@ mod tests {
             None,
             None,
         );
-        let schema = ResourceSchema::new("x.Thing").attribute(
-            AttributeSchema::optional("modes", AttributeType::unordered_list(mode)).build(),
+        let schema = PatternResourceSchema::new("x.Thing").attribute(
+            PatternAttributeSchema::optional("modes", PatternAttributeType::unordered_list(mode))
+                .build(),
         );
         let mut registry = SchemaRegistry::new();
         registry.insert("", schema.validate().expect("schema fixture must be valid"));
@@ -6127,7 +6153,7 @@ mod tests {
         let settings = AttributeType::struct_(
             "Settings",
             vec![
-                crate::schema::StructField::optional(
+                crate::schema::CompiledStructField::optional(
                     "modes",
                     AttributeType::union(vec![AttributeType::ref_("L")]),
                 )

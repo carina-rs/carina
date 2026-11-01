@@ -855,6 +855,8 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
 /// Directional compatibility for a declared source flowing into a declared sink.
 #[cfg(test)]
 mod tests {
+    use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+
     use indexmap::IndexMap;
 
     use super::*;
@@ -1428,7 +1430,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
-        let declared_type = crate::schema::AttributeType::enum_(
+        let declared_type = crate::schema::CompiledAttributeType::enum_(
             identity.clone(),
             Some(vec!["API_VALUE".to_string()]),
             vec![("API_VALUE".to_string(), "dsl_value".to_string())],
@@ -1518,14 +1520,14 @@ mod tests {
 
     #[test]
     fn native_refined_int_typecheck_preserves_the_integer_value() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+        use crate::schema::legacy_validator;
 
         fn schema(identity: TypeIdentity, accepted: i64) -> crate::schema::ValidatedResourceSchema {
-            ResourceSchema::new(format!("test.number_{accepted}"))
+            PatternResourceSchema::new(format!("test.number_{accepted}"))
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "value",
-                        AttributeType::refined_int_with_validator(
+                        PatternAttributeType::refined_int_with_validator(
                             identity,
                             None,
                             legacy_validator(move |value| match value {
@@ -1589,7 +1591,7 @@ mod tests {
         let bare_identity = TypeIdentity::bare("Mode");
         let schema_identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
         let enum_type = |identity| {
-            crate::schema::AttributeType::enum_(
+            crate::schema::CompiledAttributeType::enum_(
                 identity,
                 Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
                 vec![("Enabled".to_string(), "enabled".to_string())],

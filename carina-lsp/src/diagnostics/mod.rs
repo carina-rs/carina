@@ -228,7 +228,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         &self,
         resource_id: &carina_core::resource::ResourceId,
         attribute: &str,
-        expected: TypeInSchema<'_>,
+        expected: TypeInSchema<'_, carina_core::schema::Compiled>,
         schemas: &SchemaRegistry,
     ) -> Option<Result<(), carina_core::validation::DeferredAccessTypeError>> {
         let resource = self
@@ -625,10 +625,19 @@ impl DiagnosticEngine {
                 .root_expanded_semantic_file(current_file_path)
         {
             let directory = result.directory.root_expanded();
+            let expanded_identity_graph =
+                merged_result
+                    .as_ref()
+                    .and_then(|result| match &result.module_resolution {
+                        checks::MergedModuleResolution::Expanded { graph } => Some(graph.as_ref()),
+                        checks::MergedModuleResolution::ConstraintFailed { .. }
+                        | checks::MergedModuleResolution::Unowned { .. } => None,
+                    });
             diagnostics.extend(self.loop_anonymous_identity_diagnostics(
                 doc,
                 &current_file,
                 &directory,
+                expanded_identity_graph,
                 base_path,
             ));
         }
@@ -2504,7 +2513,7 @@ pub(super) fn build_enum_diagnostic_from_error(
 /// cannot be resolved (unknown bindings are not flagged here).
 fn check_resource_ref_type_mismatch(
     binding_index: &carina_core::binding_index::BindingIndex<'_, RelativeBindingName>,
-    expected: TypeInSchema<'_>,
+    expected: TypeInSchema<'_, carina_core::schema::Compiled>,
     path: carina_core::resource::ReferencePathRef<'_, RelativeBindingName>,
 ) -> Option<String> {
     let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {

@@ -46,7 +46,10 @@ use crate::effect::MoveAuthority;
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
 use crate::provider::{AppliedIdentifier, InFlightCreate, UnknownCreateOutcome};
-use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
+use crate::schema::{
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, DslMap,
+    Shape, ShapeWalkBudget, TypeIdentity,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use binding_address::absolute_binding_address_for_test;
@@ -9147,6 +9150,8 @@ pub trait AnonymousIdentityModuleSource {
     fn anonymous_outer_instance_identity(&self) -> Option<ResourceIdentity>;
 
     fn anonymous_scope(&self) -> Option<(String, String)>;
+
+    fn anonymous_authored_locations(&self) -> Vec<(PathBuf, crate::parser::SourceSpan)>;
 }
 
 impl AnonymousIdentityModuleSource for ModuleSource {
@@ -9157,6 +9162,17 @@ impl AnonymousIdentityModuleSource for ModuleSource {
     fn anonymous_scope(&self) -> Option<(String, String)> {
         self.identity_scope()
             .map(|scope| (scope.key().to_string(), scope.description()))
+    }
+
+    fn anonymous_authored_locations(&self) -> Vec<(PathBuf, crate::parser::SourceSpan)> {
+        match self {
+            Self::Root => Vec::new(),
+            Self::Module(module) => module
+                .module_call_path()
+                .calls()
+                .map(|call| (call.id.source_file().to_path_buf(), call.id.call_span()))
+                .collect(),
+        }
     }
 }
 
@@ -9184,6 +9200,10 @@ impl AnonymousIdentityModuleSource for SavedModuleSource {
             )),
         }
     }
+
+    fn anonymous_authored_locations(&self) -> Vec<(PathBuf, crate::parser::SourceSpan)> {
+        Vec::new()
+    }
 }
 
 impl AnonymousIdentityModuleSource for ProviderModuleSource {
@@ -9192,6 +9212,10 @@ impl AnonymousIdentityModuleSource for ProviderModuleSource {
     }
 
     fn anonymous_scope(&self) -> Option<(String, String)> {
+        match *self {}
+    }
+
+    fn anonymous_authored_locations(&self) -> Vec<(PathBuf, crate::parser::SourceSpan)> {
         match *self {}
     }
 }
@@ -9999,7 +10023,10 @@ impl<S> Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
 #[cfg(test)]
 mod enum_attr_tests {
     use super::*;
-    use crate::schema::{AttributeSchema, AttributeType, StructField, enum_identity};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+        CompiledStructField as StructField, enum_identity,
+    };
 
     fn status_enum_type() -> AttributeType {
         AttributeType::enum_(
@@ -11180,7 +11207,7 @@ impl Current {
 
     fn into_plan_input(
         mut self,
-        schema: Option<&crate::schema::ResourceSchema>,
+        schema: Option<&crate::schema::CompiledResourceSchema>,
     ) -> PlanInputCurrent {
         match &mut self {
             Self::Absent(state) => state.0.materialize_partial_read_unknowns(),
@@ -11286,7 +11313,7 @@ impl CanonicalComparisonAttributes {
     /// Build the state-style canonical comparison view for one resource.
     pub fn canonicalize(
         mut attributes: HashMap<String, Value>,
-        schema: &crate::schema::ResourceSchema,
+        schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
         crate::value::canonicalize_state_attribute_map_with_schema(&mut attributes, schema);
         Self { attributes }
@@ -11362,7 +11389,7 @@ impl<'a> PlanInputDesired<'a> {
 
     pub(crate) fn with_resource_schema(
         authored: &'a ResolvedResource,
-        schema: Option<&crate::schema::ResourceSchema>,
+        schema: Option<&crate::schema::CompiledResourceSchema>,
     ) -> Self {
         let attributes = authored.resolved_attributes();
         let comparison_attributes = match schema {

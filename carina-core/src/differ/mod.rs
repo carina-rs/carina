@@ -21,7 +21,9 @@ use crate::resource::{
     PlanInputDesired, PresentResourceState, ResolvedResource, Resource, ResourceId, State,
     UnidentifiedState, Value, into_plan_input_current_map,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
+use crate::schema::{
+    CompiledResourceSchema as ResourceSchema, SchemaRegistry, ValidatedResourceSchema,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
@@ -214,10 +216,24 @@ fn managed_binding_stability_for_resources<'a, D: 'a + Clone>(
             );
             continue;
         }
-        let create_only = schema.as_schema().create_only_attributes();
-        if changed_attributes
-            .iter()
-            .any(|attribute| create_only.contains(&attribute.as_str()))
+        let authored_views = comparison::project_authored_attribute_views(
+            &desired_attributes,
+            current_attributes,
+            comparison_saved.get(&resource.id),
+            prev_explicit.get(&resource.id),
+            Some(schema.as_schema()),
+            context,
+        );
+        if !plan::find_changed_create_only_for_resource(
+            &changed_attributes,
+            authored_views.current(),
+            authored_views.removal_evidence(),
+            resource,
+            &desired_attributes,
+            schema.as_schema(),
+            context,
+        )
+        .is_empty()
         {
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;
@@ -1008,7 +1024,7 @@ use crate::effect::Effect;
 #[cfg(test)]
 use crate::plan::Plan;
 #[cfg(test)]
-use crate::schema::AttributeType;
+use crate::schema::CompiledAttributeType as AttributeType;
 pub use comparison::ComparisonContext;
 
 #[cfg(any(test, feature = "test-utils"))]

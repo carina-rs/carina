@@ -11,6 +11,7 @@ use crate::resource::{
     Value as GenericValue,
 };
 use crate::schema::TypeIdentity;
+use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
@@ -10265,7 +10266,7 @@ fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
 fn provider_context_lookup_preserves_typed_custom_validation_errors() {
     let identity = TypeIdentity::bare("CustomType");
     let declaration =
-        crate::schema::AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        PatternAttributeType::refined_string(Some(identity.clone()), None, None, None);
     let config = ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             Default::default(),
@@ -10283,10 +10284,8 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "missing",
-        crate::schema::ResourceSchema::new("test.Missing")
-            .attribute(
-                crate::schema::AttributeSchema::optional("value", declaration.clone()).build(),
-            )
+        PatternResourceSchema::new("test.Missing")
+            .attribute(PatternAttributeSchema::optional("value", declaration.clone()).build())
             .validate()
             .expect("typed-error fixture schema must validate"),
     );
@@ -10420,14 +10419,14 @@ fn provider_context_validator_receives_canonical_numeric_text() {
 
 #[test]
 fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+    use crate::schema::legacy_validator;
 
     fn schema(identity: TypeIdentity, accepted: i64) -> crate::schema::ValidatedResourceSchema {
-        ResourceSchema::new(format!("test.number_{accepted}"))
+        PatternResourceSchema::new(format!("test.number_{accepted}"))
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "value",
-                    AttributeType::refined_int_with_validator(
+                    PatternAttributeType::refined_int_with_validator(
                         identity,
                         None,
                         legacy_validator(move |value| match value {

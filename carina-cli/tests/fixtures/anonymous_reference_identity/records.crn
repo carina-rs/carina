@@ -1,0 +1,26 @@
+mock.route53.RecordSet {
+  hosted_zone_id   = zone.id
+  name             = "www.example.com."
+  type             = "A"
+  resource_records = [
+    "192.0.2.10",
+  ]
+}
+
+mock.route53.RecordSet {
+  hosted_zone_id   = zone.id
+  name             = "www.example.com."
+  type             = "AAAA"
+  resource_records = [
+    "2001:db8::10",
+  ]
+}
+
+mock.route53.RecordSet {
+  hosted_zone_id   = zone.id
+  name             = "api.example.com."
+  type             = "A"
+  resource_records = [
+    "192.0.2.20",
+  ]
+}

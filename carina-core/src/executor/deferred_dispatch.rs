@@ -409,6 +409,8 @@ pub(super) fn dispatch_deferred_create<
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+
     use std::collections::HashMap;
 
     use super::*;
@@ -419,7 +421,6 @@ mod tests {
         ExpandedDeferredValue as DeferredValue, ExpandedValue as Value, LoopSlot, ModuleSource,
         ParsedIgnorePath, ParsedIgnorePathSegment, Resource, RootScope,
     };
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     fn materialize_compiled_fixture(
         template: &ExpandedDeferredForExpression,
@@ -536,8 +537,11 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "",
-            ResourceSchema::new("test.Child")
-                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            PatternResourceSchema::new("test.Child")
+                .attribute(
+                    PatternAttributeSchema::optional("comment", PatternAttributeType::string())
+                        .build(),
+                )
                 .validate()
                 .expect("valid deferred child schema"),
         );
@@ -585,13 +589,10 @@ mod tests {
             BindingValueSource::Local,
             BindingCompleteness::Complete,
         );
-        let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
-            crate::schema::AttributeSchema::optional(
-                "identity_input",
-                crate::schema::AttributeType::string(),
-            )
-            .create_only()
-            .build(),
+        let schema = PatternResourceSchema::new("test.Child").attribute(
+            PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
+                .create_only()
+                .build(),
         );
         let mut schemas = crate::schema::SchemaRegistry::new();
         schemas.insert(
@@ -649,15 +650,15 @@ mod tests {
             BindingValueSource::Local,
             BindingCompleteness::Complete,
         );
-        let mode_type = crate::schema::AttributeType::enum_(
+        let mode_type = PatternAttributeType::enum_(
             crate::schema::enum_identity("Mode", Some("mock.test.Child")),
             Some(vec!["API_A".to_string()]),
             vec![("API_A".to_string(), "foo".to_string())],
             None,
             None,
         );
-        let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
-            crate::schema::AttributeSchema::optional("mode", mode_type)
+        let schema = PatternResourceSchema::new("test.Child").attribute(
+            PatternAttributeSchema::optional("mode", mode_type)
                 .create_only()
                 .build(),
         );
@@ -738,13 +739,10 @@ mod tests {
             BindingValueSource::Local,
             BindingCompleteness::Complete,
         );
-        let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
-            crate::schema::AttributeSchema::optional(
-                "identity_input",
-                crate::schema::AttributeType::string(),
-            )
-            .create_only()
-            .build(),
+        let schema = PatternResourceSchema::new("test.Child").attribute(
+            PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
+                .create_only()
+                .build(),
         );
         let mut schemas = crate::schema::SchemaRegistry::new();
         schemas.insert(

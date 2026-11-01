@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
 
 use crate::resource::{ResolvedDependencies, ResolvedResourceId};
 use std::collections::HashSet;
@@ -11,7 +12,8 @@ use crate::resource::{
     ExpandedResource as Resource, ExpandedValue as Value, ResourceIdentity,
     absolute_binding_address_for_test as absolute_binding,
 };
-use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use indexmap::IndexMap;
 
 fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.to_string().into()))
@@ -36,19 +38,23 @@ fn base_schemas(subnet_vpc_id_create_only: bool) -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated("vpc_id", AttributeType::string()).build(),
+                PatternAttributeSchema::provider_populated(
+                    "vpc_id",
+                    PatternAttributeType::string(),
+                )
+                .build(),
             )
             .with_unique_name_attribute("name"))
         .validate()
@@ -64,23 +70,25 @@ fn subnet_schema(
     default_prevent_destroy: bool,
 ) -> crate::schema::ValidatedResourceSchema {
     let vpc_id = if subnet_vpc_id_create_only {
-        AttributeSchema::required("vpc_id", AttributeType::string())
+        PatternAttributeSchema::required("vpc_id", PatternAttributeType::string())
             .create_only()
             .build()
     } else {
-        AttributeSchema::required("vpc_id", AttributeType::string()).build()
+        PatternAttributeSchema::required("vpc_id", PatternAttributeType::string()).build()
     };
-    let schema = ResourceSchema::new("ec2.Subnet")
+    let schema = PatternResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::optional("name", AttributeType::string())
+            PatternAttributeSchema::optional("name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(vpc_id)
-        .attribute(AttributeSchema::required("cidr_block", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tags", AttributeType::string()).build())
         .attribute(
-            AttributeSchema::optional("availability_zone", AttributeType::string())
+            PatternAttributeSchema::required("cidr_block", PatternAttributeType::string()).build(),
+        )
+        .attribute(PatternAttributeSchema::optional("tags", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional("availability_zone", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
@@ -208,6 +216,55 @@ fn standard_states() -> HashMap<ResourceId, State> {
             ),
         ),
     ])
+}
+
+fn nested_subnet_resources() -> (Resource, Resource, State, ResourceSchema) {
+    let id = ResourceId::with_identity("ec2.NestedSubnet", "my-subnet");
+    let network = |vpc_id: Value| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("vpc_id".to_string(), vpc_id),
+            ("cidr_block".to_string(), string("10.1.1.0/24")),
+        ])))
+    };
+    let managed = Resource::new("ec2.NestedSubnet", "my-subnet")
+        .with_absolute_binding(absolute_binding("subnet"))
+        .with_attribute("name", string("subnet-main"))
+        .with_attribute("network", network(string("vpc-old")));
+    let unresolved = Resource::new("ec2.NestedSubnet", "my-subnet")
+        .with_absolute_binding(absolute_binding("subnet"))
+        .with_attribute("name", string("subnet-main"))
+        .with_attribute("network", network(ref_value("vpc", "vpc_id")));
+    let current = state(
+        &id,
+        &[
+            ("name", string("subnet-main")),
+            ("network", network(string("vpc-old"))),
+        ],
+        "subnet-123",
+    );
+    let schema = ResourceSchema::new("ec2.NestedSubnet")
+        .attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required(
+                "network",
+                AttributeType::struct_(
+                    "Network",
+                    vec![
+                        StructField::required("vpc_id", AttributeType::string())
+                            .create_only()
+                            .build(),
+                        StructField::required("cidr_block", AttributeType::string()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .with_unique_name_attribute("name");
+    (managed, unresolved, current, schema)
 }
 
 fn replacement_indices(plan: &Plan, id: &ResourceId) -> (usize, usize) {
@@ -345,6 +402,42 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
             .cascade_ref_hints
             .contains(&("vpc_id".to_string(), "vpc.vpc_id".to_string()))
     );
+}
+
+#[test]
+fn cascade_generates_replace_when_nested_create_only_field_references_replaced_resource() {
+    let mut schemas = base_schemas(false);
+    let (managed_subnet, unresolved_subnet, subnet_state, subnet_schema) =
+        nested_subnet_resources();
+    schemas.insert(
+        "",
+        subnet_schema
+            .validate()
+            .expect("nested subnet schema fixture must be valid"),
+    );
+    let (managed_vpc, unresolved_vpc) = vpc_resources(true);
+    let vpc_id = managed_vpc.id.clone();
+    let subnet_id = managed_subnet.id.clone();
+    let mut states = standard_states();
+    states.remove(&ResourceId::with_identity("ec2.Subnet", "my-subnet"));
+    states.insert(subnet_id.clone(), subnet_state);
+
+    let plan = plan_for(
+        vec![managed_vpc, managed_subnet],
+        vec![unresolved_vpc, unresolved_subnet],
+        states,
+        &schemas,
+    );
+
+    assert!(update_for(&plan, &subnet_id).is_none());
+    let metadata = replacement_metadata(&plan, &subnet_id);
+    assert!(metadata.changed_create_only.contains("network"));
+    assert!(
+        metadata
+            .cascade_ref_hints
+            .contains(&("network".to_string(), "vpc.vpc_id".to_string()))
+    );
+    assert!(delete_blocked_by(&plan, &vpc_id).contains(&resolved_id(&subnet_id)));
 }
 
 #[test]
@@ -535,14 +628,14 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
     let mut schemas = base_schemas(false);
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             ))
@@ -586,19 +679,23 @@ fn chained_cbd_middle_binding_distinct_from_identity_auto_promoted() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test.Producer")
+        (PatternResourceSchema::new("test.Producer")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("shape", AttributeType::string())
+                PatternAttributeSchema::optional("shape", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated("producer_id", AttributeType::string()).build(),
+                PatternAttributeSchema::provider_populated(
+                    "producer_id",
+                    PatternAttributeType::string(),
+                )
+                .build(),
             )
             .with_unique_name_attribute("name"))
         .validate()
@@ -606,31 +703,36 @@ fn chained_cbd_middle_binding_distinct_from_identity_auto_promoted() {
     );
     schemas.insert(
         "",
-        (ResourceSchema::new("test.Middle")
+        (PatternResourceSchema::new("test.Middle")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("a_id", AttributeType::string())
+                PatternAttributeSchema::optional("a_id", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
-            .attribute(AttributeSchema::provider_populated("b_id", AttributeType::string()).build())
+            .attribute(
+                PatternAttributeSchema::provider_populated("b_id", PatternAttributeType::string())
+                    .build(),
+            )
             .with_unique_name_attribute("name"))
         .validate()
         .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "",
-        (ResourceSchema::new("test.Consumer")
+        (PatternResourceSchema::new("test.Consumer")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
-            .attribute(AttributeSchema::optional("b_id", AttributeType::string()).build())
+            .attribute(
+                PatternAttributeSchema::optional("b_id", PatternAttributeType::string()).build(),
+            )
             .with_unique_name_attribute("name"))
         .validate()
         .expect("schema fixture must be valid"),
@@ -1337,14 +1439,14 @@ fn impossible_cbd_promotion_names_deferred_and_managed_dependents() {
     let mut schemas = base_schemas(false);
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
+        PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )

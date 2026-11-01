@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::resource::Value;
-use crate::schema::{AttributeType, SchemaRegistry, TypeIdentity};
+use crate::schema::{CompiledAttributeType as AttributeType, SchemaRegistry, TypeIdentity};
 
 /// Schema provenance for an identified refined type.
 ///

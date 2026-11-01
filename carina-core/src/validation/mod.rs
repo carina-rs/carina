@@ -24,8 +24,8 @@ use crate::resource::{
     RelativeBindingName, Resource as GenericResource, Value as GenericValue,
 };
 use crate::schema::{
-    AttributeType, BindingKind, BindingShadowsEnumMemberError, FieldAncestry, SchemaRegistry,
-    Shape, TypeError, TypeIdentity,
+    BindingKind, BindingShadowsEnumMemberError, CompiledAttributeType as AttributeType,
+    FieldAncestry, SchemaRegistry, Shape, TypeError, TypeIdentity,
 };
 use crate::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, ConsumerResolvedType,
@@ -51,7 +51,7 @@ use crate::static_type::{
 /// single declared-type assignability relation; it is never compatible with a
 /// value type.
 pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
-    use crate::schema::StructField;
+    use crate::schema::CompiledStructField as StructField;
 
     match type_expr {
         TypeExpr::String => Some(AttributeType::string()),
@@ -615,7 +615,7 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
     declared_type: Option<&TypeExpr>,
     config: &ProviderContext,
     target: &ExpectedEnumTarget<'_>,
-    resolver: &EnumValueResolver<'_>,
+    resolver: &EnumValueResolver<'_, crate::schema::Compiled>,
     identity: &TypeIdentity,
 ) -> Result<(), BindingResolutionError> {
     if let Some(declared_type) = declared_type {
@@ -764,7 +764,7 @@ fn declared_value_assignable_to_sink(
 
 fn reference_value_mismatch<B: BindingAddress>(
     reference: ReferencePathRef<'_, B>,
-    target: crate::schema::TypeInSchema<'_>,
+    target: crate::schema::TypeInSchema<'_, crate::schema::Compiled>,
     bindings: &BindingIndex<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Option<BindingResolutionError> {
@@ -796,7 +796,7 @@ fn reference_value_mismatch<B: BindingAddress>(
 
 fn deferred_value_mismatch<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
-    target: crate::schema::TypeInSchema<'_>,
+    target: crate::schema::TypeInSchema<'_, crate::schema::Compiled>,
     inference_bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     bindings: &BindingIndex<'_, B>,
@@ -1805,7 +1805,7 @@ impl std::fmt::Display for IntegerArithmeticTypeFinding {
 /// and known result mismatches are errors.
 pub fn check_deferred_access_type<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
-    expected: crate::schema::TypeInSchema<'_>,
+    expected: crate::schema::TypeInSchema<'_, crate::schema::Compiled>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
@@ -4938,9 +4938,12 @@ pub fn is_string_compatible_type(
 }
 
 fn all_resolved_union_members_on_path<'a>(
-    members: &crate::schema::UnionMembers<'a>,
+    members: &crate::schema::UnionMembers<'a, crate::schema::Compiled>,
     visited_refs: &mut Vec<&'a str>,
-    mut predicate: impl FnMut(crate::schema::ResolvedUnionMember<'a>, &[&'a str]) -> bool,
+    mut predicate: impl FnMut(
+        crate::schema::ResolvedUnionMember<'a, crate::schema::Compiled>,
+        &[&'a str],
+    ) -> bool,
 ) -> bool {
     let mut saw_member = false;
     let found_incompatible = members.any_on_path(visited_refs, |member, member_path| {

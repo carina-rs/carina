@@ -11,7 +11,7 @@ use pest::Span;
 use pest::iterators::Pair;
 
 use crate::parser::{PreprocessedFile, Rule, extract_key_string, preprocess_file};
-use crate::schema::ResourceSchema;
+use crate::schema::CompiledResourceSchema as ResourceSchema;
 
 /// Find list literal syntax (`attr = [...]`) for the given attribute names.
 /// Returns attribute name and 1-indexed line number for each occurrence.
@@ -682,7 +682,9 @@ fn fixed_keyword<'i>(pair: Pair<'i, Rule>) -> Option<(String, Span<'i>)> {
 mod tests {
     use super::*;
     use crate::parser::{ModuleCall, ParsedFile, UseStatement};
-    use crate::schema::{AttributeType, StructField};
+    use crate::schema::{
+        CompiledAttributeType as AttributeType, CompiledStructField as StructField,
+    };
 
     const NOT_COMPARED: &[(Rule, &str)] = &[
         (
@@ -1430,7 +1432,7 @@ let ready = wait source {
     fn test_list_struct_attr_names() {
         let schema = ResourceSchema::new("ec2.SecurityGroup")
             .attribute(
-                crate::schema::AttributeSchema::optional(
+                crate::schema::CompiledAttributeSchema::optional(
                     "security_group_ingress",
                     AttributeType::list(AttributeType::struct_(
                         "Ingress".to_string(),
@@ -1440,14 +1442,14 @@ let ready = wait source {
                 .build(),
             )
             .attribute(
-                crate::schema::AttributeSchema::optional(
+                crate::schema::CompiledAttributeSchema::optional(
                     "tags",
                     AttributeType::list(AttributeType::string()),
                 )
                 .build(),
             )
             .attribute(
-                crate::schema::AttributeSchema::optional(
+                crate::schema::CompiledAttributeSchema::optional(
                     "group_description",
                     AttributeType::string(),
                 )

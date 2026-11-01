@@ -9,7 +9,9 @@ use tower_lsp::lsp_types::{
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::resource::EnumValueResolver;
-use carina_core::schema::{AttributeType, EffectiveType, Shape, TypeIdentity, TypeInSchema};
+use carina_core::schema::{
+    CompiledAttributeType as AttributeType, EffectiveType, Shape, TypeIdentity, TypeInSchema,
+};
 use carina_core::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, InferenceError, NotInferableReason,
     StaticType, UnnameableInConsumer,
@@ -1836,7 +1838,7 @@ impl CompletionProvider {
     /// (see #2043 follow-up).
     fn resource_ref_completions_for_type(
         &self,
-        target: TypeInSchema<'_>,
+        target: TypeInSchema<'_, carina_core::schema::Compiled>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {

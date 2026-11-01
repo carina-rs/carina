@@ -618,8 +618,12 @@ fn same_json_wire_value(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
+    };
+
     use carina_core::resource::{ConcreteValue, DeferredValue};
-    use carina_core::schema::{AttributeType, TypeIdentity};
+    use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
     use indexmap::IndexMap;
 
     use super::*;
@@ -638,8 +642,9 @@ mod tests {
         resource
     }
 
-    fn mode_enum_type() -> AttributeType {
-        AttributeType::enum_(
+    fn mode_enum_type<R: carina_core::schema::PatternForm>()
+    -> carina_core::schema::PatternAttributeType<R> {
+        PatternAttributeType::enum_(
             TypeIdentity::new(Some("mock"), ["test", "resource"], "Mode"),
             Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
             Vec::new(),
@@ -876,11 +881,11 @@ mod tests {
         let mut registry = carina_core::schema::SchemaRegistry::new();
         registry.insert(
             "mock",
-            carina_core::schema::ResourceSchema::new("test.resource")
+            PatternResourceSchema::new("test.resource")
                 .attribute(
-                    carina_core::schema::AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "settings",
-                        AttributeType::map(mode_enum_type()),
+                        PatternAttributeType::map(mode_enum_type()),
                     )
                     .build(),
                 )

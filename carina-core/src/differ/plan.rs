@@ -16,21 +16,23 @@ use crate::plan::{
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
 use crate::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Current, Directives, PlanInputCurrent,
-    PlanInputDesiredResources, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, State, Value, plan_input_desired_resources,
+    AbsoluteBindingAddress, CanonicalComparisonAttributes, ConcreteValue, Current, Directives,
+    PlanInputCurrent, PlanInputDesired, PlanInputDesiredResources, ResolvedDataSource,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+    plan_input_desired_resources,
 };
 use crate::schema::{
-    ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
-    WAIT_DEFAULT_TIMEOUT,
+    AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
 use crate::wait::ResolvedWaitBinding;
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
 
 use super::{
-    ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates, PlannedListKeyRelease,
-    PresentDiff, diff_present_with_releases,
+    ComparisonContext, ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates,
+    PlannedListKeyRelease, PresentDiff, comparison::AuthoredRemovalEvidence,
+    diff_present_with_releases, type_aware_equal,
 };
 
 #[cfg(test)]
@@ -217,12 +219,386 @@ struct RefAttr {
     hint: String,
 }
 
-/// Check which changed attributes are create-only according to the schema
-fn find_changed_create_only(changed_attributes: &[String], schema: &ResourceSchema) -> Vec<String> {
-    let create_only_attrs = schema.create_only_attributes();
+fn contains_authored_create_only_value(
+    attr_type: &AttributeType,
+    value: &Value,
+    schema: &ResourceSchema,
+) -> bool {
+    contains_authored_create_only_value_on_path(attr_type, value, schema, &mut Vec::new())
+}
+
+fn contains_authored_create_only_value_on_path<'schema>(
+    attr_type: &'schema AttributeType,
+    value: &Value,
+    schema: &'schema ResourceSchema,
+    ref_chain: &mut Vec<&'schema str>,
+) -> bool {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return false;
+            }
+            let Some(definition) = schema.defs.get(name) else {
+                return false;
+            };
+            ref_chain.push(name);
+            let contains =
+                contains_authored_create_only_value_on_path(definition, value, schema, ref_chain);
+            ref_chain.pop();
+            contains
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return false;
+            };
+            items.iter().any(|item| {
+                contains_authored_create_only_value_on_path(element_type, item, schema, ref_chain)
+            })
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return false;
+            };
+            entries.values().any(|entry| {
+                contains_authored_create_only_value_on_path(value_type, entry, schema, ref_chain)
+            })
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return false;
+            };
+            fields.iter().any(|field| {
+                entries.get(&field.name).is_some_and(|field_value| {
+                    field.create_only
+                        || contains_authored_create_only_value_on_path(
+                            &field.field_type,
+                            field_value,
+                            schema,
+                            ref_chain,
+                        )
+                })
+            })
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => false,
+    }
+}
+
+struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
+    desired_items: &'items [&'items Value],
+    current_items: &'items [Value],
+    element_type: &'schema AttributeType,
+    schema: &'schema ResourceSchema,
+    context: &'context ComparisonContext<'comparison>,
+    removal_evidence: AuthoredRemovalEvidence,
+    current_matches: &'items mut [Option<usize>],
+}
+
+impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
+    fn matches(&mut self, desired_index: usize, seen_current: &mut [bool]) -> bool {
+        for current_index in 0..self.current_items.len() {
+            if seen_current[current_index]
+                || !create_only_values_compatible(
+                    self.element_type,
+                    &self.current_items[current_index],
+                    self.desired_items[desired_index],
+                    self.schema,
+                    self.context,
+                    self.removal_evidence,
+                )
+            {
+                continue;
+            }
+            seen_current[current_index] = true;
+            if self.current_matches[current_index]
+                .is_none_or(|previous_desired| self.matches(previous_desired, seen_current))
+            {
+                self.current_matches[current_index] = Some(desired_index);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn create_only_values_compatible(
+    attr_type: &AttributeType,
+    current: &Value,
+    desired: &Value,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
+) -> bool {
+    create_only_values_compatible_on_path(
+        attr_type,
+        current,
+        desired,
+        schema,
+        context,
+        removal_evidence,
+        &mut Vec::new(),
+    )
+}
+
+fn authored_create_only_value_is_compatible(
+    attr_type: &AttributeType,
+    current: Option<&Value>,
+    desired: &Value,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
+) -> bool {
+    !contains_authored_create_only_value(attr_type, desired, schema)
+        || current.is_some_and(|current| {
+            create_only_values_compatible(
+                attr_type,
+                current,
+                desired,
+                schema,
+                context,
+                removal_evidence,
+            )
+        })
+}
+
+fn create_only_values_compatible_on_path<'schema>(
+    attr_type: &'schema AttributeType,
+    current: &Value,
+    desired: &Value,
+    schema: &'schema ResourceSchema,
+    context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
+    ref_chain: &mut Vec<&'schema str>,
+) -> bool {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return true;
+            }
+            let Some(definition) = schema.defs.get(name) else {
+                return true;
+            };
+            ref_chain.push(name);
+            let compatible = create_only_values_compatible_on_path(
+                definition,
+                current,
+                desired,
+                schema,
+                context,
+                removal_evidence,
+                ref_chain,
+            );
+            ref_chain.pop();
+            compatible
+        }
+        AttrTypeKind::List {
+            element_type,
+            ordered,
+            ..
+        } => {
+            let Value::Concrete(ConcreteValue::List(desired_items)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::List(current_items)) = current else {
+                return !desired_items
+                    .iter()
+                    .any(|item| contains_authored_create_only_value(element_type, item, schema));
+            };
+            if *ordered {
+                desired_items.iter().enumerate().all(|(index, desired)| {
+                    authored_create_only_value_is_compatible(
+                        element_type,
+                        current_items.get(index),
+                        desired,
+                        schema,
+                        context,
+                        removal_evidence,
+                    )
+                })
+            } else {
+                let desired_items = desired_items
+                    .iter()
+                    .filter(|item| contains_authored_create_only_value(element_type, item, schema))
+                    .collect::<Vec<_>>();
+                let mut current_matches = vec![None; current_items.len()];
+                let mut matcher = UnorderedCreateOnlyMatcher {
+                    desired_items: &desired_items,
+                    current_items,
+                    element_type,
+                    schema,
+                    context,
+                    removal_evidence,
+                    current_matches: &mut current_matches,
+                };
+                (0..desired_items.len()).all(|desired_index| {
+                    matcher.matches(desired_index, &mut vec![false; current_items.len()])
+                })
+            }
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(desired_entries)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::Map(current_entries)) = current else {
+                return !desired_entries
+                    .values()
+                    .any(|entry| contains_authored_create_only_value(value_type, entry, schema));
+            };
+            desired_entries.iter().all(|(key, desired)| {
+                authored_create_only_value_is_compatible(
+                    value_type,
+                    current_entries.get(key),
+                    desired,
+                    schema,
+                    context,
+                    removal_evidence,
+                )
+            })
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(desired_fields)) = desired else {
+                return true;
+            };
+            let Value::Concrete(ConcreteValue::Map(current_fields)) = current else {
+                return !contains_authored_create_only_value(attr_type, desired, schema);
+            };
+            fields.iter().all(|field| {
+                let Some(desired) = desired_fields.get(&field.name) else {
+                    return match removal_evidence {
+                        AuthoredRemovalEvidence::Recorded => {
+                            current_fields.get(&field.name).is_none_or(|current| {
+                                !field.create_only
+                                    && !contains_authored_create_only_value(
+                                        &field.field_type,
+                                        current,
+                                        schema,
+                                    )
+                            })
+                        }
+                        AuthoredRemovalEvidence::Unrecorded => true,
+                    };
+                };
+                if field.create_only {
+                    return current_fields.get(&field.name).is_some_and(|current| {
+                        type_aware_equal(
+                            current,
+                            desired,
+                            Some(&field.field_type),
+                            &schema.defs,
+                            context,
+                        )
+                    });
+                }
+                authored_create_only_value_is_compatible(
+                    &field.field_type,
+                    current_fields.get(&field.name),
+                    desired,
+                    schema,
+                    context,
+                    removal_evidence,
+                )
+            })
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => true,
+    }
+}
+
+pub(super) fn find_changed_create_only(
+    changed_attributes: &[String],
+    current_attributes: &CanonicalComparisonAttributes,
+    removal_evidence: AuthoredRemovalEvidence,
+    desired: &PlanInputDesired<'_>,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+) -> Vec<String> {
+    find_changed_create_only_for_resource(
+        changed_attributes,
+        current_attributes,
+        removal_evidence,
+        desired.authored().as_resource(),
+        desired.comparison_attributes(),
+        schema,
+        context,
+    )
+}
+
+pub(super) fn find_changed_create_only_for_resource<D>(
+    changed_attributes: &[String],
+    current_attributes: &CanonicalComparisonAttributes,
+    removal_evidence: AuthoredRemovalEvidence,
+    desired: &Resource<
+        crate::resource::ModuleSource,
+        crate::resource::NoPlaceholder,
+        AbsoluteBindingAddress,
+        D,
+    >,
+    desired_attributes: &CanonicalComparisonAttributes,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+) -> Vec<String> {
+    let top_level = schema.create_only_attributes();
     changed_attributes
         .iter()
-        .filter(|attr| create_only_attrs.contains(&attr.as_str()))
+        .filter(|attribute| {
+            if top_level.contains(&attribute.as_str()) {
+                return true;
+            }
+
+            let Some(attribute_schema) = schema.attributes().get(attribute.as_str()) else {
+                return false;
+            };
+            let Some(desired_value) = desired_attributes.get(attribute.as_str()) else {
+                // An authored empty struct canonicalizes to absence, but it
+                // still removes any previously authored create-only leaves.
+                // Keep comparison absence from inventing additions of empty
+                // nested create-only structs during unrelated updates.
+                return removal_evidence == AuthoredRemovalEvidence::Recorded
+                    && desired.attributes.contains_key(attribute.as_str())
+                    && current_attributes
+                        .get(attribute.as_str())
+                        .is_some_and(|current| {
+                            contains_authored_create_only_value(
+                                attribute_schema.attr_type(),
+                                current,
+                                schema,
+                            )
+                        });
+            };
+            let Some(current) = current_attributes.get(attribute.as_str()) else {
+                return contains_authored_create_only_value(
+                    attribute_schema.attr_type(),
+                    desired_value,
+                    schema,
+                );
+            };
+            !create_only_values_compatible(
+                attribute_schema.attr_type(),
+                current,
+                desired_value,
+                schema,
+                context,
+                removal_evidence,
+            )
+        })
         .cloned()
         .collect()
 }
@@ -609,8 +985,9 @@ pub fn create_plan_with_cascades(
         &dependents,
         &managed_current,
         registry,
+        provider,
         outcome_unknown_import_replacements,
-    );
+    )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces, directives_map);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
     Ok(PendingCascadePlan {
@@ -851,8 +1228,22 @@ fn create_plan_parts(
                         }
 
                         let identifier = present.identifier().clone();
-                        let changed_create_only =
-                            find_changed_create_only(&changed_attributes, schema);
+                        let authored_views = super::comparison::project_authored_attribute_views(
+                            comparison_desired.comparison_attributes(),
+                            current_attributes,
+                            saved,
+                            prev_explicit_for_resource,
+                            Some(schema),
+                            context,
+                        );
+                        let changed_create_only = find_changed_create_only(
+                            &changed_attributes,
+                            authored_views.current(),
+                            authored_views.removal_evidence(),
+                            comparison_desired,
+                            schema,
+                            context,
+                        );
 
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
@@ -1376,13 +1767,14 @@ fn cascade_dependent_updates(
     dependents: &CascadeDependents<'_>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) {
+) -> ProviderResult<()> {
     loop {
         promote_referenced_replaces_to_cbd(plan, pending_replaces, dependents, registry);
 
         if pending_replaces.is_empty() {
-            return;
+            return Ok(());
         }
 
         let promoted = promote_pending_replaces_for_dependents(
@@ -1395,13 +1787,15 @@ fn cascade_dependent_updates(
             dependents.managed,
             current_states,
             registry,
+            comparison_provider,
             outcome_unknown_import_replacements,
-        );
+        )?;
 
         if !promoted {
             break;
         }
     }
+    Ok(())
 }
 
 fn promote_referenced_replaces_to_cbd(
@@ -1519,8 +1913,9 @@ fn promote_pending_replaces_for_dependents(
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> bool {
+) -> ProviderResult<bool> {
     let mut promoted = false;
 
     for resource in unresolved_managed {
@@ -1549,15 +1944,24 @@ fn promote_pending_replaces_for_dependents(
                 .iter()
                 .map(|ref_attr| ref_attr.attribute.clone())
                 .collect();
-            let Some(owner_schema) = registry.get(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                SchemaKind::Resource,
-            ) else {
+            let Some(current) = current_states.get(&resource.id) else {
                 continue;
             };
-            let create_only_refs =
-                find_changed_create_only(&ref_attr_names, owner_schema.schema().as_schema());
+            let Current::Present(_) = current.current() else {
+                continue;
+            };
+            let resolved_comparison = comparison_provider.comparison_for(registry, &resource.id)?;
+            let owner_schema = resolved_comparison.owner_schema();
+            let schema = owner_schema.schema().as_schema();
+            let desired = PlanInputDesired::with_resource_schema(resource, Some(schema));
+            let create_only_refs = find_changed_create_only(
+                &ref_attr_names,
+                current.comparison_attributes(),
+                AuthoredRemovalEvidence::Unrecorded,
+                &desired,
+                schema,
+                resolved_comparison.context(),
+            );
 
             if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
                 let ref_hints: Vec<(String, String)> = ref_attrs
@@ -1618,7 +2022,7 @@ fn promote_pending_replaces_for_dependents(
         }
     }
 
-    promoted
+    Ok(promoted)
 }
 
 fn merge_pending_create_only(

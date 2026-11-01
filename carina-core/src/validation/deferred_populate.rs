@@ -404,6 +404,10 @@ fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSeg
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
     use crate::parser::{
         DeferredForBody, DeferredForTarget, ForBinding, ParsedDeferredForExpression, ParsedFile,
@@ -414,22 +418,24 @@ mod tests {
         AuthoredDeferredValue as DeferredValue, AuthoredResource as Resource,
         AuthoredValue as Value, PathSegment, ResourceId, Subscript,
     };
-    use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-    };
+    use crate::schema::SchemaRegistry;
 
-    fn cert_schema_with_dvo_inner_field_deferred() -> ResourceSchema {
-        ResourceSchema::new("acm.Certificate").attribute(
-            AttributeSchema::provider_populated(
+    fn cert_schema_with_dvo_inner_field_deferred<R: crate::schema::PatternForm>()
+    -> crate::schema::PatternResourceSchema<R> {
+        PatternResourceSchema::new("acm.Certificate").attribute(
+            PatternAttributeSchema::provider_populated(
                 "domain_validation_options",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "DomainValidationOption".to_string(),
                     vec![
-                        StructField::provider_populated("domain_name", AttributeType::string())
-                            .build(),
-                        StructField::provider_populated(
+                        PatternStructField::provider_populated(
+                            "domain_name",
+                            PatternAttributeType::string(),
+                        )
+                        .build(),
+                        PatternStructField::provider_populated(
                             "resource_record_value",
-                            AttributeType::string(),
+                            PatternAttributeType::string(),
                         )
                         .deferred_populate()
                         .build(),
@@ -442,10 +448,10 @@ mod tests {
 
     #[test]
     fn deep_deferred_path_does_not_exhaust_a_shared_shape_budget() {
-        let mut attr_type = AttributeType::struct_(
+        let mut attr_type = PatternAttributeType::struct_(
             "Leaf",
             vec![
-                StructField::optional("deferred", AttributeType::string())
+                PatternStructField::optional("deferred", PatternAttributeType::string())
                     .deferred_populate()
                     .build(),
             ],
@@ -455,14 +461,14 @@ mod tests {
         }];
         for index in (0..80).rev() {
             let name = format!("field_{index}");
-            attr_type = AttributeType::struct_(
+            attr_type = PatternAttributeType::struct_(
                 format!("Level{index}"),
-                vec![StructField::required(name.clone(), attr_type).build()],
+                vec![PatternStructField::required(name.clone(), attr_type).build()],
             );
             segments.insert(0, PathSegment::Field { name });
         }
-        let schema = ResourceSchema::new("test.Deep")
-            .attribute(AttributeSchema::provider_populated("output", attr_type).build())
+        let schema = PatternResourceSchema::new("test.Deep")
+            .attribute(PatternAttributeSchema::provider_populated("output", attr_type).build())
             .validate()
             .expect("deep schema must be valid");
         let output = schema
@@ -472,16 +478,18 @@ mod tests {
         assert!(path_traverses_deferred(output, &segments));
     }
 
-    fn rrset_schema() -> ResourceSchema {
-        ResourceSchema::new("route53.RecordSet")
+    fn rrset_schema<R: crate::schema::PatternForm>() -> crate::schema::PatternResourceSchema<R> {
+        PatternResourceSchema::new("route53.RecordSet")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "resource_records",
-                    AttributeType::list(AttributeType::string()),
+                    PatternAttributeType::list(PatternAttributeType::string()),
                 )
                 .build(),
             )
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
     }
 
     fn dvo_chained_ref(field: &str) -> Value {
@@ -674,21 +682,26 @@ mod tests {
     fn top_level_attribute_marked_deferred_flags_any_segment_chain() {
         // Mirror RDS DBInstance.endpoint shape: the whole attribute
         // is undefined immediately post-Create.
-        let schema = ResourceSchema::new("rds.DBInstance").attribute(
-            AttributeSchema::provider_populated(
+        let schema = PatternResourceSchema::new("rds.DBInstance").attribute(
+            PatternAttributeSchema::provider_populated(
                 "endpoint",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Endpoint".to_string(),
                     vec![
-                        StructField::provider_populated("address", AttributeType::string()).build(),
+                        PatternStructField::provider_populated(
+                            "address",
+                            PatternAttributeType::string(),
+                        )
+                        .build(),
                     ],
                 ),
             )
             .deferred_populate()
             .build(),
         );
-        let consumer = ResourceSchema::new("ec2.Instance")
-            .attribute(AttributeSchema::optional("user_data", AttributeType::string()).build());
+        let consumer = PatternResourceSchema::new("ec2.Instance").attribute(
+            PatternAttributeSchema::optional("user_data", PatternAttributeType::string()).build(),
+        );
         let mut r = SchemaRegistry::new();
         r.insert(
             "aws",

@@ -1,4 +1,7 @@
 use super::{create_plan_for_tests as create_plan, *};
+use crate::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 
 use crate::resource::PersistedDirectives;
 use indexmap::IndexMap;
@@ -49,14 +52,17 @@ fn resolved_id(id: &ResourceId) -> ResolvedResourceId {
 }
 
 fn string_wait_schemas(provider: &str) -> SchemaRegistry {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         provider,
-        (ResourceSchema::new("acm.Certificate")
-            .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build()))
+        (PatternResourceSchema::new("acm.Certificate")
+            .attribute(
+                PatternAttributeSchema::optional("status", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("domain_name", PatternAttributeType::string())
+                    .build(),
+            ))
         .validate()
         .expect("wait fixture schema must be valid"),
     );
@@ -86,16 +92,15 @@ fn ignore_path(parts: &[&str]) -> crate::resource::ParsedIgnorePath {
 
 #[test]
 fn plan_records_readable_ignored_drift_without_an_update() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut desired = Resource::with_provider("mock", "Widget", "example", None).with_attribute(
         "comment",
         Value::Concrete(ConcreteValue::String("recorded".into())),
     );
     desired.directives.ignore_changes = vec![ignore_path(&["comment"])];
     let id = desired.id.clone();
-    let schema = ResourceSchema::new("Widget")
-        .attribute(AttributeSchema::optional("comment", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("Widget").attribute(
+        PatternAttributeSchema::optional("comment", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert("mock", schema.validate().expect("valid schema"));
     let current = crate::resource::into_plan_input_current_map(
@@ -134,8 +139,6 @@ fn plan_records_readable_ignored_drift_without_an_update() {
 
 #[test]
 fn plan_reports_typed_error_when_changed_parent_contains_ignored_write_only_leaf() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let config = |secret: Option<&str>, memory: i64| {
         let mut values = IndexMap::new();
         if let Some(secret) = secret {
@@ -154,16 +157,16 @@ fn plan_reports_typed_error_when_changed_parent_contains_ignored_write_only_leaf
         .with_attribute("config", config(Some("recorded"), 256));
     desired.directives.ignore_changes = vec![ignore_path(&["config", "secret"])];
     let id = desired.id.clone();
-    let schema = ResourceSchema::new("Widget").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("Widget").attribute(
+        PatternAttributeSchema::optional(
             "config",
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Config",
                 vec![
-                    StructField::optional("secret", AttributeType::string())
+                    PatternStructField::optional("secret", PatternAttributeType::string())
                         .write_only()
                         .build(),
-                    StructField::optional("memory", AttributeType::int()).build(),
+                    PatternStructField::optional("memory", PatternAttributeType::int()).build(),
                 ],
             ),
         )
@@ -631,16 +634,16 @@ fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
 fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
     use crate::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
     use crate::schema::{
-        AttributeSchema, ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity,
-        ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+        ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
+        ValidatedProviderSchemaWitness,
     };
 
     let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
-    let schema = ResourceSchema::new("lambda.Permission")
+    let schema = PatternResourceSchema::new("lambda.Permission")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "function_name",
-                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
             )
             .create_only()
             .build(),
@@ -712,6 +715,270 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
     .expect("plan comparison succeeds");
 
     assert!(plan.effects().is_empty(), "unexpected plan: {plan:?}");
+}
+
+fn nested_create_only_schema() -> crate::schema::ResourceSchema {
+    use crate::schema::ResourceSchema;
+
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    ResourceSchema::new("example.Widget").attribute(
+        AttributeSchema::required(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("immutable", AttributeType::string())
+                        .create_only()
+                        .build(),
+                    StructField::required("mutable", AttributeType::string()).build(),
+                ],
+            ),
+        )
+        .build(),
+    )
+}
+
+fn nested_config(mutable: &str, immutable: Option<&str>) -> Value {
+    let mut fields = IndexMap::from([(
+        "mutable".to_string(),
+        Value::Concrete(ConcreteValue::String(mutable.into())),
+    )]);
+    if let Some(immutable) = immutable {
+        fields.insert(
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::String(immutable.into())),
+        );
+    }
+    Value::Concrete(ConcreteValue::Map(fields))
+}
+
+fn nested_create_only_plan(
+    desired_mutable: &str,
+    current_mutable: &str,
+    authored_immutable: bool,
+) -> Plan {
+    let desired = Resource::new("example.Widget", "widget")
+        .with_attribute("config", nested_config(desired_mutable, None));
+    let id = desired.id.clone();
+    let schema = nested_create_only_schema();
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        schema
+            .validate()
+            .expect("nested create-only fixture schema must be valid"),
+    );
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                nested_config(current_mutable, Some("provider-or-authored")),
+            )]),
+        ),
+    )]);
+    let mut config_children = HashMap::from([("mutable".to_string(), ExplicitFields::Leaf)]);
+    if authored_immutable {
+        config_children.insert("immutable".to_string(), ExplicitFields::Leaf);
+    }
+    let prev_explicit = HashMap::from([(
+        id,
+        ExplicitFields::Struct {
+            children: HashMap::from([(
+                "config".to_string(),
+                ExplicitFields::Struct {
+                    children: config_children,
+                },
+            )]),
+        },
+    )]);
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &registry,
+        std::slice::from_ref(&desired),
+    );
+
+    create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &registry,
+        &empty_lifted_saved_attrs(),
+        &prev_explicit,
+        &Orphans::new(),
+        &[],
+    )
+}
+
+#[test]
+fn removing_authored_nested_create_only_field_plans_replacement() {
+    let plan = nested_create_only_plan("same", "same", true);
+
+    assert!(!plan.has_errors(), "unexpected errors: {:?}", plan.errors());
+    assert_eq!(plan.summary().replace, 1, "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().update, 0, "unexpected plan: {plan:?}");
+}
+
+#[test]
+fn provider_filled_nested_create_only_field_does_not_replace() {
+    let plan = nested_create_only_plan("new", "old", false);
+
+    assert!(!plan.has_errors(), "unexpected errors: {:?}", plan.errors());
+    assert_eq!(plan.summary().replace, 0, "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().update, 1, "unexpected plan: {plan:?}");
+}
+
+fn plan_nested_create_only_with_authoring(
+    schema: crate::schema::ResourceSchema,
+    desired_config: Value,
+    current_config: Value,
+    authoring: ExplicitFields,
+) -> Plan {
+    let desired =
+        Resource::new("example.Widget", "widget").with_attribute("config", desired_config);
+    let id = desired.id.clone();
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        schema.validate().expect("valid nested create-only schema"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(
+            id.clone(),
+            existing_state(
+                id.clone(),
+                HashMap::from([("config".to_string(), current_config)]),
+            ),
+        )]),
+        &registry,
+        std::slice::from_ref(&desired),
+    );
+    create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &registry,
+        &empty_lifted_saved_attrs(),
+        &HashMap::from([(id, authoring)]),
+        &Orphans::new(),
+        &[],
+    )
+}
+
+#[test]
+fn authored_empty_struct_removes_nested_create_only_only_with_authoring_evidence() {
+    use crate::schema::ResourceSchema;
+
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    for recorded in [true, false] {
+        let schema = ResourceSchema::new("example.Widget").attribute(
+            AttributeSchema::required(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("immutable", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let current_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::String("authored-or-provider".into())),
+        )])));
+        let authoring = if recorded {
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "config".to_string(),
+                    ExplicitFields::Struct {
+                        children: HashMap::from([("immutable".to_string(), ExplicitFields::Leaf)]),
+                    },
+                )]),
+            }
+        } else {
+            ExplicitFields::Unrecorded
+        };
+        let plan = plan_nested_create_only_with_authoring(
+            schema,
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            current_config,
+            authoring,
+        );
+
+        assert!(!plan.has_errors(), "unexpected plan: {plan:?}");
+        assert_eq!(plan.summary().replace, usize::from(recorded), "{plan:?}");
+        assert_eq!(plan.summary().update, 0, "{plan:?}");
+        if !recorded {
+            assert!(
+                plan.effects().is_empty(),
+                "no authored removal is recorded: {plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_empty_nested_create_only_struct_does_not_replace_mutable_update() {
+    use crate::schema::ResourceSchema;
+
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let schema = ResourceSchema::new("example.Widget").attribute(
+        AttributeSchema::required(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional(
+                        "immutable",
+                        AttributeType::struct_(
+                            "Immutable",
+                            vec![StructField::optional("key", AttributeType::string()).build()],
+                        ),
+                    )
+                    .create_only()
+                    .build(),
+                    StructField::required("mutable", AttributeType::string()).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
+    let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "mutable".to_string(),
+            Value::Concrete(ConcreteValue::String("new".into())),
+        ),
+        (
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        ),
+    ])));
+    let current_config = nested_config("old", None);
+    let authoring = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "config".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([("mutable".to_string(), ExplicitFields::Leaf)]),
+            },
+        )]),
+    };
+    let plan =
+        plan_nested_create_only_with_authoring(schema, desired_config, current_config, authoring);
+
+    assert!(!plan.has_errors(), "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().replace, 0, "{plan:?}");
+    assert_eq!(plan.summary().update, 1, "{plan:?}");
 }
 
 struct HintProvider {
@@ -812,8 +1079,6 @@ fn replacement_metadata<'a>(
 
 #[test]
 fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute(
             "bucket_name",
@@ -845,16 +1110,19 @@ fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
+        (PatternResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::optional("bucket_name", AttributeType::string())
+                PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("object_lock_enabled", AttributeType::bool())
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "object_lock_enabled",
+                    PatternAttributeType::bool(),
+                )
+                .create_only()
+                .build(),
             )
             .with_unique_name_attribute("bucket_name"))
         .validate()
@@ -908,8 +1176,6 @@ fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
 
 #[test]
 fn create_before_destroy_generates_temporary_name_with_can_rename() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut resource = Resource::new("logs.LogGroup", "my-log-group")
         .with_attribute(
             "log_group_name".to_string(),
@@ -944,13 +1210,14 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("logs.LogGroup")
+        (PatternResourceSchema::new("logs.LogGroup")
             .attribute(
                 // log_group_name is NOT create-only in this test (can be renamed)
-                AttributeSchema::optional("log_group_name", AttributeType::string()).build(),
+                PatternAttributeSchema::optional("log_group_name", PatternAttributeType::string())
+                    .build(),
             )
             .attribute(
-                AttributeSchema::optional("kms_key_id", AttributeType::string())
+                PatternAttributeSchema::optional("kms_key_id", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -992,8 +1259,6 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
 
 #[test]
 fn no_temporary_name_without_create_before_destroy() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     // Default directives (create_before_destroy = false)
     let resources = vec![
         Resource::new("s3.Bucket", "my-bucket")
@@ -1025,16 +1290,19 @@ fn no_temporary_name_without_create_before_destroy() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
+        (PatternResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::optional("bucket_name", AttributeType::string())
+                PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("object_lock_enabled", AttributeType::bool())
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "object_lock_enabled",
+                    PatternAttributeType::bool(),
+                )
+                .create_only()
+                .build(),
             )
             .with_unique_name_attribute("bucket_name"))
         .validate()
@@ -1069,8 +1337,6 @@ fn no_temporary_name_without_create_before_destroy() {
 
 #[test]
 fn no_temporary_name_when_name_prefix_is_used() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute(
             "bucket_name",
@@ -1106,16 +1372,19 @@ fn no_temporary_name_when_name_prefix_is_used() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
+        (PatternResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::optional("bucket_name", AttributeType::string())
+                PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("object_lock_enabled", AttributeType::bool())
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "object_lock_enabled",
+                    PatternAttributeType::bool(),
+                )
+                .create_only()
+                .build(),
             )
             .with_unique_name_attribute("bucket_name"))
         .validate()
@@ -1150,8 +1419,6 @@ fn no_temporary_name_when_name_prefix_is_used() {
 
 #[test]
 fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -1174,9 +1441,9 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -1226,8 +1493,6 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
 
 #[test]
 fn create_before_destroy_with_coexisting_replacement_uses_no_temporary_name() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -1250,9 +1515,9 @@ fn create_before_destroy_with_coexisting_replacement_uses_no_temporary_name() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -1327,8 +1592,6 @@ fn create_before_destroy_with_missing_schema_reports_schema_not_registered() {
 
 #[test]
 fn no_temporary_name_when_unique_name_attribute_changes() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     // unique_name_attribute itself changed: old-bucket → new-bucket
     // No temporary name needed since names are already different
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
@@ -1362,16 +1625,19 @@ fn no_temporary_name_when_unique_name_attribute_changes() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
+        (PatternResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::optional("bucket_name", AttributeType::string())
+                PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("object_lock_enabled", AttributeType::bool())
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "object_lock_enabled",
+                    PatternAttributeType::bool(),
+                )
+                .create_only()
+                .build(),
             )
             .with_unique_name_attribute("bucket_name"))
         .validate()
@@ -1618,7 +1884,7 @@ fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
     };
 
     assert_eq!(changed_attributes, vec!["distribution_config".to_string()]);
-    let schema = crate::schema::ResourceSchema::new("awscc.cloudfront.Distribution");
+    let schema = crate::schema::CompiledResourceSchema::new("awscc.cloudfront.Distribution");
     let patch = crate::provider::build_update_patch(
         &changed_attributes,
         &provider_ready(to),
@@ -1922,7 +2188,7 @@ fn whole_value_list_authoring_compares_and_sends_the_full_desired_list() {
     };
     assert_eq!(changed_attributes, vec!["rules".to_string()]);
 
-    let schema = crate::schema::ResourceSchema::new("example.Listener");
+    let schema = crate::schema::CompiledResourceSchema::new("example.Listener");
     let patch = crate::provider::build_update_patch(
         &changed_attributes,
         &provider_ready(to),
@@ -2143,7 +2409,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     };
     assert_eq!(changed_attributes, &["distribution_config".to_string()]);
     let ready = provider_ready(to.as_resource().clone());
-    let schema = crate::schema::ResourceSchema::new("awscc.cloudfront.Distribution");
+    let schema = crate::schema::CompiledResourceSchema::new("awscc.cloudfront.Distribution");
     let patch = crate::provider::build_update_patch(changed_attributes, &ready, from, &schema)
         .expect("fixture update patch is valid");
     let crate::provider::PatchOp::Replace {
@@ -2520,8 +2786,6 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
 
 #[test]
 fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let producer_id = ResourceId::with_identity("example.Producer", "producer-id");
     let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
     let producer = Resource::new("example.Producer", "producer-id")
@@ -2556,8 +2820,8 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("example.Producer").attribute(
-            AttributeSchema::optional("replace_key", AttributeType::string())
+        (PatternResourceSchema::new("example.Producer").attribute(
+            PatternAttributeSchema::optional("replace_key", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -2566,8 +2830,8 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
     );
     schemas.insert(
         "",
-        (ResourceSchema::new("example.Consumer").attribute(
-            AttributeSchema::optional("producer_id", AttributeType::string())
+        (PatternResourceSchema::new("example.Consumer").attribute(
+            PatternAttributeSchema::optional("producer_id", PatternAttributeType::string())
                 .removable()
                 .build(),
         ))
@@ -2779,8 +3043,6 @@ fn explicit_top_level_removal_still_detected() {
 
 #[test]
 fn plan_ignores_removed_required_struct_read_back_as_empty_map() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let desired = Resource::new("test.Widget", "example");
     let id = desired.id.clone();
     let current_states = HashMap::from([(
@@ -2797,13 +3059,19 @@ fn plan_ignores_removed_required_struct_read_back_as_empty_map() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "archive_policy",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "ArchivePolicy",
-                        vec![StructField::required("retention_days", AttributeType::int()).build()],
+                        vec![
+                            PatternStructField::required(
+                                "retention_days",
+                                PatternAttributeType::int(),
+                            )
+                            .build(),
+                        ],
                     ),
                 )
                 .removable()
@@ -2849,8 +3117,6 @@ fn plan_ignores_removed_required_struct_read_back_as_empty_map() {
 
 #[test]
 fn plan_drops_unwritten_empty_all_optional_struct_from_state() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let desired = Resource::new("test.Widget", "example");
     let id = desired.id.clone();
     let current_states = HashMap::from([(
@@ -2866,13 +3132,16 @@ fn plan_drops_unwritten_empty_all_optional_struct_from_state() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "config",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Config",
-                        vec![StructField::optional("label", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("label", PatternAttributeType::string())
+                                .build(),
+                        ],
                     ),
                 )
                 .build(),
@@ -2914,7 +3183,6 @@ fn plan_drops_unwritten_empty_all_optional_struct_from_state() {
 #[test]
 fn plan_canonicalizes_empty_nested_structs_loaded_from_saved_state() {
     use crate::provider::RawSavedAttrs;
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
 
     let settings = |include_empty_config| {
         let mut fields = IndexMap::from([(
@@ -2935,21 +3203,25 @@ fn plan_canonicalizes_empty_nested_structs_loaded_from_saved_state() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Settings",
                         vec![
-                            StructField::optional("enabled", AttributeType::bool()).build(),
-                            StructField::optional(
+                            PatternStructField::optional("enabled", PatternAttributeType::bool())
+                                .build(),
+                            PatternStructField::optional(
                                 "config",
-                                AttributeType::struct_(
+                                PatternAttributeType::struct_(
                                     "Config",
                                     vec![
-                                        StructField::optional("label", AttributeType::string())
-                                            .build(),
+                                        PatternStructField::optional(
+                                            "label",
+                                            PatternAttributeType::string(),
+                                        )
+                                        .build(),
                                     ],
                                 ),
                             )
@@ -3000,8 +3272,6 @@ fn plan_canonicalizes_empty_nested_structs_loaded_from_saved_state() {
 
 #[test]
 fn plan_treats_authored_empty_all_optional_struct_and_empty_state_as_equal() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
     let desired = Resource::new("test.Widget", "example").with_attribute("config", empty());
     let id = desired.id.clone();
@@ -3012,13 +3282,16 @@ fn plan_treats_authored_empty_all_optional_struct_and_empty_state_as_equal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "config",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Config",
-                        vec![StructField::optional("label", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("label", PatternAttributeType::string())
+                                .build(),
+                        ],
                     ),
                 )
                 .build(),
@@ -3053,8 +3326,6 @@ fn plan_treats_authored_empty_all_optional_struct_and_empty_state_as_equal() {
 
 #[test]
 fn plan_converges_after_projection_empties_authored_top_level_struct() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
     let desired = Resource::new("test.Widget", "example").with_attribute("config", empty());
     let id = desired.id.clone();
@@ -3074,13 +3345,16 @@ fn plan_converges_after_projection_empties_authored_top_level_struct() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "config",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Config",
-                        vec![StructField::optional("label", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("label", PatternAttributeType::string())
+                                .build(),
+                        ],
                     ),
                 )
                 .build(),
@@ -3123,8 +3397,6 @@ fn plan_converges_after_projection_empties_authored_top_level_struct() {
 
 #[test]
 fn plan_converges_after_projection_empties_authored_nested_struct() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
     let settings = |config: Value| {
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -3146,22 +3418,22 @@ fn plan_converges_after_projection_empties_authored_nested_struct() {
             HashMap::from([("settings".to_string(), settings(server_config))]),
         ),
     )]);
-    let config_type = AttributeType::struct_(
+    let config_type = PatternAttributeType::struct_(
         "Config",
-        vec![StructField::optional("label", AttributeType::string()).build()],
+        vec![PatternStructField::optional("label", PatternAttributeType::string()).build()],
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Settings",
                         vec![
-                            StructField::optional("x", AttributeType::int()).build(),
-                            StructField::optional("config", config_type).build(),
+                            PatternStructField::optional("x", PatternAttributeType::int()).build(),
+                            PatternStructField::optional("config", config_type).build(),
                         ],
                     ),
                 )
@@ -3213,8 +3485,6 @@ fn plan_converges_after_projection_empties_authored_nested_struct() {
 
 #[test]
 fn plan_still_removes_projected_non_empty_authored_struct() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let desired = Resource::new("test.Widget", "example");
     let id = desired.id.clone();
     let current_states = HashMap::from([(
@@ -3233,13 +3503,16 @@ fn plan_still_removes_projected_non_empty_authored_struct() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "config",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Config",
-                        vec![StructField::optional("label", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("label", PatternAttributeType::string())
+                                .build(),
+                        ],
                     ),
                 )
                 .build(),
@@ -3287,8 +3560,6 @@ fn plan_still_removes_projected_non_empty_authored_struct() {
 
 #[test]
 fn plan_canonicalizes_nested_ignored_empty_structs_before_comparison() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
     let mut desired = Resource::new("test.Widget", "example").with_attribute(
         "settings",
@@ -3309,20 +3580,23 @@ fn plan_canonicalizes_nested_ignored_empty_structs_before_comparison() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Settings",
                         vec![
-                            StructField::optional(
+                            PatternStructField::optional(
                                 "cfg",
-                                AttributeType::struct_(
+                                PatternAttributeType::struct_(
                                     "Config",
                                     vec![
-                                        StructField::optional("label", AttributeType::string())
-                                            .build(),
+                                        PatternStructField::optional(
+                                            "label",
+                                            PatternAttributeType::string(),
+                                        )
+                                        .build(),
                                     ],
                                 ),
                             )
@@ -3363,8 +3637,6 @@ fn plan_canonicalizes_nested_ignored_empty_structs_before_comparison() {
 
 #[test]
 fn plan_recanonicalizes_parent_after_ignored_missing_struct_leaf() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let settings = |label: Option<&str>| {
         let mut fields = IndexMap::from([(
             "keep".to_string(),
@@ -3400,21 +3672,25 @@ fn plan_recanonicalizes_parent_after_ignored_missing_struct_leaf() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Settings",
                         vec![
-                            StructField::optional("keep", AttributeType::string()).build(),
-                            StructField::optional(
+                            PatternStructField::optional("keep", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::optional(
                                 "cfg",
-                                AttributeType::struct_(
+                                PatternAttributeType::struct_(
                                     "Config",
                                     vec![
-                                        StructField::optional("label", AttributeType::string())
-                                            .build(),
+                                        PatternStructField::optional(
+                                            "label",
+                                            PatternAttributeType::string(),
+                                        )
+                                        .build(),
                                     ],
                                 ),
                             )
@@ -3454,8 +3730,6 @@ fn plan_recanonicalizes_parent_after_ignored_missing_struct_leaf() {
 
 #[test]
 fn plan_update_keeps_authored_empty_struct_in_provider_payload() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
     let desired = Resource::new("test.Widget", "example").with_attribute("config", empty());
     let id = desired.id.clone();
@@ -3475,13 +3749,16 @@ fn plan_update_keeps_authored_empty_struct_in_provider_payload() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "config",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Config",
-                        vec![StructField::optional("label", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("label", PatternAttributeType::string())
+                                .build(),
+                        ],
                     ),
                 )
                 .build(),
@@ -3516,8 +3793,6 @@ fn plan_update_keeps_authored_empty_struct_in_provider_payload() {
 
 #[test]
 fn plan_updates_when_top_level_and_nested_zero_field_markers_disappear() {
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
-
     let empty = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
     let settings = |include_marker| {
         let mut fields = IndexMap::from([(
@@ -3540,20 +3815,21 @@ fn plan_updates_when_top_level_and_nested_zero_field_markers_disappear() {
             HashMap::from([("settings".to_string(), settings(false))]),
         ),
     )]);
-    let marker = AttributeType::struct_("Count", Vec::new());
+    let marker = PatternAttributeType::struct_("Count", Vec::new());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
-            .attribute(AttributeSchema::optional("count", marker.clone()).build())
+        PatternResourceSchema::new("test.Widget")
+            .attribute(PatternAttributeSchema::optional("count", marker.clone()).build())
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Settings",
                         vec![
-                            StructField::optional("label", AttributeType::string()).build(),
-                            StructField::optional("count", marker).build(),
+                            PatternStructField::optional("label", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::optional("count", marker).build(),
                         ],
                     ),
                 )
@@ -3631,8 +3907,6 @@ fn diff_no_change_without_prev_desired_keys() {
 
 #[test]
 fn create_plan_detects_attribute_removal() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     // Resource in .crn has no "tags", but current state (from AWS) has tags.
     // prev_desired_keys indicates user previously had "region" and "tags".
     let resources = vec![Resource::new("s3.Bucket", "test").with_attribute(
@@ -3667,12 +3941,17 @@ fn create_plan_detects_attribute_removal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("region", AttributeType::string()).build())
+        (PatternResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
-                    .removable()
-                    .build(),
+                PatternAttributeSchema::optional("region", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .removable()
+                .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -3705,7 +3984,6 @@ fn create_plan_detects_attribute_removal() {
 
 #[test]
 fn create_plan_filters_non_removable_attribute_removal() {
-    use crate::schema::{AttributeSchema, AttributeType};
     // When schema is available, only removable attributes should trigger removal.
     // "region" is not removable, "tags" is removable.
     let resources = vec![Resource::new("s3.Bucket", "test").with_attribute(
@@ -3742,15 +4020,18 @@ fn create_plan_filters_non_removable_attribute_removal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
+        (PatternResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::optional("region", AttributeType::string())
+                PatternAttributeSchema::optional("region", PatternAttributeType::string())
                     .non_removable()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -3793,7 +4074,6 @@ fn create_plan_filters_non_removable_attribute_removal() {
 
 #[test]
 fn create_plan_skips_update_when_only_non_removable_removal() {
-    use crate::schema::{AttributeSchema, AttributeType};
     // When the only "change" is a non-removable attribute removal,
     // the plan should have no effects (no spurious Update).
     let resources = vec![Resource::new("s3.Bucket", "test").with_attribute(
@@ -3826,10 +4106,12 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::required("bucket", AttributeType::string()).build())
+        (PatternResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::optional("region", AttributeType::string())
+                PatternAttributeSchema::required("bucket", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("region", PatternAttributeType::string())
                     .non_removable()
                     .build(),
             ))
@@ -3962,7 +4244,7 @@ fn schema_default_prevent_destroy_blocks_orphan_delete_when_schema_is_available(
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
+        PatternResourceSchema::new("ec2.Vpc")
             .default_prevent_destroy()
             .validate()
             .expect("schema fixture must validate"),
@@ -4027,8 +4309,6 @@ fn unspecified_orphan_without_a_registered_schema_keeps_existing_delete_behavior
 
 #[test]
 fn prevent_destroy_blocks_replace() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     // Resource with prevent_destroy that has a create-only attribute change
     // (which would normally trigger a Replace)
     let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
@@ -4053,8 +4333,8 @@ fn prevent_destroy_blocks_replace() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Vpc").attribute(
-            AttributeSchema::optional("cidr_block", AttributeType::string())
+        (PatternResourceSchema::new("ec2.Vpc").attribute(
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -4103,8 +4383,6 @@ fn prevent_destroy_blocks_replace() {
 
 #[test]
 fn schema_default_prevent_destroy_blocks_replace_and_explicit_false_allows_it() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let desired = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -4123,9 +4401,9 @@ fn schema_default_prevent_destroy_blocks_replace_and_explicit_false_allows_it() 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
+        PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -4282,11 +4560,9 @@ fn prevent_destroy_does_not_block_create() {
 
 #[test]
 fn route53_union_non_enum_literal_reaches_plan_as_string() {
-    use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
-    };
+    use crate::schema::TypeIdentity;
 
-    let hosted_zone = AttributeType::enum_(
+    let hosted_zone = PatternAttributeType::enum_(
         TypeIdentity::new(
             Some("aws"),
             ["route53", "RecordSet", "AliasTarget"],
@@ -4300,15 +4576,18 @@ fn route53_union_non_enum_literal_reaches_plan_as_string() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("route53.RecordSet").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("route53.RecordSet").attribute(
+            PatternAttributeSchema::optional(
                 "alias_target",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "AliasTarget",
                     vec![
-                        StructField::optional(
+                        PatternStructField::optional(
                             "hosted_zone_id",
-                            AttributeType::union(vec![hosted_zone, AttributeType::string()]),
+                            PatternAttributeType::union(vec![
+                                hosted_zone,
+                                PatternAttributeType::string(),
+                            ]),
                         )
                         .build(),
                     ],
@@ -4495,12 +4774,8 @@ fn wait_binding_lowers_to_wait_effect() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("acm.Certificate").attribute(
-            crate::schema::AttributeSchema::optional(
-                "status",
-                crate::schema::AttributeType::string(),
-            )
-            .build(),
+        (PatternResourceSchema::new("acm.Certificate").attribute(
+            PatternAttributeSchema::optional("status", PatternAttributeType::string()).build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -4576,12 +4851,8 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("job.Job").attribute(
-            crate::schema::AttributeSchema::optional(
-                "state",
-                crate::schema::AttributeType::string(),
-            )
-            .build(),
+        (PatternResourceSchema::new("job.Job").attribute(
+            PatternAttributeSchema::optional("state", PatternAttributeType::string()).build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -4612,7 +4883,7 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
 #[test]
 fn nested_wait_enum_resolves_and_matches_provider_state() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField, TypeIdentity};
+    use crate::schema::TypeIdentity;
 
     let cert =
         Resource::with_provider("aws", "acm.Certificate", "cert", None).with_root_binding("cert");
@@ -4639,22 +4910,23 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
         depends_on: Default::default(),
         line: 1,
     };
-    let renewal_status = AttributeType::enum_(
+    let renewal_status = PatternAttributeType::enum_(
         TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "RenewalStatus"),
         Some(vec!["SUCCESS".to_string()]),
         vec![("SUCCESS".to_string(), "success".to_string())],
         None,
         None,
     );
-    let renewal_summary = AttributeType::struct_(
+    let renewal_summary = PatternAttributeType::struct_(
         "RenewalSummary",
-        vec![StructField::optional("renewal_status", renewal_status).build()],
+        vec![PatternStructField::optional("renewal_status", renewal_status).build()],
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("acm.Certificate")
-            .attribute(AttributeSchema::optional("renewal_summary", renewal_summary).build()))
+        (PatternResourceSchema::new("acm.Certificate").attribute(
+            PatternAttributeSchema::optional("renewal_summary", renewal_summary).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -4703,7 +4975,6 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
 #[test]
 fn quoted_wait_value_traverses_a_string_map_when_planning() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
-    use crate::schema::{AttributeSchema, ResourceSchema};
 
     let job = Resource::with_provider("test", "job.Job", "job", None).with_root_binding("job");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
@@ -4728,9 +4999,12 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("job.Job").attribute(
-            AttributeSchema::optional("labels", AttributeType::map(AttributeType::string()))
-                .build(),
+        (PatternResourceSchema::new("job.Job").attribute(
+            PatternAttributeSchema::optional(
+                "labels",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -4775,7 +5049,7 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
 #[test]
 fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
-    use crate::schema::{AttributeSchema, ResourceSchema, TypeIdentity};
+    use crate::schema::TypeIdentity;
 
     let job = Resource::with_provider("test", "job.Job", "job", None).with_root_binding("job");
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
@@ -4797,7 +5071,7 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
         depends_on: Default::default(),
         line: 1,
     };
-    let status = AttributeType::enum_(
+    let status = PatternAttributeType::enum_(
         TypeIdentity::new(Some("test"), ["job", "Job"], "Status"),
         Some(vec!["READY".to_string()]),
         vec![("READY".to_string(), "ready".to_string())],
@@ -4807,8 +5081,9 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("job.Job")
-            .attribute(AttributeSchema::optional("statuses", AttributeType::map(status)).build()))
+        (PatternResourceSchema::new("job.Job").attribute(
+            PatternAttributeSchema::optional("statuses", PatternAttributeType::map(status)).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -4857,24 +5132,25 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
 #[test]
 fn nested_wait_resolution_error_matches_validation_message() {
     use crate::parser::{ProviderContext, UntilPredicateAst, WaitBinding, parse};
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField, TypeIdentity};
+    use crate::schema::TypeIdentity;
 
-    let renewal_status = AttributeType::enum_(
+    let renewal_status = PatternAttributeType::enum_(
         TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "RenewalStatus"),
         Some(vec!["SUCCESS".to_string()]),
         vec![("SUCCESS".to_string(), "success".to_string())],
         None,
         None,
     );
-    let renewal_summary = AttributeType::struct_(
+    let renewal_summary = PatternAttributeType::struct_(
         "RenewalSummary",
-        vec![StructField::optional("renewal_status", renewal_status).build()],
+        vec![PatternStructField::optional("renewal_status", renewal_status).build()],
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("acm.Certificate")
-            .attribute(AttributeSchema::optional("renewal_summary", renewal_summary).build()))
+        (PatternResourceSchema::new("acm.Certificate").attribute(
+            PatternAttributeSchema::optional("renewal_summary", renewal_summary).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -5212,7 +5488,6 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
 fn wait_uses_schema_default_timeout_when_omitted() {
     use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
     // Downstream consumer with a pending change so the wait gates
@@ -5227,8 +5502,10 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("acm.Certificate")
-            .attribute(AttributeSchema::optional("status", AttributeType::string()).build())
+        (PatternResourceSchema::new("acm.Certificate")
+            .attribute(
+                PatternAttributeSchema::optional("status", PatternAttributeType::string()).build(),
+            )
             .with_default_wait_timeout(std::time::Duration::from_secs(99))
             .with_default_wait_interval(std::time::Duration::from_secs(7)))
         .validate()
@@ -5458,7 +5735,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
 #[test]
 fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    use crate::schema::TypeIdentity;
 
     // cert: exists with status == ISSUED and is unchanged (desired
     // matches state) → NoChange, no mutating effect on the target.
@@ -5507,10 +5784,10 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("acm.Certificate").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("acm.Certificate").attribute(
+            PatternAttributeSchema::optional(
                 "status",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Status"),
                     Some(vec!["ISSUED".to_string()]),
                     vec![("ISSUED".to_string(), "issued".to_string())],

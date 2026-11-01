@@ -36,7 +36,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-The resource type follows the pattern `<provider>.<service>.<resource_type>`. Anonymous resources need their provider declared and loaded so its schema is available. Carina derives identity from configured create-only or provider identity attributes. When the schema is available but none of those attributes is set, identity is derived from the declaration's attributes; only one such anonymous declaration of the same resource kind and provider instance is allowed in a scope. Use `let` bindings to disambiguate additional declarations.
+The resource type follows the pattern `<provider>.<service>.<resource_type>`. Anonymous resources need their provider declared and loaded so its schema is available. If the schema declares identity paths, Carina derives the address only from their configured values; a path may point to a top-level attribute or a nested struct field whose leaf is a scalar or enum. Written values are schema-canonicalized. References and composite expressions over references and literals are hashed by their deterministic authored spelling and remain stable after resolution; generated names hash a separately typed prefix. An absent value or an expression containing an unknown or unavailable leaf is an error: write the identity value or use a `let` binding. Without declared identity, Carina falls back to configured top-level create-only attributes. Only that legacy fallback derives identity from the declaration's other attributes when no create-only value is configured.
 
 ## Named resources with `let`
 
@@ -56,7 +56,7 @@ awscc.ec2.Subnet {
 
 The `let` binding gives the resource a name (`vpc`) so you can reference its attributes (like `vpc.vpc_id`) from other resources. Carina automatically determines the dependency order -- the subnet will be created after the VPC.
 
-Use anonymous resources when the binding is unused. Unnecessary `let` bindings add noise. However, two or more anonymous resources of the same type in one scope must each set a create-only or identity attribute; otherwise, give them `let` bindings so their identities stay stable.
+Use anonymous resources when the binding is unused and every declared identity value is written or expressed as a resource reference. Unnecessary `let` bindings add noise. However, two anonymous resources of the same type and provider route cannot have equal declared identity values. If an identity value is absent or has no plan-time expression, give the resource a `let` binding. If the schema has no declared identity, multiple resources need distinct configured create-only values or `let` bindings so their identities stay stable.
 
 ## Attribute types
 

@@ -29,7 +29,7 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           changed=$(git diff --name-only "$base" "$head")
-          if echo "$changed" | grep -qE '^(.*\.rs$|.*Cargo\.toml$|Cargo\.lock$|\.cargo/.*|\.config/.*|scripts/.*|site/src/content/providers/writing/schemas\.md$|\.github/(workflows|actions)/.*)'; then
+          if echo "$changed" | grep -qE '^(.*\.rs$|.*Cargo\.toml$|Cargo\.lock$|\.cargo/.*|\.config/.*|scripts/.*|site/src/content/providers/writing/(schemas|getting-started)\.md$|\.github/(workflows|actions)/.*)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -133,6 +133,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: bash scripts/check-wit-bindgen-workspace.sh
+      - run: bash scripts/check-provider-sdk-bindings.sh
+      - run: bash scripts/test-check-provider-sdk-bindings.sh
 
   check-plan-fixtures:
     name: Check Plan Fixtures

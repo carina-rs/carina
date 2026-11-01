@@ -1,5 +1,80 @@
 # Provider protocol versions
 
+The current protocol and minimum supported provider protocol are both **16**.
+
+| Protocol version | Minimum provider protocol | Change |
+|------------------|---------------------------|--------|
+| 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
+| 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
+| 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 16
+
+Protocol v16 makes declared anonymous identity a closed schema mode and changes
+its address semantics. `PROTOCOL_VERSION` and
+`MIN_SUPPORTED_PROTOCOL_VERSION` are both 16. A v16 host therefore rejects a
+v15 provider through the existing version check before attempting to decode
+its schemas. This is required because the v15 top-level `identity` boolean
+meant “add this value to the configured create-only hash inputs” and earlier
+providers could set it on mutable attributes. Interpreting that boolean with
+v16 semantics would silently change addresses or produce a misleading schema
+decode error.
+
+Every top-level `AttributeSchema` and nested `StructField` schema JSON record
+now carries a required `identity` value from the closed enum `none`, `required`,
+or `when_present`; the field has no serde default. Nested fields also carry the
+required `create_only` boolean introduced with nested identity. The host
+rebuilds decoded records through the same input-mode and create-only builders
+used by native schemas. Both identity modes require create-only scalar or enum
+leaves. Identity is rejected on provider-populated values, on a collection or
+struct value itself, below lists, maps, or unions, and below a
+provider-populated ancestor. `when_present` is additionally valid only for
+optional input. These declarations participate in semantic schema fingerprint
+encoding v7.
+
+For anonymous resources, one or more declared identity paths select the
+identity-only address encoding; other create-only values are excluded. If no
+identity path is declared, the host retains the create-only fallback. Nested
+paths are represented as typed attribute/struct-field segments in the host and
+are never transported as a dotted string. A `required` identity must be
+written, even when its schema input is optional. An omitted `when_present`
+identity instead contributes a dedicated typed absence value. Once written,
+either mode has the same rules: a stable written value or authored expression
+is required at plan time. Written values are schema-canonicalized. References
+and composite expressions whose leaves are references or literals are hashed
+by their deterministic authored spelling, and generated names hash their
+authored prefix as a separate typed value. A written `Unknown` or
+`Unavailable` value, placeholder, secret, or expression containing such a leaf
+is incomplete identity rather than absence; the user can give the resource a
+name with `let` when no stable identity material exists.
+
+The declared-identity hash encoding is typed and length-prefixed. It contains
+the length-prefixed domain `carina-anonymous-identity-v1`; the sorted
+provider-identity entry count and each length-prefixed key and value; then the
+identity-path count. Each path has its segment count followed by segments
+tagged `0` for an attribute or `1` for a struct field and a length-prefixed
+name. Its value then has a kind tag: `0` for `Written`, `1` for
+`ReferenceExpression`, `2` for `Prefix`, `3` for `PrefixExpression`, or `4`
+for `Absent`. Tags 0 through 3 retain their existing spelling payload; tag 4
+has no payload. Counts and lengths are unsigned 64-bit little-endian integers.
+The address suffix is the first 32 bits of the SHA-256 digest, interpreted in
+big-endian byte order. Consequently absence cannot collide with any written
+value, including the empty string.
+
+During anonymous-address reconciliation, an absent desired `when_present`
+identity matches only a candidate state row whose corresponding attribute or
+field is also absent. It does not match an empty string or any other written
+value. This lets migration to the declared-identity address select the same
+real-world object without conflating omission with an unresolved value.
+
+Nested create-only leaves in an unordered list are compared as a multiset,
+independent of element order and mutable sibling fields. Reordering alone is
+not a create-only change. Adding an element with an authored create-only leaf
+is a create-only change and therefore replaces the resource.
+
+The WIT world is unchanged in v16; the incompatible representation is in the
+schema JSON records. Hosts and providers must both use protocol v16.
+
 ## Version 15
 
 Protocol v15 separates an asynchronous mutation from its post-mutation
@@ -13,6 +88,33 @@ Update uses `pending-update` with a `pending-phase` of `operation` or
 share the phase-less `pending-operation` record for the token and poll interval.
 `poll-create`, `resume-create`, and `poll-update` receive a `poll-request`
 whose `finality` is `continue` or `final-attempt`.
+
+The guest SDK requires create and update tokens to implement `PhasedToken`.
+Identifier-bearing `IssuedCreate` and `ResumedCreate` handles derive both
+`pending` and `preserve` progress from the token's phase. Identifier-less
+create handles take `T::Operation`, the associated operation-phase payload;
+unissued poll and resume arms carry that payload directly. `from_operation`
+wraps it infallibly, while only SDK dispatch uses `into_operation` to narrow a
+decoded host token. `PhasedToken::phase()` derives its default from the borrowed
+`operation()` view (`Some` for operation, `None` for read-back), avoiding a
+separate phase match in provider implementations.
+Update continuations use `Pending::new(token, poll_after_secs)` and compute
+`Pending::phase()` from the token, without storing a separate mutable phase.
+The SDK does not serialize `Pending<T>` itself; guest glue serializes its token
+into the protocol's pending record.
+
+Guest decoding keeps the host's `create-progress` variant intact through
+create poll and resume dispatch. Phase validation rejects only the backward
+pairing: host progress is `reading-back`, but the token is in operation phase.
+Create poll and resume return `Undetermined` for that pairing, preserving the
+previous host continuation; update decoding rejects the same backward pairing.
+Operation progress with a read-back token is accepted when an identifier is
+available. The guest receives the identifier-bearing handle, and its next
+pending or preserved result reports read-back progress from the token.
+An identifier-less read-back token is permanently invalid: dispatch returns
+terminal `Untracked` with code `READ_BACK_WITHOUT_IDENTIFIER` before calling
+the provider. These SDK guarantees use the existing WIT variants and do not
+change the protocol version.
 
 The host starts the operation's existing deadline before the initial call.
 The read-back deadline starts only when the first `read-back` pending result
@@ -43,12 +145,13 @@ refresh.
 `resume-create` receives the same `poll-request` finality as `poll-create`; the
 host never fabricates the `sent` values that are absent from a persisted
 `resume-pending`. Persisted state retains the resume token and identifier, but
-not scheduling metadata, so the first resume call's inbound phase and delay are
-non-authoritative: the host sends `operating` with the persisted optional
-identifier. The provider recovers the operation from its token and any
-pending result it returns establishes the phase used by later polls. Delete
-continuations use the phase-less `pending-delete` record because delete has no
-post-apply read-back phase.
+not scheduling metadata. The current host sends `operating` with the persisted
+optional identifier on the first resume call. This placeholder is not evidence
+of a phase regression: a saved read-back token with an identifier can resume
+directly into read-back, including from a fresh provider instance. A returned
+pending or preserved result establishes the phase used by subsequent polls.
+Delete continuations use the phase-less `pending-delete` record because delete
+has no post-apply read-back phase.
 
 `OperationConfig.read_back` participates in semantic schema fingerprint
 encoding v6. Provider protocol and minimum supported protocol are both 15;

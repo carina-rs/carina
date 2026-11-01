@@ -28,8 +28,9 @@ use carina_core::differ::{Diff, diff};
 use carina_core::provider::{InitializedProvider, ProviderRouter};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, StructField,
-    ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness,
 };
 use carina_core::value::CanonicalState;
 
@@ -52,29 +53,45 @@ fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedRe
 /// Top-level attribute `rules` is `List<Struct{ statement: Ref(Statement) }>`.
 /// `Statement` is `Struct { and_statement: List<Ref(Statement)> }` —
 /// the simplest shape that exercises a true cycle through `Ref`.
-fn cyclic_webacl_like_schema() -> ResourceSchema {
-    let statement_def = AttributeType::struct_(
+fn cyclic_webacl_like_schema<R: carina_core::schema::PatternForm>()
+-> carina_core::schema::PatternResourceSchema<R> {
+    let statement_def = carina_core::schema::PatternAttributeType::struct_(
         "Statement".to_string(),
         vec![
-            StructField::optional(
+            carina_core::schema::PatternStructField::optional(
                 "and_statement",
-                AttributeType::list(AttributeType::ref_("Statement".to_string())),
+                carina_core::schema::PatternAttributeType::list(
+                    carina_core::schema::PatternAttributeType::ref_("Statement".to_string()),
+                ),
             )
             .build(),
         ],
     );
 
-    let rule_struct = AttributeType::struct_(
+    let rule_struct = carina_core::schema::PatternAttributeType::struct_(
         "Rule".to_string(),
         vec![
-            StructField::optional("name", AttributeType::string()).build(),
-            StructField::optional("statement", AttributeType::ref_("Statement".to_string()))
-                .build(),
+            carina_core::schema::PatternStructField::optional(
+                "name",
+                carina_core::schema::PatternAttributeType::string(),
+            )
+            .build(),
+            carina_core::schema::PatternStructField::optional(
+                "statement",
+                carina_core::schema::PatternAttributeType::ref_("Statement".to_string()),
+            )
+            .build(),
         ],
     );
 
-    ResourceSchema::new("wafv2.WebACL")
-        .attribute(AttributeSchema::optional("rules", AttributeType::list(rule_struct)).build())
+    carina_core::schema::PatternResourceSchema::new("wafv2.WebACL")
+        .attribute(
+            carina_core::schema::PatternAttributeSchema::optional(
+                "rules",
+                carina_core::schema::PatternAttributeType::list(rule_struct),
+            )
+            .build(),
+        )
         .with_def("Statement", statement_def)
 }
 
@@ -205,7 +222,14 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
         .expect("comparison provider route is initialized");
 
     let desired = resolve_resource(desired, &schemas);
-    let d = diff(&desired, &current, &saved, None, Some(&schema), &comparison);
+    let d = diff(
+        &desired,
+        &current,
+        &saved,
+        None,
+        Some(witness.resources()[0].as_schema()),
+        &comparison,
+    );
     assert!(
         matches!(d, Diff::NoChange(_)),
         "equal cyclic values must produce NoChange, got: {d:?}"
@@ -262,7 +286,14 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         .expect("comparison provider route is initialized");
 
     let desired = resolve_resource(desired, &schemas);
-    let d = diff(&desired, &current, &saved, None, Some(&schema), &comparison);
+    let d = diff(
+        &desired,
+        &current,
+        &saved,
+        None,
+        Some(witness.resources()[0].as_schema()),
+        &comparison,
+    );
     match d {
         Diff::Update {
             changed_attributes, ..
@@ -346,27 +377,30 @@ fn resource_schema_validate_routes_ref_through_defs() {
 /// instead of folding it to `StringList`.
 #[test]
 fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
     // `Selectors` def is a struct with a `string_or_list_of_strings`
     // field. `selectors` attribute references it via Ref.
-    let selectors_def = AttributeType::struct_(
+    let selectors_def = carina_core::schema::PatternAttributeType::struct_(
         "Selectors".to_string(),
         vec![
-            StructField::optional(
+            carina_core::schema::PatternStructField::optional(
                 "tags",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
+                carina_core::schema::PatternAttributeType::union(vec![
+                    carina_core::schema::PatternAttributeType::string(),
+                    carina_core::schema::PatternAttributeType::list(
+                        carina_core::schema::PatternAttributeType::string(),
+                    ),
                 ]),
             )
             .build(),
         ],
     );
-    let schema = ResourceSchema::new("test.WithRef")
+    let schema = carina_core::schema::PatternResourceSchema::new("test.WithRef")
         .attribute(
-            AttributeSchema::optional("selectors", AttributeType::ref_("Selectors".to_string()))
-                .build(),
+            carina_core::schema::PatternAttributeSchema::optional(
+                "selectors",
+                carina_core::schema::PatternAttributeType::ref_("Selectors".to_string()),
+            )
+            .build(),
         )
         .with_def("Selectors", selectors_def);
 
@@ -409,10 +443,12 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
 /// entry point that surfaces this.
 #[test]
 fn dangling_ref_surfaces_clean_validation_error() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let schema = ResourceSchema::new("test.WithDanglingRef").attribute(
-        AttributeSchema::optional("broken", AttributeType::ref_("Nowhere".to_string())).build(),
+    let schema = carina_core::schema::PatternResourceSchema::new("test.WithDanglingRef").attribute(
+        carina_core::schema::PatternAttributeSchema::optional(
+            "broken",
+            carina_core::schema::PatternAttributeType::ref_("Nowhere".to_string()),
+        )
+        .build(),
     );
     // No `with_def` call — `defs` stays empty by design.
 
@@ -463,16 +499,18 @@ fn cyclic_ref_terminates_on_finite_value() {
 #[test]
 fn schema_validate_attr_map_arm_lifts_enum_key() {
     use carina_core::resource::ConcreteValue;
-    use carina_core::schema::AttributeType;
 
-    let key_type = AttributeType::enum_(
+    let key_type = carina_core::schema::PatternAttributeType::enum_(
         carina_core::schema::TypeIdentity::bare("Op"),
         Some(vec!["eq".to_string(), "neq".to_string()]),
         vec![],
         None,
         None,
     );
-    let attr_type = AttributeType::map_with_key(key_type, AttributeType::string());
+    let attr_type = carina_core::schema::PatternAttributeType::map_with_key(
+        key_type,
+        carina_core::schema::PatternAttributeType::string(),
+    );
 
     let mut payload = indexmap::IndexMap::new();
     payload.insert(

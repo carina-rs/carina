@@ -149,11 +149,9 @@ use carina_core::resource::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 use carina_core::schema::ValidatedResourceSchema;
-#[cfg(test)]
-use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
-    ValidatedProviderSchemaWitness, resolve_file_block_names_with_schemas,
+    CompiledResourceSchema as ResourceSchema, OwnerBoundResourceSchema, SchemaKind, SchemaRegistry,
+    TypeError, ValidatedProviderSchemaWitness, resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
@@ -2994,11 +2992,12 @@ impl AnonymousReconciliationStateView {
                 projected_id.resource_type(),
                 carina_core::schema::SchemaKind::Resource,
             ) {
-                AnonymousIdStateInfo::try_from_state_attributes(
+                AnonymousIdStateInfo::try_from_state_row(
                     state_row_id.clone(),
                     projected_target.cloned(),
                     schema.schema(),
                     &attribute_values,
+                    &state_resource.name_overrides,
                 )
             } else {
                 AnonymousIdStateInfo::try_without_comparable_attributes(
@@ -3115,7 +3114,8 @@ fn reconcile_anonymous_identifiers_with_ctx(
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
         claims,
-    )?)
+    )
+    .map_err(Box::new)?)
 }
 
 fn detect_legacy_loop_moves_with_ctx(
