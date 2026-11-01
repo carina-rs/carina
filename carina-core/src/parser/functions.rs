@@ -222,6 +222,13 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
         )));
     }
 
+    if ctx
+        .session
+        .is_some_and(|session| session.function_declaration_failed(func))
+    {
+        return Ok(PreparedUserFunctionCall::Deferred(args.to_vec()));
+    }
+
     // Build substitution map: param_name -> value, and type-check annotated params
     let mut substitutions: HashMap<String, FunctionArgument> = HashMap::new();
     let mut effective_args = Vec::with_capacity(func.params.len());
@@ -249,16 +256,8 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
             argument.try_map_value(|value| try_evaluate_fn_value(value.clone(), ctx, call_line))?
         };
         // Type-check if the parameter has a type annotation
-        if let Some(ref type_expr) = param.param_type {
-            match check_fn_arg_type(
-                fn_name,
-                &param.name,
-                type_expr,
-                &argument,
-                ctx,
-                call_line,
-                None,
-            )? {
+        if param.param_type.is_some() {
+            match check_fn_arg_type(func, param, &argument, ctx, call_line, None)? {
                 FunctionArgumentTypeCheck::Complete => {}
                 FunctionArgumentTypeCheck::AwaitingRuntimeValue => {
                     has_deferred_type_check = true;
@@ -720,14 +719,18 @@ pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind, B: Bi
 
 /// Check that a function argument matches the declared parameter type.
 fn check_fn_arg_type<Source: Clone>(
-    fn_name: &str,
-    param_name: &str,
-    type_expr: &TypeExpr,
+    function: &UserFunction,
+    parameter: &FnParam,
     argument: &FunctionArgument,
     ctx: &ParseContext<'_, Source>,
     call_line: usize,
     site: Option<crate::validation::deferred_types::ProviderTypeCheckSite>,
 ) -> Result<FunctionArgumentTypeCheck, ParseError> {
+    let fn_name = &function.name;
+    let param_name = &parameter.name;
+    let Some(type_expr) = &parameter.param_type else {
+        return Ok(FunctionArgumentTypeCheck::Complete);
+    };
     if argument.pending_parameter().is_some() {
         return Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue);
     }
@@ -756,27 +759,47 @@ fn check_fn_arg_type<Source: Clone>(
     // this call runs with an enriched context, resolve the annotation at the
     // checking seam so provider custom-type validation receives the same
     // canonical API spelling as module arguments, attributes, and exports.
-    let resolved_type =
-        match crate::validation::resolve_parameter_type_for_check(type_expr, ctx.config) {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => {
-                if let Some(session) = ctx.session {
-                    match site {
-                        Some(site) => session.record(type_expr, site),
-                        None => session.record_type(
-                            type_expr,
-                            &format!("function '{fn_name}' parameter '{param_name}'"),
-                        ),
-                    }
+    let resolved_type = match crate::validation::resolve_parameter_type_for_check(
+        type_expr, ctx.config,
+    ) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            if let Some(session) = ctx.session {
+                match site {
+                    Some(site) => session.record(type_expr, site),
+                    None => session.record_type(
+                        type_expr,
+                        &format!("function '{fn_name}' parameter '{param_name}'"),
+                    ),
                 }
-                return Ok(if argument.handle().is_some() {
-                    FunctionArgumentTypeCheck::DeferredHandleAnnotation
-                } else {
-                    FunctionArgumentTypeCheck::RecordedProviderDeferral
-                });
             }
-            Err(error) => return Err(ParseError::UserFunctionError(error.to_string())),
-        };
+            return Ok(if argument.handle().is_some() {
+                FunctionArgumentTypeCheck::DeferredHandleAnnotation
+            } else {
+                FunctionArgumentTypeCheck::RecordedProviderDeferral
+            });
+        }
+        Err(error) => {
+            // This failure belongs to the authored annotation, even when
+            // evaluation discovers it first. Preserve its typed token so
+            // the shared resolution report can replace the parser backstop.
+            let name = match &error {
+                    crate::static_type::StaticTypeResolutionError::UnknownCustomType { name }
+                    | crate::static_type::StaticTypeResolutionError::UnknownCustomTypeWithSuggestion { name, .. }
+                    | crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { name, .. } => name,
+                };
+            let error = match parameter.type_span {
+                Some(span) => {
+                    ParseError::unresolved_declaration_type(name, span, error.to_string())
+                }
+                None => ParseError::UserFunctionError(error.to_string()),
+            };
+            return Err(match &function.annotation_source_file {
+                Some(path) => error.in_file(path.clone()),
+                None => error,
+            });
+        }
+    };
 
     if let Some(handle) = argument.handle() {
         if let Err(error) = crate::validation::check_handle_sink(handle, &resolved_type) {
@@ -987,17 +1010,16 @@ pub(crate) fn validate_pending_function_type_check(
     let Some(function) = functions.get(&check.function_name) else {
         return Ok(());
     };
+    if session.function_declaration_failed(function) {
+        return Ok(());
+    }
     for (parameter, argument) in function.params.iter().zip(&check.arguments) {
         if function_argument_awaits_module_substitution(argument) {
             continue;
         }
-        let Some(type_expr) = &parameter.param_type else {
-            continue;
-        };
         let result = check_fn_arg_type(
-            &function.name,
-            &parameter.name,
-            type_expr,
+            function,
+            parameter,
             argument,
             &ctx,
             check.source_line,

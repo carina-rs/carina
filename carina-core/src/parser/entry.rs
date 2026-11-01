@@ -1345,7 +1345,12 @@ fn parse_with_seeded_bindings_inner(
             }
         }
     }
-    for check in ctx.pending_function_type_checks.borrow().iter().cloned() {
+    for mut check in ctx.pending_function_type_checks.borrow().iter().cloned() {
+        // Keep authored call ownership in buffer-only parses as well as
+        // directory parses, so replay records the same site in either view.
+        check
+            .source_file
+            .get_or_insert_with(|| source_file.to_path_buf());
         parser_binding_metadata.insert_pending_function_type_check(check);
     }
     for (name, span) in argument_type_sources {

@@ -985,6 +985,16 @@ impl<'a, T> ValidationReport<'a, T> {
         }
     }
     #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn into_test_diagnostics(
+        self,
+    ) -> (Vec<AppError>, Vec<carina_core::parser::ParseWarning>) {
+        let errors = match self.result {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.into_vec(),
+        };
+        (errors, self.warnings)
+    }
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_errors(self) -> Vec<AppError> {
         match self.into_parts().0 {
             Ok(_) => Vec::new(),
@@ -1489,7 +1499,7 @@ impl ProviderLoad {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_test_with_load_errors<P: PlaceholderKind, B: BindingAddress>(
         runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,

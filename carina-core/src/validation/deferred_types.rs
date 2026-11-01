@@ -1,12 +1,13 @@
 //! Provider-dependent evidence recorded by producers and consumed at a terminal boundary.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::parser::{
-    ParseWarning, ParseWarningSpan, ProviderContext, SourceSpan, TypeExpr, WarningKind,
+    ParseWarning, ParseWarningSpan, ProviderContext, SourceSpan, TypeExpr, UserFunction,
+    WarningKind,
 };
 
 /// Authored ownership of a check, retained independently of evaluated values.
@@ -95,6 +96,10 @@ pub trait ProviderTypeCheckContext:
     fn catalog(&self) -> &ProviderContext;
     fn loaded_context(&self) -> Option<&crate::parser::LoadedProviderContext>;
     fn declaration(&self, expected: &TypeExpr, site: ProviderTypeCheckSite);
+    /// Declaration diagnostics own failed signatures; their calls must retain
+    /// the authored expression while unrelated function checks still run.
+    fn fail_function_declaration(&self, source: &Path, name: &str);
+    fn has_failed_function_declaration(&self, source: &Path, name: &str) -> bool;
     fn record(&self, expected: &TypeExpr, site: ProviderTypeCheckSite);
     fn record_type(&self, expected: &TypeExpr, context: &str);
     fn publish_checks(
@@ -104,6 +109,18 @@ pub trait ProviderTypeCheckContext:
 }
 
 impl dyn ProviderTypeCheckContext + '_ {
+    pub(crate) fn function_declaration_failed<B: crate::resource::BindingAddress>(
+        &self,
+        function: &UserFunction<B>,
+    ) -> bool {
+        let source = function
+            .annotation_source_file
+            .as_deref()
+            .or(function.body.source_file.as_deref())
+            .unwrap_or_else(|| Path::new("<config>"));
+        self.has_failed_function_declaration(source, &function.name)
+    }
+
     pub fn pending<T>(&self, output: T) -> PendingProviderTypeChecks<'_, T> {
         PendingProviderTypeChecks {
             session: self,
@@ -236,6 +253,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 pub struct TypeCheckSession<'s> {
     catalog: SessionCatalog,
     evidence: Mutex<DeferredProviderTypeChecks<'s>>,
+    failed_function_declarations: Mutex<BTreeSet<(PathBuf, String)>>,
     brand: PhantomData<fn(&'s ()) -> &'s ()>,
 }
 
@@ -256,6 +274,7 @@ impl<'s> TypeCheckSession<'s> {
         Self {
             catalog,
             brand: PhantomData,
+            failed_function_declarations: Mutex::new(BTreeSet::new()),
             evidence: Mutex::new(DeferredProviderTypeChecks {
                 pending: BTreeMap::new(),
                 declarations: BTreeMap::new(),
@@ -383,6 +402,7 @@ impl<'s> TypeCheckSession<'s> {
 }
 
 impl sealed::SessionEvidence for TypeCheckSession<'_> {}
+
 impl ProviderTypeCheckContext for TypeCheckSession<'_> {
     fn catalog(&self) -> &ProviderContext {
         self.catalog()
@@ -392,6 +412,24 @@ impl ProviderTypeCheckContext for TypeCheckSession<'_> {
     }
     fn declaration(&self, expected: &TypeExpr, site: ProviderTypeCheckSite) {
         self.declaration(expected, site);
+    }
+    fn fail_function_declaration(&self, source: &Path, name: &str) {
+        self.failed_function_declarations
+            .lock()
+            .expect("failed function declaration lock")
+            .insert((
+                crate::utils::normalize_source_path(source),
+                name.to_string(),
+            ));
+    }
+    fn has_failed_function_declaration(&self, source: &Path, name: &str) -> bool {
+        self.failed_function_declarations
+            .lock()
+            .expect("failed function declaration lock")
+            .contains(&(
+                crate::utils::normalize_source_path(source),
+                name.to_string(),
+            ))
     }
     fn record(&self, expected: &TypeExpr, site: ProviderTypeCheckSite) {
         self.record(expected, site);
@@ -770,6 +808,87 @@ mod partial_catalog_tests {
                 .with_failed_providers(std::collections::BTreeSet::from(["broken".into()])),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn empty_loaded_catalog_stays_strict_without_failed_providers() {
+        let catalog = ProviderContext {
+            custom_types: ProviderCustomTypes::loaded(
+                Default::default(),
+                Box::new(|_, _| panic!("unknown declarations must not call validators")),
+            )
+            .with_failed_providers(Default::default()),
+            ..Default::default()
+        };
+        assert!(catalog.custom_types_loaded());
+        assert!(!catalog.custom_types.may_defer(None));
+        assert!(!catalog.custom_types.may_defer(Some("aws")));
+        let result = TypeCheckSession::run(&catalog, |session| {
+            let mut parsed = parse_file(
+                "attributes { x: AwsAccountId = '123' }",
+                Path::new("/project/main.crn"),
+                &ProviderContext::default(),
+            )
+            .unwrap();
+            let errors = crate::validation::resolve_file_type_exprs(&mut parsed, session);
+            assert_eq!(errors.len(), 1, "{errors:#?}");
+            assert!(
+                errors[0]
+                    .to_string()
+                    .contains("unknown custom type 'AwsAccountId'")
+            );
+        });
+        assert!(result.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn failed_function_declaration_keeps_unrelated_pending_call_checks() {
+        for failed_call in ["", "exports { failed: String = bad('id') }\n"] {
+            let result = TypeCheckSession::run(&partial(), |session| {
+                let mut parsed = parse_file(
+                    &format!("fn bad(x: ready.Missing) {{ x }}\nfn echo(x: Arn): String {{ 'ok' }}\n{failed_call}exports {{ x = echo('id') }}\n"),
+                    Path::new("/project/main.crn"),
+                    &ProviderContext::default(),
+                )
+                .unwrap();
+                let errors = crate::validation::resolve_file_type_exprs(&mut parsed, session);
+                assert_eq!(errors.len(), 1, "{errors:#?}");
+                assert!(errors[0].to_string().contains("ready.Missing"));
+                crate::parser::resolve_resource_refs_in_session(&mut parsed, session)
+                    .expect("only the failed declaration owns its error");
+            });
+            assert_eq!(result.diagnostics().len(), 2);
+            assert!(result.diagnostics().iter().all(|diagnostic| matches!(
+                diagnostic,
+                ProviderTypeCheckDiagnostic::Deferred(warning)
+                    if warning.message.contains("type check for Arn was deferred")
+            )));
+        }
+    }
+
+    #[test]
+    fn failed_function_declaration_does_not_block_same_name_in_another_file() {
+        let result = TypeCheckSession::run(&partial(), |session| {
+            let mut failed = parse_file(
+                "fn echo(x: ready.Missing) { x }",
+                Path::new("/project/bad.crn"),
+                &ProviderContext::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::validation::resolve_file_type_exprs(&mut failed, session).len(),
+                1
+            );
+            let mut other = parse_file(
+                "fn echo(x: Arn): String { 'ok' }\nexports { x = echo('id') }",
+                Path::new("/project/other.crn"),
+                &ProviderContext::default(),
+            )
+            .unwrap();
+            assert!(crate::validation::resolve_file_type_exprs(&mut other, session).is_empty());
+            crate::parser::resolve_resource_refs_in_session(&mut other, session).unwrap();
+        });
+        assert_eq!(result.diagnostics().len(), 2);
     }
 
     #[test]

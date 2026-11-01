@@ -524,26 +524,6 @@ impl DiagnosticRun<'_> {
         {
             diagnostics.push(parse_error_to_diagnostic(error));
         }
-        // The diagnostic directory parse deliberately preserves a user-function
-        // call when evaluating its body fails, so the rest of the editor checks
-        // can still inspect the authored call. Run the strict resolver on a
-        // clone solely to surface source-owned body errors (for example, a
-        // sibling call that binds a structural handle and then uses the
-        // parameter bare). `ParseError::Located` keeps the diagnostic on the
-        // function document rather than the caller document.
-        if let (Some(result), Some(current_file_path)) = (merged_result.as_ref(), current_file_path)
-        {
-            let mut strict = result.directory.parsed.parsed().clone();
-            if let Err(error) = carina_core::parser::resolve_resource_refs_in_session(
-                &mut strict,
-                self.provider_context,
-            ) && error
-                .source_file()
-                .is_some_and(|source_file| source_file == current_file_path)
-            {
-                diagnostics.push(parse_error_to_diagnostic(&error));
-            }
-        }
         if let Some(result) = merged_result.as_ref() {
             diagnostics.extend(self.duplicate_declaration_diagnostics(
                 &source,
@@ -704,6 +684,27 @@ impl DiagnosticRun<'_> {
                 None,
             )
         });
+        // The diagnostic directory parse deliberately preserves a user-function
+        // call when evaluating its body fails, so the rest of the editor checks
+        // can still inspect the authored call. Run the strict resolver on a
+        // clone after declaration resolution so the session already owns any
+        // failed signatures. This surfaces source-owned body errors (for example, a
+        // sibling call that binds a structural handle and then uses the
+        // parameter bare). `ParseError::Located` keeps the diagnostic on the
+        // function document rather than the caller document.
+        if let (Some(result), Some(current_file_path)) = (merged_result.as_ref(), current_file_path)
+        {
+            let mut strict = result.directory.parsed.parsed().clone();
+            if let Err(error) = carina_core::parser::resolve_resource_refs_in_session(
+                &mut strict,
+                self.provider_context,
+            ) && error
+                .source_file()
+                .is_some_and(|source_file| source_file == current_file_path)
+            {
+                diagnostics.push(parse_error_to_diagnostic(&error));
+            }
+        }
         // Every catalog runs the same declaration producers. An incomplete
         // catalog records deferrals; a loaded owner produces strict diagnostics.
         {
@@ -722,12 +723,11 @@ impl DiagnosticRun<'_> {
                                 .as_ref()
                                 .map(|report| report.diagnostics().to_vec())
                                 .unwrap_or_default();
-                            if findings.is_empty()
-                                && let Err(error) =
-                                    carina_core::parser::resolve_resource_refs_in_session(
-                                        &mut parsed,
-                                        self.provider_context,
-                                    )
+                            if let Err(error) =
+                                carina_core::parser::resolve_resource_refs_in_session(
+                                    &mut parsed,
+                                    self.provider_context,
+                                )
                             {
                                 diagnostics.push(parse_error_to_diagnostic(&error));
                             }
@@ -2217,9 +2217,8 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// An orphan engine can establish an empty/partial catalog only after all
-    /// provider declarations in the directory are known. Failed discovery
-    /// preserves the unavailable-context fallback.
+    /// Successful directory discovery establishes a loaded catalog, including
+    /// when no providers are declared. Only failed owners make it partial.
     fn directory_catalog(
         &self,
         doc: &Document,
@@ -2248,7 +2247,21 @@ impl DiagnosticEngine {
                 .ok()?,
             );
         }
-        let mut loaded = self.provider_names.iter().cloned().collect::<HashSet<_>>();
+        let mut loaded = self
+            .provider_names
+            .iter()
+            .cloned()
+            .chain(
+                self.factories
+                    .iter()
+                    .map(|factory| factory.name().to_string()),
+            )
+            .chain(
+                self.schemas
+                    .iter()
+                    .map(|(provider, _, _, _)| provider.to_string()),
+            )
+            .collect::<HashSet<_>>();
         if providers.iter().any(|provider| {
             provider.name == carina_provider_mock::BUILTIN_PROVIDER_NAME
                 && provider.source.is_none()

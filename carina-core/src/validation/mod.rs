@@ -5997,6 +5997,7 @@ fn resolve_file_type_exprs_impl<
     }
     // Definitions are checked whether or not a call survives evaluation.
     for function in parsed.user_functions.values_mut() {
+        let previous_errors = errors.len();
         let path = function
             .annotation_source_file
             .as_deref()
@@ -6046,6 +6047,9 @@ fn resolve_file_type_exprs_impl<
                     source.clone(),
                 ));
             }
+        }
+        if errors.len() != previous_errors {
+            config.fail_function_declaration(path, &function.name);
         }
     }
     (

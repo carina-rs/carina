@@ -15,9 +15,8 @@
 //! `#[ignore]`-gated).
 //!
 //! Tests run unconditionally in CI. End-to-end coverage of the binary
-//! itself (argument parsing, exit codes, stdout formatting) is left to
-//! the acceptance-test suite that exercises the real provider plugins
-//! against `carina-rs/infra/`.
+//! itself also covers provider-availability regressions below, including
+//! terminal warnings, error severity, and exit codes on the same input as LSP.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -230,6 +229,334 @@ fn lsp_error_multiset(
             })
             .map(|diagnostic| diagnostic.message.clone()),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AnnotationDiagnostic {
+    severity: &'static str,
+    code: Option<String>,
+    message: String,
+}
+
+fn cli_annotation_diagnostics(
+    fixture: &TempDir,
+    output: &std::process::Output,
+    load_errors: &HashMap<String, String>,
+) -> Vec<AnnotationDiagnostic> {
+    use carina_cli::error::AppError;
+    use carina_core::parser::WarningKind;
+
+    // Read the typed production report before rendering. The subprocess below
+    // independently verifies that validate prints those same severities,
+    // counts and messages; terminal text does not expose diagnostic codes.
+    let typed = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        fixture.path(),
+        Vec::new(),
+        load_errors.clone(),
+    );
+    let mut diagnostics = Vec::new();
+    for warning in typed.warnings {
+        let code = match warning.kind {
+            WarningKind::ProviderSchemasNotLoaded => "providers_not_loaded",
+            other => panic!("unexpected CLI warning kind: {other:?}"),
+        };
+        diagnostics.push(AnnotationDiagnostic {
+            severity: "WARNING",
+            code: Some(code.to_string()),
+            message: warning.message,
+        });
+    }
+    for error in typed.errors {
+        match &error {
+            AppError::TypeResolution(_) => {}
+            AppError::ModuleCall(finding)
+                if finding.kind()
+                    == carina_core::validation::ModuleCallFindingKind::TypeResolution => {}
+            AppError::Validation(message)
+                if load_errors.values().any(|reason| reason == message) =>
+            {
+                continue;
+            }
+            other => panic!("unexpected CLI error: {other:?}"),
+        }
+        let formatted = carina_cli::error::format_error_with_source_chain(&error);
+        for (message, count) in cli_located_message_multiset(&[formatted]) {
+            assert_eq!(count, 1);
+            diagnostics.push(AnnotationDiagnostic {
+                severity: "ERROR",
+                code: None,
+                message,
+            });
+        }
+    }
+
+    let stderr = std::str::from_utf8(&output.stderr).expect("CLI diagnostics must be UTF-8");
+    let mut printed = Vec::new();
+    let mut provider_errors = 0;
+    let mut provider_notices = 0;
+    for line in stderr.lines() {
+        if load_errors
+            .keys()
+            .any(|provider| line.starts_with(&format!("Provider '{provider}' ")))
+        {
+            provider_notices += 1;
+            continue;
+        }
+        if let Some(warning) = line.trim().strip_prefix('⚠') {
+            let (_, message) = warning.split_once(": ").expect("located CLI warning");
+            printed.push(("WARNING", message.to_string()));
+            continue;
+        }
+        let message = line
+            .strip_prefix("Error: ")
+            .unwrap_or_else(|| panic!("unexpected stderr line: {line:?}; stderr: {stderr}"));
+        // Each located finding's file/line header is rendered separately.
+        if message
+            .rsplit_once(" at line ")
+            .is_some_and(|(file, line)| file.ends_with(".crn") && line.parse::<usize>().is_ok())
+        {
+            continue;
+        }
+        if load_errors
+            .keys()
+            .any(|provider| message.starts_with(&format!("Provider '{provider}' ")))
+        {
+            provider_errors += 1;
+        } else {
+            printed.push(("ERROR", message.to_string()));
+        }
+    }
+    assert_eq!(provider_errors, load_errors.len(), "{stderr}");
+    assert_eq!(provider_notices, load_errors.len(), "{stderr}");
+    let mut expected = diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.severity, diagnostic.message.clone()))
+        .collect::<Vec<_>>();
+    expected.sort();
+    printed.sort();
+    assert_eq!(
+        printed, expected,
+        "subprocess and typed CLI report differ: {stderr}"
+    );
+    let success = load_errors.is_empty()
+        && diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != "ERROR");
+    assert_eq!(output.status.success(), success, "{stderr}");
+    if success {
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("successful validate JSON");
+        assert_eq!(json["status"], "ok", "{json}");
+        assert!(
+            json.get("warnings").is_none(),
+            "unexpected warnings: {json}"
+        );
+    } else {
+        assert!(output.stdout.is_empty(), "failed validate emitted stdout");
+    }
+    diagnostics.sort();
+    diagnostics
+}
+
+fn lsp_annotation_diagnostics(
+    diagnostics: &[tower_lsp::lsp_types::Diagnostic],
+    load_errors: &HashMap<String, String>,
+) -> Vec<AnnotationDiagnostic> {
+    use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
+
+    let mut annotations = Vec::new();
+    let mut provider_errors = 0;
+    for diagnostic in diagnostics {
+        // Provider-loading notices have their own existing CLI/LSP rendering;
+        // this comparison covers every provider-type diagnostic without filtering
+        // errors or warnings by message text.
+        if diagnostic.severity == Some(DiagnosticSeverity::INFORMATION) {
+            assert!(
+                load_errors.iter().any(|(provider, reason)| {
+                    diagnostic.message == format!("Provider '{provider}' is not loaded: {reason}")
+                }),
+                "unexpected LSP notice: {diagnostic:#?}"
+            );
+            provider_errors += 1;
+            continue;
+        }
+        let severity = match diagnostic.severity {
+            Some(DiagnosticSeverity::WARNING) => "WARNING",
+            Some(DiagnosticSeverity::ERROR) => "ERROR",
+            other => panic!("unexpected LSP severity: {other:?}"),
+        };
+        let code = match &diagnostic.code {
+            Some(NumberOrString::String(code)) => Some(code.clone()),
+            None => None,
+            other => panic!("unexpected LSP code: {other:?}"),
+        };
+        annotations.push(AnnotationDiagnostic {
+            severity,
+            code,
+            message: diagnostic.message.clone(),
+        });
+    }
+    assert_eq!(provider_errors, load_errors.len(), "{diagnostics:#?}");
+    annotations.sort();
+    annotations
+}
+
+fn assert_annotation_parity(
+    source: &str,
+    engine: DiagnosticEngine,
+    failed_provider: bool,
+    expected: &[(&str, Option<&str>, &str)],
+) {
+    let fixture = write_fixture(&[("main.crn", source)]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
+        .args(["validate", fixture.path().to_str().unwrap(), "--json"])
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .output()
+        .expect("run carina validate");
+    let load_errors = if failed_provider {
+        HashMap::from([(
+            "broken".to_string(),
+            "fixture provider unavailable".to_string(),
+        )])
+    } else {
+        HashMap::new()
+    };
+    let cli = cli_annotation_diagnostics(&fixture, &output, &load_errors);
+    let mut unmatched = cli.clone();
+    for (severity, code, message) in expected {
+        let index = unmatched
+            .iter()
+            .position(|diagnostic| {
+                diagnostic.severity == *severity
+                    && diagnostic.code.as_deref() == *code
+                    && diagnostic.message.contains(message)
+            })
+            .unwrap_or_else(|| panic!("missing {severity} {code:?} {message:?}: {cli:#?}"));
+        unmatched.remove(index);
+    }
+    assert!(
+        unmatched.is_empty(),
+        "unexpected CLI diagnostics: {unmatched:#?}"
+    );
+
+    let path = fixture.path().join("main.crn");
+    let document = Document::new_with_path(
+        source.to_string(),
+        path.clone(),
+        Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    // CLI validate receives a directory, so LSP must analyze that same
+    // directory. An orphan buffer deliberately has different catalog authority.
+    let diagnostics = engine
+        .with_provider_errors(load_errors.clone())
+        .analyze(&document, Some(&path));
+    let lsp = lsp_annotation_diagnostics(&diagnostics, &load_errors);
+    assert_eq!(
+        lsp, cli,
+        "CLI and LSP must agree on every type finding's severity, code, count, and message; source: {source}; diagnostics: {diagnostics:#?}"
+    );
+}
+
+fn undeclared_type_engine() -> DiagnosticEngine {
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(TestProviderFactory {
+        name: "mock".to_string(),
+        schemas: Vec::new(),
+    })];
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        SchemaRegistry::new(),
+    );
+    DiagnosticEngine::new(Arc::new(loaded), vec!["mock".to_string()])
+}
+
+const FAILED_ANNOTATION_PROVIDER: &str =
+    "provider broken { source = 'file:///definitely-missing/broken.wasm' }\n";
+
+#[test]
+fn providerless_directory_has_cli_lsp_strict_attribute_parity() {
+    assert_annotation_parity(
+        "attributes { x: AwsAccountId = '123' }\n",
+        DiagnosticEngine::without_loaded_provider_schemas(),
+        false,
+        &[("ERROR", None, "unknown custom type 'AwsAccountId'")],
+    );
+}
+
+#[test]
+fn failed_provider_dotted_annotation_has_cli_lsp_deferral_parity() {
+    assert_annotation_parity(
+        &format!("{FAILED_ANNOTATION_PROVIDER}exports {{\n  x: broken.AccountId = 42\n}}\n"),
+        DiagnosticEngine::without_loaded_provider_schemas(),
+        true,
+        &[(
+            "WARNING",
+            Some("providers_not_loaded"),
+            "type check for broken.AccountId was deferred",
+        )],
+    );
+}
+
+#[test]
+fn unloaded_bare_function_annotation_has_cli_lsp_deferral_parity() {
+    for invocation in ["", "exports { x = echo('arn:aws:s3:::bucket') }\n"] {
+        let mut expected = vec![(
+            "WARNING",
+            Some("providers_not_loaded"),
+            "type check for Arn was deferred",
+        )];
+        if !invocation.is_empty() {
+            expected.push(expected[0]);
+        }
+        assert_annotation_parity(
+            &format!(
+                "{FAILED_ANNOTATION_PROVIDER}fn echo(value: Arn): String {{ 'value' }}\n{invocation}"
+            ),
+            DiagnosticEngine::without_loaded_provider_schemas(),
+            true,
+            &expected,
+        );
+    }
+}
+
+#[test]
+fn loaded_undeclared_bare_function_annotation_has_cli_lsp_error_parity() {
+    for provider in ["", "provider mock {}\n"] {
+        for invocation in ["", "exports { x = echo('arn:aws:s3:::bucket') }\n"] {
+            assert_annotation_parity(
+                &format!("{provider}fn echo(value: Arn): String {{ 'value' }}\n{invocation}"),
+                undeclared_type_engine(),
+                false,
+                &[("ERROR", None, "unknown custom type 'Arn'")],
+            );
+        }
+    }
+}
+
+#[test]
+fn unrelated_declaration_error_keeps_cli_lsp_pending_call_parity() {
+    for failed_call in ["", "exports { failed: String = bad('id') }\n"] {
+        assert_annotation_parity(
+            &format!(
+                "provider mock {{}}\n{FAILED_ANNOTATION_PROVIDER}fn bad(x: mock.Missing) {{ x }}\nfn echo(x: Arn): String {{ 'ok' }}\n{failed_call}exports {{ x = echo('id') }}\n"
+            ),
+            undeclared_type_engine(),
+            true,
+            &[
+                ("ERROR", None, "unknown custom type 'mock.Missing'"),
+                (
+                    "WARNING",
+                    Some("providers_not_loaded"),
+                    "type check for Arn was deferred",
+                ),
+                (
+                    "WARNING",
+                    Some("providers_not_loaded"),
+                    "type check for Arn was deferred",
+                ),
+            ],
+        );
+    }
 }
 
 struct ModuleCallParityCase {

@@ -10128,7 +10128,8 @@ fn user_fn_arn_argument_defers_without_schemas_and_rejects_unknown_loaded_type()
             name = f("arn:aws:s3:::my-bucket")
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default())
+    let source_file = std::path::Path::new("/project/main.crn");
+    let parsed = parse_file(input, source_file, &ProviderContext::default())
         .expect("bootstrap parsing must retain the unresolved check");
     assert!(matches!(
         parsed.resources[0].attributes["name"],
@@ -10140,6 +10141,7 @@ fn user_fn_arn_argument_defers_without_schemas_and_rejects_unknown_loaded_type()
     assert_eq!(checks.len(), 1, "the argument check must remain pending");
     assert_eq!(checks[0].function_name, "f");
     assert_eq!(checks[0].source_line, 5);
+    assert_eq!(checks[0].source_file.as_deref(), Some(source_file));
     assert!(matches!(
         parsed.user_functions["f"].params[0].param_type,
         Some(TypeExpr::UnloadedSchemaType(_))

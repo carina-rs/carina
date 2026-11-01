@@ -63,6 +63,30 @@ pub fn validate_with_factories(
     path: &Path,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
+    let diagnostics = validate_diagnostics_with_factories(path, factories, Default::default());
+    for warning in &diagnostics.warnings {
+        print_provider_type_warning(warning);
+    }
+    diagnostics
+        .errors
+        .iter()
+        .map(|error| crate::error::format_error_with_source_chain(error))
+        .collect()
+}
+
+/// Typed output from the production validation report, before terminal rendering.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct ValidateDiagnostics {
+    pub errors: Vec<AppError>,
+    pub warnings: Vec<carina_core::parser::ParseWarning>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn validate_diagnostics_with_factories(
+    path: &Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+    load_errors: std::collections::HashMap<String, String>,
+) -> ValidateDiagnostics {
     let provider_context = ProviderContext::default();
     let loaded = match load_configuration_with_config(
         path,
@@ -70,30 +94,26 @@ pub fn validate_with_factories(
         &carina_core::schema::SchemaRegistry::new(),
     ) {
         Ok(l) => l,
-        Err(e) => return vec![e.to_string()],
+        Err(e) => {
+            return ValidateDiagnostics {
+                errors: vec![AppError::Config(e.to_string())],
+                warnings: Vec::new(),
+            };
+        }
     };
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::for_test_with_provider_phase(
+    let providers = ProviderLoad::for_test_with_load_errors(
         &crate::test_support::TestCommandRuntime::new(),
         factories,
         &parsed.providers,
+        load_errors,
     );
 
-    let mut error_reports: Vec<String> = Vec::new();
-    error_reports.extend(
-        super::validate_and_resolve_errors(
-            &parsed,
-            base_dir,
-            &providers,
-            false,
-            &loaded.duplicate_declarations,
-        )
-        .iter()
-        .map(|error| crate::error::format_error_with_source_chain(error)),
-    );
-
-    error_reports
+    let (errors, warnings) = providers
+        .validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations)
+        .into_test_diagnostics();
+    ValidateDiagnostics { errors, warnings }
 }
 
 /// Test-support twin of [`validate_with_factories`] that returns the
