@@ -9,7 +9,16 @@ mutable attributes for multiple 'mock.test.resource' declarations using provider
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
 fn unique_list_scope_fixture(second_body: &str) -> (String, Vec<Diagnostic>) {
-    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    unique_list_declaration_scope_fixture(second_body, false)
+}
+
+fn unique_list_declaration_scope_fixture(
+    second_body: &str,
+    let_bound: bool,
+) -> (String, Vec<Diagnostic>) {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ListElements, ResourceSchema, StructField,
+    };
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -54,6 +63,39 @@ fn unique_list_scope_fixture(second_body: &str) -> (String, Vec<Diagnostic>) {
             )
             .attribute(
                 AttributeSchema::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "Rule",
+                        vec![
+                            StructField::required("label", AttributeType::string()).build(),
+                            StructField::optional(
+                                "tags",
+                                AttributeType::list(AttributeType::string()),
+                            )
+                            .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "unique_rules",
+                    AttributeType::refined_list(
+                        AttributeType::struct_(
+                            "UniqueRule",
+                            vec![StructField::required("label", AttributeType::string()).build()],
+                        ),
+                        true,
+                        None,
+                        ListElements::Unique,
+                    ),
+                )
+                .with_block_name("unique_rule")
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
                     "matrix",
                     AttributeType::refined_list(
                         AttributeType::list(AttributeType::string()),
@@ -70,12 +112,132 @@ fn unique_list_scope_fixture(second_body: &str) -> (String, Vec<Diagnostic>) {
     let engine = custom_engine(schemas);
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
-    let source = format!(
-        "mock.test.UniqueLists {{\n  name = \"first\"\n  tags_list = [\"ok\"]\n  modes = [allow]\n  values = [\"first\"]\n}}\nmock.test.UniqueLists {{\n  name = \"second\"\n  {second_body}\n}}\n"
-    );
+    let source = if let_bound {
+        format!(
+            "let a = mock.test.UniqueLists {{ name = \"a\" }}\nlet b = mock.test.UniqueLists {{ name = \"b\"\n  {second_body}\n}}\n"
+        )
+    } else {
+        format!(
+            "mock.test.UniqueLists {{\n  name = \"first\"\n  tags_list = [\"ok\"]\n  modes = [allow]\n  values = [\"first\"]\n}}\nmock.test.UniqueLists {{\n  name = \"second\"\n  {second_body}\n}}\n"
+        )
+    };
     std::fs::write(directory.path().join("main.crn"), &source).unwrap();
     let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
     (source, diagnostics)
+}
+
+#[test]
+fn round5_let_bound_plain_list_error_stays_in_second_resource() {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture("tags_list = [\"ok\", 5]", true);
+    let diagnostic = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(diagnostic.range.start.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.range.end.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+}
+
+#[test]
+fn round5_let_bound_duplicate_stays_in_second_resource() {
+    let (_, diagnostics) =
+        unique_list_declaration_scope_fixture("values = [\"repo\", \"repo\"]", true);
+    let diagnostic = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    assert_eq!(diagnostic.range.start.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.range.end.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round5_let_bound_struct_list_error_stays_in_second_resource() {
+    let (_, diagnostics) =
+        unique_list_declaration_scope_fixture("rules {\n    label = 5\n  }", true);
+    let diagnostic = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(diagnostic.range.start.line, 3, "{diagnostics:#?}");
+    assert_eq!(diagnostic.range.end.line, 3, "{diagnostics:#?}");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+}
+
+#[test]
+fn round5_let_bound_unknown_attribute_is_reported_once() {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture("typo = true", true);
+    let diagnostic = only_message_diagnostic(&diagnostics, "Unknown attribute 'typo'");
+    assert_eq!(diagnostic.range.start.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.range.end.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round5_indexed_list_errors_use_element_spans() {
+    for body in [
+        "tags_list = [\"ok\", 5, 6]",
+        "matrix = [[\"ok\", 5, 6]]",
+        "rules = [5, 6]",
+        "rules {\n    label = \"ok\"\n    tags = [\"ok\", 5, 6]\n  }",
+    ] {
+        let (source, diagnostics) = unique_list_scope_fixture(body);
+        let mut errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("Type mismatch"))
+            .collect();
+        errors.sort_by_key(|diagnostic| diagnostic.range.start);
+        assert_eq!(errors.len(), 2, "{body}: {diagnostics:#?}");
+        for (diagnostic, element) in errors.iter().zip(["5", "6"]) {
+            let prefix = &source[..source.rfind(element).unwrap()];
+            let line = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
+            let start = prefix.rsplit('\n').next().unwrap().chars().count() as u32;
+            assert_eq!(
+                diagnostic.range,
+                Range::new(Position::new(line, start), Position::new(line, start + 1)),
+                "{body}: {diagnostics:#?}"
+            );
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        }
+        assert_ne!(errors[0].range, errors[1].range);
+    }
+}
+
+#[test]
+fn round5_indexed_list_errors_keep_paths_without_element_spans() {
+    for (body, path) in [
+        ("tags_list = concat([5, 6], [\"ok\"])", "tags_list"),
+        ("matrix = [concat([5, 6], [\"ok\"])]", "matrix[0]"),
+    ] {
+        let (_, diagnostics) = unique_list_scope_fixture(body);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected String"))
+            .collect();
+        assert_eq!(errors.len(), 2, "{body}: {diagnostics:#?}");
+        for index in [1, 2] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(&format!("{path}[{index}]"))),
+                "{body}: {diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_unique_lists_continue_to_allow_duplicate_elements() {
+    for body in [
+        "tags_list = [\"ok\", \"ok\"]",
+        "rules {\n    label = \"ok\"\n  }\n  rules {\n    label = \"ok\"\n  }",
+    ] {
+        let (_, diagnostics) = unique_list_scope_fixture(body);
+        assert!(diagnostics.is_empty(), "{body}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn round5_unique_list_block_alias_reports_one_duplicate() {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture(
+        "unique_rule {\n    label = \"repo\"\n  }\n  unique_rule {\n    label = \"repo\"\n  }",
+        true,
+    );
+    let duplicate = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    assert_eq!(duplicate.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(duplicate.range.start.line, 5, "{diagnostics:#?}");
+    assert_eq!(duplicate.range.end.line, 6, "{diagnostics:#?}");
 }
 
 #[test]

@@ -45,29 +45,22 @@ impl DiagnosticEngine {
         let mut reported_duplicate = false;
         for (path, err) in errors {
             let is_duplicate = super::is_duplicate_list_error(&err);
-            if is_duplicate
-                && let Some(range) = self
-                    .value_range_for_path(doc, attr_name, &path, scope)
-                    .or_else(|| {
-                        self.range_for_path(doc, attr_name, &path, scope).map(
-                            |(line, col, end_col)| {
-                                Range::new(
-                                    tower_lsp::lsp_types::Position::new(line, col),
-                                    tower_lsp::lsp_types::Position::new(line, end_col),
-                                )
-                            },
+            let ends_in_index = matches!(path.steps().last(), Some(FieldPathStep::Index(_)));
+            let element_range = if is_duplicate || ends_in_index {
+                self.value_range_for_path(doc, attr_name, &path, scope)
+            } else {
+                None
+            };
+            let range = element_range.or_else(|| {
+                self.range_for_path(doc, attr_name, &path, scope)
+                    .map(|(line, col, end_col)| {
+                        Range::new(
+                            tower_lsp::lsp_types::Position::new(line, col),
+                            tower_lsp::lsp_types::Position::new(line, end_col),
                         )
                     })
-            {
-                diagnostics.push(super::carina_diagnostic_range(
-                    range,
-                    DiagnosticSeverity::ERROR,
-                    err.with_attribute(attr_name).to_string(),
-                ));
-                reported_duplicate = true;
-                continue;
-            }
-            if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path, scope) {
+            });
+            if let Some(range) = range {
                 if path.is_empty() {
                     let tagged = err.clone().with_attribute(attr_name);
                     if let Some(diagnostic) =
@@ -82,19 +75,29 @@ impl DiagnosticEngine {
                     .steps()
                     .iter()
                     .any(|step| matches!(step, FieldPathStep::Index(_)));
+                // Computed lists have no authored element span. Preserve the
+                // collected path so separate item errors remain distinguishable.
+                // Duplicate and field-group messages already carry their paths.
+                let attribute = if ends_in_index
+                    && element_range.is_none()
+                    && !is_duplicate
+                    && !matches!(&err, TypeError::FieldGroupViolation { .. })
+                {
+                    format!("{attr_name}{path}")
+                } else {
+                    attr_name.to_string()
+                };
                 let err = if is_item_error || matches!(&err, TypeError::FieldGroupViolation { .. })
                 {
-                    err.with_attribute(attr_name)
+                    err.with_attribute(&attribute)
                 } else {
                     err
                 };
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    end_col,
+                diagnostics.push(super::carina_diagnostic_range(
+                    range,
                     severity_for_validation_error(&err),
                     if is_item_error && err.attribute_name().is_none() {
-                        format!("{err} for '{attr_name}'")
+                        format!("{err} for '{attribute}'")
                     } else {
                         err.to_string()
                     },

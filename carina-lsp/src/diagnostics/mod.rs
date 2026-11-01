@@ -1184,7 +1184,10 @@ impl DiagnosticEngine {
                     }
                     ResourceRef::Resource(_)
                     | ResourceRef::LiveComposition(_)
-                    | ResourceRef::DataSource(_) => None,
+                    | ResourceRef::DataSource(_) => rref.binding().and_then(|binding| {
+                        self.find_let_binding_position(&doc.text(), binding)
+                            .map(|(line, _)| line)
+                    }),
                     ResourceRef::Deferred {
                         resource: _resource,
                         deferred: _deferred,
@@ -1444,12 +1447,13 @@ impl DiagnosticEngine {
                                     line,
                                     col,
                                     col + attr_name.len() as u32,
-                                    DiagnosticSeverity::WARNING,
+                                    DiagnosticSeverity::ERROR,
                                     format!(
                                         "Unknown attribute '{}' for resource type '{}'{}",
                                         attr_name, resource_id.resource_type, suggestion
                                     ),
                                 ));
+                                reported_attribute_diagnostics.insert(canonical_name.to_string());
                             }
                             continue;
                         }
@@ -1566,7 +1570,8 @@ impl DiagnosticEngine {
                                     build_schema_diagnostic_from_error(&tagged, range)
                                 {
                                     if is_duplicate_list_error(&tagged) {
-                                        reported_attribute_diagnostics.insert(attr_name.clone());
+                                        reported_attribute_diagnostics
+                                            .insert(canonical_name.to_string());
                                     }
                                     diagnostics.push(diagnostic);
                                     None
@@ -1809,7 +1814,8 @@ impl DiagnosticEngine {
                                         scope,
                                     );
                                 if reported_duplicate {
-                                    reported_attribute_diagnostics.insert(attr_name.clone());
+                                    reported_attribute_diagnostics
+                                        .insert(canonical_name.to_string());
                                 }
                                 diagnostics.extend(nested_diagnostics);
                             }
@@ -1877,11 +1883,16 @@ impl DiagnosticEngine {
                             }
                             let is_masked_secret_error = error.to_string().contains("(secret)");
                             // Statically evaluated expressions may first become known
-                            // in this pass. Suppress a list refinement only when the
-                            // attribute pass actually emitted its diagnostic.
-                            if is_duplicate_list_error(&error)
+                            // in this pass. Suppress list refinements and unknown
+                            // attributes only when the attribute pass emitted them.
+                            if (is_duplicate_list_error(&error)
+                                || matches!(&error, TypeError::UnknownAttribute { .. }))
                                 && error.attribute_name().is_some_and(|attribute| {
-                                    reported_attribute_diagnostics.contains(attribute)
+                                    let canonical = bn_map
+                                        .get(attribute)
+                                        .map(String::as_str)
+                                        .unwrap_or(attribute);
+                                    reported_attribute_diagnostics.contains(canonical)
                                 })
                             {
                                 continue;
@@ -2425,9 +2436,10 @@ impl DiagnosticEngine {
 ///
 /// - For `Deferred(for_expr)` the scope starts at the `for` line and ends
 ///   at the closing brace of the for expression.
-/// - For an authored anonymous `Direct` resource, the parser-derived start
-///   line selects that exact declaration. Other direct resources fall back to
-///   locating the `provider.resource_type` token.
+/// - For an authored `Direct` resource, the start line of its anonymous
+///   declaration or its own `let` binding selects that exact declaration.
+///   Other direct resources fall back to locating the `provider.resource_type`
+///   token.
 ///
 /// Returns `None` when the block can't be located (e.g., during partial
 /// parses). Callers that fall back to `None` get document-wide search —
