@@ -9,8 +9,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
-    ModuleConstraintId, PendingModuleConstraint, ResolvedDataSource, ResolvedResource, Resource,
-    ResourceId, ResourceIdentity,
+    ModuleConstraintId, PendingModuleConstraint, PlaceholderKind, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceId, ResourceIdentity,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -35,7 +35,7 @@ use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 use crate::wiring::{
-    CanonicalResourcePair, OverrideAwareBuildMode, OverrideAwareResources,
+    OverrideAwareBuildMode, OverrideAwareResources, ParserCanonicalResourcePair,
     resolve_config_block_names_for_test,
 };
 
@@ -68,8 +68,13 @@ fn complete_create(state: carina_core::resource::State) -> carina_core::executor
     }
 }
 
-fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
-    parsed: carina_core::parser::File<E>,
+fn resolve_module_file_for_test<E: carina_core::parser::ExportParamLike>(
+    parsed: carina_core::parser::File<
+        E,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::parser::ParsedDeferredForPhase<carina_core::resource::ParserPlaceholder>,
+    >,
 ) -> carina_core::parser::ModuleResolvedFile<E> {
     let base_dir = parsed
         .module_calls
@@ -84,6 +89,22 @@ fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("test fixture crosses module resolution")
+}
+
+fn resolve_file_for_test<E>(
+    parsed: carina_core::parser::File<
+        E,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::parser::ParsedDeferredForPhase<carina_core::resource::ParserPlaceholder>,
+    >,
+) -> carina_core::parser::ExpandedFile<E::Expanded>
+where
+    E: carina_core::parser::ExportParamLike + carina_core::parser::IntoExpandedExportParam,
+{
+    resolve_module_file_for_test(parsed)
+        .into_expanded()
+        .expect("test fixture must contain no parser placeholders")
 }
 
 fn complete_update(
@@ -101,9 +122,9 @@ fn canonical_unresolved_for_test(
     ctx: &WiringContext,
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> CanonicalResourcePair<carina_core::parser::InferredExportParam> {
+) -> ParserCanonicalResourcePair<carina_core::parser::InferredExportParam> {
     resolve_config_block_names_for_test(
-        resolve_file_for_test(parsed.clone()),
+        resolve_module_file_for_test(parsed.clone()),
         unresolved.clone(),
         ctx.schemas(),
     )
@@ -123,7 +144,7 @@ fn canonical_resolved_unresolved_for_test(
     ctx: &WiringContext,
     parsed: &carina_core::parser::ModuleResolvedInferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> CanonicalResourcePair<carina_core::parser::InferredExportParam> {
+) -> ParserCanonicalResourcePair<carina_core::parser::InferredExportParam> {
     resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
         .unwrap_or_else(|errors| {
             panic!(
@@ -139,17 +160,13 @@ fn canonical_resolved_unresolved_for_test(
 
 fn canonical_resources_for_test(
     resources: Vec<Resource>,
-    schemas: &SchemaRegistry,
-) -> CanonicalResourcePair<carina_core::parser::ParsedExportParam> {
-    let mut unresolved = carina_core::parser::ParsedFile::default();
-    unresolved.resources = resources;
-    let resolved = resolve_file_for_test(unresolved.clone());
-    resolve_config_block_names_for_test(
-        resolved,
-        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        schemas,
-    )
-    .expect("test block-name resolution must succeed")
+    _schemas: &SchemaRegistry,
+) -> crate::wiring::CanonicalResourcePair<
+    carina_core::parser::ParsedExportParam<carina_core::resource::NoPlaceholder>,
+> {
+    let mut parsed = carina_core::parser::ExpandedParsedFile::default();
+    parsed.resources = resources.clone();
+    crate::wiring::CanonicalResourcePair::for_test(parsed, resources)
 }
 
 fn validated_apply_config_for_test(
@@ -158,7 +175,7 @@ fn validated_apply_config_for_test(
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> ValidatedConfig {
     let resources = canonical_unresolved_for_test(wiring.context(), parsed, unresolved);
-    ValidatedConfig::from_wiring_ref_for_test(wiring, resources)
+    wiring.validated_parser_pair_for_test(resources)
 }
 
 fn validated_resolved_apply_config_for_test(
@@ -166,16 +183,20 @@ fn validated_resolved_apply_config_for_test(
     parsed: &carina_core::parser::ModuleResolvedInferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> ValidatedConfig {
-    let resources = canonical_resolved_unresolved_for_test(wiring.context(), parsed, unresolved);
+    let resources = canonical_resolved_unresolved_for_test(wiring.context(), parsed, unresolved)
+        .into_expanded_for_test()
+        .expect("resolved test pair must contain no parser placeholders");
     ValidatedConfig::from_wiring_ref_for_test(wiring, resources)
 }
 
 fn validated_reload_owner_for_test(wiring: &ValidatedWiring) -> ValidatedConfig {
-    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
+    let parsed = resolve_module_file_for_test(carina_core::parser::InferredFile::default());
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let resources = canonical_resolved_unresolved_for_test(wiring.context(), &parsed, &unresolved);
+    let resources = canonical_resolved_unresolved_for_test(wiring.context(), &parsed, &unresolved)
+        .into_expanded_for_test()
+        .expect("resolved reload pair must contain no parser placeholders");
     ValidatedConfig::from_wiring_ref_for_test(wiring, resources)
 }
 
@@ -202,6 +223,35 @@ fn mock_http_wasm_path() -> Option<PathBuf> {
     .into_iter()
     .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
     .find(|path| path.exists())
+}
+
+fn mock_http_test_egress(
+    load: &carina_provider_resolver::VerifiedLoad,
+    lock_dir: &Path,
+) -> carina_provider_resolver::LockedEgress {
+    let declaration = carina_provider_resolver::VerifiedEgressDeclaration::read(load)
+        .expect("mock HTTP provider must carry a valid egress declaration");
+    let canonical_source = declaration.source().to_string();
+    let source = canonical_source
+        .strip_prefix("file://")
+        .map(|path| format!("file://{}", lock_dir.join(path).display()))
+        .unwrap_or(canonical_source);
+    let hosts = declaration
+        .patterns()
+        .iter()
+        .map(|pattern| format!("    {:?},", pattern.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!hosts.is_empty(), "mock HTTP provider must declare egress");
+    let lock = format!(
+        "version = 5\n\n[[provider]]\nname = \"mock_http\"\nsource = {source:?}\nmode = \"file\"\nsha256 = {:?}\n\n[provider.egress]\nconsent = \"explicit\"\nhosts = [\n{hosts}\n]\n",
+        declaration.sha256().as_str(),
+    );
+    std::fs::write(lock_dir.join("carina-providers.lock"), lock)
+        .expect("write mock HTTP egress consent");
+    carina_provider_resolver::load_locked_egress(lock_dir, load)
+        .expect("load mock HTTP egress consent")
+        .expect("mock HTTP egress consent must match the fixture")
 }
 
 fn spawn_mock_http_server(
@@ -277,7 +327,7 @@ fn mock_http_resource(identity: &str, address: SocketAddr, behavior: &str) -> Re
 fn mock_http_ready_config(
     factory: &dyn ProviderFactory,
 ) -> carina_core::provider::ProviderReadyConfig {
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers.push(carina_core::parser::ProviderConfig {
         name: factory.name().to_string(),
         attributes: IndexMap::new(),
@@ -379,13 +429,16 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             carina_provider_resolver::ProviderTrustClass::Untrusted,
         ),
     );
-    let fresh_factory = carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
-        fresh_verified,
-        cache.path(),
-    )
-    .await
-    .expect("load mock HTTP WASM provider")
-    .with_http_test_route("phase-test.invalid", server_address);
+    let locked_egress = mock_http_test_egress(&fresh_verified, cache.path());
+    let fresh_factory =
+        carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            fresh_verified,
+            cache.path(),
+            Some(&locked_egress),
+        )
+        .await
+        .expect("load mock HTTP WASM provider")
+        .with_http_test_route("phase-test.invalid", server_address);
     let fresh_ready = mock_http_ready_config(&fresh_factory);
     let fresh_initialized = fresh_factory
         .create_initialized_provider(None, &fresh_ready)
@@ -452,13 +505,15 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             carina_provider_resolver::ProviderTrustClass::Untrusted,
         ),
     );
-    let replacement_factory = carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir(
-        replacement_verified,
-        cache.path(),
-    )
-    .await
-    .expect("load replacement mock HTTP WASM provider")
-    .with_http_test_route("phase-test.invalid", server_address);
+    let replacement_factory =
+        carina_plugin_host::WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            replacement_verified,
+            cache.path(),
+            Some(&locked_egress),
+        )
+        .await
+        .expect("load replacement mock HTTP WASM provider")
+        .with_http_test_route("phase-test.invalid", server_address);
     let replacement_ready = mock_http_ready_config(&replacement_factory);
     let replacement_initialized = replacement_factory
         .create_initialized_provider(None, &replacement_ready)
@@ -783,11 +838,15 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
-fn resolved_provider_configs<E, D>(
-    parsed: &carina_core::parser::File<E, D>,
+fn resolved_provider_configs(
+    parsed: &carina_core::parser::InferredFile,
 ) -> carina_core::parser::ResolvedProviderConfigs {
+    let parsed = parsed
+        .clone()
+        .into_expanded()
+        .expect("test provider configuration must contain no parser placeholders");
     carina_core::parser::resolve_provider_attributes_with_remote(
-        parsed,
+        &parsed,
         &HashMap::new(),
         &carina_core::parser::ProviderContext::default(),
     )
@@ -795,7 +854,20 @@ fn resolved_provider_configs<E, D>(
 }
 
 fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderConfigs {
-    resolved_provider_configs(&carina_core::parser::InferredFile::default())
+    carina_core::parser::resolve_provider_attributes_with_remote(
+        &carina_core::parser::ExpandedInferredFile::default(),
+        &HashMap::new(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("empty provider configs must resolve")
+}
+
+fn expanded_provider_configs(parsed: &carina_core::parser::InferredFile) -> Vec<ProviderConfig> {
+    parsed
+        .clone()
+        .into_expanded()
+        .expect("test provider configs must contain no parser placeholders")
+        .providers
 }
 
 fn inspected_saved_plan(plan_file: PlanFile) -> InspectedPlanFile {
@@ -886,7 +958,9 @@ for account_id in orgs.accounts {
     )
     .expect("parse saved-plan loop provenance fixture");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(parsed, Path::new("."))
-        .expect("cross the deferred-body resolution seam");
+        .expect("cross the deferred-body resolution seam")
+        .into_expanded()
+        .expect("saved-plan loop fixture must contain only loop slots");
 
     let mut deferred = parsed.deferred_for_expressions().to_vec().into_iter();
 
@@ -910,12 +984,12 @@ for account_id in orgs.accounts {
     let bound = deferred.next().expect("bound deferred loop");
     let unbound = deferred.next().expect("unbound deferred loop");
     assert!(matches!(
-        &bound.target,
-        carina_core::parser::DeferredForTarget::Bound { binding }
-            if binding == "bound_items"
+        bound.target(),
+        carina_core::parser::DeferredForTarget::Bound(target)
+            if target.binding() == "bound_items"
     ));
     assert!(matches!(
-        &unbound.target,
+        unbound.target(),
         carina_core::parser::DeferredForTarget::Unbound { .. }
     ));
 
@@ -931,24 +1005,12 @@ for account_id in orgs.accounts {
         to: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
         origin: Some(origin.clone()),
     });
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-            "mock",
-            "test.resource",
-            "bound_pending",
-            None,
-        )),
-        template: Box::new(bound),
-    });
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
-            "mock",
-            "test.resource",
-            "unbound_pending",
-            None,
-        )),
-        template: Box::new(unbound),
-    });
+    plan.add(Effect::DeferredCreate(
+        carina_core::effect::DeferredCreatePayload::new(Box::new(bound)),
+    ));
+    plan.add(Effect::DeferredCreate(
+        carina_core::effect::DeferredCreatePayload::new(Box::new(unbound)),
+    ));
 
     let plan_file = record_with_builtin_mock_schemas(PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
@@ -1015,14 +1077,14 @@ for account_id in orgs.accounts {
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            UnresolvedSavedEffect::DeferredCreate { template, .. } => Some(&template.target),
+            UnresolvedSavedEffect::DeferredCreate(payload) => Some(payload.template.target()),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert!(targets.iter().any(|target| matches!(
         target,
-        carina_core::parser::DeferredForTarget::Bound { binding }
-            if binding == "bound_items"
+        carina_core::parser::DeferredForTarget::Bound(bound)
+            if bound.binding() == "bound_items"
     )));
     assert!(targets.iter().any(|target| matches!(
         target,
@@ -1289,7 +1351,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
 
     let bound = ProviderBoundPlanFile::for_test(
         inspected_saved_plan(plan_file),
-        ProviderLoad::for_test(Vec::new(), &[])
+        ProviderLoad::for_test::<carina_core::resource::NoPlaceholder>(Vec::new(), &[])
             .into_complete()
             .expect("test provider load is complete"),
         Path::new("."),
@@ -1316,8 +1378,9 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
 }
 
 fn checked_exports(
-    params: &[carina_core::parser::InferredExportParam],
-) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam> {
+    params: &[carina_core::parser::ExpandedInferredExportParam],
+) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::ExpandedInferredExportParam>
+{
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
@@ -1348,9 +1411,15 @@ fn resolve_and_materialize_exports_for_test(
 fn saved_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
-    carina_core::parser::SavedProviderConfigs::from(&resolved_provider_configs(&parsed))
+    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("test provider configs must resolve");
+    carina_core::parser::SavedProviderConfigs::from(&resolved)
 }
 
 fn deserialize_saved_provider_configs(
@@ -1359,7 +1428,9 @@ fn deserialize_saved_provider_configs(
     serde_json::from_value(serde_json::to_value(configs).unwrap()).unwrap()
 }
 
-fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
+fn saved_composition_argument<P: PlaceholderKind + PartialEq>(
+    value: Value<P>,
+) -> LiveCompositionArgument<P> {
     LiveCompositionArgument::from_value(
         value,
         carina_core::validation::resolve_consumer_static_type_for_signature(
@@ -1370,7 +1441,10 @@ fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
     )
 }
 
-fn saved_module_composition(argument: Value, rejected: &str) -> LiveComposition {
+fn saved_module_composition<P: PlaceholderKind + PartialEq>(
+    argument: Value<P>,
+    rejected: &str,
+) -> LiveComposition<P> {
     let argument_name = "value";
     LiveComposition {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1420,7 +1494,7 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
         identifier: string_value("provider-id"),
     });
 
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.resources = vec![Resource::with_provider(
         "mock",
         "test.resource",
@@ -1432,8 +1506,6 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
         to_span: None,
         id: string_value("provider-id"),
     }];
-    let parsed = resolve_file_for_test(parsed);
-
     let identifiers = import_identifiers_from_current_config(&plan, &parsed);
 
     assert!(
@@ -1472,9 +1544,8 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     ));
     current.binding = None;
     current.call_path = crate::test_composition_call_path_in(&current_source);
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.compositions = vec![current];
-    let parsed = resolve_file_for_test(parsed);
     let provider_inputs = load_and_resolve_provider_configs(
         &parsed,
         tmp.path(),
@@ -1921,7 +1992,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
     let rendered = error.to_string();
 
     assert!(
-        rendered.contains("Failed to load WASM component"),
+        rendered.contains("failed to read provider component"),
         "provider load diagnostic is missing: {rendered}"
     );
     assert!(
@@ -2081,14 +2152,10 @@ let secret_resource = mock.test.resource {{
 async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     let (_temp, downstream, parsed) =
         crate::provider_upstream_test_support::provider_upstream_fixture();
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        &downstream,
-        &ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect("test fixture crosses module resolution");
-    let inputs = load_apply_provider_inputs(&parsed, &downstream, &ProviderContext::default())
+    let expanded = parsed
+        .into_expanded()
+        .expect("provider upstream fixture has no parser placeholders");
+    let inputs = load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
         .await
         .expect("bootstrap provider inputs must resolve");
     let received_role_arn = Arc::new(Mutex::new(None));
@@ -2117,13 +2184,9 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
 async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
     let (_temp, base_dir, parsed) =
         crate::provider_upstream_test_support::provider_default_tags_missing_upstream_fixture();
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        &base_dir,
-        &ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect("test fixture crosses module resolution");
+    let parsed = parsed
+        .into_expanded()
+        .expect("provider default-tags fixture has no parser placeholders");
 
     let error =
         match load_apply_provider_inputs(&parsed, &base_dir, &ProviderContext::default()).await {
@@ -2227,15 +2290,12 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let unresolved_parsed = loaded.unresolved_parsed;
     let wiring = ValidatedWiring::from_load_for_test(providers);
     let validated_config = validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        &downstream,
-        &ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect("test fixture crosses module resolution");
+    let expanded = parsed
+        .clone()
+        .into_expanded()
+        .expect("provider upstream fixture has no parser placeholders");
     let stale_inputs =
-        load_apply_provider_inputs(&parsed, &downstream, &ProviderContext::default())
+        load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
             .await
             .unwrap();
     assert_eq!(
@@ -3519,11 +3579,17 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         })],
         &[],
     );
-    let ctx = wiring.context();
-    let provider_configs = resolved_provider_configs(&parsed);
-    let canonical_resources =
-        canonical_resolved_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
-    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
+    let expanded = parsed
+        .clone()
+        .into_expanded()
+        .expect("module data-source fixture has no parser placeholders");
+    let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+        &expanded,
+        &HashMap::new(),
+        &ProviderContext::default(),
+    )
+    .expect("module data-source provider configs must resolve");
+    let validated = validated_resolved_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -3655,11 +3721,18 @@ let lookup = read mock.iam.Roles {{
         &loaded.duplicate_declarations,
     );
     assert!(validation_errors.is_empty(), "{validation_errors:?}");
-    let mut composition = saved_module_composition(string_value("bad"), "bad");
+    let mut composition = saved_module_composition(
+        Value::<carina_core::resource::ParserPlaceholder>::Concrete(ConcreteValue::String(
+            "bad".into(),
+        )),
+        "bad",
+    );
     composition.signature.attributes.insert(
         "value".to_string(),
         carina_core::resource::LiveCompositionAttribute::from_value(
-            string_value("^existing$"),
+            Value::<carina_core::resource::ParserPlaceholder>::Concrete(ConcreteValue::String(
+                "^existing$".to_string().into(),
+            )),
             None,
         ),
     );
@@ -3668,11 +3741,16 @@ let lookup = read mock.iam.Roles {{
         "name_regex",
         Value::resource_ref("checked", "value", Vec::new()),
     );
+    let expanded_provider_configs = parsed
+        .clone()
+        .into_expanded()
+        .expect("phase-2 constraint fixture has no leftover parser placeholders")
+        .providers;
     let wiring = ValidatedWiring::from_factories_for_test(
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
-        &parsed.providers,
+        &expanded_provider_configs,
     );
     let observer_factory = fixture.observer_factory();
 
@@ -3824,7 +3902,7 @@ fn apply_time_classification_uses_folded_data_source_preserved_dependency() {
 #[test]
 fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
     let configured = DataSource::with_provider("mock", "iam.Roles", "configured", None);
-    let unexpected = DataSource::with_provider("mock", "iam.Roles", "unexpected", None);
+    let unexpected: DataSource = DataSource::with_provider("mock", "iam.Roles", "unexpected", None);
 
     let missing = data_source_values_from_saved_plan(std::slice::from_ref(&configured), &[])
         .expect_err("a missing saved outcome must be rejected");
@@ -4328,13 +4406,9 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     )
     .expect("load plan fixture")
     .parsed;
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        &downstream,
-        &ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect("test fixture crosses module resolution");
+    let parsed = parsed
+        .into_expanded()
+        .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
         &parsed,
         &downstream,
@@ -4409,7 +4483,7 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     let fixture = ApplyCancellationFixture::new();
     let mut parsed = carina_core::parser::InferredFile::default();
     parsed.compositions = vec![saved_module_composition(
-        Value::resource_ref("missing", "value", vec![]),
+        Value::<carina_core::resource::ParserPlaceholder>::resource_ref("missing", "value", vec![]),
         "bad",
     )];
     let unresolved_parsed = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
@@ -5115,7 +5189,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    seed_apply_cascade_state(&fixture, ctx, &parsed.providers, false);
+    seed_apply_cascade_state(&fixture, ctx, &expanded_provider_configs(&parsed), false);
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
@@ -5183,7 +5257,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    seed_apply_cascade_state(&fixture, ctx, &parsed.providers, true);
+    seed_apply_cascade_state(&fixture, ctx, &expanded_provider_configs(&parsed), true);
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
@@ -5216,8 +5290,12 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
 
     let raw = std::fs::read_to_string(fixture.state_path()).expect("state file must be written");
     let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
-    let old_subnet_identity =
-        concrete_subnet_identity(ctx, &parsed.providers, "vpc-old", "10.220.1.0/24");
+    let old_subnet_identity = concrete_subnet_identity(
+        ctx,
+        &expanded_provider_configs(&parsed),
+        "vpc-old",
+        "10.220.1.0/24",
+    );
     let subnet_rows = state["resources"]
         .as_array()
         .expect("state resources must be an array")
@@ -5416,7 +5494,12 @@ awscc.ec2.Subnet {{
 
     let mut subnet_state = ResourceState::try_applied(
         "ec2.Subnet",
-        concrete_subnet_identity(ctx, &parsed.providers, "vpc-old", "10.220.1.0/24"),
+        concrete_subnet_identity(
+            ctx,
+            &expanded_provider_configs(&parsed),
+            "vpc-old",
+            "10.220.1.0/24",
+        ),
         "awscc",
         "subnet-old",
     )
@@ -5570,7 +5653,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
 
     let provider_configs = resolved_provider_configs(&parsed);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
-    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -5686,7 +5769,7 @@ let nat = mock.ec2.NatGateway {{
     let provider_configs = resolved_provider_configs(&parsed);
     let step1_state = Some(step1_state);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
-    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
     let clean_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -5745,7 +5828,7 @@ let nat = mock.ec2.NatGateway {{
     let provider_configs = resolved_provider_configs(&parsed);
     let step2_state = Some(step2_state);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
-    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -5872,7 +5955,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
-    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -6013,7 +6096,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let provider_configs = resolved_provider_configs(&parsed);
     let before_failure = Some(fixture.read_state().await);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
-    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
     let removal_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -6094,7 +6177,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let provider_configs = resolved_provider_configs(&parsed);
     let saved = Some(saved);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
-    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -6169,7 +6252,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let (parsed, unresolved_parsed) = load();
     let provider_configs = resolved_provider_configs(&parsed);
     let canonical_resources = canonical_unresolved_for_test(ctx, &parsed, &unresolved_parsed);
-    let validated = ValidatedConfig::from_wiring_ref_for_test(&wiring, canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -6935,13 +7018,12 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
 
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
     let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: backend.as_ref(),
-            parsed: &parsed,
+            parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -6973,12 +7055,11 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
         "bucket",
         Value::Concrete(ConcreteValue::String("state-bucket".into())),
     );
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.compositions = vec![saved_module_composition(
         Value::Concrete(ConcreteValue::String("forbidden".into())),
         "forbidden",
     )];
-    let parsed = resolve_file_for_test(parsed);
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
@@ -7037,14 +7118,12 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     );
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
-
     let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: backend.as_ref(),
-            parsed: &parsed,
+            parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -7123,14 +7202,12 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     );
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
-
     let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: backend.as_ref(),
-            parsed: &parsed,
+            parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -7214,14 +7291,12 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     );
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
-    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
-
     let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: backend.as_ref(),
-            parsed: &parsed,
+            parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -7280,14 +7355,12 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
         .expect("schema fixture must be valid"),
     );
     let provider_configs = empty_resolved_provider_configs();
-    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
-
     let error = create_checked_bootstrap_resource_for_test(
         &provider,
         resource,
         BootstrapCreateContext {
             backend: &BootstrapWriteFailureBackend,
-            parsed: &parsed,
+            parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
             factories: &[],
@@ -8417,7 +8490,7 @@ fn format_duration_zero() {
 
 #[test]
 fn resolve_exports_resolves_cross_file_resource_refs() {
-    use carina_core::parser::InferredExportParam as ExportParameter;
+    use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
     use carina_core::resource::Value;
 
     // Build a state file with a resource that has a binding and attributes
@@ -8501,7 +8574,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // identity and never lands in `state.resources`, so an export
     // referencing `<module_call>.<attr>` failed with
     // `unresolved reference <call>.<attr>`.
-    use carina_core::parser::InferredExportParam as ExportParameter;
+    use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
     use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
 
     let state = {
@@ -8614,7 +8687,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     // through `ResourceRef` recursion before bottoming out at the real
     // role's `arn` from state. Pins the resolver's transitive walk so a
     // regression that broke after a single hop would surface.
-    use carina_core::parser::InferredExportParam as ExportParameter;
+    use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
     use carina_core::resource::{AccessPath, DeferredValue, LiveComposition, Value};
 
     let state = {
@@ -8775,7 +8848,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // mutated composition's stale concrete attribute and return
     // OLD_ARN. With the fix in place, the pre-resolve snapshot
     // kicks in and re-resolves against the post-apply state.
-    use carina_core::parser::InferredExportParam as ExportParameter;
+    use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
     use carina_core::resolver::resolve_managed_refs_with_state_and_remote;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DeferredValue, LiveComposition, ResourceId,
@@ -8953,7 +9026,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // Without the fix, `resolve_export_values_post_apply` returns an empty map (no
     // entry for the export) instead of the NEW arn — exports stays
     // at the pre-apply literal in production.
-    use carina_core::parser::InferredExportParam as ExportParameter;
+    use carina_core::parser::ExpandedInferredExportParam as ExportParameter;
     use carina_core::resource::{
         AccessPath, ConcreteValue, DataSource, DeferredValue, ResourceId, State as ResourceState,
         Value,
@@ -9152,20 +9225,6 @@ mod apply_deferred_for_parity {
     };
     use std::collections::HashMap;
 
-    fn parse_resolved(source: &str) -> carina_core::parser::ModuleResolvedParsedFile {
-        let parsed = parse_file(
-            source,
-            std::path::Path::new("apply_deferred_for.crn"),
-            &ProviderContext::default(),
-        )
-        .expect("parse");
-        carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
-            std::path::Path::new("."),
-        )
-        .expect("cross the deferred-body resolution seam")
-    }
-
     fn comparison_schemas() -> SchemaRegistry {
         let certificate = ResourceSchema::new("acm.Certificate")
             .attribute(
@@ -9272,9 +9331,22 @@ mod apply_deferred_for_parity {
                 }
             }
         "#;
-        let parsed = parse_resolved(src);
-        let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let parsed = parse_file(
+            src,
+            std::path::Path::new("apply_deferred_for.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("parse");
+        let parsed = carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("cross the deferred-body resolution seam");
         let states = dvo_state(&parsed);
+        let parsed = parsed
+            .into_expanded()
+            .expect("deferred-for fixture must contain only loop slots");
+        let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let schemas = comparison_schemas();
 
         // This is the exact function `run_apply_locked` calls
@@ -9340,7 +9412,15 @@ mod apply_deferred_for_parity {
                 aws.route53.RecordSet { name = opt.resource_record.name }
             }
         "#;
-        let parsed = parse_resolved(src);
+        let parsed = parse_file(
+            src,
+            std::path::Path::new("apply_deferred_for.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("parse");
+        let parsed = parsed
+            .into_expanded()
+            .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty: HashMap<ResourceId, State> = HashMap::new();
 
@@ -9396,9 +9476,22 @@ mod apply_deferred_for_parity {
             }
         "#
         .replacen("LOOP_TARGET", loop_target, 1);
-        let parsed = parse_resolved(&src);
-        let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let parsed = parse_file(
+            &src,
+            std::path::Path::new("apply_deferred_for.crn"),
+            &ProviderContext::default(),
+        )
+        .expect("parse");
+        let parsed = carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("cross the deferred-body resolution seam");
         let states = dvo_state(&parsed);
+        let parsed = parsed
+            .into_expanded()
+            .expect("deferred-for fixture must contain only loop slots");
+        let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let mut schemas = carina_core::schema::SchemaRegistry::new();
         schemas.insert(
             "aws",
@@ -9497,7 +9590,11 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 32 adds mandatory
+    //! `carina plan` is the supported migration. Version 36 adds typed
+    //! deferred-for templates and stage-specific placeholder types. Version 35
+    //! stores tri-state prevent-destroy directives and the approved state-only
+    //! directive change set. Version 34 adds Int-only integer arithmetic.
+    //! Version 33 adds typed keyed-list release effects. Version 32 adds mandatory
     //! provider-instance reference scopes and the create-outcome-unknown marker
     //! for provider protocol v13. Version 31 persists authored ignore paths;
     //! version 30 was never emitted. Version 29 persists anonymous loop
@@ -9598,16 +9695,17 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn format_34_and_older_are_rejected_before_payload_decoding() {
+    async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            35,
-            "carina#4150 uses saved-plan format 35",
+            36,
+            "carina#4094 uses saved-plan format 36 after carina#4150 format 35",
         );
+        let previous = 35;
 
-        for older_version in [34, 33, 32] {
+        for older_version in [previous, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
@@ -9629,7 +9727,7 @@ mod saved_plan_version_tests {
                 carina_core::shutdown::ShutdownToken::running(),
             )
             .await
-            .expect_err("an older format must be rejected before decoding its payload");
+            .expect_err("an older emitted format must be rejected before decoding its payload");
 
             let crate::error::AppError::UnsupportedPlanVersion {
                 found, expected, ..

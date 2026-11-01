@@ -251,9 +251,10 @@ pub struct FixturePlan {
     pub schemas: SchemaRegistry,
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub deferred_for_expressions: carina_core::parser::ResolvedDeferredForExpressions,
-    pub export_params: Vec<carina_core::parser::InferredExportParam>,
-    pub resolved_export_params:
-        carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>,
+    pub export_params: Vec<carina_core::parser::ExpandedInferredExportParam>,
+    pub resolved_export_params: carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::ExpandedInferredExportParam,
+    >,
     /// Per-resource user-authoring trees lifted from the fixture's
     /// `carina.state.json`. Forwarded to `format_plan` so server-side
     /// default fields the user never wrote do not surface in plan

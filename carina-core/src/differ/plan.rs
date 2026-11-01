@@ -1212,7 +1212,7 @@ pub fn block_deletes_on_prior_consumer_updates(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => None,
         })
         .collect();

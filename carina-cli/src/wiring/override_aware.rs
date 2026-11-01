@@ -10,8 +10,11 @@ use carina_core::effect::deps::UnresolvedResource;
 use carina_core::name_override::{
     ApplyDecision, NameOverride, NameOverrideSource, should_apply_override,
 };
-use carina_core::parser::ModuleResolvedFile;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
+use carina_core::parser::{File, ResolvedDeferredForPhase};
+use carina_core::resource::{
+    ConcreteValue, LoopSlot, ModuleSource, NoPlaceholder, ParserPlaceholder, PlaceholderKind,
+    Resource, ResourceId, Value,
+};
 use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
 use super::ProjectedStateRead;
@@ -58,14 +61,55 @@ use super::ProjectedStateRead;
 /// );
 /// ```
 #[derive(Debug, Clone)]
-pub struct CanonicalResourcePair<E> {
-    parsed: ModuleResolvedFile<E>,
-    unresolved: Vec<Resource>,
+pub struct CanonicalResourcePair<
+    E,
+    P: PlaceholderKind = NoPlaceholder,
+    T: PlaceholderKind = LoopSlot,
+> {
+    parsed: File<E, P, T, ResolvedDeferredForPhase<P, T>>,
+    unresolved: Vec<Resource<ModuleSource, P>>,
     /// Generated prefix values captured before persisted state can replace
     /// them with a pending re-read unknown. A post-refresh reconciliation
     /// restores these fallbacks first, then overlays only the refreshed
     /// current value or refreshed marker.
-    prefix_fallbacks: Vec<HashMap<String, Value>>,
+    prefix_fallbacks: Vec<HashMap<String, Value<P>>>,
+}
+
+pub(crate) type ParserCanonicalResourcePair<E> =
+    CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>;
+
+type CanonicalResourceParts<E, P, T> = (
+    File<E, P, T, ResolvedDeferredForPhase<P, T>>,
+    Vec<Resource<ModuleSource, P>>,
+);
+
+#[cfg(test)]
+impl<E: carina_core::parser::IntoExpandedExportParam> ParserCanonicalResourcePair<E> {
+    pub(crate) fn into_expanded_for_test(
+        self,
+    ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::LeftoverPlaceholders>
+    {
+        let Self {
+            parsed,
+            unresolved,
+            prefix_fallbacks,
+        } = self;
+        let unresolved = unresolved
+            .into_iter()
+            .map(Resource::into_expanded)
+            .collect::<Result<_, _>>()
+            .map_err(carina_core::resource::LeftoverPlaceholders::from)?;
+        let prefix_fallbacks = prefix_fallbacks
+            .into_iter()
+            .map(|attributes| carina_core::resource::into_expanded_value_map(attributes, None))
+            .collect::<Result<_, _>>()
+            .map_err(carina_core::resource::LeftoverPlaceholders::from)?;
+        Ok(CanonicalResourcePair {
+            parsed: parsed.into_expanded()?,
+            unresolved,
+            prefix_fallbacks,
+        })
+    }
 }
 
 /// Selects how a deferred-for expression owned by a
@@ -91,8 +135,11 @@ pub enum CanonicalResourceIdentityError {
     Identity(#[from] carina_core::identifier::AnonymousIdentityError),
 }
 
-impl<E> CanonicalResourcePair<E> {
-    fn new(parsed: ModuleResolvedFile<E>, unresolved: Vec<Resource>) -> Self {
+impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
+    fn new(
+        parsed: File<E, P, T, ResolvedDeferredForPhase<P, T>>,
+        unresolved: Vec<Resource<ModuleSource, P>>,
+    ) -> Self {
         Self {
             parsed,
             unresolved,
@@ -100,43 +147,28 @@ impl<E> CanonicalResourcePair<E> {
         }
     }
 
-    pub(super) fn from_resolved_file(
-        parsed: carina_core::validation::ResolvedFile<E>,
-        unresolved: Vec<Resource>,
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn for_test(
+        parsed: File<E, P, T, ResolvedDeferredForPhase<P, T>>,
+        unresolved: Vec<Resource<ModuleSource, P>>,
     ) -> Self {
-        Self::new(parsed.into_file(), unresolved)
+        Self::new(parsed, unresolved)
     }
 
-    pub(super) fn into_parts(self) -> (ModuleResolvedFile<E>, Vec<Resource>) {
+    pub(super) fn into_parts(self) -> CanonicalResourceParts<E, P, T> {
         (self.parsed, self.unresolved)
-    }
-
-    pub(super) fn resolve_block_names(
-        _access: &super::ValidationPipelineAccess,
-        parsed: ModuleResolvedFile<E>,
-        unresolved: UnresolvedConfigSnapshot,
-        registry: &SchemaRegistry,
-    ) -> Result<Self, Vec<BlockNameConflict>> {
-        let (parsed, unresolved) =
-            carina_core::schema::resolve_config_block_names(parsed, unresolved, registry)?;
-        Ok(Self::new(parsed, unresolved))
     }
 
     /// The canonical evaluated configuration. Callers borrow every non-resource
     /// input from this file so it cannot drift from the resources consumed by
     /// [`OverrideAwareResources`].
-    pub fn parsed(&self) -> &ModuleResolvedFile<E> {
+    pub fn parsed(&self) -> &File<E, P, T, ResolvedDeferredForPhase<P, T>> {
         &self.parsed
     }
 
-    pub fn unresolved(&self) -> &[Resource] {
+    pub fn unresolved(&self) -> &[Resource<ModuleSource, P>] {
         &self.unresolved
-    }
-
-    /// Dependency-sort the canonical evaluated resources without releasing
-    /// the owned file or accepting a replacement resource vector.
-    pub fn sorted_resources(&self) -> Result<Vec<Resource>, String> {
-        sort_resources_by_dependencies(&self.parsed.resources)
     }
 
     /// Resolve `<attribute>_prefix` meta-attributes without releasing the
@@ -149,12 +181,12 @@ impl<E> CanonicalResourcePair<E> {
         Ok(self)
     }
 
-    /// Canonicalize evaluated values and assign anonymous identities without
-    /// exposing the mutable resource slice held by the pair.
+    /// Canonicalize values and assign anonymous identities without exposing
+    /// the mutable resource slice held by the pair.
     pub fn canonicalize_and_compute_anonymous_identifiers(
         &mut self,
         registry: &carina_core::schema::SchemaRegistry,
-        providers: &[carina_core::parser::ProviderConfig],
+        providers: &[carina_core::parser::ProviderConfig<P>],
         factories: &[Box<dyn carina_core::provider::ProviderFactory>],
         conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
     ) -> Result<(), CanonicalResourceIdentityError> {
@@ -177,6 +209,34 @@ impl<E> CanonicalResourcePair<E> {
                 CanonicalResourceIdentityError::Identity(error)
             }
         })
+    }
+}
+
+impl<E> CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder> {
+    pub(super) fn resolve_block_names(
+        _access: &super::ValidationPipelineAccess,
+        parsed: carina_core::parser::ModuleResolvedFile<E>,
+        unresolved: UnresolvedConfigSnapshot,
+        registry: &SchemaRegistry,
+    ) -> Result<Self, Vec<BlockNameConflict>> {
+        let (parsed, unresolved) =
+            carina_core::schema::resolve_config_block_names(parsed, unresolved, registry)?;
+        Ok(Self::new(parsed, unresolved))
+    }
+}
+
+impl<E> CanonicalResourcePair<E> {
+    pub(super) fn from_resolved_file(
+        parsed: carina_core::validation::ResolvedFile<E>,
+        unresolved: Vec<Resource>,
+    ) -> Self {
+        Self::new(parsed.into_file(), unresolved)
+    }
+
+    /// Dependency-sort the canonical evaluated resources without releasing
+    /// the owned file or accepting a replacement resource vector.
+    pub fn sorted_resources(&self) -> Result<Vec<Resource>, String> {
+        sort_resources_by_dependencies(&self.parsed.resources)
     }
 
     /// Reconcile generated prefix values against state while retaining the
@@ -757,13 +817,8 @@ mod tests {
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
-        let mut parsed = carina_core::parser::ParsedFile::default();
+        let mut parsed = carina_core::parser::ExpandedParsedFile::default();
         parsed.resources = resources.clone();
-        let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
-            std::path::Path::new("."),
-        )
-        .expect("test fixture crosses module resolution");
         let canonical = CanonicalResourcePair::new(parsed, resources);
         let state = ProjectedStateRead::for_test_name_overrides(overrides);
         OverrideAwareResources::build_pair_with_stability(

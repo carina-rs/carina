@@ -7,7 +7,7 @@ use aws_sdk_iam::types::PolicyEvaluationDecisionType;
 use carina_core::effect::{Effect, PlanOp};
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
-use carina_core::resource::{ResolvedResource, ResolvedResourceError, ResourceId};
+use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
 use colored::Colorize;
 use serde_json::Value as JsonValue;
@@ -277,7 +277,7 @@ pub(crate) fn collect_required_actions(
 ) -> Result<Vec<RequiredAction>, crate::error::AppError> {
     let mut required = Vec::new();
     for effect in plan.effects() {
-        for (id, op) in effect_required_ops(effect, schemas)? {
+        for (id, op) in effect_required_ops(effect, schemas) {
             let actions = provider.required_permissions(&id, op)?;
             for action in actions {
                 required.push(RequiredAction {
@@ -293,23 +293,19 @@ pub(crate) fn collect_required_actions(
     Ok(required)
 }
 
-fn effect_required_ops(
-    effect: &Effect,
-    schemas: &SchemaRegistry,
-) -> Result<Vec<(ResourceId, PlanOp)>, ResolvedResourceError> {
-    let ops = match effect {
+fn effect_required_ops(effect: &Effect, _schemas: &SchemaRegistry) -> Vec<(ResourceId, PlanOp)> {
+    match effect {
         Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
         Effect::Create(resource) => vec![(resource.id.clone(), PlanOp::Create)],
         Effect::ResumeCreate { resource, .. } => vec![(resource.id.clone(), PlanOp::Create)],
         Effect::Update { to, .. } => vec![(to.id.clone(), PlanOp::Update)],
         Effect::Delete { id, .. } => vec![(id.clone().into_inner(), PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id.clone().into_inner(), PlanOp::Read)],
-        Effect::DeferredCreate { template, .. } => {
-            let resource = ResolvedResource::resolve_with_schemas(
-                template.template_resource.clone(),
-                schemas,
-            )?;
-            vec![(resource.id.clone(), PlanOp::Create)]
+        Effect::DeferredCreate(payload) => {
+            vec![(
+                payload.template.template_resource_id().clone(),
+                PlanOp::Create,
+            )]
         }
         Effect::DeferredReplace(payload) => {
             let mut ops: Vec<_> = payload
@@ -317,19 +313,17 @@ fn effect_required_ops(
                 .iter()
                 .map(|delete| (delete.id.clone().into_inner(), PlanOp::Delete))
                 .collect();
-            let resource = ResolvedResource::resolve_with_schemas(
-                payload.template.template_resource.clone(),
-                schemas,
-            )?;
-            ops.push((resource.id.clone(), PlanOp::Create));
+            ops.push((
+                payload.template.template_resource_id().clone(),
+                PlanOp::Create,
+            ));
             ops
         }
         Effect::Remove { .. }
         | Effect::Move { .. }
         | Effect::ReleaseListKeys { .. }
         | Effect::Wait { .. } => Vec::new(),
-    };
-    Ok(ops)
+    }
 }
 
 fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
@@ -344,9 +338,9 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::ReleaseListKeys { id, .. } => vec![id.as_inner()],
         Effect::Move { from, to, .. } => vec![from.as_inner(), to.as_inner()],
         Effect::Wait { .. } => Vec::new(),
-        Effect::DeferredCreate { id, .. } => vec![id.as_inner()],
+        Effect::DeferredCreate(payload) => vec![payload.id().as_inner()],
         Effect::DeferredReplace(payload) => {
-            let mut ids = vec![payload.id.as_inner()];
+            let mut ids = vec![payload.id().as_inner()];
             ids.extend(payload.deletes.iter().map(|delete| delete.id.as_inner()));
             ids
         }
@@ -964,25 +958,19 @@ mod tests {
         let template_resource =
             Resource::with_provider("aws", "route53.RecordSet", "validation_records", None);
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredCreate {
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: None,
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.RecordSet".to_string(),
-                attributes: Default::default(),
-                target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
-                template_resource,
-            }),
-        });
+        let template = DeferredForExpression::new(
+            None,
+            1,
+            "for opt in cert.domain_validation_options".to_string(),
+            carina_core::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            template_resource,
+        );
+        plan.add(Effect::DeferredCreate(
+            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
+        ));
 
         let entries = collect_required_actions(
             &plan,
@@ -1010,25 +998,19 @@ mod tests {
             .expect("valid ignore path"),
         ];
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredCreate {
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: None,
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.RecordSet".to_string(),
-                attributes: Default::default(),
-                target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
-                template_resource,
-            }),
-        });
+        let template = DeferredForExpression::new(
+            None,
+            1,
+            "for opt in cert.domain_validation_options".to_string(),
+            carina_core::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            template_resource,
+        );
+        plan.add(Effect::DeferredCreate(
+            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
+        ));
 
         let mut schemas = SchemaRegistry::new();
         schemas.insert(

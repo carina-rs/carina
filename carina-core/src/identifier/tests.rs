@@ -1,9 +1,10 @@
 use super::*;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    AccessPath, CompositionCall, CompositionCallPath, InterpolationPart, LoopModulePrefixOrigin,
-    LoopProvenance, ModuleInstanceScope, ModuleSource, PendingReRead, ReReadReason, Resource,
-    ResourceIdentity, Subscript, UnknownReason, ValueString,
+    AccessPath, ApplyTimeUnknown, CompositionCall, CompositionCallPath, InterpolationPart,
+    LoopModulePrefixOrigin, LoopProvenance, LoopSlot, ModuleInstanceScope, ModuleSource,
+    PendingReRead, ReReadReason, Resource as StagedResource, ResourceIdentity, Subscript,
+    ValueString,
 };
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate,
@@ -12,6 +13,15 @@ use crate::schema::{
 };
 use indexmap::IndexMap;
 use std::path::Path;
+
+type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
+type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
+type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
+type Resource = StagedResource<ModuleSource, crate::resource::NoPlaceholder>;
+type LoopValue = crate::resource::Value<LoopSlot>;
+type LoopConcreteValue = crate::resource::ConcreteValue<LoopSlot>;
+type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
+type LoopResource = StagedResource<ModuleSource, LoopSlot>;
 
 fn concrete_string(value: impl Into<ValueString>) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
@@ -119,6 +129,8 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
         &crate::parser::ProviderContext::default(),
     )
     .expect("valid loop fixture")
+    .into_expanded()
+    .expect("loop fixture contains no parser placeholders")
     .resources
 }
 
@@ -242,7 +254,7 @@ fn pending_reread_identifier_material_has_stable_typed_bytes() {
     ];
 
     for (pending, expected) in cases {
-        let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(
+        let value = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
             pending,
         )));
         assert_eq!(
@@ -685,20 +697,33 @@ fn anonymous_deferred_declared_identity_is_a_typed_error() {
             .validate()
             .expect("budget schema fixture must be valid"),
     );
-    let mut resource = budget_resource(None, "actual");
-    let Some(Value::Concrete(ConcreteValue::Map(budget))) = resource.attributes.get_mut("budget")
-    else {
-        panic!("budget fixture must contain a struct value");
-    };
-    budget.insert(
-        "budget_name".to_string(),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+    let mut resource = LoopResource::pending_with_provider("mock", "budgets.Budget", None);
+    resource.set_attr(
+        "budget",
+        LoopValue::Concrete(LoopConcreteValue::Map(IndexMap::from([
+            (
+                "budget_name".to_string(),
+                LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
+            ),
+            (
+                "budget_type".to_string(),
+                LoopValue::Concrete(LoopConcreteValue::String("COST".into())),
+            ),
+        ]))),
     );
     let mut resources = vec![resource];
+    let providers = CanonicalizedProviderConfigs::<LoopSlot>::from_configs_for_test(Vec::new());
+    let resources = crate::value::canonicalize_resources_with_schemas(&mut resources, &registry)
+        .expect("loop-placeholder identity fixture must canonicalize");
 
-    let error =
-        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
-            .expect_err("deferred declared identity must be rejected");
+    let error = compute_anonymous_identifiers_with_provider_configs(
+        resources,
+        &providers,
+        &registry,
+        AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        &|_| Vec::new(),
+    )
+    .expect_err("deferred declared identity must be rejected");
 
     assert!(matches!(
         error,
@@ -4537,7 +4562,7 @@ fn canonical_enum_create_only_comparison_preserves_identity_hash_material() {
 
 #[test]
 fn upstream_unknown_identity_hash_strings_remain_stable() {
-    let export = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let export = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: AccessPath::new("network", "vpc_id"),
     }));
     assert_eq!(
@@ -4545,9 +4570,11 @@ fn upstream_unknown_identity_hash_strings_remain_stable() {
         "Unknown(UpstreamRef(network.vpc_id))"
     );
 
-    let all_exports = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
-        binding: "network".into(),
-    }));
+    let all_exports = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: "network".into(),
+        },
+    ));
     assert_eq!(
         deterministic_value_string(&all_exports),
         "Unknown(UpstreamBareRef(network))"
@@ -8051,7 +8078,8 @@ fn nested_loop_rewrite_uses_current_module_prefix_and_is_a_valid_move_target() {
     )
     .expect("rendered move target must parse");
     assert!(
-        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]).is_empty(),
+        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[] as &[Resource],)
+            .is_empty(),
         "the suggested current-prefix target must not be classified as legacy",
     );
 }
@@ -8073,7 +8101,9 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         fixture.path(),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("directory parses");
+    .expect("directory parses")
+    .into_expanded()
+    .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =
@@ -8381,13 +8411,13 @@ import {
         &crate::parser::ProviderContext::default(),
     )
     .expect("bound discard loop and state blocks parse");
-    assert!(matches!(
-        parsed.parsed_deferred_for_expressions(),
-        [crate::parser::ParsedDeferredForExpression {
-            target: crate::parser::DeferredForTarget::Bound { binding },
-            ..
-        }] if binding == "_"
-    ));
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+    assert_eq!(
+        parsed.parsed_deferred_for_expressions()[0]
+            .target()
+            .bound_binding(),
+        Some("_")
+    );
 
     let errors =
         check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &parsed.resources);
@@ -8431,7 +8461,8 @@ fn moved_to_rejects_an_orphaned_legacy_segment_below_a_regular_prefix() {
     )
     .expect("moved block parses");
 
-    let errors = check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]);
+    let errors =
+        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[] as &[Resource]);
 
     assert_eq!(errors.len(), 1);
     assert!(errors[0].to_string().contains("net._for0[0]"));

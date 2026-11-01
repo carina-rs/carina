@@ -183,6 +183,10 @@ impl LoopSource {
         self.system_identity.as_str()
     }
 
+    pub(crate) fn scheduler_identity(&self) -> &ResourceIdentity {
+        &self.system_identity
+    }
+
     pub(crate) fn display_name(&self) -> String {
         format!("{}:{}", self.file(), self.line())
     }
@@ -624,6 +628,10 @@ impl UnboundLoopTemplate {
 
     pub(crate) fn scheduler_key(&self) -> &str {
         self.source.scheduler_key()
+    }
+
+    pub(crate) fn scheduler_identity(&self) -> &ResourceIdentity {
+        self.source.scheduler_identity()
     }
 
     pub(crate) fn display_name(&self) -> String {

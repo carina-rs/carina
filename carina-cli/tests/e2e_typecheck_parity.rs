@@ -136,7 +136,7 @@ fn cli_diagnostics_at(
 fn cli_validated_file(
     factories: Vec<Box<dyn ProviderFactory>>,
     fixture: &TempDir,
-) -> carina_core::parser::ModuleResolvedInferredFile {
+) -> carina_core::parser::ExpandedInferredFile {
     let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
         &carina_core::parser::ProviderContext::default(),
@@ -1452,6 +1452,42 @@ let duplicate = mock.test.resource {
             "ignore_changes path `rule.action` passes through a list, which is not supported",
             "ignore_changes path `rule[0].action` contains a list index, which is not supported",
         ]
+    );
+}
+
+#[test]
+fn unbound_deferred_template_type_error_keeps_authored_source_location() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"provider mock {}
+let src = mock.test.resource { name = "src" }
+let n = 5
+
+for _, t in (src.tags ?? {}) {
+  mock.test.resource { name = n }
+}
+"#,
+    )]);
+    let schemas = carina_provider_mock::builtin_schemas().into_iter().fold(
+        SchemaRegistry::new(),
+        |mut registry, schema| {
+            registry.insert("mock", schema);
+            registry
+        },
+    );
+
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    let mismatch = diagnostics
+        .iter()
+        .find(|message| message.contains("Type mismatch: expected String, got Int"))
+        .unwrap_or_else(|| panic!("missing deferred-template type error: {diagnostics:#?}"));
+    assert!(
+        mismatch.contains("main.crn at line 6\nType mismatch: expected String, got Int"),
+        "the template must retain the authored source lookup: {mismatch}",
+    );
+    assert!(
+        !mismatch.contains("<pending>"),
+        "a stable parse-time template id must prevent pending-id fallback: {mismatch}",
     );
 }
 
@@ -3858,7 +3894,7 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
     let schema = ResourceSchema::new("route53.Record")
         .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("hosted_zone_id", hosted_zone_id).build());
-    let attributes = HashMap::from([
+    let attributes: HashMap<String, Value> = HashMap::from([
         (
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("record".into())),

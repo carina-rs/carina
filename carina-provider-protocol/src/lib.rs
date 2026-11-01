@@ -1,4 +1,7 @@
+mod host_pattern;
 pub mod types;
+
+pub use host_pattern::{HostPattern, HostPatternError};
 
 use std::future::Future;
 use std::time::{Duration, Instant};

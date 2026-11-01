@@ -98,7 +98,8 @@ fn cyclic_schema_validates_a_two_level_nested_value() {
         .validate()
         .expect("cyclic schema fixture must be valid");
 
-    let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 1)]));
+    let rules_value: Value =
+        Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 1)]));
 
     schema
         .effective_attribute("rules")
@@ -113,7 +114,7 @@ fn cyclic_schema_rejects_a_string_where_a_list_is_required_under_ref() {
         .validate()
         .expect("cyclic schema fixture must be valid");
 
-    let mut bad_statement = indexmap::IndexMap::new();
+    let mut bad_statement: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
     bad_statement.insert(
         "and_statement".to_string(),
         Value::Concrete(ConcreteValue::String("not a list".into())),
@@ -370,12 +371,12 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
     // host state canonicalization must collapse to `StringList`
     // *if* the Ref is followed and the resolved struct's field type
     // is consulted.
-    let mut payload = indexmap::IndexMap::new();
+    let mut payload: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
     payload.insert(
         "tags".to_string(),
         Value::Concrete(ConcreteValue::String("env=prod".into())),
     );
-    let value = Value::Concrete(ConcreteValue::Map(payload));
+    let value: Value = Value::Concrete(ConcreteValue::Map(payload));
 
     let schema = schema.validate().expect("schema fixture must be valid");
     let canon = schema
@@ -470,7 +471,7 @@ fn schema_validate_attr_map_arm_lifts_enum_key() {
     let mut payload = indexmap::IndexMap::new();
     payload.insert(
         "eq".to_string(),
-        Value::Concrete(ConcreteValue::String("x".into())),
+        Value::<carina_core::resource::NoPlaceholder>::Concrete(ConcreteValue::String("x".into())),
     );
     let value = Value::Concrete(ConcreteValue::Map(payload));
 
@@ -489,7 +490,7 @@ fn schema_validate_attr_map_arm_lifts_enum_key() {
     let mut bad_payload = indexmap::IndexMap::new();
     bad_payload.insert(
         "unknown".to_string(),
-        Value::Concrete(ConcreteValue::String("x".into())),
+        Value::<carina_core::resource::NoPlaceholder>::Concrete(ConcreteValue::String("x".into())),
     );
     let bad_value = Value::Concrete(ConcreteValue::Map(bad_payload));
     schema

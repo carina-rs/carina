@@ -3,14 +3,15 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use crate::parser::ParsedValue as Value;
 use crate::parser::Rule;
-use crate::parser::ast::{ProviderConfig, RequireBlock};
 use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::parse_expression;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::resource::{ConcreteValue, Value, ValueString};
+use crate::parser::{ParserProviderConfig as ProviderConfig, ParserRequireBlock as RequireBlock};
+use crate::resource::{ConcreteValue, ValueString};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 

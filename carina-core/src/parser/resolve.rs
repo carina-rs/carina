@@ -7,17 +7,24 @@ use super::ast::{ExportParamLike, File, ParsedFile, ProviderConfig};
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
+use super::{
+    ParsedDataSource as DataSource, ParsedFunctionArgument as FunctionArgument,
+    ParsedResource as Resource, ParsedValue as Value,
+};
 use crate::eval_value::EvalValue;
 use crate::resource::{
-    AccessMissPolicy, ConcreteValue, DataSource, DeferredValue, DiagnosticSourceLine,
-    InterpolationPart, Resource, UnavailableCoalescePolicy, UnavailableReason,
-    UnavailableSecretPolicy, Value, find_unavailable_evaluation,
+    AccessMissPolicy, ConcreteValue, DeferredValue, DiagnosticSourceLine,
+    InterpolationPart as GenericInterpolationPart, LoopSlot, NoPlaceholder, ParserPlaceholder,
+    UnavailableCoalescePolicy, UnavailableReason, UnavailableSecretPolicy, Value as GenericValue,
+    find_unavailable_evaluation,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
+
+type InterpolationPart = GenericInterpolationPart<ParserPlaceholder>;
 
 /// One provider configuration whose construction-time attributes have crossed
 /// an allowed resolution seam.
@@ -57,7 +64,7 @@ impl ResolvedProviderConfig {
         &self.config.name
     }
 
-    pub fn attributes(&self) -> &IndexMap<String, Value> {
+    pub fn attributes(&self) -> &IndexMap<String, GenericValue> {
         &self.config.attributes
     }
 
@@ -178,7 +185,7 @@ const PROVIDER_CONFIG_SECTIONS: [ProviderConfigSection; 2] = [
 fn provider_config_section(
     config: &ProviderConfig,
     section: ProviderConfigSection,
-) -> &IndexMap<String, Value> {
+) -> &IndexMap<String, GenericValue> {
     match section {
         ProviderConfigSection::Attribute => &config.attributes,
         ProviderConfigSection::DefaultTag => &config.default_tags,
@@ -188,7 +195,7 @@ fn provider_config_section(
 fn provider_config_section_mut(
     config: &mut ProviderConfig,
     section: ProviderConfigSection,
-) -> &mut IndexMap<String, Value> {
+) -> &mut IndexMap<String, GenericValue> {
     match section {
         ProviderConfigSection::Attribute => &mut config.attributes,
         ProviderConfigSection::DefaultTag => &mut config.default_tags,
@@ -328,13 +335,13 @@ impl TryFrom<SavedProviderConfigs> for ResolvedProviderConfigs {
 mod saved_provider_config_secret_tests {
     use super::*;
 
-    fn secret(value: &str) -> Value {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+    fn secret(value: &str) -> GenericValue {
+        GenericValue::Deferred(DeferredValue::Secret(Box::new(GenericValue::Concrete(
             ConcreteValue::String(value.into()),
         ))))
     }
 
-    fn provider(token: &str) -> ProviderConfig {
+    fn provider(token: &str) -> ProviderConfig<NoPlaceholder> {
         ProviderConfig {
             name: "mock".to_string(),
             attributes: IndexMap::from([("token".to_string(), secret(token))]),
@@ -347,9 +354,9 @@ mod saved_provider_config_secret_tests {
         }
     }
 
-    fn placeholder_hash(value: &Value) -> &crate::resource::RedactedSecretHash {
+    fn placeholder_hash(value: &GenericValue) -> &crate::resource::RedactedSecretHash {
         match value {
-            Value::Deferred(DeferredValue::RedactedSecret { hash }) => hash,
+            GenericValue::Deferred(DeferredValue::RedactedSecret { hash }) => hash,
             other => panic!("expected saved-plan secret placeholder, got {other:?}"),
         }
     }
@@ -539,7 +546,7 @@ pub(crate) fn resolve_snapshot_function_calls_with_config(
         }
     }
 
-    let mut fn_ctx = super::ParseContext::new(config);
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
     fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     // This snapshot preserves authored references for identity/dependency
@@ -594,7 +601,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<(), ParseError> {
-    let pending_ctx = super::ParseContext::new(config);
+    let pending_ctx = super::ParseContext::for_evaluation(config);
     for check in parsed
         .parser_binding_metadata
         .pending_function_type_checks()
@@ -678,7 +685,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // `&mut parsed` borrow to avoid the clone is hairy on the error
     // path (would need to restore on every `?` exit), so we accept a
     // single map clone per call.
-    let mut fn_ctx = super::ParseContext::new(config);
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
     fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     let resource_source_files: HashMap<crate::resource::ResourceId, std::path::PathBuf> = parsed
@@ -764,22 +771,17 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
-        match &mut deferred.body {
-            super::DeferredForBody::Resource(resource) => {
-                for value in resource.attributes.values_mut() {
-                    *value = resolve_function_calls_only(
-                        value,
-                        &binding_map,
-                        &fn_ctx,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
-                    )?;
-                }
-            }
-            // Unsupported read and module-call bodies are retained verbatim
-            // so the module-resolution seam can report their typed error.
-            // They never become a resource template or a saved plan effect.
-            super::DeferredForBody::Read(_) | super::DeferredForBody::ModuleCall(_) => {}
+        let Some(attributes) = deferred.template_attributes_mut() else {
+            continue;
+        };
+        for value in attributes.values_mut() {
+            *value = resolve_function_calls_only(
+                value,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
         }
     }
 
@@ -1127,7 +1129,8 @@ fn collect_reference_roots(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => {}
+        | Value::Deferred(DeferredValue::Unknown(_))
+        | Value::Deferred(DeferredValue::Placeholder(_)) => {}
     }
 }
 
@@ -1340,7 +1343,7 @@ fn accumulate_deferred_iterable_errors(
 fn resolve_value_with_config(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
-    fn_ctx: &super::ParseContext<'_>,
+    fn_ctx: &super::ParseContext<'_, super::context::EvaluationOnly>,
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
@@ -1473,7 +1476,6 @@ fn resolve_value_with_config(
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            use crate::resource::InterpolationPart;
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
@@ -1544,7 +1546,7 @@ fn resolve_value_with_config(
             source_line,
         }) => {
             let authored_line = source_line.get();
-            let resolved_args: Result<Vec<crate::resource::FunctionArgument>, ParseError> = args
+            let resolved_args: Result<Vec<FunctionArgument>, ParseError> = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
@@ -1630,7 +1632,8 @@ fn resolve_value_with_config(
             DeferredValue::BindingRef { .. }
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
     }
 }
@@ -1680,11 +1683,10 @@ fn reject_required_interpolation_unavailable(
 fn resolve_function_calls_only(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
-    fn_ctx: &super::ParseContext<'_>,
+    fn_ctx: &super::ParseContext<'_, super::context::EvaluationOnly>,
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
-    use crate::resource::InterpolationPart;
     match value {
         Value::Deferred(
             DeferredValue::ModuleIf(_)
@@ -1767,7 +1769,8 @@ fn resolve_function_calls_only(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
     }
 }
@@ -1787,7 +1790,12 @@ fn resolve_function_calls_only(
 /// `ParsedFile` or `InferredFile` — we only touch
 /// `provider.unresolved_attributes`, never `export_params`.
 pub fn resolve_provider_unresolved_attributes<E, D>(
-    parsed: &mut super::File<E, D>,
+    parsed: &mut super::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1816,7 +1824,7 @@ pub fn resolve_provider_unresolved_attributes<E, D>(
             .entry(wb.binding.as_str().to_string())
             .or_default();
     }
-    let mut fn_ctx = super::ParseContext::new(config);
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
     fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     for provider in &mut parsed.providers {
@@ -1850,25 +1858,49 @@ pub fn resolve_provider_unresolved_attributes<E, D>(
 /// lower-level parser resolution passes and never receive
 /// [`ResolvedProviderConfigs`].
 pub fn resolve_provider_attributes_with_remote<E, D>(
-    parsed: &super::File<E, D>,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    parsed: &super::File<E, NoPlaceholder, LoopSlot, D>,
+    remote_bindings: &HashMap<String, HashMap<String, GenericValue>>,
     config: &ProviderContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
-    let mut binding_map = HashMap::new();
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut bindings = crate::binding_index::ResolvedBindings::default();
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
-            binding_map.insert(binding_name.to_string(), rref.resolved_attributes());
+            let attributes = match rref {
+                super::TopLevelResourceRef::Resource(resource) => resource.resolved_attributes(),
+                super::TopLevelResourceRef::DataSource(data_source) => {
+                    crate::resource::attrs_to_hashmap(&data_source.attributes)
+                }
+                super::TopLevelResourceRef::LiveComposition(composition) => composition
+                    .signature
+                    .attributes
+                    .iter()
+                    .map(|(name, attribute)| (name.clone(), attribute.to_value()))
+                    .collect(),
+            };
+            binding_map.insert(
+                binding_name.to_string(),
+                attributes
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone().into_placeholder_type()))
+                    .collect(),
+            );
             bindings.set_with_completeness(
                 binding_name,
-                rref.resolved_attributes(),
+                attributes,
                 crate::binding_index::BindingValueSource::Local,
                 crate::binding_index::BindingCompleteness::Incomplete,
             );
         }
     }
     for (binding, attrs) in remote_bindings {
-        binding_map.insert(binding.clone(), attrs.clone());
+        binding_map.insert(
+            binding.clone(),
+            attrs
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone().into_placeholder_type()))
+                .collect(),
+        );
         bindings.set_with_completeness(
             binding,
             attrs.clone(),
@@ -1879,7 +1911,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
     for upstream in &parsed.upstream_states {
         binding_map.entry(upstream.binding.clone()).or_default();
     }
-    let mut fn_ctx = super::ParseContext::new(config);
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
     fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     let mut providers = Vec::with_capacity(parsed.providers.len());
@@ -1888,8 +1920,15 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
         for section in [&mut provider.attributes, &mut provider.default_tags] {
             let mut resolved = IndexMap::new();
             for (key, expr) in section.iter() {
+                let parser_expr = expr.clone().into_placeholder_type();
                 let parser_resolved =
-                    resolve_value_with_config(expr, &binding_map, &fn_ctx, false, false)?;
+                    resolve_value_with_config(&parser_expr, &binding_map, &fn_ctx, false, false)?;
+                let parser_resolved = parser_resolved.into_expanded().map_err(|error| {
+                    ParseError::InvalidExpression {
+                        line: 0,
+                        message: error.to_string(),
+                    }
+                })?;
                 let value = crate::resolver::resolve_ref_value_with_config(
                     &parser_resolved,
                     &bindings,
@@ -1917,7 +1956,14 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
 ///
 /// Errors when a resolved value has the wrong shape (e.g.
 /// `default_tags = "string"`).
-pub fn finalize_provider_configs<E, D>(parsed: &mut super::File<E, D>) -> Result<(), ParseError> {
+pub fn finalize_provider_configs<E, D>(
+    parsed: &mut super::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
+) -> Result<(), ParseError> {
     for provider in parsed.providers.iter_mut() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match value {
@@ -2214,12 +2260,12 @@ for item in source.arn {
         )
         .expect("parse deferred for fixture");
         let crate::parser::DeferredForBody::Resource(template) =
-            &parsed.parsed_deferred_for_expressions()[0].body
+            parsed.parsed_deferred_for_expressions()[0].body()
         else {
             panic!("deferred fixture body must be a resource")
         };
         assert!(matches!(
-            template.attributes.get("comment"),
+            template.attributes().get("comment"),
             Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
         ));
 
@@ -2227,22 +2273,12 @@ for item in source.arn {
             .expect("resolve deferred template functions");
 
         let crate::parser::DeferredForBody::Resource(template) =
-            &parsed.parsed_deferred_for_expressions()[0].body
+            parsed.parsed_deferred_for_expressions()[0].body()
         else {
             panic!("deferred fixture body must be a resource")
         };
         assert!(matches!(
-            template.attributes.get("comment"),
-            Some(Value::Deferred(DeferredValue::Secret(_)))
-        ));
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
-        assert!(matches!(
-            parsed.deferred_for_expressions()[0]
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "comment").then_some(value)),
+            template.attributes().get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
     }

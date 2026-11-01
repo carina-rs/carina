@@ -9,7 +9,10 @@ use serde_json::json;
 use carina_core::data_source_value::{
     DataSourceValue, DataSourceValues, ExecutableDataSourceValues,
 };
-use carina_core::effect::{Effect, ReleasedListKey, ReleasedListKeys};
+use carina_core::effect::{
+    DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes,
+    ReleasedListKey, ReleasedListKeys,
+};
 use carina_core::executor::{
     AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
     ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
@@ -66,8 +69,8 @@ fn loaded_provider_context() -> LoadedProviderContext {
 }
 
 #[test]
-fn saved_plan_version_is_35_for_tri_state_directives() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 35);
+fn saved_plan_version_is_36_for_deferred_value_stages() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 36);
 }
 
 #[test]
@@ -243,8 +246,9 @@ fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
 }
 
 fn checked_exports(
-    params: &[carina_core::parser::InferredExportParam],
-) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam> {
+    params: &[carina_core::parser::ExpandedInferredExportParam],
+) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::ExpandedInferredExportParam>
+{
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
@@ -268,7 +272,7 @@ fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportSta
 fn saved_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
@@ -2836,7 +2840,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
 
 #[tokio::test]
 async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -2927,7 +2931,7 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         &carina_core::parser::ProviderContext::default(),
     )
     .unwrap();
-    let ctx = WiringContext::new_for_test(vec![], &parsed.providers);
+    let ctx = WiringContext::new_for_test_with_placeholders(vec![], &parsed.providers);
 
     assert!(
         ctx.factories().is_empty(),
@@ -3829,8 +3833,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
     assert!(error.contains("sorted_resources[0]"), "got: {error}");
 }
 
-#[test]
-fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
+fn bound_deferred_template() -> carina_core::parser::DeferredForExpression {
     let parsed = carina_core::parser::parse_file(
         "let upstream = upstream_state { source = '../upstream' }\n\
          let children = for value in upstream.values {\n\
@@ -3840,27 +3843,21 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("bound deferred loop parses");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
-        std::path::Path::new("."),
-    )
-    .expect("cross the deferred-body resolution seam");
+    let parsed = parsed
+        .into_expanded()
+        .expect("bound deferred loop must contain only loop slots");
     let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
-        template.target,
-        carina_core::parser::DeferredForTarget::Bound { .. }
+        template.target(),
+        carina_core::parser::DeferredForTarget::Bound(_)
     ));
+    template
+}
+
+fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
     let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::with_provider_identity(
-            "mock",
-            "__deferred_for",
-            "children",
-            None,
-        ),
-        template: Box::new(template),
-    });
-    let plan_file = record_test_plan(
+    plan.add(effect);
+    record_test_plan(
         PlanFileContents {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
@@ -3885,21 +3882,161 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
             wait_bindings: Vec::new(),
         },
         &["mock"],
+    )
+}
+
+fn plan_file_with_bound_deferred_template() -> PlanFile {
+    plan_file_with_deferred_effect(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(bound_deferred_template()),
+    )))
+}
+
+fn plan_file_with_bound_deferred_replace_template() -> PlanFile {
+    let delete = DeferredReplaceDelete {
+        id: carina_core::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "children[0]",
+            None,
+        ),
+        identifier: AppliedIdentifier::new("provider-id").expect("fixture identifier is non-empty"),
+        directives: Directives::default(),
+        binding: Some("children[0]".to_string()),
+        dependencies: HashSet::new(),
+        explicit_dependencies: HashSet::new(),
+        blocked_by_updates: HashSet::new(),
+    };
+    plan_file_with_deferred_effect(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+        deletes: NonEmptyDeletes::try_new(vec![delete]).expect("fixture has one delete"),
+        template: Box::new(bound_deferred_template()),
+    })))
+}
+
+#[test]
+fn plan_file_validation_accepts_matching_bound_deferred_template_identity() {
+    plan_file_with_bound_deferred_template()
+        .validate_resource_identities()
+        .expect("the template address derived from the bound target must be valid");
+}
+
+#[test]
+fn plan_file_load_rejects_deferred_top_level_resource_type_mismatch() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+        .expect("serialize bound deferred template");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["resource_type"] = json!("other.x");
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("display resource type must match the executable template")
+        .to_string();
+    assert!(
+        error.contains("Invalid saved plan") && error.contains("resource_type"),
+        "unexpected validation error: {error}",
     );
-    let mut json = serde_json::to_value(plan_file).expect("serialize valid bound template");
+}
+
+#[test]
+fn plan_file_load_rejects_deferred_top_level_attributes() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+        .expect("serialize bound deferred template");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["attributes"] = json!([]);
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("attributes must live only in the executable template resource")
+        .to_string();
+    assert!(error.contains("unknown field `attributes`"), "{error}");
+}
+
+#[test]
+fn plan_file_load_rejects_indexed_bound_deferred_target() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+        .expect("serialize bound deferred template");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["target"]["binding"] =
+        json!("children[0]");
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("a deferred target cannot bind an already indexed address")
+        .to_string();
+    assert!(error.contains("cannot end in an index"), "{error}");
+}
+
+#[test]
+fn plan_file_load_rejects_unknown_bound_deferred_target_field() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+        .expect("serialize bound deferred template");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["target"]["template"] = json!("x");
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("unknown bound-target fields must fail at load")
+        .to_string();
+    assert!(error.contains("unknown field `template`"), "{error}");
+}
+
+#[test]
+fn plan_file_load_reports_deferred_template_provider_type_mismatch_first() {
+    for (field, tampered) in [("provider", "other"), ("resource_type", "other.x")] {
+        let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+            .expect("serialize bound deferred template");
+        json["plan"]["effects"][0]["DeferredCreate"]["template"]["template_resource"]["id"]
+            [field] = json!(tampered);
+        let error = serde_json::from_value::<PlanFile>(json)
+            .expect_err("template provider/type must match its display projection")
+            .to_string();
+        assert!(
+            error.contains("Invalid saved plan")
+                && error.contains("template resource provider/type")
+                && !error.contains("deferred effect"),
+            "unexpected validation error for {field}: {error}",
+        );
+    }
+}
+
+#[test]
+fn plan_file_validation_rejects_mismatched_bound_deferred_template_identity() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+        .expect("serialize bound deferred template");
+    let other_target = carina_core::parser::BoundDeferredTarget::new("other_children")
+        .expect("fixture binding is non-empty");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["template_resource"]["id"]["identity"] =
+        json!(other_target.template_address().to_string());
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("a template for a different binding must fail at the load seam")
+        .to_string();
+    assert!(
+        error.contains("Invalid saved plan")
+            && error.contains("template resource identity")
+            && error.contains("does not match bound deferred target `children`"),
+        "unexpected validation error: {error}",
+    );
+}
+
+#[test]
+fn plan_file_validation_rejects_mismatched_bound_deferred_template_binding() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+        .expect("serialize bound deferred template");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["template_resource"]["binding"] =
+        json!("totally-else");
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("a template binding that disagrees with its target must fail at load")
+        .to_string();
+    assert!(
+        error.contains("Invalid saved plan")
+            && error.contains("template resource binding")
+            && error.contains("does not match bound deferred target `children`"),
+        "unexpected validation error: {error}",
+    );
+}
+
+#[test]
+fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+        .expect("serialize valid bound template");
     json["plan"]["effects"][0]["DeferredCreate"]["template"]["template_resource"]["id"]
         .as_object_mut()
         .expect("template resource id")
         .remove("identity");
 
-    let decoded: PlanFile = serde_json::from_value(json)
-        .expect("field codec admits pending templates before semantic validation");
-    let error = decoded
-        .validate_resource_identities()
-        .expect_err("bound deferred templates require a resolved identity");
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("bound deferred templates require an identity at the load seam")
+        .to_string();
 
     assert!(
-        error.contains("plan.effects[0].template_resource"),
+        error.contains("Invalid saved plan") && error.contains("template resource identity"),
         "unexpected validation error: {error}",
     );
 }
@@ -3915,66 +4052,58 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
-        std::path::Path::new("."),
-    )
-    .expect("cross the deferred-body resolution seam");
-    let mut template = parsed.deferred_for_expressions()[0].clone();
+    let parsed = parsed
+        .into_expanded()
+        .expect("unbound deferred loop must contain only loop slots");
+    let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
-        template.target,
+        template.target(),
         carina_core::parser::DeferredForTarget::Unbound { .. }
     ));
-    template.template_resource.id = carina_core::resource::ResourceId::with_provider_identity(
-        "mock",
-        "test.resource",
-        "incorrectly_resolved",
-        None,
-    );
-    let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::with_provider_identity(
-            "mock",
-            "__deferred_for",
-            "unbound_loop",
-            None,
-        ),
-        template: Box::new(template),
-    });
-    let plan_file = record_test_plan(
-        PlanFileContents {
-            version: PlanFile::CURRENT_VERSION,
-            carina_version: "test".to_string(),
-            timestamp: "2026-10-30T00:00:00Z".to_string(),
-            source_path: "main.crn".to_string(),
-            state_lineage: None,
-            state_serial: None,
-            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
-                "mock",
-            )]),
-            backend_config: None,
-            plan,
-            sorted_resources: Vec::new(),
-            unresolved_resources: Vec::new(),
-            compositions: Vec::new(),
-            data_sources: Vec::new(),
-            data_source_origins: Vec::new(),
-            data_source_values: Vec::new(),
-            current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
-            upstream_sources: Vec::new(),
-            wait_bindings: Vec::new(),
-        },
-        &["mock"],
-    );
-
-    let error = plan_file
-        .validate_resource_identities()
-        .expect_err("unbound deferred templates require a pending identity");
+    let plan_file = plan_file_with_deferred_effect(Effect::DeferredCreate(
+        DeferredCreatePayload::new(Box::new(template)),
+    ));
+    let mut json = serde_json::to_value(plan_file).expect("serialize valid unbound template");
+    json["plan"]["effects"][0]["DeferredCreate"]["template"]["template_resource"]["id"]["identity"] =
+        json!("incorrectly_resolved");
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("unbound deferred templates require a pending identity at the load seam")
+        .to_string();
     assert!(
-        error.contains("plan.effects[0].template_resource")
+        error.contains("Invalid saved plan")
+            && error.contains("template resource identity")
             && error.contains("unbound deferred target")
             && error.contains("pending"),
+        "unexpected validation error: {error}",
+    );
+}
+
+#[test]
+fn plan_file_validation_rejects_deferred_create_id_that_disagrees_with_target() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_template())
+        .expect("serialize bound deferred template");
+    json["plan"]["effects"][0]["DeferredCreate"]["id"]["identity"] = json!("other");
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("a deferred create id for another scheduler key must fail at load")
+        .to_string();
+    assert!(
+        error.contains("Invalid saved plan")
+            && error.contains("does not match deferred target scheduler key `children`"),
+        "unexpected validation error: {error}",
+    );
+}
+
+#[test]
+fn plan_file_validation_rejects_deferred_replace_id_that_disagrees_with_target() {
+    let mut json = serde_json::to_value(plan_file_with_bound_deferred_replace_template())
+        .expect("serialize bound deferred replace template");
+    json["plan"]["effects"][0]["DeferredReplace"]["id"]["identity"] = json!("other");
+    let error = serde_json::from_value::<PlanFile>(json)
+        .expect_err("a deferred replace id for another scheduler key must fail at load")
+        .to_string();
+    assert!(
+        error.contains("Invalid saved plan")
+            && error.contains("does not match deferred target scheduler key `children`"),
         "unexpected validation error: {error}",
     );
 }
@@ -4230,6 +4359,23 @@ fn encoded_plan_with_mock_provider_evidence() -> serde_json::Value {
 fn plan_file_decode_accepts_base_mock_provider_evidence() {
     serde_json::from_value::<PlanFile>(encoded_plan_with_mock_provider_evidence())
         .expect("base provider evidence fixture must decode");
+}
+
+#[test]
+fn plan_file_decode_rejects_loop_placeholder_outside_template() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["sorted_resources"][0]["attributes"]["leaked"] =
+        serde_json::json!({ "Unknown": "ForValue" });
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("a loop placeholder outside a deferred template must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("for-loop placeholder is not allowed outside a deferred for-loop template"),
+        "unexpected plan decode error: {error}"
+    );
 }
 
 #[test]
@@ -4669,7 +4815,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
 #[tokio::test]
 async fn persist_exports_only_writes_state_with_new_exports() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::{ConcreteValue, Value};
 
     let captured = Arc::new(Mutex::new(None));
@@ -4717,7 +4863,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
 #[tokio::test]
 async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -4913,7 +5059,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
 
 #[tokio::test]
 async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -5037,7 +5183,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
 
 #[tokio::test]
 async fn finalize_apply_persists_resource_state_before_reporting_export_error() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::{ExpandedInferredExportParam as InferredExportParam, TypeExpr};
 
     let captured = Arc::new(Mutex::new(None));
     let backend = CapturingBackend {

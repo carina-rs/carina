@@ -6,9 +6,12 @@ use super::ast::{FnParam, PendingFunctionTypeCheck, TypeExpr, UserFunction, User
 use super::context::{ParseContext, next_pair};
 use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
+use super::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
 use crate::eval_value::{BareStructuralHandle, EvalValue, StructuralHandleKind};
-use crate::resource::{ConcreteValue, DeferredValue, FunctionArgument, UnknownReason, Value};
+use crate::resource::{
+    ConcreteValue, DeferredValue, ParserPlaceholder, PlaceholderKind, Value as GenericValue,
+};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -52,8 +55,7 @@ pub(super) fn parse_fn_def(
                         }
                         _ => {
                             // This is the default expression
-                            let mut default_ctx = ParseContext::new(ctx.config);
-                            default_ctx.set_preprocessed_file(preprocessed_file);
+                            let mut default_ctx = ctx.isolated();
                             default_ctx
                                 .replace_shared_user_functions(Arc::clone(&ctx.user_functions));
                             default_ctx
@@ -96,8 +98,7 @@ pub(super) fn parse_fn_def(
 
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
-    let mut body_ctx = ParseContext::new(ctx.config);
-    body_ctx.set_preprocessed_file(preprocessed_file);
+    let mut body_ctx = ctx.isolated();
     body_ctx.replace_shared_user_functions(Arc::clone(&ctx.user_functions));
     body_ctx
         .seeded_user_functions
@@ -109,7 +110,7 @@ pub(super) fn parse_fn_def(
         // call-site argument decide during substitution.
         body_ctx.set_variable(
             p.name.clone(),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam {
+            Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam {
                 name: p.name.clone(),
             })),
         );
@@ -129,7 +130,7 @@ pub(super) fn parse_fn_def(
                 )?;
                 body_ctx.set_variable(
                     let_name.clone(),
-                    Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal {
+                    Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnLocal {
                         name: let_name.clone(),
                     })),
                 );
@@ -161,9 +162,9 @@ pub(super) fn parse_fn_def(
     })
 }
 
-enum PreparedUserFunctionCall<'cfg> {
+enum PreparedUserFunctionCall<'cfg, Source = super::context::AuthoredDiagnosticSource> {
     Ready {
-        child_ctx: Box<ParseContext<'cfg>>,
+        child_ctx: Box<ParseContext<'cfg, Source>>,
         substitutions: HashMap<String, FunctionArgument>,
     },
     Deferred(Vec<FunctionArgument>),
@@ -177,12 +178,12 @@ enum FunctionArgumentTypeCheck {
 
 /// Prepare a user-defined function call: validate args, build substitutions, and return
 /// the child context with all parameters and local lets resolved.
-fn prepare_user_function_call<'cfg>(
+fn prepare_user_function_call<'cfg, Source: Clone>(
     func: &UserFunction,
     args: &[FunctionArgument],
-    ctx: &ParseContext<'cfg>,
+    ctx: &ParseContext<'cfg, Source>,
     call_line: usize,
-) -> Result<PreparedUserFunctionCall<'cfg>, ParseError> {
+) -> Result<PreparedUserFunctionCall<'cfg, Source>, ParseError> {
     let fn_name = &func.name;
 
     // Check recursion
@@ -364,7 +365,8 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => false,
     }
 }
@@ -382,7 +384,13 @@ pub(super) fn contains_module_argument(value: &Value) -> bool {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred.values().into_iter().any(contains_module_argument)
         }
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { .. })) => true,
+        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })) => true,
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::FnParam { .. }
+            | ParserPlaceholder::FnLocal { .. }
+            | ParserPlaceholder::Loop(_)
+            | ParserPlaceholder::EmptyInterpolation { .. },
+        )) => false,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_module_argument),
         Value::Concrete(ConcreteValue::Map(entries)) => {
             entries.values().any(contains_module_argument)
@@ -439,7 +447,7 @@ pub(super) fn contains_module_argument(value: &Value) -> bool {
 pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
     resolver: &'resolver dyn crate::parser::CustomTypeResolver,
     schema: crate::schema::OwnerBoundResourceSchema<'schema>,
-) -> impl Fn(&crate::schema::AttributeType, &Value) -> Result<(), crate::schema::TypeError>
+) -> impl Fn(&crate::schema::AttributeType, &GenericValue) -> Result<(), crate::schema::TypeError>
 + use<'resolver, 'schema> {
     let owner = schema.owner();
     move |declared_type, value| {
@@ -458,8 +466,8 @@ pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
 /// for that config. No provider-name comparison or owner lookup is involved.
 pub fn custom_type_lookup_for_factory<'a>(
     factory: &'a dyn crate::provider::ProviderFactory,
-) -> impl Fn(&crate::schema::AttributeType, &Value) -> Result<(), crate::schema::TypeError> + use<'a>
-{
+) -> impl Fn(&crate::schema::AttributeType, &GenericValue) -> Result<(), crate::schema::TypeError>
++ use<'a> {
     move |declared_type, value| {
         validate_identified_declaration(declared_type, |declaration| {
             crate::provider::validate_custom_type_declaration_with_factory(
@@ -493,38 +501,38 @@ fn validate_identified_declaration(
 /// Bare built-in identities use the kind-aware built-in registry. Provider
 /// identities must already have resolved schema owners and route through those
 /// factories, even if their descriptive identity collides with a built-in.
-pub fn validate_custom_type(
+pub fn validate_custom_type<P: PlaceholderKind>(
     identity: &TypeIdentity,
-    value: &Value,
+    value: &GenericValue<P>,
     _config: &ProviderContext,
 ) -> crate::provider::ProviderResult<()> {
     match value {
-        Value::Deferred(DeferredValue::ResourceRef { .. }) => return Ok(()),
-        Value::Deferred(
+        GenericValue::Deferred(DeferredValue::ResourceRef { .. }) => return Ok(()),
+        GenericValue::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
         ) => return Ok(()),
-        Value::Deferred(DeferredValue::Access(_access)) => return Ok(()),
-        Value::Deferred(DeferredValue::Interpolation(_parts)) => return Ok(()),
-        Value::Deferred(DeferredValue::Unknown(_reason)) => return Ok(()),
-        Value::Concrete(_concrete) => {}
-        Value::Deferred(_deferred) => {}
+        GenericValue::Deferred(DeferredValue::Access(_access)) => return Ok(()),
+        GenericValue::Deferred(DeferredValue::Interpolation(_parts)) => return Ok(()),
+        GenericValue::Deferred(DeferredValue::Unknown(_reason)) => return Ok(()),
+        GenericValue::Concrete(_concrete) => {}
+        GenericValue::Deferred(_deferred) => {}
     }
 
     use crate::schema::RefinedScalarKind;
 
     let builtin_kind = match value {
-        Value::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => {
+        GenericValue::Concrete(ConcreteValue::String(_) | ConcreteValue::EnumIdentifier(_)) => {
             Some(RefinedScalarKind::String)
         }
-        Value::Concrete(ConcreteValue::Int(_)) => {
+        GenericValue::Concrete(ConcreteValue::Int(_)) => {
             if crate::schema::builtin_validator(RefinedScalarKind::Int, identity).is_some() {
                 Some(RefinedScalarKind::Int)
             } else {
                 Some(RefinedScalarKind::Float)
             }
         }
-        Value::Concrete(ConcreteValue::Float(_)) => Some(RefinedScalarKind::Float),
-        Value::Concrete(
+        GenericValue::Concrete(ConcreteValue::Float(_)) => Some(RefinedScalarKind::Float),
+        GenericValue::Concrete(
             ConcreteValue::CanonicalEnum(_)
             | ConcreteValue::Bool(_)
             | ConcreteValue::Duration(_)
@@ -532,21 +540,39 @@ pub fn validate_custom_type(
             | ConcreteValue::StringList(_)
             | ConcreteValue::Map(_),
         )
-        | Value::Deferred(_) => None,
+        | GenericValue::Deferred(_) => None,
     };
     if let Some(kind) = builtin_kind
         && let Some(validator) = crate::schema::builtin_validator(kind, identity)
     {
-        let identifier_text;
         let validation_value = match value {
-            Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                identifier_text =
-                    Value::Concrete(ConcreteValue::String(raw.as_str().to_string().into()));
-                &identifier_text
+            GenericValue::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                GenericValue::Concrete(ConcreteValue::String(raw.as_str().to_string().into()))
             }
-            _ => value,
+            GenericValue::Concrete(ConcreteValue::String(value)) => {
+                GenericValue::Concrete(ConcreteValue::String(value.clone()))
+            }
+            GenericValue::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+                GenericValue::Concrete(ConcreteValue::CanonicalEnum(value.clone()))
+            }
+            GenericValue::Concrete(ConcreteValue::Int(value)) => {
+                GenericValue::Concrete(ConcreteValue::Int(*value))
+            }
+            GenericValue::Concrete(ConcreteValue::Float(value)) => {
+                GenericValue::Concrete(ConcreteValue::Float(*value))
+            }
+            GenericValue::Concrete(
+                ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::List(_)
+                | ConcreteValue::StringList(_)
+                | ConcreteValue::Map(_),
+            )
+            | GenericValue::Deferred(_) => {
+                unreachable!("a built-in custom-type validator accepts only scalar values")
+            }
         };
-        return validator(validation_value).map_err(|error| {
+        return validator(&validation_value).map_err(|error| {
             crate::provider::ProviderError::invalid_input_caused_by(
                 "Custom type validation failed",
                 error,
@@ -573,44 +599,77 @@ pub fn validate_custom_type(
 /// let value = Value::Concrete(ConcreteValue::String("id".into()));
 /// let _ = validate_schema_custom_type(&owned, &value, &ProviderContext::default());
 /// ```
-pub fn validate_schema_custom_type(
+pub fn validate_schema_custom_type<P: PlaceholderKind>(
     owned: &crate::parser::OwnedTypeIdentity,
-    value: &Value,
+    value: &GenericValue<P>,
     config: &crate::parser::LoadedProviderContext,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     validate_schema_custom_type_with_context(owned, value, config)
 }
 
-pub(crate) fn validate_schema_custom_type_with_context(
+pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind>(
     owned: &crate::parser::OwnedTypeIdentity,
-    value: &Value,
+    value: &GenericValue<P>,
     config: &ProviderContext,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     match value {
-        Value::Deferred(
+        GenericValue::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Interpolation(_)
             | DeferredValue::Secret(_)
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => return Ok(()),
-        Value::Concrete(_) | Value::Deferred(_) => {}
+        GenericValue::Concrete(_) | GenericValue::Deferred(_) => {}
     }
+    let value = match value {
+        GenericValue::Concrete(ConcreteValue::String(value)) => {
+            GenericValue::Concrete(ConcreteValue::String(value.clone()))
+        }
+        GenericValue::Concrete(ConcreteValue::EnumIdentifier(value)) => {
+            GenericValue::Concrete(ConcreteValue::EnumIdentifier(value.clone()))
+        }
+        GenericValue::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+            GenericValue::Concrete(ConcreteValue::CanonicalEnum(value.clone()))
+        }
+        GenericValue::Concrete(ConcreteValue::Int(value)) => {
+            GenericValue::Concrete(ConcreteValue::Int(*value))
+        }
+        GenericValue::Concrete(ConcreteValue::Float(value)) => {
+            GenericValue::Concrete(ConcreteValue::Float(*value))
+        }
+        GenericValue::Concrete(ConcreteValue::Bool(value)) => {
+            GenericValue::Concrete(ConcreteValue::Bool(*value))
+        }
+        GenericValue::Concrete(ConcreteValue::Duration(value)) => {
+            GenericValue::Concrete(ConcreteValue::Duration(*value))
+        }
+        GenericValue::Concrete(ConcreteValue::StringList(value)) => {
+            GenericValue::Concrete(ConcreteValue::StringList(value.clone()))
+        }
+        GenericValue::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_)) => {
+            unreachable!("custom-type validation receives only scalar values")
+        }
+        GenericValue::Deferred(_) => {
+            unreachable!("deferred values returned before provider validation")
+        }
+    };
     config.custom_type_resolver().validate(
         crate::parser::CustomTypeValidationTarget::Annotation(owned),
-        value,
+        &value,
     )
 }
 
 /// Check that a function argument matches the declared parameter type.
-fn check_fn_arg_type(
+fn check_fn_arg_type<Source: Clone>(
     fn_name: &str,
     param_name: &str,
     type_expr: &TypeExpr,
     argument: &FunctionArgument,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     call_line: usize,
 ) -> Result<FunctionArgumentTypeCheck, ParseError> {
     if argument.pending_parameter().is_some() {
@@ -675,10 +734,10 @@ pub(crate) fn lower_function_arguments(
         .collect()
 }
 
-pub(super) fn record_deferred_function_type_check(
+pub(super) fn record_deferred_function_type_check<Source: Clone>(
     function: &UserFunction,
     arguments: &[FunctionArgument],
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     source_line: usize,
 ) {
     if function
@@ -711,10 +770,10 @@ pub(crate) fn reject_builtin_handle_arguments(
     Ok(())
 }
 
-pub(crate) fn evaluate_user_function_eval(
+pub(crate) fn evaluate_user_function_eval<Source: Clone>(
     func: &UserFunction,
     args: Vec<EvalValue>,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     line: usize,
 ) -> Result<Value, ParseError> {
     let arguments = lower_function_arguments(args, line)?;
@@ -731,10 +790,10 @@ fn function_argument_type_error(
     ))
 }
 
-pub(crate) fn validate_pending_function_type_check(
+pub(crate) fn validate_pending_function_type_check<Source: Clone>(
     check: &PendingFunctionTypeCheck,
     functions: &HashMap<String, UserFunction>,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
 ) -> Result<(), ParseError> {
     let Some(function) = functions.get(&check.function_name) else {
         return Ok(());
@@ -802,10 +861,10 @@ fn function_return_type_error(
 }
 
 /// Evaluate a user-defined function call by substituting arguments into the body
-pub(crate) fn evaluate_user_function(
+pub(crate) fn evaluate_user_function<Source: Clone>(
     func: &UserFunction,
     args: &[FunctionArgument],
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     call_line: usize,
 ) -> Result<Value, ParseError> {
     let prepared =
@@ -857,7 +916,7 @@ pub(crate) fn evaluate_resolved_user_function(
     config: &ProviderContext,
     call_line: usize,
 ) -> Result<Value, ParseError> {
-    let mut context = ParseContext::new(config);
+    let mut context = ParseContext::for_evaluation(config);
     context.replace_shared_user_functions(Arc::clone(functions));
     if !context.user_functions.contains_key(&function.name) {
         context.insert_user_function(function.name.clone(), function.clone());
@@ -934,8 +993,8 @@ fn substitute_function_call_argument(
     let Some(value) = argument.value() else {
         return Ok(argument.clone());
     };
-    if let Value::Deferred(DeferredValue::Unknown(
-        UnknownReason::FnParam { name } | UnknownReason::FnLocal { name },
+    if let Value::Deferred(DeferredValue::Placeholder(
+        ParserPlaceholder::FnParam { name } | ParserPlaceholder::FnLocal { name },
     )) = value
         && let Some(substitution) = substitutions.get(name)
     {
@@ -979,8 +1038,8 @@ fn substitute_fn_params_with_position(
                 .try_map(|value| substitute_fn_params(value, substitutions, source_line))?;
             Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
         }
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam { name }))
-        | Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal { name })) => {
+        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam { name }))
+        | Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnLocal { name })) => {
             match substitutions.get(name) {
                 Some(argument) => {
                     substituted_function_argument(name, argument, position, source_line)?
@@ -1142,6 +1201,11 @@ fn substitute_fn_params_with_position(
                 .map_err(|error| ParseError::integer_arithmetic(span, source_line, error))?
         }
         Value::Deferred(DeferredValue::Unknown(_))
+        | Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument { .. }
+            | ParserPlaceholder::Loop(_)
+            | ParserPlaceholder::EmptyInterpolation { .. },
+        ))
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
@@ -1259,9 +1323,9 @@ pub(crate) fn apply_parser_closure(
     )))
 }
 
-pub(super) fn try_evaluate_fn_value(
+pub(super) fn try_evaluate_fn_value<Source: Clone>(
     value: Value,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     containing_line: usize,
 ) -> Result<Value, ParseError> {
     match value {
@@ -1417,7 +1481,8 @@ pub(super) fn try_evaluate_fn_value(
             | DeferredValue::Coalesce { .. }
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => Ok(value),
     }
 }

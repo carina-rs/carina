@@ -8,8 +8,8 @@ use indexmap::IndexMap;
 use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, ResolvedIgnoreChanges, SavedValueViews,
-    UnknownReason, Value, merge_with_saved, value_at_leaf,
+    ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, ResolvedIgnoreChanges,
+    SavedValueViews, Value, merge_with_saved, value_at_leaf,
 };
 use crate::schema::{
     AttributeType, DslTransform, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
@@ -632,7 +632,7 @@ pub(crate) enum LeafProvenance<'a> {
 
 fn contains_pending_reread(value: &Value) -> bool {
     match value {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(_))) => true,
+        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(_))) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_pending_reread),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_pending_reread),
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
@@ -675,6 +675,7 @@ fn contains_pending_reread(value: &Value) -> bool {
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => false,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -871,6 +872,7 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Unavailable { .. }) => true,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 

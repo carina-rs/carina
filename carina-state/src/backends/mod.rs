@@ -91,7 +91,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsupported_backend() {
-        let config = carina_core::parser::BackendConfig {
+        let config: carina_core::parser::BackendConfig = carina_core::parser::BackendConfig {
             backend_type: "unsupported".to_string(),
             attributes: HashMap::new(),
             attribute_spans: HashMap::new(),

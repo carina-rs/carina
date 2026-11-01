@@ -241,7 +241,7 @@ pub fn detect_moved_block_hints<S>(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => None,
         })
         .collect::<Vec<_>>();
@@ -263,7 +263,7 @@ pub fn detect_moved_block_hints<S>(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => {}
         }
     }
@@ -477,9 +477,9 @@ mod tests {
     use carina_core::plan::Plan;
     use carina_core::provider::AppliedIdentifier;
     use carina_core::resource::{
-        ConcreteValue, Current, DeferredValue, DeposedKey, Directives, EnumValueResolver,
-        ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State,
-        UnknownReason, Value,
+        ApplyTimeUnknown, ConcreteValue, Current, DeferredValue, DeposedKey, Directives,
+        EnumValueResolver, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+        ResourceIdentity, State, Value,
     };
     use carina_core::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
@@ -656,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_desired_create_only_value_produces_no_hint() {
+    fn apply_time_unknown_desired_create_only_value_produces_no_hint() {
         let mut plan = Plan::new();
         let mut prior = HashMap::new();
         add_delete(
@@ -669,7 +669,13 @@ mod tests {
         add_create(
             &mut plan,
             id("vpcs[0]", None),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
+                path: carina_core::resource::AccessPath::with_fields(
+                    "bootstrap",
+                    "network",
+                    vec!["cidr".into()],
+                ),
+            })),
         );
 
         let hints = detect_moved_block_hints(&plan, &prior, &schemas(true));

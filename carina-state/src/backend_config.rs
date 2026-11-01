@@ -1,7 +1,7 @@
 //! Schema-backed state backend configuration.
 
 use carina_core::parser;
-use carina_core::resource::{ConcreteValue, Value, ValueString};
+use carina_core::resource::{ConcreteValue, PlaceholderKind, Value, ValueString};
 use carina_core::schema::{
     AttributeType, DslTransform, TypeError, TypeIdentity, ValidatedConfigSchema,
 };
@@ -269,11 +269,11 @@ fn local_schema() -> ValidatedConfigSchema {
     .expect("the built-in local backend config schema must be valid")
 }
 
-fn canonicalize_attributes(
-    config: &parser::BackendConfig,
+fn canonicalize_attributes<P: PlaceholderKind>(
+    config: &parser::BackendConfig<P>,
     schema: &ValidatedConfigSchema,
     required: &[&'static str],
-) -> (HashMap<String, Value>, Vec<BackendAttributeError>) {
+) -> (HashMap<String, Value<P>>, Vec<BackendAttributeError>) {
     let mut errors = Vec::new();
     for attribute in required {
         if !config.attributes.contains_key(*attribute) {
@@ -322,11 +322,11 @@ fn canonicalize_attributes(
     (canonicalized, errors)
 }
 
-fn invalid_resolved_shape(
+fn invalid_resolved_shape<P: PlaceholderKind>(
     backend_type: &str,
     attribute: &str,
     expected: &str,
-    value: &Value,
+    value: &Value<P>,
 ) -> BackendAttributeError {
     BackendAttributeError::InvalidAttribute {
         backend_type: backend_type.to_string(),
@@ -338,8 +338,8 @@ fn invalid_resolved_shape(
     }
 }
 
-fn take_string(
-    attributes: &mut HashMap<String, Value>,
+fn take_string<P: PlaceholderKind>(
+    attributes: &mut HashMap<String, Value<P>>,
     backend_type: &str,
     attribute: &str,
 ) -> Result<Option<ValueString>, BackendAttributeError> {
@@ -357,8 +357,8 @@ fn take_string(
     }
 }
 
-fn take_bool(
-    attributes: &mut HashMap<String, Value>,
+fn take_bool<P: PlaceholderKind>(
+    attributes: &mut HashMap<String, Value<P>>,
     backend_type: &str,
     attribute: &str,
 ) -> Result<Option<bool>, BackendAttributeError> {
@@ -389,7 +389,9 @@ fn collect_attribute<T>(
     }
 }
 
-fn resolve_s3_backend(config: &parser::BackendConfig) -> Result<BackendConfig, BackendConfigError> {
+fn resolve_s3_backend<P: PlaceholderKind>(
+    config: &parser::BackendConfig<P>,
+) -> Result<BackendConfig, BackendConfigError> {
     let (mut attributes, mut errors) =
         canonicalize_attributes(config, &s3_schema(), &["bucket", "key"]);
     let bucket = collect_attribute(
@@ -438,8 +440,8 @@ fn resolve_s3_backend(config: &parser::BackendConfig) -> Result<BackendConfig, B
     }))
 }
 
-fn resolve_local_backend(
-    config: &parser::BackendConfig,
+fn resolve_local_backend<P: PlaceholderKind>(
+    config: &parser::BackendConfig<P>,
 ) -> Result<BackendConfig, BackendConfigError> {
     let (mut attributes, mut errors) = canonicalize_attributes(config, &local_schema(), &[]);
     let path = collect_attribute(
@@ -453,10 +455,10 @@ fn resolve_local_backend(
     Ok(BackendConfig::Local(LocalBackendSettings { path }))
 }
 
-impl TryFrom<&parser::BackendConfig> for BackendConfig {
+impl<P: PlaceholderKind> TryFrom<&parser::BackendConfig<P>> for BackendConfig {
     type Error = BackendConfigError;
 
-    fn try_from(config: &parser::BackendConfig) -> Result<Self, Self::Error> {
+    fn try_from(config: &parser::BackendConfig<P>) -> Result<Self, Self::Error> {
         match config.backend_type.as_str() {
             S3_BACKEND_TYPE => resolve_s3_backend(config),
             LOCAL_BACKEND_TYPE => resolve_local_backend(config),
@@ -468,6 +470,7 @@ impl TryFrom<&parser::BackendConfig> for BackendConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::NoPlaceholder;
 
     fn resolve(source: &str) -> Result<BackendConfig, BackendConfigError> {
         let parsed = carina_core::parser::parse_file(
@@ -521,7 +524,7 @@ mod tests {
             .expect("S3 schema must contain region")
             .canonicalize_provider_config(
                 AWS_PROVIDER_NAME,
-                Value::Concrete(ConcreteValue::String("us_west_2".into())),
+                Value::<NoPlaceholder>::Concrete(ConcreteValue::String("us_west_2".into())),
             )
             .unwrap();
         let Value::Concrete(ConcreteValue::CanonicalEnum(expected)) = provider_value else {

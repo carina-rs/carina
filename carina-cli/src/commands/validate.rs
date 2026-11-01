@@ -147,7 +147,7 @@ enum ValidatedEntry<'a> {
     /// `header` alone are identical for `for _, opt in cert.dvo { … }`
     /// repeated twice).
     DeferredLoop {
-        resource_type: String,
+        resource_type: &'a str,
         target: &'a carina_core::parser::DeferredForTarget,
         header: &'a str,
         file: Option<&'a str>,
@@ -173,16 +173,17 @@ impl std::fmt::Display for ValidatedEntry<'_> {
                 line,
             } => {
                 let location = match target {
-                    carina_core::parser::DeferredForTarget::Bound { .. } => match file {
+                    carina_core::parser::DeferredForTarget::Bound(_) => match file {
                         Some(file) => format!("{file}:{line}"),
                         None => line.to_string(),
                     },
                     carina_core::parser::DeferredForTarget::Unbound { .. } => target.display_name(),
                 };
                 match target {
-                    carina_core::parser::DeferredForTarget::Bound { binding } => write!(
+                    carina_core::parser::DeferredForTarget::Bound(target) => write!(
                         f,
-                        "{resource_type}.{binding}[?] (deferred: {header} @ {location})"
+                        "{resource_type}.{} (deferred: {header} @ {location})",
+                        target.template_address()
                     ),
                     carina_core::parser::DeferredForTarget::Unbound { .. } => {
                         write!(f, "{resource_type}.<pending> (deferred for at {location})")
@@ -223,8 +224,8 @@ fn validated_entries<E>(
                 resource: _resource,
                 deferred: d,
             } => ValidatedEntry::DeferredLoop {
-                resource_type: d.resource_type.clone(),
-                target: &d.target,
+                resource_type: d.resource_type(),
+                target: d.target(),
                 header: &d.header,
                 file: d.file.as_deref(),
                 line: d.line,
@@ -452,6 +453,45 @@ mod tests {
             std::path::Path::new("."),
         )
         .expect("test fixture crosses module resolution")
+    }
+
+    #[test]
+    fn multi_file_empty_interpolations_report_each_site_with_context() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        std::fs::write(
+            fixture.path().join("resource.crn"),
+            "let broken = mock.test.Thing {\n  value = \"${}\"\n}\n",
+        )
+        .expect("write resource fixture");
+        std::fs::write(
+            fixture.path().join("exports.crn"),
+            "exports {\n  broken: String = \"${}\"\n}\n",
+        )
+        .expect("write export fixture");
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let empty_interpolations = errors
+            .iter()
+            .filter(|error| error.contains("empty interpolation `${}`"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            empty_interpolations.len(),
+            2,
+            "one error must be retained for each offending site: {errors:#?}",
+        );
+        assert!(
+            empty_interpolations.iter().any(|error| {
+                error.contains("mock.test.Thing.broken: attribute `value`: empty interpolation `${}` — fill in the expression or remove it")
+            }),
+            "resource context is missing: {empty_interpolations:#?}",
+        );
+        assert!(
+            empty_interpolations.iter().any(|error| {
+                error.contains("exports `broken`: empty interpolation `${}` — fill in the expression or remove it")
+            }),
+            "export context is missing: {empty_interpolations:#?}",
+        );
     }
 
     #[test]

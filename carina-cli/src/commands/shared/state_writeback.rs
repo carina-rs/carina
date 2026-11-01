@@ -239,11 +239,11 @@ fn writeback_comparison_ids<'a, S>(
         .collect::<Vec<_>>();
     for effect in plan.effects() {
         match effect {
-            Effect::DeferredCreate { template, .. } => {
-                ids.push(&template.template_resource.id);
+            Effect::DeferredCreate(payload) => {
+                ids.push(payload.template.template_resource_id());
             }
             Effect::DeferredReplace(payload) => {
-                ids.push(&payload.template.template_resource.id);
+                ids.push(payload.template.template_resource_id());
             }
             Effect::Read { .. }
             | Effect::Create(_)
@@ -346,7 +346,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
 /// resources cannot enter the live export-resolution path.
 pub(crate) struct ExportResolutionInputs<'a> {
     pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
     /// Total post-read outcomes. Apply-time reads replace their deferred
     /// entries before this reaches export resolution.
@@ -596,7 +596,7 @@ pub(crate) struct SkippedExport {
 /// non-finite float, remains an error and aborts writeback.
 pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
     pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
     pub sorted_resources: &'a [Resource],
     pub pre_resolve_compositions: &'a [carina_core::resource::LiveComposition],
@@ -609,7 +609,7 @@ pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
 pub(crate) fn resolve_export_values_post_apply(
     input: ResolveExportValuesPostApplyInput<'_>,
 ) -> Result<
-    carina_core::validation::CheckedExportValues<carina_core::parser::InferredExportParam>,
+    carina_core::validation::CheckedExportValues<carina_core::parser::ExpandedInferredExportParam>,
     AppError,
 > {
     use carina_core::binding_index::ResolvedBindings;
@@ -683,7 +683,7 @@ pub(crate) fn resolve_export_values_post_apply(
 /// impossible to serialize the pre-apply display snapshot.
 pub(crate) fn materialize_exports(
     export_params: &carina_core::validation::CheckedExportValues<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
 ) -> Result<ExportResolution, AppError> {
     use carina_core::value::SerializationError;
@@ -1261,7 +1261,7 @@ fn create_side_upsert_ids<S>(plan: &Plan<S>) -> HashSet<ResourceId> {
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Import { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::Wait { .. } => {}
         }
     }
@@ -2061,8 +2061,8 @@ mod apply_state_save_tests {
     use carina_core::plan::Plan;
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
-        ConcreteValue, DeferredValue, Directives, ResolvedResourceId, Resource, ResourceId, State,
-        UnknownReason, Value,
+        ApplyTimeUnknown, ConcreteValue, DeferredValue, Directives, ResolvedResourceId, Resource,
+        ResourceId, State, Value,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
     use carina_state::{CurrentInstance, DeposedInstance, DeposedKey, NameOverride};
@@ -2316,28 +2316,21 @@ mod apply_state_save_tests {
     #[test]
     fn apply_state_save_inputs_pre_resolve_deferred_runtime_comparisons() {
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredCreate {
-            id: ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: Some("main.crn".to_string()),
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.Record".to_string(),
-                attributes: Vec::new(),
-                target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
-                // Saved deferred templates are reconstructed before their
-                // runtime element identity exists. Comparison pre-resolution
-                // must key this pending id by provider instance and type.
-                template_resource: Resource::pending_with_provider("aws", "route53.Record", None),
-            }),
-        });
+        let template = DeferredForExpression::new(
+            Some("main.crn".to_string()),
+            1,
+            "for opt in cert.domain_validation_options".to_string(),
+            carina_core::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            // Comparison pre-resolution keys the materialized template by
+            // provider instance and type before any runtime child exists.
+            Resource::pending_with_provider("aws", "route53.Record", None),
+        );
+        plan.add(Effect::DeferredCreate(
+            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
+        ));
         let runtime_id = ResourceId::with_provider_identity(
             "aws",
             "route53.Record",
@@ -4950,31 +4943,20 @@ mod apply_state_save_tests {
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         });
-        plan.add(Effect::DeferredCreate {
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: Some("main.crn".to_string()),
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.Record".to_string(),
-                attributes: vec![],
-                target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
-                template_resource: Resource::with_provider(
-                    "aws",
-                    "route53.Record",
-                    "validation_records",
-                    None,
-                )
+        let template = DeferredForExpression::new(
+            Some("main.crn".to_string()),
+            1,
+            "for opt in cert.domain_validation_options".to_string(),
+            carina_core::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            Resource::with_provider("aws", "route53.Record", "validation_records", None)
                 .with_binding("validation_records"),
-            }),
-        });
+        );
+        plan.add(Effect::DeferredCreate(
+            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
+        ));
         let successfully_deleted = HashSet::from([DeletedInstanceKey::new(
             id.clone(),
             EffectGeneration::Deposed(deposed_key),
@@ -5033,23 +5015,16 @@ mod apply_state_save_tests {
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: Some("main.crn".to_string()),
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.Record".to_string(),
-                attributes: vec![],
-                target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
+            template: Box::new(DeferredForExpression::new(
+                Some("main.crn".to_string()),
+                1,
+                "for opt in cert.domain_validation_options".to_string(),
+                carina_core::parser::DeferredForTarget::bound("validation_records")
+                    .expect("fixture binding is valid"),
+                Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                ForBinding::Simple("opt".to_string()),
                 template_resource,
-            }),
+            )),
         }))
     }
 
@@ -5539,7 +5514,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
-        let previous_attributes = HashMap::from([(
+        let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
@@ -5715,7 +5690,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
-        let previous_attributes = HashMap::from([(
+        let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
@@ -5838,7 +5813,7 @@ mod apply_state_save_tests {
         plan.add(Effect::Create(
             carina_core::resource::ResolvedResource::new(desired.clone()),
         ));
-        let previous_attributes = HashMap::from([(
+        let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
@@ -6439,7 +6414,13 @@ mod apply_state_save_tests {
                 ),
                 (
                     "unknown".to_string(),
-                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                    Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
+                        path: carina_core::resource::AccessPath::with_fields(
+                            "bootstrap",
+                            "network",
+                            vec!["unknown".into()],
+                        ),
+                    })),
                 ),
             ]),
         )
@@ -7168,10 +7149,10 @@ mod apply_state_save_tests {
 #[cfg(test)]
 mod export_writeback_tests {
     use super::*;
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::{
-        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
-        PendingReRead, UnknownReason, Value,
+        AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart,
+        PartialReadMarker, PendingReRead, Value,
     };
     use carina_state::{ResourceState, StateFile};
 
@@ -7300,7 +7281,7 @@ mod export_writeback_tests {
         assert!(matches!(
             &values.as_slice()[0].value,
             Some(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::PendingReRead(pending)
+                ApplyTimeUnknown::PendingReRead(pending)
             ))) if pending == &PendingReRead::incomplete(
                 "provider read after create did not return every attribute"
             )
@@ -7485,7 +7466,9 @@ mod export_writeback_tests {
 #[cfg(test)]
 mod stage4_unknown_err_tests {
     use super::*;
-    use carina_core::resource::{AccessPath, ConcreteValue, DeferredValue, UnknownReason, Value};
+    use carina_core::resource::{
+        AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, Value,
+    };
     use carina_core::value::{SerializationContext, SerializationError};
 
     /// RFC #2371 stage 4 contract pin: the persisted export encoder returns
@@ -7495,13 +7478,13 @@ mod stage4_unknown_err_tests {
     #[test]
     fn unknown_returns_err_from_persisted_export_encode() {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        let v = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = PersistedExportValue::encode(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { path: p },
+                reason: ApplyTimeUnknown::UpstreamExport { path: p },
                 context: SerializationContext::StateWriteback,
             } => assert_eq!(p, path),
             other => {

@@ -573,7 +573,7 @@ fn effect_owned_resource_id(effect: &Effect) -> Option<&ResourceId> {
         Effect::Move { to, .. } => Some(to.as_inner()),
         Effect::ReleaseListKeys { id, .. } => Some(id.as_inner()),
         Effect::Wait { .. } => None,
-        Effect::DeferredCreate { .. } => None,
+        Effect::DeferredCreate(_) => None,
         Effect::DeferredReplace(_) => None,
     }
 }
@@ -600,12 +600,8 @@ fn effect_module_source(effect: &Effect) -> Option<&ModuleSource> {
             resource.module_source.as_ref()
         }
         Effect::Update { to, .. } => to.module_source.as_ref(),
-        Effect::DeferredCreate { template, .. } => {
-            template.template_resource.module_source.as_ref()
-        }
-        Effect::DeferredReplace(payload) => {
-            payload.template.template_resource.module_source.as_ref()
-        }
+        Effect::DeferredCreate(payload) => payload.template.template_resource().module_source(),
+        Effect::DeferredReplace(payload) => payload.template.template_resource().module_source(),
         Effect::Delete { .. }
         | Effect::Import { .. }
         | Effect::Remove { .. }
@@ -742,16 +738,16 @@ fn node_from_effect(
             Vec::new(),
             None,
         ),
-        Effect::DeferredCreate { id, template } => (
-            deferred_label(template, id),
-            id.display_type(),
+        Effect::DeferredCreate(payload) => (
+            deferred_label(&payload.template),
+            payload.id().display_type(),
             EffectKind::DeferredCreate,
             Vec::new(),
-            deferred_after_note(template),
+            deferred_after_note(&payload.template),
         ),
         Effect::DeferredReplace(payload) => (
-            deferred_label(&payload.template, &payload.id),
-            payload.id.display_type(),
+            deferred_label(&payload.template),
+            payload.id().display_type(),
             EffectKind::DeferredReplace,
             Vec::new(),
             deferred_after_note(&payload.template),
@@ -801,7 +797,7 @@ fn effect_anonymous_discriminator(effect: &Effect) -> Option<String> {
         | Effect::Remove { .. }
         | Effect::Move { .. }
         | Effect::Wait { .. }
-        | Effect::DeferredCreate { .. }
+        | Effect::DeferredCreate(_)
         | Effect::DeferredReplace(_) => return None,
     };
     resource_anonymous_discriminator(binding, id)
@@ -830,17 +826,14 @@ fn resource_label(binding: Option<&str>, id: &ResourceId, module_label: Option<&
         .unwrap_or_else(|| short_type.to_string())
 }
 
-fn deferred_label(
-    template: &carina_core::parser::DeferredForExpression,
-    id: &ResolvedResourceId,
-) -> String {
-    match &template.target {
-        carina_core::parser::DeferredForTarget::Bound { binding } => binding.clone(),
+fn deferred_label<S>(template: &carina_core::parser::DeferredForExpression<S>) -> String {
+    match template.target() {
+        carina_core::parser::DeferredForTarget::Bound(target) => target.binding().to_string(),
         carina_core::parser::DeferredForTarget::Unbound { .. } => {
             format!(
                 "{}.<pending> (deferred for at {})",
-                id.display_type(),
-                template.target.display_name(),
+                template.deferred_effect_id().display_type(),
+                template.target().display_name(),
             )
         }
     }
@@ -1334,23 +1327,19 @@ mod tests {
     #[test]
     fn deferred_effect_with_literal_iterable_has_no_value_detail() {
         const ITERABLE_VALUE: &str = "value-that-must-not-appear";
-        let template = DeferredForExpression {
-            file: None,
-            line: 1,
-            header: "for item in literal".to_string(),
-            resource_type: "test.Widget".to_string(),
-            attributes: Vec::new(),
-            target: carina_core::parser::DeferredForTarget::Bound {
-                binding: "widgets".to_string(),
-            },
-            iterable: Value::Concrete(ConcreteValue::String(ITERABLE_VALUE.into())),
-            binding: ForBinding::Simple("item".to_string()),
-            template_resource: Resource::new("test.Widget", "widgets"),
-        };
-        let effect = Effect::DeferredCreate {
-            id: ResolvedResourceId::new(ResourceId::with_identity("__deferred_for", "widgets")),
-            template: Box::new(template),
-        };
+        let template = DeferredForExpression::new(
+            None,
+            1,
+            "for item in literal".to_string(),
+            carina_core::parser::DeferredForTarget::bound("widgets")
+                .expect("fixture binding is valid"),
+            Value::Concrete(ConcreteValue::String(ITERABLE_VALUE.into())),
+            ForBinding::Simple("item".to_string()),
+            Resource::new("test.Widget", "widgets"),
+        );
+        let effect = Effect::DeferredCreate(carina_core::effect::DeferredCreatePayload::new(
+            Box::new(template),
+        ));
 
         let node = node_from_effect(0, &effect, None, None);
 
@@ -1374,14 +1363,14 @@ mod tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("parse deferred loop fixture");
-        let mut parsed =
-            carina_core::module_resolver::resolve_modules_providerless(parsed, fixture.path())
-                .expect("cross the deferred-body resolution seam");
+        let mut parsed = parsed
+            .into_expanded()
+            .expect("deferred loop fixture must contain no parser placeholders");
         let template = parsed
             .deferred_for_expressions_mut()
             .pop()
             .expect("fixture contains one deferred loop");
-        assert_eq!(template.target.display_name(), "main.crn:2");
+        assert_eq!(template.target().display_name(), "main.crn:2");
         assert!(
             template
                 .file
@@ -1392,47 +1381,14 @@ mod tests {
 
         let saved = carina_core::parser::SavedDeferredForExpression::from(template);
         let json = serde_json::to_string(&saved).expect("serialize saved deferred template");
-        let saved: carina_core::parser::SavedDeferredForExpression =
-            serde_json::from_str(&json).expect("deserialize saved deferred template");
-        let DeferredForExpression {
-            file,
-            line,
-            header,
-            resource_type,
-            attributes,
-            target,
-            iterable,
-            binding,
-            template_resource: _,
-        } = saved;
-        let round_tripped = DeferredForExpression {
-            file,
-            line,
-            header,
-            resource_type,
-            attributes,
-            target,
-            iterable,
-            binding,
-            template_resource: Resource::pending_with_provider("mock", "test.Child", None),
-        };
-
-        let mut plan = Plan::new();
-        plan.add(Effect::DeferredCreate {
-            id: ResolvedResourceId::with_provider_identity(
-                "mock",
-                "__deferred_for",
-                "pending_accounts",
-                None,
-            ),
-            template: Box::new(round_tripped),
-        });
-        let node = node_from_effect(0, &plan.effects()[0], None, None);
+        let round_tripped: carina_core::parser::SavedDeferredForExpression =
+            serde_json::from_str(&json).expect("deserialize saved deferred template for display");
+        let label = deferred_label(&round_tripped);
 
         assert!(
-            node.label.contains("deferred for at main.crn:2"),
+            label.contains("deferred for at main.crn:2"),
             "saved-plan label lost its display-relative origin: {}",
-            node.label,
+            label,
         );
     }
 

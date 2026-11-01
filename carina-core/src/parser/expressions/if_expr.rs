@@ -18,7 +18,10 @@ use crate::parser::{
     decide_if_condition, first_inner, if_structural_handle, next_pair, parse_expression,
     parse_expression_eval, parse_module_call, parse_read_resource_expr, parse_resource_for_target,
 };
-use crate::resource::{DataSource, DeferredValue, LoopKind, Resource, Value};
+use crate::parser::{
+    ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
+};
+use crate::resource::{DeferredValue, LoopKind};
 
 /// Result of parsing an if expression body: a managed resource, a data
 /// source, a module call, or a value.
@@ -407,7 +410,7 @@ fn parse_if_body(
                 Ok(IfBodyResult::Resource(Box::new(resource)))
             }
             (IfBodyForm::DataSource, Rule::read_resource_expr) => {
-                target.reject_unbound_read(LoopKind::If)?;
+                target.bound_read_target(LoopKind::If)?;
                 let data_source = parse_read_resource_expr(
                     inner,
                     &local_ctx,

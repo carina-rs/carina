@@ -41,16 +41,15 @@ use crate::module_walk::ModuleWalk;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    CanonicalResourcePair, NonEmptyValidationErrors, WiringContext,
+    NonEmptyValidationErrors, ParserCanonicalResourcePair, WiringContext,
     compute_anonymous_identifiers_with_policy_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
-    validate_no_backend_in_modules, validate_no_empty_interpolations,
-    validate_no_exports_in_modules, validate_no_provider_in_modules,
-    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
-    validate_provider_region_with_ctx, validate_resources_with_ctx,
-    validate_wait_bindings_with_ctx,
+    validate_no_backend_in_modules, validate_no_exports_in_modules,
+    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
+    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
+    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -318,14 +317,20 @@ pub fn validate_and_resolve_with_provider_load_for_test(
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    validate_and_resolve_with_config(
-        parsed,
-        base_dir,
-        &providers,
-        skip_resource_validation,
-        duplicate_declarations,
-    )
+    let (providers, load_error) =
+        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+    if let Some(error) = load_error {
+        return Err(error);
+    }
+    providers
+        .validation_report(
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            duplicate_declarations,
+        )
+        .into_result()
+        .map_err(|errors| collapse_errors(errors.into_vec()))
 }
 
 /// Test-support collecting, non-minting validation entry point.
@@ -371,7 +376,7 @@ pub(crate) enum ResolvedConfig {
         parsed: Box<carina_core::parser::ModuleResolvedInferredFile>,
     },
     Paired {
-        resources: Box<CanonicalResourcePair<carina_core::parser::InferredExportParam>>,
+        resources: Box<ParserCanonicalResourcePair<carina_core::parser::InferredExportParam>>,
     },
 }
 
@@ -455,10 +460,10 @@ fn extend_module_resolution_errors(
     }
 }
 
-fn extend_expanded_binding_use_errors(
+fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>(
     errors: &mut Vec<AppError>,
     report: &carina_core::validation::BindingUseReport,
-    compositions: &[carina_core::resource::LiveComposition],
+    compositions: &[carina_core::resource::LiveComposition<P>],
 ) {
     extend_module_call_errors(
         errors,
@@ -827,6 +832,19 @@ pub(crate) fn validate_and_resolve_errors_inner(
     };
     let parsed = resolved_config.parsed();
 
+    // This is the sole parser-placeholder boundary. Standalone module
+    // definitions intentionally retain typed module-argument slots until a
+    // caller expands them; root configurations must be fully expanded.
+    let placeholder_boundary = if carina_core::validation::is_module_definition(parsed) {
+        carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+    } else {
+        carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+    };
+    if let Err(leftovers) = parsed.validate_expansion_boundary(placeholder_boundary) {
+        errors.extend(leftovers.into_errors().into_iter().map(AppError::from));
+        return Err(non_empty_validation_failure(errors));
+    }
+
     let (upstream_exports, upstream_resolve_errors) = if skip_resource_validation {
         (Default::default(), Vec::new())
     } else {
@@ -839,12 +857,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
     };
 
     if !skip_resource_validation {
-        // Mid-edit `${}` is parser-accepted (#2480) so the AST stays
-        // intact for LSP diagnostics, but it must not reach a provider —
-        // surface it as a hard error before the schema-level checks
-        // below try to type-check around the marker. See #2487.
-        errors.extend(validate_no_empty_interpolations(parsed));
-
         errors.extend(validate_resources_with_ctx(ctx, parsed, enriched_context));
         errors.extend(validate_depends_on_with_ctx(parsed));
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
@@ -1263,6 +1275,7 @@ mod tests {
             .path()
             .join(".carina/providers/file/local-provider/local-provider.wasm");
         std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, b"not a wasm component").unwrap();
         std::fs::write(&installed_path, b"not a wasm component").unwrap();
 
         let mut parsed = empty_parsed_file();
@@ -1283,7 +1296,7 @@ mod tests {
         let message = error.to_string();
 
         assert!(
-            message.contains("Failed to load WASM component"),
+            message.contains("failed to read provider component"),
             "{message}"
         );
         assert!(!message.contains("Run `carina init`"), "{message}");
@@ -1536,7 +1549,13 @@ child { values = [source] }
         assert!(!report.is_ready(), "fixture must produce a binding finding");
 
         let mut errors = Vec::new();
-        extend_expanded_binding_use_errors(&mut errors, &report, &[]);
+        extend_expanded_binding_use_errors(
+            &mut errors,
+            &report,
+            &[] as &[carina_core::resource::LiveComposition<
+                carina_core::resource::ParserPlaceholder,
+            >],
+        );
         assert!(
             errors.iter().any(|error| {
                 matches!(error, AppError::ModuleCall(finding)

@@ -135,6 +135,11 @@ typed identities and values, refusing a mismatch with re-plan guidance before
 provider effects run. Format 34 plans cannot distinguish explicit false from
 an unspecified value and must be regenerated.
 
+Saved-plan format 36 adds typed deferred-for templates and stage-specific
+placeholder values. Deferred template attributes are serialized only through
+their `template_resource`. Older plans are rejected with the same replan
+guidance; the state format remains unchanged.
+
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
 validates and preserves that continuation through the same typestate path as

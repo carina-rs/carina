@@ -27,7 +27,7 @@ pub(crate) struct TrustedLocalGrant {
     origin: GrantOrigin,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedLocalGrants(Vec<TrustedLocalGrant>);
 
 impl TrustedLocalGrants {

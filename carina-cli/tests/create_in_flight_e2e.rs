@@ -63,6 +63,15 @@ impl Scenario {
         assert_success("carina init", &output);
     }
 
+    fn init_accepting_egress(&self, provider_source: &std::path::Path) {
+        let source = format!("file://{}", provider_source.display());
+        let output = self
+            .carina(&["init", ".", "--accept-egress", &source])
+            .output()
+            .expect("run carina init with egress consent");
+        assert_success("carina init", &output);
+    }
+
     fn apply_with_modes(&self, create: &str, resume: &str) -> Output {
         self.carina(&["apply", ".", "--auto-approve", "--lock=false"])
             .env("CARINA_MOCK_CREATE_MODE", create)
@@ -344,7 +353,7 @@ mock.test.short_budget {
 }"#,
         provider_block,
     );
-    scenario.init();
+    scenario.init_accepting_egress(&wasm_path);
 
     let first = scenario.apply_with_modes("success", "resumed");
     assert_failed("WASM initial pending apply", &first);
@@ -1025,7 +1034,7 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
         cached_plan.sorted_resources[0].attributes.get("name"),
         Some(carina_core::resource::Value::Deferred(
             carina_core::resource::DeferredValue::Unknown(
-                carina_core::resource::UnknownReason::PendingReRead(_)
+                carina_core::resource::ApplyTimeUnknown::PendingReRead(_)
             )
         ))
     ));

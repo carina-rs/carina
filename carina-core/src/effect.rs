@@ -14,6 +14,7 @@ use std::{
     ops::Deref,
 };
 
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
 use crate::non_empty::NonEmptyVec;
@@ -24,7 +25,6 @@ use crate::resource::{DataSource, DeferredValue};
 use crate::resource::{
     DeposedKey, Directives, LoopElementOrigin, ModuleSource, ResolvedDataSource, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, SavedModuleSource, State, Value,
-    resolve_resource_ignore_changes,
 };
 use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
@@ -288,16 +288,134 @@ impl From<NonEmptyDeletes> for Vec<DeferredReplaceDelete> {
     }
 }
 
+/// Payload for [`Effect::DeferredCreate`].
+///
+/// The scheduler id is projected from `template` and exists only on the wire,
+/// where deserialization validates it before discarding the duplicate value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredCreatePayload<S = ModuleSource> {
+    /// The for-expression body, replayed against the upstream state.
+    pub template: Box<DeferredForExpression<S>>,
+}
+
+impl<S> DeferredCreatePayload<S> {
+    pub fn new(template: Box<DeferredForExpression<S>>) -> Self {
+        Self { template }
+    }
+
+    pub fn id(&self) -> &ResolvedResourceId {
+        self.template.deferred_effect_id()
+    }
+}
+
+impl<S: Serialize + Clone> Serialize for DeferredCreatePayload<S> {
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("DeferredCreatePayload", 2)?;
+        state.serialize_field("id", self.id())?;
+        state.serialize_field("template", &self.template)?;
+        state.end()
+    }
+}
+
+impl<'de, S: serde::de::DeserializeOwned> Deserialize<'de> for DeferredCreatePayload<S> {
+    fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
+    where
+        De: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(bound(deserialize = "S: serde::de::DeserializeOwned"))]
+        struct Wire<S> {
+            id: ResolvedResourceId,
+            template: Box<DeferredForExpression<S>>,
+        }
+
+        let Wire { id, template } = Wire::deserialize(deserializer)?;
+        validate_deferred_effect_id::<De::Error, S>(&id, &template)?;
+        Ok(Self { template })
+    }
+}
+
 /// Payload for [`Effect::DeferredReplace`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeferredReplacePayload<S = ModuleSource> {
     /// Pre-apply iterations being destroyed.
     pub deletes: NonEmptyDeletes,
-    /// Synthetic id used for plan-tree display and progress.
-    pub id: ResolvedResourceId,
     /// The for-expression body, replayed against the upstream state.
     pub template: Box<DeferredForExpression<S>>,
+}
+
+impl<S> DeferredReplacePayload<S> {
+    pub fn id(&self) -> &ResolvedResourceId {
+        self.template.deferred_effect_id()
+    }
+}
+
+impl<S: Serialize + Clone> Serialize for DeferredReplacePayload<S> {
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("DeferredReplacePayload", 3)?;
+        state.serialize_field("deletes", &self.deletes)?;
+        state.serialize_field("id", self.id())?;
+        state.serialize_field("template", &self.template)?;
+        state.end()
+    }
+}
+
+impl<'de, S: serde::de::DeserializeOwned> Deserialize<'de> for DeferredReplacePayload<S> {
+    fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
+    where
+        De: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(bound(deserialize = "S: serde::de::DeserializeOwned"))]
+        struct Wire<S> {
+            deletes: NonEmptyDeletes,
+            id: ResolvedResourceId,
+            template: Box<DeferredForExpression<S>>,
+        }
+
+        let Wire {
+            deletes,
+            id,
+            template,
+        } = Wire::deserialize(deserializer)?;
+        validate_deferred_effect_id::<De::Error, S>(&id, &template)?;
+        Ok(Self { deletes, template })
+    }
+}
+
+fn validate_deferred_effect_id<E: serde::de::Error, S>(
+    id: &ResolvedResourceId,
+    template: &DeferredForExpression<S>,
+) -> Result<(), E> {
+    let expected = template.deferred_effect_id();
+    if id.provider() != expected.provider() {
+        return Err(E::custom(
+            "Invalid saved plan: deferred effect provider does not match deferred template resource provider",
+        ));
+    }
+    if id.resource_type() != expected.resource_type() {
+        return Err(E::custom(
+            "Invalid saved plan: deferred effect resource type does not match deferred template resource type",
+        ));
+    }
+    if id.provider_instance() != expected.provider_instance() {
+        return Err(E::custom(
+            "Invalid saved plan: deferred effect provider instance does not match deferred template resource provider instance",
+        ));
+    }
+    if id.identity() != expected.identity() {
+        return Err(E::custom(format!(
+            "Invalid saved plan: deferred effect id does not match deferred target scheduler key `{}`",
+            template.target().scheduler_key()
+        )));
+    }
+    Ok(())
 }
 
 /// One keyed list entry released from Carina's authored-value projection.
@@ -626,7 +744,7 @@ impl ResolvedMove {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "S: Serialize + Clone",
-    deserialize = "S: Deserialize<'de>"
+    deserialize = "S: serde::de::DeserializeOwned"
 ))]
 pub enum EffectWithSource<S> {
     /// Read the current state of a resource (data source)
@@ -775,12 +893,7 @@ pub enum EffectWithSource<S> {
     ///
     /// Emitted by the planner when the iterable's plan-time value is
     /// unresolved. State-only: does not call the provider.
-    DeferredCreate {
-        /// Synthetic id used for plan-tree display and progress.
-        id: ResolvedResourceId,
-        /// The for-expression body, replayed against the upstream state.
-        template: Box<DeferredForExpression<S>>,
-    },
+    DeferredCreate(DeferredCreatePayload<S>),
 
     /// A deferred-for replacement whose delete side is known at plan time
     /// and whose create side is materialized after the upstream binding is
@@ -856,10 +969,7 @@ pub enum UnresolvedSavedEffect {
         #[serde(default)]
         explicit_dependencies: HashSet<String>,
     },
-    DeferredCreate {
-        id: ResolvedResourceId,
-        template: Box<DeferredForExpression<SavedModuleSource>>,
-    },
+    DeferredCreate(DeferredCreatePayload<SavedModuleSource>),
     DeferredReplace(Box<DeferredReplacePayload<SavedModuleSource>>),
 }
 
@@ -936,7 +1046,7 @@ impl From<SavedEffect> for UnresolvedSavedEffect {
                 interval,
                 explicit_dependencies,
             },
-            Effect::DeferredCreate { id, template } => Self::DeferredCreate { id, template },
+            Effect::DeferredCreate(payload) => Self::DeferredCreate(payload),
             Effect::DeferredReplace(payload) => Self::DeferredReplace(payload),
         }
     }
@@ -955,7 +1065,7 @@ impl UnresolvedSavedEffect {
             | Self::Remove { .. }
             | Self::ReleaseListKeys { .. }
             | Self::Wait { .. }
-            | Self::DeferredCreate { .. }
+            | Self::DeferredCreate(_)
             | Self::DeferredReplace(_) => None,
         }
     }
@@ -972,7 +1082,7 @@ impl UnresolvedSavedEffect {
             Self::Move { .. } => "move",
             Self::ReleaseListKeys { .. } => "release_list_keys",
             Self::Wait { .. } => "wait",
-            Self::DeferredCreate { .. } => "deferred_create",
+            Self::DeferredCreate(_) => "deferred_create",
             Self::DeferredReplace(_) => "deferred_replace",
         }
     }
@@ -986,10 +1096,10 @@ impl UnresolvedSavedEffect {
             | Self::Import { id, .. }
             | Self::Remove { id }
             | Self::Move { to: id, .. }
-            | Self::ReleaseListKeys { id, .. }
-            | Self::DeferredCreate { id, .. } => id,
+            | Self::ReleaseListKeys { id, .. } => id,
+            Self::DeferredCreate(payload) => payload.id(),
             Self::Wait { target_id, .. } => target_id.id(),
-            Self::DeferredReplace(payload) => &payload.id,
+            Self::DeferredReplace(payload) => payload.id(),
         }
     }
 
@@ -1070,12 +1180,12 @@ impl UnresolvedSavedEffect {
                 interval,
                 explicit_dependencies,
             },
-            Self::DeferredCreate { id, mut template } => {
-                resolve_resource_ignore_changes(&mut template.template_resource, schemas)?;
-                Effect::DeferredCreate { id, template }
+            Self::DeferredCreate(mut payload) => {
+                payload.template.resolve_template_ignore_changes(schemas)?;
+                Effect::DeferredCreate(payload)
             }
             Self::DeferredReplace(mut payload) => {
-                resolve_resource_ignore_changes(&mut payload.template.template_resource, schemas)?;
+                payload.template.resolve_template_ignore_changes(schemas)?;
                 Effect::DeferredReplace(payload)
             }
         })
@@ -1157,19 +1267,13 @@ impl From<Effect> for SavedEffect {
                 interval,
                 explicit_dependencies,
             },
-            Effect::DeferredCreate { id, template } => Self::DeferredCreate {
-                id,
-                template: Box::new((*template).into()),
-            },
+            Effect::DeferredCreate(payload) => Self::DeferredCreate(DeferredCreatePayload {
+                template: Box::new((*payload.template).into()),
+            }),
             Effect::DeferredReplace(payload) => {
-                let DeferredReplacePayload {
-                    deletes,
-                    id,
-                    template,
-                } = *payload;
+                let DeferredReplacePayload { deletes, template } = *payload;
                 Self::DeferredReplace(Box::new(DeferredReplacePayload {
                     deletes,
-                    id,
                     template: Box::new((*template).into()),
                 }))
             }
@@ -1293,7 +1397,7 @@ impl<S> EffectWithSource<S> {
             | Self::Remove { .. }
             | Self::ReleaseListKeys { .. }
             | Self::Wait { .. }
-            | Self::DeferredCreate { .. }
+            | Self::DeferredCreate(_)
             | Self::DeferredReplace(_) => None,
         }
     }
@@ -1311,7 +1415,7 @@ impl<S> EffectWithSource<S> {
             | Self::Remove { .. }
             | Self::ReleaseListKeys { .. }
             | Self::Wait { .. }
-            | Self::DeferredCreate { .. }
+            | Self::DeferredCreate(_)
             | Self::DeferredReplace(_) => None,
         }
     }
@@ -1340,7 +1444,7 @@ impl<S> EffectWithSource<S> {
             | Self::Remove { .. }
             | Self::Move { .. }
             | Self::Wait { .. }
-            | Self::DeferredCreate { .. }
+            | Self::DeferredCreate(_)
             | Self::DeferredReplace(_) => None,
         }
     }
@@ -1376,6 +1480,18 @@ impl EffectWithSource<ModuleSource> {
         use std::time::Duration;
 
         let id = ResourceId::with_identity("test", "x");
+        let deferred_template = || {
+            crate::parser::DeferredForExpression::new(
+                Some("main.crn".to_string()),
+                12,
+                "for opt in cert.domain_validation_options".to_string(),
+                crate::parser::DeferredForTarget::bound("validation_records")
+                    .expect("fixture binding is valid"),
+                Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                crate::parser::ForBinding::Simple("opt".to_string()),
+                Resource::new("route53.Record", "validation_records"),
+            )
+        };
 
         macro_rules! effect_cases {
             ($(($effect:expr, $pattern:pat)),+ $(,)?) => {{
@@ -1495,30 +1611,8 @@ impl EffectWithSource<ModuleSource> {
                 Effect::Wait { .. }
             ),
             (
-                Effect::DeferredCreate {
-                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                        "route53.Record",
-                        "validation_records"
-                    )),
-                    template: Box::new(crate::parser::DeferredForExpression {
-                        file: Some("main.crn".to_string()),
-                        line: 12,
-                        header: "for opt in cert.domain_validation_options".to_string(),
-                        resource_type: "route53.Record".to_string(),
-                        attributes: vec![],
-                        target: crate::parser::DeferredForTarget::Bound {
-                            binding: "validation_records".to_string(),
-                        },
-                        iterable: Value::resource_ref(
-                            "cert",
-                            "domain_validation_options",
-                            Vec::new(),
-                        ),
-                        binding: crate::parser::ForBinding::Simple("opt".to_string()),
-                        template_resource: Resource::new("route53.Record", "validation_records"),
-                    }),
-                },
-                Effect::DeferredCreate { .. }
+                Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(deferred_template(),))),
+                Effect::DeferredCreate(_)
             ),
             (
                 Effect::DeferredReplace(Box::new(DeferredReplacePayload {
@@ -1535,27 +1629,7 @@ impl EffectWithSource<ModuleSource> {
                         blocked_by_updates: HashSet::new(),
                     }])
                     .expect("test fixture has one delete"),
-                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                        "route53.Record",
-                        "validation_records"
-                    )),
-                    template: Box::new(crate::parser::DeferredForExpression {
-                        file: Some("main.crn".to_string()),
-                        line: 12,
-                        header: "for opt in cert.domain_validation_options".to_string(),
-                        resource_type: "route53.Record".to_string(),
-                        attributes: vec![],
-                        target: crate::parser::DeferredForTarget::Bound {
-                            binding: "validation_records".to_string(),
-                        },
-                        iterable: Value::resource_ref(
-                            "cert",
-                            "domain_validation_options",
-                            Vec::new(),
-                        ),
-                        binding: crate::parser::ForBinding::Simple("opt".to_string()),
-                        template_resource: Resource::new("route53.Record", "validation_records"),
-                    }),
+                    template: Box::new(deferred_template()),
                 })),
                 Effect::DeferredReplace(_)
             ),
@@ -1581,7 +1655,7 @@ impl<S> EffectWithSource<S> {
             Effect::Move { .. } => "->",
             Effect::ReleaseListKeys { .. } => "!",
             Effect::Wait { .. } => ">",
-            Effect::DeferredCreate { .. } => "+",
+            Effect::DeferredCreate(_) => "+",
             Effect::DeferredReplace(_) => "+/-",
         }
     }
@@ -1656,7 +1730,7 @@ impl<S> EffectWithSource<S> {
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => None,
         }
     }
@@ -1682,7 +1756,7 @@ impl<S> EffectWithSource<S> {
             Effect::Move { .. } => "move",
             Effect::ReleaseListKeys { .. } => "release_list_keys",
             Effect::Wait { .. } => "wait",
-            Effect::DeferredCreate { .. } => "deferred_create",
+            Effect::DeferredCreate(_) => "deferred_create",
             Effect::DeferredReplace(_) => "deferred_replace",
         }
     }
@@ -1700,7 +1774,7 @@ impl<S> EffectWithSource<S> {
             Effect::Move { .. } => true,
             Effect::ReleaseListKeys { .. } => true,
             Effect::Wait { .. } => false,
-            Effect::DeferredCreate { .. } => true,
+            Effect::DeferredCreate(_) => true,
             Effect::DeferredReplace(_) => true,
         }
     }
@@ -1718,7 +1792,7 @@ impl<S> EffectWithSource<S> {
             Effect::Move { .. } => true,
             Effect::ReleaseListKeys { .. } => true,
             Effect::Wait { .. } => false,
-            Effect::DeferredCreate { .. } => false,
+            Effect::DeferredCreate(_) => false,
             Effect::DeferredReplace(_) => true,
         }
     }
@@ -1737,7 +1811,7 @@ impl<S> EffectWithSource<S> {
             Effect::Move { .. } => false,
             Effect::ReleaseListKeys { .. } => false,
             Effect::Wait { .. } => false,
-            Effect::DeferredCreate { .. } => true,
+            Effect::DeferredCreate(_) => true,
             Effect::DeferredReplace(_) => true,
         }
     }
@@ -1755,8 +1829,8 @@ impl<S> EffectWithSource<S> {
             Effect::Move { to, .. } => to,
             Effect::ReleaseListKeys { id, .. } => id,
             Effect::Wait { target_id, .. } => target_id.id(),
-            Effect::DeferredCreate { id, .. } => id,
-            Effect::DeferredReplace(payload) => &payload.id,
+            Effect::DeferredCreate(payload) => payload.id(),
+            Effect::DeferredReplace(payload) => payload.id(),
         }
     }
 
@@ -1774,11 +1848,11 @@ impl<S> EffectWithSource<S> {
             Effect::Delete { id, .. }
             | Effect::Import { id, .. }
             | Effect::Remove { id }
-            | Effect::ReleaseListKeys { id, .. }
-            | Effect::DeferredCreate { id, .. } => id.identity().clone(),
+            | Effect::ReleaseListKeys { id, .. } => id.identity().clone(),
+            Effect::DeferredCreate(payload) => payload.id().identity().clone(),
             Effect::Move { to, .. } => to.identity().clone(),
             Effect::Wait { identity, .. } => identity.clone(),
-            Effect::DeferredReplace(payload) => payload.id.identity().clone(),
+            Effect::DeferredReplace(payload) => payload.id().identity().clone(),
         }
     }
 
@@ -1800,7 +1874,7 @@ impl<S> EffectWithSource<S> {
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => EffectInstanceKey::current(self.identity()),
         }
     }
@@ -1829,7 +1903,7 @@ impl<S> EffectWithSource<S> {
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => None,
         }
     }
@@ -1854,10 +1928,12 @@ impl<S> EffectWithSource<S> {
             // binding_name is the stable identity. A consumer iterating
             // `plan.effects().filter_map(|e| e.binding_name())` will see
             // DeferredReplaces and skip DeferredCreates — this is intentional.
-            Effect::DeferredCreate { .. } => None,
-            Effect::DeferredReplace(payload) => {
-                payload.template.target.bound_binding().map(str::to_string)
-            }
+            Effect::DeferredCreate(_) => None,
+            Effect::DeferredReplace(payload) => payload
+                .template
+                .target()
+                .bound_binding()
+                .map(str::to_string),
         }
     }
 
@@ -1900,7 +1976,7 @@ impl<S> EffectWithSource<S> {
             Effect::Move { from, .. } => vec![from.clone()],
             Effect::ReleaseListKeys { .. } => Vec::new(),
             Effect::Wait { .. } => Vec::new(),
-            Effect::DeferredCreate { .. } => Vec::new(),
+            Effect::DeferredCreate(_) => Vec::new(),
             // Absorbed deletes are replacement outcomes, not ordinary
             // cleanups. Apply writeback classifies them exhaustively in
             // `classify_replacement_outcome`, where the create result is
@@ -1934,7 +2010,7 @@ impl<S> EffectWithSource<S> {
             Effect::Move { .. } => Vec::new(),
             Effect::ReleaseListKeys { .. } => Vec::new(),
             Effect::Wait { .. } => Vec::new(),
-            Effect::DeferredCreate { .. } => Vec::new(),
+            Effect::DeferredCreate(_) => Vec::new(),
             Effect::DeferredReplace(payload) => payload
                 .deletes
                 .iter()
@@ -1982,7 +2058,7 @@ impl<S> EffectWithSource<S> {
                 explicit_dependencies,
                 ..
             } => explicit_dependencies.clone(),
-            Effect::DeferredCreate { .. } => HashSet::new(),
+            Effect::DeferredCreate(_) => HashSet::new(),
             Effect::DeferredReplace(payload) => {
                 deferred_replace_delete_explicit_dependencies(&payload.deletes)
             }
@@ -2034,8 +2110,8 @@ impl<S> EffectWithSource<S> {
                 deps.extend(self.explicit_dependencies());
                 deps.into_iter().collect()
             }
-            Effect::DeferredCreate { template, .. } => {
-                template.root_bindings().into_iter().collect()
+            Effect::DeferredCreate(payload) => {
+                payload.template.root_bindings().into_iter().collect()
             }
             Effect::DeferredReplace(payload) => {
                 let mut deps = deferred_replace_delete_dependencies(&payload.deletes);
@@ -2071,13 +2147,12 @@ impl<S> EffectWithSource<S> {
                 );
                 edges
             }
-            Effect::Wait { .. } | Effect::DeferredCreate { .. } | Effect::DeferredReplace(_) => {
-                self.blocking_bindings()
-                    .into_iter()
-                    .map(ResourceIdentity::new)
-                    .map(ScheduleEdge::DependsOn)
-                    .collect()
-            }
+            Effect::Wait { .. } | Effect::DeferredCreate(_) | Effect::DeferredReplace(_) => self
+                .blocking_bindings()
+                .into_iter()
+                .map(ResourceIdentity::new)
+                .map(ScheduleEdge::DependsOn)
+                .collect(),
             Effect::Read { .. }
             | Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -2111,7 +2186,7 @@ impl<S> EffectWithSource<S> {
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => Vec::new(),
         }
     }
@@ -2252,29 +2327,22 @@ mod tests {
     }
 
     fn deferred_for_template() -> crate::parser::DeferredForExpression {
-        crate::parser::DeferredForExpression {
-            file: Some("main.crn".to_string()),
-            line: 12,
-            header: "for opt in cert.domain_validation_options".to_string(),
-            resource_type: "route53.Record".to_string(),
-            attributes: vec![],
-            target: crate::parser::DeferredForTarget::Bound {
-                binding: "validation_records".to_string(),
-            },
-            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            binding: crate::parser::ForBinding::Simple("opt".to_string()),
-            template_resource: Resource::new("route53.Record", "validation_records"),
-        }
+        crate::parser::DeferredForExpression::new(
+            Some("main.crn".to_string()),
+            12,
+            "for opt in cert.domain_validation_options".to_string(),
+            crate::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            crate::parser::ForBinding::Simple("opt".to_string()),
+            Resource::new("route53.Record", "validation_records"),
+        )
     }
 
     fn deferred_create_effect() -> Effect {
-        Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "route53.Record",
-                "validation_records",
-            )),
-            template: Box::new(deferred_for_template()),
-        }
+        Effect::DeferredCreate(DeferredCreatePayload::new(
+            Box::new(deferred_for_template()),
+        ))
     }
 
     fn deferred_replace_effect() -> Effect {
@@ -2295,12 +2363,55 @@ mod tests {
                 blocked_by_updates: HashSet::new(),
             }])
             .expect("test fixture has one delete"),
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
             template: Box::new(template),
         }))
+    }
+
+    #[test]
+    fn deferred_effect_wire_matches_stored_id_shape_byte_for_byte() {
+        #[derive(Serialize)]
+        enum StoredEffect {
+            DeferredCreate {
+                id: ResolvedResourceId,
+                template: Box<crate::parser::DeferredForExpression>,
+            },
+            DeferredReplace(Box<StoredDeferredReplacePayload>),
+        }
+
+        #[derive(Serialize)]
+        struct StoredDeferredReplacePayload {
+            deletes: NonEmptyDeletes,
+            id: ResolvedResourceId,
+            template: Box<crate::parser::DeferredForExpression>,
+        }
+
+        let create_template = Box::new(deferred_for_template());
+        let create_id = create_template.deferred_effect_id().clone();
+        let current_create =
+            Effect::DeferredCreate(DeferredCreatePayload::new(create_template.clone()));
+        let stored_create = StoredEffect::DeferredCreate {
+            id: create_id,
+            template: create_template,
+        };
+        assert_eq!(
+            serde_json::to_vec(&current_create).expect("serialize current deferred create"),
+            serde_json::to_vec(&stored_create).expect("serialize stored deferred create"),
+        );
+
+        let Effect::DeferredReplace(current_replace) = deferred_replace_effect() else {
+            unreachable!("fixture constructs DeferredReplace")
+        };
+        let stored_replace =
+            StoredEffect::DeferredReplace(Box::new(StoredDeferredReplacePayload {
+                deletes: current_replace.deletes.clone(),
+                id: current_replace.id().clone(),
+                template: current_replace.template.clone(),
+            }));
+        let current_replace = Effect::DeferredReplace(current_replace);
+        assert_eq!(
+            serde_json::to_vec(&current_replace).expect("serialize current deferred replace"),
+            serde_json::to_vec(&stored_replace).expect("serialize stored deferred replace"),
+        );
     }
 
     fn every_effect_variant() -> Vec<(&'static str, Effect)> {
@@ -2435,11 +2546,11 @@ mod tests {
         // would wrap the nested value as a DSL string literal with
         // surrounding `"…"` quotes and `${…}` syntax).
         use crate::resource::{
-            ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+            ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Value,
         };
         let inner = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamAllExports {
+                ApplyTimeUnknown::UpstreamAllExports {
                     binding: "u".into(),
                 },
             ))),
@@ -2482,11 +2593,11 @@ mod tests {
         // interpolation; the helper now gates that path through the
         // `Value` type.
         use crate::resource::{
-            ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+            ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Value,
         };
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamAllExports {
+                ApplyTimeUnknown::UpstreamAllExports {
                     binding: "upstream".into(),
                 },
             ))),
@@ -2515,13 +2626,7 @@ mod tests {
             value: Box::new(Value::resource_ref("primary", "items", Vec::new())),
             default: Box::new(Value::resource_ref("fallback", "items", Vec::new())),
         });
-        let effect = Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "route53.Record",
-                "validation_records",
-            )),
-            template: Box::new(template),
-        };
+        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(template)));
 
         assert_eq!(
             effect.blocking_bindings(),
@@ -2548,10 +2653,6 @@ mod tests {
                 blocked_by_updates: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
             template: Box::new(template),
         }));
 
@@ -2580,10 +2681,6 @@ mod tests {
                 blocked_by_updates: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
             template: Box::new(template),
         }));
 
@@ -2614,12 +2711,16 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded = deserialize_effect(&json);
         match decoded {
-            Effect::DeferredCreate { template, .. } => {
+            Effect::DeferredCreate(payload) => {
+                let template = payload.template;
                 assert_eq!(template.file, None);
                 assert_eq!(template.line, 0);
                 assert_eq!(template.header, "for opt in cert.domain_validation_options");
-                assert_eq!(template.resource_type, "route53.Record");
-                assert_eq!(template.target.bound_binding(), Some("validation_records"));
+                assert_eq!(template.resource_type(), "route53.Record");
+                assert_eq!(
+                    template.target().bound_binding(),
+                    Some("validation_records")
+                );
                 assert_eq!(
                     template.reference_candidates(),
                     BTreeSet::from(["cert.domain_validation_options".to_string()])
@@ -2635,6 +2736,42 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded = deserialize_effect(&json);
         assert_eq!(decoded, SavedEffect::from(original));
+    }
+
+    #[test]
+    fn deferred_ignore_changes_error_reports_materialized_template_address() {
+        use crate::resource::{ParsedIgnorePath, ParsedIgnorePathSegment};
+        use crate::schema::ResourceSchema;
+
+        let mut effect = deferred_create_effect();
+        let Effect::DeferredCreate(payload) = &mut effect else {
+            unreachable!("fixture constructs DeferredCreate")
+        };
+        payload.template.template_directives_mut().ignore_changes =
+            vec![ParsedIgnorePath::new(vec![
+                ParsedIgnorePathSegment::Attribute("missing".to_string()),
+            ])];
+
+        let json = serde_json::to_string(&effect).expect("serialize");
+        let saved = serde_json::from_str::<UnresolvedSavedEffect>(&json)
+            .expect("deserialize unresolved saved effect");
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "route53",
+            ResourceSchema::new("Record")
+                .validate()
+                .expect("valid test schema"),
+        );
+
+        let error = saved
+            .resolve_with_schemas(&schemas)
+            .expect_err("ignore_changes path is absent from the schema");
+        assert!(
+            error
+                .to_string()
+                .contains("route53.Record.validation_records[?]"),
+            "unexpected error: {error}",
+        );
     }
 
     #[test]

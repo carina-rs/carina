@@ -9,15 +9,18 @@ use std::path::{Path, PathBuf};
 use crate::parser::{
     DeferredIfBody, File, LoadedProviderContext, ModuleCallDiagnosticSource, ModuleResolvedFile,
     ModuleResolvedParsedFile, ParseError, ParsedFile, ProviderContext, StateBlock, UseStatement,
-    ValidateExpr,
+    ValidateExpr as GenericValidateExpr,
 };
-use crate::resource::{ModuleConstraintId, Value};
+use crate::resource::{ModuleConstraintId, ParserPlaceholder, Value as GenericValue};
 use crate::schema::SchemaRegistry;
 
 use super::error::{ModuleError, ModuleErrorCallSource};
 use super::expander::instance_prefix_for_call;
 use super::loader::sorted_crn_paths_in;
 use super::validation::{ConstraintOrigin, ModuleConstraintDiagnostic};
+
+type Value = GenericValue<ParserPlaceholder>;
+type ValidateExpr = GenericValidateExpr<ParserPlaceholder>;
 
 /// Resolver-owned result of evaluating one authored module constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1599,16 +1602,16 @@ impl ExpandedModuleContribution {
 /// gate; planning/apply and the ordinary resolver must pass it.
 pub fn ensure_expanded_root_graph<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::ParserDeferredForPhaseAudit,
 >(
-    file: &File<E, D>,
+    file: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
 ) -> Result<(), ModuleError> {
     audit_expanded_module_contribution(file)
         .map_err(|context| ModuleError::UnexpandedModuleTemplate { context })
 }
 
-fn audit_value_has_no_module_if(
-    value: &Value,
+fn audit_value_has_no_module_if<P: crate::resource::PlaceholderKind>(
+    value: &GenericValue<P>,
     context: std::fmt::Arguments<'_>,
 ) -> Result<(), String> {
     if super::deferred_if::value_contains_module_if(value) {
@@ -1665,9 +1668,9 @@ fn audit_attributes<'a>(
 /// publication audit makes an explicit decision about it.
 fn audit_expanded_module_contribution<
     E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
+    D: crate::parser::ParserDeferredForPhaseAudit,
 >(
-    file: &File<E, D>,
+    file: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
 ) -> Result<(), String> {
     file.assert_module_if_audit_classifies_every_field();
     let File {

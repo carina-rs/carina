@@ -28,11 +28,11 @@ use super::expressions::primary::{
     parse_primary_eval_with_mode,
 };
 use super::expressions::wait_expr::parse_wait_expr;
-use super::grammar::PreprocessedFile;
+use super::grammar::{ParserBindingName, PreprocessedFile};
 use super::parse_expression_eval;
 use super::util::descend_expression;
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
-use crate::resource::{DataSource, Resource};
+use crate::parser::{ParsedDataSource as DataSource, ParsedResource as Resource};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
 /// rather than `Value` so partial applications (closures) can survive
@@ -141,20 +141,24 @@ pub(super) fn parse_let_binding_extended(
 > {
     let source_span = crate::parser::SourceSpan::from_pest(&pair, preprocessed_file);
     let mut inner = pair.into_inner();
-    let name = next_pair(&mut inner, "binding name", "let binding")?
-        .as_str()
-        .to_string();
+    let name = ParserBindingName::from_let_binding_pair(next_pair(
+        &mut inner,
+        "binding name",
+        "let binding",
+    )?);
     let rhs_pair = next_pair(&mut inner, "expression", "let binding")?;
 
     // `use` is the only meta-statement allowed as a let-binding RHS. The
     // grammar permits it here and only here (see carina.pest); everywhere
     // else it is a parse error.
     if rhs_pair.as_rule() == Rule::use_expr {
-        let use_stmt = parse_use_expr(rhs_pair, &name, ctx, source_span, source_file)?;
-        let value =
-            EvalValue::structural_handle(StructuralHandle::new(StructuralHandleKind::Use, &name));
+        let use_stmt = parse_use_expr(rhs_pair, name.as_str(), ctx, source_span, source_file)?;
+        let value = EvalValue::structural_handle(StructuralHandle::new(
+            StructuralHandleKind::Use,
+            name.as_str(),
+        ));
         return Ok((
-            name,
+            name.into_string(),
             value,
             vec![],
             vec![],
@@ -179,7 +183,7 @@ pub(super) fn parse_let_binding_extended(
         )?;
 
     Ok((
-        name,
+        name.into_string(),
         value,
         expanded_resources,
         data_sources,
@@ -233,7 +237,7 @@ fn arithmetic_on_declaration_error(line: usize) -> ParseError {
 fn parse_expression_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
-    binding_name: &str,
+    binding_name: &ParserBindingName,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<LetBindingRhs, ParseError> {
@@ -408,7 +412,7 @@ fn parse_expression_with_resource_or_module(
 fn parse_primary_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
-    binding_name: &str,
+    binding_name: &ParserBindingName,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
     fallback_mode: &ExpressionMode<'_>,
@@ -432,7 +436,7 @@ pub(crate) fn parse_integer_operand_primary(
 ) -> Result<EvalValue, ParseError> {
     let position = ctx.original_position(&inner)?;
     let (line, column) = (position.line(), position.column());
-    let binding_name = format!("__integer_operand_{line}_{column}");
+    let binding_name = ParserBindingName::integer_operand(line, column);
     let mut operand_ctx = ctx.clone();
     let operand_mode =
         ExpressionMode::with_source(source_file, preprocessed_file).for_integer_operand();
@@ -453,11 +457,12 @@ pub(crate) fn parse_integer_operand_primary(
 fn parse_primary_inner_with_resource_or_module(
     inner: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
-    binding_name: &str,
+    binding_name: &ParserBindingName,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
     fallback_mode: &ExpressionMode<'_>,
 ) -> Result<LetBindingRhs, ParseError> {
+    let binding_name_str = binding_name.as_str();
     if inner.as_rule() == Rule::variable_ref {
         let mut reference_parts = inner.clone().into_inner();
         if let Some(identifier) = reference_parts.next()
@@ -481,14 +486,19 @@ fn parse_primary_inner_with_resource_or_module(
 
     match inner.as_rule() {
         Rule::read_resource_expr => {
-            let data_source =
-                parse_read_resource_expr(inner, ctx, binding_name, preprocessed_file, source_file)?;
+            let data_source = parse_read_resource_expr(
+                inner,
+                ctx,
+                binding_name_str,
+                preprocessed_file,
+                source_file,
+            )?;
             let resource_type = super::ast::ResourceTypePath::new(
                 data_source.id.provider.clone(),
                 data_source.id.resource_type.clone(),
             );
             Ok((
-                structural_handle(binding_name, resource_type),
+                structural_handle(binding_name_str, resource_type),
                 vec![],
                 vec![data_source],
                 vec![],
@@ -498,7 +508,7 @@ fn parse_primary_inner_with_resource_or_module(
         }
         Rule::upstream_state_expr => {
             let line = ctx.original_position(&inner)?.line();
-            let us = parse_upstream_state_expr(inner, binding_name)?;
+            let us = parse_upstream_state_expr(inner, binding_name_str)?;
             if ctx.upstream_states.contains_key(&us.binding) {
                 return Err(ParseError::DuplicateBinding {
                     name: us.binding,
@@ -507,7 +517,7 @@ fn parse_primary_inner_with_resource_or_module(
             }
             ctx.upstream_states.insert(us.binding.clone(), us);
             Ok((
-                upstream_state_structural_handle(binding_name),
+                upstream_state_structural_handle(binding_name_str),
                 vec![],
                 vec![],
                 vec![],
@@ -517,20 +527,20 @@ fn parse_primary_inner_with_resource_or_module(
         }
         Rule::provider_expr => {
             let line = ctx.original_position(&inner)?.line();
-            let config = parse_provider_expr(inner, ctx, binding_name)?;
+            let config = parse_provider_expr(inner, ctx, binding_name_str)?;
             if ctx
                 .named_provider_instances
                 .iter()
-                .any(|p| p.binding.as_deref() == Some(binding_name))
+                .any(|p| p.binding.as_deref() == Some(binding_name_str))
             {
                 return Err(ParseError::DuplicateBinding {
-                    name: binding_name.to_string(),
+                    name: binding_name_str.to_string(),
                     line,
                 });
             }
             ctx.named_provider_instances.push(config);
             Ok((
-                provider_structural_handle(binding_name),
+                provider_structural_handle(binding_name_str),
                 vec![],
                 vec![],
                 vec![],
@@ -540,7 +550,7 @@ fn parse_primary_inner_with_resource_or_module(
         }
         Rule::wait_expr => {
             let line = ctx.original_position(&inner)?.line();
-            let wb = parse_wait_expr(inner, binding_name)?;
+            let wb = parse_wait_expr(inner, binding_name_str)?;
             if ctx.wait_bindings.contains_key(wb.binding.as_str()) {
                 return Err(ParseError::DuplicateBinding {
                     name: wb.binding.into_string(),
@@ -550,7 +560,7 @@ fn parse_primary_inner_with_resource_or_module(
             ctx.wait_bindings
                 .insert(wb.binding.as_str().to_string(), wb);
             Ok((
-                wait_structural_handle(binding_name),
+                wait_structural_handle(binding_name_str),
                 vec![],
                 vec![],
                 vec![],
@@ -560,13 +570,13 @@ fn parse_primary_inner_with_resource_or_module(
         }
         Rule::resource_expr => {
             let resource =
-                parse_resource_expr(inner, ctx, binding_name, preprocessed_file, source_file)?;
+                parse_resource_expr(inner, ctx, binding_name_str, preprocessed_file, source_file)?;
             let resource_type = super::ast::ResourceTypePath::new(
                 resource.id.provider.clone(),
                 resource.id.resource_type.clone(),
             );
             Ok((
-                structural_handle(binding_name, resource_type),
+                structural_handle(binding_name_str, resource_type),
                 vec![resource],
                 vec![],
                 vec![],
@@ -575,15 +585,11 @@ fn parse_primary_inner_with_resource_or_module(
             ))
         }
         Rule::for_expr => {
-            let (resources, data_sources, module_calls) = parse_for_expr(
-                inner,
-                ctx,
-                LoopParseTarget::bound(binding_name),
-                preprocessed_file,
-                source_file,
-            )?;
+            let target = LoopParseTarget::bound(binding_name);
+            let (resources, data_sources, module_calls) =
+                parse_for_expr(inner, ctx, target, preprocessed_file, source_file)?;
             Ok((
-                for_structural_handle(binding_name),
+                for_structural_handle(binding_name_str),
                 resources,
                 data_sources,
                 module_calls,
@@ -592,14 +598,9 @@ fn parse_primary_inner_with_resource_or_module(
             ))
         }
         Rule::if_expr => {
+            let target = LoopParseTarget::bound(binding_name);
             let (value, resources, data_sources, module_calls, import, binding_kind) =
-                parse_if_expr(
-                    inner,
-                    ctx,
-                    LoopParseTarget::bound(binding_name),
-                    preprocessed_file,
-                    source_file,
-                )?;
+                parse_if_expr(inner, ctx, target, preprocessed_file, source_file)?;
             Ok((
                 value,
                 resources,
@@ -612,7 +613,7 @@ fn parse_primary_inner_with_resource_or_module(
         Rule::module_call => {
             let call = parse_module_call(inner, ctx, preprocessed_file, source_file)?;
             Ok((
-                module_structural_handle(binding_name),
+                module_structural_handle(binding_name_str),
                 vec![],
                 vec![],
                 vec![call],

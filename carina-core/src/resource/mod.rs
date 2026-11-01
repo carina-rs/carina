@@ -1,7 +1,7 @@
 //! Resource - Representing resources and their state
 //!
 //! The `Value::Deferred` / `DeferredValue` representation (including
-//! `DeferredValue::Unknown(UnknownReason)`) is one of several "not determined
+//! `DeferredValue::Unknown(ApplyTimeUnknown)`) is one of several "not determined
 //! yet" forms.
 //! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
 //! which stage produces and consumes it, and how validation treats it.
@@ -19,6 +19,7 @@ use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -866,12 +867,11 @@ impl From<PendingResourceIdentityError> for ResolvedResourceError {
 /// Re-resolve authored resource directives that depend on the provider schema.
 ///
 /// Deferred anonymous-loop templates intentionally still have pending identities
-/// when a saved plan is loaded. Their directives must nevertheless be checked
-/// against the fingerprint-validated schemas before apply; identity validation
-/// remains the responsibility of [`ResolvedResource::resolve_with_schemas`]
-/// after the template has been materialized.
-pub(crate) fn resolve_resource_ignore_changes<S>(
-    resource: &mut Resource<S>,
+/// when a saved plan is loaded. Bound templates instead expose their derived
+/// materialized address while directives are checked, so diagnostics name the
+/// template (for example, `items[?]`) rather than a pending placeholder.
+pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind>(
+    resource: &mut Resource<S, P>,
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), ResolvedResourceError> {
     let ignore_changes = if resource.directives.ignore_changes.is_empty() {
@@ -1491,16 +1491,18 @@ impl std::fmt::Display for ReferencePath {
 /// into the static reference path understood by [`crate::binding_index`].
 ///
 /// Module arguments are values, not structural resource references, so their
-/// runtime representation deliberately remains `Unknown(ModuleArgument)` plus
-/// `Access`. This projection is validation metadata only: it does not weaken
+/// parser representation deliberately remains a placeholder plus `Access`.
+/// This projection is validation metadata only: it does not weaken
 /// the construction invariant that a structural reference-rooted access is
 /// canonicalized to `ResourceRef` / `BindingRef`.
-pub(crate) fn module_argument_reference_path(value: &Value) -> Option<ReferencePath> {
-    fn collect(value: &Value) -> Option<(String, Vec<PathSegment>)> {
+pub(crate) fn module_argument_reference_path<P: PlaceholderKind>(
+    value: &Value<P>,
+) -> Option<ReferencePath> {
+    fn collect<P: PlaceholderKind>(value: &Value<P>) -> Option<(String, Vec<PathSegment>)> {
         match value {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-                name, ..
-            })) => Some((name.clone(), Vec::new())),
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder
+                .module_argument_name()
+                .map(|name| (name.to_string(), Vec::new())),
             Value::Deferred(DeferredValue::Access(access)) => {
                 let (binding, mut segments) = collect(access.base())?;
                 segments.push(access.step().clone());
@@ -1602,7 +1604,7 @@ impl<'a> From<&'a ReferencePath> for ReferencePathRef<'a> {
 /// leaf (#2439; plan-display redaction depends on the tag). Single
 /// source of truth for the secret-tunnel discipline, shared by
 /// `resolver::resolve_ref_value` and [`navigate_value_path`].
-pub(crate) fn peel_secrets(mut value: Value) -> (Value, usize) {
+pub(crate) fn peel_secrets<P: PlaceholderKind>(mut value: Value<P>) -> (Value<P>, usize) {
     let mut depth = 0;
     while let Value::Deferred(DeferredValue::Secret(inner)) = value {
         value = *inner;
@@ -1613,7 +1615,7 @@ pub(crate) fn peel_secrets(mut value: Value) -> (Value, usize) {
 
 /// Re-wrap `value` in `depth` layers of `Value::Secret`. Inverse of
 /// [`peel_secrets`].
-pub(crate) fn rewrap_secrets(value: Value, depth: usize) -> Value {
+pub(crate) fn rewrap_secrets<P: PlaceholderKind>(value: Value<P>, depth: usize) -> Value<P> {
     (0..depth).fold(value, |acc, _| {
         Value::Deferred(DeferredValue::Secret(Box::new(acc)))
     })
@@ -1721,7 +1723,7 @@ impl std::fmt::Display for ValueAccessError {
 
 impl std::error::Error for ValueAccessError {}
 
-fn concrete_value_shape(value: &ConcreteValue) -> &'static str {
+fn concrete_value_shape<P: PlaceholderKind>(value: &ConcreteValue<P>) -> &'static str {
     match value {
         ConcreteValue::String(_) => "string",
         ConcreteValue::EnumIdentifier(_) | ConcreteValue::CanonicalEnum(_) => "enum",
@@ -1798,9 +1800,9 @@ pub enum AccessMissPolicy {
 /// resolution preserve the original `ResourceRef` when navigation itself is
 /// undecidable, without guessing from the returned `Value` shape.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ValuePathSegmentResult {
-    Resolved(Value),
-    Deferred(Value),
+pub(crate) enum ValuePathSegmentResult<P: PlaceholderKind = NoPlaceholder> {
+    Resolved(Value<P>),
+    Deferred(Value<P>),
     /// The selected element is absent from a concrete container, but the
     /// caller's source policy says that view may be incomplete.  The caller
     /// must retain its original unresolved expression; constructing an
@@ -1808,8 +1810,8 @@ pub(crate) enum ValuePathSegmentResult {
     DeferredMiss(ValueAccessError),
 }
 
-impl ValuePathSegmentResult {
-    pub(crate) fn into_value(self) -> Result<Value, ValueAccessError> {
+impl<P: PlaceholderKind> ValuePathSegmentResult<P> {
+    pub(crate) fn into_value(self) -> Result<Value<P>, ValueAccessError> {
         match self {
             Self::Resolved(value) | Self::Deferred(value) => Ok(value),
             Self::DeferredMiss(error) => Err(error),
@@ -1817,9 +1819,21 @@ impl ValuePathSegmentResult {
     }
 }
 
-fn deferred_access(base: Value, step: PathSegment, source_line: usize) -> Value {
+fn deferred_access<P: PlaceholderKind>(
+    base: Value<P>,
+    step: PathSegment,
+    source_line: usize,
+) -> Value<P> {
     let display_root = match &base {
-        Value::Deferred(DeferredValue::Access(access)) => access.display_root.clone(),
+        Value::Deferred(DeferredValue::Access(access)) => match &access.display_root {
+            Some(LoopAccessDisplayRoot::Rooted(binding)) if access.is_rooted_at_loop_slot() => {
+                Some(LoopAccessDisplayRoot::Rooted(binding.clone()))
+            }
+            Some(LoopAccessDisplayRoot::DeferredMiss(binding)) => {
+                Some(LoopAccessDisplayRoot::DeferredMiss(binding.clone()))
+            }
+            Some(LoopAccessDisplayRoot::Rooted(_)) | None => None,
+        },
         _ => None,
     };
     Value::Deferred(DeferredValue::Access(AccessExpr {
@@ -1830,10 +1844,10 @@ fn deferred_access(base: Value, step: PathSegment, source_line: usize) -> Value 
     }))
 }
 
-fn handle_access_miss(
+fn handle_access_miss<P: PlaceholderKind>(
     miss_policy: AccessMissPolicy,
     miss: ValueAccessMiss,
-) -> Result<ValuePathSegmentResult, ValueAccessError> {
+) -> Result<ValuePathSegmentResult<P>, ValueAccessError> {
     let error = ValueAccessError::from(miss);
     match miss_policy {
         AccessMissPolicy::Error => Err(error),
@@ -1847,12 +1861,12 @@ fn handle_access_miss(
 /// and [`navigate_value_path`]. Concrete containers are navigated immediately;
 /// a deferred base is retained as [`DeferredValue::Access`]. Secret wrappers
 /// are peeled before navigation and restored around the selected value.
-pub(crate) fn apply_value_path_segment(
-    base: Value,
+pub(crate) fn apply_value_path_segment<P: PlaceholderKind>(
+    base: Value<P>,
     step: PathSegment,
     source_line: usize,
     miss_policy: AccessMissPolicy,
-) -> Result<ValuePathSegmentResult, ValueAccessError> {
+) -> Result<ValuePathSegmentResult<P>, ValueAccessError> {
     let (peeled, secret_depth) = peel_secrets(base);
     let selected = match peeled {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
@@ -1988,14 +2002,36 @@ pub(crate) fn apply_value_path_segment(
 /// it can return a concrete selection or canonical reference just as the
 /// parser and resolver do. The raw [`DeferredValue::Access`] constructor is
 /// intentionally unavailable outside this module.
-pub fn apply_postfix_access(
-    base: Value,
+pub fn apply_postfix_access<P: PlaceholderKind>(
+    base: Value<P>,
     step: PathSegment,
     source_line: usize,
     miss_policy: AccessMissPolicy,
-) -> Result<Value, ValueAccessError> {
+) -> Result<Value<P>, ValueAccessError> {
     apply_value_path_segment(base, step, source_line, miss_policy)
         .and_then(ValuePathSegmentResult::into_value)
+}
+
+/// Build the parser-stage access rooted at a deferred for-loop binding.
+///
+/// Ordinary binding-rooted access is canonicalized to `ResourceRef`, but a
+/// loop binding is a value slot rather than a resource. The parsed access is
+/// converted to an `Access(Placeholder(LoopSlot), ..)` tree when the enclosing
+/// deferred template crosses [`Value::into_expanded`].
+pub(crate) fn parser_deferred_for_access(
+    binding: String,
+    slot: LoopSlot,
+    step: PathSegment,
+    source_line: usize,
+) -> Value<ParserPlaceholder> {
+    Value::Deferred(DeferredValue::Access(AccessExpr {
+        base: Box::new(Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::Loop(slot),
+        ))),
+        step,
+        source_line,
+        display_root: Some(LoopAccessDisplayRoot::Rooted(binding)),
+    }))
 }
 
 /// Navigate a value tree along an [`AccessPath`]'s `attribute` then
@@ -2080,11 +2116,11 @@ pub(crate) mod duration_secs {
 /// state files (in the pre-Phase-5 flat shape) round-trip via the
 /// inner enums' externally-tagged defaults — exactly the legacy
 /// JSON shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub enum Value {
-    Concrete(ConcreteValue),
-    Deferred(DeferredValue),
+pub enum Value<P: PlaceholderKind = NoPlaceholder> {
+    Concrete(ConcreteValue<P>),
+    Deferred(DeferredValue<P>),
 }
 
 /// A runtime string together with provenance used exclusively to make
@@ -2244,7 +2280,7 @@ impl<'de> Deserialize<'de> for ValueString {
 /// Concrete-axis variants: values that carry their own runtime type
 /// and are safe to type-check at validate time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConcreteValue {
+pub enum ConcreteValue<P: PlaceholderKind = NoPlaceholder> {
     String(ValueString),
     /// An enum identifier — a value written in the DSL as a bare
     /// identifier (`tcp`) or namespaced identifier
@@ -2267,12 +2303,12 @@ pub enum ConcreteValue {
     /// contract).
     #[serde(with = "duration_secs")]
     Duration(std::time::Duration),
-    List(Vec<Value>),
+    List(Vec<Value<P>>),
     /// Canonical form for fields whose schema type is
     /// `Union(vec![String, list(String)])` — the IAM-style
     /// `string_or_list_of_strings` shape. See #2481, #2510.
     StringList(Vec<ValueString>),
-    Map(IndexMap<String, Value>),
+    Map(IndexMap<String, Value<P>>),
 }
 
 /// Shared typed operand used while function and module arguments cross
@@ -2283,40 +2319,39 @@ pub enum ConcreteValue {
 /// it is a pre-classification tree for directory fixed-point parsing, whereas
 /// this enum represents one already-classified argument operand.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StructuralOperand {
+pub(crate) enum StructuralOperand<P: PlaceholderKind = NoPlaceholder> {
     Value {
-        value: Value,
-        access_base: Option<Value>,
+        value: Value<P>,
+        access_base: Option<Value<P>>,
     },
     Handle {
         handle: crate::eval_value::StructuralHandle,
-        access_base: Value,
+        access_base: Value<P>,
     },
     /// A bare module parameter forwarded across a nested argument boundary
     /// before the outermost caller has determined whether it is a value or a
     /// handle. Keeping this state beside `Value` and `Handle` prevents a
     /// placeholder `Value` from prematurely deciding the classification.
-    Parameter { name: String, access_base: Value },
+    Parameter { name: String, access_base: Value<P> },
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum StructuralOperandRef<'a> {
-    Value(&'a Value),
+pub(crate) enum StructuralOperandRef<'a, P: PlaceholderKind = NoPlaceholder> {
+    Value(&'a Value<P>),
     Handle {
         handle: &'a crate::eval_value::StructuralHandle,
-        access_base: &'a Value,
+        access_base: &'a Value<P>,
     },
     Parameter {
         name: &'a str,
-        access_base: &'a Value,
+        access_base: &'a Value<P>,
     },
 }
 
-impl StructuralOperand {
-    pub(crate) fn from_value(value: Value) -> Self {
-        if let Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-            name, ..
-        })) = &value
+impl<P: PlaceholderKind> StructuralOperand<P> {
+    pub(crate) fn from_value(value: Value<P>) -> Self {
+        if let Value::Deferred(DeferredValue::Placeholder(placeholder)) = &value
+            && let Some(name) = placeholder.module_argument_name()
         {
             return Self::Parameter {
                 name: name.to_string(),
@@ -2329,12 +2364,13 @@ impl StructuralOperand {
         }
     }
 
-    pub(crate) fn from_value_with_access_base(value: Value, access_base: Option<Value>) -> Self {
+    pub(crate) fn from_value_with_access_base(
+        value: Value<P>,
+        access_base: Option<Value<P>>,
+    ) -> Self {
         if access_base.is_none()
-            && let Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-                name,
-                ..
-            })) = &value
+            && let Value::Deferred(DeferredValue::Placeholder(placeholder)) = &value
+            && let Some(name) = placeholder.module_argument_name()
         {
             return Self::Parameter {
                 name: name.to_string(),
@@ -2344,17 +2380,9 @@ impl StructuralOperand {
         Self::Value { value, access_base }
     }
 
-    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
-        let access_base = handle.access_base_value();
-        Self::Handle {
-            handle,
-            access_base,
-        }
-    }
-
     pub(crate) fn from_handle_with_access_base(
         handle: crate::eval_value::StructuralHandle,
-        access_base: Value,
+        access_base: Value<P>,
     ) -> Self {
         Self::Handle {
             handle,
@@ -2362,7 +2390,7 @@ impl StructuralOperand {
         }
     }
 
-    pub(crate) fn value(&self) -> Option<&Value> {
+    pub(crate) fn value(&self) -> Option<&Value<P>> {
         match self {
             Self::Value { value, .. } => Some(value),
             Self::Handle { .. } | Self::Parameter { .. } => None,
@@ -2383,7 +2411,7 @@ impl StructuralOperand {
         }
     }
 
-    pub(crate) fn value_ref(&self) -> StructuralOperandRef<'_> {
+    pub(crate) fn value_ref(&self) -> StructuralOperandRef<'_, P> {
         match self {
             Self::Value { value, .. } => StructuralOperandRef::Value(value),
             Self::Handle {
@@ -2399,7 +2427,7 @@ impl StructuralOperand {
         }
     }
 
-    pub(crate) fn access_ref(&self) -> StructuralOperandRef<'_> {
+    pub(crate) fn access_ref(&self) -> StructuralOperandRef<'_, P> {
         match self {
             Self::Value { value, access_base } => {
                 StructuralOperandRef::Value(access_base.as_ref().unwrap_or(value))
@@ -2417,7 +2445,7 @@ impl StructuralOperand {
         }
     }
 
-    pub(crate) fn explicit_access_base(&self) -> Option<&Value> {
+    pub(crate) fn explicit_access_base(&self) -> Option<&Value<P>> {
         match self {
             Self::Value { access_base, .. } => access_base.as_ref(),
             Self::Handle { access_base, .. } => Some(access_base),
@@ -2425,33 +2453,47 @@ impl StructuralOperand {
         }
     }
 
-    pub(crate) fn traversal_value(&self) -> &Value {
+    pub(crate) fn traversal_value(&self) -> &Value<P> {
         match self {
             Self::Value { value, .. } => value,
             Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
         }
     }
 
-    pub(crate) fn traversal_value_mut(&mut self) -> &mut Value {
+    pub(crate) fn traversal_value_mut(&mut self) -> &mut Value<P> {
         match self {
             Self::Value { value, .. } => value,
             Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
+        }
+    }
+
+    pub(crate) fn visit_values(&self, visitor: &mut impl FnMut(&Value<P>)) {
+        match self {
+            Self::Value { value, access_base } => {
+                visitor(value);
+                if let Some(access_base) = access_base {
+                    visitor(access_base);
+                }
+            }
+            Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => {
+                visitor(access_base);
+            }
         }
     }
 
     pub(crate) fn try_visit_values<E>(
         &self,
-        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+        visitor: &mut impl FnMut(&Value<P>) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
             Self::Value { value, access_base } => {
-                visit(value)?;
+                visitor(value)?;
                 if let Some(access_base) = access_base {
-                    visit(access_base)?;
+                    visitor(access_base)?;
                 }
             }
             Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => {
-                visit(access_base)?;
+                visitor(access_base)?;
             }
         }
         Ok(())
@@ -2459,7 +2501,7 @@ impl StructuralOperand {
 
     pub(crate) fn try_map<E>(
         &self,
-        mut map: impl FnMut(&Value) -> Result<Value, E>,
+        mut map: impl FnMut(&Value<P>) -> Result<Value<P>, E>,
     ) -> Result<Self, E> {
         Ok(match self {
             Self::Value { value, access_base } => Self::Value {
@@ -2479,10 +2521,43 @@ impl StructuralOperand {
             },
         })
     }
+
+    pub(crate) fn try_map_stage<Q: PlaceholderKind, E>(
+        self,
+        map: &mut dyn FnMut(Value<P>) -> Result<Value<Q>, E>,
+    ) -> Result<StructuralOperand<Q>, E> {
+        Ok(match self {
+            Self::Value { value, access_base } => StructuralOperand::Value {
+                value: map(value)?,
+                access_base: access_base.map(map).transpose()?,
+            },
+            Self::Handle {
+                handle,
+                access_base,
+            } => StructuralOperand::Handle {
+                handle,
+                access_base: map(access_base)?,
+            },
+            Self::Parameter { name, access_base } => StructuralOperand::Parameter {
+                name,
+                access_base: map(access_base)?,
+            },
+        })
+    }
 }
 
-impl<'a> StructuralOperandRef<'a> {
-    pub(crate) fn value(self) -> &'a Value {
+impl StructuralOperand<ParserPlaceholder> {
+    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
+        let access_base = handle.access_base_value();
+        Self::Handle {
+            handle,
+            access_base,
+        }
+    }
+}
+
+impl<'a, P: PlaceholderKind> StructuralOperandRef<'a, P> {
+    pub(crate) fn value(self) -> &'a Value<P> {
         match self {
             Self::Value(value) => value,
             Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => access_base,
@@ -2497,24 +2572,18 @@ impl<'a> StructuralOperandRef<'a> {
 /// lookup without lowering it into the public value model. It is consumed by
 /// function resolution before plans or state are serialized.
 #[derive(Clone, PartialEq)]
-pub struct FunctionArgument {
-    operand: StructuralOperand,
+pub struct FunctionArgument<P: PlaceholderKind = NoPlaceholder> {
+    operand: StructuralOperand<P>,
 }
 
-impl FunctionArgument {
-    pub fn from_value(value: Value) -> Self {
+impl<P: PlaceholderKind> FunctionArgument<P> {
+    pub fn from_value(value: Value<P>) -> Self {
         Self {
             operand: StructuralOperand::from_value(value),
         }
     }
 
-    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
-        Self {
-            operand: StructuralOperand::from_handle(handle),
-        }
-    }
-
-    pub fn value(&self) -> Option<&Value> {
+    pub fn value(&self) -> Option<&Value<P>> {
         self.operand.value()
     }
 
@@ -2530,24 +2599,24 @@ impl FunctionArgument {
     /// canonicalization, and diagnostic walkers. Semantic consumers must use
     /// [`Self::value`] and [`Self::handle`] so a handle cannot accidentally be
     /// treated as a value.
-    pub(crate) fn walker_value(&self) -> &Value {
+    pub(crate) fn walker_value(&self) -> &Value<P> {
         self.operand.traversal_value()
     }
 
-    pub(crate) fn walker_value_mut(&mut self) -> &mut Value {
+    pub(crate) fn walker_value_mut(&mut self) -> &mut Value<P> {
         self.operand.traversal_value_mut()
     }
 
     pub(crate) fn try_visit_values<E>(
         &self,
-        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+        visit: &mut impl FnMut(&Value<P>) -> Result<(), E>,
     ) -> Result<(), E> {
         self.operand.try_visit_values(visit)
     }
 
     pub(crate) fn try_map_value<E>(
         &self,
-        map: impl FnOnce(&Value) -> Result<Value, E>,
+        map: impl FnOnce(&Value<P>) -> Result<Value<P>, E>,
     ) -> Result<Self, E> {
         let operand = match &self.operand {
             StructuralOperand::Value { value, .. } => StructuralOperand::from_value(map(value)?),
@@ -2562,15 +2631,46 @@ impl FunctionArgument {
         };
         Ok(Self { operand })
     }
+
+    pub(crate) fn try_into_expanded(self) -> Result<FunctionArgument<NoPlaceholder>, P> {
+        let mut reject = |placeholder| Err(placeholder);
+        let operand = self
+            .operand
+            .try_map_stage(&mut |value| value.try_map_placeholder(&mut reject))?;
+        Ok(FunctionArgument { operand })
+    }
 }
 
-impl From<Value> for FunctionArgument {
-    fn from(value: Value) -> Self {
+impl FunctionArgument<ParserPlaceholder> {
+    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle) -> Self {
+        Self {
+            operand: StructuralOperand::from_handle(handle),
+        }
+    }
+}
+
+impl FunctionArgument<NoPlaceholder> {
+    pub(crate) fn into_placeholder_type<P: PlaceholderKind>(self) -> FunctionArgument<P> {
+        let operand =
+            match self
+                .operand
+                .try_map_stage::<P, std::convert::Infallible>(&mut |value| {
+                    Ok(value.into_placeholder_type())
+                }) {
+                Ok(operand) => operand,
+                Err(never) => match never {},
+            };
+        FunctionArgument { operand }
+    }
+}
+
+impl<P: PlaceholderKind> From<Value<P>> for FunctionArgument<P> {
+    fn from(value: Value<P>) -> Self {
         Self::from_value(value)
     }
 }
 
-impl fmt::Debug for FunctionArgument {
+impl<P: PlaceholderKind + fmt::Debug> fmt::Debug for FunctionArgument<P> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.operand.value_ref() {
             StructuralOperandRef::Value(value) => value.fmt(f),
@@ -2586,7 +2686,10 @@ impl fmt::Debug for FunctionArgument {
     }
 }
 
-impl Serialize for FunctionArgument {
+impl<P> Serialize for FunctionArgument<P>
+where
+    P: PlaceholderKind + Serialize,
+{
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.operand.value_ref() {
             StructuralOperandRef::Value(value) => value.serialize(serializer),
@@ -2601,9 +2704,12 @@ impl Serialize for FunctionArgument {
     }
 }
 
-impl<'de> Deserialize<'de> for FunctionArgument {
+impl<'de, P> Deserialize<'de> for FunctionArgument<P>
+where
+    P: PlaceholderKind + Deserialize<'de>,
+{
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Value::deserialize(deserializer).map(Self::from_value)
+        Value::<P>::deserialize(deserializer).map(Self::from_value)
     }
 }
 
@@ -2659,6 +2765,179 @@ impl PartialEq for DiagnosticSourceLine {
 
 impl Eq for DiagnosticSourceLine {}
 
+/// Authored parser span attached to a value-shaped node for diagnostics.
+///
+/// The file and range travel with a placeholder when directory parsing
+/// inlines a sibling value. They are deliberately excluded from equality,
+/// hashing, and serialization by [`DiagnosticSourceSpan`], so source
+/// provenance can never become value identity or secret-hash material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiagnosticSourceRange {
+    start_line: NonZeroUsize,
+    start_column: NonZeroUsize,
+    end_line: NonZeroUsize,
+    end_column: NonZeroUsize,
+}
+
+impl DiagnosticSourceRange {
+    pub const fn start_line(self) -> usize {
+        self.start_line.get()
+    }
+
+    pub const fn start_column(self) -> usize {
+        self.start_column.get()
+    }
+
+    pub const fn end_line(self) -> usize {
+        self.end_line.get()
+    }
+
+    pub const fn end_column(self) -> usize {
+        self.end_column.get()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthoredDiagnosticSourceSpan {
+    source_file: PathBuf,
+    range: DiagnosticSourceRange,
+}
+
+/// Diagnostic-only source identity and range.
+///
+/// Parser construction always produces the authored variant. The private
+/// deserialized variant exists only because source metadata is deliberately
+/// skipped on the wire. As with [`DiagnosticSourceLine`], every instance
+/// compares equal and hashes to the same value because authored location is
+/// not semantic value data.
+///
+/// Parser code must attach an authored source; there is no public constructor
+/// for an unlocated span:
+///
+/// ```compile_fail,E0599
+/// use carina_core::resource::DiagnosticSourceSpan;
+///
+/// let _ = DiagnosticSourceSpan::synthetic();
+/// ```
+///
+/// An unlocated span is reserved for deserialization, not ordinary
+/// construction:
+///
+/// ```compile_fail,E0277
+/// use carina_core::resource::DiagnosticSourceSpan;
+///
+/// let _: DiagnosticSourceSpan = Default::default();
+/// ```
+#[derive(Debug, Clone)]
+pub struct DiagnosticSourceSpan(DiagnosticSourceSpanState);
+
+#[derive(Debug, Clone)]
+enum DiagnosticSourceSpanState {
+    Authored(AuthoredDiagnosticSourceSpan),
+    Deserialized,
+}
+
+impl DiagnosticSourceSpan {
+    pub(crate) fn authored(
+        source_file: PathBuf,
+        start_line: usize,
+        start_column: usize,
+        end_line: usize,
+        end_column: usize,
+    ) -> Self {
+        let range = DiagnosticSourceRange {
+            start_line: NonZeroUsize::new(start_line).expect("parser source lines are one-based"),
+            start_column: NonZeroUsize::new(start_column)
+                .expect("parser source columns are one-based"),
+            end_line: NonZeroUsize::new(end_line).expect("parser source lines are one-based"),
+            end_column: NonZeroUsize::new(end_column).expect("parser source columns are one-based"),
+        };
+        Self(DiagnosticSourceSpanState::Authored(
+            AuthoredDiagnosticSourceSpan { source_file, range },
+        ))
+    }
+
+    fn deserialized() -> Self {
+        Self(DiagnosticSourceSpanState::Deserialized)
+    }
+
+    pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
+        match &self.0 {
+            DiagnosticSourceSpanState::Authored(source) => {
+                Some((source.source_file.as_path(), source.range))
+            }
+            DiagnosticSourceSpanState::Deserialized => None,
+        }
+    }
+}
+
+impl PartialEq for DiagnosticSourceSpan {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticSourceSpan {}
+
+impl Hash for DiagnosticSourceSpan {
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
+}
+
+/// Module-argument diagnostics that travel with a parser placeholder without
+/// becoming value identity or serialized data.
+///
+/// A neutral module-argument seed has neither field. The first authored
+/// reference attaches `source`; nested forwarding may additionally retain the
+/// caller-facing `name`. Keeping both fields behind this one wrapper gives all
+/// diagnostic-only metadata the same equality, hashing, and serde rule.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleArgumentDiagnostic {
+    source: Option<DiagnosticSourceSpan>,
+    name: Option<String>,
+}
+
+impl ModuleArgumentDiagnostic {
+    pub(crate) fn stamp_authored_source(&mut self, source: DiagnosticSourceSpan) {
+        if self.source.is_none() {
+            self.source = Some(source);
+        }
+    }
+
+    pub(crate) fn forward_from(&mut self, source: &Self, fallback_name: &str) {
+        if let Some(authored) = &source.source {
+            self.source = Some(authored.clone());
+        }
+        self.name = Some(source.name.as_deref().unwrap_or(fallback_name).to_string());
+    }
+
+    pub(crate) fn diagnostic_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub(crate) fn source_line(&self) -> Option<usize> {
+        self.authored_location()
+            .map(|(_, range)| range.start_line())
+    }
+
+    pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
+        self.source
+            .as_ref()
+            .and_then(DiagnosticSourceSpan::authored_location)
+    }
+}
+
+impl PartialEq for ModuleArgumentDiagnostic {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ModuleArgumentDiagnostic {}
+
+impl Hash for ModuleArgumentDiagnostic {
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
+}
+
 /// Diagnostic-safe explanation retained after a built-in was attempted and
 /// failed during permissive resolution.
 ///
@@ -2696,11 +2975,11 @@ impl fmt::Display for UnavailableReason {
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
-pub enum DeferredValue {
-    /// Parser-only module-template conditional. Module expansion selects a
-    /// branch after argument substitution; this variant is rejected by serde
-    /// and by the expanded-contribution boundary.
-    ModuleIf(Box<crate::parser::DeferredValueIf>),
+pub enum DeferredValue<P: PlaceholderKind = NoPlaceholder> {
+    /// A value-level `if` whose condition depends on a reusable module
+    /// argument. Module expansion selects a branch after call-site
+    /// substitution; it cannot cross the expansion boundary.
+    ModuleIf(Box<crate::parser::DeferredValueIf<P>>),
     /// Reference to another resource's attribute via an access path.
     ResourceRef { path: AccessPath },
     /// Reference to a binding without an attribute selector.
@@ -2708,19 +2987,19 @@ pub enum DeferredValue {
     /// Null/missing coalescing deferred until the left operand's resolution
     /// boundary can distinguish a definitive absence from an unknown value.
     Coalesce {
-        value: Box<Value>,
-        default: Box<Value>,
+        value: Box<Value<P>>,
+        default: Box<Value<P>>,
     },
     /// A typed binary Int expression that is evaluated once both operands are
     /// available. This is an intrinsic node, not a hidden built-in call.
-    IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr),
+    IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
     /// String interpolation: `"prefix-${expr}-suffix"`
-    Interpolation(Vec<InterpolationPart>),
+    Interpolation(Vec<InterpolationPart<P>>),
     /// Built-in function call: `join("-", ["a", "b"])` or via pipe
     /// `["a", "b"] |> join("-")`. Evaluated during reference resolution.
     FunctionCall {
         name: crate::builtins::BuiltinFunction,
-        args: Vec<FunctionArgument>,
+        args: Vec<FunctionArgument<P>>,
         /// One-based authored line, or `None` for a synthetic/deserialized
         /// call. Diagnostic metadata is excluded from equality and serde by
         /// [`DiagnosticSourceLine`].
@@ -2734,7 +3013,7 @@ pub enum DeferredValue {
     /// the saved expression is evaluated again.
     Unavailable {
         name: crate::builtins::BuiltinFunction,
-        args: Vec<FunctionArgument>,
+        args: Vec<FunctionArgument<P>>,
         reason: UnavailableReason,
         /// One-based authored line, or `None` for a synthetic node.
         source_line: DiagnosticSourceLine,
@@ -2747,16 +3026,16 @@ pub enum DeferredValue {
         /// Lexical function scope captured with `function`. Function bodies
         /// may call sibling helpers after this outer call is deferred.
         functions: std::sync::Arc<std::collections::HashMap<String, crate::parser::UserFunction>>,
-        args: Vec<FunctionArgument>,
+        args: Vec<FunctionArgument<P>>,
         source_line: DiagnosticSourceLine,
     },
     /// Field/index access whose base is not concrete yet. Once `base`
     /// resolves, the resolver applies `step` through
     /// [`apply_value_path_segment`].
-    Access(AccessExpr),
+    Access(AccessExpr<P>),
     /// A secret value. The inner value is sent to the provider but
     /// stored as an Argon2id hash in state.
-    Secret(Box<Value>),
+    Secret(Box<Value<P>>),
     /// An opaque secret hash loaded from persisted state or a serialized
     /// saved plan.
     ///
@@ -2767,10 +3046,12 @@ pub enum DeferredValue {
     /// The DSL parser has no syntax that can construct it.
     RedactedSecret { hash: RedactedSecretHash },
     /// A value not known at plan time. RFC #2371.
-    Unknown(UnknownReason),
+    Unknown(ApplyTimeUnknown),
+    /// A stage-specific slot that must be consumed at its phase boundary.
+    Placeholder(P),
 }
 
-impl DeferredValue {
+impl<P: PlaceholderKind> DeferredValue<P> {
     /// Project a pending or unsuccessfully attempted built-in call onto the
     /// representation shared by persistence, identity, and display.
     ///
@@ -2778,7 +3059,7 @@ impl DeferredValue {
     /// the function and resolved arguments are its stable value material.
     pub fn as_function_call_parts(
         &self,
-    ) -> Option<(crate::builtins::BuiltinFunction, &[FunctionArgument])> {
+    ) -> Option<(crate::builtins::BuiltinFunction, &[FunctionArgument<P>])> {
         match self {
             Self::ModuleIf(_) => None,
             Self::FunctionCall { name, args, .. } => Some((*name, args)),
@@ -2792,27 +3073,38 @@ impl DeferredValue {
             | Self::Access(_)
             | Self::Secret(_)
             | Self::RedactedSecret { .. }
-            | Self::Unknown(_) => None,
+            | Self::Unknown(_)
+            | Self::Placeholder(_) => None,
         }
     }
 }
 
-/// A sealed postfix-access node.  Its fields are read-only outside this
-/// module, so every rebuild must pass through [`apply_value_path_segment`]
-/// and cannot leave an Access wrapped around a concrete or reference root.
+/// A sealed postfix-access node. Its fields are read-only outside this
+/// module, so every rebuild must pass through [`apply_value_path_segment`].
+/// A concrete root is retained only in the typed [`LoopAccessDisplayRoot::DeferredMiss`]
+/// state used for an incomplete local desired-side view.
 #[derive(Clone)]
-pub struct AccessExpr {
-    base: Box<Value>,
+enum LoopAccessDisplayRoot {
+    /// The access chain is still semantically rooted at a typed loop slot.
+    Rooted(String),
+    /// A local desired-side view missed this authored loop path and may gain
+    /// the field at apply time, so the original path is retained deliberately.
+    DeferredMiss(String),
+}
+
+#[derive(Clone)]
+pub struct AccessExpr<P: PlaceholderKind = NoPlaceholder> {
+    base: Box<Value<P>>,
     step: PathSegment,
     source_line: usize,
     /// Parser-only authored root for deferred-for diagnostics (`item` in
     /// `item.missing`). It is display metadata, like `source_line`, and is
     /// intentionally omitted from the serialized Value representation.
-    display_root: Option<String>,
+    display_root: Option<LoopAccessDisplayRoot>,
 }
 
-impl AccessExpr {
-    pub fn base(&self) -> &Value {
+impl<P: PlaceholderKind> AccessExpr<P> {
+    pub fn base(&self) -> &Value<P> {
         &self.base
     }
 
@@ -2825,7 +3117,31 @@ impl AccessExpr {
     }
 
     pub fn display_root(&self) -> Option<&str> {
-        self.display_root.as_deref()
+        match &self.display_root {
+            Some(LoopAccessDisplayRoot::Rooted(binding)) => Some(binding),
+            Some(LoopAccessDisplayRoot::DeferredMiss(_)) | None => None,
+        }
+    }
+
+    pub(crate) fn deferred_miss_display_root(&self) -> Option<&str> {
+        match &self.display_root {
+            Some(LoopAccessDisplayRoot::DeferredMiss(binding)) => Some(binding),
+            Some(LoopAccessDisplayRoot::Rooted(_)) | None => None,
+        }
+    }
+
+    pub(crate) fn has_authored_loop_path(&self) -> bool {
+        self.display_root.is_some()
+    }
+
+    fn is_rooted_at_loop_slot(&self) -> bool {
+        match self.base() {
+            Value::Deferred(DeferredValue::Access(access)) => access.is_rooted_at_loop_slot(),
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+                placeholder.loop_slot().is_some()
+            }
+            _ => false,
+        }
     }
 
     /// Rebuild this access after a value-tree transform. The operands still
@@ -2833,14 +3149,25 @@ impl AccessExpr {
     /// is retained when the result remains deferred.
     pub(crate) fn rebuild_result(
         &self,
-        base: Value,
+        base: Value<P>,
         step: PathSegment,
         miss_policy: AccessMissPolicy,
-    ) -> Result<ValuePathSegmentResult, ValueAccessError> {
+    ) -> Result<ValuePathSegmentResult<P>, ValueAccessError> {
         apply_value_path_segment(base, step, self.source_line, miss_policy).map(|result| {
-            let restore_display_root = |value: Value| match &self.display_root {
-                Some(root) => value.with_access_display_root(root.clone()),
-                None => value,
+            let restore_display_root = |value: Value<P>| match &self.display_root {
+                Some(LoopAccessDisplayRoot::Rooted(root))
+                    if matches!(
+                        &value,
+                        Value::Deferred(DeferredValue::Access(access))
+                            if access.is_rooted_at_loop_slot()
+                    ) =>
+                {
+                    value.with_access_display_root(root.clone())
+                }
+                Some(LoopAccessDisplayRoot::DeferredMiss(root)) => {
+                    value.with_deferred_miss_display_root(root.clone())
+                }
+                Some(LoopAccessDisplayRoot::Rooted(_)) | None => value,
             };
             match result {
                 ValuePathSegmentResult::Resolved(value) => {
@@ -2858,19 +3185,19 @@ impl AccessExpr {
 
     pub(crate) fn rebuild(
         &self,
-        base: Value,
+        base: Value<P>,
         step: PathSegment,
         miss_policy: AccessMissPolicy,
-    ) -> Result<Value, ValueAccessError> {
+    ) -> Result<Value<P>, ValueAccessError> {
         self.rebuild_result(base, step, miss_policy)
             .and_then(ValuePathSegmentResult::into_value)
     }
 
     pub(crate) fn rebuild_with_base(
         &self,
-        base: Value,
+        base: Value<P>,
         miss_policy: AccessMissPolicy,
-    ) -> Result<Value, ValueAccessError> {
+    ) -> Result<Value<P>, ValueAccessError> {
         self.rebuild(base, self.step.clone(), miss_policy)
     }
 
@@ -2880,17 +3207,22 @@ impl AccessExpr {
     /// placeholders are being substituted. The fallback may never be chosen,
     /// so a concrete missing-field error must remain dormant until `??`
     /// selects it at a later resolution boundary.
-    pub(crate) fn rebuild_lazy_with_base(&self, base: Value) -> Value {
+    pub(crate) fn rebuild_lazy_with_base(&self, base: Value<P>) -> Value<P> {
         Value::Deferred(DeferredValue::Access(Self {
             base: Box::new(base),
             step: self.step.clone(),
             source_line: self.source_line,
-            display_root: self.display_root.clone(),
+            display_root: self.display_root.as_ref().map(|root| match root {
+                LoopAccessDisplayRoot::Rooted(binding)
+                | LoopAccessDisplayRoot::DeferredMiss(binding) => {
+                    LoopAccessDisplayRoot::DeferredMiss(binding.clone())
+                }
+            }),
         }))
     }
 }
 
-impl Value {
+impl<P: PlaceholderKind> Value<P> {
     /// Whether this value is the one syntactic shape for which `??` may
     /// interpret a missing selection as absence: a direct reference, or an
     /// access chain whose base is itself a direct reference.
@@ -2967,7 +3299,8 @@ impl Value {
                 | DeferredValue::Unavailable { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
                 | DeferredValue::Access(_)
-                | DeferredValue::Unknown(_),
+                | DeferredValue::Unknown(_)
+                | DeferredValue::Placeholder(_),
             ) => false,
         }
     }
@@ -2977,16 +3310,47 @@ impl Value {
     /// still go through [`apply_value_path_segment`].
     pub(crate) fn with_access_display_root(mut self, root: impl Into<String>) -> Self {
         if let Value::Deferred(DeferredValue::Access(access)) = &mut self {
-            access.display_root = Some(root.into());
+            access.display_root = Some(LoopAccessDisplayRoot::Rooted(root.into()));
+        }
+        self
+    }
+
+    pub(crate) fn with_deferred_miss_display_root(mut self, root: impl Into<String>) -> Self {
+        if let Value::Deferred(DeferredValue::Access(access)) = &mut self {
+            access.display_root = Some(LoopAccessDisplayRoot::DeferredMiss(root.into()));
+        }
+        self
+    }
+
+    pub(crate) fn retain_deferred_miss_display_root(mut self) -> Self {
+        if let Value::Deferred(DeferredValue::Access(access)) = &mut self
+            && let Some(root) = &mut access.display_root
+        {
+            *root = match root {
+                LoopAccessDisplayRoot::Rooted(binding)
+                | LoopAccessDisplayRoot::DeferredMiss(binding) => {
+                    LoopAccessDisplayRoot::DeferredMiss(binding.clone())
+                }
+            };
         }
         self
     }
 }
 
-impl Serialize for DeferredValue {
+impl<P> Serialize for DeferredValue<P>
+where
+    P: PlaceholderKind + Serialize,
+{
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
-        enum SerializableDeferredValue<'a> {
+        #[serde(untagged)]
+        enum SerializableUnknown<'a> {
+            ApplyTime(&'a ApplyTimeUnknown),
+            LoopSlot(LoopSlot),
+        }
+
+        #[derive(Serialize)]
+        enum SerializableDeferredValue<'a, P: PlaceholderKind> {
             ResourceRef {
                 path: &'a AccessPath,
             },
@@ -2994,23 +3358,24 @@ impl Serialize for DeferredValue {
                 binding: &'a str,
             },
             Coalesce {
-                value: &'a Value,
-                default: &'a Value,
+                value: &'a Value<P>,
+                default: &'a Value<P>,
             },
-            IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr),
-            Interpolation(&'a [InterpolationPart]),
+            IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<P>),
+            Interpolation(&'a [InterpolationPart<P>]),
             FunctionCall {
                 name: &'a str,
-                args: &'a [FunctionArgument],
+                args: &'a [FunctionArgument<P>],
             },
             Access {
-                base: &'a Value,
+                base: &'a Value<P>,
                 step: &'a PathSegment,
             },
             RedactedSecret {
                 hash: &'a RedactedSecretHash,
             },
-            Unknown(&'a UnknownReason),
+            Unknown(SerializableUnknown<'a>),
+            Placeholder(&'a P),
         }
 
         match self {
@@ -3018,12 +3383,17 @@ impl Serialize for DeferredValue {
                 "module-template conditional cannot be serialized before expansion",
             )),
             Self::ResourceRef { path } => {
-                SerializableDeferredValue::ResourceRef { path }.serialize(serializer)
+                let value: SerializableDeferredValue<'_, P> =
+                    SerializableDeferredValue::ResourceRef { path };
+                value.serialize(serializer)
             }
-            Self::BindingRef { binding } => SerializableDeferredValue::BindingRef {
-                binding: binding.as_str(),
+            Self::BindingRef { binding } => {
+                let value: SerializableDeferredValue<'_, P> =
+                    SerializableDeferredValue::BindingRef {
+                        binding: binding.as_str(),
+                    };
+                value.serialize(serializer)
             }
-            .serialize(serializer),
             Self::Coalesce { value, default } => {
                 SerializableDeferredValue::Coalesce { value, default }.serialize(serializer)
             }
@@ -3053,19 +3423,40 @@ impl Serialize for DeferredValue {
                 "raw secret values cannot be serialized; redact or materialize them at the typed boundary",
             )),
             Self::RedactedSecret { hash } => {
-                SerializableDeferredValue::RedactedSecret { hash }.serialize(serializer)
+                let value: SerializableDeferredValue<'_, P> =
+                    SerializableDeferredValue::RedactedSecret { hash };
+                value.serialize(serializer)
             }
             Self::Unknown(reason) => {
-                SerializableDeferredValue::Unknown(reason).serialize(serializer)
+                let value: SerializableDeferredValue<'_, P> =
+                    SerializableDeferredValue::Unknown(SerializableUnknown::ApplyTime(reason));
+                value.serialize(serializer)
             }
+            Self::Placeholder(placeholder) => match placeholder.loop_slot() {
+                Some(slot) => {
+                    SerializableDeferredValue::<P>::Unknown(SerializableUnknown::LoopSlot(slot))
+                        .serialize(serializer)
+                }
+                None => SerializableDeferredValue::Placeholder(placeholder).serialize(serializer),
+            },
         }
     }
 }
 
-impl<'de> Deserialize<'de> for DeferredValue {
+impl<'de, P> Deserialize<'de> for DeferredValue<P>
+where
+    P: PlaceholderKind + Deserialize<'de>,
+{
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        enum DeserializableDeferredValue {
+        #[serde(untagged)]
+        enum DeserializableUnknown {
+            ApplyTime(ApplyTimeUnknown),
+            LoopSlot(LoopSlot),
+        }
+
+        #[derive(Deserialize)]
+        enum DeserializableDeferredValue<P: PlaceholderKind> {
             ResourceRef {
                 path: AccessPath,
             },
@@ -3073,24 +3464,25 @@ impl<'de> Deserialize<'de> for DeferredValue {
                 binding: String,
             },
             Coalesce {
-                value: Box<Value>,
-                default: Box<Value>,
+                value: Box<Value<P>>,
+                default: Box<Value<P>>,
             },
-            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr),
-            Interpolation(Vec<InterpolationPart>),
+            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
+            Interpolation(Vec<InterpolationPart<P>>),
             FunctionCall {
                 name: String,
-                args: Vec<FunctionArgument>,
+                args: Vec<FunctionArgument<P>>,
             },
             Access {
-                base: Box<Value>,
+                base: Box<Value<P>>,
                 step: PathSegment,
             },
-            Secret(Box<Value>),
+            Secret(Box<Value<P>>),
             RedactedSecret {
                 hash: RedactedSecretHash,
             },
-            Unknown(UnknownReason),
+            Unknown(DeserializableUnknown),
+            Placeholder(P),
         }
 
         match DeserializableDeferredValue::deserialize(deserializer)? {
@@ -3127,12 +3519,154 @@ impl<'de> Deserialize<'de> for DeferredValue {
             DeserializableDeferredValue::RedactedSecret { hash } => {
                 Ok(Self::RedactedSecret { hash })
             }
-            DeserializableDeferredValue::Unknown(reason) => Ok(Self::Unknown(reason)),
+            DeserializableDeferredValue::Unknown(DeserializableUnknown::ApplyTime(reason)) => {
+                Ok(Self::Unknown(reason))
+            }
+            DeserializableDeferredValue::Unknown(DeserializableUnknown::LoopSlot(slot)) => {
+                P::from_loop_slot(slot)
+                    .map(Self::Placeholder)
+                    .map_err(serde::de::Error::custom)
+            }
+            DeserializableDeferredValue::Placeholder(placeholder) => {
+                if let Some(slot) = placeholder.loop_slot() {
+                    Err(serde::de::Error::custom(LoopPlaceholderWireTag { slot }))
+                } else {
+                    Ok(Self::Placeholder(placeholder))
+                }
+            }
         }
     }
 }
 
-impl fmt::Debug for DeferredValue {
+impl<'de, P> Deserialize<'de> for Value<P>
+where
+    P: PlaceholderKind + Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum DeserializableUnknown {
+            ApplyTime(ApplyTimeUnknown),
+            LoopSlot(LoopSlot),
+        }
+
+        #[derive(Deserialize)]
+        enum DeserializableValue<P: PlaceholderKind> {
+            String(ValueString),
+            EnumIdentifier(RawEnumIdentifier),
+            CanonicalEnum(CanonicalEnumValue),
+            Int(i64),
+            Float(f64),
+            Bool(bool),
+            #[serde(with = "duration_secs")]
+            Duration(std::time::Duration),
+            List(Vec<Value<P>>),
+            StringList(Vec<ValueString>),
+            Map(IndexMap<String, Value<P>>),
+            ResourceRef {
+                path: AccessPath,
+            },
+            BindingRef {
+                binding: String,
+            },
+            Coalesce {
+                value: Box<Value<P>>,
+                default: Box<Value<P>>,
+            },
+            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr<P>),
+            Interpolation(Vec<InterpolationPart<P>>),
+            FunctionCall {
+                name: String,
+                args: Vec<FunctionArgument<P>>,
+            },
+            Access {
+                base: Box<Value<P>>,
+                step: PathSegment,
+            },
+            Secret(Box<Value<P>>),
+            RedactedSecret {
+                hash: RedactedSecretHash,
+            },
+            Unknown(DeserializableUnknown),
+            Placeholder(P),
+        }
+
+        let value = match DeserializableValue::deserialize(deserializer)? {
+            DeserializableValue::String(value) => Value::Concrete(ConcreteValue::String(value)),
+            DeserializableValue::EnumIdentifier(value) => {
+                Value::Concrete(ConcreteValue::EnumIdentifier(value))
+            }
+            DeserializableValue::CanonicalEnum(value) => {
+                Value::Concrete(ConcreteValue::CanonicalEnum(value))
+            }
+            DeserializableValue::Int(value) => Value::Concrete(ConcreteValue::Int(value)),
+            DeserializableValue::Float(value) => Value::Concrete(ConcreteValue::Float(value)),
+            DeserializableValue::Bool(value) => Value::Concrete(ConcreteValue::Bool(value)),
+            DeserializableValue::Duration(value) => Value::Concrete(ConcreteValue::Duration(value)),
+            DeserializableValue::List(value) => Value::Concrete(ConcreteValue::List(value)),
+            DeserializableValue::StringList(value) => {
+                Value::Concrete(ConcreteValue::StringList(value))
+            }
+            DeserializableValue::Map(value) => Value::Concrete(ConcreteValue::Map(value)),
+            DeserializableValue::ResourceRef { path } => {
+                Value::Deferred(DeferredValue::ResourceRef { path })
+            }
+            DeserializableValue::BindingRef { binding } => {
+                Value::Deferred(DeferredValue::BindingRef { binding })
+            }
+            DeserializableValue::Coalesce { value, default } => {
+                Value::Deferred(DeferredValue::Coalesce { value, default })
+            }
+            DeserializableValue::IntegerArithmetic(expression) => {
+                Value::Deferred(DeferredValue::IntegerArithmetic(expression))
+            }
+            DeserializableValue::Interpolation(parts) => {
+                Value::Deferred(DeferredValue::Interpolation(parts))
+            }
+            DeserializableValue::FunctionCall { name, args } => {
+                let name = crate::builtins::BuiltinFunction::from_name(&name).ok_or_else(|| {
+                    serde::de::Error::custom(format!("unknown built-in function '{name}'"))
+                })?;
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name,
+                    args,
+                    source_line: DiagnosticSourceLine::synthetic(),
+                })
+            }
+            DeserializableValue::Access { base, step } => {
+                let value = apply_postfix_access(*base, step, 0, AccessMissPolicy::Error)
+                    .map_err(serde::de::Error::custom)?;
+                if matches!(value, Value::Concrete(_)) {
+                    return Err(serde::de::Error::custom(
+                        "serialized deferred access resolved to a concrete value",
+                    ));
+                }
+                value
+            }
+            DeserializableValue::Secret(value) => Value::Deferred(DeferredValue::Secret(value)),
+            DeserializableValue::RedactedSecret { hash } => {
+                Value::Deferred(DeferredValue::RedactedSecret { hash })
+            }
+            DeserializableValue::Unknown(DeserializableUnknown::ApplyTime(reason)) => {
+                Value::Deferred(DeferredValue::Unknown(reason))
+            }
+            DeserializableValue::Unknown(DeserializableUnknown::LoopSlot(slot)) => {
+                Value::Deferred(DeferredValue::Placeholder(
+                    P::from_loop_slot(slot).map_err(serde::de::Error::custom)?,
+                ))
+            }
+            DeserializableValue::Placeholder(placeholder) => {
+                if let Some(slot) = placeholder.loop_slot() {
+                    return Err(serde::de::Error::custom(LoopPlaceholderWireTag { slot }));
+                }
+                Value::Deferred(DeferredValue::Placeholder(placeholder))
+            }
+        };
+        Ok(value)
+    }
+}
+
+impl<P: PlaceholderKind + fmt::Debug> fmt::Debug for DeferredValue<P> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::ModuleIf(deferred) => f.debug_tuple("ModuleIf").field(deferred).finish(),
@@ -3196,6 +3730,9 @@ impl fmt::Debug for DeferredValue {
             Self::Secret(_) => f.write_str("Secret((secret))"),
             Self::RedactedSecret { .. } => f.write_str("RedactedSecret((secret hash))"),
             Self::Unknown(reason) => f.debug_tuple("Unknown").field(reason).finish(),
+            Self::Placeholder(placeholder) => {
+                f.debug_tuple("Placeholder").field(placeholder).finish()
+            }
         }
     }
 }
@@ -3922,8 +4459,8 @@ impl fmt::Debug for RedactedSecretHash {
 /// from the parent `Value`; the inner element / key types stay
 /// `Value` because lists and maps can mix concrete and deferred
 /// elements (e.g. `["literal", vpc.id]`).
-#[derive(Debug, Clone, Copy)]
-pub enum ConcreteValueRef<'a> {
+#[derive(Debug)]
+pub enum ConcreteValueRef<'a, P: PlaceholderKind = NoPlaceholder> {
     String(&'a ValueString),
     /// See `ConcreteValue::EnumIdentifier`.
     EnumIdentifier(&'a RawEnumIdentifier),
@@ -3932,12 +4469,20 @@ pub enum ConcreteValueRef<'a> {
     Float(f64),
     Bool(bool),
     Duration(std::time::Duration),
-    List(&'a [Value]),
+    List(&'a [Value<P>]),
     StringList(&'a [ValueString]),
-    Map(&'a IndexMap<String, Value>),
+    Map(&'a IndexMap<String, Value<P>>),
 }
 
-impl<'a> ConcreteValueRef<'a> {
+impl<P: PlaceholderKind> Copy for ConcreteValueRef<'_, P> {}
+
+impl<P: PlaceholderKind> Clone for ConcreteValueRef<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, P: PlaceholderKind> ConcreteValueRef<'a, P> {
     /// Return the inner `&str` for either textual variant at call sites where
     /// source shape is deliberately irrelevant (for example, generic custom
     /// scalar validation). Enum-aware formatting, comparison, and resolution
@@ -3952,7 +4497,7 @@ impl<'a> ConcreteValueRef<'a> {
     }
 }
 
-impl ConcreteValue {
+impl<P: PlaceholderKind> ConcreteValue<P> {
     /// Build a parser-surface enum identifier from source/display text.
     ///
     /// This is a raw-value convenience API for parsers and tests. Durable
@@ -3973,8 +4518,8 @@ impl ConcreteValue {
 ///
 /// Phase 1 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972).
 #[derive(Debug, Clone, Copy)]
-pub enum DeferredValueRef<'a> {
-    ModuleIf(&'a crate::parser::DeferredValueIf),
+pub enum DeferredValueRef<'a, P: PlaceholderKind = NoPlaceholder> {
+    ModuleIf(&'a crate::parser::DeferredValueIf<P>),
     ResourceRef {
         path: &'a AccessPath,
     },
@@ -3982,33 +4527,34 @@ pub enum DeferredValueRef<'a> {
         binding: &'a str,
     },
     Coalesce {
-        value: &'a Value,
-        default: &'a Value,
+        value: &'a Value<P>,
+        default: &'a Value<P>,
     },
-    IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr),
-    Interpolation(&'a [InterpolationPart]),
+    IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr<P>),
+    Interpolation(&'a [InterpolationPart<P>]),
     FunctionCall {
         name: &'a str,
-        args: &'a [FunctionArgument],
+        args: &'a [FunctionArgument<P>],
         source_line: Option<NonZeroUsize>,
     },
     Unavailable {
         name: crate::builtins::BuiltinFunction,
-        args: &'a [FunctionArgument],
+        args: &'a [FunctionArgument<P>],
         reason: &'a UnavailableReason,
         source_line: Option<NonZeroUsize>,
     },
     Access {
-        base: &'a Value,
+        base: &'a Value<P>,
         step: &'a PathSegment,
         source_line: usize,
     },
-    Secret(&'a Value),
+    Secret(&'a Value<P>),
     RedactedSecret(&'a RedactedSecretHash),
-    Unknown(&'a UnknownReason),
+    Unknown(&'a ApplyTimeUnknown),
+    Placeholder(&'a P),
 }
 
-impl Value {
+impl<P: PlaceholderKind> Value<P> {
     /// Whether this value tree carries any `env()`-derived string whose
     /// plaintext must be excluded from diagnostics.
     pub(crate) fn contains_diagnostic_sensitive_string(&self) -> bool {
@@ -4076,6 +4622,7 @@ impl Value {
                 | DeferredValue::RedactedSecret { .. }
                 | DeferredValue::Unknown(_),
             ) => false,
+            Value::Deferred(DeferredValue::Placeholder(_)) => false,
         }
     }
 
@@ -4091,7 +4638,7 @@ impl Value {
     /// cannot represent a deferred value, so the "deferred leaked
     /// into concrete-only path" bug class becomes structurally
     /// unrepresentable. See RFC #2972.
-    pub fn as_concrete(&self) -> Option<ConcreteValueRef<'_>> {
+    pub fn as_concrete(&self) -> Option<ConcreteValueRef<'_, P>> {
         match self {
             Value::Concrete(c) => Some(match c {
                 ConcreteValue::String(s) => ConcreteValueRef::String(s),
@@ -4112,7 +4659,7 @@ impl Value {
     /// If this value is on the deferred axis, return a borrowing
     /// projection. Returns `None` for concrete variants. Mirror of
     /// [`Self::as_concrete`].
-    pub fn as_deferred(&self) -> Option<DeferredValueRef<'_>> {
+    pub fn as_deferred(&self) -> Option<DeferredValueRef<'_, P>> {
         match self {
             Value::Deferred(d) => Some(match d {
                 DeferredValue::ModuleIf(deferred) => DeferredValueRef::ModuleIf(deferred),
@@ -4163,6 +4710,9 @@ impl Value {
                 DeferredValue::Secret(inner) => DeferredValueRef::Secret(inner),
                 DeferredValue::RedactedSecret { hash } => DeferredValueRef::RedactedSecret(hash),
                 DeferredValue::Unknown(reason) => DeferredValueRef::Unknown(reason),
+                DeferredValue::Placeholder(placeholder) => {
+                    DeferredValueRef::Placeholder(placeholder)
+                }
             }),
             Value::Concrete(_) => None,
         }
@@ -4218,16 +4768,86 @@ pub enum ReReadReason {
     NotFound,
 }
 
-/// Why a `Value::Unknown` is unknown. Each variant carries only the
-/// information its own consumer needs — no shared "context" field invites
-/// drift across reasons. See RFC #2371.
-/// These reasons span parser-stage placeholders (`FnParam`, `FnLocal`,
-/// `ModuleArgument`, `EmptyInterpolation`, and the `ForKey`, `ForIndex`, and
-/// `ForValue` loop placeholders) and markers that survive into plan/apply
-/// (`UpstreamExport`, `UpstreamAllExports`, and `PendingReRead`);
-/// #4094 tracks splitting them by stage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UnknownReason {
+/// Uninhabited placeholder type for values that have crossed every expansion
+/// boundary.
+///
+/// The default [`Value`] is `Value<NoPlaceholder>`, so constructing a parser
+/// placeholder or loop slot in an expanded value is rejected by the type
+/// checker.
+///
+/// ```compile_fail,E0308
+/// use carina_core::resource::{DeferredValue, ParserPlaceholder, Value};
+///
+/// let _: Value = Value::Deferred(DeferredValue::Placeholder(
+///     ParserPlaceholder::FnParam { name: "input".to_string() },
+/// ));
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::resource::{DeferredValue, LoopSlot, Value};
+///
+/// let _: Value = Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NoPlaceholder {}
+
+/// Parser-stage slots consumed by function evaluation, module expansion, or
+/// deferred-loop template construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ParserPlaceholder {
+    FnParam {
+        name: String,
+    },
+    ModuleArgument {
+        name: String,
+        /// Authored reference span and forwarded display name. A declaration
+        /// or seed placeholder remains neutral until its first authored use.
+        /// This parser metadata is never value data.
+        #[serde(skip, default)]
+        diagnostic: Box<ModuleArgumentDiagnostic>,
+    },
+    FnLocal {
+        name: String,
+    },
+    /// A typed loop slot emitted while parsing a deferred for-body. The slot
+    /// is transferred to the template-only [`LoopSlot`] stage at the
+    /// expansion boundary; its authored binding name is display metadata on
+    /// access nodes, never identity.
+    Loop(LoopSlot),
+    /// Mid-edit empty `${}` interpolation.
+    EmptyInterpolation {
+        /// Authored file and interpolation range. This metadata follows
+        /// inlined values but is never serialized as value data.
+        #[serde(skip, default = "DiagnosticSourceSpan::deserialized")]
+        source: DiagnosticSourceSpan,
+    },
+}
+
+impl ParserPlaceholder {
+    /// Authored location for diagnostics, independent of placeholder kind.
+    pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
+        match self {
+            Self::ModuleArgument { diagnostic, .. } => diagnostic.authored_location(),
+            Self::EmptyInterpolation { source } => source.authored_location(),
+            Self::FnParam { .. } | Self::FnLocal { .. } | Self::Loop(_) => None,
+        }
+    }
+}
+
+/// Placeholder available only inside a deferred for-loop template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LoopSlot {
+    #[serde(rename = "ForKey")]
+    Key,
+    #[serde(rename = "ForIndex")]
+    Index,
+    #[serde(rename = "ForValue")]
+    Value,
+}
+
+/// Why a value remains unknown until apply or a later refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ApplyTimeUnknown {
     /// One export reached through an attribute path on an `upstream_state`
     /// binding that did not resolve (state file missing, or the export was absent).
     /// Renders as `(known after upstream apply: <path.to_dot_string()>)`.
@@ -4247,54 +4867,751 @@ pub enum UnknownReason {
     // Keep the wire tag independent of the Rust variant name.
     #[serde(rename = "UpstreamBareRef")]
     UpstreamAllExports { binding: String },
-    /// Map-binding key in a deferred for-expression
-    /// (`for (k, _) in iterable`). Substituted with the actual key when
-    /// the iterable is later resolved.
-    ForKey,
-    /// Indexed-binding index in a deferred for-expression
-    /// (`for (i, _) in iterable`). Substituted with the actual index.
-    ForIndex,
-    /// Loop-variable value in a deferred for-expression
-    /// (`for v in iterable`). Substituted with the actual element.
-    ForValue,
-    /// Function parameter placeholder while parsing a user-defined
-    /// function body. Substituted with the call argument when the
-    /// function is evaluated.
-    FnParam { name: String },
-    /// Module argument placeholder while parsing a module definition.
-    /// This is a value slot, not a structural resource address; module
-    /// expansion substitutes it before provider-facing validation.
-    ModuleArgument {
-        name: String,
-        /// One-based line of this reference, absent on a neutral declaration
-        /// or seed placeholder. This parser metadata is never value data.
-        #[serde(skip, default)]
-        source_line: DiagnosticSourceLine,
-        /// Authored inner parameter name retained while a nested module
-        /// forwards this placeholder to an outer parameter.
-        #[serde(skip, default)]
-        diagnostic_name: Option<String>,
-    },
-    /// Function-local let placeholder while parsing a user-defined
-    /// function body. Substituted after local lets are evaluated for a
-    /// call.
-    FnLocal { name: String },
-    /// Mid-edit empty `${}` interpolation. Carries no payload — the
-    /// presence of the marker is enough for the LSP to surface a
-    /// diagnostic at the `${}` span and for downstream resolvers to
-    /// stay tolerant. See #2480.
-    EmptyInterpolation,
     /// An apply completed, but its follow-up read did not resolve the value.
     PendingReRead(PendingReRead),
 }
 
+/// A parser slot survived the only fallible parser-to-expanded value
+/// transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftoverPlaceholder {
+    placeholder: ParserPlaceholder,
+    context: LeftoverPlaceholderContext,
+}
+
+impl fmt::Display for LeftoverPlaceholder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}{}", self.context, self.placeholder)
+    }
+}
+
+impl std::error::Error for LeftoverPlaceholder {}
+
+struct LocatedLeftoverPlaceholder<'a>(&'a LeftoverPlaceholder);
+
+impl fmt::Display for LocatedLeftoverPlaceholder<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some((source_file, range)) = self.0.placeholder.authored_location() {
+            write!(
+                formatter,
+                "{}:{}:{}: ",
+                source_file.display(),
+                range.start_line(),
+                range.start_column(),
+            )?;
+        }
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeftoverPlaceholderContext {
+    Value,
+    Variable {
+        name: String,
+    },
+    ProviderAttribute {
+        provider: String,
+        attribute: String,
+    },
+    BackendAttribute {
+        backend: String,
+        attribute: String,
+    },
+    ModuleCallArgument {
+        module_call: String,
+        argument: String,
+    },
+    ArgumentDefault {
+        name: String,
+    },
+    ArgumentValidation {
+        name: String,
+    },
+    ResourceAttribute {
+        resource: String,
+        attribute: String,
+    },
+    Export {
+        name: String,
+    },
+    AttributeDefault {
+        name: String,
+    },
+    StateImport {
+        target: String,
+    },
+    Require {
+        label: String,
+    },
+    DeferredForIterable {
+        header: String,
+    },
+    DeferredForAttribute {
+        header: String,
+        attribute: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopPlaceholderPolicy {
+    Reject,
+    AllowInDeferredTemplate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleArgumentPolicy {
+    Reject,
+    AllowUntilModuleExpansion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeftoverPlaceholderPolicy {
+    loop_slots: LoopPlaceholderPolicy,
+    module_arguments: ModuleArgumentPolicy,
+}
+
+impl LeftoverPlaceholderPolicy {
+    pub(crate) const REJECT_ALL: Self = Self {
+        loop_slots: LoopPlaceholderPolicy::Reject,
+        module_arguments: ModuleArgumentPolicy::Reject,
+    };
+
+    pub(crate) const fn module_expansion_field(allow_module_arguments: bool) -> Self {
+        Self {
+            loop_slots: LoopPlaceholderPolicy::Reject,
+            module_arguments: if allow_module_arguments {
+                ModuleArgumentPolicy::AllowUntilModuleExpansion
+            } else {
+                ModuleArgumentPolicy::Reject
+            },
+        }
+    }
+
+    pub(crate) const fn deferred_template(allow_module_arguments: bool) -> Self {
+        Self {
+            loop_slots: LoopPlaceholderPolicy::AllowInDeferredTemplate,
+            module_arguments: if allow_module_arguments {
+                ModuleArgumentPolicy::AllowUntilModuleExpansion
+            } else {
+                ModuleArgumentPolicy::Reject
+            },
+        }
+    }
+}
+
+impl fmt::Display for LeftoverPlaceholderContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value => Ok(()),
+            Self::Variable { name } => write!(formatter, "let `{name}`: "),
+            Self::ProviderAttribute {
+                provider,
+                attribute,
+            } => write!(formatter, "provider `{provider}` attribute `{attribute}`: "),
+            Self::BackendAttribute { backend, attribute } => {
+                write!(formatter, "backend `{backend}` attribute `{attribute}`: ")
+            }
+            Self::ModuleCallArgument {
+                module_call,
+                argument,
+            } => write!(
+                formatter,
+                "module call `{module_call}` argument `{argument}`: "
+            ),
+            Self::ArgumentDefault { name } => {
+                write!(formatter, "arguments `{name}` default: ")
+            }
+            Self::ArgumentValidation { name } => {
+                write!(formatter, "arguments `{name}` validation: ")
+            }
+            Self::ResourceAttribute {
+                resource,
+                attribute,
+            } => write!(formatter, "{resource}: attribute `{attribute}`: "),
+            Self::Export { name } => write!(formatter, "exports `{name}`: "),
+            Self::AttributeDefault { name } => {
+                write!(formatter, "attributes `{name}` default: ")
+            }
+            Self::StateImport { target } => write!(formatter, "import `{target}` id: "),
+            Self::Require { label } => write!(formatter, "require `{label}`: "),
+            Self::DeferredForIterable { header } => {
+                write!(formatter, "deferred `{header}` iterable: ")
+            }
+            Self::DeferredForAttribute { header, attribute } => {
+                write!(formatter, "deferred `{header}` attribute `{attribute}`: ")
+            }
+        }
+    }
+}
+
+impl LeftoverPlaceholder {
+    /// Render this error with its authored source location when one is known.
+    pub fn located(&self) -> impl fmt::Display + '_ {
+        LocatedLeftoverPlaceholder(self)
+    }
+
+    pub fn placeholder(&self) -> &ParserPlaceholder {
+        &self.placeholder
+    }
+
+    pub(crate) fn in_resource_attribute(
+        mut self,
+        resource: impl Into<String>,
+        attribute: impl Into<String>,
+    ) -> Self {
+        self.context = LeftoverPlaceholderContext::ResourceAttribute {
+            resource: resource.into(),
+            attribute: attribute.into(),
+        };
+        self
+    }
+
+    pub(crate) fn in_export(mut self, name: impl Into<String>) -> Self {
+        self.context = LeftoverPlaceholderContext::Export { name: name.into() };
+        self
+    }
+
+    pub(crate) fn in_attribute_default(mut self, name: impl Into<String>) -> Self {
+        self.context = LeftoverPlaceholderContext::AttributeDefault { name: name.into() };
+        self
+    }
+}
+
+/// Every parser-stage placeholder rejected by one file expansion boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftoverPlaceholders(Vec<LeftoverPlaceholder>);
+
+impl LeftoverPlaceholders {
+    pub(crate) fn new(errors: Vec<LeftoverPlaceholder>) -> Self {
+        debug_assert!(!errors.is_empty());
+        Self(errors)
+    }
+
+    pub fn errors(&self) -> &[LeftoverPlaceholder] {
+        &self.0
+    }
+
+    pub fn into_errors(self) -> Vec<LeftoverPlaceholder> {
+        self.0
+    }
+}
+
+impl From<LeftoverPlaceholder> for LeftoverPlaceholders {
+    fn from(error: LeftoverPlaceholder) -> Self {
+        Self(vec![error])
+    }
+}
+
+impl fmt::Display for LeftoverPlaceholders {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, error) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("\n")?;
+            }
+            error.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LeftoverPlaceholders {}
+
+struct LocatedLeftoverPlaceholders<'a>(&'a LeftoverPlaceholders);
+
+impl fmt::Display for LocatedLeftoverPlaceholders<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, error) in self.0.errors().iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("\n")?;
+            }
+            write!(formatter, "{}", error.located())?;
+        }
+        Ok(())
+    }
+}
+
+impl LeftoverPlaceholders {
+    /// Render every error with its authored source location when one is known.
+    pub fn located(&self) -> impl fmt::Display + '_ {
+        LocatedLeftoverPlaceholders(self)
+    }
+}
+
+/// A serialized for-loop slot appeared in an ordinary expanded value instead
+/// of a deferred for-loop template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("for-loop placeholder is not allowed outside a deferred for-loop template: {slot}")]
+pub struct PlaceholderOutsideTemplate {
+    slot: LoopSlot,
+}
+
+impl PlaceholderOutsideTemplate {
+    pub fn slot(&self) -> LoopSlot {
+        self.slot
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("for-loop placeholder must use the saved-plan `Unknown` wire tag: {slot}")]
+struct LoopPlaceholderWireTag {
+    slot: LoopSlot,
+}
+
+impl std::fmt::Display for ParserPlaceholder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FnParam { name } => write!(formatter, "unresolved function parameter: {name}"),
+            Self::FnLocal { name } => write!(formatter, "unresolved function local: {name}"),
+            Self::ModuleArgument { name, .. } => {
+                write!(formatter, "unresolved module argument: {name}")
+            }
+            Self::Loop(slot) => slot.fmt(formatter),
+            Self::EmptyInterpolation { .. } => formatter
+                .write_str("empty interpolation `${}` — fill in the expression or remove it"),
+        }
+    }
+}
+
+/// Internal behavior shared by the three stage marker types.
+#[doc(hidden)]
+pub trait PlaceholderKind:
+    Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize
+{
+    fn module_argument_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Lexical binding whose declared type can prove this parser slot's type.
+    fn inference_binding_name(&self) -> Option<&str> {
+        self.module_argument_name()
+    }
+
+    fn loop_slot(&self) -> Option<LoopSlot> {
+        None
+    }
+
+    fn from_loop_slot(slot: LoopSlot) -> Result<Self, PlaceholderOutsideTemplate>
+    where
+        Self: Sized,
+    {
+        Err(PlaceholderOutsideTemplate { slot })
+    }
+
+    /// Render the placeholder as a value. This is distinct from [`Display`],
+    /// which is also used for typed expansion errors.
+    fn render(&self) -> String {
+        self.to_string()
+    }
+
+    /// Parser-stage placeholders are stable syntax tokens during directory
+    /// fixed-point parsing. Runtime/template placeholders deliberately retain
+    /// unknown-value equality semantics.
+    fn parser_token_eq(&self, _other: &Self) -> bool {
+        false
+    }
+}
+
+impl PlaceholderKind for NoPlaceholder {}
+
+impl fmt::Display for NoPlaceholder {
+    fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {}
+    }
+}
+
+impl fmt::Display for LoopSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Key => "deferred for-binding key",
+            Self::Index => "deferred for-binding index",
+            Self::Value => "deferred for-binding value",
+        })
+    }
+}
+
+impl PlaceholderKind for LoopSlot {
+    fn loop_slot(&self) -> Option<LoopSlot> {
+        Some(*self)
+    }
+
+    fn from_loop_slot(slot: LoopSlot) -> Result<Self, PlaceholderOutsideTemplate> {
+        Ok(slot)
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Key => "(known after upstream apply: key)".to_string(),
+            Self::Index => "(known after upstream apply: index)".to_string(),
+            Self::Value => "(known after upstream apply)".to_string(),
+        }
+    }
+}
+
+impl PlaceholderKind for ParserPlaceholder {
+    fn module_argument_name(&self) -> Option<&str> {
+        match self {
+            Self::ModuleArgument { name, .. } => Some(name),
+            Self::FnParam { .. }
+            | Self::FnLocal { .. }
+            | Self::Loop(_)
+            | Self::EmptyInterpolation { .. } => None,
+        }
+    }
+
+    fn inference_binding_name(&self) -> Option<&str> {
+        match self {
+            Self::FnParam { name } | Self::FnLocal { name } | Self::ModuleArgument { name, .. } => {
+                Some(name)
+            }
+            Self::Loop(_) | Self::EmptyInterpolation { .. } => None,
+        }
+    }
+
+    fn loop_slot(&self) -> Option<LoopSlot> {
+        match self {
+            Self::Loop(slot) => Some(*slot),
+            Self::FnParam { .. }
+            | Self::ModuleArgument { .. }
+            | Self::FnLocal { .. }
+            | Self::EmptyInterpolation { .. } => None,
+        }
+    }
+
+    fn from_loop_slot(slot: LoopSlot) -> Result<Self, PlaceholderOutsideTemplate> {
+        Ok(Self::Loop(slot))
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::FnParam { name } => format!("(unresolved function parameter: {name})"),
+            Self::FnLocal { name } => format!("(unresolved function local: {name})"),
+            Self::ModuleArgument { name, .. } => {
+                format!("(unresolved module argument: {name})")
+            }
+            Self::Loop(slot) => slot.render(),
+            Self::EmptyInterpolation { .. } => "(empty interpolation)".to_string(),
+        }
+    }
+
+    fn parser_token_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl<P: PlaceholderKind> Value<P> {
+    /// Clone this value into the placeholder-free stage, returning `None` if
+    /// any placeholder remains anywhere in the tree.
+    pub fn to_expanded(&self) -> Option<Value> {
+        self.clone()
+            .try_map_placeholder::<NoPlaceholder, ()>(&mut |_placeholder| Err(()))
+            .ok()
+    }
+
+    pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P)) {
+        match self {
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => visitor(placeholder),
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                for value in deferred.values() {
+                    value.visit_placeholders(visitor);
+                }
+            }
+            Value::Concrete(ConcreteValue::List(values)) => {
+                for value in values {
+                    value.visit_placeholders(visitor);
+                }
+            }
+            Value::Concrete(ConcreteValue::Map(values)) => {
+                for value in values.values() {
+                    value.visit_placeholders(visitor);
+                }
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                value.visit_placeholders(visitor);
+                default.visit_placeholders(visitor);
+            }
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                for part in parts {
+                    if let InterpolationPart::Expr(value) = part {
+                        value.visit_placeholders(visitor);
+                    }
+                }
+            }
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => {
+                for argument in args {
+                    argument.operand.visit_values(&mut |value| {
+                        value.visit_placeholders(visitor);
+                    });
+                }
+            }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.base().visit_placeholders(visitor);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().visit_placeholders(visitor);
+                expression.rhs().visit_placeholders(visitor);
+            }
+            Value::Deferred(DeferredValue::Secret(value)) => {
+                value.visit_placeholders(visitor);
+            }
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
+            )
+            | Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::RedactedSecret { .. }
+                | DeferredValue::Unknown(_),
+            ) => {}
+        }
+    }
+
+    pub(crate) fn try_map_placeholder<Q: PlaceholderKind, E>(
+        self,
+        map: &mut dyn FnMut(P) -> Result<Value<Q>, E>,
+    ) -> Result<Value<Q>, E> {
+        let map_argument = |argument: FunctionArgument<P>,
+                            map: &mut dyn FnMut(P) -> Result<Value<Q>, E>|
+         -> Result<FunctionArgument<Q>, E> {
+            let operand = argument
+                .operand
+                .try_map_stage(&mut |value| value.try_map_placeholder(map))?;
+            Ok(FunctionArgument { operand })
+        };
+
+        Ok(match self {
+            Self::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                Value::Deferred(DeferredValue::ModuleIf(Box::new(
+                    deferred.try_map_stage(|value| value.try_map_placeholder(map))?,
+                )))
+            }
+            Self::Concrete(ConcreteValue::String(value)) => {
+                Value::Concrete(ConcreteValue::String(value))
+            }
+            Self::Concrete(ConcreteValue::EnumIdentifier(value)) => {
+                Value::Concrete(ConcreteValue::EnumIdentifier(value))
+            }
+            Self::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+                Value::Concrete(ConcreteValue::CanonicalEnum(value))
+            }
+            Self::Concrete(ConcreteValue::Int(value)) => Value::Concrete(ConcreteValue::Int(value)),
+            Self::Concrete(ConcreteValue::Float(value)) => {
+                Value::Concrete(ConcreteValue::Float(value))
+            }
+            Self::Concrete(ConcreteValue::Bool(value)) => {
+                Value::Concrete(ConcreteValue::Bool(value))
+            }
+            Self::Concrete(ConcreteValue::Duration(value)) => {
+                Value::Concrete(ConcreteValue::Duration(value))
+            }
+            Self::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
+                values
+                    .into_iter()
+                    .map(|value| value.try_map_placeholder(map))
+                    .collect::<Result<_, _>>()?,
+            )),
+            Self::Concrete(ConcreteValue::StringList(values)) => {
+                Value::Concrete(ConcreteValue::StringList(values))
+            }
+            Self::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
+                values
+                    .into_iter()
+                    .map(|(name, value)| Ok((name, value.try_map_placeholder(map)?)))
+                    .collect::<Result<_, E>>()?,
+            )),
+            Self::Deferred(DeferredValue::ResourceRef { path }) => {
+                Value::Deferred(DeferredValue::ResourceRef { path })
+            }
+            Self::Deferred(DeferredValue::BindingRef { binding }) => {
+                Value::Deferred(DeferredValue::BindingRef { binding })
+            }
+            Self::Deferred(DeferredValue::Coalesce { value, default }) => {
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(value.try_map_placeholder(map)?),
+                    default: Box::new(default.try_map_placeholder(map)?),
+                })
+            }
+            Self::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                Value::Deferred(DeferredValue::IntegerArithmetic(
+                    expression.try_map_stage(|value| value.try_map_placeholder(map))?,
+                ))
+            }
+            Self::Deferred(DeferredValue::Interpolation(parts)) => {
+                Value::Deferred(DeferredValue::Interpolation(
+                    parts
+                        .into_iter()
+                        .map(|part| match part {
+                            InterpolationPart::Literal(value) => {
+                                Ok(InterpolationPart::Literal(value))
+                            }
+                            InterpolationPart::Expr(value) => {
+                                Ok(InterpolationPart::Expr(value.try_map_placeholder(map)?))
+                            }
+                        })
+                        .collect::<Result<_, E>>()?,
+                ))
+            }
+            Self::Deferred(DeferredValue::FunctionCall {
+                name,
+                args,
+                source_line,
+            }) => Value::Deferred(DeferredValue::FunctionCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|argument| map_argument(argument, map))
+                    .collect::<Result<_, _>>()?,
+                source_line,
+            }),
+            Self::Deferred(DeferredValue::Unavailable {
+                name,
+                args,
+                reason,
+                source_line,
+            }) => Value::Deferred(DeferredValue::Unavailable {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|argument| map_argument(argument, map))
+                    .collect::<Result<_, _>>()?,
+                reason,
+                source_line,
+            }),
+            Self::Deferred(DeferredValue::ResolvedFunctionCall {
+                function,
+                functions,
+                args,
+                source_line,
+            }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function,
+                functions,
+                args: args
+                    .into_iter()
+                    .map(|argument| map_argument(argument, map))
+                    .collect::<Result<_, _>>()?,
+                source_line,
+            }),
+            Self::Deferred(DeferredValue::Access(access)) => {
+                Value::Deferred(DeferredValue::Access(AccessExpr {
+                    base: Box::new(access.base.try_map_placeholder(map)?),
+                    step: access.step,
+                    source_line: access.source_line,
+                    display_root: access.display_root,
+                }))
+            }
+            Self::Deferred(DeferredValue::Secret(value)) => Value::Deferred(DeferredValue::Secret(
+                Box::new(value.try_map_placeholder(map)?),
+            )),
+            Self::Deferred(DeferredValue::RedactedSecret { hash }) => {
+                Value::Deferred(DeferredValue::RedactedSecret { hash })
+            }
+            Self::Deferred(DeferredValue::Unknown(reason)) => {
+                Value::Deferred(DeferredValue::Unknown(reason))
+            }
+            Self::Deferred(DeferredValue::Placeholder(placeholder)) => map(placeholder)?,
+        })
+    }
+}
+
+impl Value<NoPlaceholder> {
+    pub(crate) fn into_placeholder_type<P: PlaceholderKind>(self) -> Value<P> {
+        match self.try_map_placeholder::<P, std::convert::Infallible>(&mut |never| match never {}) {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
+}
+
+impl Value<ParserPlaceholder> {
+    pub(crate) fn collect_leftover_placeholders(
+        &self,
+        context: LeftoverPlaceholderContext,
+        policy: LeftoverPlaceholderPolicy,
+        errors: &mut Vec<LeftoverPlaceholder>,
+    ) {
+        self.visit_placeholders(&mut |placeholder| {
+            let allowed = match placeholder {
+                ParserPlaceholder::Loop(_) => {
+                    policy.loop_slots == LoopPlaceholderPolicy::AllowInDeferredTemplate
+                }
+                ParserPlaceholder::ModuleArgument { .. } => {
+                    policy.module_arguments == ModuleArgumentPolicy::AllowUntilModuleExpansion
+                }
+                ParserPlaceholder::FnParam { .. }
+                | ParserPlaceholder::FnLocal { .. }
+                | ParserPlaceholder::EmptyInterpolation { .. } => false,
+            };
+            if allowed {
+                return;
+            }
+            errors.push(LeftoverPlaceholder {
+                placeholder: placeholder.clone(),
+                context: context.clone(),
+            });
+        });
+    }
+
+    pub fn into_expanded(self) -> Result<Value, LeftoverPlaceholder> {
+        self.try_map_placeholder(&mut |placeholder| {
+            Err(LeftoverPlaceholder {
+                placeholder,
+                context: LeftoverPlaceholderContext::Value,
+            })
+        })
+    }
+
+    pub(crate) fn into_loop_template(self) -> Result<Value<LoopSlot>, LeftoverPlaceholder> {
+        self.try_map_placeholder(&mut |placeholder| match placeholder {
+            ParserPlaceholder::Loop(slot) => Ok(Value::Deferred(DeferredValue::Placeholder(slot))),
+            placeholder => Err(LeftoverPlaceholder {
+                placeholder,
+                context: LeftoverPlaceholderContext::Value,
+            }),
+        })
+    }
+}
+
+/// Cross a string-keyed value map into the expanded stage. Resource owners
+/// may supply their id so leftover placeholders retain attribute context.
+pub fn into_expanded_value_map<C>(
+    values: impl IntoIterator<Item = (String, Value<ParserPlaceholder>)>,
+    resource: Option<&ResourceId>,
+) -> Result<C, LeftoverPlaceholder>
+where
+    C: FromIterator<(String, Value)>,
+{
+    values
+        .into_iter()
+        .map(|(name, value)| {
+            value
+                .into_expanded()
+                .map(|value| (name.clone(), value))
+                .map_err(|error| match resource {
+                    Some(resource) => error.in_resource_attribute(resource.to_string(), name),
+                    None => error,
+                })
+        })
+        .collect()
+}
+
 /// A part of a string interpolation expression
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum InterpolationPart {
+pub enum InterpolationPart<P: PlaceholderKind = NoPlaceholder> {
     /// Literal text segment
     Literal(ValueString),
     /// An expression to be evaluated and converted to string
-    Expr(Value),
+    Expr(Value<P>),
 }
 
 /// `PartialEq` for `Value` is hand-rolled (not derived) to enforce one
@@ -4307,7 +5624,7 @@ pub enum InterpolationPart {
 /// argument token is the sole exception: fixed-point directory parsing must
 /// be able to recognize the same lexical placeholder across passes, and it is
 /// always substituted before values reach the differ. See RFC #2371.
-impl PartialEq for Value {
+impl<P: PlaceholderKind + PartialEq> PartialEq for Value<P> {
     fn eq(&self, other: &Self) -> bool {
         if let (Value::Deferred(left), Value::Deferred(right)) = (self, other)
             && let (Some((left_name, left_args)), Some((right_name, right_args))) = (
@@ -4320,16 +5637,14 @@ impl PartialEq for Value {
 
         match (self, other) {
             (
-                Value::Deferred(DeferredValue::ModuleIf(a)),
-                Value::Deferred(DeferredValue::ModuleIf(b)),
-            ) => a == b,
-            (
-                Value::Deferred(DeferredValue::Unknown(a @ UnknownReason::ModuleArgument { .. })),
-                Value::Deferred(DeferredValue::Unknown(b @ UnknownReason::ModuleArgument { .. })),
-            ) => a == b,
+                Value::Deferred(DeferredValue::Placeholder(a)),
+                Value::Deferred(DeferredValue::Placeholder(b)),
+            ) if a.parser_token_eq(b) => true,
             // Constraint: Unknown is never equal to anything.
             (Value::Deferred(DeferredValue::Unknown(_)), _)
-            | (_, Value::Deferred(DeferredValue::Unknown(_))) => false,
+            | (_, Value::Deferred(DeferredValue::Unknown(_)))
+            | (Value::Deferred(DeferredValue::Placeholder(_)), _)
+            | (_, Value::Deferred(DeferredValue::Placeholder(_))) => false,
             (
                 Value::Concrete(ConcreteValue::String(a)),
                 Value::Concrete(ConcreteValue::String(b)),
@@ -4399,6 +5714,10 @@ impl PartialEq for Value {
                 }),
             ) => av == bv && ad == bd,
             (
+                Value::Deferred(DeferredValue::ModuleIf(a)),
+                Value::Deferred(DeferredValue::ModuleIf(b)),
+            ) => a == b,
+            (
                 Value::Deferred(DeferredValue::IntegerArithmetic(a)),
                 Value::Deferred(DeferredValue::IntegerArithmetic(b)),
             ) => a == b,
@@ -4441,8 +5760,8 @@ impl PartialEq for Value {
 /// fold simple `Expr(scalar)` into a `Literal` (consuming the scalar's
 /// string), merge adjacent `Literal`s, and collapse the result to
 /// `Value::String` when no `Expr` parts remain.
-fn canonicalize_interpolation(parts: Vec<InterpolationPart>) -> Value {
-    let mut merged: Vec<InterpolationPart> = Vec::with_capacity(parts.len());
+fn canonicalize_interpolation<P: PlaceholderKind>(parts: Vec<InterpolationPart<P>>) -> Value<P> {
+    let mut merged: Vec<InterpolationPart<P>> = Vec::with_capacity(parts.len());
     let mut contains_folded_secret = false;
     for part in parts {
         let next = match part {
@@ -4495,7 +5814,7 @@ fn canonicalize_interpolation(parts: Vec<InterpolationPart>) -> Value {
 /// A scalar inside `Secret(_)` is folded through the same conversion and
 /// reports that provenance to the caller, which wraps the completed
 /// interpolation in `Secret` rather than dropping the sensitivity tag.
-fn value_into_literal(v: Value) -> Result<(ValueString, bool), Value> {
+fn value_into_literal<P: PlaceholderKind>(v: Value<P>) -> Result<(ValueString, bool), Value<P>> {
     match v {
         Value::Concrete(ConcreteValue::String(s)) => Ok((s, false)),
         Value::Concrete(ConcreteValue::Int(n)) => Ok((n.to_string().into(), false)),
@@ -4516,7 +5835,7 @@ pub enum ResourceRefUsage {
     CoalesceValue,
 }
 
-impl Value {
+impl<P: PlaceholderKind> Value<P> {
     /// Recursively normalize this `Value` so that downstream code does not
     /// have to handle redundant `Interpolation` shapes.
     ///
@@ -4536,7 +5855,7 @@ impl Value {
     /// unchanged. The transformation is idempotent.
     ///
     /// See #2227.
-    pub fn canonicalize(mut self) -> Value {
+    pub fn canonicalize(mut self) -> Value<P> {
         self.canonicalize_in_place();
         self
     }
@@ -4762,6 +6081,7 @@ impl Value {
             // a live reference to walk — dependency analysis happens
             // upstream of the stamping pass.
             Value::Deferred(DeferredValue::Unknown(_)) => {}
+            Value::Deferred(DeferredValue::Placeholder(_)) => {}
         }
     }
 
@@ -4831,6 +6151,7 @@ impl Value {
             // *replaced with* by stamping passes. It is no longer a live
             // reference to walk.
             Value::Deferred(DeferredValue::Unknown(_)) => {}
+            Value::Deferred(DeferredValue::Placeholder(_)) => {}
         }
     }
 }
@@ -4850,12 +6171,14 @@ impl Value {
 /// values must run `carina_core::resolver::resolve_refs_with_state_and_remote`
 /// (or an equivalent) first. See #1683 for a regression caused by assuming
 /// this method performed resolution.
-pub fn attrs_to_hashmap(attrs: &IndexMap<String, Value>) -> HashMap<String, Value> {
+pub fn attrs_to_hashmap<P: PlaceholderKind>(
+    attrs: &IndexMap<String, Value<P>>,
+) -> HashMap<String, Value<P>> {
     attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 /// Check if a Value contains any ResourceRef (possibly nested)
-pub fn contains_resource_ref(value: &Value) -> bool {
+pub fn contains_resource_ref<P: PlaceholderKind>(value: &Value<P>) -> bool {
     let mut found = false;
     value.visit_resource_refs(&mut |_| found = true);
     found
@@ -4914,8 +6237,8 @@ pub(crate) enum UnavailableSecretPolicy {
 
 /// Find the first built-in evaluation that was attempted and definitively
 /// failed, using the caller's explicit coalesce and secret traversal policy.
-pub(crate) fn find_unavailable_evaluation(
-    value: &Value,
+pub(crate) fn find_unavailable_evaluation<P: PlaceholderKind>(
+    value: &Value<P>,
     coalesce_policy: UnavailableCoalescePolicy,
     secret_policy: UnavailableSecretPolicy,
 ) -> Option<(
@@ -4923,8 +6246,8 @@ pub(crate) fn find_unavailable_evaluation(
     &UnavailableReason,
     DiagnosticSourceLine,
 )> {
-    fn find(
-        value: &Value,
+    fn find<P: PlaceholderKind>(
+        value: &Value<P>,
         coalesce_policy: UnavailableCoalescePolicy,
         secret_policy: UnavailableSecretPolicy,
         inside_secret: bool,
@@ -4994,7 +6317,8 @@ pub(crate) fn find_unavailable_evaluation(
                 DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::RedactedSecret { .. }
-                | DeferredValue::Unknown(_),
+                | DeferredValue::Unknown(_)
+                | DeferredValue::Placeholder(_),
             ) => None,
         }
     }
@@ -5163,23 +6487,12 @@ impl Value {
                     // Reuse `AccessPath`'s native `Hash` impl (matches
                     // the `ResourceRef` arm above) — no per-call String
                     // allocation.
-                    UnknownReason::UpstreamExport { path } => path.hash(hasher),
-                    UnknownReason::UpstreamAllExports { binding } => binding.hash(hasher),
-                    UnknownReason::FnParam { name }
-                    | UnknownReason::FnLocal { name }
-                    | UnknownReason::ModuleArgument { name, .. } => {
-                        name.hash(hasher);
-                    }
-                    UnknownReason::PendingReRead(pending) => pending.hash(hasher),
-                    // `For{Key,Index,Value}` and `EmptyInterpolation`
-                    // carry no payload; the discriminant alone already
-                    // distinguishes them.
-                    UnknownReason::ForKey
-                    | UnknownReason::ForIndex
-                    | UnknownReason::ForValue
-                    | UnknownReason::EmptyInterpolation => {}
+                    ApplyTimeUnknown::UpstreamExport { path } => path.hash(hasher),
+                    ApplyTimeUnknown::UpstreamAllExports { binding } => binding.hash(hasher),
+                    ApplyTimeUnknown::PendingReRead(pending) => pending.hash(hasher),
                 }
             }
+            Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         }
     }
 }
@@ -6948,8 +8261,11 @@ impl DefaultTagKeys {
 /// let _: Resource = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
-pub struct Resource<S = ModuleSource> {
+#[serde(bound(
+    serialize = "S: Serialize, P: PlaceholderKind + Serialize",
+    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>"
+))]
+pub struct Resource<S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
     ///
@@ -6957,7 +8273,7 @@ pub struct Resource<S = ModuleSource> {
     /// the user wrote attributes in the `.crn` file. Anything that
     /// re-renders attributes — diagnostic messages, formatter output,
     /// plan display, snapshot tests — depends on this stability (#2222).
-    pub attributes: IndexMap<String, Value>,
+    pub attributes: IndexMap<String, Value<P>>,
     /// `directives` meta-argument block: Carina-side instructions for
     /// how to handle this resource (force-delete, create-before-destroy,
     /// prevent-destroy).
@@ -7034,8 +8350,8 @@ impl From<Resource> for ProviderResource {
     }
 }
 
-impl From<Resource> for SavedResource {
-    fn from(resource: Resource) -> Self {
+impl<P: PlaceholderKind> From<Resource<ModuleSource, P>> for Resource<SavedModuleSource, P> {
+    fn from(resource: Resource<ModuleSource, P>) -> Self {
         let Resource {
             id,
             attributes,
@@ -7065,7 +8381,79 @@ impl From<Resource> for SavedResource {
     }
 }
 
-impl Resource {
+impl<S> Resource<S, ParserPlaceholder> {
+    pub fn into_expanded(self) -> Result<Resource<S>, LeftoverPlaceholder> {
+        let Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        } = self;
+        let attributes = into_expanded_value_map(attributes, Some(&id))?;
+        Ok(Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        })
+    }
+}
+
+impl<S> Resource<S, ParserPlaceholder> {
+    pub(crate) fn into_loop_template(self) -> Result<Resource<S, LoopSlot>, LeftoverPlaceholder> {
+        let Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        } = self;
+        let resource_id = id.to_string();
+        Ok(Resource {
+            id,
+            attributes: attributes
+                .into_iter()
+                .map(|(name, value)| {
+                    value
+                        .into_loop_template()
+                        .map(|value| (name.clone(), value))
+                        .map_err(|error| error.in_resource_attribute(resource_id.clone(), name))
+                })
+                .collect::<Result<_, _>>()?,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        })
+    }
+}
+
+impl<P: PlaceholderKind> Resource<ModuleSource, P> {
     pub fn from_id(id: ResourceId) -> Self {
         Self {
             id,
@@ -7127,7 +8515,7 @@ impl Resource {
     }
 }
 
-impl<S: Clone> Resource<S> {
+impl<S: Clone, P: PlaceholderKind> Resource<S, P> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut resource = self.clone();
         resource.id = self.id.instantiate_pending();
@@ -7235,15 +8623,6 @@ impl<S> Resource<S> {
     /// directly via `self.attributes` (`IndexMap`), so flipping this
     /// helper would just force every downstream caller to widen its
     /// signature for no order benefit.
-    pub fn resolved_attributes(&self) -> HashMap<String, Value> {
-        attrs_to_hashmap(&self.attributes)
-    }
-
-    /// Get an attribute value by key, returning `Option<&Value>`.
-    pub fn get_attr(&self, key: &str) -> Option<&Value> {
-        self.attributes.get(key)
-    }
-
     /// Get an enum attribute using its provider API spelling.
     ///
     /// `Ok(None)` is returned only when the resource attribute is absent.
@@ -7296,24 +8675,35 @@ impl<S> Resource<S> {
         };
         enum_attr_for_value(schema, field_type, value, &path)
     }
+}
 
-    /// Get a mutable attribute value by key, returning `Option<&mut Value>`.
-    pub fn get_attr_mut(&mut self, key: &str) -> Option<&mut Value> {
+impl<S, P: PlaceholderKind> Resource<S, P> {
+    /// Returns the attributes projected to a `HashMap`.
+    pub fn resolved_attributes(&self) -> HashMap<String, Value<P>> {
+        self.attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
+    pub fn get_attr(&self, key: &str) -> Option<&Value<P>> {
+        self.attributes.get(key)
+    }
+
+    pub fn get_attr_mut(&mut self, key: &str) -> Option<&mut Value<P>> {
         self.attributes.get_mut(key)
     }
 
-    /// Set an attribute value.
-    pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
+    pub fn set_attr(&mut self, key: impl Into<String>, value: Value<P>) {
         self.attributes.insert(key.into(), value);
     }
 
-    pub fn with_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
+    pub fn with_attribute(mut self, key: impl Into<String>, value: Value<P>) -> Self {
         self.attributes.insert(key.into(), value);
         self
     }
 
-    /// Set attributes from a `HashMap<String, Value>`.
-    pub fn with_value_attributes(mut self, attrs: HashMap<String, Value>) -> Self {
+    pub fn with_value_attributes(mut self, attrs: HashMap<String, Value<P>>) -> Self {
         self.attributes = attrs.into_iter().collect();
         self
     }
@@ -8118,8 +9508,8 @@ mod enum_attr_tests {
     }
 }
 
-/// Check that a resource's attribute tree is free of any
-/// [`Value::Deferred`] placeholder before provider dispatch.
+/// Check that a resource's attribute tree is free of provider-ineligible
+/// [`Value::Deferred`] payloads before provider dispatch.
 pub(crate) fn assert_resource_fully_resolved<S>(
     resource: &Resource<S>,
 ) -> Result<(), crate::value::SerializationError> {
@@ -8198,6 +9588,7 @@ pub(crate) fn assert_value_fully_resolved(
                 context,
             })
         }
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -8673,7 +10064,7 @@ impl State {
         };
         for attr in marker.missing_attributes() {
             self.attributes.entry(attr.clone()).or_insert_with(|| {
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(
+                Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
                     marker.pending().clone(),
                 )))
             });

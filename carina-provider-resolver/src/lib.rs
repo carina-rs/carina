@@ -1,5 +1,6 @@
 //! Provider resolution: download, cache, and verify provider WASM components.
 
+mod egress;
 mod github;
 mod github_location;
 mod install_lock;
@@ -12,6 +13,13 @@ mod user_trust;
 mod verified_artifact;
 mod version_resolver;
 
+pub use carina_provider_protocol::{HostPattern, HostPatternError};
+pub use egress::{
+    AcceptedEgressSourceError, AcceptedEgressSources, CanonicalSource, CarinaRsSigned,
+    CarryOverRefused, ConsentedEgress, EgressConsent, EgressConsentError, EgressLockRecord,
+    EgressSectionError, ExplicitConsent, LockedEgress, Sha256, VerifiedEgressDeclaration,
+    is_wasi_http_import,
+};
 #[cfg(any(test, feature = "test-utils"))]
 pub use github::FixtureGithubHttp;
 pub use github_location::{ArtifactId, AssetId, CommitSha, ReleaseTag};

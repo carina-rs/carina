@@ -110,7 +110,7 @@ impl HistoricalDisplayAttributes {
                 | Effect::Remove { .. }
                 | Effect::Move { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => {}
             }
         }
@@ -157,7 +157,7 @@ impl HistoricalDisplayAttributes {
                 | Effect::Move { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => {}
             }
         }
@@ -734,7 +734,7 @@ pub fn build_detail_rows_by_instance<S>(
         Effect::Remove { .. }
         | Effect::Move { .. }
         | Effect::Wait { .. }
-        | Effect::DeferredCreate { .. }
+        | Effect::DeferredCreate(_)
         | Effect::DeferredReplace(_) => Vec::new(),
     })
 }

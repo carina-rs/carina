@@ -26,6 +26,10 @@ const NON_INSTANTIABLE_COMPONENT_WAT: &str = r#"
 )
 "#;
 
+fn non_instantiable_component() -> Vec<u8> {
+    wat::parse_str(NON_INSTANTIABLE_COMPONENT_WAT).expect("fixture WAT must compile")
+}
+
 struct CacheArtifactSnapshot {
     contents: Vec<u8>,
     modified: std::time::SystemTime,
@@ -280,8 +284,9 @@ async fn precompile_cache_key_depends_only_on_content() {
         "identical provider bytes must share one precompile cache entry"
     );
 
+    let distinct_component = non_instantiable_component();
     let distinct_error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        test_load(NON_INSTANTIABLE_COMPONENT_WAT.as_bytes(), "mock"),
+        test_load(&distinct_component, "mock"),
         cache_dir.path(),
     )
     .await
@@ -381,13 +386,13 @@ async fn test_from_bytes_recovers_from_stale_cache() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn warm_cache_instantiation_failure_preserves_precompiled_artifact() {
-    let wasm_bytes = NON_INSTANTIABLE_COMPONENT_WAT.as_bytes();
+    let wasm_bytes = non_instantiable_component();
     let cache_dir = tempfile::tempdir().expect("Failed to create cache temp dir");
 
     // A cold load still precompiles the component before its deterministic
     // bring-up failure, leaving a valid cache artifact for the next attempt.
     let cold_error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        test_load(wasm_bytes, "mock"),
+        test_load(&wasm_bytes, "mock"),
         cache_dir.path(),
     )
     .await
@@ -404,7 +409,7 @@ async fn warm_cache_instantiation_failure_preserves_precompiled_artifact() {
     let artifact_before = snapshot_cache_artifact(&cwasm_path);
 
     let warm_error = match WasmProviderFactory::from_bytes_with_cache_dir(
-        test_load(wasm_bytes, "mock"),
+        test_load(&wasm_bytes, "mock"),
         cache_dir.path(),
     )
     .await
@@ -552,7 +557,7 @@ async fn from_precompiled_classifies_failure_by_step() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_precompiled_factory_creates_provider() {
+async fn precompiled_factory_is_schema_only() {
     let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
@@ -563,9 +568,10 @@ async fn test_precompiled_factory_creates_provider() {
         .await
         .expect("from_precompiled should succeed");
 
-    // Verify the factory can actually create a working provider
+    // `from_precompiled` is test-only and intentionally cannot mint the
+    // consent witness required by credentialed runtime instances.
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &carina_core::parser::InferredFile::default(),
+        &carina_core::parser::ExpandedInferredFile::default(),
         &std::collections::HashMap::new(),
         &carina_core::parser::ProviderContext::default(),
     )
@@ -573,11 +579,15 @@ async fn test_precompiled_factory_creates_provider() {
     let resolved = resolved.provider_or_implicit(factory.name());
     let config = carina_core::executor::prepare_provider_ready_config(&factory, resolved.as_ref())
         .expect("test provider config should pass preparation");
-    let provider = factory
-        .create_initialized_provider(None, &config)
-        .await
-        .expect("provider should init");
-    assert_eq!(provider.provider().name(), "mock");
+    let error = match factory.create_initialized_provider(None, &config).await {
+        Ok(_) => panic!("a schema-only precompiled factory must reject runtime creation"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("provider runtime instance is missing consented egress")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

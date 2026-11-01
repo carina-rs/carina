@@ -421,6 +421,7 @@ impl Unsealer {
                 | DeferredValue::Access(_)
                 | DeferredValue::Unknown(_),
             ) => true,
+            Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         }
     }
 
@@ -558,6 +559,7 @@ fn preserve_equal_json_subtrees(
             _,
         )
         | (Value::Concrete(ConcreteValue::Map(_) | ConcreteValue::List(_)), _, _, _) => {}
+        (Value::Deferred(DeferredValue::Placeholder(never)), _, _, _) => match *never {},
     }
 }
 

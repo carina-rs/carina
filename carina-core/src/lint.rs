@@ -407,7 +407,12 @@ pub fn collect_tag_keys_for_file(source: &str, file: &Path) -> Vec<TagKeyEntry> 
 /// module walk's cycle-guard convention.
 pub fn collect_all_tag_keys<E, D, S: AsRef<str>>(
     root_inputs: &[(PathBuf, S)],
-    parsed: &crate::parser::File<E, D>,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     base_dir: &Path,
 ) -> Vec<TagKeyEntry> {
     fn canonical_guard_path(path: &Path) -> PathBuf {

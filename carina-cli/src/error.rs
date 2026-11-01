@@ -719,6 +719,10 @@ impl std::error::Error for DestroyDependencyAnalysisError {
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// Provider installation, egress consent, or initialization failed.
+    #[error(transparent)]
+    Init(Box<crate::commands::init::InitError>),
+
     /// User-owned Carina directories could not be resolved safely.
     #[error(transparent)]
     UserDirs(#[from] carina_core::UserDirsError),
@@ -951,6 +955,14 @@ pub enum AppError {
     #[error(transparent)]
     BindingUseReport(Box<carina_core::validation::BindingUseReport>),
 
+    /// A parser-only placeholder survived module and function expansion.
+    #[error("{}", .0.located())]
+    LeftoverPlaceholder(carina_core::resource::LeftoverPlaceholder),
+
+    /// All parser-only placeholders rejected by one file expansion boundary.
+    #[error("{}", .0.located())]
+    LeftoverPlaceholders(carina_core::resource::LeftoverPlaceholders),
+
     /// One core-owned module-call finding at its parser-authored location.
     #[error(transparent)]
     ModuleCall(Box<carina_core::validation::ModuleCallFinding>),
@@ -1086,6 +1098,12 @@ pub enum AppError {
     StateLockLost { error: BackendError },
 }
 
+impl From<crate::commands::init::InitError> for AppError {
+    fn from(error: crate::commands::init::InitError) -> Self {
+        Self::Init(Box::new(error))
+    }
+}
+
 impl AppError {
     pub(crate) fn from_locked_state_reload(
         source: LockedStateReloadError,
@@ -1188,6 +1206,18 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
 impl From<carina_core::resource::ResolvedResourceError> for AppError {
     fn from(error: carina_core::resource::ResolvedResourceError) -> Self {
         Self::ResolvedResource(Box::new(error))
+    }
+}
+
+impl From<carina_core::resource::LeftoverPlaceholder> for AppError {
+    fn from(error: carina_core::resource::LeftoverPlaceholder) -> Self {
+        Self::LeftoverPlaceholder(error)
+    }
+}
+
+impl From<carina_core::resource::LeftoverPlaceholders> for AppError {
+    fn from(error: carina_core::resource::LeftoverPlaceholders) -> Self {
+        Self::LeftoverPlaceholders(error)
     }
 }
 
