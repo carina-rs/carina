@@ -5,6 +5,7 @@
 //! substitute_arguments};` re-export there to bring those `pub(super)`
 //! helpers into the `super::*` glob below.
 
+use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, ModuleSource, ParserPlaceholder,
     RawEnumIdentifier, Resource, ResourceId, ResourceIdentity, Value,
 };
-use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+use crate::schema::TypeIdentity;
 
 fn known(type_expr: TypeExpr) -> TypeExpr {
     type_expr
@@ -113,9 +114,9 @@ fn loop_module_identity_registry() -> crate::schema::SchemaRegistry {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("test.Leaf")
+        PatternResourceSchema::new("test.Leaf")
             .attribute(
-                AttributeSchema::optional("identity_input", AttributeType::string())
+                PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -329,9 +330,9 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("test.resource")
+        PatternResourceSchema::new("test.resource")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -1929,13 +1930,10 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "mock",
-        (crate::schema::ResourceSchema::new("test.resource").attribute(
-            crate::schema::AttributeSchema::optional(
-                "replacement_key",
-                crate::schema::AttributeType::string(),
-            )
-            .create_only()
-            .build(),
+        (PatternResourceSchema::new("test.resource").attribute(
+            PatternAttributeSchema::optional("replacement_key", PatternAttributeType::string())
+                .create_only()
+                .build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -5863,15 +5861,20 @@ let instance = child { count = source.count + 1 }
     let mut schemas = crate::schema::SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Source")
-            .attribute(AttributeSchema::provider_populated("count", AttributeType::int()).build())
+        PatternResourceSchema::new("test.Source")
+            .attribute(
+                PatternAttributeSchema::provider_populated("count", PatternAttributeType::int())
+                    .build(),
+            )
             .validate()
             .expect("source schema"),
     );
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Target")
-            .attribute(AttributeSchema::required("count", AttributeType::int()).build())
+        PatternResourceSchema::new("test.Target")
+            .attribute(
+                PatternAttributeSchema::required("count", PatternAttributeType::int()).build(),
+            )
             .validate()
             .expect("target schema"),
     );

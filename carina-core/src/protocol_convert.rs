@@ -38,10 +38,13 @@ use crate::resource::{
     ResourceIdentity, ResourceIdentityError, ResourceIdentityState, State, Value,
 };
 use crate::schema::{
-    AttributeSchema, AttributeSchemaParts, AttributeType, ConfigSchemaValidationError, FieldGroup,
-    FieldGroupKind, InputMode, RawShape, ResourceSchema, ResourceSchemaParts,
-    ResourceSchemaValidationError, ResourceValidation, SchemaKind, SchemaValidationIssueLocation,
-    StructField, StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
+    AttributeSchema as DraftAttributeSchema, AttributeSchemaParts,
+    AttributeType as DraftAttributeType, CompiledAttributeSchema as AttributeSchema,
+    CompiledAttributeType as AttributeType, CompiledStructField as StructField,
+    ConfigSchemaValidationError, FieldGroup, FieldGroupKind, InputMode, RawShape,
+    ResourceSchema as DraftResourceSchema, ResourceSchemaParts, ResourceSchemaValidationError,
+    ResourceValidation, SchemaKind, SchemaValidationIssueLocation, StructField as DraftStructField,
+    StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
     ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 
@@ -372,6 +375,27 @@ impl SchemaDecodeError {
                 source: _source,
             } => {
                 attribute_path.insert(0, name.to_string());
+            }
+            Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
+        }
+        self
+    }
+
+    fn prepend_definition(mut self, name: &str) -> Self {
+        match &mut self {
+            Self::InvalidSchema {
+                detail: _detail,
+                resource_type: _resource_type,
+                attribute_path,
+                schema_issue_location,
+                source: _source,
+            } => {
+                let path = std::iter::once(name.to_string())
+                    .chain(attribute_path.drain(..))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                *schema_issue_location =
+                    Some(Box::new(SchemaValidationIssueLocation::Definition(path)));
             }
             Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
         }
@@ -868,7 +892,7 @@ pub fn protocol_to_resource_schema(
         defs,
     } = schema;
 
-    let mut core = ResourceSchema::new(resource_type.clone());
+    let mut core = DraftResourceSchema::new(resource_type.clone());
     if let Some(description) = description {
         core = core.with_description(description.clone());
     }
@@ -903,7 +927,7 @@ pub fn protocol_to_resource_schema(
     for (name, definition) in defs {
         let definition = protocol_to_attribute_type(definition).map_err(|error| {
             error
-                .prepend_attribute(name)
+                .prepend_definition(name)
                 .with_resource_type(resource_type)
         })?;
         core = core.with_def(name.clone(), definition);
@@ -949,7 +973,7 @@ pub fn protocol_to_config_schema(
 
 pub fn protocol_to_attribute_schema(
     attribute: &protocol::AttributeSchema,
-) -> Result<AttributeSchema, SchemaDecodeError> {
+) -> Result<DraftAttributeSchema, SchemaDecodeError> {
     let protocol::AttributeSchema {
         name,
         attr_type,
@@ -992,7 +1016,7 @@ pub fn protocol_to_attribute_schema(
                 )
                 .prepend_attribute(name));
             }
-            let mut builder = AttributeSchema::optional(name.clone(), attr_type);
+            let mut builder = DraftAttributeSchema::optional(name.clone(), attr_type);
             if let Some(default) = default {
                 builder = builder.with_default(default);
             }
@@ -1045,7 +1069,7 @@ pub fn protocol_to_attribute_schema(
                 )
                 .prepend_attribute(name));
             }
-            let mut builder = AttributeSchema::required(name.clone(), attr_type);
+            let mut builder = DraftAttributeSchema::required(name.clone(), attr_type);
             if let Some(description) = description {
                 builder = builder.with_description(description.clone());
             }
@@ -1086,7 +1110,7 @@ pub fn protocol_to_attribute_schema(
                     .prepend_attribute(name));
                 }
             }
-            let mut builder = AttributeSchema::provider_populated(name.clone(), attr_type);
+            let mut builder = DraftAttributeSchema::provider_populated(name.clone(), attr_type);
             if let Some(description) = description {
                 builder = builder.with_description(description.clone());
             }
@@ -1104,7 +1128,7 @@ pub fn protocol_to_attribute_schema(
 /// Decode one protocol attribute type, rebuilding core-owned validators by identity.
 pub fn protocol_to_attribute_type(
     attribute_type: &protocol::AttributeType,
-) -> Result<AttributeType, SchemaDecodeError> {
+) -> Result<DraftAttributeType, SchemaDecodeError> {
     match attribute_type {
         protocol::AttributeType::String {
             pattern,
@@ -1129,8 +1153,8 @@ pub fn protocol_to_attribute_type(
             decode_optional_identity(identity),
             *range,
         )),
-        protocol::AttributeType::Bool => Ok(AttributeType::bool()),
-        protocol::AttributeType::Duration => Ok(AttributeType::duration()),
+        protocol::AttributeType::Bool => Ok(DraftAttributeType::bool()),
+        protocol::AttributeType::Duration => Ok(DraftAttributeType::duration()),
         protocol::AttributeType::StringEnum {
             values,
             name,
@@ -1142,7 +1166,7 @@ pub fn protocol_to_attribute_type(
                 .filter(|namespace| !namespace.is_empty())
                 .map(|namespace| crate::schema::enum_identity(name, Some(namespace)))
                 .unwrap_or_else(|| TypeIdentity::bare(name));
-            Ok(AttributeType::enum_(
+            Ok(DraftAttributeType::enum_(
                 identity,
                 Some(values.clone()),
                 dsl_aliases.clone(),
@@ -1157,13 +1181,13 @@ pub fn protocol_to_attribute_type(
             validate,
         } => {
             reject_opaque_validator("List", validate)?;
-            Ok(AttributeType::refined_list(
+            Ok(DraftAttributeType::refined_list(
                 protocol_to_attribute_type(element_type)?,
                 *ordered,
                 *length,
             ))
         }
-        protocol::AttributeType::Map { inner, key } => Ok(AttributeType::map_with_key(
+        protocol::AttributeType::Map { inner, key } => Ok(DraftAttributeType::map_with_key(
             protocol_to_attribute_type(key)?,
             protocol_to_attribute_type(inner)?,
         )),
@@ -1171,7 +1195,7 @@ pub fn protocol_to_attribute_type(
             name,
             fields,
             field_groups,
-        } => Ok(AttributeType::struct_with_field_groups(
+        } => Ok(DraftAttributeType::struct_with_field_groups(
             name.clone(),
             fields
                 .iter()
@@ -1186,7 +1210,7 @@ pub fn protocol_to_attribute_type(
                 })
                 .collect::<Result<_, _>>()?,
         )),
-        protocol::AttributeType::Union { members } => Ok(AttributeType::union(
+        protocol::AttributeType::Union { members } => Ok(DraftAttributeType::union(
             members
                 .iter()
                 .map(protocol_to_attribute_type)
@@ -1213,7 +1237,7 @@ pub fn protocol_to_attribute_type(
                 return Err(SchemaDecodeError::empty_custom_enum_namespace(name));
             }
             let identity = crate::schema::enum_identity(name, Some(namespace.as_str()));
-            Ok(AttributeType::enum_with_base(
+            Ok(DraftAttributeType::enum_with_base(
                 identity,
                 protocol_to_attribute_type(base)?,
                 None,
@@ -1222,7 +1246,7 @@ pub fn protocol_to_attribute_type(
                 dsl_transform.clone(),
             ))
         }
-        protocol::AttributeType::Ref { name } => Ok(AttributeType::ref_(name.clone())),
+        protocol::AttributeType::Ref { name } => Ok(DraftAttributeType::ref_(name.clone())),
     }
 }
 
@@ -1249,54 +1273,54 @@ fn decoded_refined_string(
     pattern: Option<String>,
     length: Option<(Option<u64>, Option<u64>)>,
     to_dsl: Option<protocol::DslTransform>,
-) -> AttributeType {
+) -> DraftAttributeType {
     match identity {
         Some(identity) => match crate::schema::builtin_validator(
             crate::schema::RefinedScalarKind::String,
             &identity,
         ) {
-            Some(validate) => AttributeType::refined_string_with_validator(
+            Some(validate) => DraftAttributeType::refined_string_with_validator(
                 identity, pattern, length, validate, to_dsl,
             ),
-            None => AttributeType::refined_string(Some(identity), pattern, length, to_dsl),
+            None => DraftAttributeType::refined_string(Some(identity), pattern, length, to_dsl),
         },
-        None => AttributeType::refined_string(None, pattern, length, to_dsl),
+        None => DraftAttributeType::refined_string(None, pattern, length, to_dsl),
     }
 }
 
 fn decoded_refined_int(
     identity: Option<TypeIdentity>,
     range: Option<(Option<i64>, Option<i64>)>,
-) -> AttributeType {
+) -> DraftAttributeType {
     match identity {
         Some(identity) => {
             match crate::schema::builtin_validator(crate::schema::RefinedScalarKind::Int, &identity)
             {
                 Some(validate) => {
-                    AttributeType::refined_int_with_validator(identity, range, validate)
+                    DraftAttributeType::refined_int_with_validator(identity, range, validate)
                 }
-                None => AttributeType::refined_int(Some(identity), range),
+                None => DraftAttributeType::refined_int(Some(identity), range),
             }
         }
-        None => AttributeType::refined_int(None, range),
+        None => DraftAttributeType::refined_int(None, range),
     }
 }
 
 fn decoded_refined_float(
     identity: Option<TypeIdentity>,
     range: Option<(Option<f64>, Option<f64>)>,
-) -> AttributeType {
+) -> DraftAttributeType {
     match identity {
         Some(identity) => match crate::schema::builtin_validator(
             crate::schema::RefinedScalarKind::Float,
             &identity,
         ) {
             Some(validate) => {
-                AttributeType::refined_float_with_validator(identity, range, validate)
+                DraftAttributeType::refined_float_with_validator(identity, range, validate)
             }
-            None => AttributeType::refined_float(Some(identity), range),
+            None => DraftAttributeType::refined_float(Some(identity), range),
         },
-        None => AttributeType::refined_float(None, range),
+        None => DraftAttributeType::refined_float(None, range),
     }
 }
 
@@ -1306,7 +1330,7 @@ fn protocol_legacy_custom_to_core(
     pattern: Option<String>,
     length: Option<(Option<u64>, Option<u64>)>,
     to_dsl: Option<protocol::DslTransform>,
-) -> Result<AttributeType, SchemaDecodeError> {
+) -> Result<DraftAttributeType, SchemaDecodeError> {
     if let protocol::AttributeType::Custom {
         name: _inner_name,
         base: inner_base,
@@ -1388,7 +1412,7 @@ fn protocol_legacy_custom_to_core(
             }
             reject_legacy_custom_metadata(enclosing_name, "pattern", pattern.as_ref(), "List")?;
             reject_legacy_custom_metadata(enclosing_name, "to_dsl", to_dsl.as_ref(), "List")?;
-            Ok(AttributeType::refined_list(
+            Ok(DraftAttributeType::refined_list(
                 protocol_to_attribute_type(element_type)?,
                 *ordered,
                 prefer_outer_legacy_custom_metadata(length, *base_length),
@@ -1504,7 +1528,7 @@ fn legacy_custom_int_bound(
 
 pub fn protocol_to_struct_field(
     field: &protocol::StructField,
-) -> Result<StructField, SchemaDecodeError> {
+) -> Result<DraftStructField, SchemaDecodeError> {
     let protocol::StructField {
         name,
         field_type,
@@ -1526,7 +1550,7 @@ pub fn protocol_to_struct_field(
 
     match input_mode {
         InputMode::Optional => {
-            let mut builder = StructField::optional(name.clone(), field_type);
+            let mut builder = DraftStructField::optional(name.clone(), field_type);
             if let Some(description) = description {
                 builder = builder.with_description(description.clone());
             }
@@ -1545,7 +1569,7 @@ pub fn protocol_to_struct_field(
             Ok(builder.build())
         }
         InputMode::Required => {
-            let mut builder = StructField::required(name.clone(), field_type);
+            let mut builder = DraftStructField::required(name.clone(), field_type);
             if let Some(description) = description {
                 builder = builder.with_description(description.clone());
             }
@@ -1564,7 +1588,7 @@ pub fn protocol_to_struct_field(
             Ok(builder.build())
         }
         InputMode::ProviderPopulated => {
-            let mut builder = StructField::provider_populated(name.clone(), field_type);
+            let mut builder = DraftStructField::provider_populated(name.clone(), field_type);
             if let Some(description) = description {
                 builder = builder.with_description(description.clone());
             }
@@ -2465,6 +2489,270 @@ pub fn protocol_update_patch_to_core(
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::CompiledResourceSchema as ResourceSchema;
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
+    #[test]
+    fn decode_rejects_uncompilable_string_patterns() {
+        use carina_provider_protocol::types as protocol;
+        let string = protocol::AttributeType::String {
+            identity: None,
+            pattern: Some("(?=x)".to_string()),
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+        let legacy = protocol::AttributeType::Custom {
+            name: "DomainName".to_string(),
+            base: Box::new(protocol::AttributeType::String {
+                identity: None,
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+            }),
+            pattern: Some("(?=x)".to_string()),
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+        for wire in [string, legacy] {
+            let error = protocol_to_config_schema(BTreeMap::from([("value".to_string(), wire)]))
+                .expect_err("unsupported patterns must fail at schema admission");
+            let source = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<ConfigSchemaValidationError>()
+                .expect("the decoder must preserve the whole schema error");
+            let (location, source) = source.pattern_errors().next().unwrap();
+            assert_eq!(
+                location,
+                &SchemaValidationIssueLocation::Attribute("value".to_string())
+            );
+            assert_eq!(source.pattern, "(?=x)");
+        }
+    }
+
+    fn bad_pattern(pattern: &str) -> protocol::AttributeType {
+        protocol::AttributeType::String {
+            identity: None,
+            pattern: Some(pattern.into()),
+            length: None,
+            validate: None,
+            to_dsl: None,
+        }
+    }
+
+    #[test]
+    fn protocol_admission_collects_patterns_and_refs_with_typed_locations() {
+        let schema = PatternResourceSchema::new("test.Pattern")
+            .attribute(
+                PatternAttributeSchema::optional("foo", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        wire.defs.insert("Bad".into(), bad_pattern("["));
+        wire.attributes.get_mut("foo").unwrap().attr_type = protocol::AttributeType::List {
+            element_type: Box::new(bad_pattern("(?=x)")),
+            ordered: true,
+            length: None,
+            validate: None,
+        };
+        let mut missing = wire.attributes["foo"].clone();
+        missing.name = "missing".into();
+        missing.attr_type = protocol::AttributeType::Ref {
+            name: "Missing".into(),
+        };
+        wire.attributes.insert(missing.name.clone(), missing);
+
+        let error = protocol_to_resource_schema(&wire).unwrap_err();
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<ResourceSchemaValidationError>()
+            .expect("protocol admission must expose the whole core schema error");
+        assert_eq!(
+            source
+                .located_issues()
+                .map(|(location, _)| location.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SchemaValidationIssueLocation::Definition("Bad".into()),
+                SchemaValidationIssueLocation::Attribute("foo[]".into()),
+                SchemaValidationIssueLocation::Attribute("missing".into()),
+            ]
+        );
+        assert_eq!(
+            source
+                .pattern_errors()
+                .map(|(location, error)| (location.clone(), error.pattern.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SchemaValidationIssueLocation::Definition("Bad".into()), "["),
+                (
+                    SchemaValidationIssueLocation::Attribute("foo[]".into()),
+                    "(?=x)"
+                ),
+            ]
+        );
+        assert!(source.issues().any(
+            |(path, message)| path == "missing" && message.contains("`Missing` is not defined")
+        ));
+        assert!(
+            matches!(error, SchemaDecodeError::InvalidSchema { schema_issue_location: Some(ref location), .. }
+            if **location == SchemaValidationIssueLocation::Definition("Bad".into()))
+        );
+        assert!(!error.to_string().contains("attribute 'Bad'"), "{error}");
+    }
+
+    #[test]
+    fn protocol_definition_decode_errors_have_definition_locations() {
+        let schema = DraftResourceSchema::new("test.Definition")
+            .validate()
+            .unwrap();
+        let mut wire = resource_schema_to_protocol(&schema).unwrap();
+        let mut bad = bad_pattern("valid");
+        let protocol::AttributeType::String { validate, .. } = &mut bad else {
+            unreachable!()
+        };
+        *validate = Some(serde_json::json!(true));
+        wire.defs.insert("Bad".to_string(), bad);
+        let error = protocol_to_resource_schema(&wire).unwrap_err();
+        assert!(
+            matches!(error, SchemaDecodeError::InvalidSchema {
+            schema_issue_location: Some(ref location), ref attribute_path, ..
+        } if **location == SchemaValidationIssueLocation::Definition("Bad".to_string()) && attribute_path.is_empty()),
+            "{error}"
+        );
+        assert!(error.to_string().contains("defs.Bad"), "{error}");
+    }
+
+    #[test]
+    fn protocol_config_admission_collects_patterns_and_refs() {
+        let error = protocol_to_config_schema(BTreeMap::from([
+            (
+                "first".into(),
+                protocol::AttributeType::List {
+                    element_type: Box::new(bad_pattern("(?=x)")),
+                    ordered: true,
+                    length: None,
+                    validate: None,
+                },
+            ),
+            ("second".into(), bad_pattern("[")),
+            (
+                "missing".into(),
+                protocol::AttributeType::Ref {
+                    name: "Missing".into(),
+                },
+            ),
+        ]))
+        .unwrap_err();
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<ConfigSchemaValidationError>()
+            .expect("config admission must expose the whole core schema error");
+        assert_eq!(
+            source
+                .located_issues()
+                .map(|(location, _)| location.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SchemaValidationIssueLocation::Attribute("first[]".into()),
+                SchemaValidationIssueLocation::Attribute("missing".into()),
+                SchemaValidationIssueLocation::Attribute("second".into()),
+            ]
+        );
+        assert_eq!(source.pattern_errors().count(), 2);
+    }
+
+    #[test]
+    fn legacy_custom_compiles_only_the_surviving_pattern() {
+        let invalid_string = protocol::AttributeType::String {
+            identity: None,
+            pattern: Some("(?=x)".into()),
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+        let invalid_custom = protocol::AttributeType::Custom {
+            name: "Inner".into(),
+            base: Box::new(invalid_string.clone()),
+            pattern: Some("(?=y)".into()),
+            length: None,
+            validate: None,
+            to_dsl: None,
+        };
+        for base in [invalid_string, invalid_custom] {
+            let wire = protocol::AttributeType::Custom {
+                name: "Outer".into(),
+                base: Box::new(base),
+                pattern: Some("^valid$".into()),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            };
+            let decoded =
+                protocol_to_attribute_type(&wire).expect("shadowed patterns must not be compiled");
+            assert!(matches!(
+                decoded.raw_shape(),
+                RawShape::String {
+                    pattern: Some("^valid$"),
+                    ..
+                }
+            ));
+            ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), decoded)]))
+                .expect("only the surviving pattern may reach admission");
+        }
+    }
+
+    #[test]
+    fn legacy_custom_rejects_incompatible_metadata_before_compiling() {
+        for (base_kind, base) in [
+            (
+                "Int",
+                protocol::AttributeType::Int {
+                    identity: None,
+                    range: None,
+                },
+            ),
+            (
+                "Float",
+                protocol::AttributeType::Float {
+                    identity: None,
+                    range: None,
+                },
+            ),
+            (
+                "List",
+                protocol::AttributeType::List {
+                    element_type: Box::new(protocol::AttributeType::Bool),
+                    ordered: true,
+                    length: None,
+                    validate: None,
+                },
+            ),
+        ] {
+            let wire = protocol::AttributeType::Custom {
+                name: String::new(),
+                base: Box::new(base),
+                pattern: Some("(?=x)".into()),
+                length: None,
+                validate: None,
+                to_dsl: None,
+            };
+            let error = protocol_to_attribute_type(&wire).unwrap_err();
+            let source = std::error::Error::source(&error).unwrap();
+            assert!(
+                matches!(source.downcast_ref::<ProtocolConvertError>(), Some(
+                ProtocolConvertError::LegacyCustomUnsupportedMetadata { field: "pattern", base_kind: actual, .. }
+            ) if *actual == base_kind),
+                "{error}: {source}"
+            );
+        }
+    }
+
     use super::*;
     use crate::provider::{ProviderDirectiveSchema, ProviderDirectives, UpdatePatch};
     use crate::resource::{ModuleSource, PreventDestroy, ProviderResource, RedactedSecretHash};
@@ -2488,10 +2776,10 @@ mod tests {
 
     fn schema_with_identified_type(
         identity: &TypeIdentity,
-        attribute_type: AttributeType,
+        attribute_type: DraftAttributeType,
     ) -> ValidatedResourceSchema {
-        ResourceSchema::new("aws.lambda.Function")
-            .attribute(AttributeSchema::optional("function", attribute_type).build())
+        PatternResourceSchema::new("aws.lambda.Function")
+            .attribute(PatternAttributeSchema::optional("function", attribute_type).build())
             .validate()
             .unwrap_or_else(|error| panic!("fixture for {identity} must validate: {error}"))
     }
@@ -2521,18 +2809,18 @@ mod tests {
     fn provider_schema_envelope_round_trips_the_aggregate_witness() {
         let first = reference_identity("Alias");
         let second = reference_identity("Name");
-        let schema = ResourceSchema::new("aws.lambda.Function")
+        let schema = PatternResourceSchema::new("aws.lambda.Function")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "alias",
-                    AttributeType::refined_string(Some(first.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(first.clone()), None, None, None),
                 )
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "name",
-                    AttributeType::refined_string(Some(second.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(second.clone()), None, None, None),
                 )
                 .build(),
             )
@@ -2578,7 +2866,7 @@ mod tests {
         let identity = TypeIdentity::new(None::<String>, ["shared"], "Name");
         let schema = schema_with_identified_type(
             &identity,
-            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
         );
         let witness = ValidatedProviderSchemaWitness::new(
             vec![schema],
@@ -2603,7 +2891,7 @@ mod tests {
         let identity = reference_identity("Name");
         let schema = schema_with_identified_type(
             &identity,
-            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
         );
         let mut wire = envelope_with_form(&identity, Some(schema));
         wire.reference_forms.push(wire.reference_forms[0].clone());
@@ -2633,7 +2921,7 @@ mod tests {
         let identity = reference_identity("Endpoint");
         let config = ValidatedConfigSchema::validate(BTreeMap::from([(
             "endpoint".to_string(),
-            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
         )]))
         .expect("config fixture must validate");
         let wire = envelope_with_form(&identity, None);
@@ -2652,7 +2940,7 @@ mod tests {
         let identity = reference_identity("Count");
         let schema = schema_with_identified_type(
             &identity,
-            AttributeType::refined_int(Some(identity.clone()), None),
+            PatternAttributeType::refined_int(Some(identity.clone()), None),
         );
         let wire = envelope_with_form(&identity, Some(schema));
 
@@ -2672,7 +2960,7 @@ mod tests {
         let identity = reference_identity("Mode");
         let schema = schema_with_identified_type(
             &identity,
-            AttributeType::enum_(
+            PatternAttributeType::enum_(
                 identity.clone(),
                 Some(vec!["enabled".to_string()]),
                 Vec::new(),
@@ -3037,12 +3325,15 @@ mod tests {
 
         let config_validation = ValidatedConfigSchema::validate(BTreeMap::from([(
             "value".to_string(),
-            AttributeType::ref_("Missing"),
+            PatternAttributeType::ref_("Missing"),
         )]))
         .expect_err("the fixture must fail schema validation");
         let config = SchemaDecodeError::config_schema_validation(config_validation);
-        let resource_validation = ResourceSchema::new("test.Widget")
-            .attribute(AttributeSchema::optional("value", AttributeType::ref_("Missing")).build())
+        let resource_validation = PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::ref_("Missing"))
+                    .build(),
+            )
             .validate()
             .expect_err("the resource fixture must fail schema validation");
         let resource =
@@ -3060,28 +3351,36 @@ mod tests {
 
     #[test]
     fn validated_schema_round_trips_through_real_json_projection() {
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional("aliases", AttributeType::list(AttributeType::string()))
-                    .with_default(Value::Concrete(ConcreteValue::StringList(vec![
-                        "one".into(),
-                        "two".into(),
-                    ])))
-                    .with_completions(vec![CompletionValue::new("one", "first alias")])
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "aliases",
+                    PatternAttributeType::list(PatternAttributeType::string()),
+                )
+                .with_default(Value::Concrete(ConcreteValue::StringList(vec![
+                    "one".into(),
+                    "two".into(),
+                ])))
+                .with_completions(vec![CompletionValue::new("one", "first alias")])
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::list(AttributeType::struct_(
+                    PatternAttributeType::list(PatternAttributeType::struct_(
                         "Setting",
                         vec![
-                            StructField::required("key", AttributeType::string()).build(),
-                            StructField::required("value", AttributeType::string()).build(),
+                            PatternStructField::required("key", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::required("value", PatternAttributeType::string())
+                                .build(),
                         ],
                     )),
                 )
@@ -3158,13 +3457,16 @@ mod tests {
 
     #[test]
     fn protocol_decode_rejects_invalid_keyed_partial_update_through_schema_validation() {
-        let schema = ResourceSchema::new("test.Settings")
+        let schema = PatternResourceSchema::new("test.Settings")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::list(AttributeType::struct_(
+                    PatternAttributeType::list(PatternAttributeType::struct_(
                         "Setting",
-                        vec![StructField::required("key", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::required("key", PatternAttributeType::string())
+                                .build(),
+                        ],
                     )),
                 )
                 .keyed_partial_update("key")
@@ -3194,17 +3496,23 @@ mod tests {
     fn field_groups_round_trip_at_resource_and_struct_scope() {
         let nested_group = FieldGroup::at_least_one(["left", "right"]).unwrap();
         let top_group = FieldGroup::at_most_one(["first", "second"]).unwrap();
-        let schema = ResourceSchema::new("test.Groups")
-            .attribute(AttributeSchema::optional("first", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("second", AttributeType::string()).build())
+        let schema = PatternResourceSchema::new("test.Groups")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional("first", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("second", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
                     "nested",
-                    AttributeType::struct_with_field_groups(
+                    PatternAttributeType::struct_with_field_groups(
                         "Nested",
                         vec![
-                            StructField::optional("left", AttributeType::string()).build(),
-                            StructField::optional("right", AttributeType::string()).build(),
+                            PatternStructField::optional("left", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::optional("right", PatternAttributeType::string())
+                                .build(),
                         ],
                         vec![nested_group.clone()],
                     ),
@@ -3238,8 +3546,10 @@ mod tests {
 
     #[test]
     fn protocol_decode_rejects_field_groups_with_fewer_than_two_fields() {
-        let schema = ResourceSchema::new("test.Groups")
-            .attribute(AttributeSchema::optional("only", AttributeType::string()).build())
+        let schema = PatternResourceSchema::new("test.Groups")
+            .attribute(
+                PatternAttributeSchema::optional("only", PatternAttributeType::string()).build(),
+            )
             .validate()
             .unwrap();
         let mut wire = resource_schema_to_protocol(&schema).unwrap();

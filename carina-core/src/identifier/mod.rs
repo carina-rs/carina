@@ -16,7 +16,8 @@ use crate::resource::{
     Resource, ResourceId, ResourceIdentity, Value, ValueString,
 };
 use crate::schema::{
-    AttributeType, ResourceSchema, SchemaRegistry, Shape, ValidatedResourceSchema,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    SchemaRegistry, Shape, ValidatedResourceSchema,
 };
 use crate::validation::is_string_compatible_type;
 use crate::value::{CanonicalizedProviderConfigs, CanonicalizedResources};

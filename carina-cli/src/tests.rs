@@ -1,3 +1,6 @@
+use carina_core::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,9 +30,7 @@ use carina_core::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Directives, ParsedIgnorePath,
     ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
-use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-};
+use carina_core::schema::SchemaRegistry;
 use carina_core::value::PersistedValue;
 use carina_state::{
     BackendError, DeposedInstance, DeposedKey, LoadedState, LockInfo, ResourceState, RowBasis,
@@ -91,15 +92,15 @@ test.Target { resource_type = VPC }
     )
     .expect("schema-independent bootstrap parse");
 
-    let source_schema = ResourceSchema::new("Source")
-        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+    let source_schema = PatternResourceSchema::new("Source")
+        .attribute(PatternAttributeSchema::optional("name", PatternAttributeType::string()).build())
         .validate()
         .unwrap();
-    let target_schema = ResourceSchema::new("Target")
+    let target_schema = PatternResourceSchema::new("Target")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "resource_type",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     carina_core::schema::enum_identity("ResourceType", Some("test.Target")),
                     Some(vec!["VPC".to_string()]),
                     vec![("VPC".to_string(), "vpc".to_string())],
@@ -411,10 +412,12 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+        PatternResourceSchema::new("test.resource")
             .attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+                PatternAttributeSchema::optional("comment", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             )
@@ -779,15 +782,16 @@ fn plan_file_serde_round_trip() {
         explicit_dependencies: std::collections::HashSet::new(),
         blocked_by_updates: HashSet::new(),
     });
-    let release_schema = ResourceSchema::new("test.SavedRelease")
+    let release_schema = PatternResourceSchema::new("test.SavedRelease")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "settings",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "Setting",
                     vec![
-                        StructField::required("key", AttributeType::string()).build(),
-                        StructField::required("value", AttributeType::string()).build(),
+                        PatternStructField::required("key", PatternAttributeType::string()).build(),
+                        PatternStructField::required("value", PatternAttributeType::string())
+                            .build(),
                     ],
                 )),
             )
@@ -1879,12 +1883,15 @@ async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        (ResourceSchema::new("test.Resource").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("test.Resource").attribute(
+            PatternAttributeSchema::optional(
                 "config",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Config",
-                    vec![StructField::optional("label", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("label", PatternAttributeType::string())
+                            .build(),
+                    ],
                 ),
             )
             .build(),
@@ -1941,8 +1948,10 @@ async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Resource")
-            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+        PatternResourceSchema::new("test.Resource")
+            .attribute(
+                PatternAttributeSchema::optional("comment", PatternAttributeType::string()).build(),
+            )
             .validate()
             .expect("ignore_changes fixture schema must be valid"),
     );
@@ -1981,10 +1990,10 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     };
 
     let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
-    let schema = ResourceSchema::new("lambda.Permission").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("lambda.Permission").attribute(
+        PatternAttributeSchema::optional(
             "function_name",
-            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
         )
         .build(),
     );
@@ -2100,10 +2109,12 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        (ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        (PatternResourceSchema::new("test.resource")
             .attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             ))
@@ -3466,8 +3477,6 @@ fn import_effect_preserves_resource_metadata_in_state() {
 
 #[test]
 fn build_state_after_apply_persists_write_only_attributes() {
-    use carina_core::schema::{AttributeSchema, AttributeType};
-
     // Set up a resource with a write-only attribute (ipv4_netmask_length)
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
@@ -3502,12 +3511,18 @@ fn build_state_after_apply_persists_write_only_attributes() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
-                    .write_only()
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "ipv4_netmask_length",
+                    PatternAttributeType::int(),
+                )
+                .write_only()
+                .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -3560,16 +3575,20 @@ fn build_state_after_apply_persists_write_only_attributes() {
 fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     use carina_core::differ::create_plan_for_test as create_plan;
     use carina_core::resource::EnumValueResolver;
-    use carina_core::schema::{AttributeSchema, AttributeType, TypeIdentity};
+    use carina_core::schema::TypeIdentity;
 
-    let domain_type = AttributeType::enum_(
+    let domain_type = PatternAttributeType::enum_(
         TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
         Some(vec!["vpc".to_string(), "standard".to_string()]),
         Vec::new(),
         None,
         None,
     );
-    let domain = EnumValueResolver::new(&domain_type)
+    let compiled = carina_core::schema::ValidatedConfigSchema::validate(
+        std::collections::BTreeMap::from([("value".to_string(), domain_type.clone())]),
+    )
+    .unwrap();
+    let domain = EnumValueResolver::new(&compiled.parts()["value"])
         .resolve_state_text("vpc")
         .unwrap();
     let mut resource = Resource::with_provider("aws", "ec2.Eip", "main", None);
@@ -3591,10 +3610,13 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
-        (ResourceSchema::new("ec2.Eip")
-            .attribute(AttributeSchema::optional("allocation_id", AttributeType::string()).build())
+        (PatternResourceSchema::new("ec2.Eip")
             .attribute(
-                AttributeSchema::optional("domain", domain_type)
+                PatternAttributeSchema::optional("allocation_id", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("domain", domain_type)
                     .write_only()
                     .build(),
             ))
@@ -3652,8 +3674,6 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
 
 #[test]
 fn build_state_after_apply_write_only_detects_value_change() {
-    use carina_core::schema::{AttributeSchema, AttributeType};
-
     // Simulate: user changed ipv4_netmask_length from 16 to 24
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
@@ -3705,12 +3725,18 @@ fn build_state_after_apply_write_only_detects_value_change() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("ipv4_netmask_length", AttributeType::int())
-                    .write_only()
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "ipv4_netmask_length",
+                    PatternAttributeType::int(),
+                )
+                .write_only()
+                .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),

@@ -27,7 +27,8 @@ use carina_core::resource::{
     Value,
 };
 use carina_core::schema::{
-    FieldName, ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys,
+    CompiledResourceSchema as ResourceSchema, FieldName, SchemaKind, SchemaRegistry,
+    schema_write_only_keys,
 };
 use carina_core::value::{
     PersistedExportValue, PersistedValue, SerializationError, contains_unredacted_secret,

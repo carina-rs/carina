@@ -14,7 +14,10 @@ use crate::resource::{
     CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, Resource, Value,
     pair_list_elements, pair_list_elements_with_uniqueness,
 };
-use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
+use crate::schema::{
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    empty_defs_for_schema_walks,
+};
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -2470,7 +2473,9 @@ mod tests {
 
     #[test]
     fn carried_whole_value_fallback_survives_refresh_until_values_converge() {
-        use crate::schema::{AttributeSchema, StructField};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
+        };
 
         let prior_explicit = ExplicitFields::Struct {
             children: HashMap::from([("items".to_string(), whole_value(&[&["description"]]))]),
@@ -2708,7 +2713,10 @@ mod tests {
 
     #[test]
     fn aligned_builder_pairing_matches_schema_aware_differ_pairing() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+            CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+        };
 
         let effect_type = AttributeType::enum_(
             crate::schema::TypeIdentity::bare("Effect"),

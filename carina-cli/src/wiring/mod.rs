@@ -137,11 +137,9 @@ use carina_core::resource::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 use carina_core::schema::ValidatedResourceSchema;
-#[cfg(test)]
-use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
-    ValidatedProviderSchemaWitness, resolve_file_block_names_with_schemas,
+    CompiledResourceSchema as ResourceSchema, OwnerBoundResourceSchema, SchemaKind, SchemaRegistry,
+    TypeError, ValidatedProviderSchemaWitness, resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;

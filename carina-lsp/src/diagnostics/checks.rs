@@ -628,7 +628,7 @@ fn source_file_is_current(file: Option<&str>, current_file_name: Option<&str>) -
 }
 
 fn collect_enum_provider_namespaces(
-    attr_type: &carina_core::schema::AttributeType,
+    attr_type: &carina_core::schema::CompiledAttributeType,
     namespaces: &mut HashSet<String>,
 ) {
     use carina_core::schema::RawShape;

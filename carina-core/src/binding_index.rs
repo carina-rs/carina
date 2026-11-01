@@ -51,7 +51,8 @@ use crate::resource::{
     State, Subscript, Value,
 };
 use crate::schema::{
-    AttributeType, ResourceSchema, SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -121,7 +122,7 @@ impl ResolvedTypeConstraint {
         Self { attr_type, defs }
     }
 
-    fn type_in_schema(&self) -> TypeInSchema<'_> {
+    fn type_in_schema(&self) -> TypeInSchema<'_, crate::schema::Compiled> {
         self.attr_type.in_schema(&self.defs)
     }
 
@@ -291,7 +292,10 @@ impl ResolvedRefType {
     /// `sink`. The returned mismatch identifies the first failing constraint;
     /// inferred failures also retain the current boundary's declaration for
     /// diagnostics.
-    pub fn is_assignable_to_sink(&self, sink: TypeInSchema<'_>) -> Result<(), RefTypeMismatch> {
+    pub fn is_assignable_to_sink(
+        &self,
+        sink: TypeInSchema<'_, crate::schema::Compiled>,
+    ) -> Result<(), RefTypeMismatch> {
         let authoritative = self.authoritative.constraint().type_in_schema();
         if !authoritative.is_assignable_to(sink) {
             return Err(RefTypeMismatch {
@@ -2577,15 +2581,15 @@ impl<'a> IterableBindings<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+
     use super::*;
     use crate::parser::{
         ArgumentParameter, BindingName, ResourceTypePath, TypeExpr, UntilPredicateAst,
         UpstreamState, WaitBinding, parse,
     };
     use crate::resource::{LiveCompositionAttribute, LiveCompositionSignature};
-    use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, TypeInSchema,
-    };
+    use crate::schema::{CompiledAttributeType as AttributeType, TypeIdentity, TypeInSchema};
 
     fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
         crate::validation::resolve_consumer_static_type_for_signature(
@@ -2611,10 +2615,15 @@ mod tests {
         }
     }
 
-    fn vpc_schema() -> ResourceSchema {
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+    fn vpc_schema<R: crate::schema::PatternForm>() -> crate::schema::PatternResourceSchema<R> {
+        PatternResourceSchema::new("ec2.Vpc")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
+                    .build(),
+            )
     }
 
     fn registry_with_vpc() -> SchemaRegistry {
@@ -3005,20 +3014,20 @@ let vpc = aws.ec2.Vpc {
     #[derive(Clone)]
     struct ChainType {
         name: &'static str,
-        attr: AttributeType,
+        attr: crate::schema::AttributeType,
         declaration: Option<TypeExpr>,
     }
 
     fn composition_chain_type_universe() -> Vec<ChainType> {
-        let string = AttributeType::string();
-        let bool_ = AttributeType::bool();
-        let vpc_id = AttributeType::refined_string(
+        let string = crate::schema::AttributeType::string();
+        let bool_ = crate::schema::AttributeType::bool();
+        let vpc_id = crate::schema::AttributeType::refined_string(
             Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
             None,
             None,
             None,
         );
-        let security_group_id = AttributeType::refined_string(
+        let security_group_id = crate::schema::AttributeType::refined_string(
             Some(TypeIdentity::from_schema_type(
                 "aws",
                 "ec2.SecurityGroup",
@@ -3042,17 +3051,32 @@ let vpc = aws.ec2.Vpc {
             },
             ChainType {
                 name: "String(pattern=alpha)",
-                attr: AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None),
+                attr: crate::schema::AttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".to_string()),
+                    None,
+                    None,
+                ),
                 declaration: None,
             },
             ChainType {
                 name: "String(pattern=digits)",
-                attr: AttributeType::refined_string(None, Some("^[0-9]+$".to_string()), None, None),
+                attr: crate::schema::AttributeType::refined_string(
+                    None,
+                    Some("^[0-9]+$".to_string()),
+                    None,
+                    None,
+                ),
                 declaration: None,
             },
             ChainType {
                 name: "String(length=..1024)",
-                attr: AttributeType::refined_string(None, None, Some((None, Some(1024))), None),
+                attr: crate::schema::AttributeType::refined_string(
+                    None,
+                    None,
+                    Some((None, Some(1024))),
+                    None,
+                ),
                 declaration: None,
             },
             ChainType {
@@ -3081,27 +3105,29 @@ let vpc = aws.ec2.Vpc {
             },
             ChainType {
                 name: "List<String>",
-                attr: AttributeType::list(string.clone()),
+                attr: crate::schema::AttributeType::list(string.clone()),
                 declaration: Some(TypeExpr::List(Box::new(TypeExpr::String))),
             },
             ChainType {
                 name: "List<String(pattern=alpha)>",
-                attr: AttributeType::list(AttributeType::refined_string(
-                    None,
-                    Some("^[a-z]+$".to_string()),
-                    None,
-                    None,
-                )),
+                attr: crate::schema::AttributeType::list(
+                    crate::schema::AttributeType::refined_string(
+                        None,
+                        Some("^[a-z]+$".to_string()),
+                        None,
+                        None,
+                    ),
+                ),
                 declaration: None,
             },
             ChainType {
                 name: "Map<String>",
-                attr: AttributeType::map(string.clone()),
+                attr: crate::schema::AttributeType::map(string.clone()),
                 declaration: Some(TypeExpr::Map(Box::new(TypeExpr::String))),
             },
             ChainType {
                 name: "Union<String | Bool>",
-                attr: AttributeType::union(vec![string, bool_]),
+                attr: crate::schema::AttributeType::union(vec![string, bool_]),
                 declaration: Some(TypeExpr::Union(vec![TypeExpr::String, TypeExpr::Bool])),
             },
         ]
@@ -3114,6 +3140,13 @@ let vpc = aws.ec2.Vpc {
     #[test]
     fn composition_attribute_chain_requires_declared_and_inferred_types() {
         let universe = composition_chain_type_universe();
+        let compiled = crate::schema::ValidatedConfigSchema::validate(
+            universe
+                .iter()
+                .map(|ty| (ty.name.to_string(), ty.attr.clone()))
+                .collect(),
+        )
+        .unwrap();
 
         for actual in &universe {
             for declared in &universe {
@@ -3136,8 +3169,8 @@ let vpc = aws.ec2.Vpc {
                 let mut registry = SchemaRegistry::new();
                 registry.insert(
                     "test",
-                    (ResourceSchema::new("source.Node").attribute(
-                        AttributeSchema::optional("value", actual.attr.clone()).build(),
+                    (PatternResourceSchema::new("source.Node").attribute(
+                        PatternAttributeSchema::optional("value", actual.attr.clone()).build(),
                     ))
                     .validate()
                     .expect("schema fixture must be valid"),
@@ -3153,12 +3186,17 @@ let vpc = aws.ec2.Vpc {
 
                 for sink in &universe {
                     let accepted = chain
-                        .is_assignable_to_sink(TypeInSchema::schemaless(&sink.attr))
+                        .is_assignable_to_sink(TypeInSchema::schemaless(
+                            &compiled.parts()[sink.name],
+                        ))
                         .is_ok();
-                    let actual_accepts = TypeInSchema::schemaless(&actual.attr)
-                        .is_assignable_to(TypeInSchema::schemaless(&sink.attr));
-                    let declared_accepts = TypeInSchema::schemaless(&declared.attr)
-                        .is_assignable_to(TypeInSchema::schemaless(&sink.attr));
+                    let actual_accepts = TypeInSchema::schemaless(&compiled.parts()[actual.name])
+                        .is_assignable_to(TypeInSchema::schemaless(&compiled.parts()[sink.name]));
+                    let declared_accepts =
+                        TypeInSchema::schemaless(&compiled.parts()[declared.name])
+                            .is_assignable_to(TypeInSchema::schemaless(
+                                &compiled.parts()[sink.name],
+                            ));
                     assert!(
                         !accepted || (actual_accepts && declared_accepts),
                         "checker accepted {} ->(declared {})→ {}, but direct constraints were actual={} declared={}",

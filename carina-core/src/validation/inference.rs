@@ -34,7 +34,10 @@ use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
 use crate::provider::ProviderLoadedSchemaRegistry;
 use crate::resource::{ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind, Value};
-use crate::schema::{AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
+use crate::schema::{
+    AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    SchemaKind, SchemaRegistry,
+};
 pub use crate::static_type::InferenceError;
 use crate::static_type::{
     ExportStaticType, InferenceIssue, InferredUncheckedReason, NotInferableReason, StaticType,
@@ -1299,12 +1302,15 @@ pub fn format_inference_error(name: &str, err: &InferenceError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
     use crate::parser::ModuleCall;
     use crate::resource::AccessPath;
     use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
-        legacy_validator,
+        CompiledAttributeType as AttributeType, SchemaRegistry, TypeIdentity, legacy_validator,
     };
 
     type Value = crate::resource::Value<crate::resource::ParserPlaceholder>;
@@ -1317,8 +1323,8 @@ mod tests {
         Ok(())
     }
 
-    fn vpc_id_custom() -> AttributeType {
-        AttributeType::refined_string_with_validator(
+    fn vpc_id_custom<R: crate::schema::PatternForm>() -> crate::schema::PatternAttributeType<R> {
+        PatternAttributeType::refined_string_with_validator(
             TypeIdentity::bare("VpcId"),
             None,
             None,
@@ -1327,10 +1333,13 @@ mod tests {
         )
     }
 
-    fn vpc_schema() -> ResourceSchema {
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("vpc_id", vpc_id_custom()).build())
+    fn vpc_schema<R: crate::schema::PatternForm>() -> crate::schema::PatternResourceSchema<R> {
+        PatternResourceSchema::new("ec2.Vpc")
+            .attribute(
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(PatternAttributeSchema::optional("vpc_id", vpc_id_custom()).build())
     }
 
     #[test]
@@ -1366,8 +1375,9 @@ mod tests {
                 && operator_span.column() == Some(20)
         ));
 
-        let schema = ResourceSchema::new("clock.Source").attribute(
-            AttributeSchema::provider_populated("seconds", AttributeType::int()).build(),
+        let schema = PatternResourceSchema::new("clock.Source").attribute(
+            PatternAttributeSchema::provider_populated("seconds", PatternAttributeType::int())
+                .build(),
         );
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
@@ -1400,18 +1410,23 @@ mod tests {
 
         let port_identity = TypeIdentity::bare("Port");
         let label_identity = TypeIdentity::bare("Label");
-        let schema = ResourceSchema::new("clock.Source")
+        let schema = PatternResourceSchema::new("clock.Source")
             .attribute(
-                AttributeSchema::provider_populated(
+                PatternAttributeSchema::provider_populated(
                     "port",
-                    AttributeType::refined_int(Some(port_identity.clone()), None),
+                    PatternAttributeType::refined_int(Some(port_identity.clone()), None),
                 )
                 .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated(
+                PatternAttributeSchema::provider_populated(
                     "label",
-                    AttributeType::refined_string(Some(label_identity.clone()), None, None, None),
+                    PatternAttributeType::refined_string(
+                        Some(label_identity.clone()),
+                        None,
+                        None,
+                        None,
+                    ),
                 )
                 .build(),
             );
@@ -1641,13 +1656,15 @@ mod tests {
         // `vpc.tags.environment` against a `Struct{environment: String}`.
         // Locks the descent loop so a future refactor cannot silently
         // break field-path traversal.
-        use crate::schema::StructField;
-        let tags_struct = AttributeType::struct_(
+
+        let tags_struct = PatternAttributeType::struct_(
             "Tags",
-            vec![StructField::optional("environment", AttributeType::string()).build()],
+            vec![
+                PatternStructField::optional("environment", PatternAttributeType::string()).build(),
+            ],
         );
-        let schema = ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::optional("tags", tags_struct).build());
+        let schema = PatternResourceSchema::new("ec2.Vpc")
+            .attribute(PatternAttributeSchema::optional("tags", tags_struct).build());
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
@@ -1988,9 +2005,9 @@ mod tests {
         // not `List<String>`. Without subscript handling the inferer
         // would type the value as the collection itself and a
         // downstream `: String` receiver would spuriously reject.
-        let list_str = AttributeType::list(AttributeType::string());
-        let schema = ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::optional("subnets", list_str).build());
+        let list_str = PatternAttributeType::list(PatternAttributeType::string());
+        let schema = PatternResourceSchema::new("ec2.Vpc")
+            .attribute(PatternAttributeSchema::optional("subnets", list_str).build());
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
@@ -2057,9 +2074,12 @@ mod tests {
         // A `Union` receiver carries multiple alternatives; projecting
         // it to one branch silently lets the value satisfy alternatives
         // it doesn't. Demand annotation instead.
-        let union_attr = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
-        let schema = ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::optional("polymorphic", union_attr).build());
+        let union_attr = PatternAttributeType::union(vec![
+            PatternAttributeType::string(),
+            PatternAttributeType::int(),
+        ]);
+        let schema = PatternResourceSchema::new("ec2.Vpc")
+            .attribute(PatternAttributeSchema::optional("polymorphic", union_attr).build());
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
@@ -2123,23 +2143,29 @@ mod tests {
         // forwarding the whole struct, not picking a union branch, and
         // must not be blocked. Inference accepts this and projects the
         // outer Struct into a TypeExpr::Struct.
-        use crate::schema::StructField;
-        let inner_struct = AttributeType::struct_(
+
+        let inner_struct = PatternAttributeType::struct_(
             "Statement",
             vec![
-                StructField::optional(
+                PatternStructField::optional(
                     "principal",
-                    AttributeType::union(vec![AttributeType::string(), AttributeType::int()]),
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::string(),
+                        PatternAttributeType::int(),
+                    ]),
                 )
                 .build(),
             ],
         );
-        let outer_struct = AttributeType::struct_(
+        let outer_struct = PatternAttributeType::struct_(
             "PolicyDocument",
-            vec![StructField::optional("statement", AttributeType::list(inner_struct)).build()],
+            vec![
+                PatternStructField::optional("statement", PatternAttributeType::list(inner_struct))
+                    .build(),
+            ],
         );
-        let schema = ResourceSchema::new("iam.Policy")
-            .attribute(AttributeSchema::optional("policy_document", outer_struct).build());
+        let schema = PatternResourceSchema::new("iam.Policy")
+            .attribute(PatternAttributeSchema::optional("policy_document", outer_struct).build());
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",

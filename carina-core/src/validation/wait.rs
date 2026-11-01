@@ -148,14 +148,16 @@ pub fn validate_wait_bindings<E, D>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::parser::{ProviderContext, parse};
     use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };
 
+    use super::*;
+    use crate::parser::{ProviderContext, parse};
+    use crate::schema::TypeIdentity;
+
     fn wait_schemas() -> SchemaRegistry {
-        let status = AttributeType::enum_(
+        let status = PatternAttributeType::enum_(
             TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Status"),
             Some(vec!["ISSUED".to_string()]),
             vec![("ISSUED".to_string(), "issued".to_string())],
@@ -165,9 +167,12 @@ mod tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            (ResourceSchema::new("acm.Certificate")
-                .attribute(AttributeSchema::optional("state", AttributeType::string()).build())
-                .attribute(AttributeSchema::optional("status", status).build()))
+            (PatternResourceSchema::new("acm.Certificate")
+                .attribute(
+                    PatternAttributeSchema::optional("state", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(PatternAttributeSchema::optional("status", status).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -220,22 +225,23 @@ let status_ready = wait cert {
 
     #[test]
     fn nested_struct_enum_wait_value_is_resolved_at_the_full_lhs_path() {
-        let renewal_status = AttributeType::enum_(
+        let renewal_status = PatternAttributeType::enum_(
             TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "RenewalStatus"),
             Some(vec!["SUCCESS".to_string()]),
             vec![("SUCCESS".to_string(), "success".to_string())],
             None,
             None,
         );
-        let renewal_summary = AttributeType::struct_(
+        let renewal_summary = PatternAttributeType::struct_(
             "RenewalSummary",
-            vec![StructField::optional("renewal_status", renewal_status).build()],
+            vec![PatternStructField::optional("renewal_status", renewal_status).build()],
         );
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            (ResourceSchema::new("acm.Certificate")
-                .attribute(AttributeSchema::optional("renewal_summary", renewal_summary).build()))
+            (PatternResourceSchema::new("acm.Certificate").attribute(
+                PatternAttributeSchema::optional("renewal_summary", renewal_summary).build(),
+            ))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -258,9 +264,12 @@ let renewed = wait cert {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            (ResourceSchema::new("job.Job").attribute(
-                AttributeSchema::optional("labels", AttributeType::map(AttributeType::string()))
-                    .build(),
+            (PatternResourceSchema::new("job.Job").attribute(
+                PatternAttributeSchema::optional(
+                    "labels",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
             ))
             .validate()
             .expect("schema fixture must be valid"),
@@ -281,7 +290,7 @@ let ready = wait job {
 
     #[test]
     fn typed_enum_wait_value_can_traverse_an_enum_map() {
-        let status = AttributeType::enum_(
+        let status = PatternAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["job", "Job"], "Status"),
             Some(vec!["READY".to_string()]),
             vec![("READY".to_string(), "ready".to_string())],
@@ -291,8 +300,9 @@ let ready = wait job {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            (ResourceSchema::new("job.Job").attribute(
-                AttributeSchema::optional("statuses", AttributeType::map(status)).build(),
+            (PatternResourceSchema::new("job.Job").attribute(
+                PatternAttributeSchema::optional("statuses", PatternAttributeType::map(status))
+                    .build(),
             ))
             .validate()
             .expect("schema fixture must be valid"),
@@ -316,9 +326,12 @@ let ready = wait job {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            (ResourceSchema::new("job.Job").attribute(
-                AttributeSchema::optional("states", AttributeType::list(AttributeType::string()))
-                    .build(),
+            (PatternResourceSchema::new("job.Job").attribute(
+                PatternAttributeSchema::optional(
+                    "states",
+                    PatternAttributeType::list(PatternAttributeType::string()),
+                )
+                .build(),
             ))
             .validate()
             .expect("schema fixture must be valid"),
@@ -344,7 +357,7 @@ let ready = wait job {
 
     #[test]
     fn data_source_wait_is_rejected_while_managed_wait_is_accepted() {
-        let managed_status = AttributeType::enum_(
+        let managed_status = PatternAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
             Some(vec!["READY".to_string()]),
             vec![("READY".to_string(), "ready".to_string())],
@@ -354,8 +367,8 @@ let ready = wait job {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            (ResourceSchema::new("lookup.Job")
-                .attribute(AttributeSchema::optional("status", managed_status).build()))
+            (PatternResourceSchema::new("lookup.Job")
+                .attribute(PatternAttributeSchema::optional("status", managed_status).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );

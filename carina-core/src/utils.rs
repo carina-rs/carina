@@ -1,7 +1,7 @@
 //! Shared utility functions for value normalization and conversion
 
 use crate::resource::{ConcreteValue, Value};
-use crate::schema::AttributeType;
+use crate::schema::CompiledAttributeType as AttributeType;
 use std::path::{Component, Path, PathBuf};
 
 /// Lexically normalize a diagnostic source path without consulting the
@@ -519,7 +519,7 @@ pub fn validate_enum_namespace(
 fn shape_for_projection<'a>(
     attr_type: &'a AttributeType,
     defs: Option<&'a std::collections::BTreeMap<String, AttributeType>>,
-) -> Option<crate::schema::Shape<'a>> {
+) -> Option<crate::schema::Shape<'a, crate::schema::Compiled>> {
     match defs {
         Some(defs) => Some(attr_type.shape_with_defs(defs)),
         None => attr_type.shape_ref_free().ok(),
@@ -570,7 +570,7 @@ fn shape_for_projection<'a>(
 /// without re-running validation.
 pub fn lift_state_enum_leaves(
     attributes: &mut std::collections::HashMap<String, Value>,
-    schema: &crate::schema::ResourceSchema,
+    schema: &crate::schema::CompiledResourceSchema,
 ) {
     for (name, attr) in &schema.attributes {
         if let Some(value) = attributes.get(name)
@@ -1006,6 +1006,10 @@ pub fn pretty_with_newline_bytes<T: serde::Serialize>(value: &T) -> serde_json::
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
     use crate::schema::{TypeIdentity, enum_identity};
 
@@ -1792,27 +1796,26 @@ mod tests {
     #[test]
     fn lift_saved_state_enum_leaves_resolves_schema_per_resource() {
         use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-        };
+        use crate::schema::SchemaRegistry;
         use std::collections::HashMap;
 
-        let version_enum = AttributeType::enum_(
+        let version_enum = PatternAttributeType::enum_(
             crate::schema::enum_identity("Version", Some("aws.iam.PolicyDocument")),
             Some(vec!["2012-10-17".to_string()]),
             vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
             None,
             None,
         );
-        let policy_struct = AttributeType::struct_(
+        let policy_struct = PatternAttributeType::struct_(
             "PolicyDocument".to_string(),
-            vec![StructField::optional("version", version_enum).build()],
+            vec![PatternStructField::optional("version", version_enum).build()],
         );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
-            (ResourceSchema::new("iam.RolePolicy")
-                .attribute(AttributeSchema::optional("policy_document", policy_struct).build()))
+            (PatternResourceSchema::new("iam.RolePolicy").attribute(
+                PatternAttributeSchema::optional("policy_document", policy_struct).build(),
+            ))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -1869,27 +1872,26 @@ mod tests {
     #[test]
     fn lift_current_state_enum_leaves_lifts_provider_read_state() {
         use crate::resource::{ConcreteValue, Current, Resource, ResourceId, State, Value};
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-        };
+        use crate::schema::SchemaRegistry;
         use std::collections::HashMap;
 
-        let version_enum = AttributeType::enum_(
+        let version_enum = PatternAttributeType::enum_(
             crate::schema::enum_identity("Version", Some("aws.iam.PolicyDocument")),
             Some(vec!["2012-10-17".to_string()]),
             vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
             None,
             None,
         );
-        let policy_struct = AttributeType::struct_(
+        let policy_struct = PatternAttributeType::struct_(
             "PolicyDocument".to_string(),
-            vec![StructField::optional("version", version_enum).build()],
+            vec![PatternStructField::optional("version", version_enum).build()],
         );
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
-            (ResourceSchema::new("iam.Role").attribute(
-                AttributeSchema::optional("assume_role_policy_document", policy_struct).build(),
+            (PatternResourceSchema::new("iam.Role").attribute(
+                PatternAttributeSchema::optional("assume_role_policy_document", policy_struct)
+                    .build(),
             ))
             .validate()
             .expect("schema fixture must be valid"),

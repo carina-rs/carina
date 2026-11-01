@@ -20,7 +20,9 @@ use crate::resource::{
     PresentResourceState, ResolvedResource, Resource, ResourceId, State, UnidentifiedState, Value,
     into_plan_input_current_map,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
+use crate::schema::{
+    CompiledResourceSchema as ResourceSchema, SchemaRegistry, ValidatedResourceSchema,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
@@ -859,7 +861,7 @@ use crate::effect::Effect;
 #[cfg(test)]
 use crate::plan::Plan;
 #[cfg(test)]
-use crate::schema::AttributeType;
+use crate::schema::CompiledAttributeType as AttributeType;
 pub use comparison::ComparisonContext;
 
 #[cfg(any(test, feature = "test-utils"))]

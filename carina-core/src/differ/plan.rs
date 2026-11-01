@@ -19,8 +19,8 @@ use crate::resource::{
     ResourceIdentity, State, Value, plan_input_desired_resources,
 };
 use crate::schema::{
-    ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
-    WAIT_DEFAULT_TIMEOUT,
+    CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec,
+    WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;

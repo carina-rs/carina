@@ -2266,6 +2266,8 @@ pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::PatternResourceSchema;
+
     use super::*;
     use crate::resource::ConcreteValue;
     use std::collections::HashSet;
@@ -2741,7 +2743,6 @@ mod tests {
     #[test]
     fn deferred_ignore_changes_error_reports_materialized_template_address() {
         use crate::resource::{ParsedIgnorePath, ParsedIgnorePathSegment};
-        use crate::schema::ResourceSchema;
 
         let mut effect = deferred_create_effect();
         let Effect::DeferredCreate(payload) = &mut effect else {
@@ -2758,7 +2759,7 @@ mod tests {
         let mut schemas = crate::schema::SchemaRegistry::new();
         schemas.insert(
             "route53",
-            ResourceSchema::new("Record")
+            PatternResourceSchema::new("Record")
                 .validate()
                 .expect("valid test schema"),
         );

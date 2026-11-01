@@ -1,4 +1,7 @@
 use super::*;
+use crate::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 
 macro_rules! unexpected_resume_create {
     () => {
@@ -170,13 +173,10 @@ fn anonymous_deferred_collision_fixture() -> (
         crate::binding_index::BindingValueSource::Upstream,
         crate::binding_index::BindingCompleteness::Complete,
     );
-    let schema = crate::schema::ResourceSchema::new("test.Child").attribute(
-        crate::schema::AttributeSchema::optional(
-            "identity_input",
-            crate::schema::AttributeType::string(),
-        )
-        .create_only()
-        .build(),
+    let schema = PatternResourceSchema::new("test.Child").attribute(
+        PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
+            .create_only()
+            .build(),
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -1046,7 +1046,7 @@ static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "",
-        (crate::schema::ResourceSchema::new("test"))
+        (PatternResourceSchema::new("test"))
             .validate()
             .expect("schema fixture must be valid"),
     );
@@ -1054,13 +1054,15 @@ static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
 });
 
 static DEFAULT_TAG_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "test",
-        (ResourceSchema::new("test").attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        (PatternResourceSchema::new("test").attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -1074,14 +1076,13 @@ static DEFAULT_TAG_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
 /// schema to act on. carina#3063: this stage is plan pipeline stage 1
 /// and must also be re-applied at apply time.
 static CANON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
     let mut reg = SchemaRegistry::new();
-    let schema = ResourceSchema::new("sg").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("sg").attribute(
+        PatternAttributeSchema::optional(
             "subject",
-            AttributeType::union(vec![
-                AttributeType::string(),
-                AttributeType::list(AttributeType::string()),
+            PatternAttributeType::union(vec![
+                PatternAttributeType::string(),
+                PatternAttributeType::list(PatternAttributeType::string()),
             ]),
         )
         .build(),
@@ -1094,35 +1095,40 @@ static CANON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
 });
 
 static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
-    use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, StructField, enum_identity,
-    };
+    use crate::schema::enum_identity;
 
     let mut reg = SchemaRegistry::new();
-    let schema = ResourceSchema::new("a")
-        .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("size", AttributeType::float()).build())
+    let schema = PatternResourceSchema::new("a")
         .attribute(
-            AttributeSchema::optional("items", AttributeType::list(AttributeType::string()))
-                .build(),
+            PatternAttributeSchema::optional("description", PatternAttributeType::string()).build(),
+        )
+        .attribute(PatternAttributeSchema::optional("size", PatternAttributeType::float()).build())
+        .attribute(
+            PatternAttributeSchema::optional(
+                "items",
+                PatternAttributeType::list(PatternAttributeType::string()),
+            )
+            .build(),
         )
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "options",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Options",
                     vec![
-                        StructField::optional("enabled", AttributeType::bool()).build(),
-                        StructField::optional("label", AttributeType::string()).build(),
+                        PatternStructField::optional("enabled", PatternAttributeType::bool())
+                            .build(),
+                        PatternStructField::optional("label", PatternAttributeType::string())
+                            .build(),
                     ],
                 ),
             )
             .build(),
         )
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "mode",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     enum_identity("Mode", Some("test")),
                     Some(vec!["AES256".to_string(), "aws:kms".to_string()]),
                     Vec::new(),
@@ -1133,22 +1139,25 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
             .build(),
         )
         .attribute(
-            AttributeSchema::optional("write_only_token", AttributeType::string())
+            PatternAttributeSchema::optional("write_only_token", PatternAttributeType::string())
                 .write_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("create_only_write_only_token", AttributeType::string())
-                .write_only()
-                .create_only()
-                .build(),
+            PatternAttributeSchema::optional(
+                "create_only_write_only_token",
+                PatternAttributeType::string(),
+            )
+            .write_only()
+            .create_only()
+            .build(),
         )
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "master_password",
-                AttributeType::union(vec![
-                    AttributeType::string(),
-                    AttributeType::list(AttributeType::string()),
+                PatternAttributeType::union(vec![
+                    PatternAttributeType::string(),
+                    PatternAttributeType::list(PatternAttributeType::string()),
                 ]),
             )
             .build(),
@@ -1164,13 +1173,14 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
 /// `CanonicalEnum("all")` API spelling without a provider-owned alias table.
 struct AliasFactory;
 
-fn alias_resource_schema() -> crate::schema::ResourceSchema {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, enum_identity};
+fn alias_resource_schema<R: crate::schema::PatternForm>() -> crate::schema::PatternResourceSchema<R>
+{
+    use crate::schema::enum_identity;
 
-    ResourceSchema::new("sg").attribute(
-        AttributeSchema::optional(
+    PatternResourceSchema::new("sg").attribute(
+        PatternAttributeSchema::optional(
             "ip_protocol",
-            AttributeType::enum_(
+            PatternAttributeType::enum_(
                 enum_identity("IpProtocol", Some("test.ec2.SecurityGroup")),
                 Some(vec!["all".to_string(), "tcp".to_string()]),
                 Vec::new(),
@@ -2737,34 +2747,41 @@ async fn skipped_or_cancelled_resume_has_no_applied_entry() {
 }
 
 fn provider_boundary_constraint_schemas() -> SchemaRegistry {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test")
+        (PatternResourceSchema::new("test")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "target",
-                    AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+                    PatternAttributeType::refined_string(
+                        None,
+                        Some("^good-".to_string()),
+                        None,
+                        None,
+                    ),
                 )
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional("token", AttributeType::string())
+                PatternAttributeSchema::optional("token", PatternAttributeType::string())
                     .write_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "config",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Config",
                         vec![
-                            StructField::optional("issuer", AttributeType::string()).build(),
-                            StructField::optional("client_secret", AttributeType::string())
-                                .write_only()
+                            PatternStructField::optional("issuer", PatternAttributeType::string())
                                 .build(),
+                            PatternStructField::optional(
+                                "client_secret",
+                                PatternAttributeType::string(),
+                            )
+                            .write_only()
+                            .build(),
                         ],
                     ),
                 )
@@ -2777,15 +2794,13 @@ fn provider_boundary_constraint_schemas() -> SchemaRegistry {
 }
 
 fn deferred_child_constraint_schemas() -> SchemaRegistry {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("test").attribute(
+            PatternAttributeSchema::optional(
                 "value",
-                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+                PatternAttributeType::refined_string(None, Some("^good-".to_string()), None, None),
             )
             .build(),
         ))
@@ -2796,18 +2811,23 @@ fn deferred_child_constraint_schemas() -> SchemaRegistry {
 }
 
 fn deferred_data_source_constraint_schemas() -> SchemaRegistry {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("Lookup").as_data_source().attribute(
-            AttributeSchema::optional(
-                "filter",
-                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
-            )
-            .build(),
-        ))
+        (PatternResourceSchema::new("Lookup")
+            .as_data_source()
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "filter",
+                    PatternAttributeType::refined_string(
+                        None,
+                        Some("^good-".to_string()),
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -3369,8 +3389,6 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
 
 #[tokio::test]
 async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentation() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
     let provider = MockProvider::new();
     let mut updated = make_resource("entirely-write-only", &[]);
     updated.set_attr(
@@ -3404,23 +3422,31 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test")
+        (PatternResourceSchema::new("test")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "target",
-                    AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+                    PatternAttributeType::refined_string(
+                        None,
+                        Some("^good-".to_string()),
+                        None,
+                        None,
+                    ),
                 )
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "creds",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Credentials",
                         vec![
-                            StructField::optional("password", AttributeType::string())
-                                .write_only()
-                                .build(),
+                            PatternStructField::optional(
+                                "password",
+                                PatternAttributeType::string(),
+                            )
+                            .write_only()
+                            .build(),
                         ],
                     ),
                 )
@@ -5594,7 +5620,6 @@ async fn test_apply_renormalizes_after_resolution() {
 #[tokio::test]
 async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     use crate::binding_index::BindingValueSource;
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let provider = MockProvider::new();
     let mut source = make_resource("normalized-literal", &[]);
@@ -5623,15 +5648,22 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test")
+        (PatternResourceSchema::new("test")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "marker",
-                    AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+                    PatternAttributeType::refined_string(
+                        None,
+                        Some("^raw_dsl$".to_string()),
+                        None,
+                        None,
+                    ),
                 )
                 .build(),
             )
-            .attribute(AttributeSchema::optional("runtime", AttributeType::string()).build()))
+            .attribute(
+                PatternAttributeSchema::optional("runtime", PatternAttributeType::string()).build(),
+            ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -5692,8 +5724,6 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
 /// values.
 #[tokio::test]
 async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
     let provider = MockProvider::new();
     let mut planned = make_resource("missing-origin", &[]);
     planned.set_attr(
@@ -5709,10 +5739,15 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("test").attribute(
+            PatternAttributeSchema::optional(
                 "marker",
-                AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+                PatternAttributeType::refined_string(
+                    None,
+                    Some("^raw_dsl$".to_string()),
+                    None,
+                    None,
+                ),
             )
             .build(),
         ))
@@ -5758,7 +5793,6 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
 #[tokio::test]
 async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let provider = MockProvider::new();
     let producer = make_resource("data-source-origin-producer", &[]);
@@ -5821,16 +5855,23 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("Lookup")
+        (PatternResourceSchema::new("Lookup")
             .as_data_source()
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "marker",
-                    AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+                    PatternAttributeType::refined_string(
+                        None,
+                        Some("^raw_dsl$".to_string()),
+                        None,
+                        None,
+                    ),
                 )
                 .build(),
             )
-            .attribute(AttributeSchema::optional("runtime", AttributeType::string()).build()))
+            .attribute(
+                PatternAttributeSchema::optional("runtime", PatternAttributeType::string()).build(),
+            ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -7065,18 +7106,17 @@ async fn test_read_effect_is_no_op() {
 
 #[tokio::test]
 async fn release_list_keys_never_reaches_provider_executor() {
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
     let provider = MockProvider::new();
-    let schema = ResourceSchema::new("test.KeyedSettings")
+    let schema = PatternResourceSchema::new("test.KeyedSettings")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "settings",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "Setting",
                     vec![
-                        StructField::required("key", AttributeType::string()).build(),
-                        StructField::required("value", AttributeType::string()).build(),
+                        PatternStructField::required("key", PatternAttributeType::string()).build(),
+                        PatternStructField::required("value", PatternAttributeType::string())
+                            .build(),
                     ],
                 )),
             )
@@ -8581,7 +8621,7 @@ impl Provider for CascadeReplaceProvider {
 async fn cascading_replacement_child_create_uses_new_parent_binding() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
     use crate::differ::create_plan_with_cascades;
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use crate::schema::SchemaRegistry;
 
     fn string(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
@@ -8601,14 +8641,18 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated("vpc_id", AttributeType::string()).build(),
+                PatternAttributeSchema::provider_populated(
+                    "vpc_id",
+                    PatternAttributeType::string(),
+                )
+                .build(),
             )
             .with_coexisting_replacement())
         .validate()
@@ -8616,24 +8660,31 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     );
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Subnet")
+        (PatternResourceSchema::new("ec2.Subnet")
             .attribute(
-                AttributeSchema::optional("vpc_id", AttributeType::string())
+                PatternAttributeSchema::optional("vpc_id", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("availability_zone", AttributeType::string())
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "availability_zone",
+                    PatternAttributeType::string(),
+                )
+                .create_only()
+                .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated("subnet_id", AttributeType::string()).build(),
+                PatternAttributeSchema::provider_populated(
+                    "subnet_id",
+                    PatternAttributeType::string(),
+                )
+                .build(),
             )
             .with_coexisting_replacement())
         .validate()
