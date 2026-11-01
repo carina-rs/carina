@@ -1,0 +1,9 @@
+let deferred_source = mock.test.resource {
+  name = "${label}-deferred-source-updated"
+}
+
+let children = for key, value in (deferred_source.tags ?? { first = "child" }) {
+  mock.test.resource {
+    name = "${label}-${key}-${value}"
+  }
+}

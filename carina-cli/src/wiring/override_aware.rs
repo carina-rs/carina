@@ -13,8 +13,8 @@ use carina_core::name_override::{
 };
 use carina_core::parser::{File, ResolvedDeferredForPhase};
 use carina_core::resource::{
-    ConcreteValue, LoopSlot, ModuleSource, NoPlaceholder, ParserPlaceholder, PlaceholderKind,
-    Resource, ResourceId, Value,
+    AbsoluteBindingAddress, ConcreteValue, LoopSlot, ModuleSource, NoPlaceholder,
+    ParserPlaceholder, PlaceholderKind, Resource, ResourceId, Value,
 };
 use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
@@ -67,7 +67,13 @@ pub struct CanonicalResourcePair<
     P: PlaceholderKind = NoPlaceholder,
     T: PlaceholderKind = LoopSlot,
 > {
-    parsed: File<E, P, T, ResolvedDeferredForPhase<P, T>>,
+    parsed: File<
+        E,
+        P,
+        T,
+        ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>,
+        AbsoluteBindingAddress,
+    >,
     unresolved: Vec<Resource<ModuleSource, P>>,
     /// Generated prefix values captured before persisted state can replace
     /// them with a pending re-read unknown. A post-refresh reconciliation
@@ -80,12 +86,14 @@ pub(crate) type ParserCanonicalResourcePair<E> =
     CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>;
 
 type CanonicalResourceParts<E, P, T> = (
-    File<E, P, T, ResolvedDeferredForPhase<P, T>>,
+    File<E, P, T, ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>, AbsoluteBindingAddress>,
     Vec<Resource<ModuleSource, P>>,
 );
 
 #[cfg(test)]
-impl<E: carina_core::parser::IntoExpandedExportParam> ParserCanonicalResourcePair<E> {
+impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
+    ParserCanonicalResourcePair<E>
+{
     pub(crate) fn into_expanded_for_test(
         self,
     ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::LeftoverPlaceholders>
@@ -127,7 +135,13 @@ pub enum CanonicalResourceIdentityError {
 
 impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
     fn new(
-        parsed: File<E, P, T, ResolvedDeferredForPhase<P, T>>,
+        parsed: File<
+            E,
+            P,
+            T,
+            ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>,
+            AbsoluteBindingAddress,
+        >,
         unresolved: Vec<Resource<ModuleSource, P>>,
     ) -> Self {
         Self {
@@ -138,9 +152,14 @@ impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
     pub fn for_test(
-        parsed: File<E, P, T, ResolvedDeferredForPhase<P, T>>,
+        parsed: File<
+            E,
+            P,
+            T,
+            ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>,
+            AbsoluteBindingAddress,
+        >,
         unresolved: Vec<Resource<ModuleSource, P>>,
     ) -> Self {
         Self::new(parsed, unresolved)
@@ -153,7 +172,15 @@ impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
     /// The canonical evaluated configuration. Callers borrow every non-resource
     /// input from this file so it cannot drift from the resources consumed by
     /// [`OverrideAwareResources`].
-    pub fn parsed(&self) -> &File<E, P, T, ResolvedDeferredForPhase<P, T>> {
+    pub fn parsed(
+        &self,
+    ) -> &File<
+        E,
+        P,
+        T,
+        ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>,
+        AbsoluteBindingAddress,
+    > {
         &self.parsed
     }
 
@@ -176,7 +203,7 @@ impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
     pub fn canonicalize_and_compute_anonymous_identifiers(
         &mut self,
         registry: &carina_core::schema::SchemaRegistry,
-        providers: &[carina_core::parser::ProviderConfig<P>],
+        providers: &[carina_core::parser::ProviderConfig<P, AbsoluteBindingAddress>],
         factories: &[Box<dyn carina_core::provider::ProviderFactory>],
         conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
     ) -> Result<(), CanonicalResourceIdentityError> {
@@ -283,10 +310,11 @@ impl<E> CanonicalResourcePair<E> {
         &mut self,
         find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
         claims: &carina_core::identifier::StateBlockClaims,
-    ) {
+    ) where
+        E: carina_core::parser::ExportParamLike<NoPlaceholder, AbsoluteBindingAddress>,
+    {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut self.parsed.resources,
-            &mut self.parsed.compositions,
+            &mut self.parsed,
             find_state_names_by_type,
             claims,
         );
@@ -334,7 +362,10 @@ impl<E> CanonicalResourcePair<E> {
     /// evaluated resources and data sources.
     pub async fn prepare_desired_side_for_plan(
         &mut self,
-        provider_configs: &[carina_core::parser::ProviderConfig],
+        provider_configs: &[carina_core::parser::ProviderConfig<
+            NoPlaceholder,
+            AbsoluteBindingAddress,
+        >],
         normalizer: &dyn carina_core::provider::ProviderNormalizer,
         schemas: &carina_core::schema::SchemaRegistry,
     ) -> carina_core::provider::ProviderResult<()> {
@@ -432,7 +463,6 @@ impl OverrideAwareResources {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
     pub fn build_pair_without_state_for_test<E>(
         resources: &CanonicalResourcePair<E>,
         inputs: LivePreApplyInputs<'_>,
@@ -568,10 +598,10 @@ impl OverrideAwareResources {
         &self,
         binding_sources: &OverrideAwareResources,
     ) -> Vec<Resource> {
-        let mut by_binding: HashMap<&str, &Resource> = HashMap::new();
-        let mut duplicate_bindings: HashSet<&str> = HashSet::new();
+        let mut by_binding: HashMap<&AbsoluteBindingAddress, &Resource> = HashMap::new();
+        let mut duplicate_bindings: HashSet<&AbsoluteBindingAddress> = HashSet::new();
         for source in binding_sources.unresolved_resources() {
-            let Some(binding) = source.binding.as_deref() else {
+            let Some(binding) = source.binding.as_ref() else {
                 continue;
             };
             if by_binding.insert(binding, source).is_some() {
@@ -583,7 +613,7 @@ impl OverrideAwareResources {
             .iter()
             .zip(self.paired_unresolved_resources())
             .map(|(resource, fallback)| {
-                let Some(binding) = resource.binding.as_deref() else {
+                let Some(binding) = resource.binding.as_ref() else {
                     return fallback;
                 };
                 if duplicate_bindings.contains(binding) {
@@ -771,20 +801,24 @@ mod tests {
     use carina_core::binding_index::WaitAliasSpec;
     use carina_core::resource::{AccessPath, DeferredValue, PlanInputCurrent};
 
+    fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
     fn string(value: impl Into<String>) -> Value {
         Value::Concrete(ConcreteValue::String(value.into().into()))
     }
 
     fn resource(binding: &'static str, name: Value) -> Resource {
         let mut resource = Resource::new("mock.thing", binding);
-        resource.binding = Some(binding.to_string());
+        resource.binding = Some(absolute_binding(binding));
         resource.attributes.insert("name".to_string(), name);
         resource
     }
 
     fn resource_ref(binding: &str, attribute: &str) -> Value {
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(binding, attribute),
+            path: AccessPath::new(binding, attribute).resolve_root_for_test(),
         })
     }
 
@@ -837,7 +871,9 @@ mod tests {
         resources
             .resources()
             .iter()
-            .find(|resource| resource.binding.as_deref() == Some(binding))
+            .find(|resource| {
+                resource.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
             .and_then(|resource| resource.attributes.get("name"))
             .and_then(|value| concrete_string(value).map(ToOwned::to_owned))
     }

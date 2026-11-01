@@ -15,7 +15,8 @@ use carina_core::parser::{
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Directives, LoopSlot, NoPlaceholder,
+    RelativeBindingName, ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
 use indexmap::IndexMap;
@@ -23,6 +24,10 @@ use tempfile::TempDir;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
 }
 
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
@@ -47,7 +52,7 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
 }
 
 fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
-    let configs = [ProviderConfig {
+    let configs: [ProviderConfig; 1] = [ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -177,13 +182,14 @@ fn assert_success(label: &str, output: &Output) {
 }
 
 fn mock_resource(name: &str, binding: &str) -> Resource {
-    Resource::with_provider(
+    let mut resource = Resource::with_provider(
         "mock",
         "test.resource",
         carina_core::resource::ResourceIdentity::try_from(name.to_string()).unwrap(),
         None,
-    )
-    .with_binding(binding)
+    );
+    resource.binding = Some(absolute_binding(binding));
+    resource
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {
@@ -213,7 +219,8 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
 
     let template_resource: carina_core::resource::Resource<
         carina_core::resource::ModuleSource,
-        carina_core::resource::LoopSlot,
+        LoopSlot,
+        AbsoluteBindingAddress,
     > = carina_core::resource::Resource::with_provider(
         "mock",
         "test.resource",
@@ -221,14 +228,23 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             .unwrap(),
         None,
     )
-    .with_binding("validation_records");
+    .with_absolute_binding(carina_core::resource::absolute_binding_address_for_test(
+        "validation_records",
+    ));
     let template = DeferredForExpression::new(
         Some("main.crn".to_string()),
         1,
         "for opt in cert.domain_validation_options".to_string(),
-        carina_core::parser::DeferredForTarget::bound("validation_records")
-            .expect("fixture binding is valid"),
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        carina_core::parser::DeferredForTarget::bound(
+            carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+            "cert",
+            "domain_validation_options",
+            Vec::new(),
+        )
+        .resolve_root_for_test(),
         ForBinding::Simple("opt".to_string()),
         template_resource,
     );
@@ -244,8 +260,8 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             identifier: AppliedIdentifier::new("old-validation-id")
                 .expect("fixture identifier is non-empty"),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: HashSet::from([absolute_binding("cert")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         }])
@@ -337,7 +353,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         .expect("fixture identifier is non-empty")
         .with_attribute("name", serde_json::json!("main-current"))
         .with_attribute("status", serde_json::json!("ACTIVE"));
-    row.binding = Some("main".to_string());
+    row.binding = Some(absolute_binding("main"));
     row.deposed.push(DeposedInstance::from_persisted_json(
         deposed_key.clone(),
         "main-old".to_string(),
@@ -375,7 +391,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         identifier: AppliedIdentifier::new("main-old").expect("fixture identifier is non-empty"),
         generation: EffectGeneration::Deposed(deposed_key),
         directives: Directives::default(),
-        binding: Some("main".to_string()),
+        binding: Some(absolute_binding("main")),
         dependencies: HashSet::new(),
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),

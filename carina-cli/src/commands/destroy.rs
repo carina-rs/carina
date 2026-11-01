@@ -30,7 +30,8 @@ use carina_core::provider::{Provider, ProviderError};
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
-    ConcreteValue, Current, PreventDestroySource, ResolvedResourceId, Resource, ResourceId, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, PreventDestroySource, ResolvedResourceId,
+    Resource, ResourceId, ResourceIdentity, Value,
 };
 use carina_core::schema::SchemaKind;
 #[cfg(test)]
@@ -716,11 +717,13 @@ async fn run_destroy_locked_owned(
     resources_to_destroy.sort_by(|left, right| {
         let left_key = left
             .binding
-            .clone()
+            .as_ref()
+            .map(ToString::to_string)
             .unwrap_or_else(|| left.id.identity_display().to_string());
         let right_key = right
             .binding
-            .clone()
+            .as_ref()
+            .map(ToString::to_string)
             .unwrap_or_else(|| right.id.identity_display().to_string());
         left_key.cmp(&right_key)
     });
@@ -766,7 +769,8 @@ async fn run_destroy_locked_owned(
         .iter()
         .map(|effect| {
             effect
-                .binding_name()
+                .binding_address()
+                .map(ToString::to_string)
                 .unwrap_or_else(|| effect.resource_id().identity_display().to_string())
         })
         .collect();
@@ -951,10 +955,13 @@ async fn run_destroy_locked_owned(
     let resource_info: Vec<(String, Effect)> = delete_effects
         .iter()
         .map(|effect| {
-            let binding = effect.binding_name().unwrap_or_else(|| {
-                let id = effect.resource_id();
-                format!("{}:{}", id.resource_type, id.identity_display())
-            });
+            let binding = effect
+                .binding_address()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
+                    let id = effect.resource_id();
+                    format!("{}:{}", id.resource_type, id.identity_display())
+                });
             (binding, effect.clone())
         })
         .collect();
@@ -1507,6 +1514,7 @@ async fn run_destroy_locked(
             .await;
         }
     };
+    let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
     let validated_config = match providers.validate_evaluated_config(parsed, base_dir, true, &[]) {
         Ok(validated_config) => validated_config,
         Err(error) => {
@@ -1701,20 +1709,22 @@ fn observe_destroy_success_for_tests(
 }
 
 fn build_destroy_wait_aliases(
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
     delete_effects: &[Effect],
 ) -> Vec<DestroyWaitAlias> {
-    let delete_dependencies: Vec<(String, HashSet<String>)> = delete_effects
+    let delete_dependencies: Vec<(
+        ResourceIdentity,
+        Option<AbsoluteBindingAddress>,
+        HashSet<AbsoluteBindingAddress>,
+    )> = delete_effects
         .iter()
         .filter_map(|effect| match effect {
             Effect::Delete {
-                id, dependencies, ..
-            } => Some((
-                effect
-                    .binding_name()
-                    .unwrap_or_else(|| id.identity_str().to_string()),
-                dependencies.clone(),
-            )),
+                id,
+                binding,
+                dependencies,
+                ..
+            } => Some((id.identity().clone(), binding.clone(), dependencies.clone())),
             Effect::Read { .. }
             | Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -1730,11 +1740,11 @@ fn build_destroy_wait_aliases(
         .collect();
     let destroy_targets: HashSet<&str> = delete_dependencies
         .iter()
-        .map(|(binding, _)| binding.as_str())
+        .filter_map(|(_, binding, _)| binding.as_ref().map(AbsoluteBindingAddress::as_str))
         .collect();
     let referenced_bindings: HashSet<&str> = delete_dependencies
         .iter()
-        .flat_map(|(_, dependencies)| dependencies.iter().map(String::as_str))
+        .flat_map(|(_, _, dependencies)| dependencies.iter().map(AbsoluteBindingAddress::as_str))
         .collect();
 
     wait_bindings
@@ -1746,19 +1756,16 @@ fn build_destroy_wait_aliases(
             }
             let mut consumers = delete_dependencies
                 .iter()
-                .filter(|(_, dependencies)| dependencies.contains(wait.binding.as_str()))
-                .map(|(binding, _)| binding.clone())
+                .filter(|(_, _, dependencies)| dependencies.contains(&wait.binding))
+                .map(|(identity, _, _)| identity.clone())
                 .collect::<Vec<_>>();
-            consumers.sort();
+            consumers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
             consumers.dedup();
 
             DestroyWaitAlias::new(
-                wait.binding.as_str().to_string(),
-                wait.target.as_str().to_string(),
-                wait.depends_on
-                    .iter()
-                    .map(|dep| dep.as_str().to_string())
-                    .collect(),
+                wait.binding.clone(),
+                wait.target.clone(),
+                wait.depends_on.iter().cloned().collect(),
                 consumers,
             )
         })
@@ -2215,6 +2222,10 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
 
+    fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+        crate::absolute_binding_for_test(name)
+    }
+
     #[path = "cancellation_fixture.rs"]
     mod cancellation_fixture;
 
@@ -2292,7 +2303,7 @@ mod tests {
             identifier: carina_core::provider::AppliedIdentifier::new("blocked-id").unwrap(),
             generation: EffectGeneration::Current,
             directives: Default::default(),
-            binding: Some("blocked".into()),
+            binding: Some(absolute_binding("blocked")),
             dependencies: Default::default(),
             explicit_dependencies: Default::default(),
             blocked_by_updates: Default::default(),
@@ -2495,12 +2506,18 @@ mod tests {
     #[tokio::test]
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = parsed
-            .into_expanded()
-            .expect("provider upstream fixture has no parser placeholders");
+        let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            &downstream,
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("test fixture crosses module resolution")
+        .into_expanded()
+        .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2559,7 +2576,7 @@ mod tests {
         parsed
             .upstream_states
             .push(carina_core::parser::UpstreamState {
-                binding: "unrelated".to_string(),
+                binding: carina_core::resource::RelativeBindingName::new("unrelated"),
                 source: std::path::PathBuf::from("../unrelated"),
             });
 
@@ -3121,9 +3138,9 @@ mod tests {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
         use std::collections::{BTreeSet, HashMap};
 
-        let resource =
-            Resource::with_provider("awscc", "ec2.Vpc", "main", Some("current".to_string()))
-                .with_binding("main");
+        let mut resource =
+            Resource::with_provider("awscc", "ec2.Vpc", "main", Some("current".to_string()));
+        resource.binding = Some(absolute_binding("main"));
         let current_states = HashMap::from([(
             resource.id.clone(),
             Current::from_state(
@@ -3132,7 +3149,7 @@ mod tests {
         )]);
         let deposed_key = DeposedKey::new_unique();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
-        row.binding = Some("main".to_string());
+        row.binding = Some(absolute_binding("main"));
         row.deposed.push(DeposedInstance::from_persisted_json(
             deposed_key.clone(),
             "vpc-old".to_string(),
@@ -3172,7 +3189,7 @@ mod tests {
             } if id.as_inner().provider_instance.as_deref() == Some("deposed")
                 && identifier.as_str() == "vpc-old"
                 && key == &deposed_key
-                && dependencies == &HashSet::from(["subnet".to_string()])
+                && dependencies == &HashSet::from([absolute_binding("subnet")])
         ));
     }
 
@@ -3356,12 +3373,12 @@ mod tests {
 
         let mut parent = ResourceState::try_applied("test.Parent", "parent", "mock", "parent-123")
             .expect("fixture identifier is non-empty");
-        parent.binding = Some("parent".to_string());
+        parent.binding = Some(absolute_binding("parent"));
         let mut child = ResourceState::try_applied("test.Child", "child", "mock", "child-123")
             .expect("fixture identifier is non-empty");
-        child.binding = Some("child".to_string());
-        child.directives.depends_on = vec!["parent".to_string()];
-        child.dependency_bindings = BTreeSet::from(["network".to_string()]);
+        child.binding = Some(absolute_binding("child"));
+        child.directives.depends_on = vec![absolute_binding("parent")];
+        child.dependency_bindings = BTreeSet::from([absolute_binding("network")]);
 
         let mut state_file = StateFile::new();
         state_file.upsert_resource(parent).unwrap();
@@ -3390,9 +3407,10 @@ mod tests {
             Some(&state_file),
             &HashSet::new(),
         ));
+        let child_binding = absolute_binding("child");
         let child_delete = effects
             .iter()
-            .find(|effect| effect.binding_name().as_deref() == Some("child"))
+            .find(|effect| effect.binding_address() == Some(&child_binding))
             .expect("child orphan must produce a Delete");
         assert!(matches!(
             child_delete,
@@ -3400,8 +3418,10 @@ mod tests {
                 dependencies,
                 explicit_dependencies,
                 ..
-            } if dependencies == &HashSet::from(["network".to_string(), "parent".to_string()])
-                && explicit_dependencies == &HashSet::from(["parent".to_string()])
+            } if dependencies == &HashSet::from([
+                absolute_binding("network"),
+                absolute_binding("parent"),
+            ]) && explicit_dependencies == &HashSet::from([absolute_binding("parent")])
         ));
 
         let analysis = build_effect_dependency_analysis(
@@ -3415,7 +3435,7 @@ mod tests {
         let depths = compute_delete_depths(effects.len(), &deletion_deps);
         let names = effects
             .iter()
-            .map(|effect| effect.binding_name().unwrap())
+            .map(|effect| effect.binding_address().unwrap().to_string())
             .collect::<Vec<_>>();
         let order = topological_delete_order(effects.len(), &deletion_deps, &depths, &names)
             .expect("orphan dependency graph must be acyclic");
@@ -3433,10 +3453,10 @@ mod tests {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
         use std::collections::{BTreeSet, HashMap};
 
-        let resource: Resource =
-            Resource::with_provider("awscc", "s3.Bucket", "state", None).with_binding("state");
+        let mut resource: Resource = Resource::with_provider("awscc", "s3.Bucket", "state", None);
+        resource.binding = Some(absolute_binding("state"));
         let mut row = ResourceState::new("s3.Bucket", "state", "awscc");
-        row.binding = Some("state".to_string());
+        row.binding = Some(absolute_binding("state"));
         row.deposed.push(DeposedInstance::from_persisted_json(
             DeposedKey::new_unique(),
             "old-state-bucket".to_string(),
@@ -3471,7 +3491,7 @@ mod tests {
         use std::collections::{BTreeSet, HashMap};
 
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
-        row.binding = Some("main".to_string());
+        row.binding = Some(absolute_binding("main"));
         row.directives.set_prevent_destroy(true);
         let deposed_key = DeposedKey::new_unique();
         row.deposed.push(DeposedInstance::from_persisted_json(

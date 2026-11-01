@@ -16,8 +16,8 @@ use super::{ParserProviderConfig as ProviderConfig, ParserWaitBinding as WaitBin
 use super::{ProviderContext, Rule};
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
 use crate::resource::{
-    DiagnosticSourceSpan, ModuleSource, ParserPlaceholder, Resource as GenericResource, ResourceId,
-    Value as GenericValue,
+    DiagnosticSourceSpan, ModuleSource, ParserPlaceholder, RelativeBindingName,
+    Resource as GenericResource, ResourceId, Value as GenericValue,
 };
 use indexmap::IndexMap;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -25,8 +25,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-type Value = GenericValue<ParserPlaceholder>;
-type Resource = GenericResource<ModuleSource, ParserPlaceholder>;
+type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
+type Resource = GenericResource<ModuleSource, ParserPlaceholder, RelativeBindingName>;
 #[derive(Clone)]
 pub(crate) struct AuthoredDiagnosticSource {
     path: std::path::PathBuf,

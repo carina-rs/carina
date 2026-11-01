@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use carina_core::parser::BackendConfig as ParserBackendConfig;
+use carina_core::resource::{BindingAddress, PlaceholderKind};
 use thiserror::Error;
 
 use crate::backend::{BackendError, BackendResult};
@@ -250,12 +251,15 @@ impl BackendSelection {
     /// A pending migration selects the old backend recorded in the lock and
     /// returns its drift metadata without printing. Missing locks are allowed
     /// here so the command layer can retain command-specific policy.
-    pub fn for_read(
+    pub fn for_read<P: PlaceholderKind, B: BindingAddress>(
         project_dir: &Path,
-        configured: Option<&ParserBackendConfig>,
+        configured: Option<&ParserBackendConfig<P, B>>,
     ) -> BackendResult<ReadBackendSelection> {
-        let project_dir = canonical_project_dir(project_dir);
-        let inspection = inspect(&project_dir, configured)?;
+        let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
+        Self::for_read_inspection(inspection)
+    }
+
+    fn for_read_inspection(inspection: BackendInspection) -> BackendResult<ReadBackendSelection> {
         let lock_present = !matches!(inspection.status, BackendDriftStatus::Fresh);
         let (selected_config, drift) = match inspection.status {
             BackendDriftStatus::Drifted(drift) => {
@@ -276,12 +280,17 @@ impl BackendSelection {
     /// Select a backend for an operation that may mutate state.
     ///
     /// Only the `Verified` result carries a constructible backend token.
-    pub fn verified_for_mutation(
+    pub fn verified_for_mutation<P: PlaceholderKind, B: BindingAddress>(
         project_dir: &Path,
-        configured: Option<&ParserBackendConfig>,
+        configured: Option<&ParserBackendConfig<P, B>>,
     ) -> BackendResult<MutationBackendSelection> {
-        let project_dir = canonical_project_dir(project_dir);
-        let inspection = inspect(&project_dir, configured)?;
+        let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
+        Self::verified_for_mutation_inspection(inspection)
+    }
+
+    fn verified_for_mutation_inspection(
+        inspection: BackendInspection,
+    ) -> BackendResult<MutationBackendSelection> {
         match inspection.status {
             BackendDriftStatus::Fresh => Ok(MutationBackendSelection::MissingLock {
                 path: BackendLock::lock_path(&inspection.project_dir),
@@ -347,9 +356,9 @@ impl BackendSelection {
 
     /// Force-release a backend lock, selecting the old locked backend during
     /// pending migration without exposing a general backend capability.
-    pub async fn force_unlock(
+    pub async fn force_unlock<P: PlaceholderKind, B: BindingAddress>(
         project_dir: &Path,
-        configured: Option<&ParserBackendConfig>,
+        configured: Option<&ParserBackendConfig<P, B>>,
         lock_id: &str,
     ) -> BackendResult<()> {
         let selected = Self::for_read(project_dir, configured)?;
@@ -378,22 +387,29 @@ impl BackendSelection {
 }
 
 /// Inspect backend drift without constructing a backend.
-pub fn inspect_backend_drift(
+pub fn inspect_backend_drift<P: PlaceholderKind, B: BindingAddress>(
     project_dir: &Path,
-    configured: Option<&ParserBackendConfig>,
+    configured: Option<&ParserBackendConfig<P, B>>,
 ) -> BackendResult<BackendDriftStatus> {
     inspect(project_dir, configured).map(|inspection| inspection.status)
 }
 
-fn inspect(
+fn inspect<P: PlaceholderKind, B: BindingAddress>(
     project_dir: &Path,
-    configured: Option<&ParserBackendConfig>,
+    configured: Option<&ParserBackendConfig<P, B>>,
 ) -> BackendResult<BackendInspection> {
-    let project_dir = project_dir.to_path_buf();
     let configured = configured
         .map(BackendConfig::try_from)
         .transpose()
         .map_err(BackendError::from)?;
+    inspect_resolved(project_dir, configured)
+}
+
+fn inspect_resolved(
+    project_dir: &Path,
+    configured: Option<BackendConfig>,
+) -> BackendResult<BackendInspection> {
+    let project_dir = project_dir.to_path_buf();
     let configured_lock = configured
         .as_ref()
         .map(BackendLock::from_config)
@@ -600,7 +616,7 @@ mod tests {
         let alias = root.path().join("project-alias");
         symlink(&project, &alias).unwrap();
 
-        let selected = BackendSelection::for_read(&alias, None).unwrap();
+        let selected = BackendSelection::for_read(&alias, None::<&ParserBackendConfig>).unwrap();
         let BackendTarget::Configured { base_dir, .. } = selected.selection.target() else {
             panic!("project read must select a configured backend target")
         };

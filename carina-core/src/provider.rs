@@ -911,6 +911,7 @@ impl DeleteRequest {
 ///     force_delete: false,
 ///     create_before_destroy: false,
 ///     prevent_destroy: false,
+///     prevent_destroy_source: None,
 /// };
 /// ```
 ///
@@ -925,6 +926,20 @@ pub struct ProviderDirectives {
     create_before_destroy: bool,
     prevent_destroy: bool,
     prevent_destroy_source: Option<PreventDestroySource>,
+}
+
+/// Read-only projection used at the provider protocol boundary.
+///
+/// The projection is intentionally constructed only by
+/// [`ProviderDirectives::protocol_parts`]. Keeping the exhaustive projection
+/// beside the private fields means adding an effective directive cannot be
+/// silently omitted from the wire conversion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderDirectiveProtocolParts {
+    pub(crate) force_delete: bool,
+    pub(crate) create_before_destroy: bool,
+    pub(crate) prevent_destroy: bool,
+    pub(crate) prevent_destroy_source: Option<PreventDestroySource>,
 }
 
 impl ProviderDirectives {
@@ -977,6 +992,21 @@ impl ProviderDirectives {
     /// Provenance for effective destruction protection, when enabled.
     pub fn prevent_destroy_source(&self) -> Option<PreventDestroySource> {
         self.prevent_destroy_source
+    }
+
+    pub(crate) fn protocol_parts(&self) -> ProviderDirectiveProtocolParts {
+        let Self {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            prevent_destroy_source,
+        } = *self;
+        ProviderDirectiveProtocolParts {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            prevent_destroy_source,
+        }
     }
 }
 
@@ -5231,9 +5261,14 @@ impl ProviderInstanceKey {
     }
 }
 
-impl From<&ProviderConfig> for ProviderInstanceKey {
-    fn from(config: &ProviderConfig) -> Self {
-        Self::new(config.name.clone(), config.binding.clone())
+impl<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>
+    From<&ProviderConfig<P, B>> for ProviderInstanceKey
+{
+    fn from(config: &ProviderConfig<P, B>) -> Self {
+        Self::new(
+            config.name.clone(),
+            config.binding.as_ref().map(ToString::to_string),
+        )
     }
 }
 
@@ -5328,7 +5363,10 @@ impl std::error::Error for DefaultTagEncodingError {}
 /// Records which tag keys came from defaults as host-owned provenance on the
 /// resource, separate from provider-facing attributes.
 pub fn merge_default_tags<S>(
-    config: &ProviderConfig,
+    config: &ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >,
     resources: &mut [Resource<S>],
     registry: &SchemaRegistry,
 ) -> ProviderResult<()> {
@@ -5917,7 +5955,14 @@ impl ProviderRouter {
 
     /// Register a provider under the same route derived from its config by
     /// host-owned normalization.
-    pub fn add_provider_config(&mut self, config: &ProviderConfig, provider: InitializedProvider) {
+    pub fn add_provider_config<
+        P: crate::resource::PlaceholderKind,
+        B: crate::resource::BindingAddress,
+    >(
+        &mut self,
+        config: &ProviderConfig<P, B>,
+        provider: InitializedProvider,
+    ) {
         self.providers
             .insert(ProviderInstanceKey::from(config), provider);
     }
@@ -7287,7 +7332,7 @@ where
     fn validate<'a>(
         &self,
         target: crate::parser::CustomTypeValidationTarget<'a>,
-        value: &'a Value,
+        value: &'a crate::resource::Value,
     ) -> Result<(), crate::parser::CustomTypeValidationError> {
         let factories = self.factories.as_factories();
         match target {
@@ -7633,6 +7678,15 @@ impl Provider for Box<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
+    type DeferredValue = crate::resource::ExpandedDeferredValue;
+
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::unavailable(Box::new(provider))
@@ -8826,14 +8880,14 @@ mod tests {
                     ("S".to_string(), placeholder.clone()),
                     (
                         "Vpc".to_string(),
-                        Value::resource_ref("vpc", "identifier", Vec::new()),
+                        Value::root_resource_ref("vpc", "identifier", Vec::new()),
                     ),
                 ]))),
             ),
             (
                 "items".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::resource_ref("vpc", "identifier", Vec::new()),
+                    Value::root_resource_ref("vpc", "identifier", Vec::new()),
                     placeholder,
                 ])),
             ),
@@ -8899,12 +8953,12 @@ mod tests {
                 ),
                 (
                     "Owner".to_string(),
-                    Value::resource_ref("management", "owner", Vec::new()),
+                    Value::root_resource_ref("management", "owner", Vec::new()),
                 ),
                 (
                     "Count".to_string(),
                     crate::integer_arithmetic::evaluate_integer_values(
-                        Value::resource_ref("management", "count", Vec::new()),
+                        Value::root_resource_ref("management", "count", Vec::new()),
                         crate::integer_arithmetic::IntegerOp::Add,
                         Value::Concrete(ConcreteValue::Int(1)),
                         crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
@@ -8918,12 +8972,8 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut resources = vec![Resource::with_provider(
-            "aws",
-            "service.Widget",
-            "example",
-            None,
-        )];
+        let resource: Resource = Resource::with_provider("aws", "service.Widget", "example", None);
+        let mut resources = vec![resource];
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
@@ -8974,15 +9024,15 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut resources = vec![
-            Resource::with_provider("aws", "service.Widget", "example", None).with_attribute(
+        let resource: Resource = Resource::with_provider("aws", "service.Widget", "example", None)
+            .with_attribute(
                 "tags",
                 Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "Name".to_string(),
                     Value::Concrete(ConcreteValue::String("example".into())),
                 )]))),
-            ),
-        ];
+            );
+        let mut resources = vec![resource];
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
@@ -9020,7 +9070,7 @@ mod tests {
 
         config.default_tags.insert(
             "ManagedBy".to_string(),
-            Value::resource_ref("management", "owner", Vec::new()),
+            Value::root_resource_ref("management", "owner", Vec::new()),
         );
         config.default_tags.insert(
             "Team".to_string(),
@@ -9600,7 +9650,9 @@ mod tests {
             };
             assert_eq!(pending, expected);
             let rendered =
-                crate::value::render_unknown(&ApplyTimeUnknown::PendingReRead(pending.clone()));
+                crate::value::render_unknown(&ApplyTimeUnknown::<
+                    crate::resource::AbsoluteBindingAddress,
+                >::PendingReRead(pending.clone()));
             assert_eq!(
                 rendered,
                 "(unknown until next refresh: read after apply was incomplete — provider returned a partial read)"
@@ -11369,7 +11421,10 @@ mod tests {
             "mock".to_string(),
             initialized(TaggedProvider { tag: "default" }),
         );
-        let named_config = ProviderConfig {
+        let named_config: ProviderConfig<
+            crate::resource::NoPlaceholder,
+            crate::resource::RelativeBindingName,
+        > = ProviderConfig {
             name: "mock".to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
@@ -11875,7 +11930,7 @@ mod tests {
         // Test normalize_desired
         let ext = SchemaOnlyProvider;
         let mut resources = vec![
-            Resource::new("test", "example")
+            Resource::<crate::resource::ModuleSource>::new("test", "example")
                 .with_attribute(
                     "key",
                     Value::Concrete(ConcreteValue::String("value".into())),
@@ -12041,19 +12096,17 @@ mod tests {
         router.add_provider("normalizing".to_string(), initialized(NormalizingProvider));
         router.add_normalizer("normalizing", Box::new(TestNormalizer));
 
-        let peer_ref = Value::resource_ref("peer", "identifier", Vec::new());
+        let peer_ref = Value::root_resource_ref("peer", "identifier", Vec::new());
         let pending = Value::Deferred(DeferredValue::Unknown(
             crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".to_string(),
+                binding: absolute_binding("upstream"),
             },
         ));
-        let mut resources = vec![
-            Resource::with_provider("normalizing", "test", "example", None)
-                .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
-                .with_attribute("peer", peer_ref.clone())
-                .with_attribute("pending", pending.clone())
-                .into_provider_resource(),
-        ];
+        let resource: Resource = Resource::with_provider("normalizing", "test", "example", None)
+            .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
+            .with_attribute("peer", peer_ref.clone())
+            .with_attribute("pending", pending.clone());
+        let mut resources = vec![resource.into_provider_resource()];
         router.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),

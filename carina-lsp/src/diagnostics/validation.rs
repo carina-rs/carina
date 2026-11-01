@@ -11,14 +11,14 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::resource::{ParserPlaceholder, Value as GenericValue};
+use carina_core::resource::{ParserPlaceholder, RelativeBindingName, Value as GenericValue};
 use carina_core::schema::{
     EffectiveType, FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema,
 };
 
 use super::{DiagnosticEngine, build_enum_diagnostic_from_error, carina_diagnostic};
 
-type Value = GenericValue<ParserPlaceholder>;
+type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
 impl DiagnosticEngine {
     /// Run [`carina_core::schema::EffectiveType::validate_collect`] against

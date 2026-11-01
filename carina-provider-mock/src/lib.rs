@@ -22,7 +22,8 @@ use carina_core::provider::{
     ResumeOutcomeKind,
 };
 use carina_core::resource::{
-    ConcreteValue, PlaceholderKind, Resource, ResourceId, State, Value, legacy_secret_migration,
+    BindingAddress, ConcreteValue, PlaceholderKind, Resource, ResourceId, State, Value,
+    legacy_secret_migration,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
@@ -92,8 +93,8 @@ impl std::error::Error for MockStateValueDecodeError {
 /// `provider mock {}` whose provider factory was not loaded. A sourced mock
 /// always belongs to the plugin path, including when that plugin failed to
 /// load.
-pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a>(
-    provider_configs: impl IntoIterator<Item = &'a ProviderConfig<P>>,
+pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
+    provider_configs: impl IntoIterator<Item = &'a ProviderConfig<P, B>>,
     provider_is_loaded: impl FnOnce(&str) -> bool,
 ) -> bool {
     let mut provider_configs = provider_configs.into_iter().peekable();
@@ -2068,7 +2069,7 @@ mod tests {
         )
     }
 
-    fn mock_provider_config() -> ProviderConfig {
+    fn mock_provider_config() -> carina_core::parser::ExpandedProviderConfig {
         carina_core::parser::parse_file(
             "provider mock {}\n",
             std::path::Path::new("mock_provider_config.crn"),
@@ -2085,7 +2086,10 @@ mod tests {
 
     #[test]
     fn builtin_provider_selection_is_shared_by_implicit_and_explicit_mock_paths() {
-        assert!(uses_builtin_provider::<NoPlaceholder>(&[], |_| {
+        assert!(uses_builtin_provider::<
+            NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >(&[], |_| {
             panic!("the implicit fallback does not depend on loaded factories")
         }));
 

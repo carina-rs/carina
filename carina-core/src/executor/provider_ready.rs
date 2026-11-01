@@ -26,9 +26,10 @@ use crate::provider::{
 #[cfg(test)]
 use crate::resource::NoPlaceholder;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, LiveComposition, ParserPlaceholder, PlaceholderKind,
-    ProviderDataSource, ProviderModuleSource, ProviderResource, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
+    BindingAddress, ConcreteValue, DataSource, DeferredValue, LiveComposition, ParserPlaceholder,
+    PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
+    RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
+    SavedComposition, Value,
 };
 use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
@@ -148,7 +149,10 @@ impl ProviderReadyConfig {
 pub struct ProviderPreparationContext<'a> {
     bindings: &'a ResolvedBindings,
     module_gate: &'a ModuleConstraintGate,
-    provider_configs: &'a [ProviderConfig],
+    provider_configs: &'a [ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
     normalizer: &'a dyn ProviderNormalizer,
     custom_type_resolver:
         crate::provider::FactoryCustomTypeResolver<&'a [Box<dyn ProviderFactory>]>,
@@ -159,7 +163,10 @@ impl<'a> ProviderPreparationContext<'a> {
     pub fn new(
         bindings: &'a ResolvedBindings,
         module_gate: &'a ModuleConstraintGate,
-        provider_configs: &'a [ProviderConfig],
+        provider_configs: &'a [ProviderConfig<
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+        >],
         normalizer: &'a dyn ProviderNormalizer,
         factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
@@ -491,11 +498,11 @@ impl ProviderConfigPreparationError {
     }
 }
 
-fn canonicalize_provider_config_attributes(
+fn canonicalize_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
     provider_name: &str,
-    attributes: &IndexMap<String, Value>,
+    attributes: &IndexMap<String, Value<P, B>>,
     attr_types: &crate::schema::ValidatedConfigSchema,
-) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+) -> Result<IndexMap<String, Value<P, B>>, ProviderConfigPreparationError> {
     let attributes = crate::value::canonicalize_provider_config_attributes_with_types(
         provider_name,
         attributes,
@@ -509,7 +516,27 @@ fn canonicalize_provider_config_attributes(
             error: vec![error].into(),
         }
     })?;
-    Ok(CanonicalProviderConfigAttributes { attributes })
+    Ok(attributes)
+}
+
+fn validate_canonical_provider_config(
+    factory: &dyn ProviderFactory,
+    provider_name: &str,
+    attributes: IndexMap<String, Value>,
+) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+    let canonical = CanonicalProviderConfigAttributes { attributes };
+    factory.validate_config(&canonical).map_err(|error| {
+        let error = if canonical.values().any(crate::value::contains_secret) {
+            error.with_redacted_message("configuration containing a secret failed validation")
+        } else {
+            error
+        };
+        ProviderConfigPreparationError::ProviderValidation {
+            provider: provider_name.to_string(),
+            error: ProviderConfigValidationError { error },
+        }
+    })?;
+    Ok(canonical)
 }
 
 /// Validate and canonicalize one provider configuration through the single
@@ -529,79 +556,39 @@ pub fn validate_and_canonicalize_provider_config(
     let config_schema = factory.provider_config_attribute_types();
     let canonical =
         canonicalize_provider_config_attributes(provider_name, attributes, &config_schema)?;
-    validate_provider_config_attributes(
-        factory,
-        provider_name,
-        canonical.attributes(),
-        &config_schema,
-    )?;
+    validate_provider_config_attributes(factory, provider_name, &canonical, &config_schema)?;
 
     let serializable = canonical
-        .attributes
         .into_iter()
-        .filter(|(_, value)| !crate::validation::value_contains_unresolved_ref(value))
+        .filter_map(|(name, value)| {
+            value
+                .try_into_address_free_absolute()
+                .map(|value| (name, value))
+        })
         .collect();
-    let canonical = CanonicalProviderConfigAttributes {
-        attributes: serializable,
-    };
-
-    factory.validate_config(&canonical).map_err(|error| {
-        let error = if canonical.values().any(crate::value::contains_secret) {
-            error.with_redacted_message("configuration containing a secret failed validation")
-        } else {
-            error
-        };
-        ProviderConfigPreparationError::ProviderValidation {
-            provider: provider_name.to_string(),
-            error: ProviderConfigValidationError { error },
-        }
-    })?;
-
-    Ok(canonical)
+    validate_canonical_provider_config(factory, provider_name, serializable)
 }
 
 pub fn validate_parser_provider_config(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &IndexMap<String, Value<ParserPlaceholder>>,
+    attributes: &IndexMap<String, Value<ParserPlaceholder, RelativeBindingName>>,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
     let config_schema = factory.provider_config_attribute_types();
-    let serializable = attributes
+    let canonical =
+        canonicalize_provider_config_attributes(provider_name, attributes, &config_schema)?;
+    validate_provider_config_attributes(factory, provider_name, &canonical, &config_schema)?;
+
+    let serializable = canonical
         .iter()
         .filter_map(|(name, value)| {
-            if crate::validation::value_contains_unresolved_ref(value) {
-                return None;
-            }
-            value.to_expanded().map(|value| (name.clone(), value))
+            value
+                .to_expanded()?
+                .try_into_address_free_absolute()
+                .map(|value| (name.clone(), value))
         })
         .collect();
-    let canonical =
-        canonicalize_provider_config_attributes(provider_name, &serializable, &config_schema)?;
-
-    let mut validation_attributes = attributes.clone();
-    for (name, value) in canonical.attributes() {
-        validation_attributes.insert(name.clone(), value.clone().into_placeholder_type());
-    }
-    validate_provider_config_attributes(
-        factory,
-        provider_name,
-        &validation_attributes,
-        &config_schema,
-    )?;
-
-    factory.validate_config(&canonical).map_err(|error| {
-        let error = if canonical.values().any(crate::value::contains_secret) {
-            error.with_redacted_message("configuration containing a secret failed validation")
-        } else {
-            error
-        };
-        ProviderConfigPreparationError::ProviderValidation {
-            provider: provider_name.to_string(),
-            error: ProviderConfigValidationError { error },
-        }
-    })?;
-
-    Ok(canonical)
+    validate_canonical_provider_config(factory, provider_name, serializable)
 }
 
 /// Prepare provider configuration for construction and normalization.
@@ -643,10 +630,10 @@ pub fn prepare_provider_ready_config(
 /// The static validation phase calls this directly because unresolved values
 /// are intentionally allowed there. Provider construction calls it only after
 /// proving the complete map resolved.
-fn validate_provider_config_attributes<P: PlaceholderKind>(
+fn validate_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &IndexMap<String, Value<P>>,
+    attributes: &IndexMap<String, Value<P, B>>,
     attr_types: &crate::schema::ValidatedConfigSchema,
 ) -> Result<(), ProviderConfigPreparationError> {
     let lookup = crate::parser::custom_type_lookup_for_factory(factory);

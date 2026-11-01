@@ -1,6 +1,8 @@
 //! `join(separator, list)` built-in function
 
-use crate::resource::{ConcreteValue, DeferredValue, Value, ValueString};
+use crate::resource::{
+    BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Value, ValueString,
+};
 
 use super::value_type_name;
 
@@ -15,7 +17,9 @@ use super::value_type_name;
 /// join("-", ["a", "b", "c"])  // => "a-b-c"
 /// ["a", "b"] |> join("-")     // => "a-b" (pipe form)
 /// ```
-pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_join<B: BindingAddress>(
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!(
             "join() expects 2 arguments (separator, list), got {}",
@@ -67,7 +71,9 @@ pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
     }
 }
 
-fn join_scalar(value: &Value) -> Result<(ValueString, bool), String> {
+fn join_scalar<B: BindingAddress>(
+    value: &Value<NoPlaceholder, B>,
+) -> Result<(ValueString, bool), String> {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => Ok((value.clone(), false)),
         Value::Concrete(ConcreteValue::EnumIdentifier(value)) => Ok((value.as_str().into(), false)),
@@ -98,7 +104,10 @@ fn join_scalar(value: &Value) -> Result<(ValueString, bool), String> {
 mod tests {
     use crate::ValueDescription;
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, DeferredValue, Value};
+    use crate::resource::{
+        ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+        ExpandedValue as Value,
+    };
     use crate::value::{PERSISTED_SECRET_KEY, format_value, value_to_json};
 
     #[test]
@@ -245,7 +254,7 @@ mod tests {
 
     #[test]
     fn unknown_function() {
-        let result = evaluate_builtin("unknown_func", &[]);
+        let result: Result<Value, String> = evaluate_builtin("unknown_func", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown built-in function"));
     }

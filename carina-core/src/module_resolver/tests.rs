@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
@@ -20,10 +20,22 @@ use crate::parser::{
     ParsedDeferredForPhase, ParsedFile, ProviderContext, ResourceTypePath, SourceSpan, TypeExpr,
 };
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, ModuleSource, ParserPlaceholder,
-    RawEnumIdentifier, Resource, ResourceId, ResourceIdentity, Value,
+    AbsoluteBindingAddress, CanonicalEnumValue, LoopSlot, ModuleSource, ParserPlaceholder,
+    RawEnumIdentifier, RelativeBindingName, ResourceId, ResourceIdentity,
 };
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+
+type Value<P = ParserPlaceholder, B = RelativeBindingName> = crate::resource::Value<P, B>;
+type ConcreteValue<P = ParserPlaceholder, B = RelativeBindingName> =
+    crate::resource::ConcreteValue<P, B>;
+type DeferredValue<P = ParserPlaceholder, B = RelativeBindingName> =
+    crate::resource::DeferredValue<P, B>;
+type Directives<B = RelativeBindingName> = crate::resource::Directives<B>;
+type Resource<S = ModuleSource, P = ParserPlaceholder, B = RelativeBindingName> =
+    crate::resource::Resource<S, P, B>;
+type ExpandedValue = Value<ParserPlaceholder, AbsoluteBindingAddress>;
+type ExpandedConcreteValue = ConcreteValue<ParserPlaceholder, AbsoluteBindingAddress>;
+type ExpandedDeferredValue = DeferredValue<ParserPlaceholder, AbsoluteBindingAddress>;
 
 fn known(type_expr: TypeExpr) -> TypeExpr {
     type_expr
@@ -40,7 +52,10 @@ fn resolve_modules(
     parsed: ParsedFile,
     base_dir: &std::path::Path,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
-    super::resolve_modules_providerless(parsed, base_dir)
+    super::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        base_dir,
+    )
 }
 
 fn resolve_modules_with_config(
@@ -49,20 +64,34 @@ fn resolve_modules_with_config(
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
-    super::resolve_modules_with_providerless_config(parsed, base_dir, config, schemas)
+    super::resolve_modules_with_providerless_config(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        base_dir,
+        config,
+        schemas,
+    )
 }
 
 fn reconcile_anonymous_module_instances(
-    resources: &mut [Resource<crate::resource::ModuleSource, ParserPlaceholder>],
-    compositions: &mut [crate::resource::LiveComposition<ParserPlaceholder>],
+    resources: &mut [Resource<ModuleSource, ParserPlaceholder, AbsoluteBindingAddress>],
+    compositions: &mut [crate::resource::LiveComposition<
+        ParserPlaceholder,
+        AbsoluteBindingAddress,
+    >],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
+    let mut file = crate::parser::ModuleResolvedParsedFile {
+        resources: resources.to_vec(),
+        compositions: compositions.to_vec(),
+        ..Default::default()
+    };
     crate::module_resolver::reconcile_anonymous_module_instances(
-        resources,
-        compositions,
+        &mut file,
         find_state_names_by_type,
         &crate::identifier::StateBlockClaims::empty(),
     );
+    resources.clone_from_slice(&file.resources);
+    compositions.clone_from_slice(&file.compositions);
 }
 
 fn module_arguments(
@@ -74,13 +103,1267 @@ fn module_arguments(
         .collect()
 }
 
+fn expanded_resource_ref(
+    binding: impl Into<String>,
+    attribute: impl Into<String>,
+    path: Vec<String>,
+) -> ExpandedValue {
+    Value::resource_ref(
+        crate::resource::RelativeBindingName::new(binding.into()),
+        attribute,
+        path,
+    )
+    .resolve_root(&crate::resource::RootScope::new())
+}
+
+/// Small filesystem fixture shared by module-resolution regressions. Keeping
+/// directory creation and writes here makes each test describe only the
+/// module graph it is exercising.
+struct ModuleResolutionFixture {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl ModuleResolutionFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("temporary module-resolution fixture");
+        let root = temp.path().to_path_buf();
+        Self { _temp: temp, root }
+    }
+
+    fn write(&self, relative: impl AsRef<Path>, source: &str) -> PathBuf {
+        let path = self.root.join(relative);
+        fs::create_dir_all(path.parent().expect("fixture file has a parent"))
+            .expect("create fixture directory");
+        fs::write(&path, source).expect("write fixture file");
+        path
+    }
+
+    fn resolve_caller(
+        &self,
+        caller_relative: impl AsRef<Path>,
+    ) -> Result<ModuleResolvedParsedFile, ModuleError> {
+        let caller_file = self.root.join(caller_relative);
+        let caller = fs::read_to_string(&caller_file).expect("read fixture caller");
+        let parsed = crate::parser::parse_file(&caller, &caller_file, &ProviderContext::default())
+            .expect("fixture caller parses");
+        resolve_modules(
+            parsed,
+            caller_file.parent().expect("caller file has a directory"),
+        )
+    }
+}
+
+fn assert_secret_resource_reference_is_module_qualified(call: &str) -> AbsoluteBindingAddress {
+    let fixture = ModuleResolutionFixture::new();
+    let caller = format!("let app_module = use {{ source = \"./modules/app\" }}\n{call}\n");
+    let caller_file = fixture.write("main.crn", &caller);
+    fixture.write(
+        "modules/app/main.crn",
+        r#"arguments { marker: String = "app" }
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = secret(role.identifier)
+}
+"#,
+    );
+    fixture.write(
+        "modules/app/iam.crn",
+        "let role = mock.test.resource { name = \"role\" }\n",
+    );
+    let parsed = crate::parser::parse_file(&caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let prefix = instance_prefix_for_call(&parsed.module_calls[0]);
+    let expanded = resolve_modules(parsed, &fixture.root).expect("module expands");
+    let consumer = expanded
+        .resources
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == format!("{prefix}.consumer"))
+        })
+        .expect("expanded consumer");
+    let ExpandedValue::Deferred(ExpandedDeferredValue::Secret(inner)) =
+        consumer.get_attr("comment").expect("secret comment")
+    else {
+        panic!("comment must remain a secret expression")
+    };
+    let ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) = inner.as_ref()
+    else {
+        panic!("secret must retain the inner resource reference")
+    };
+    assert_eq!(path.binding_address().as_str(), format!("{prefix}.role"));
+    assert_ne!(path.binding_address().as_str(), "role");
+    path.binding_address().clone()
+}
+
+#[test]
+fn named_module_secret_inner_resource_reference_is_absolute() {
+    assert_eq!(
+        assert_secret_resource_reference_is_module_qualified("let app = app_module {}").as_str(),
+        "app.role",
+    );
+}
+
+#[test]
+fn anonymous_module_secret_inner_resource_reference_is_absolute() {
+    let address = assert_secret_resource_reference_is_module_qualified("app_module {}");
+    assert!(address.as_str().starts_with("app_module_"));
+    assert!(address.as_str().ends_with(".role"));
+}
+
+#[test]
+fn module_argument_if_resolves_true_and_false_value_branches() {
+    let root = tempfile::tempdir().expect("temporary module fixture");
+    let module_dir = root.path().join("choice");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&module_dir).expect("create module directory");
+    fs::create_dir_all(&caller_dir).expect("create caller directory");
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { flag: Bool }
+let selected = if flag { "yes" } else { "no" }
+attributes {
+  value: String = selected
+}
+"#,
+    )
+    .expect("write module");
+    let caller = r#"
+let choice = use { source = "../choice" }
+let enabled = choice { flag = true }
+let disabled = choice { flag = false }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).expect("write caller");
+
+    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let parsed = resolve_modules(parsed, &caller_dir).expect("module conditionals expand");
+
+    let value = |binding: &str| {
+        parsed
+            .compositions
+            .iter()
+            .find(|composition| {
+                composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
+            .and_then(|composition| composition.signature.attributes.get("value"))
+            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .unwrap_or_else(|| panic!("missing `{binding}.value`"))
+    };
+    assert_eq!(
+        value("enabled"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("yes".into()))
+    );
+    assert_eq!(
+        value("disabled"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("no".into()))
+    );
+}
+
+#[test]
+fn module_argument_if_selects_integer_arithmetic_branches() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write(
+        "choice/main.crn",
+        r#"arguments {
+  flag: Bool
+  n: Int
+}
+attributes {
+  value: Int = if flag { n + 1 } else { n - 1 }
+  operand_value: Int = (if flag { n } else { n - 2 }) + 1
+}
+"#,
+    );
+    fixture.write(
+        "caller/main.crn",
+        r#"let choice = use { source = "../choice" }
+let incremented = choice { flag = true  n = 10 }
+let decremented = choice { flag = false  n = 10 }
+"#,
+    );
+
+    let parsed = fixture
+        .resolve_caller("caller/main.crn")
+        .expect("module conditionals with integer arithmetic expand");
+    let value = |binding: &str, attribute: &str| {
+        parsed
+            .compositions
+            .iter()
+            .find(|composition| {
+                composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
+            .and_then(|composition| composition.signature.attributes.get(attribute))
+            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .unwrap_or_else(|| panic!("missing `{binding}.{attribute}`"))
+    };
+
+    assert_eq!(
+        value("incremented", "value"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::Int(11))
+    );
+    assert_eq!(
+        value("decremented", "value"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::Int(9))
+    );
+    assert_eq!(
+        value("incremented", "operand_value"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::Int(11)),
+        "a ModuleIf nested in an arithmetic operand must be selected",
+    );
+    assert_eq!(
+        value("decremented", "operand_value"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::Int(9)),
+        "the false ModuleIf operand must be selected before arithmetic folds",
+    );
+}
+
+#[test]
+fn deferred_for_body_selects_module_if_before_deriving_dependencies() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write(
+        "choice/main.crn",
+        r#"arguments { flag: Bool }
+let seed = mock.test.resource {
+  name = "seed"
+  tags = { item = "value" }
+}
+let generated = for _, item in seed.tags {
+  mock.test.resource {
+    name = if flag { seed.name } else { item }
+  }
+}
+"#,
+    );
+    fixture.write(
+        "caller/main.crn",
+        r#"let choice = use { source = "../choice" }
+let enabled = choice { flag = true }
+let disabled = choice { flag = false }
+"#,
+    );
+
+    let parsed = fixture
+        .resolve_caller("caller/main.crn")
+        .expect("module conditionals in deferred-for bodies expand");
+    let deferred = |iterable_binding: &str| {
+        parsed
+            .deferred_for_expressions()
+            .iter()
+            .find(|deferred| {
+                deferred
+                    .root_bindings()
+                    .iter()
+                    .any(|binding| binding.as_str() == iterable_binding)
+            })
+            .unwrap_or_else(|| panic!("missing deferred loop for {iterable_binding}"))
+    };
+
+    let enabled = deferred("enabled.seed");
+    assert_eq!(
+        enabled.template_resource().attributes().get("name"),
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "seed".into()
+        ))),
+    );
+    assert_eq!(
+        enabled
+            .template_resource()
+            .dependency_bindings()
+            .iter()
+            .map(|binding| binding.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["enabled.seed"]),
+        "dependency metadata must be derived from the selected value",
+    );
+
+    let disabled = deferred("disabled.seed");
+    assert!(
+        matches!(
+            disabled.template_resource().attributes().get("name"),
+            Some(crate::resource::Value::Deferred(
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::Loop(
+                    LoopSlot::Value,
+                ))
+            ))
+        ),
+        "the selected false branch must retain only the loop placeholder: {:?}",
+        disabled.template_resource().attributes().get("name"),
+    );
+    assert!(
+        disabled
+            .template_resource()
+            .dependency_bindings()
+            .is_empty(),
+        "the unselected seed reference must not leave a dependency edge: {:?}",
+        disabled.template_resource().dependency_bindings(),
+    );
+}
+
+#[test]
+fn module_argument_if_deferred_value_is_not_serializable_or_deserializable() {
+    let deferred = DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+        DeferredIfCondition::new(
+            Value::Deferred(DeferredValue::Placeholder(
+                ParserPlaceholder::ModuleArgument {
+                    name: "flag".to_string(),
+                    diagnostic: Default::default(),
+                },
+            )),
+            PathBuf::from("module/main.crn"),
+            1,
+        ),
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
+    )));
+
+    let error = serde_json::to_string(&deferred)
+        .expect_err("module-template conditionals must not cross a serde boundary");
+    assert!(
+        error
+            .to_string()
+            .contains("module-template conditional cannot be serialized before expansion"),
+        "unexpected serialization error: {error}",
+    );
+
+    let arithmetic = crate::integer_arithmetic::ValidatedIntegerExpr::new(
+        Value::Deferred(deferred.clone()),
+        crate::integer_arithmetic::IntegerOp::Add,
+        Value::Concrete(ConcreteValue::Int(1)),
+        crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+    )
+    .expect("an Int-valued module conditional is a valid arithmetic operand");
+    let error = serde_json::to_string(&DeferredValue::IntegerArithmetic(arithmetic))
+        .expect_err("an arithmetic operand must not hide a module-template conditional");
+    assert!(
+        error
+            .to_string()
+            .contains("module-template conditional cannot be serialized before expansion"),
+        "unexpected nested serialization error: {error}",
+    );
+
+    let error = serde_json::from_str::<DeferredValue>(r#"{"ModuleIf":{}}"#)
+        .expect_err("ModuleIf must not be a deserializable deferred-value variant");
+    assert!(
+        error.to_string().contains("unknown variant `ModuleIf`"),
+        "unexpected deserialization error: {error}",
+    );
+}
+
+#[test]
+fn module_argument_if_materializes_structural_branches() {
+    let root = tempfile::tempdir().expect("temporary structural-if fixture");
+    let module_dir = root.path().join("choice");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { flag: Bool }
+let selected = if flag {
+  mock.test.Thing { value = "then" }
+} else {
+  mock.test.Thing { value = "else" }
+}
+let optional = if flag {
+  mock.test.Optional { value = "present" }
+}
+"#,
+    )
+    .unwrap();
+    let caller = r#"
+let choice = use { source = "../choice" }
+let enabled = choice { flag = true }
+let disabled = choice { flag = false }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).unwrap();
+
+    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let parsed = resolve_modules(parsed, &caller_dir).expect("structural branches expand");
+
+    let attribute = |binding: &str| {
+        parsed
+            .resources
+            .iter()
+            .find(|resource| {
+                resource.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
+            .and_then(|resource| resource.get_attr("value"))
+            .cloned()
+    };
+    assert_eq!(
+        attribute("enabled.selected"),
+        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "then".into()
+        )))
+    );
+    assert_eq!(
+        attribute("disabled.selected"),
+        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "else".into()
+        )))
+    );
+    assert_eq!(
+        attribute("enabled.optional"),
+        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "present".into()
+        )))
+    );
+    assert_eq!(attribute("disabled.optional"), None);
+    assert!(parsed.deferred_module_ifs.is_empty());
+}
+
+#[test]
+fn module_argument_if_resolves_nested_values_and_pure_function() {
+    let root = tempfile::tempdir().expect("temporary nested-value fixture");
+    let module_dir = root.path().join("choice");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { flag: Bool }
+fn identity(value: Bool): Bool { value }
+let carrier = mock.test.Thing {
+  selected = if flag { "resource-yes" } else { "resource-no" }
+  nested = [{ selected = if flag { "nested-yes" } else { "nested-no" } }]
+}
+attributes {
+  nested = [{ selected = if flag { "yes" } else { "no" } }]
+  by_function: String = if identity(flag) { "yes" } else { "no" }
+}
+"#,
+    )
+    .unwrap();
+    let caller = r#"
+let choice = use { source = "../choice" }
+let enabled = choice { flag = true }
+let disabled = choice { flag = false }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).unwrap();
+
+    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let parsed = resolve_modules(parsed, &caller_dir).expect("nested conditionals expand");
+
+    let output = |binding: &str, name: &str| {
+        parsed
+            .compositions
+            .iter()
+            .find(|composition| {
+                composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
+            .and_then(|composition| composition.signature.attributes.get(name))
+            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .unwrap_or_else(|| panic!("missing `{binding}.{name}`"))
+    };
+    assert_eq!(
+        output("enabled", "by_function"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("yes".into()))
+    );
+    assert_eq!(
+        output("disabled", "by_function"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("no".into()))
+    );
+    let ExpandedValue::Concrete(ExpandedConcreteValue::List(items)) = output("enabled", "nested")
+    else {
+        panic!("nested output was not a list")
+    };
+    let ExpandedValue::Concrete(ExpandedConcreteValue::Map(entry)) = &items[0] else {
+        panic!("nested output item was not a map")
+    };
+    assert_eq!(
+        entry.get("selected"),
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "yes".into()
+        )))
+    );
+    let resource_value = |binding: &str, name: &str| {
+        parsed
+            .resources
+            .iter()
+            .find(|resource| {
+                resource.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
+            .and_then(|resource| resource.get_attr(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("missing `{binding}.{name}`"))
+    };
+    assert_eq!(
+        resource_value("enabled.carrier", "selected"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("resource-yes".into()))
+    );
+    assert_eq!(
+        resource_value("disabled.carrier", "selected"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("resource-no".into()))
+    );
+    let ExpandedValue::Concrete(ExpandedConcreteValue::List(items)) =
+        resource_value("disabled.carrier", "nested")
+    else {
+        panic!("nested resource attribute was not a list")
+    };
+    let ExpandedValue::Concrete(ExpandedConcreteValue::Map(entry)) = &items[0] else {
+        panic!("nested resource attribute item was not a map")
+    };
+    assert_eq!(
+        entry.get("selected"),
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "nested-no".into()
+        )))
+    );
+}
+
+#[test]
+fn module_argument_if_forwarding_resolves_in_outer_caller() {
+    let root = tempfile::tempdir().expect("temporary forwarded-if fixture");
+    let inner_dir = root.path().join("inner");
+    let outer_dir = root.path().join("outer");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments { flag: Bool }
+attributes { value: String = if flag { "yes" } else { "no" } }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments { flag: Bool }
+let inner = use { source = "../inner" }
+let forwarded = inner { flag = flag }
+"#,
+    )
+    .unwrap();
+    let caller = r#"
+let outer = use { source = "../outer" }
+let enabled = outer { flag = true }
+let disabled = outer { flag = false }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).unwrap();
+
+    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let parsed = resolve_modules(parsed, &caller_dir).expect("forwarded conditions expand");
+
+    let nested_value = |binding: &str| {
+        parsed
+            .compositions
+            .iter()
+            .find(|composition| {
+                composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
+            .and_then(|composition| composition.signature.attributes.get("value"))
+            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .unwrap_or_else(|| panic!("missing `{binding}.value`"))
+    };
+    assert_eq!(
+        nested_value("enabled.forwarded"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("yes".into()))
+    );
+    assert_eq!(
+        nested_value("disabled.forwarded"),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("no".into()))
+    );
+}
+
+#[test]
+fn module_argument_if_forwards_structural_selection_across_modules() {
+    let root = tempfile::tempdir().expect("temporary forwarded structural-if fixture");
+    let inner_dir = root.path().join("inner");
+    let outer_dir = root.path().join("outer");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments { inner_flag: Bool }
+let optional = if inner_flag {
+  mock.test.Thing { value = "present" }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+arguments { outer_flag: Bool }
+let inner = use { source = "../inner" }
+let forwarded = inner { inner_flag = outer_flag }
+"#,
+    )
+    .unwrap();
+    let caller = r#"
+let outer = use { source = "../outer" }
+let enabled = outer { outer_flag = true }
+let disabled = outer { outer_flag = false }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).unwrap();
+
+    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let parsed =
+        resolve_modules(parsed, &caller_dir).expect("forwarded structural condition expands");
+
+    assert!(
+        parsed
+            .iter_all_resources()
+            .any(|resource| resource.binding() == Some("enabled.forwarded.optional")),
+        "true forwarding must materialize the inner resource: {:?}",
+        parsed
+            .iter_all_resources()
+            .filter_map(|resource| resource.binding())
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        parsed
+            .iter_all_resources()
+            .all(|resource| resource.binding() != Some("disabled.forwarded.optional")),
+        "false forwarding must not materialize the inner resource",
+    );
+}
+
+#[test]
+fn forwarded_structural_condition_is_not_rebound_by_a_colliding_callee_argument() {
+    let root = tempfile::tempdir().expect("temporary forwarded collision fixture");
+    let inner_dir = root.path().join("dbl");
+    let middle_dir = root.path().join("m");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::create_dir_all(&middle_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments {
+  flag: Bool
+  other: Bool
+}
+let a = if flag {
+  mock.test.resource { name = "then" }
+} else {
+  mock.test.resource { name = "else" }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        middle_dir.join("main.crn"),
+        r#"
+arguments { other: Bool }
+let inner = use { source = "../dbl" }
+let mm = inner {
+  flag = other
+  other = true
+}
+"#,
+    )
+    .unwrap();
+    let caller = r#"
+let middle = use { source = "../m" }
+let off = middle { other = false }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).unwrap();
+
+    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let parsed = resolve_modules(parsed, &caller_dir).expect("forwarded condition expands");
+
+    let selected = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("off.mm.a")
+        })
+        .expect("selected inner resource");
+    assert_eq!(
+        selected.get_attr("name"),
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "else".into()
+        ))),
+        "the already-substituted outer `other` argument was rebound by the inner `other` argument",
+    );
+}
+
+#[test]
+fn diagnostic_expansion_keeps_forwarded_structural_if_in_standalone_module() {
+    let root = tempfile::tempdir().expect("temporary diagnostic forwarding fixture");
+    let inner_dir = root.path().join("inner");
+    let outer_dir = root.path().join("outer");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+arguments { flag: Bool }
+let optional = if flag {
+  mock.test.Thing { value = "present" }
+}
+"#,
+    )
+    .unwrap();
+    let outer_source = r#"
+arguments { flag: Bool }
+let inner = use { source = "../inner" }
+let forwarded = inner { flag = flag }
+"#;
+    let outer_file = outer_dir.join("main.crn");
+    fs::write(&outer_file, outer_source).unwrap();
+
+    let parsed = crate::parser::parse_file(outer_source, &outer_file, &ProviderContext::default())
+        .expect("standalone outer module parses");
+    let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
+    let result = super::resolve_modules_with_providerless_diagnostics(
+        &parsed,
+        &outer_dir,
+        &ProviderContext::default(),
+        &crate::schema::SchemaRegistry::new(),
+        &[],
+    );
+
+    let ModuleResolutionDiagnosticResult::Expanded { graph } = result else {
+        panic!("standalone diagnostic expansion rejected a forwarded template")
+    };
+    assert_eq!(
+        graph.deferred_module_ifs.len(),
+        1,
+        "editor expansion must retain the forwarded structural template",
+    );
+}
+
+#[test]
+fn module_argument_if_conditional_module_call_materializes_only_selected_branch() {
+    let root = tempfile::tempdir().expect("temporary conditional-call fixture");
+    let leaf_dir = root.path().join("modules/leaf");
+    let chooser_dir = root.path().join("modules/chooser");
+    let caller_dir = root.path().join("apps/caller");
+    fs::create_dir_all(&leaf_dir).unwrap();
+    fs::create_dir_all(&chooser_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        leaf_dir.join("main.crn"),
+        r#"
+arguments { label: String }
+let item = mock.test.Thing { value = label }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        chooser_dir.join("main.crn"),
+        r#"
+arguments { flag: Bool }
+let leaf = use { source = "../leaf" }
+let selected = if flag {
+  leaf { label = "then" }
+} else {
+  leaf { label = "else" }
+}
+"#,
+    )
+    .unwrap();
+    let caller = r#"
+let chooser = use { source = "../../modules/chooser" }
+let enabled = chooser { flag = true }
+let disabled = chooser { flag = false }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).unwrap();
+
+    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let parsed = resolve_modules(parsed, &caller_dir).expect("conditional module calls expand");
+
+    let value = |binding: &str| {
+        parsed
+            .resources
+            .iter()
+            .find(|resource| {
+                resource.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
+            })
+            .and_then(|resource| resource.get_attr("value"))
+            .cloned()
+    };
+    assert_eq!(
+        value("enabled.selected.item"),
+        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "then".into()
+        )))
+    );
+    assert_eq!(
+        value("disabled.selected.item"),
+        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "else".into()
+        )))
+    );
+    let selected_call = parsed
+        .compositions
+        .iter()
+        .find(|composition| {
+            composition.binding.as_ref().map(|binding| binding.as_str()) == Some("enabled.selected")
+        })
+        .expect("selected nested module composition");
+    let expected_leaf_dir = leaf_dir.canonicalize().unwrap();
+    assert_eq!(
+        selected_call
+            .call_path()
+            .immediate()
+            .module_directory
+            .as_deref(),
+        Some(expected_leaf_dir.as_path()),
+        "a retained conditional call must keep the directory where its import was prepared",
+    );
+}
+
+#[test]
+fn conditional_module_call_keeps_caller_refs_distinct_from_colliding_local_bindings() {
+    let root = tempfile::tempdir().expect("temporary conditional-call collision fixture");
+    let leaf_dir = root.path().join("leaf");
+    let chooser_dir = root.path().join("chooser");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&leaf_dir).unwrap();
+    fs::create_dir_all(&chooser_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        leaf_dir.join("main.crn"),
+        r#"
+arguments {
+  caller: mock.test.resource
+  local: mock.test.resource
+}
+let nested = mock.test.resource {
+  name = "nested"
+  parent = caller.name
+  parent_name = local.name
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        chooser_dir.join("main.crn"),
+        r#"
+arguments {
+  flag: Bool
+  caller: mock.test.resource
+}
+let shared = mock.test.resource { name = "module-local" }
+let leaf = use { source = "../leaf" }
+let selected = if flag {
+  leaf {
+    caller = caller
+    local = shared
+  }
+}
+"#,
+    )
+    .unwrap();
+    let caller = r#"
+let shared = mock.test.resource { name = "caller" }
+let chooser = use { source = "../chooser" }
+let enabled = chooser { flag = true caller = shared }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).unwrap();
+
+    let mut config = ProviderContext::default();
+    config
+        .resource_types
+        .insert(("mock".to_string(), "test.resource".to_string()));
+    let parsed = crate::parser::parse_file(caller, &caller_file, &config).expect("caller parse");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &caller_dir,
+        &config,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("conditional nested call expands in the chooser's module scope");
+
+    let nested = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str())
+                == Some("enabled.selected.nested")
+        })
+        .expect("selected leaf resource");
+    assert!(
+        matches!(
+            nested.get_attr("parent"),
+            Some(ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }))
+                if path.binding() == "shared" && path.attribute() == "name"
+        ),
+        "caller reference was captured by the chooser-local `shared`: {:?}",
+        nested.get_attr("parent"),
+    );
+    assert!(
+        matches!(
+            nested.get_attr("parent_name"),
+            Some(ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }))
+                if path.binding() == "enabled.shared" && path.attribute() == "name"
+        ),
+        "chooser-local reference was not prefixed: {:?}",
+        nested.get_attr("parent_name"),
+    );
+}
+
+#[test]
+fn dropped_structural_if_binding_never_falls_back_to_caller_scope() {
+    let root = tempfile::tempdir().expect("temporary dropped-binding fixture");
+    let module_dir = root.path().join("choice");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"arguments { flag: Bool }
+let optional = if flag {
+  mock.test.resource { name = "module-optional" }
+}
+let consumer = mock.test.resource {
+  name = "consumer"
+  parent_name = optional.name
+}
+"#,
+    )
+    .unwrap();
+
+    let resolve = |flag: bool| {
+        let caller_dir = root.path().join(if flag { "enabled" } else { "disabled" });
+        fs::create_dir_all(&caller_dir).unwrap();
+        let caller = format!(
+            r#"let optional = mock.test.resource {{ name = "caller-optional" }}
+let choice = use {{ source = "../choice" }}
+let instance = choice {{ flag = {flag} }}
+"#,
+        );
+        let caller_file = caller_dir.join("main.crn");
+        fs::write(&caller_file, &caller).unwrap();
+        let parsed = crate::parser::parse_file(&caller, &caller_file, &ProviderContext::default())
+            .expect("caller parse");
+        resolve_modules(parsed, &caller_dir)
+    };
+
+    let enabled = resolve(true).expect("selected optional binding remains available");
+    let consumer = enabled
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("instance.consumer")
+        })
+        .expect("expanded consumer");
+    assert!(
+        matches!(
+            consumer.get_attr("parent_name"),
+            Some(ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }))
+                if path.binding() == "instance.optional"
+        ),
+        "selected branch reference did not stay module-local: {:?}",
+        consumer.get_attr("parent_name"),
+    );
+
+    let error = resolve(false)
+        .expect_err("a dropped module binding must not resolve against the caller collision")
+        .to_string();
+    assert!(
+        error.contains("optional"),
+        "binding missing from error: {error}"
+    );
+    assert!(
+        error.contains("condition `flag`") && !error.contains("(unresolved module argument: flag)"),
+        "condition source expression missing from error: {error}"
+    );
+    assert!(
+        error.contains("choice/main.crn") && error.contains("line 2"),
+        "module source missing from error: {error}",
+    );
+}
+
+#[test]
+fn dropped_structural_if_binding_is_reported_from_wait_target() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write(
+        "choice/main.crn",
+        r#"arguments { flag: Bool }
+let conditional = if flag {
+  mock.test.resource { name = "conditional" }
+}
+let ready = wait conditional {
+  until = conditional.name == "conditional"
+}
+"#,
+    );
+    fixture.write(
+        "caller/main.crn",
+        r#"let choice = use { source = "../choice" }
+let instance = choice { flag = false }
+"#,
+    );
+
+    let error = fixture
+        .resolve_caller("caller/main.crn")
+        .expect_err("a wait target cannot refer to a dropped conditional binding")
+        .to_string();
+    assert!(
+        error.contains("binding 'conditional' is defined only in a dropped branch")
+            && error.contains("condition `flag`")
+            && error.contains("choice/main.crn"),
+        "wait target did not use the dedicated dropped-binding diagnostic: {error}",
+    );
+}
+
+#[test]
+fn dropped_structural_if_binding_is_reported_from_wait_depends_on() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write(
+        "choice/main.crn",
+        r#"arguments { flag: Bool }
+let conditional = if flag {
+  mock.test.resource { name = "conditional" }
+}
+let stable = mock.test.resource { name = "stable" }
+let ready = wait stable {
+  until = stable.name == "stable"
+  depends_on = [conditional]
+}
+"#,
+    );
+    fixture.write(
+        "caller/main.crn",
+        r#"let choice = use { source = "../choice" }
+let instance = choice { flag = false }
+"#,
+    );
+
+    let error = fixture
+        .resolve_caller("caller/main.crn")
+        .expect_err("wait depends_on cannot refer to a dropped conditional binding")
+        .to_string();
+    assert!(
+        error.contains("binding 'conditional' is defined only in a dropped branch")
+            && error.contains("condition `flag`")
+            && error.contains("choice/main.crn"),
+        "wait depends_on did not use the dedicated dropped-binding diagnostic: {error}",
+    );
+}
+
+#[test]
+fn same_condition_guarded_references_are_checked_after_value_branch_selection() {
+    let root = tempfile::tempdir().expect("temporary guarded-reference fixture");
+    let module_dir = root.path().join("choice");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"arguments { flag: Bool }
+let a = if flag {
+  mock.test.resource { name = "a" }
+}
+let b = mock.test.resource {
+  name = "b"
+  comment = if flag { a.name } else { "none" }
+}
+attributes {
+  n: String = if flag { a.name } else { "none" }
+}
+"#,
+    )
+    .unwrap();
+    let caller = r#"let choice = use { source = "../choice" }
+let off = choice { flag = false }
+let on = choice { flag = true }
+"#;
+    let caller_file = caller_dir.join("main.crn");
+    fs::write(&caller_file, caller).unwrap();
+
+    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let parsed = resolve_modules(parsed, &caller_dir)
+        .expect("guarded references must be checked after selecting their value branch");
+
+    let off = parsed
+        .iter_all_resources()
+        .find(|resource| resource.binding() == Some("off.b"))
+        .expect("false instance consumer");
+    assert_eq!(
+        off.attributes().get("comment").cloned(),
+        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "none".into()
+        )))
+    );
+    assert!(
+        parsed
+            .iter_all_resources()
+            .any(|resource| resource.binding() == Some("on.a")),
+        "true instance must retain the selected conditional binding"
+    );
+    assert!(
+        !parsed
+            .iter_all_resources()
+            .any(|resource| resource.binding() == Some("off.a")),
+        "false instance must drop the conditional binding"
+    );
+
+    let off_output = parsed
+        .compositions
+        .iter()
+        .find(|composition| {
+            composition.binding.as_ref().map(|binding| binding.as_str()) == Some("off")
+        })
+        .and_then(|composition| composition.signature.attributes.get("n"))
+        .map(crate::resource::LiveCompositionAttribute::to_value)
+        .expect("false instance output");
+    assert_eq!(
+        off_output,
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("none".into()))
+    );
+}
+
+#[test]
+fn module_argument_if_post_substitution_errors_use_module_source_and_line() {
+    let root = tempfile::tempdir().expect("temporary deferred-if error fixture");
+    let runtime_dir = root.path().join("runtime");
+    let non_bool_dir = root.path().join("non_bool");
+    let caller_dir = root.path().join("caller");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(&non_bool_dir).unwrap();
+    fs::create_dir_all(&caller_dir).unwrap();
+    fs::write(
+        runtime_dir.join("main.crn"),
+        "arguments { flag: Bool }\nattributes {\n  value = if flag { 'yes' } else { 'no' }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        non_bool_dir.join("main.crn"),
+        "arguments { flag: String }\nattributes {\n  value = if flag { 'yes' } else { 'no' }\n}\n",
+    )
+    .unwrap();
+
+    let runtime_caller = r#"
+let runtime = use { source = "../runtime" }
+let source = mock.test.Thing { ready = true }
+let selected = runtime { flag = source.ready }
+"#;
+    let runtime_file = caller_dir.join("runtime.crn");
+    let parsed =
+        crate::parser::parse_file(runtime_caller, &runtime_file, &ProviderContext::default())
+            .expect("runtime caller parses");
+    let error = resolve_modules(parsed, &caller_dir)
+        .expect_err("runtime argument must fail after substitution")
+        .to_string();
+    assert!(error.contains("runtime/main.crn"), "{error}");
+    assert!(error.contains("line 3"), "{error}");
+    assert!(
+        error.contains("if condition depends on a runtime value; condition must be statically known at parse time"),
+        "{error}"
+    );
+
+    let non_bool_caller = r#"
+let non_bool = use { source = "../non_bool" }
+let selected = non_bool { flag = "not-bool" }
+"#;
+    let non_bool_file = caller_dir.join("non_bool.crn");
+    let parsed =
+        crate::parser::parse_file(non_bool_caller, &non_bool_file, &ProviderContext::default())
+            .expect("non-bool caller parses");
+    let error = resolve_modules(parsed, &caller_dir)
+        .expect_err("non-Bool argument must fail after substitution")
+        .to_string();
+    assert!(error.contains("non_bool/main.crn"), "{error}");
+    assert!(error.contains("line 3"), "{error}");
+    assert!(
+        error.contains("if condition must be a Bool value, got: string"),
+        "{error}"
+    );
+}
+
+#[test]
+fn resolve_modules_rejects_a_root_module_template_before_publication() {
+    let root = tempfile::tempdir().expect("temporary root module template");
+    let source_file = root.path().join("main.crn");
+    let source = r#"
+arguments { flag: Bool }
+attributes { value = if flag { "yes" } else { "no" } }
+"#;
+    fs::write(&source_file, source).unwrap();
+    let parsed = crate::parser::parse_file(source, &source_file, &ProviderContext::default())
+        .expect("standalone module template parses");
+
+    let error = resolve_modules(parsed, root.path())
+        .expect_err("the ordinary resolver must not publish an unresolved root template")
+        .to_string();
+    assert!(
+        error.contains("cannot publish a reusable module template")
+            && error.contains("argument-dependent `if`")
+            && !error.contains("Internal parser error"),
+        "unexpected root publication error: {error}",
+    );
+}
+
+#[test]
+fn resolve_modules_rejects_a_deferred_contribution_before_merging_it() {
+    let root = tempfile::tempdir().expect("temporary leaking contribution fixture");
+    let choice_dir = root.path().join("choice");
+    let outer_dir = root.path().join("outer");
+    fs::create_dir_all(&choice_dir).unwrap();
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        choice_dir.join("main.crn"),
+        r#"
+arguments { flag: Bool }
+attributes { value = if flag { "yes" } else { "no" } }
+"#,
+    )
+    .unwrap();
+    let source = r#"
+arguments { flag: Bool }
+let choice = use { source = "../choice" }
+let forwarded = choice { flag = flag }
+"#;
+    let source_file = outer_dir.join("main.crn");
+    fs::write(&source_file, source).unwrap();
+    let parsed = crate::parser::parse_file(source, &source_file, &ProviderContext::default())
+        .expect("standalone forwarding module parses");
+
+    let error = resolve_modules(parsed, &outer_dir)
+        .expect_err("a deferred module contribution must fail its publication conversion")
+        .to_string();
+    assert!(
+        error.contains("argument-dependent `if`") && error.contains("composition attribute"),
+        "{error}"
+    );
+}
+
 fn parsed_deferred_resource(
-    expression: DeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>,
+    expression: DeferredForExpression<
+        ModuleSource,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        RelativeBindingName,
+    >,
 ) -> ParsedDeferredForExpression {
     ParsedDeferredForExpression::from_location(
-        expression.location().clone(),
-        SourceSpan::dummy(),
-        expression.header.clone(),
+        (
+            expression.location().clone(),
+            SourceSpan::dummy(),
+            expression.header.clone(),
+        ),
         expression.target().clone(),
         expression.iterable.clone(),
         crate::parser::ParsedDeferredForIterableState::Deferred,
@@ -377,7 +1660,9 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
             .schema(),
         &HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("inner".into())),
+            crate::resource::ExpandedValue::Concrete(
+                crate::resource::ExpandedConcreteValue::String("inner".into()),
+            ),
         )]),
     )
     .expect("state fixture has a valid resolved address");
@@ -436,7 +1721,7 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
         "fixture must pin the authored call range",
     );
 
-    let error = super::resolve_modules_with_providerless_config(
+    let error = resolve_modules_with_config(
         parsed,
         base.path(),
         &ProviderContext::default(),
@@ -468,7 +1753,7 @@ fn create_test_module() -> ParsedFile {
                 attrs.insert(
                     "vpc_id".to_string(),
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "vpc_id".to_string(),
+                        binding: "vpc_id".into(),
                     }),
                 );
                 attrs.into_iter().collect()
@@ -531,7 +1816,7 @@ fn test_substitute_arguments() {
 
     // Argument params are lexically scoped: binding_name is the param name itself
     let value = Value::Deferred(DeferredValue::BindingRef {
-        binding: "vpc_id".to_string(),
+        binding: "vpc_id".into(),
     });
     let result = substitute_arguments(&value, &inputs).expect("substitution");
 
@@ -551,7 +1836,7 @@ fn test_substitute_arguments_nested() {
 
     let value = Value::Concrete(ConcreteValue::List(vec![
         Value::Deferred(DeferredValue::BindingRef {
-            binding: "port".to_string(),
+            binding: "port".into(),
         }),
         Value::Concrete(ConcreteValue::Int(443)),
     ]));
@@ -666,7 +1951,7 @@ fn test_substitute_arguments_recurses_into_residual_coalesce() {
     let value = Value::Deferred(DeferredValue::Coalesce {
         value: Box::new(Value::resource_ref("up", "accounts", vec![])),
         default: Box::new(Value::Deferred(DeferredValue::BindingRef {
-            binding: "fallback".to_string(),
+            binding: "fallback".into(),
         })),
     });
 
@@ -854,7 +2139,9 @@ fn test_expand_module_call() {
     );
     assert_eq!(
         sg.get_attr("vpc_id"),
-        Some(&Value::Concrete(ConcreteValue::String("vpc-456".into())))
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "vpc-456".into()
+        )))
     );
     let Some(crate::resource::ModuleSource::Module(source)) = &sg.module_source else {
         panic!("expanded resource must retain its live module source")
@@ -902,7 +2189,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             directives: Directives::default().with_provider_instance("us"),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
-            binding: Some("cert".to_string()),
+            binding: Some("cert".into()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
@@ -979,7 +2266,10 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
     // `provider_instance` before carina#3038. A close-but-different
     // SimHash in state triggers a name rewrite, so this test must
     // assert that the named-instance routing survives the rewrite.
-    use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
+    use crate::resource::{
+        AuthoredConcreteValue as ConcreteValue, AuthoredResource as Resource,
+        AuthoredValue as Value, ResourceId,
+    };
 
     let current_hash = crate::identifier::SimHash::parse_16_hex("000000000000abcd").unwrap();
     let current_prefix = format!("thing_{:016x}", current_hash);
@@ -1004,7 +2294,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         directives: Directives::default().with_provider_instance("us"),
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
-        binding: Some(format!("{}.role", current_prefix)),
+        binding: Some(format!("{}.role", current_prefix).into()),
         dependency_bindings: BTreeSet::new(),
         module_source: Some(crate::resource::ModuleSource::expanded_module(
             "thing",
@@ -1024,6 +2314,12 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         loop_provenance: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),
     }];
+    let mut resources: Vec<
+        crate::resource::Resource<ModuleSource, ParserPlaceholder, AbsoluteBindingAddress>,
+    > = resources
+        .drain(..)
+        .map(|resource| resource.resolve_root(&crate::resource::RootScope::new()))
+        .collect();
 
     let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
     reconcile_anonymous_module_instances(&mut resources, &mut [], &state_lookup);
@@ -1056,7 +2352,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.insert(
                         "cidr_block".to_string(),
                         Value::Deferred(DeferredValue::BindingRef {
-                            binding: "cidr".to_string(),
+                            binding: "cidr".into(),
                         }),
                     );
                     attrs.into_iter().collect()
@@ -1064,7 +2360,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 directives: Directives::default(),
                 resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
-                binding: Some("vpc".to_string()),
+                binding: Some("vpc".into()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
@@ -1084,7 +2380,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 directives: Directives::default(),
                 resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
-                binding: Some("subnet".to_string()),
+                binding: Some("subnet".into()),
                 dependency_bindings: BTreeSet::new(),
                 module_source: None,
                 default_tag_keys: Default::default(),
@@ -1158,30 +2454,42 @@ fn test_multiple_module_instances_no_collision() {
 
     // binding must be prefixed so they don't collide (using dot notation)
     assert_eq!(
-        expanded_a[0].binding,
-        Some("prod.vpc".to_string()),
+        expanded_a[0]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
+        Some("prod.vpc"),
         "Instance A vpc binding should use dot path"
     );
     assert_eq!(
-        expanded_a[1].binding,
-        Some("prod.subnet".to_string()),
+        expanded_a[1]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
+        Some("prod.subnet"),
         "Instance A subnet binding should use dot path"
     );
     assert_eq!(
-        expanded_b[0].binding,
-        Some("staging.vpc".to_string()),
+        expanded_b[0]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
+        Some("staging.vpc"),
         "Instance B vpc binding should use dot path"
     );
     assert_eq!(
-        expanded_b[1].binding,
-        Some("staging.subnet".to_string()),
+        expanded_b[1]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
+        Some("staging.subnet"),
         "Instance B subnet binding should use dot path"
     );
 
     // Intra-module ResourceRef must point to the dot-path binding
     assert_eq!(
         expanded_a[1].get_attr("vpc_id"),
-        Some(&Value::resource_ref(
+        Some(&expanded_resource_ref(
             "prod.vpc".to_string(),
             "id".to_string(),
             vec![]
@@ -1190,7 +2498,7 @@ fn test_multiple_module_instances_no_collision() {
     );
     assert_eq!(
         expanded_b[1].get_attr("vpc_id"),
-        Some(&Value::resource_ref(
+        Some(&expanded_resource_ref(
             "staging.vpc".to_string(),
             "id".to_string(),
             vec![]
@@ -1230,7 +2538,7 @@ fn create_module_with_attributes() -> ParsedFile {
             directives: Directives::default(),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
-            binding: Some("sg".to_string()),
+            binding: Some("sg".into()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
@@ -1290,7 +2598,13 @@ fn test_expand_module_call_creates_composition() {
     assert_eq!(expanded.compositions.len(), 1);
     let composition_res = &expanded.compositions[0];
 
-    assert_eq!(composition_res.binding, Some("web".to_string()));
+    assert_eq!(
+        composition_res
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
+        Some("web")
+    );
     // Module info lives in the flattened module_name / instance fields.
     assert_eq!(composition_res.module_name, "web_tier");
     assert_eq!(composition_res.instance, "web");
@@ -1312,7 +2626,7 @@ fn test_expand_module_call_creates_composition() {
             .attributes
             .get("security_group")
             .map(|a| a.to_value()),
-        Some(Value::resource_ref(
+        Some(expanded_resource_ref(
             "web.sg".to_string(),
             "id".to_string(),
             vec![]
@@ -1346,7 +2660,13 @@ fn test_expand_module_call_populates_compositions_slice() {
 
     // The composition resource lives only in the typed slice.
     assert_eq!(expanded.compositions.len(), 1);
-    assert_eq!(expanded.compositions[0].binding, Some("web".to_string()));
+    assert_eq!(
+        expanded.compositions[0]
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
+        Some("web")
+    );
     assert_eq!(expanded.compositions[0].module_name, "web_tier");
     assert_eq!(expanded.compositions[0].instance, "web");
 
@@ -1617,7 +2937,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .arguments
             .get("region")
             .map(|argument| argument.value()),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "ap-northeast-1".into()
         ))),
         "region argument must be recorded on the composition signature",
@@ -1628,7 +2948,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .arguments
             .get("instance_count")
             .map(|argument| argument.value()),
-        Some(&Value::Concrete(ConcreteValue::Int(3))),
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::Int(3))),
         "instance_count argument must be recorded on the composition signature",
     );
     assert_eq!(
@@ -1653,7 +2973,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .attributes
             .get("endpoint")
             .map(|a| a.to_value()),
-        Some(Value::Concrete(ConcreteValue::String(
+        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "fixed-endpoint".into()
         ))),
     );
@@ -1709,15 +3029,23 @@ let role = awscc.iam.Role {
     resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
-fn role_names<E, P: crate::resource::PlaceholderKind, T: crate::resource::PlaceholderKind, D>(
-    parsed: &crate::parser::File<E, P, T, D>,
+fn role_names<
+    E,
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+    D,
+    B: crate::resource::BindingAddress,
+>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
 ) -> HashSet<String> {
     parsed
         .resources
         .iter()
         .filter(|r| r.id.resource_type == "iam.Role")
         .filter_map(|r| match r.get_attr("role_name")? {
-            Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(s)) => {
+                Some(s.expose_plaintext().to_owned())
+            }
             _ => None,
         })
         .collect()
@@ -1836,7 +3164,7 @@ thing { name = 'beta'  }
 #[test]
 fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
     let mut origin = Resource::with_provider("mock", "test.resource", "origin", None);
-    origin.binding = Some("origin".to_string());
+    origin.binding = Some("origin".into());
 
     // Model the parsed `upper(origin)` call directly: ordinary parsing rejects
     // a bare handle in strict mode, while the permissive directory pass keeps
@@ -1892,7 +3220,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
     let argument_bindings = dependents
         .iter()
         .map(|resource| {
-            let Some(Value::Deferred(DeferredValue::Unavailable {
+            let Some(ExpandedValue::Deferred(ExpandedDeferredValue::Unavailable {
                 name: crate::builtins::BuiltinFunction::upper,
                 args,
                 ..
@@ -1906,24 +3234,23 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
             let [argument] = args.as_slice() else {
                 panic!("upper() must retain one argument: {args:?}");
             };
-            let Value::Deferred(DeferredValue::BindingRef { binding }) = argument.walker_value()
+            let ExpandedValue::Deferred(ExpandedDeferredValue::BindingRef { binding }) =
+                argument.walker_value()
             else {
                 panic!("upper() must retain its handle-shaped argument: {argument:?}");
             };
-            binding.clone()
+            binding.to_string()
         })
         .collect::<HashSet<_>>();
     assert_eq!(
         argument_bindings,
         HashSet::from(["first.origin".to_string(), "second.origin".to_string()]),
     );
-    let mut resources = ParsedFile {
-        resources,
-        ..ParsedFile::default()
-    }
-    .into_expanded()
-    .expect("expanded module resources contain no parser placeholders")
-    .resources;
+    let mut resources = resources
+        .into_iter()
+        .map(crate::resource::Resource::into_expanded)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("expanded module resources contain no parser placeholders");
 
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
@@ -2038,11 +3365,15 @@ thing { name = 'after-edit' }
         .instantiate_with_identity(crate::resource::ResourceIdentity::new(format!(
             "{new_prefix}.nested"
         )));
-    nested.binding = Some(format!("{new_prefix}.nested"));
+    nested.binding =
+        Some(crate::resource::RootScope::new().resolve(format!("{new_prefix}.nested").into()));
     nested.signature.arguments.insert(
         "role_name".to_string(),
-        crate::resource::LiveCompositionArgument::from_value(
-            Value::resource_ref(
+        crate::resource::LiveCompositionArgument::<
+            ParserPlaceholder,
+            AbsoluteBindingAddress,
+        >::from_value(
+            expanded_resource_ref(
                 format!("{new_prefix}.role"),
                 "role_name".to_string(),
                 vec![],
@@ -2076,7 +3407,7 @@ thing { name = 'after-edit' }
         state_name
     );
     assert_eq!(
-        role.binding.as_deref(),
+        role.binding.as_ref().map(|binding| binding.as_str()),
         Some(state_name.as_str()),
         "binding should be remapped too",
     );
@@ -2102,7 +3433,7 @@ thing { name = 'after-edit' }
         .unwrap();
     assert_eq!(nested.id.identity_str(), format!("{state_prefix}.nested"));
     assert_eq!(
-        nested.binding.as_deref(),
+        nested.binding.as_ref().map(|binding| binding.as_str()),
         Some(format!("{state_prefix}.nested").as_str())
     );
     assert_eq!(
@@ -2111,7 +3442,7 @@ thing { name = 'after-edit' }
             .arguments
             .get("role_name")
             .map(|argument| argument.value()),
-        Some(&Value::resource_ref(
+        Some(&expanded_resource_ref(
             format!("{state_prefix}.role"),
             "role_name".to_string(),
             vec![],
@@ -2121,7 +3452,7 @@ thing { name = 'after-edit' }
 
 #[test]
 fn test_module_instance_reconcile_skips_claimed_prefix() {
-    let mut claimed_from = resolve_thing_fixture(
+    let claimed_from = resolve_thing_fixture(
         r#"
 let thing = use { source = '../modules/thing' }
 
@@ -2153,9 +3484,10 @@ thing { name = 'after-edit' }
         HashSet::new(),
     );
 
+    let mut claimed_from = claimed_from;
+
     crate::module_resolver::reconcile_anonymous_module_instances(
-        &mut claimed_from.resources,
-        &mut claimed_from.compositions,
+        &mut claimed_from,
         &state_lookup,
         &claims,
     );
@@ -2172,7 +3504,7 @@ thing { name = 'after-edit' }
         "a claimed state child must exclude the whole state prefix from orphan candidates",
     );
 
-    let mut claimed_to = resolve_thing_fixture(
+    let claimed_to = resolve_thing_fixture(
         r#"
 let thing = use { source = '../modules/thing' }
 
@@ -2204,9 +3536,10 @@ thing { name = 'after-edit' }
         .collect(),
     );
 
+    let mut claimed_to = claimed_to;
+
     crate::module_resolver::reconcile_anonymous_module_instances(
-        &mut claimed_to.resources,
-        &mut claimed_to.compositions,
+        &mut claimed_to,
         &state_lookup,
         &claims,
     );
@@ -2574,13 +3907,19 @@ fn test_module_dot_path_bindings_and_refs() {
     );
 
     // binding should use dot notation
-    assert_eq!(expanded[0].binding, Some("prod.vpc".to_string()));
-    assert_eq!(expanded[1].binding, Some("prod.subnet".to_string()));
+    assert_eq!(
+        expanded[0].binding.as_ref().map(|binding| binding.as_str()),
+        Some("prod.vpc")
+    );
+    assert_eq!(
+        expanded[1].binding.as_ref().map(|binding| binding.as_str()),
+        Some("prod.subnet")
+    );
 
     // Intra-module ResourceRef should use dot notation
     assert_eq!(
         expanded[1].get_attr("vpc_id"),
-        Some(&Value::resource_ref(
+        Some(&expanded_resource_ref(
             "prod.vpc".to_string(),
             "id".to_string(),
             vec![]
@@ -2617,7 +3956,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             directives: Directives::default(),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
-            binding: Some("distribution".to_string()),
+            binding: Some("distribution".into()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
@@ -2626,10 +3965,11 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
         });
         m.wait_bindings.push(WaitBinding {
             binding: "cert_issued".into(),
-            target: "main_vpc".into(),
-            until_raw: "main_vpc.state == \"available\"".to_string(),
+            target: "vpc".into(),
+            until_raw: "vpc.state == \"available\"".to_string(),
             until_predicate: UntilPredicateAst {
-                lhs_segments: vec!["main_vpc".to_string(), "state".to_string()],
+                root: "vpc".into(),
+                attribute_segments: vec!["state".to_string()],
                 rhs: Value::Concrete(ConcreteValue::String("available".into())),
             },
             timeout_secs: Some(300),
@@ -2660,17 +4000,23 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
     // is instance-prefixed.
     assert_eq!(expanded.wait_bindings.len(), 1);
     let wb = &expanded.wait_bindings[0];
-    assert_eq!(wb.binding, "prod.cert_issued");
-    assert_eq!(wb.target, "prod.main_vpc");
+    assert_eq!(wb.binding.as_str(), "prod.cert_issued");
+    assert_eq!(wb.target.as_str(), "prod.vpc");
+    assert_eq!(wb.until_predicate.root.as_str(), "prod.vpc");
+    assert_eq!(wb.until_predicate.attribute_segments, ["state"]);
     assert_eq!(
-        wb.until_predicate.lhs_segments,
-        vec!["prod.main_vpc".to_string(), "state".to_string()]
+        wb.depends_on
+            .iter()
+            .map(|binding| binding.as_str())
+            .collect::<Vec<_>>(),
+        vec!["prod.subnet"]
     );
-    assert_eq!(wb.depends_on, vec!["prod.subnet".to_string()]);
     // RHS value and surface text are not binding names — unchanged.
     assert_eq!(
         wb.until_predicate.rhs,
-        Value::Concrete(ConcreteValue::String("available".into()))
+        crate::resource::ExpandedValue::Concrete(crate::resource::ExpandedConcreteValue::String(
+            "available".into()
+        ))
     );
     assert_eq!(wb.timeout_secs, Some(300));
 
@@ -2684,7 +4030,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
         .expect("distribution resource present");
     assert_eq!(
         dist.get_attr("acm_certificate_arn"),
-        Some(&Value::resource_ref(
+        Some(&expanded_resource_ref(
             "prod.cert_issued".to_string(),
             "certificate_arn".to_string(),
             vec![]
@@ -2723,7 +4069,7 @@ fn test_module_composition_dot_path_refs() {
             .attributes
             .get("security_group")
             .map(|a| a.to_value()),
-        Some(Value::resource_ref(
+        Some(expanded_resource_ref(
             "web.sg".to_string(),
             "id".to_string(),
             vec![]
@@ -2733,7 +4079,7 @@ fn test_module_composition_dot_path_refs() {
 
 #[test]
 fn test_substitute_arguments_interpolation() {
-    use crate::resource::InterpolationPart;
+    use crate::resource::AuthoredInterpolationPart as InterpolationPart;
 
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -2745,7 +4091,7 @@ fn test_substitute_arguments_interpolation() {
     let value = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("prefix-".into()),
         InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
-            binding: "env_name".to_string(),
+            binding: "env_name".into(),
         })),
         InterpolationPart::Literal("-suffix".into()),
     ]));
@@ -2813,7 +4159,7 @@ fn test_substitute_arguments_function_call() {
         name: crate::builtins::BuiltinFunction::cidr_subnet,
         args: vec![
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "cidr".to_string(),
+                binding: "cidr".into(),
             })
             .into(),
             Value::Concrete(ConcreteValue::Int(8)).into(),
@@ -2880,7 +4226,7 @@ fn test_substitute_arguments_unavailable_builtin_call() {
 
 /// Module with interpolation in resource attributes to test argument substitution
 fn create_module_with_interpolation() -> ParsedFile {
-    use crate::resource::InterpolationPart;
+    use crate::resource::AuthoredInterpolationPart as InterpolationPart;
 
     ParsedFile {
         providers: vec![],
@@ -2893,7 +4239,7 @@ fn create_module_with_interpolation() -> ParsedFile {
                 attrs.insert(
                     "cidr_block".to_string(),
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "cidr_block".to_string(),
+                        binding: "cidr_block".into(),
                     }),
                 );
                 attrs.insert(
@@ -2901,14 +4247,14 @@ fn create_module_with_interpolation() -> ParsedFile {
                     Value::Deferred(DeferredValue::Interpolation(vec![
                         InterpolationPart::Literal("test-".into()),
                         InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
-                            binding: "env_name".to_string(),
+                            binding: "env_name".into(),
                         })),
                     ])),
                 );
                 attrs.insert(
                     "env".to_string(),
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "env_name".to_string(),
+                        binding: "env_name".into(),
                     }),
                 );
                 attrs.into_iter().collect()
@@ -2916,7 +4262,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             directives: Directives::default(),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
-            binding: Some("vpc".to_string()),
+            binding: Some("vpc".into()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
@@ -2994,13 +4340,15 @@ fn test_expand_module_call_with_interpolation() {
     // Simple argument substitution should work
     assert_eq!(
         vpc.get_attr("cidr_block"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "10.0.0.0/16".into()
         )))
     );
     assert_eq!(
         vpc.get_attr("env"),
-        Some(&Value::Concrete(ConcreteValue::String("dev".into())))
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "dev".into()
+        )))
     );
 
     // Interpolation with argument substitutes and canonicalizes back to
@@ -3010,7 +4358,9 @@ fn test_expand_module_call_with_interpolation() {
     // `Interpolation([Literal("test-"), Expr(String("dev"))])` (#2815, #2817).
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("test-dev".into()))),
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "test-dev".into()
+        ))),
     );
 }
 
@@ -3097,8 +4447,8 @@ mock.test.Consumer {
         .expect("expanded inner consumer");
     assert_eq!(
         consumer.get_attr("values"),
-        Some(&Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("forwarded".into()),)
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::List(vec![
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("forwarded".into()),)
         ]))),
     );
 
@@ -3161,7 +4511,7 @@ fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
     // After expansion the binding must be instance-prefixed (`web.net`),
     // not the bare intra-module name (`net`).
     match vpc_id {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+        ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) => {
             assert_eq!(
                 path.binding(),
                 "web.net",
@@ -3180,10 +4530,19 @@ fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
         .expect("inner module composition must be retained");
     let immediate_call = nested.call_path().immediate();
     let root_call = nested.call_path().root();
-    assert_eq!(immediate_call.binding.as_deref(), Some("web.net"));
+    assert_eq!(
+        immediate_call
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str()),
+        Some("web.net")
+    );
     assert_eq!(immediate_call.instance, "web.net");
     assert_eq!(immediate_call.module_name, "inner");
-    assert_eq!(root_call.binding.as_deref(), Some("web"));
+    assert_eq!(
+        root_call.binding.as_ref().map(|binding| binding.as_str()),
+        Some("web")
+    );
     assert_eq!(root_call.instance, "web");
     assert_eq!(root_call.module_name, "outer");
 }
@@ -3234,8 +4593,7 @@ fn test_nested_module_cycle_detection() {
     );
 }
 
-#[test]
-fn test_expand_module_call_with_function_call_argument() {
+fn expand_module_call_with_cidr_function_argument(cidr: Value) -> ExpandedValue {
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules
@@ -3251,7 +4609,7 @@ fn test_expand_module_call_with_function_call_argument() {
             Value::Deferred(DeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::cidr_subnet,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())).into(),
+                    cidr.into(),
                     Value::Concrete(ConcreteValue::Int(8)).into(),
                     Value::Concrete(ConcreteValue::Int(0)).into(),
                 ],
@@ -3273,18 +4631,39 @@ fn test_expand_module_call_with_function_call_argument() {
 
     let vpc = &expanded[0];
 
-    // FunctionCall argument should be substituted as-is (resolved at apply time)
+    vpc.get_attr("cidr_block").expect("expanded CIDR").clone()
+}
+
+#[test]
+fn test_expand_module_call_with_function_call_argument() {
+    // Expansion evaluates pure calls once every substituted operand is known.
     assert_eq!(
-        vpc.get_attr("cidr_block"),
-        Some(&Value::Deferred(DeferredValue::FunctionCall {
+        expand_module_call_with_cidr_function_argument(Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".into(),
+        ))),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("10.0.0.0/24".into())),
+    );
+}
+
+#[test]
+fn test_expand_module_call_with_unresolved_function_call_argument_stays_deferred() {
+    // An unresolved caller reference must keep the function deferred, without
+    // treating that caller binding as a module-local name.
+    assert_eq!(
+        expand_module_call_with_cidr_function_argument(Value::resource_ref(
+            "network",
+            "cidr_block",
+            Vec::new(),
+        )),
+        ExpandedValue::Deferred(ExpandedDeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::cidr_subnet,
             args: vec![
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())).into(),
-                Value::Concrete(ConcreteValue::Int(8)).into(),
-                Value::Concrete(ConcreteValue::Int(0)).into(),
+                expanded_resource_ref("network", "cidr_block", Vec::new()).into(),
+                ExpandedValue::Concrete(ExpandedConcreteValue::Int(8)).into(),
+                ExpandedValue::Concrete(ExpandedConcreteValue::Int(0)).into(),
             ],
             source_line: (0).into(),
-        }))
+        })
     );
 }
 
@@ -3664,8 +5043,12 @@ fn test_argument_validation_with_resource_reference_is_pending() {
 fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
     use crate::parser::{CompareOp, ValidateExpr};
     use crate::resource::{
-        CompositionCall, CompositionCallPath, LiveComposition, LiveCompositionArgument,
-        LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint,
+        AuthoredCompositionCall as CompositionCall,
+        AuthoredCompositionCallPath as CompositionCallPath,
+        AuthoredLiveComposition as LiveComposition,
+        AuthoredLiveCompositionArgument as LiveCompositionArgument,
+        AuthoredLiveCompositionSignature as LiveCompositionSignature, ModuleConstraintId,
+        PendingModuleConstraint,
     };
 
     let parsed_calls = crate::parser::parse_file(
@@ -3684,7 +5067,7 @@ let root = outer { outer_port = producer.port }
 
     let inner_call = CompositionCall {
         module_name: "inner".to_string(),
-        binding: Some("inner".to_string()),
+        binding: Some("inner".into()),
         instance: "inner".to_string(),
         module_source: None,
         module_directory: None,
@@ -3700,7 +5083,7 @@ let root = outer { outer_port = producer.port }
                 "port".to_string(),
                 LiveCompositionArgument::from_value(
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "outer_port".to_string(),
+                        binding: "outer_port".into(),
                     }),
                     consumer_type(TypeExpr::String),
                     ArgumentOrigin::Defaulted,
@@ -3720,7 +5103,7 @@ let root = outer { outer_port = producer.port }
                 message: "port must not be empty".to_string(),
             }],
         },
-        binding: Some("inner".to_string()),
+        binding: Some("inner".into()),
         dependency_bindings: BTreeSet::new(),
         module_name: "inner".to_string(),
         instance: "inner".to_string(),
@@ -3786,8 +5169,8 @@ let root = outer { outer_port = producer.port }
             .signature
             .arguments
             .get("port")
-            .map(LiveCompositionArgument::value),
-        Some(&Value::resource_ref("producer", "port", Vec::new()))
+            .map(|argument| argument.value()),
+        Some(&expanded_resource_ref("producer", "port", Vec::new()))
     );
     let constraint = &nested.signature.pending_constraints[0];
     assert_eq!(
@@ -4508,7 +5891,10 @@ fn test_argument_type_custom_validator() {
                 if target.identity() != &validator_identity {
                     return Ok(());
                 }
-                let Value::Concrete(ConcreteValue::String(s)) = value else {
+                let crate::resource::ExpandedValue::Concrete(
+                    crate::resource::ExpandedConcreteValue::String(s),
+                ) = value
+                else {
                     return Err(crate::parser::fixture_custom_type_rejection(
                         target,
                         "Expected string",
@@ -4529,6 +5915,7 @@ fn test_argument_type_custom_validator() {
     });
 
     let mut module = create_test_module();
+    module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arn".to_string(),
         static_type: known(TypeExpr::SchemaType { owned }),
@@ -4591,7 +5978,10 @@ fn test_argument_type_list_of_custom_type() {
                 if target.identity() != &validator_identity {
                     return Ok(());
                 }
-                let Value::Concrete(ConcreteValue::String(s)) = value else {
+                let crate::resource::ExpandedValue::Concrete(
+                    crate::resource::ExpandedConcreteValue::String(s),
+                ) = value
+                else {
                     return Err(crate::parser::fixture_custom_type_rejection(
                         target,
                         "Expected string",
@@ -4612,6 +6002,7 @@ fn test_argument_type_list_of_custom_type() {
     });
 
     let mut module = create_test_module();
+    module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arns".to_string(),
         static_type: known(TypeExpr::List(Box::new(TypeExpr::SchemaType { owned }))),
@@ -4724,7 +6115,10 @@ fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ModuleReso
     resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
-fn role_attr<'a>(parsed: &'a ModuleResolvedParsedFile, attr: &str) -> &'a Value<ParserPlaceholder> {
+fn role_attr<'a>(
+    parsed: &'a ModuleResolvedParsedFile,
+    attr: &str,
+) -> &'a Value<ParserPlaceholder, AbsoluteBindingAddress> {
     parsed
         .resources
         .iter()
@@ -4763,17 +6157,19 @@ m {
     );
 
     let policy = role_attr(&parsed, "assume_role_policy_document");
-    let Value::Concrete(ConcreteValue::Map(policy_map)) = policy else {
+    let ExpandedValue::Concrete(ExpandedConcreteValue::Map(policy_map)) = policy else {
         panic!("assume_role_policy_document should be a Map, got {policy:?}");
     };
     let patterns = policy_map.get("patterns").expect("patterns should exist");
-    let Value::Concrete(ConcreteValue::List(items)) = patterns else {
+    let ExpandedValue::Concrete(ExpandedConcreteValue::List(items)) = patterns else {
         panic!("patterns should be a List, got {patterns:?}");
     };
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0],
-        Value::Concrete(ConcreteValue::String("repo:carina-rs/infra:*".into())),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "repo:carina-rs/infra:*".into()
+        )),
         "default's ${{github_repo}} interpolation must resolve against the caller's value"
     );
 }
@@ -4808,7 +6204,9 @@ m {
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("repo:carina-rs/infra:*".into())),
+        &ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "repo:carina-rs/infra:*".into()
+        )),
         "block-form default's `${{github_repo}}` must resolve against the caller's value"
     );
 }
@@ -4841,7 +6239,7 @@ m {
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("p".into())),
+        &ExpandedValue::Concrete(ExpandedConcreteValue::String("p".into())),
         "bare-identifier default `secondary = primary` must resolve to caller's `primary`"
     );
 }
@@ -4890,19 +6288,27 @@ let child = selector {
     let selected = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("child.selected"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.selected")
+        })
         .expect("expanded selected resource");
     assert_eq!(
         selected.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("b".into())))
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "b".into()
+        )))
     );
     assert_eq!(
         selected.get_attr("bracket_value"),
-        Some(&Value::Concrete(ConcreteValue::String("value".into())))
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "value".into()
+        )))
     );
     assert_eq!(
         selected.get_attr("field_value"),
-        Some(&Value::Concrete(ConcreteValue::String("value".into())))
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "value".into()
+        )))
     );
 }
 
@@ -5038,11 +6444,13 @@ let child = selector { vpc = source }
     let selected = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("child.selected"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.selected")
+        })
         .expect("expanded consumer");
     assert_eq!(
         selected.get_attr("parent"),
-        Some(&Value::resource_ref("source", "identifier", vec![])),
+        Some(&expanded_resource_ref("source", "identifier", vec![])),
     );
 }
 
@@ -5092,12 +6500,30 @@ let child = imported { peer = source }
     let consumer = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("child.consumer"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.consumer")
+        })
         .expect("expanded consumer");
-    assert_eq!(consumer.directives.depends_on, vec!["source"]);
+    assert_eq!(
+        consumer
+            .directives
+            .depends_on
+            .iter()
+            .map(|binding| binding.as_str())
+            .collect::<Vec<_>>(),
+        vec!["source"]
+    );
     let dependencies = crate::deps::get_resource_dependencies(consumer);
-    assert!(dependencies.contains("source"));
-    assert!(!dependencies.contains("child.peer"));
+    assert!(
+        dependencies
+            .iter()
+            .any(|binding| binding.as_str() == "source")
+    );
+    assert!(
+        dependencies
+            .iter()
+            .all(|binding| binding.as_str() != "child.peer")
+    );
 }
 
 #[test]
@@ -5187,11 +6613,13 @@ let child = imported { peer = peer.identifier }
     let consumer = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("child.consumer"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.consumer")
+        })
         .expect("expanded consumer");
     assert_eq!(
         consumer.get_attr("parent"),
-        Some(&Value::resource_ref(
+        Some(&expanded_resource_ref(
             "peer",
             "identifier",
             vec!["name".to_string()],
@@ -5229,7 +6657,7 @@ m {}
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("X-X!".into())),
+        &ExpandedValue::Concrete(ExpandedConcreteValue::String("X-X!".into())),
         "transitive default chain `a → b → c` must collapse to a flat string"
     );
 }
@@ -5266,16 +6694,16 @@ m {
     );
 
     let policy = role_attr(&parsed, "assume_role_policy_document");
-    let Value::Concrete(ConcreteValue::Map(policy_map)) = policy else {
+    let ExpandedValue::Concrete(ExpandedConcreteValue::Map(policy_map)) = policy else {
         panic!("policy should be Map, got {policy:?}");
     };
     let tags = policy_map.get("tags").expect("tags should exist");
-    let Value::Concrete(ConcreteValue::Map(tag_map)) = tags else {
+    let ExpandedValue::Concrete(ExpandedConcreteValue::Map(tag_map)) = tags else {
         panic!("tags should be Map, got {tags:?}");
     };
     assert_eq!(
         tag_map.get("region"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "ap-northeast-1-tag".into()
         ))),
         "interpolation inside a nested map default must resolve recursively"
@@ -5312,15 +6740,15 @@ m {
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("hello".into())),
+        &ExpandedValue::Concrete(ExpandedConcreteValue::String("hello".into())),
     );
     let policy = role_attr(&parsed, "assume_role_policy_document");
-    let Value::Concrete(ConcreteValue::Map(policy_map)) = policy else {
+    let ExpandedValue::Concrete(ExpandedConcreteValue::Map(policy_map)) = policy else {
         panic!("policy should be Map, got {policy:?}");
     };
     assert_eq!(
         policy_map.get("y_value"),
-        Some(&Value::Concrete(ConcreteValue::Int(42)))
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::Int(42)))
     );
 }
 
@@ -5360,7 +6788,7 @@ m {}
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("L".into())),
+        &ExpandedValue::Concrete(ExpandedConcreteValue::String("L".into())),
         "forward-ref default `prefix = later` resolves to `later`'s value `'L'` \
          once the fix-point loop runs in `expander.rs::substitute_arguments`"
     );
@@ -5399,10 +6827,9 @@ m {}
         // walk order. Either is fine — the contract is that the loop
         // terminates without panicking and preserves a structured,
         // statically typed placeholder rather than inventing a value.
-        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
-            name,
-            ..
-        })) => {
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument { name, .. },
+        )) => {
             assert!(
                 name == "a" || name == "b",
                 "expected cyclic argument to point at `a` or `b`, got: {name:?}"
@@ -5445,7 +6872,7 @@ m {
     // Find the module's expanded `role` (the upstream Vpc has type Vpc, not Role).
     let role_name = role_attr(&parsed, "role_name");
     match role_name {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+        ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) => {
             assert_eq!(
                 path.binding(),
                 "upstream",
@@ -5881,11 +7308,19 @@ let instance = child { count = source.count + 1 }
     let count = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("instance.target"))
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == "instance.target")
+        })
         .and_then(|resource| resource.get_attr("count"))
         .expect("expanded target count");
     assert!(
-        matches!(count, Value::Deferred(DeferredValue::IntegerArithmetic(_))),
+        matches!(
+            count,
+            ExpandedValue::Deferred(ExpandedDeferredValue::IntegerArithmetic(_))
+        ),
         "module substitution must preserve typed arithmetic, got {count:?}",
     );
 }
@@ -6077,13 +7512,15 @@ let instance = child { source = source }
     let value = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("instance.consumer"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("instance.consumer")
+        })
         .and_then(|resource| resource.get_attr("parent"))
         .expect("expanded consumer parent");
     assert!(
         matches!(
             value,
-            Value::Deferred(DeferredValue::ResourceRef { path })
+            ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path })
                 if path.binding() == "source" && path.attribute() == "name"
         ),
         "module argument access must retain the caller binding, got {value:?}",
@@ -6510,9 +7947,8 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     let module = {
         let mut m = create_module_with_intra_refs();
         // The loop iterates `cert.domain_validation_options`, so `cert`
-        // must be a real module-internal binding for the
-        // intra-module-conditional prefix to apply (same condition as
-        // `rewrite_intra_module_refs`). Add it so this unit faithfully
+        // must be a real module-internal binding for the typed module scope
+        // to resolve it to this instance. Add it so this unit faithfully
         // models the real `let cert = aws.acm.Certificate { … }` case.
         m.resources.push(Resource {
             id: ResourceId::with_identity("acm.Certificate", "cert"),
@@ -6520,7 +7956,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             directives: Directives::default(),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
-            binding: Some("cert".to_string()),
+            binding: Some("cert".into()),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
@@ -6532,7 +7968,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                 None,
                 7,
                 "for _, opt in cert.domain_validation_options".to_string(),
-                DeferredForTarget::bound("_domain_validation_options")
+                DeferredForTarget::bound(RelativeBindingName::new("_domain_validation_options"))
                     .expect("fixture binding is valid"),
                 Value::resource_ref("cert", "domain_validation_options", Vec::new()),
                 ForBinding::Map("_".to_string(), "opt".to_string()),
@@ -6594,7 +8030,11 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         "module-internal deferred-for must survive expand_module_call (carina#3126)"
     );
     let d = &expanded.parsed_deferred_for_expressions()[0];
-    assert!(d.root_bindings().contains("r.cert"));
+    assert!(
+        d.root_bindings()
+            .iter()
+            .any(|binding| binding.as_str() == "r.cert")
+    );
     // carina#3126 PR-B: binding-name fields are instance-prefixed so
     // the loop-generated resources are isolated per module instance
     // and the iterable resolves against the (now prefixed) module
@@ -6607,12 +8047,14 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         Some("r._domain_validation_options"),
         "PR-B must instance-prefix binding_name"
     );
-    // `cert` is a module-internal `let cert` binding → prefixed
-    // (same caller-collision guard `rewrite_intra_module_refs`
-    // applies to a `ResourceRef` head; a caller-shared name would
-    // NOT be prefixed — see prefix_parsed_deferred_for_expression).
+    // `cert` is a module-internal `let cert` binding, so the typed module
+    // scope resolves it to `r.cert`. A module argument would instead be
+    // substituted with its caller-expanded absolute value.
     assert_eq!(
-        d.root_bindings(),
+        d.root_bindings()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>(),
         std::collections::BTreeSet::from(["r.cert".to_string()]),
         "PR-B must instance-prefix the intra-module iterable root"
     );
@@ -6630,7 +8072,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         .get("validated_cert")
         .expect("template attr preserved");
     match validated_cert {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+        ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) => {
             assert_eq!(
                 path.binding(),
                 "r.cert",
@@ -6656,13 +8098,21 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
 
     let mut module = create_test_module_with_anonymous_resource();
     module.resources.clear();
+    module.arguments.push(ArgumentParameter {
+        name: "accounts".to_string(),
+        static_type: known(TypeExpr::List(Box::new(TypeExpr::String))),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    });
     module
         .parsed_deferred_for_expressions_mut()
         .push(parsed_deferred_resource(DeferredForExpression::new(
             None,
             1,
             "for _, account in accounts.items".to_string(),
-            DeferredForTarget::bound("assignments").expect("fixture binding is valid"),
+            DeferredForTarget::bound(RelativeBindingName::new("assignments"))
+                .expect("fixture binding is valid"),
             Value::resource_ref("accounts", "items", Vec::new()),
             ForBinding::Map("_".to_string(), "account".to_string()),
             Resource::pending_with_provider("awscc", "sso.Assignment", None),
@@ -6675,7 +8125,14 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
             .insert("assignments".to_string(), module);
         resolver
     };
-    let call = ModuleCall::test("assignments".to_string(), None, HashMap::new());
+    let call = ModuleCall::test("assignments".to_string(), None, {
+        let mut arguments = HashMap::new();
+        arguments.insert(
+            "accounts".to_string(),
+            Value::resource_ref("accounts", "items", Vec::new()),
+        );
+        module_arguments(arguments)
+    });
 
     let first_expanded = resolver.expand_module_call(&call, "first").unwrap();
     let first = first_expanded
@@ -6701,30 +8158,31 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
     assert_ne!(first.id(), second.id());
 }
 
-/// carina#3126 PR-B negative case: an `iterable_binding` that is NOT a
-/// module-internal binding (a caller-passed / argument binding that
-/// merely shares a name) must **not** be instance-prefixed — the same
-/// caller-collision guard `rewrite_intra_module_refs` applies to a
-/// `ResourceRef` head. This locks the `else` arm of the conditional
-/// and is the safety property the deliberate divergence from the
-/// design's unconditional-prefix table protects. Without this test a
-/// future "simplification" back to unconditional prefixing would pass
-/// CI while silently breaking caller-passed iterables.
+/// carina#3126 PR-B negative case: a deferred iterable supplied through
+/// a module argument is already absolute in the caller's scope and must
+/// never be prefixed with the callee's instance address.
 #[test]
 fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     use crate::parser::{DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
-        // No module resource/wait is bound `accounts` — it is meant to
-        // come from the caller (e.g. an argument), so it is NOT in
-        // `intra_module_bindings` and must survive unprefixed.
+        m.arguments.push(ArgumentParameter {
+            name: "accounts".to_string(),
+            static_type: known(TypeExpr::List(Box::new(TypeExpr::String))),
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        });
+        // `accounts` is a module argument, so its caller-expanded address is
+        // substituted rather than acquiring the callee's instance prefix.
         m.parsed_deferred_for_expressions_mut()
             .push(parsed_deferred_resource(DeferredForExpression::new(
                 None,
                 3,
                 "for _, a in accounts.list".to_string(),
-                DeferredForTarget::bound("_list").expect("fixture binding is valid"),
+                DeferredForTarget::bound(RelativeBindingName::new("_list"))
+                    .expect("fixture binding is valid"),
                 Value::resource_ref("accounts", "list", Vec::new()),
                 ForBinding::Map("_".to_string(), "a".to_string()),
                 Resource {
@@ -6756,6 +8214,10 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
             "cidr".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         );
+        args.insert(
+            "accounts".to_string(),
+            Value::resource_ref("accounts", "list", Vec::new()),
+        );
         module_arguments(args)
     });
 
@@ -6767,9 +8229,12 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     // (caller-collision guard). A regression to unconditional
     // prefixing would make this `prod.accounts` and fail here.
     assert_eq!(
-        d.root_bindings(),
+        d.root_bindings()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>(),
         std::collections::BTreeSet::from(["accounts".to_string()]),
-        "a non-module-internal iterable binding must NOT be prefixed"
+        "a caller-supplied iterable binding must not be prefixed"
     );
 }
 
@@ -6870,7 +8335,10 @@ let r = registry {
         "r._domain_validation_options"
     );
     assert_eq!(
-        d.root_bindings(),
+        d.root_bindings()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>(),
         std::collections::BTreeSet::from(["r.cert".to_string()])
     );
 
@@ -6884,8 +8352,8 @@ let r = registry {
          merge surface (carina#3061); got: {:?}",
         parsed.wait_bindings
     );
-    assert_eq!(parsed.wait_bindings[0].binding, "r.cert_issued");
-    assert_eq!(parsed.wait_bindings[0].target, "r.cert");
+    assert_eq!(parsed.wait_bindings[0].binding.as_str(), "r.cert_issued");
+    assert_eq!(parsed.wait_bindings[0].target.as_str(), "r.cert");
 }
 
 #[test]
@@ -6917,8 +8385,12 @@ let second = for item in source.second {
     assert_eq!(
         comments,
         [
-            Some(&Value::Concrete(ConcreteValue::String("first".into()))),
-            Some(&Value::Concrete(ConcreteValue::String("second".into()))),
+            Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                "first".into()
+            ))),
+            Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                "second".into()
+            ))),
         ],
         "finalization must derive order and templates from the typed list alone"
     );
@@ -6984,8 +8456,11 @@ let second = for item in secnd_items {
     )
     .expect("both undefined iterables remain deferred until finalization");
 
-    let error = super::resolve_modules_providerless(parsed, std::path::Path::new("."))
-        .expect_err("finalization must reject both undefined iterables");
+    let error = super::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect_err("finalization must reject both undefined iterables");
     let message = error.display_relative_to(std::path::Path::new("."));
 
     assert!(
@@ -7067,25 +8542,30 @@ let registry_publish = registry {
     let consumer = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("registry_publish.consumer"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str())
+                == Some("registry_publish.consumer")
+        })
         .expect("expanded module consumer must exist");
     assert!(
         consumer
             .dependency_bindings
-            .contains("registry_publish.target"),
+            .iter()
+            .any(|binding| binding.as_str() == "registry_publish.target"),
         "module resource dependency must be populated and prefixed: {:?}",
         consumer.dependency_bindings,
     );
     assert!(
-        !consumer
+        consumer
             .dependency_bindings
-            .contains("registry_publish.label"),
+            .iter()
+            .all(|binding| binding.as_str() != "registry_publish.label"),
         "module arguments must not be mistaken for intra-module resources: {:?}",
         consumer.dependency_bindings,
     );
     assert_eq!(
         consumer.attributes.get("description"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "module-target:caller-label".into(),
         ))),
         "module-local references must resolve before argument substitution"
@@ -7094,16 +8574,23 @@ let registry_publish = registry {
     let roles = parsed
         .data_sources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("registry_publish.roles"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str())
+                == Some("registry_publish.roles")
+        })
         .expect("expanded module data source must exist");
     assert_eq!(
-        roles.dependency_bindings,
+        roles
+            .dependency_bindings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>(),
         BTreeSet::from(["registry_publish.target".to_string()]),
         "module data-source dependency must be populated and prefixed"
     );
     assert_eq!(
         roles.attributes.get("name_regex"),
-        Some(&Value::Concrete(ConcreteValue::String(
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "^module-target$".into(),
         ))),
         "module data-source input must resolve through the production loader"
@@ -7112,7 +8599,9 @@ let registry_publish = registry {
     let composition = parsed
         .compositions
         .iter()
-        .find(|composition| composition.binding.as_deref() == Some("registry_publish"))
+        .find(|composition| {
+            composition.binding.as_ref().map(|binding| binding.as_str()) == Some("registry_publish")
+        })
         .expect("module output composition must exist");
     let target_name = composition
         .signature
@@ -7211,7 +8700,9 @@ let outer = outer_module {}
     let target = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("outer.inner.target"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("outer.inner.target")
+        })
         .expect("twice-expanded target must exist");
     assert_eq!(
         target.id.identity_str().expect("resolved identity"),
@@ -7221,10 +8712,17 @@ let outer = outer_module {}
     let consumer = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("outer.inner.consumer"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str())
+                == Some("outer.inner.consumer")
+        })
         .expect("twice-expanded consumer must exist");
     assert_eq!(
-        consumer.dependency_bindings,
+        consumer
+            .dependency_bindings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>(),
         BTreeSet::from(["outer.inner.target".to_string()]),
         "the outer pass must prefix the inner dependency once, matching the final target binding"
     );
@@ -7232,10 +8730,16 @@ let outer = outer_module {}
     let roles = parsed
         .data_sources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("outer.inner.roles"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("outer.inner.roles")
+        })
         .expect("twice-expanded data source must exist");
     assert_eq!(
-        roles.dependency_bindings,
+        roles
+            .dependency_bindings
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>(),
         BTreeSet::from(["outer.inner.target".to_string()]),
         "nested data-source dependency metadata must match the twice-expanded target binding"
     );
@@ -7253,6 +8757,7 @@ let outer = outer_module {}
 #[test]
 fn argument_type_list_accepts_resource_ref() {
     let mut module = create_test_module();
+    module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "role_arns".to_string(),
         static_type: known(TypeExpr::List(Box::new(TypeExpr::Simple(
@@ -7293,6 +8798,7 @@ fn argument_type_list_accepts_resource_ref() {
 #[test]
 fn argument_type_map_accepts_resource_ref() {
     let mut module = create_test_module();
+    module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "tags".to_string(),
         static_type: known(TypeExpr::Map(Box::new(TypeExpr::String))),
@@ -7330,6 +8836,7 @@ fn argument_type_map_accepts_resource_ref() {
 #[test]
 fn argument_type_struct_accepts_resource_ref() {
     let mut module = create_test_module();
+    module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "options".to_string(),
         static_type: known(TypeExpr::Struct {
@@ -7366,6 +8873,7 @@ fn argument_type_struct_accepts_resource_ref() {
 #[test]
 fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
     let mut module = create_test_module();
+    module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "count".to_string(),
         static_type: known(TypeExpr::Int),
@@ -7670,6 +9178,7 @@ fn argument_type_mismatch_error_shows_complete_nested_list_path() {
 #[test]
 fn binding_ref_argument_defers_to_binding_index() {
     let mut module = create_test_module();
+    module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "environment".to_string(),
         static_type: known(TypeExpr::Union(vec![
@@ -7690,7 +9199,7 @@ fn binding_ref_argument_defers_to_binding_index() {
         module_arguments([(
             "environment".to_string(),
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "outer_environment".to_string(),
+                binding: "outer_environment".into(),
             }),
         )]),
     );

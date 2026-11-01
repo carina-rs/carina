@@ -7,13 +7,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::differ::ComparisonContext;
 use crate::effect::ResolvedMove;
-use crate::parser::ProviderConfig;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
 use crate::provider::{ComparisonResolutionError, ProviderFactory, ProviderRouter};
 use crate::resource::{
-    AnonymousIdentityModuleSource, ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue,
-    LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind, ResolvedResourceId,
-    Resource, ResourceId, ResourceIdentity, Value, ValueString,
+    AnonymousIdentityModuleSource, ApplyTimeUnknown, BindingAddress, ConcreteValue, DataSource,
+    DeferredValue, LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value, ValueString,
 };
 use crate::schema::{
     AttributeType, ResourceSchema, SchemaRegistry, Shape, ValidatedResourceSchema,
@@ -162,8 +161,8 @@ pub enum AnonymousIdentityBasis {
 /// bytes hashed for that basis. An unresolved `<attribute>_prefix` is treated
 /// identically to the same prefix after [`resolve_attr_prefixes`] moves it into
 /// [`Resource::prefixes`].
-fn stable_anonymous_hash_inputs<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+fn stable_anonymous_hash_inputs<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     schema: &ResourceSchema,
 ) -> BTreeMap<String, String> {
     let mut inputs = BTreeMap::new();
@@ -205,8 +204,8 @@ fn stable_anonymous_hash_inputs<S, P: PlaceholderKind>(
 /// unknown. Otherwise, presence is what matters here, not whether a value is
 /// concrete yet. A deferred create-only or identity value will become
 /// concrete later but is still an immutable identity input.
-pub fn classify_anonymous_identity_basis<S, P: PlaceholderKind>(
-    resource: &Resource<S, P>,
+pub fn classify_anonymous_identity_basis<S, P: PlaceholderKind, B: BindingAddress>(
+    resource: &Resource<S, P, B>,
     registry: &SchemaRegistry,
 ) -> Option<AnonymousIdentityBasis> {
     let schema = registry.get_for(resource)?;
@@ -260,7 +259,9 @@ impl Ord for AnonymousResourceKind {
 }
 
 impl AnonymousResourceKind {
-    fn of<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(resource: &Resource<S, P>) -> Self {
+    fn of<S: AnonymousIdentityModuleSource, P: PlaceholderKind, B: BindingAddress>(
+        resource: &Resource<S, P, B>,
+    ) -> Self {
         let module_scope = resource
             .module_source
             .as_ref()
@@ -294,9 +295,9 @@ impl AttributeDerivedAnonymousResourceConflict {
     /// Return whether `resource` is one of the declarations represented by
     /// this conflict. This lets source-aware callers attach the shared error to
     /// each declaration without reimplementing the grouping rule.
-    pub fn includes<S: AnonymousIdentityModuleSource, P: PlaceholderKind>(
+    pub fn includes<S: AnonymousIdentityModuleSource, P: PlaceholderKind, B: BindingAddress>(
         &self,
-        resource: &Resource<S, P>,
+        resource: &Resource<S, P, B>,
         registry: &SchemaRegistry,
     ) -> bool {
         resource.binding.is_none()
@@ -537,7 +538,7 @@ pub fn compute_anonymous_identifiers_with_factories<
     P: PlaceholderKind,
 >(
     resources: CanonicalizedResources<'_, S, P>,
-    providers: &[ProviderConfig<P>],
+    providers: &[crate::parser::ProviderConfig<P, crate::resource::AbsoluteBindingAddress>],
     factories: &[Box<dyn ProviderFactory>],
     registry: &SchemaRegistry,
     conflict_policy: AnonymousIdentityConflictPolicy,
@@ -700,8 +701,8 @@ fn has_legacy_synthetic_identity_segment(identity: &str) -> bool {
 /// current resource, include that resource's resolved address in the repair
 /// text.
 pub fn check_legacy_loop_move_targets<S>(
-    state_blocks: &[StateBlock<impl PlaceholderKind>],
-    resources: &[Resource<S, impl PlaceholderKind>],
+    state_blocks: &[StateBlock<impl PlaceholderKind, impl crate::resource::BindingAddress>],
+    resources: &[Resource<S, impl PlaceholderKind, impl crate::resource::BindingAddress>],
 ) -> Vec<LegacyLoopMoveTargetError> {
     state_blocks
         .iter()
@@ -778,8 +779,9 @@ pub fn check_legacy_loop_move_targets<S>(
 pub fn check_attribute_derived_anonymous_resource_conflicts<
     S: AnonymousIdentityModuleSource,
     P: PlaceholderKind,
+    B: BindingAddress,
 >(
-    resources: &[Resource<S, P>],
+    resources: &[Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> Vec<AttributeDerivedAnonymousResourceConflict> {
     let mut counts = BTreeMap::<AnonymousResourceKind, usize>::new();
@@ -812,18 +814,21 @@ pub fn check_attribute_derived_anonymous_resource_conflicts<
 /// identity for them, so removing the binding would turn valid lint advice
 /// into a later hard error. Stable and singleton attribute-derived resources
 /// remain safe to anonymize.
-pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
-    resources: &[Resource<crate::resource::ModuleSource, P>],
+pub(crate) fn identity_required_bindings<
+    S: AnonymousIdentityModuleSource,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
+    resources: &[Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> HashSet<String> {
     let mut required = HashSet::new();
-    let mut resources_by_kind =
-        BTreeMap::<AnonymousResourceKind, Vec<&Resource<crate::resource::ModuleSource, P>>>::new();
+    let mut resources_by_kind = BTreeMap::<AnonymousResourceKind, Vec<&Resource<S, P, B>>>::new();
     for resource in resources {
         match classify_anonymous_identity_basis(resource, registry) {
             None => {
                 if let Some(binding) = &resource.binding {
-                    required.insert(binding.clone());
+                    required.insert(binding.to_string());
                 }
             }
             Some(AnonymousIdentityBasis::AttributeDerived) => {
@@ -841,7 +846,7 @@ pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
             .into_values()
             .filter(|resources| resources.len() >= 2)
             .flatten()
-            .filter_map(|resource| resource.binding.clone()),
+            .filter_map(|resource| resource.binding.as_ref().map(ToString::to_string)),
     );
     required
 }
@@ -855,8 +860,8 @@ pub(crate) fn identity_required_bindings<P: PlaceholderKind>(
 /// - Generates a temporary name: `prefix + random_suffix`
 ///
 /// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
-pub fn resolve_attr_prefixes<P: PlaceholderKind>(
-    resources: &mut [Resource<crate::resource::ModuleSource, P>],
+pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
+    resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
@@ -1011,7 +1016,9 @@ pub fn reconcile_prefixed_names(
 ///
 /// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
 /// so the output is consistent across runs (HashMap iteration order is random).
-fn deterministic_value_string<P: PlaceholderKind>(value: &Value<P>) -> String {
+fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> String {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
             "ModuleIf({}, {}, {})",
@@ -1322,9 +1329,9 @@ pub(crate) fn closest_unique_simhash_match<C: Copy>(
 /// Map values are expanded so each entry becomes a separate feature (e.g., `tags.Environment`),
 /// allowing SimHash to produce close hashes when only one map entry changes.
 /// Non-map values use `deterministic_value_string` as the feature value.
-pub(crate) fn flatten_value_for_simhash<P: PlaceholderKind>(
+pub(crate) fn flatten_value_for_simhash<P: PlaceholderKind, B: BindingAddress>(
     prefix: &str,
-    value: &Value<P>,
+    value: &Value<P, B>,
     out: &mut std::collections::BTreeMap<String, String>,
 ) {
     match value {
@@ -1410,9 +1417,9 @@ pub fn anonymous_identity_discriminator(identity: &ResourceIdentity) -> Option<S
 /// This is the shared feature set used by both anonymous identifier computation
 /// (when the schema has no create-only attributes) and `compute_resource_simhash`
 /// so the two always agree on what a resource's anonymous ID would be.
-fn simhash_from_identity_and_resource<S, P: PlaceholderKind>(
+fn simhash_from_identity_and_resource<S, P: PlaceholderKind, B: BindingAddress>(
     identity_values: &BTreeMap<String, String>,
-    resource: &Resource<S, P>,
+    resource: &Resource<S, P, B>,
 ) -> SimHash {
     let mut simhash_values = identity_values.clone();
     for (key, value) in &resource.attributes {
@@ -1730,7 +1737,7 @@ fn loop_module_conflicts<S, P: PlaceholderKind>(
 #[cfg(test)]
 pub fn compute_anonymous_identifiers_for_test(
     resources: &mut [Resource],
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
@@ -2044,7 +2051,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
 #[cfg(test)]
 pub fn compute_anonymous_identifiers_with_provider_configs_for_test(
     resources: &mut [Resource],
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), AnonymousIdentityError> {
@@ -3344,7 +3351,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
     registry: &SchemaRegistry,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-    providers: &[ProviderConfig],
+    providers: &[crate::parser::ExpandedProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
