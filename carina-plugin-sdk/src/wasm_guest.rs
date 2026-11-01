@@ -1160,20 +1160,70 @@ macro_rules! export_provider {
 
             fn sdk_to_wit_pending<T: serde::Serialize>(
                 pending: &$crate::Pending<T>,
-            ) -> Result<wit_types::PendingOperation, serde_json::Error> {
-                Ok(wit_types::PendingOperation {
+            ) -> Result<wit_types::PendingUpdate, serde_json::Error> {
+                Ok(wit_types::PendingUpdate {
+                    operation: wit_types::PendingOperation {
+                        token: serde_json::to_string(&pending.token)?,
+                        poll_after_secs: pending.poll_after_secs,
+                    },
+                    phase: proto_to_wit_pending_phase(pending.phase),
+                })
+            }
+
+            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned>(
+                pending: wit_types::PendingUpdate,
+            ) -> Result<$crate::Pending<T>, serde_json::Error> {
+                Ok($crate::Pending {
+                    token: serde_json::from_str(&pending.operation.token)?,
+                    poll_after_secs: pending.operation.poll_after_secs,
+                    phase: wit_to_proto_pending_phase(pending.phase),
+                })
+            }
+
+            fn sdk_to_wit_pending_delete<T: serde::Serialize>(
+                pending: &$crate::PendingDelete<T>,
+            ) -> Result<wit_types::PendingDelete, serde_json::Error> {
+                Ok(wit_types::PendingDelete {
                     token: serde_json::to_string(&pending.token)?,
                     poll_after_secs: pending.poll_after_secs,
                 })
             }
 
-            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned>(
-                pending: wit_types::PendingOperation,
-            ) -> Result<$crate::Pending<T>, serde_json::Error> {
-                Ok($crate::Pending {
-                    token: serde_json::from_str(&pending.token)?,
-                    poll_after_secs: pending.poll_after_secs,
-                })
+            fn wit_to_sdk_pending_delete<T: serde::de::DeserializeOwned>(
+                pending: wit_types::PendingDelete,
+            ) -> Result<$crate::PendingDelete<T>, serde_json::Error> {
+                Ok($crate::PendingDelete::new(
+                    serde_json::from_str(&pending.token)?,
+                    pending.poll_after_secs,
+                ))
+            }
+
+            fn proto_to_wit_pending_phase(
+                phase: $crate::PendingPhase,
+            ) -> wit_types::PendingPhase {
+                match phase {
+                    $crate::PendingPhase::Operation => wit_types::PendingPhase::Operation,
+                    $crate::PendingPhase::ReadBack => wit_types::PendingPhase::ReadBack,
+                }
+            }
+
+            fn wit_to_proto_pending_phase(
+                phase: wit_types::PendingPhase,
+            ) -> $crate::PendingPhase {
+                match phase {
+                    wit_types::PendingPhase::Operation => $crate::PendingPhase::Operation,
+                    wit_types::PendingPhase::ReadBack => $crate::PendingPhase::ReadBack,
+                }
+            }
+
+            fn wit_to_sdk_poll_request(request: wit_types::PollRequest) -> $crate::PollRequest {
+                let finality = match request.finality {
+                    wit_types::PollFinality::Continue => $crate::PollFinality::Continue,
+                    wit_types::PollFinality::FinalAttempt => {
+                        $crate::PollFinality::FinalAttempt
+                    }
+                };
+                $crate::PollRequest { finality }
             }
 
             fn proto_to_wit_sent(sent: &proto::Sent) -> wit_types::SentAttributes {
@@ -1232,6 +1282,24 @@ macro_rules! export_provider {
                 })
             }
 
+            fn proto_to_wit_create_progress(progress: proto::CreateProgress) -> wit_types::CreateProgress {
+                match progress {
+                    proto::CreateProgress::Operating { identifier } => wit_types::CreateProgress::Operating(
+                        identifier.map(proto::AppliedIdentifier::into_inner),
+                    ),
+                    proto::CreateProgress::ReadingBack { identifier } => {
+                        wit_types::CreateProgress::ReadingBack(identifier.into_inner())
+                    }
+                }
+            }
+
+            fn wit_create_identifier(progress: wit_types::CreateProgress) -> Option<String> {
+                match progress {
+                    wit_types::CreateProgress::Operating(identifier) => identifier,
+                    wit_types::CreateProgress::ReadingBack(identifier) => Some(identifier),
+                }
+            }
+
             enum CreateStepEncodeFailure {
                 /// A dispatched continuation failed token encoding. An
                 /// initial create without an identifier must trap so the host
@@ -1239,7 +1307,7 @@ macro_rules! export_provider {
                 /// reuse its last decodable token. Once an identifier exists,
                 /// the failure becomes `Created` plus `ReadFailed`.
                 PendingToken {
-                    identifier: Option<String>,
+                    progress: wit_types::CreateProgress,
                     sent: wit_types::SentAttributes,
                     poll_after_secs: u32,
                     error: wit_types::ProviderError,
@@ -1266,11 +1334,11 @@ macro_rules! export_provider {
                 fn into_create_verdict(self) -> wit_types::CreateVerdict {
                     match self {
                         Self::PendingToken {
-                            identifier,
+                            progress,
                             sent,
                             poll_after_secs: _poll_after_secs,
                             error,
-                        } => match identifier {
+                        } => match wit_create_identifier(progress) {
                             Some(identifier) => {
                                 wit_types::CreateVerdict::Created(wit_types::CreatedFailure {
                                     identifier,
@@ -1295,14 +1363,14 @@ macro_rules! export_provider {
                 ) -> wit_types::PollVerdict {
                     match self {
                         Self::PendingToken {
-                            identifier,
+                            progress,
                             sent,
                             poll_after_secs,
                             error,
                         } => {
                             let wit_types::PendingCreate {
                                 operation,
-                                identifier: _previous_identifier,
+                                progress: _previous_progress,
                                 sent: _previous_sent,
                             } = previous;
                             let wit_types::PendingOperation {
@@ -1315,7 +1383,7 @@ macro_rules! export_provider {
                                         token,
                                         poll_after_secs,
                                     },
-                                    identifier,
+                                    progress,
                                     sent,
                                 },
                                 error,
@@ -1332,7 +1400,7 @@ macro_rules! export_provider {
                 /// A resume reuses its last decodable token while retaining
                 /// any identifier and poll interval returned by this call.
                 PendingToken {
-                    identifier: Option<String>,
+                    progress: wit_types::CreateProgress,
                     poll_after_secs: u32,
                     error: wit_types::ProviderError,
                 },
@@ -1361,13 +1429,13 @@ macro_rules! export_provider {
                 ) -> wit_types::ResumeVerdict {
                     match self {
                         Self::PendingToken {
-                            identifier,
+                            progress,
                             poll_after_secs,
                             error,
                         } => {
                             let wit_types::ResumePending {
                                 operation,
-                                identifier: _previous_identifier,
+                                progress: _previous_progress,
                             } = previous;
                             let wit_types::PendingOperation {
                                 token,
@@ -1379,7 +1447,7 @@ macro_rules! export_provider {
                                         token,
                                         poll_after_secs,
                                     },
-                                    identifier,
+                                    progress,
                                 },
                                 error,
                             })
@@ -1399,7 +1467,7 @@ macro_rules! export_provider {
                 ) -> wit_types::ResumeVerdict {
                     match self {
                         Self::PendingToken {
-                            identifier: None,
+                            progress: wit_types::CreateProgress::Operating(None),
                             sent: _sent,
                             poll_after_secs: _poll_after_secs,
                             error,
@@ -1420,14 +1488,15 @@ macro_rules! export_provider {
                 pending: proto::PendingCreate<T>,
                 operation: &'static str,
             ) -> Result<wit_types::PendingCreate, CreateStepEncodeFailure> {
-                let (token, identifier, sent, poll_after_secs) = pending.into_parts();
+                let (token, progress, sent, poll_after_secs) = pending.into_parts();
                 let sent = proto_to_wit_sent(&sent);
+                let progress = proto_to_wit_create_progress(progress);
                 let token = match serde_json::to_string(&token) {
                     Ok(token) => token,
                     Err(error) => {
                         let error = boundary_token_encode_to_provider_error(operation, error);
                         return Err(CreateStepEncodeFailure::PendingToken {
-                            identifier: identifier.map(proto::AppliedIdentifier::into_inner),
+                            progress,
                             sent,
                             poll_after_secs,
                             error,
@@ -1439,7 +1508,7 @@ macro_rules! export_provider {
                         token,
                         poll_after_secs,
                     },
-                    identifier: identifier.map(proto::AppliedIdentifier::into_inner),
+                    progress,
                     sent,
                 })
             }
@@ -1448,11 +1517,11 @@ macro_rules! export_provider {
                 pending: proto::ResumePending<T>,
                 operation: &'static str,
             ) -> Result<wit_types::ResumePending, ResumeStepEncodeFailure> {
-                let (token, identifier, poll_after_secs) = pending.into_parts();
-                let identifier = identifier.map(proto::AppliedIdentifier::into_inner);
+                let (token, progress, poll_after_secs) = pending.into_parts();
+                let progress = proto_to_wit_create_progress(progress);
                 let token = serde_json::to_string(&token).map_err(|error| {
                     ResumeStepEncodeFailure::PendingToken {
-                        identifier: identifier.clone(),
+                        progress: progress.clone(),
                         poll_after_secs,
                         error: boundary_token_encode_to_provider_error(operation, error),
                     }
@@ -1462,7 +1531,7 @@ macro_rules! export_provider {
                         token,
                         poll_after_secs,
                     },
-                    identifier,
+                    progress,
                 })
             }
 
@@ -1649,6 +1718,23 @@ macro_rules! export_provider {
                             Err(ResumeStepEncodeFailure::created(identifier, error))
                         }
                     },
+                    proto::ResumeStep::PartialSuccess {
+                        identifier,
+                        attributes,
+                        diagnostic,
+                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
+                        Ok(state) => Ok(wit_types::ResumeStep::PartialSuccess(
+                            wit_types::CreatePartialSuccess {
+                                state,
+                                diagnostic: proto_to_wit_partial_read_diagnostic(diagnostic),
+                            },
+                        )),
+                        Err(error) => {
+                            let error =
+                                boundary_encode_to_provider_error(operation, None, error);
+                            Err(ResumeStepEncodeFailure::created(identifier, error))
+                        }
+                    },
                     proto::ResumeStep::Pending(pending) => {
                         sdk_to_wit_resume_pending(pending, operation)
                             .map(wit_types::ResumeStep::Pending)
@@ -1720,7 +1806,7 @@ macro_rules! export_provider {
             ) -> Result<(Option<proto::AppliedIdentifier>, proto::Sent, T), wit_types::ProviderError> {
                 let wit_types::PendingCreate {
                     operation,
-                    identifier,
+                    progress,
                     sent,
                 } = pending;
                 let wit_types::PendingOperation {
@@ -1749,7 +1835,7 @@ macro_rules! export_provider {
                 let token = serde_json::from_str(&token).map_err(|error| {
                     boundary_token_decode_to_provider_error("poll_create", error)
                 })?;
-                let identifier = decode_create_identifier("poll_create", identifier)?;
+                let identifier = decode_create_identifier("poll_create", wit_create_identifier(progress))?;
                 Ok((identifier, sent, token))
             }
 
@@ -1758,7 +1844,7 @@ macro_rules! export_provider {
             ) -> Result<(Option<proto::AppliedIdentifier>, T), wit_types::ProviderError> {
                 let wit_types::ResumePending {
                     operation,
-                    identifier,
+                    progress,
                 } = pending;
                 let wit_types::PendingOperation {
                     token,
@@ -1767,7 +1853,7 @@ macro_rules! export_provider {
                 let token = serde_json::from_str(&token).map_err(|error| {
                     boundary_token_decode_to_provider_error("resume_create", error)
                 })?;
-                let identifier = decode_create_identifier("resume_create", identifier)?;
+                let identifier = decode_create_identifier("resume_create", wit_create_identifier(progress))?;
                 Ok((identifier, token))
             }
 
@@ -1795,7 +1881,7 @@ macro_rules! export_provider {
             ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
                 match outcome {
                     $crate::DeleteOutcome::Deleted => Ok(wit_types::DeleteOutcome::Deleted),
-                    $crate::DeleteOutcome::Pending(pending) => sdk_to_wit_pending(pending)
+                    $crate::DeleteOutcome::Pending(pending) => sdk_to_wit_pending_delete(pending)
                         .map(wit_types::DeleteOutcome::Pending)
                         .map_err(|error| {
                             boundary_token_encode_to_provider_error(operation, error)
@@ -2257,6 +2343,7 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
                     pending: wit_types::PendingCreate,
+                    poll_request: wit_types::PollRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
@@ -2278,6 +2365,7 @@ macro_rules! export_provider {
                         }
                     };
                     let provider = get_provider().lock().unwrap();
+                    let poll_request = wit_to_sdk_poll_request(poll_request);
                     match $crate::dispatch_poll_create(
                         &*provider,
                         &proto_id,
@@ -2285,6 +2373,7 @@ macro_rules! export_provider {
                         identifier,
                         sent,
                         token,
+                        poll_request,
                     ) {
                         Ok(step) => sdk_to_wit_create_step(step, "poll_create")
                             .map_err(|failure| {
@@ -2302,6 +2391,7 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
                     pending: wit_types::ResumePending,
+                    poll_request: wit_types::PollRequest,
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
@@ -2323,12 +2413,14 @@ macro_rules! export_provider {
                         }
                     };
                     let provider = get_provider().lock().unwrap();
+                    let poll_request = wit_to_sdk_poll_request(poll_request);
                     match $crate::dispatch_resume_create(
                         &*provider,
                         &proto_id,
                         proto_request,
                         identifier,
                         token,
+                        poll_request,
                     ) {
                         Ok(step) => sdk_to_wit_resume_step(step, "resume_create")
                             .map_err(|failure| {
@@ -2371,7 +2463,8 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::UpdateRequest,
-                    pending: wit_types::PendingOperation,
+                    pending: wit_types::PendingUpdate,
+                    poll_request: wit_types::PollRequest,
                 ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
@@ -2388,12 +2481,14 @@ macro_rules! export_provider {
                         boundary_token_decode_to_provider_error("poll_update", error)
                     })?;
                     let provider = get_provider().lock().unwrap();
+                    let poll_request = wit_to_sdk_poll_request(poll_request);
                     match $crate::CarinaProvider::poll_update(
                         &*provider,
                         &proto_id,
                         &identifier,
                         proto_request,
                         pending,
+                        poll_request,
                     ) {
                         Ok(outcome) => sdk_to_wit_update_outcome(&outcome, "poll_update"),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
@@ -2426,14 +2521,14 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::DeleteRequest,
-                    pending: wit_types::PendingOperation,
+                    pending: wit_types::PendingDelete,
                 ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error("poll_delete", error)
                     })?;
                     let proto_request = wit_to_proto_delete_request(request);
-                    let pending = wit_to_sdk_pending::<
+                    let pending = wit_to_sdk_pending_delete::<
                         <$provider_type as $crate::CarinaProvider>::DeleteToken,
                     >(pending)
                     .map_err(|error| {

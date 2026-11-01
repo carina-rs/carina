@@ -3758,10 +3758,10 @@ impl Provider for ReadWithRetryProvider {
         let id = id.clone();
         let identifier = identifier.to_string();
         Box::pin(async move {
-            Ok(UpdateOutcome::Success {
-                state: AppliedState::new(id, identifier, HashMap::new())
+            Ok(UpdateOutcome::success(
+                AppliedState::new(id, identifier, HashMap::new())
                     .expect("provider input identifier is non-empty"),
-            })
+            ))
         })
     }
 
@@ -10453,10 +10453,10 @@ mod read_with_retry_identifier_tests {
             let id = id.clone();
             let identifier = identifier.to_string();
             Box::pin(async move {
-                Ok(carina_core::provider::UpdateOutcome::Success {
-                    state: AppliedState::new(id, identifier, HashMap::new())
+                Ok(carina_core::provider::UpdateOutcome::success(
+                    AppliedState::new(id, identifier, HashMap::new())
                         .expect("provider input identifier is non-empty"),
-                })
+                ))
             })
         }
 

@@ -194,10 +194,10 @@ impl Provider for NoopProvider {
         let id = id.clone();
         let identifier = identifier.to_string();
         Box::pin(async move {
-            Ok(carina_core::provider::UpdateOutcome::Success {
-                state: carina_core::provider::AppliedState::new(id, identifier, HashMap::new())
+            Ok(carina_core::provider::UpdateOutcome::success(
+                carina_core::provider::AppliedState::new(id, identifier, HashMap::new())
                     .expect("provider input identifier is non-empty"),
-            })
+            ))
         })
     }
     fn delete(

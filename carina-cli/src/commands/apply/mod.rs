@@ -248,7 +248,7 @@ async fn create_checked_bootstrap_resource(
     match outcome {
         Ok(outcome) => {
             let identifier = outcome.identifier().as_str().to_string();
-            let (state, accepted_request, diagnostic) =
+            let (state, accepted_request, diagnostic, _read_back_end) =
                 carina_core::executor::complete_create_for_writeback(outcome, accepted_request);
             let row = carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                 &resolved,

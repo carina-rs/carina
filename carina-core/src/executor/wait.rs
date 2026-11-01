@@ -995,10 +995,10 @@ mod tests {
             let id = id.clone();
             let identifier = identifier.to_string();
             Box::pin(async move {
-                Ok(crate::provider::UpdateOutcome::Success {
-                    state: AppliedState::new(id, identifier, HashMap::new())
+                Ok(crate::provider::UpdateOutcome::success(
+                    AppliedState::new(id, identifier, HashMap::new())
                         .expect("provider input identifier is non-empty"),
-                })
+                ))
             })
         }
 
