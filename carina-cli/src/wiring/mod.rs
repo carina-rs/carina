@@ -752,10 +752,14 @@ impl NonEmptyValidationErrors {
 pub(crate) struct ValidationReport<'a> {
     result: Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
     schemas: &'a SchemaRegistry,
+    provider_type_warnings: Vec<carina_core::parser::ParseWarning>,
     config_state: std::marker::PhantomData<TemplateConfig>,
 }
 
 impl<'a> ValidationReport<'a> {
+    pub(crate) fn provider_type_warnings(&self) -> &[carina_core::parser::ParseWarning] {
+        &self.provider_type_warnings
+    }
     #[cfg(test)]
     pub(crate) fn errors(&self) -> &[AppError] {
         match &self.result {
@@ -803,6 +807,35 @@ fn validation_report_from<'a>(
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> ValidationReport<'a> {
+    let provider_type_warnings = if !load_errors.is_empty()
+        || parsed.providers.iter().any(|provider| {
+            !context
+                .factories()
+                .iter()
+                .any(|factory| factory.name() == provider.name)
+        }) {
+        let mut warnings =
+            carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
+                parsed.parsed(),
+                carina_core::parser::ProviderContext::unloaded(),
+                &base_dir.join("main.crn"),
+            )
+            .report();
+        let modules = crate::module_walk::ModuleWalk::load(parsed.parsed(), base_dir);
+        for module in modules.iter() {
+            warnings.extend(
+                carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
+                    &module.loaded().parsed,
+                    carina_core::parser::ProviderContext::unloaded(),
+                    &module.module_path().join("main.crn"),
+                )
+                .report(),
+            );
+        }
+        warnings
+    } else {
+        Vec::new()
+    };
     let result = match crate::commands::validate_and_resolve_errors_inner(
         &ValidationPipelineAccess::new(),
         parsed.clone(),
@@ -822,6 +855,7 @@ fn validation_report_from<'a>(
     ValidationReport {
         result,
         schemas: context.schemas(),
+        provider_type_warnings,
         config_state: std::marker::PhantomData,
     }
 }
@@ -1041,6 +1075,7 @@ impl ProviderLoad {
         let ValidationReport {
             result,
             schemas: _,
+            provider_type_warnings: _,
             config_state: _,
         } = validation_report_from(
             &self.context,

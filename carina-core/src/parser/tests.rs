@@ -2304,6 +2304,96 @@ fn schema_type_serde_rejects_empty_owners_with_or_without_scalar_kind() {
 }
 
 #[test]
+fn schema_type_serde_rejects_scalar_kind_that_conflicts_with_its_declaration() {
+    let original = TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            TypeIdentity::bare("Count"),
+            crate::schema::RefinedScalarKind::Int,
+        ),
+    };
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["SchemaType"]["owned"]["scalar_kind"] = serde_json::json!("String");
+    assert!(
+        serde_json::from_value::<TypeExpr>(wire).is_err(),
+        "decoding cannot change the scalar kind independently of its declaration"
+    );
+}
+
+#[test]
+fn schema_type_serde_rejects_scalar_metadata_without_declaration_evidence() {
+    let original = TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            TypeIdentity::bare("Count"),
+            crate::schema::RefinedScalarKind::Int,
+        ),
+    };
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["SchemaType"]["owned"]
+        .as_object_mut()
+        .unwrap()
+        .remove("declaration");
+    assert!(
+        serde_json::from_value::<TypeExpr>(wire).is_err(),
+        "scalar metadata alone is not declaration evidence"
+    );
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["SchemaType"]["owned"]["identity"] =
+        serde_json::to_value(TypeIdentity::bare("OtherCount")).unwrap();
+    assert!(
+        serde_json::from_value::<TypeExpr>(wire).is_err(),
+        "decoding must validate identity against the declaration too"
+    );
+}
+
+#[test]
+fn user_fn_loaded_catalog_strictly_checks_custom_type_arguments_and_returns() {
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                TypeIdentity::bare("AccountId"),
+                crate::schema::RefinedScalarKind::String,
+            )]),
+            Box::new(|target, _| {
+                Err(crate::parser::fixture_invalid_custom_type_value(
+                    target,
+                    crate::schema::TypeError::ValidationFailed {
+                        message: "rejected by loaded catalog".into(),
+                    },
+                ))
+            }),
+        ),
+        ..Default::default()
+    };
+    for source in [
+        "fn f(x: AccountId) { x }\nlet value = f('account')\n",
+        "fn f(): AccountId { 'account' }\nlet value = f()\n",
+    ] {
+        let error =
+            parse(source, &config).expect_err("loaded checking must invoke the provider validator");
+        assert!(
+            error.to_string().contains("rejected by loaded catalog"),
+            "{error}"
+        );
+    }
+    let loaded_empty = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            Default::default(),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..Default::default()
+    };
+    let error = parse(
+        "fn f(x: Arn) { x }\nlet value = f('arn:aws:s3:::bucket')\n",
+        &loaded_empty,
+    )
+    .expect_err("a loaded catalog must reject an undeclared Arn");
+    assert!(error.to_string().contains("Arn"), "{error}");
+}
+
+#[test]
 fn struct_type_expr_roundtrips_through_serde_json() {
     let t = TypeExpr::Struct {
         fields: vec![
@@ -9856,7 +9946,7 @@ fn user_fn_custom_type_ipv6_address_arg_invalid() {
 }
 
 #[test]
-fn user_fn_unresolved_custom_type_arn_arg_is_rejected() {
+fn user_fn_arn_argument_defers_without_schemas_and_rejects_unknown_loaded_type() {
     let input = r#"
         fn f(x: Arn) { x }
 
@@ -9864,12 +9954,60 @@ fn user_fn_unresolved_custom_type_arn_arg_is_rejected() {
             name = f("arn:aws:s3:::my-bucket")
         }
     "#;
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("an ownerless, non-built-in Simple annotation must not validate");
+    let parsed = parse(input, &ProviderContext::default())
+        .expect("bootstrap parsing must retain the unresolved check");
+    assert!(matches!(
+        parsed.resources[0].attributes["name"],
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
+    let checks = parsed
+        .parser_binding_metadata
+        .pending_function_type_checks();
+    assert_eq!(checks.len(), 1, "the argument check must remain pending");
+    assert_eq!(checks[0].function_name, "f");
+    assert_eq!(checks[0].source_line, 5);
+    assert!(matches!(
+        parsed.user_functions["f"].params[0].param_type,
+        Some(TypeExpr::UnloadedSchemaType(_))
+    ));
+    let loaded = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            Default::default(),
+            Box::new(|_, _| panic!("an unknown type must never validate")),
+        ),
+        ..Default::default()
+    };
+    let error = parse(input, &loaded).expect_err("a loaded catalog must reject an undeclared Arn");
     assert!(
-        error.to_string().contains("owner-qualified schema type"),
+        error.to_string().contains("unknown custom type 'Arn'"),
         "{error}"
     );
+}
+
+#[test]
+fn user_fn_unloaded_custom_type_return_defers_until_schemas_are_loaded() {
+    let parsed = parse(
+        "fn f(): AccountId { 'account' }\nlet value = f()\n",
+        &ProviderContext::default(),
+    )
+    .expect("an unloaded return annotation must preserve the deferred call");
+    assert!(matches!(
+        parsed.variables["value"],
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
+}
+
+#[test]
+fn user_fn_unloaded_custom_type_argument_defers_until_schemas_are_loaded() {
+    let parsed = parse(
+        "fn f(x: AccountId) { x }\nlet value = f('account')\n",
+        &ProviderContext::default(),
+    )
+    .expect("an unloaded parameter annotation must preserve the deferred call");
+    assert!(matches!(
+        parsed.variables["value"],
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
 }
 
 #[test]

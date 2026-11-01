@@ -224,6 +224,13 @@ pub struct RefTypeMismatch {
     declared: Option<String>,
 }
 
+/// Reference assignment distinguishes a proven mismatch from missing schemas.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefTypeAssignabilityError {
+    Mismatch(RefTypeMismatch),
+    Unchecked(Box<crate::parser::CustomTypeValidationError>),
+}
+
 impl RefTypeMismatch {
     pub fn actual_type_name(&self) -> &str {
         &self.actual
@@ -246,7 +253,10 @@ impl RefTypeMismatch {
 impl ResolvedRefType {
     /// A lexical value declaration is authoritative independently of the
     /// caller expression later substituted for that value.
-    pub(crate) fn from_value_declaration(type_expr: &crate::parser::TypeExpr) -> Option<Self> {
+    pub(crate) fn from_value_declaration<B: BindingAddress>(
+        type_expr: &crate::parser::TypeExpr,
+        bindings: &BindingIndex<'_, B>,
+    ) -> Option<Self> {
         fn is_value_constraint(type_expr: &crate::parser::TypeExpr) -> bool {
             use crate::parser::TypeExpr;
 
@@ -275,7 +285,8 @@ impl ResolvedRefType {
         if !is_value_constraint(type_expr) {
             return None;
         }
-        crate::validation::lift_type_expr(type_expr)
+        bindings
+            .lift_declared_type(type_expr)
             .map(|attr_type| Self::new(attr_type, BTreeMap::new()))
     }
 
@@ -339,28 +350,35 @@ impl ResolvedRefType {
     /// `sink`. The returned mismatch identifies the first failing constraint;
     /// inferred failures also retain the current boundary's declaration for
     /// diagnostics.
-    pub fn is_assignable_to_sink(
+    pub fn is_assignable_to_sink<B: BindingAddress>(
         &self,
         sink: TypeInSchema<'_, crate::schema::Compiled>,
-    ) -> Result<(), RefTypeMismatch> {
+        bindings: &BindingIndex<'_, B>,
+    ) -> Result<(), RefTypeAssignabilityError> {
         let authoritative = self.authoritative.constraint().type_in_schema();
-        if authoritative.assignment_to(sink).is_mismatch() {
-            return Err(RefTypeMismatch {
+        if !bindings
+            .check_type_assignment(authoritative, sink)
+            .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
+        {
+            return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
                 actual: authoritative.resolved_type_name(),
                 declared: None,
-            });
+            }));
         }
 
         for evidence in &self.evidence {
             let evidence = evidence.type_in_schema();
-            if evidence.assignment_to(sink).is_mismatch() {
-                return Err(RefTypeMismatch {
+            if !bindings
+                .check_type_assignment(evidence, sink)
+                .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
+            {
+                return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
                     actual: evidence.resolved_type_name(),
                     declared: self
                         .authoritative
                         .is_declared_composition_attribute()
                         .then(|| authoritative.resolved_type_name()),
-                });
+                }));
             }
         }
         Ok(())
@@ -788,6 +806,25 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
 
     pub fn get(&self, name: &str) -> Option<&BindingEntry<'a, B>> {
         self.entries.get(name)
+    }
+
+    pub(crate) fn provider_context(&self) -> &'a crate::parser::ProviderContext {
+        self.provider_context
+    }
+
+    /// Consume assignment with this index's provider authority. Loaded paths
+    /// propagate missing evidence; bootstrap paths explicitly allow it.
+    pub fn check_type_assignment(
+        &self,
+        source: TypeInSchema<'_, crate::schema::Compiled>,
+        sink: TypeInSchema<'_, crate::schema::Compiled>,
+    ) -> Result<bool, crate::parser::CustomTypeValidationError> {
+        let assignment = source.assignment_to(sink);
+        if self.provider_context.custom_types_loaded() {
+            assignment.require_loaded()
+        } else {
+            Ok(assignment.allow_unchecked())
+        }
     }
 
     fn lift_declared_type(&self, ty: &crate::parser::TypeExpr) -> Option<AttributeType> {
@@ -2859,9 +2896,87 @@ impl<'a> IterableBindings<'a> {
 mod tests {
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
     #[test]
+    fn value_declaration_resolves_the_catalog_scalar_kind_before_lifting() {
+        let declaration =
+            crate::parser::parse_type_expr_str("Count", crate::parser::ProviderContext::unloaded())
+                .unwrap();
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let provider_context = crate::parser::ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                    "test",
+                    crate::schema::TypeIdentity::bare("Count"),
+                    crate::schema::RefinedScalarKind::Int,
+                )]),
+                Box::new(|_, _| Ok(())),
+            ),
+            ..Default::default()
+        };
+        let index = BindingIndex::from_parsed(&parsed, &schemas, &provider_context);
+        let source = ResolvedRefType::from_value_declaration(&declaration, &index).unwrap();
+        assert!(
+            source
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()), &index)
+                .is_ok(),
+            "the declaration must resolve to an Int before it becomes authoritative"
+        );
+        assert!(matches!(
+            source
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()), &index),
+            Err(RefTypeAssignabilityError::Mismatch(_))
+        ));
+    }
+
+    #[test]
+    fn binding_assignment_requires_loaded_evidence_or_explicitly_allows_unchecked() {
+        let declaration =
+            crate::parser::parse_type_expr_str("Count", crate::parser::ProviderContext::unloaded())
+                .unwrap();
+        let source = crate::validation::lift_type_expr(&declaration).unwrap();
+        let sink = AttributeType::int();
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let loaded = crate::parser::ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                HashSet::new(),
+                Box::new(|_, _| Ok(())),
+            ),
+            ..Default::default()
+        };
+        let strict = BindingIndex::from_parsed(&parsed, &schemas, &loaded);
+        let bootstrap = BindingIndex::from_parsed(
+            &parsed,
+            &schemas,
+            crate::parser::ProviderContext::unloaded(),
+        );
+        assert_eq!(
+            strict.check_type_assignment(
+                TypeInSchema::schemaless(&source),
+                TypeInSchema::schemaless(&sink)
+            ),
+            Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+        );
+        assert_eq!(
+            bootstrap.check_type_assignment(
+                TypeInSchema::schemaless(&source),
+                TypeInSchema::schemaless(&sink)
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
     fn value_declaration_source_keeps_legacy_handle_values_inferred() {
         use crate::parser::{ResourceTypePath, TypeExpr};
 
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &schemas,
+            crate::parser::ProviderContext::unloaded(),
+        );
         let handle = TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc"));
         for declaration in [
             handle.clone(),
@@ -2873,11 +2988,13 @@ mod tests {
             TypeExpr::Union(vec![TypeExpr::String, handle]),
         ] {
             assert!(
-                super::ResolvedRefType::from_value_declaration(&declaration).is_none(),
+                super::ResolvedRefType::from_value_declaration(&declaration, &index).is_none(),
                 "a legacy handle annotation must not erase substituted value evidence: {declaration:?}",
             );
         }
-        assert!(super::ResolvedRefType::from_value_declaration(&TypeExpr::String).is_some());
+        assert!(
+            super::ResolvedRefType::from_value_declaration(&TypeExpr::String, &index).is_some()
+        );
     }
 
     use super::*;
@@ -3092,12 +3209,12 @@ let existing = read aws.ec2.Vpc {
         assert_eq!(count.display_type_name(), "Int");
         assert!(
             count
-                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()))
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()), &index)
                 .is_ok()
         );
         assert!(
             count
-                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()))
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()), &index)
                 .is_err()
         );
 
@@ -3577,9 +3694,10 @@ let vpc = aws.ec2.Vpc {
 
                 for sink in &universe {
                     let accepted = chain
-                        .is_assignable_to_sink(TypeInSchema::schemaless(
-                            &compiled.parts()[sink.name],
-                        ))
+                        .is_assignable_to_sink(
+                            TypeInSchema::schemaless(&compiled.parts()[sink.name]),
+                            &index,
+                        )
                         .is_ok();
                     let actual_accepts = TypeInSchema::schemaless(&compiled.parts()[actual.name])
                         .is_assignable_to(TypeInSchema::schemaless(&compiled.parts()[sink.name]));
@@ -3680,14 +3798,14 @@ let vpc = aws.ec2.Vpc {
 
         for accepted in [AttributeType::string(), same] {
             assert!(
-                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&accepted))
+                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&accepted), &index)
                     .is_ok(),
                 "resource handles retain main's string-shaped compatibility"
             );
         }
         for rejected in [AttributeType::int(), different, literal_union] {
             assert!(
-                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&rejected))
+                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&rejected), &index)
                     .is_err(),
                 "resource handles must not flow into non-string, closed-literal, or different-handle sinks"
             );

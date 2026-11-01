@@ -164,6 +164,28 @@ pub fn run_lint(
     };
     let provider_factory_error = provider_factory_error.map(|error| error.to_string());
     let schemas = providers.schemas();
+    let provider_type_warnings = if loaded_provider_context.is_none() {
+        let mut warnings =
+            carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
+                parsed.parsed(),
+                ProviderContext::unloaded(),
+                &base_dir.join("main.crn"),
+            )
+            .report();
+        for module in module_walk.iter() {
+            warnings.extend(
+                carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
+                    &module.loaded().parsed,
+                    ProviderContext::unloaded(),
+                    &module.module_path().join("main.crn"),
+                )
+                .report(),
+            );
+        }
+        warnings
+    } else {
+        Vec::new()
+    };
 
     // Report invalid root-owned module blocks through lint's collected,
     // path-prefixed output. The resolver enforces the same invariants as
@@ -245,6 +267,16 @@ pub fn run_lint(
             message,
         });
     }
+    warnings.extend(provider_type_warnings.into_iter().map(|warning| {
+        LintWarning {
+            file: warning
+                .file
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.to_path_buf()),
+            line: warning.line,
+            message: warning.message,
+        }
+    }));
     for duplicate in &duplicate_declarations {
         let file = duplicate
             .first_file()
@@ -357,6 +389,18 @@ mod tests {
     use super::*;
     use carina_core::lint::collect_tag_keys_for_file;
     use carina_core::parser::ParsedFile;
+
+    #[test]
+    fn lint_providerless_fallback_reports_deferred_type_warnings() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("main.crn"), "provider broken { source = 'file:///definitely-missing/broken.wasm' }\nfn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes { x: AwsAccountId = '123' }\n").unwrap();
+        let user_dirs = carina_core::TestUserDirs::new();
+        let error = run_lint(&user_dirs, fixture.path(), ProviderContext::unloaded()).unwrap_err();
+        assert!(
+            matches!(&error, AppError::Validation(message) if message == "Found 2 lint warning(s)."),
+            "{error}"
+        );
+    }
 
     #[test]
     fn lint_preserves_imported_module_pest_syntax_diagnostic() {

@@ -175,6 +175,10 @@ enum PreparedUserFunctionCall<'cfg, Source = super::context::AuthoredDiagnosticS
 enum FunctionArgumentTypeCheck {
     Complete,
     DeferredUntilSchemasAreLoaded,
+    /// The structural argument is already an explicit handle. Its annotation
+    /// still needs provider classification, but a pure body can run while the
+    /// pending check retains that handle for loaded validation.
+    DeferredHandleAnnotation,
 }
 
 /// Prepare a user-defined function call: validate args, build substitutions, and return
@@ -212,6 +216,7 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
     let mut substitutions: HashMap<String, FunctionArgument> = HashMap::new();
     let mut effective_args = Vec::with_capacity(func.params.len());
     let mut has_deferred_type_check = false;
+    let mut defer_value_call = false;
     for (i, param) in func.params.iter().enumerate() {
         let argument = if i < args.len() {
             args[i].clone()
@@ -229,10 +234,16 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
         };
         // Type-check if the parameter has a type annotation
         if let Some(ref type_expr) = param.param_type {
-            has_deferred_type_check |= matches!(
-                check_fn_arg_type(fn_name, &param.name, type_expr, &argument, ctx, call_line,)?,
-                FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded
-            );
+            match check_fn_arg_type(fn_name, &param.name, type_expr, &argument, ctx, call_line)? {
+                FunctionArgumentTypeCheck::Complete => {}
+                FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded => {
+                    has_deferred_type_check = true;
+                    defer_value_call = true;
+                }
+                FunctionArgumentTypeCheck::DeferredHandleAnnotation => {
+                    has_deferred_type_check = true;
+                }
+            }
         }
         substitutions.insert(param.name.clone(), argument.clone());
         effective_args.push(argument);
@@ -255,8 +266,12 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
             function_name: fn_name.clone(),
             arguments: effective_args.clone(),
             source_line: call_line,
+            source_column: None,
             source_file: None,
         });
+        if defer_value_call {
+            return Ok(PreparedUserFunctionCall::Deferred(effective_args));
+        }
     }
 
     // Create a child context with recursion tracking
@@ -601,12 +616,11 @@ pub(crate) fn validate_builtin_custom_type<P: PlaceholderKind, B: BindingAddress
 /// use carina_core::parser::{
 ///     OwnedTypeIdentity, ProviderContext, validate_schema_custom_type,
 /// };
-/// use carina_core::resource::{ConcreteValue, Value};
-/// use carina_core::schema::TypeIdentity;
+/// use carina_core::resource::Value;
 ///
-/// let owned = OwnedTypeIdentity::provider("test", TypeIdentity::bare("Id"), carina_core::schema::RefinedScalarKind::String);
-/// let value = Value::Concrete(ConcreteValue::String("id".into()));
-/// let _ = validate_schema_custom_type(&owned, &value, &ProviderContext::default());
+/// fn check(owned: &OwnedTypeIdentity, value: &Value) {
+///     let _ = validate_schema_custom_type(owned, value, &ProviderContext::default());
+/// }
 /// ```
 pub fn validate_schema_custom_type<P: PlaceholderKind, B: BindingAddress>(
     owned: &crate::parser::OwnedTypeIdentity,
@@ -693,7 +707,11 @@ fn check_fn_arg_type<Source: Clone>(
         match crate::validation::resolve_parameter_type_for_check(type_expr, ctx.config) {
             Ok(Some(resolved)) => resolved,
             Ok(None) => {
-                return Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded);
+                return Ok(if argument.handle().is_some() {
+                    FunctionArgumentTypeCheck::DeferredHandleAnnotation
+                } else {
+                    FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded
+                });
             }
             Err(error) => return Err(ParseError::UserFunctionError(error.to_string())),
         };
@@ -716,16 +734,37 @@ fn check_fn_arg_type<Source: Clone>(
     let value = argument.value().expect("non-handle function argument");
     let type_expr = resolved_type.as_type_expr();
 
-    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value_with_context(
+    let provider_context =
+        crate::validation::typecheck::TypecheckProviderContext::for_parser(ctx.config);
+    let check = crate::validation::typecheck::check_type_expr_value_with_context(
         &type_expr,
         value,
-        ctx.config,
+        provider_context,
         crate::validation::typecheck::TypecheckInference::Unavailable,
-    ) {
-        return Err(function_argument_type_error(fn_name, param_name, mismatch));
-    }
+    );
+    finish_function_type_check(check, provider_context)
+        .map_err(|mismatch| function_argument_type_error(fn_name, param_name, mismatch))
+}
 
-    Ok(FunctionArgumentTypeCheck::Complete)
+fn finish_function_type_check(
+    check: crate::validation::typecheck::TypeExprValueCheck,
+    provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
+) -> Result<FunctionArgumentTypeCheck, crate::validation::typecheck::TypeExprValueError> {
+    use crate::validation::typecheck::TypeExprValueCheck;
+    match check {
+        TypeExprValueCheck::Assignable => Ok(FunctionArgumentTypeCheck::Complete),
+        TypeExprValueCheck::Mismatch(error) => Err(error),
+        deferred @ TypeExprValueCheck::Deferred(_)
+            if provider_context.requires_provider_schemas() =>
+        {
+            deferred
+                .require_provider_schemas()
+                .map(|()| FunctionArgumentTypeCheck::Complete)
+        }
+        TypeExprValueCheck::Deferred(_) => {
+            Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded)
+        }
+    }
 }
 
 pub(crate) fn lower_function_arguments(
@@ -748,16 +787,29 @@ pub(super) fn record_deferred_function_type_check<Source: Clone>(
     arguments: &[FunctionArgument],
     ctx: &ParseContext<'_, Source>,
     source_line: usize,
+    source_column: Option<usize>,
 ) {
     if function
         .params
         .iter()
         .any(|parameter| parameter.param_type.is_some())
+        || function.return_type.is_some()
     {
         ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
             function_name: function.name.clone(),
-            arguments: arguments.to_vec(),
+            arguments: function
+                .params
+                .iter()
+                .enumerate()
+                .filter_map(|(index, parameter)| {
+                    arguments
+                        .get(index)
+                        .cloned()
+                        .or_else(|| parameter.default.clone().map(FunctionArgument::from_value))
+                })
+                .collect(),
             source_line,
+            source_column,
             source_file: None,
         });
     }
@@ -824,7 +876,8 @@ pub(crate) fn validate_pending_function_type_check<Source: Clone>(
         );
         match result {
             Ok(FunctionArgumentTypeCheck::Complete)
-            | Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded) => {}
+            | Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded)
+            | Ok(FunctionArgumentTypeCheck::DeferredHandleAnnotation) => {}
             Err(error) => {
                 let located = match error {
                     ParseError::InvalidExpression { message, .. }
@@ -849,17 +902,16 @@ fn check_fn_return_type(
     fn_name: &str,
     type_expr: &TypeExpr,
     value: &Value,
-    config: &ProviderContext,
-) -> Result<(), ParseError> {
-    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value_with_context(
+    config: crate::validation::typecheck::TypecheckProviderContext<'_>,
+) -> Result<FunctionArgumentTypeCheck, ParseError> {
+    let check = crate::validation::typecheck::check_type_expr_value_with_context(
         type_expr,
         value,
         config,
         crate::validation::typecheck::TypecheckInference::Unavailable,
-    ) {
-        return Err(function_return_type_error(fn_name, mismatch));
-    }
-    Ok(())
+    );
+    finish_function_type_check(check, config)
+        .map_err(|mismatch| function_return_type_error(fn_name, mismatch))
 }
 
 fn function_return_type_error(
@@ -908,9 +960,32 @@ pub(crate) fn evaluate_user_function<Source: Clone>(
         .map_err(|error| locate_function_body_error(func, error))?
         .canonicalize();
     // Check return type if annotated
-    if let Some(ref return_type) = func.return_type {
-        check_fn_return_type(&func.name, return_type, &result, child_ctx.config)
-            .map_err(|error| locate_function_body_error(func, error))?;
+    if let Some(ref return_type) = func.return_type
+        && matches!(
+            check_fn_return_type(
+                &func.name,
+                return_type,
+                &result,
+                crate::validation::typecheck::TypecheckProviderContext::for_parser(
+                    child_ctx.config
+                ),
+            )
+            .map_err(|error| locate_function_body_error(func, error))?,
+            FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded
+        )
+    {
+        return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: ctx
+                .resolved_user_function(&func.name)
+                .unwrap_or_else(|| std::sync::Arc::new(func.clone())),
+            functions: ctx.shared_user_function_scope(),
+            args: func
+                .params
+                .iter()
+                .map(|parameter| substitutions[&parameter.name].clone())
+                .collect(),
+            source_line: call_line.into(),
+        }));
     }
     Ok(result)
 }

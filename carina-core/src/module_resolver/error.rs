@@ -50,6 +50,12 @@ pub enum ModuleErrorCallSource<'a> {
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
+    /// Terminal providerless failure together with every unresolved type site.
+    #[error("{error}\n{}", render_provider_type_warnings(.warnings))]
+    WithProviderTypeWarnings {
+        error: Box<ModuleError>,
+        warnings: Vec<crate::parser::ParseWarning>,
+    },
     #[error("{0}")]
     Multiple(MultipleModuleErrors),
 
@@ -189,6 +195,49 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
+    pub(crate) fn with_provider_type_warnings(
+        self,
+        warnings: Vec<crate::parser::ParseWarning>,
+    ) -> Self {
+        let existing = self.provider_type_warnings();
+        let warnings = warnings
+            .into_iter()
+            .filter(|warning| !existing.contains(&warning))
+            .collect::<Vec<_>>();
+        if warnings.is_empty() {
+            return self;
+        }
+        let (error, mut all) = match self {
+            Self::WithProviderTypeWarnings { error, warnings } => (error, warnings),
+            error => (Box::new(error), Vec::new()),
+        };
+        for warning in warnings {
+            if !all.contains(&warning) {
+                all.push(warning);
+            }
+        }
+        Self::WithProviderTypeWarnings {
+            error,
+            warnings: all,
+        }
+    }
+
+    pub fn provider_type_warnings(&self) -> Vec<&crate::parser::ParseWarning> {
+        match self {
+            Self::WithProviderTypeWarnings { warnings, error } => warnings
+                .iter()
+                .chain(error.provider_type_warnings())
+                .collect(),
+            Self::OwnedByCalls { error, .. } | Self::AtCall { error, .. } => {
+                error.provider_type_warnings()
+            }
+            Self::Multiple(errors) => errors
+                .iter()
+                .flat_map(Self::provider_type_warnings)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
     pub(crate) fn from_errors(errors: Vec<Self>) -> Option<Self> {
         let mut errors = errors.into_iter();
         let first = errors.next()?;
@@ -223,6 +272,7 @@ impl ModuleError {
     /// Outermost typed source ownership for this failure.
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
         match self {
+            Self::WithProviderTypeWarnings { error, .. } => error.call_source(),
             Self::Multiple(_errors) => ModuleErrorCallSource::Unavailable,
             Self::OwnedByCalls { calls, .. } => ModuleErrorCallSource::Owners(calls),
             Self::AtCall { call, .. } => ModuleErrorCallSource::Failing(call),
@@ -252,6 +302,7 @@ impl ModuleError {
 
     pub(crate) fn failing_call(&self) -> Option<&ModuleCallId> {
         match self {
+            Self::WithProviderTypeWarnings { error, .. } => error.failing_call(),
             Self::Multiple(_errors) => None,
             Self::OwnedByCalls { calls: _, error } => error.failing_call(),
             Self::AtCall { call, error } => error.failing_call().or(Some(call)),
@@ -308,7 +359,9 @@ impl ModuleError {
     /// Semantic leaf after removing typed import ownership wrappers.
     pub fn root_cause(&self) -> &Self {
         match self {
-            Self::OwnedByCalls { error, .. } | Self::AtCall { error, .. } => error.root_cause(),
+            Self::OwnedByCalls { error, .. }
+            | Self::AtCall { error, .. }
+            | Self::WithProviderTypeWarnings { error, .. } => error.root_cause(),
             error @ (Self::Multiple(_)
             | Self::NotFound(_)
             | Self::CircularImport(_)
@@ -340,6 +393,11 @@ impl ModuleError {
     /// the same stable, project-relative path in either case.
     pub fn display_relative_to(&self, root: &Path) -> String {
         match self {
+            Self::WithProviderTypeWarnings { error, warnings } => format!(
+                "{}\n{}",
+                error.display_relative_to(root),
+                render_provider_type_warnings(warnings)
+            ),
             Self::Multiple(errors) => errors
                 .iter()
                 .map(|error| error.display_relative_to(root))
@@ -435,6 +493,7 @@ impl ModuleError {
 
     fn is_deferred_for_body_rejection(&self) -> bool {
         match self.root_cause() {
+            Self::WithProviderTypeWarnings { error, .. } => error.is_deferred_for_body_rejection(),
             Self::Multiple(errors) => errors
                 .iter()
                 .all(ModuleError::is_deferred_for_body_rejection),
@@ -465,6 +524,21 @@ impl ModuleError {
             | Self::NotADirectory { .. } => false,
         }
     }
+}
+
+fn render_provider_type_warnings(warnings: &[crate::parser::ParseWarning]) -> String {
+    warnings
+        .iter()
+        .map(|warning| {
+            format!(
+                "warning: {}:{}: {}",
+                warning.file.as_deref().unwrap_or("<module>"),
+                warning.line,
+                warning.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {

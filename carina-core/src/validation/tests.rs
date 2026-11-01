@@ -52,9 +52,10 @@ fn rendered_typecheck_result(
     typecheck::check_type_expr_value_with_context(
         type_expr,
         value,
-        config,
+        typecheck::TypecheckProviderContext::for_parser(config),
         typecheck::TypecheckInference::Unavailable,
     )
+    .require_provider_schemas()
     .err()
     .map(|error| error.to_string())
 }
@@ -392,6 +393,88 @@ let sink = mock.test.Consumer { count = invalid }
     assert_eq!(
         error, "operator '+': left operand must be Int, got Float",
         "the declaration and its consuming resource attribute must not duplicate the finding",
+    );
+}
+
+#[test]
+fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
+    use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
+
+    let unknown =
+        crate::parser::parse_type_expr_str("UndeclaredCount", ProviderContext::unloaded()).unwrap();
+    let parsed = ParsedFile::default();
+    let schemas = SchemaRegistry::new();
+    let config = loaded_context_for_test(ProviderContext::default());
+    let index = BindingIndex::from_parsed(&parsed, &schemas, &config);
+    let bindings = inference::InferenceBindings::from([(
+        "count".into(),
+        inference::InferenceBinding::Argument { type_expr: unknown },
+    )]);
+    let value = evaluate_integer_values(
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument {
+                name: "count".into(),
+                diagnostic: Default::default(),
+            },
+        )),
+        IntegerOp::Add,
+        Value::Concrete(ConcreteValue::Int(1)),
+        IntegerOperatorSpan::synthetic(),
+    )
+    .unwrap();
+    let sink = AttributeType::int();
+    let error = check_deferred_access_type(
+        &value,
+        crate::schema::TypeInSchema::schemaless(&sink),
+        &bindings,
+        &schemas,
+        &index,
+    )
+    .expect_err("a loaded catalog must reject an unknown operand type");
+    assert!(
+        matches!(&error, DeferredAccessTypeError::InvalidAccess {
+        error: inference::InferenceError::UnknownType { reason },
+    } if reason.contains("UndeclaredCount")),
+        "{error}"
+    );
+}
+
+#[test]
+fn composition_reference_reports_declared_type_resolution_failure() {
+    let parsed = crate::parser::parse(
+        "let source = mock.test.Source {}",
+        ProviderContext::unloaded(),
+    )
+    .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Source")
+            .attribute(
+                PatternAttributeSchema::provider_populated("value", PatternAttributeType::string())
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let config = loaded_context_for_test(ProviderContext::default());
+    let index = BindingIndex::from_parsed(&parsed, &schemas, &config);
+    let declared =
+        crate::parser::parse_type_expr_str("UndeclaredAccountId", ProviderContext::unloaded())
+            .unwrap();
+    let path = crate::resource::AuthoredAccessPath::new("source", "value");
+    let result = composition_ref_error_kind(
+        (&path).into(),
+        Some(RefSink::TypeExpr(&declared)),
+        &index,
+        UnknownReferencePolicy::Report,
+        crate::resource::ResourceRefUsage::Required,
+    );
+    assert!(
+        matches!(result, Some(ModuleCallRefErrorKind::DeclarationResolution(
+        StaticTypeResolutionError::UnknownCustomType { name },
+    )) if name == "UndeclaredAccountId"),
+        "a direct reference check must retain the declaration's own error"
     );
 }
 
@@ -1234,9 +1317,10 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
     let error = typecheck::check_type_expr_value_with_context(
         &ty,
         &value,
-        &context,
+        typecheck::TypecheckProviderContext::for_parser(&context),
         typecheck::TypecheckInference::Unavailable,
     )
+    .require_provider_schemas()
     .unwrap_err();
     assert!(
         matches!(error, typecheck::TypeExprValueError::CustomTypeValidation { error, .. }
@@ -3705,9 +3789,10 @@ fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
         let error = typecheck::check_type_expr_value_with_context(
             &expected,
             &value,
-            &ProviderContext::default(),
+            typecheck::TypecheckProviderContext::for_parser(&ProviderContext::default()),
             typecheck::TypecheckInference::Unavailable,
         )
+        .require_provider_schemas()
         .expect_err("the declared scalar kind must be checked before its validator");
         assert!(
             matches!(

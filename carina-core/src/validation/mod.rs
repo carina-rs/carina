@@ -1,6 +1,7 @@
 //! Validation utilities for resources and modules
 
 pub mod deferred_populate;
+pub mod deferred_types;
 pub mod depends_on;
 pub mod typecheck;
 pub mod wait;
@@ -10,7 +11,9 @@ use std::hash::Hash;
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
+use crate::binding_index::{
+    BindingIndex, RefType, RefTypeAssignabilityError, RefTypeError, ResolvedRefType,
+};
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ParsedValue as Value,
@@ -768,7 +771,15 @@ fn declared_value_assignable_to_sink(
             crate::schema::TypeInSchema::schemaless(&lifted_sink)
         }
     };
-    if !source.assignment_to(target).is_mismatch() {
+    let assignment = source.assignment_to(target);
+    let assignable = if config.custom_types_loaded() {
+        assignment
+            .require_loaded()
+            .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))?
+    } else {
+        assignment.allow_unchecked()
+    };
+    if assignable {
         return Ok(());
     }
     Err(BindingResolutionError::Existing(format!(
@@ -785,14 +796,24 @@ fn reference_value_mismatch<B: BindingAddress>(
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Option<BindingResolutionError> {
     match bindings.ref_type(reference) {
-        RefType::Typed(source) => source.is_assignable_to_sink(target).err().map(|mismatch| {
-            BindingResolutionError::ReferenceType(Box::new(BindingReferenceTypeError {
-                expected: target.resolved_type_name(),
-                actual: mismatch.actual_type_name().to_string(),
-                declared: mismatch.declared_type_name().map(str::to_string),
-                path: diagnostic_path(reference),
-            }))
-        }),
+        RefType::Typed(source) => {
+            source
+                .is_assignable_to_sink(target, bindings)
+                .err()
+                .map(|error| match error {
+                    RefTypeAssignabilityError::Mismatch(mismatch) => {
+                        BindingResolutionError::ReferenceType(Box::new(BindingReferenceTypeError {
+                            expected: target.resolved_type_name(),
+                            actual: mismatch.actual_type_name().to_string(),
+                            declared: mismatch.declared_type_name().map(str::to_string),
+                            path: diagnostic_path(reference),
+                        }))
+                    }
+                    RefTypeAssignabilityError::Unchecked(reason) => {
+                        BindingResolutionError::CustomType(reason)
+                    }
+                })
+        }
         RefType::Unchecked => None,
         RefType::UnknownBinding { binding, attribute } => {
             let reference = if attribute.is_empty() {
@@ -1820,13 +1841,18 @@ pub fn check_deferred_access_type<B: BindingAddress>(
     // silently skipped by a copied `InferenceBinding` predicate.
     if let GenericValue::Deferred(DeferredValue::ResourceRef { path }) = value {
         return match binding_index.postfix_ref_type(path) {
-            RefType::Typed(source) => match source.is_assignable_to_sink(expected) {
+            RefType::Typed(source) => match source.is_assignable_to_sink(expected, binding_index) {
                 Ok(()) => Ok(()),
-                Err(mismatch) => Err(DeferredAccessTypeError::TypeMismatch {
-                    expected: expected.resolved_type_name(),
-                    actual: mismatch.actual_type_name().to_string(),
-                    origin: mismatch.origin_description(path.into()),
-                }),
+                Err(RefTypeAssignabilityError::Unchecked(reason)) => {
+                    Err(unchecked_assignment_error(reason))
+                }
+                Err(RefTypeAssignabilityError::Mismatch(mismatch)) => {
+                    Err(DeferredAccessTypeError::TypeMismatch {
+                        expected: expected.resolved_type_name(),
+                        actual: mismatch.actual_type_name().to_string(),
+                        origin: mismatch.origin_description(path.into()),
+                    })
+                }
             },
             RefType::UnknownAttribute(RefTypeError::InvalidAccess { step, actual, .. }) => {
                 Err(DeferredAccessTypeError::InvalidAccess {
@@ -1849,7 +1875,12 @@ pub fn check_deferred_access_type<B: BindingAddress>(
         };
     }
 
-    let actual = match inference::infer_type_from_value(value, bindings, schemas) {
+    let actual = match inference::infer_type_from_value_with_provider_context(
+        value,
+        bindings,
+        schemas,
+        binding_index.provider_context(),
+    ) {
         Ok(actual) => actual,
         Err(crate::static_type::InferenceIssue::Failed(
             error @ inference::InferenceError::InvalidAccess { .. },
@@ -1869,14 +1900,14 @@ pub fn check_deferred_access_type<B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ inference::InferenceError::InvalidIntegerArithmeticOperand { .. },
+            error @ (inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
+            | inference::InferenceError::UnknownType { .. }),
         )) => return Err(DeferredAccessTypeError::InvalidAccess { error }),
         // Dynamic result types and unavailable authorities cannot be checked
         // soundly at this phase. Spell every inference variant out so adding a
         // new failure reason forces an explicit checked/unchecked decision.
         Err(crate::static_type::InferenceIssue::Failed(
-            inference::InferenceError::UnknownType { .. }
-            | inference::InferenceError::HeterogeneousCollection { .. }
+            inference::InferenceError::HeterogeneousCollection { .. }
             | inference::InferenceError::UnknownBinding { .. }
             | inference::InferenceError::CyclicVirtualBinding { .. },
         ))
@@ -1898,7 +1929,10 @@ pub fn check_deferred_access_type<B: BindingAddress>(
         return Ok(());
     };
     let actual = crate::schema::TypeInSchema::schemaless(&actual);
-    if !actual.assignment_to(expected).is_mismatch() {
+    if binding_index
+        .check_type_assignment(actual, expected)
+        .map_err(unchecked_assignment_error)?
+    {
         return Ok(());
     }
     Err(DeferredAccessTypeError::TypeMismatch {
@@ -1906,6 +1940,14 @@ pub fn check_deferred_access_type<B: BindingAddress>(
         actual: actual.resolved_type_name(),
         origin: format!("from {}", crate::value::format_value(value)),
     })
+}
+
+fn unchecked_assignment_error(reason: impl std::fmt::Display) -> DeferredAccessTypeError {
+    DeferredAccessTypeError::InvalidAccess {
+        error: inference::InferenceError::UnknownType {
+            reason: reason.to_string(),
+        },
+    }
 }
 
 fn invalid_integer_operand<B: BindingAddress>(
@@ -2003,13 +2045,23 @@ fn prove_integer_operand<B: BindingAddress>(
 
     if let Some(RefType::Typed(source)) = reference_type {
         return source
-            .is_assignable_to_sink(integer_sink)
-            .map_err(|mismatch| {
-                invalid_integer_operand(expression, side, mismatch.actual_type_name().to_string())
+            .is_assignable_to_sink(integer_sink, binding_index)
+            .map_err(|error| match error {
+                RefTypeAssignabilityError::Mismatch(mismatch) => invalid_integer_operand(
+                    expression,
+                    side,
+                    mismatch.actual_type_name().to_string(),
+                ),
+                RefTypeAssignabilityError::Unchecked(reason) => unchecked_assignment_error(reason),
             });
     }
 
-    match inference::infer_type_from_value(value, bindings, schemas) {
+    match inference::infer_type_from_value_with_provider_context(
+        value,
+        bindings,
+        schemas,
+        binding_index.provider_context(),
+    ) {
         Ok(TypeExpr::Int) => Ok(()),
         Ok(TypeExpr::UnloadedSchemaType(_))
         | Err(crate::static_type::InferenceIssue::NotInferable(
@@ -2059,9 +2111,9 @@ fn check_integer_result_sink<B: BindingAddress>(
             let Some(expected) = lift_type_expr(&resolved) else {
                 return Ok(());
             };
-            if !actual
-                .assignment_to(crate::schema::TypeInSchema::schemaless(&expected))
-                .is_mismatch()
+            if binding_index
+                .check_type_assignment(actual, crate::schema::TypeInSchema::schemaless(&expected))
+                .map_err(unchecked_assignment_error)?
             {
                 return Ok(());
             }
@@ -2076,7 +2128,10 @@ fn check_integer_result_sink<B: BindingAddress>(
         // intrinsic Int contract is sufficient.
         Some(RefSink::String) | None => return Ok(()),
     };
-    if !actual.assignment_to(expected).is_mismatch() {
+    if binding_index
+        .check_type_assignment(actual, expected)
+        .map_err(unchecked_assignment_error)?
+    {
         Ok(())
     } else {
         Err(DeferredAccessTypeError::TypeMismatch {
@@ -2334,9 +2389,12 @@ pub fn check_file_integer_arithmetic_values<
                 Some(RefSink::TypeExpr(&INT_REF_SINK)),
                 &function_bindings,
             );
-            if let Ok(type_expr) =
-                inference::infer_type_from_value(value, &function_bindings, schemas)
-            {
+            if let Ok(type_expr) = inference::infer_type_from_value_with_provider_context(
+                value,
+                &function_bindings,
+                schemas,
+                binding_index.provider_context(),
+            ) {
                 function_bindings.insert(
                     name.clone(),
                     inference::InferenceBinding::Argument { type_expr },
@@ -2390,6 +2448,10 @@ pub enum ModuleCallRefErrorKind {
         declared: Option<String>,
     },
     UnknownAttribute(RefTypeError),
+    DeclarationResolution(StaticTypeResolutionError),
+    ProviderSchemaUnavailable {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -2546,6 +2608,14 @@ fn format_module_call_ref_error_with_path(
         ModuleCallRefErrorKind::UnknownAttribute(error) => {
             write!(f, "module call '{}': {}", call_label, error)
         }
+        ModuleCallRefErrorKind::DeclarationResolution(error) => write!(
+            f,
+            "module call '{call_label}': argument '{argument}': {error}"
+        ),
+        ModuleCallRefErrorKind::ProviderSchemaUnavailable { reason } => write!(
+            f,
+            "module call '{call_label}': argument '{argument}': {reason}"
+        ),
     }
 }
 
@@ -2671,6 +2741,12 @@ impl<B: BindingAddress> std::fmt::Display for AttributeParamRefError<B> {
             ModuleCallRefErrorKind::UnknownAttribute(error) => {
                 write!(f, "attribute '{}': {}", self.attribute, error)
             }
+            ModuleCallRefErrorKind::DeclarationResolution(error) => {
+                write!(f, "attribute '{}': {error}", self.attribute)
+            }
+            ModuleCallRefErrorKind::ProviderSchemaUnavailable { reason } => {
+                write!(f, "attribute '{}': {reason}", self.attribute)
+            }
         }
     }
 }
@@ -2760,6 +2836,10 @@ impl std::error::Error for CompositionRefError {}
 /// while expanded bindings differ for every module instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CompositionRefErrorKindKey {
+    DeclarationResolution(StaticTypeResolutionError),
+    ProviderSchemaUnavailable {
+        reason: String,
+    },
     TypeMismatch {
         expected: String,
         actual: String,
@@ -2788,6 +2868,14 @@ enum CompositionRefErrorKindKey {
 impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
     fn from(kind: &ModuleCallRefErrorKind) -> Self {
         match kind {
+            ModuleCallRefErrorKind::DeclarationResolution(error) => {
+                Self::DeclarationResolution(error.clone())
+            }
+            ModuleCallRefErrorKind::ProviderSchemaUnavailable { reason } => {
+                Self::ProviderSchemaUnavailable {
+                    reason: reason.clone(),
+                }
+            }
             ModuleCallRefErrorKind::TypeMismatch {
                 expected,
                 actual,
@@ -2863,16 +2951,28 @@ fn composition_ref_error_kind<B: BindingAddress>(
     match bindings.ref_type(path) {
         RefType::Typed(source) => {
             let declared = sink.and_then(RefSink::as_type_expr)?;
-            let declared = bindings.resolve_declared_type(declared).ok()?;
+            let declared = match bindings.resolve_declared_type(declared) {
+                Ok(declared) => declared,
+                Err(error) => return Some(ModuleCallRefErrorKind::DeclarationResolution(error)),
+            };
             let sink = lift_type_expr(&declared)?;
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
             source
-                .is_assignable_to_sink(sink_type)
+                .is_assignable_to_sink(sink_type, bindings)
                 .err()
-                .map(|mismatch| ModuleCallRefErrorKind::TypeMismatch {
-                    expected: sink_type.resolved_type_name(),
-                    actual: mismatch.actual_type_name().to_string(),
-                    declared: mismatch.declared_type_name().map(str::to_string),
+                .map(|error| match error {
+                    RefTypeAssignabilityError::Mismatch(mismatch) => {
+                        ModuleCallRefErrorKind::TypeMismatch {
+                            expected: sink_type.resolved_type_name(),
+                            actual: mismatch.actual_type_name().to_string(),
+                            declared: mismatch.declared_type_name().map(str::to_string),
+                        }
+                    }
+                    RefTypeAssignabilityError::Unchecked(reason) => {
+                        ModuleCallRefErrorKind::ProviderSchemaUnavailable {
+                            reason: reason.to_string(),
+                        }
+                    }
                 })
         }
         RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {
@@ -2944,6 +3044,12 @@ fn validate_user_function_ref_types_inner<
                 ModuleCallRefErrorKind::UnknownAttribute(error) => {
                     format!("{context}: {error}")
                 }
+                ModuleCallRefErrorKind::DeclarationResolution(error) => {
+                    format!("{context}: {error}")
+                }
+                ModuleCallRefErrorKind::ProviderSchemaUnavailable { reason } => {
+                    format!("{context}: {reason}")
+                }
             };
             errors.push(message);
         });
@@ -2953,17 +3059,22 @@ fn validate_user_function_ref_types_inner<
         source: &TypeExpr,
         sink: &TypeExpr,
         bindings: &BindingIndex<'_>,
-    ) -> Option<(String, String)> {
-        let source = bindings.resolve_declared_type(source).ok()?;
-        let sink = bindings.resolve_declared_type(sink).ok()?;
-        let source = lift_type_expr(&source)?;
-        let sink = lift_type_expr(&sink)?;
+    ) -> Result<Option<(String, String)>, String> {
+        let source = bindings
+            .resolve_declared_type(source)
+            .map_err(|error| error.to_string())?;
+        let sink = bindings
+            .resolve_declared_type(sink)
+            .map_err(|error| error.to_string())?;
+        let (Some(source), Some(sink)) = (lift_type_expr(&source), lift_type_expr(&sink)) else {
+            return Ok(None);
+        };
         let source = crate::schema::TypeInSchema::schemaless(&source);
         let sink = crate::schema::TypeInSchema::schemaless(&sink);
-        source
-            .assignment_to(sink)
-            .is_mismatch()
-            .then(|| (sink.resolved_type_name(), source.resolved_type_name()))
+        let assignable = bindings
+            .check_type_assignment(source, sink)
+            .map_err(|error| error.to_string())?;
+        Ok((!assignable).then(|| (sink.resolved_type_name(), source.resolved_type_name())))
     }
 
     fn list_sink(type_expr: &TypeExpr) -> Option<&TypeExpr> {
@@ -3031,11 +3142,14 @@ fn validate_user_function_ref_types_inner<
             if let (Some(source), Some((sink, context))) = (
                 function.and_then(|function| function.return_type.as_ref()),
                 result_context,
-            ) && let Some((expected, actual)) = declared_result_mismatch(source, sink, bindings)
-            {
-                errors.push(format!(
-                    "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
-                ));
+            ) {
+                match declared_result_mismatch(source, sink, bindings) {
+                    Ok(Some((expected, actual))) => errors.push(format!(
+                        "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
+                    )),
+                    Ok(None) => {},
+                    Err(error) => errors.push(format!("{context}: function '{name}' return type: {error}")),
+                }
             }
             for (index, argument) in args.iter().enumerate() {
                 let parameter_sink = function
@@ -3826,6 +3940,7 @@ fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
     resource_id: &crate::resource::ResourceId,
     attribute: &str,
     value: &GenericValue<ParserPlaceholder, B>,
+    bindings: &BindingIndex<'_, B>,
 ) -> Option<(&'a str, ResolvedRefType)> {
     let GenericValue::Deferred(DeferredValue::ResourceRef { path: _path }) = value else {
         return None;
@@ -3856,7 +3971,7 @@ fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
                 if source.as_ref() != value {
                     return None;
                 }
-                let source = ResolvedRefType::from_value_declaration(declared_type.as_deref()?)?;
+                let source = ResolvedRefType::from_value_declaration(declared_type.as_deref()?, bindings)?;
                 Some((record.authored.name.as_str(), source))
             }
             crate::parser::BareBindingSource::Structural(_handle) => None,
@@ -3900,7 +4015,13 @@ fn validate_resource_ref_types_inner<
                 let declared_source = module_source
                     .and_then(crate::resource::ModuleSource::module_call)
                     .and_then(|_call| {
-                        module_resource_ref_declaration(parsed, resource_id, attr_name, attr_value)
+                        module_resource_ref_declaration(
+                            parsed,
+                            resource_id,
+                            attr_name,
+                            attr_value,
+                            bindings,
+                        )
                     });
                 let effective_sink = validated_schema
                     .effective_attribute_by_authored_name(attr_name)
@@ -3943,8 +4064,13 @@ fn validate_resource_ref_types_inner<
                         }) else {
                             return;
                         };
-                        let Err(mismatch) = source.is_assignable_to_sink(sink_type) else {
-                            return;
+                        let mismatch = match source.is_assignable_to_sink(sink_type, bindings) {
+                            Ok(()) => return,
+                            Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
+                            Err(RefTypeAssignabilityError::Unchecked(reason)) => {
+                                all_errors.push(format!("{resource_location}: {reason}"));
+                                return;
+                            }
                         };
                         let source_name = mismatch.actual_type_name();
                         let origin = mismatch.origin_description(reference);
@@ -3979,11 +4105,18 @@ fn validate_resource_ref_types_inner<
                     };
                     let checked = match declared_source.as_ref() {
                         Some((name, declared)) => declared
-                            .is_assignable_to_sink(sink_type)
-                            .map_err(|mismatch| DeferredAccessTypeError::TypeMismatch {
-                                expected: sink_type.resolved_type_name(),
-                                actual: mismatch.actual_type_name().to_string(),
-                                origin: format!("from {name}"),
+                            .is_assignable_to_sink(sink_type, bindings)
+                            .map_err(|error| match error {
+                                RefTypeAssignabilityError::Mismatch(mismatch) => {
+                                    DeferredAccessTypeError::TypeMismatch {
+                                        expected: sink_type.resolved_type_name(),
+                                        actual: mismatch.actual_type_name().to_string(),
+                                        origin: format!("from {name}"),
+                                    }
+                                }
+                                RefTypeAssignabilityError::Unchecked(reason) => {
+                                    unchecked_assignment_error(reason)
+                                }
                             }),
                         None => check_deferred_access_type(
                             access,
@@ -4493,15 +4626,21 @@ fn check_attribute_param_ref<B: BindingAddress>(
                 return;
             };
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-            if let Err(mismatch) = source.is_assignable_to_sink(sink_type) {
-                errors.push(format!(
-                    "attribute '{}': type mismatch: expected {}, got {} ({})",
-                    param_name,
-                    expected_type.expect("lifted expected type exists"),
-                    mismatch.actual_type_name(),
-                    mismatch.origin_description(path),
-                ));
-            }
+            let mismatch = match source.is_assignable_to_sink(sink_type, bindings) {
+                Ok(()) => return,
+                Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
+                Err(RefTypeAssignabilityError::Unchecked(reason)) => {
+                    errors.push(format!("attribute '{param_name}': {reason}"));
+                    return;
+                }
+            };
+            errors.push(format!(
+                "attribute '{}': type mismatch: expected {}, got {} ({})",
+                param_name,
+                expected_type.expect("lifted expected type exists"),
+                mismatch.actual_type_name(),
+                mismatch.origin_description(path),
+            ));
         }
         RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {}
         RefType::UnknownAttribute(error) => {
@@ -4589,19 +4728,25 @@ fn check_export_ref<B: BindingAddress>(
                 return;
             };
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-            if let Err(mismatch) = source.is_assignable_to_sink(sink_type) {
-                let inferred_origin = mismatch
-                    .declared_type_name()
-                    .map(|_| format!(" ({})", mismatch.origin_description(path)));
-                errors.push(format!(
-                    "export '{}': type mismatch for '{}': expected {}, got {}{}",
-                    param_name,
-                    path.to_dot_string(),
-                    type_expr,
-                    mismatch.actual_type_name(),
-                    inferred_origin.as_deref().unwrap_or_default(),
-                ));
-            }
+            let mismatch = match source.is_assignable_to_sink(sink_type, bindings) {
+                Ok(()) => return,
+                Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
+                Err(RefTypeAssignabilityError::Unchecked(reason)) => {
+                    errors.push(format!("export '{param_name}': {reason}"));
+                    return;
+                }
+            };
+            let inferred_origin = mismatch
+                .declared_type_name()
+                .map(|_| format!(" ({})", mismatch.origin_description(path)));
+            errors.push(format!(
+                "export '{}': type mismatch for '{}': expected {}, got {}{}",
+                param_name,
+                path.to_dot_string(),
+                type_expr,
+                mismatch.actual_type_name(),
+                inferred_origin.as_deref().unwrap_or_default(),
+            ));
         }
         RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {}
         RefType::UnknownAttribute(error) => {

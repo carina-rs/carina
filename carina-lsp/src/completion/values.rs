@@ -225,9 +225,14 @@ fn type_expr_source_is_assignable_to(
     let Some(source) = carina_core::validation::lift_type_expr(&source) else {
         return true;
     };
-    !TypeInSchema::schemaless(&source)
-        .assignment_to(sink.in_schema(sink_defs))
-        .is_mismatch()
+    let assignment = TypeInSchema::schemaless(&source).assignment_to(sink.in_schema(sink_defs));
+    if provider_ctx.custom_types_loaded() {
+        // Completion has no diagnostic channel; missing loaded evidence must
+        // exclude the candidate rather than suggest an unproven assignment.
+        assignment.require_loaded().unwrap_or(false)
+    } else {
+        assignment.allow_unchecked()
+    }
 }
 
 /// Context when the user has typed `binding_name.` after `=`.

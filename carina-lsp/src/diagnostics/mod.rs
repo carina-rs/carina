@@ -398,7 +398,9 @@ impl DiagnosticEngine {
             binding_input,
             &self.schemas,
             upstream_exports,
-            module_signatures, &self.provider_context);
+            module_signatures,
+            &self.provider_context,
+        );
         let inference_bindings =
             carina_core::validation::inference::bindings_from_parsed(binding_input);
         let binding_use_report = match &self.provider_context {
@@ -516,6 +518,52 @@ impl DiagnosticEngine {
                 .and_then(|result| result.directory.semantic_file(path))
         });
         let current_parsed = doc.parsed().or(merged_current_file);
+        if !self.provider_context.custom_types_loaded() {
+            let checks = match merged_result.as_ref() {
+                Some(result) => Some(
+                    carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
+                        result.directory.parsed.parsed(),
+                        &self.provider_context,
+                        doc.source_file(),
+                    ),
+                ),
+                None => current_parsed.map(|parsed| {
+                    carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
+                        parsed,
+                        &self.provider_context,
+                        doc.source_file(),
+                    )
+                }),
+            };
+            for warning in checks.into_iter().flat_map(|checks| checks.report()) {
+                if warning
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| Path::new(file) != doc.source_file())
+                {
+                    continue;
+                }
+                let span = warning.span.expect("settled type checks retain a location");
+                let mut diagnostic = carina_diagnostic_range(
+                    tower_lsp::lsp_types::Range::new(
+                        tower_lsp::lsp_types::Position::new(
+                            (span.start_line - 1) as u32,
+                            (span.start_column - 1) as u32,
+                        ),
+                        tower_lsp::lsp_types::Position::new(
+                            (span.end_line - 1) as u32,
+                            (span.end_column - 1) as u32,
+                        ),
+                    ),
+                    DiagnosticSeverity::WARNING,
+                    warning.message,
+                );
+                diagnostic.code = Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "providers_not_loaded".into(),
+                ));
+                diagnostics.push(diagnostic);
+            }
+        }
         // A source parsed in isolation cannot know sibling function
         // declarations. Prefer the successful directory parse over that
         // provisional failure (notably a sibling user function used as a
@@ -2520,7 +2568,15 @@ fn check_resource_ref_type_mismatch(
     };
 
     // Directional: the ref (source) must be assignable to the expected (sink).
-    let mismatch = source.is_assignable_to_sink(expected).err()?;
+    let mismatch = match source
+        .is_assignable_to_sink(expected, binding_index)
+        .err()?
+    {
+        carina_core::binding_index::RefTypeAssignabilityError::Mismatch(mismatch) => mismatch,
+        carina_core::binding_index::RefTypeAssignabilityError::Unchecked(reason) => {
+            return Some(reason.to_string());
+        }
+    };
     Some(format!(
         "Type mismatch: expected {}, got {} ({})",
         expected.resolved_type_name(),

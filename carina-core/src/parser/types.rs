@@ -302,11 +302,7 @@ pub(crate) fn merge_custom_type_candidates(
         owners = owners.union(owned.owners());
     }
     Ok(Some(TypeExpr::SchemaType {
-        owned: super::OwnedTypeIdentity::with_owners(
-            first.identity().clone(),
-            owners,
-            first.scalar_kind(),
-        ),
+        owned: first.with_merged_owners(owners),
     }))
 }
 

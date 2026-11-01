@@ -5437,7 +5437,7 @@ fn exports_type_warning_for_literal_mismatch() {
 }
 
 #[test]
-fn unloaded_bare_attribute_interpolation_has_no_type_warning() {
+fn unloaded_bare_attribute_interpolation_reports_only_providers_not_loaded() {
     let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
         r#"
@@ -5448,7 +5448,26 @@ attributes {
 "#,
     );
     let diagnostics = engine.analyze(&doc, None);
-    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.code,
+        Some(tower_lsp::lsp_types::NumberOrString::String(
+            "providers_not_loaded".to_string()
+        ))
+    );
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(diagnostic.source.as_deref(), Some("carina"));
+    assert!(
+        diagnostic.message.contains("SomeBareProviderType"),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("interpolation")),
+        "{diagnostics:#?}"
+    );
 }
 
 #[test]
@@ -6303,13 +6322,20 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
     use indexmap::IndexMap;
 
     fn schema_type(path: &str) -> TypeExpr {
-        TypeExpr::SchemaType {
-            owned: carina_core::parser::OwnedTypeIdentity::provider(
-                "aws",
-                carina_core::schema::TypeIdentity::from_schema_type("aws", path, "Id"),
-                carina_core::schema::RefinedScalarKind::String,
-            ),
-        }
+        let engine = module_boundary_identity_engine();
+        let nominal = carina_core::parser::parse_type_expr_str(
+            &format!("aws.{path}.Id"),
+            carina_core::parser::ProviderContext::unloaded(),
+        )
+        .unwrap();
+        let resolved =
+            carina_core::validation::resolve_type_expr(&nominal, &engine.provider_context).unwrap();
+        carina_core::parser::resolve_type_expr_from_schemas(
+            &resolved,
+            &engine.schemas,
+            &engine.provider_context,
+        )
+        .unwrap()
     }
 
     fn consumer_type(type_expr: TypeExpr) -> carina_core::static_type::ConsumerStaticType {
@@ -14732,4 +14758,105 @@ fn validation_subscript_uses_the_regular_expression_parser_in_lsp() {
         diagnostics.is_empty(),
         "a validation subscript must accept a regular constant expression: {diagnostics:#?}",
     );
+}
+#[test]
+fn providerless_orphan_reports_deferred_function_and_attribute_type_checks() {
+    let source = "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes {\n  x: AwsAccountId = '123'\n}\n";
+    let path = std::path::PathBuf::from("/orphan/main.crn");
+    let doc = create_document_at(source, path.clone());
+    let expected = carina_core::validation::deferred_types::DeferredProviderTypeChecks::collect(
+        doc.parsed().unwrap(),
+        &ProviderContext::default(),
+        &path,
+    )
+    .report();
+    let diagnostics = test_engine().analyze(&doc, None);
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "providers_not_loaded".into(),
+                ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 2, "{diagnostics:#?}");
+    for (diagnostic, warning) in warnings.iter().zip(expected) {
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diagnostic.source.as_deref(), Some("carina"));
+        assert_eq!(diagnostic.message, warning.message);
+        assert_eq!(diagnostic.range.start.line as usize + 1, warning.line);
+    }
+}
+
+#[test]
+fn providerless_directory_reports_deferred_type_checks_once() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("main.crn");
+    let source = "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes {\n  x: AwsAccountId = '123'\n}\n";
+    std::fs::write(&path, source).unwrap();
+    let doc = create_document_at(source, path.clone());
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "providers_not_loaded".into(),
+                ))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 2, "{diagnostics:#?}");
+    assert!(warnings.iter().all(
+        |warning| warning.severity == Some(DiagnosticSeverity::WARNING)
+            && warning.source.as_deref() == Some("carina")
+    ));
+}
+
+#[test]
+fn loaded_catalog_settles_type_checks_and_keeps_typos_as_unknown_types() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let source = "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes { x: AwsAccountId = '123' }\n";
+    let doc = create_document(source);
+    let mut schemas = SchemaRegistry::new();
+    let mut schema = ResourceSchema::new("test.Types");
+    for name in ["Arn", "AwsAccountId"] {
+        schema = schema.attribute(
+            AttributeSchema::optional(
+                name,
+                AttributeType::refined_string(Some(TypeIdentity::bare(name)), None, None, None),
+            )
+            .build(),
+        );
+    }
+    schemas.insert("test", schema.validate().unwrap());
+    let diagnostics = custom_engine(schemas).analyze(&doc, None);
+    assert!(
+        !diagnostics.iter().any(|diagnostic| diagnostic.code
+            == Some(tower_lsp::lsp_types::NumberOrString::String(
+                "providers_not_loaded".into()
+            ))),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown custom type")),
+        "{diagnostics:#?}"
+    );
+    let diagnostics = custom_engine(SchemaRegistry::new()).analyze(&doc, None);
+    for name in ["Arn", "AwsAccountId"] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.severity
+                == Some(DiagnosticSeverity::ERROR)
+                && diagnostic
+                    .message
+                    .contains(&format!("unknown custom type '{name}'"))),
+            "{diagnostics:#?}"
+        );
+    }
+    assert!(!diagnostics.iter().any(|diagnostic| diagnostic.code
+        == Some(tower_lsp::lsp_types::NumberOrString::String(
+            "providers_not_loaded".into()
+        ))));
 }

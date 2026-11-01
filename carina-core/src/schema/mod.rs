@@ -13546,12 +13546,10 @@ impl SchemaRegistry {
         for (owner, _, _, schema) in self.iter() {
             let mut collect = |candidate: &TypeIdentity, declaration: &CompiledAttributeType| {
                 if candidate == identity {
-                    let kind = identified_declaration_scalar_kind(declaration)
-                        .expect("admitted identified declarations carry scalar kinds");
-                    declarations.insert(crate::parser::OwnedTypeIdentity::provider(
+                    declarations.insert(crate::parser::OwnedTypeIdentity::from_declaration(
                         owner,
-                        candidate.clone(),
-                        kind,
+                        crate::parser::IdentifiedCustomTypeDeclaration::new(declaration)
+                            .expect("admitted identified declarations carry scalar kinds"),
                     ));
                 }
             };

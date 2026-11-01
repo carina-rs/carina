@@ -43,6 +43,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Clone for TypecheckInference<'_, P, 
 #[derive(Clone, Copy)]
 pub(crate) enum TypecheckProviderContext<'a> {
     Loaded(&'a LoadedProviderContext),
+    LoadedParserCatalog(&'a ProviderContext),
     Providerless(&'a ProviderContext),
 }
 
@@ -55,17 +56,27 @@ impl<'a> TypecheckProviderContext<'a> {
         Self::Providerless(config)
     }
 
+    /// The parser borrows the raw context inside its lexical scopes. Classify
+    /// that authority once, before checking a parameter or return value.
+    pub(crate) fn for_parser(config: &'a ProviderContext) -> Self {
+        if config.custom_types_loaded() {
+            Self::LoadedParserCatalog(config)
+        } else {
+            Self::Providerless(config)
+        }
+    }
+
     pub(crate) fn as_provider_context(self) -> &'a ProviderContext {
         match self {
             Self::Loaded(config) => config.as_provider_context(),
-            Self::Providerless(config) => config,
+            Self::LoadedParserCatalog(config) | Self::Providerless(config) => config,
         }
     }
 
     pub(crate) fn loaded_context(self) -> Option<&'a LoadedProviderContext> {
         match self {
             Self::Loaded(config) => Some(config),
-            Self::Providerless(_) => None,
+            Self::LoadedParserCatalog(_) | Self::Providerless(_) => None,
         }
     }
 
@@ -83,7 +94,15 @@ impl<'a> TypecheckProviderContext<'a> {
                 check_type_expr_value_providerless(expected, value, config, inference)
                     .allow_deferred()
             }
+            Self::LoadedParserCatalog(_) => {
+                check_type_expr_value_inner(expected, value, self, inference)
+                    .require_provider_schemas()
+            }
         }
+    }
+
+    pub(crate) fn requires_provider_schemas(self) -> bool {
+        matches!(self, Self::Loaded(_) | Self::LoadedParserCatalog(_))
     }
 }
 
@@ -106,7 +125,9 @@ pub struct TypeExprValueDeferral {
 }
 
 impl TypeExprValueCheck {
-    /// Bootstrap/editor phases deliberately accept unavailable provider evidence.
+    /// Intermediate bootstrap/editor checks may retain unavailable evidence.
+    /// A terminal providerless pipeline must settle its sites through
+    /// [`super::deferred_types::DeferredProviderTypeChecks`].
     pub fn allow_deferred(self) -> Result<(), TypeExprValueError> {
         match self {
             Self::Assignable | Self::Deferred(_) => Ok(()),
@@ -335,22 +356,23 @@ enum ProviderCustomTypeValidation {
     Providerless,
 }
 
-/// Raw parser seam retaining main's historical unloaded-context behaviour.
-/// Public validation callers must use a witness-carrying entry point above.
 fn check_type_expr_value_inner<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
-    config: &ProviderContext,
+    config: TypecheckProviderContext<'_>,
     inference: TypecheckInference<'_, P, B>,
-) -> Result<(), TypeExprValueError> {
+) -> TypeExprValueCheck {
     check_type_expr_value_inner_with_mode(
         expected,
         value,
-        config,
+        config.as_provider_context(),
         inference,
-        ProviderCustomTypeValidation::Loaded,
+        if config.requires_provider_schemas() {
+            ProviderCustomTypeValidation::Loaded
+        } else {
+            ProviderCustomTypeValidation::Providerless
+        },
     )
-    .require_provider_schemas()
 }
 
 fn deferred_provider_check<P: PlaceholderKind, B: BindingAddress>(
@@ -384,7 +406,35 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
     };
     if let TypeExpr::UnloadedSchemaType(_) = expected {
         return match super::resolve_type_expr(expected, config) {
-            Ok(TypeExpr::UnloadedSchemaType(_)) => deferred_provider_check(expected, value),
+            Ok(TypeExpr::UnloadedSchemaType(_)) => {
+                // Provider declarations can only refine String, Int or Float.
+                // Missing schemas cannot make a concrete container or another
+                // primitive into one of those scalar types.
+                match value {
+                    Value::Concrete(
+                        ConcreteValue::String(_)
+                        | ConcreteValue::Int(_)
+                        | ConcreteValue::Float(_)
+                        | ConcreteValue::EnumIdentifier(_)
+                        | ConcreteValue::CanonicalEnum(_),
+                    ) => deferred_provider_check(expected, value),
+                    Value::Concrete(_) => Mismatch(mismatch(expected, value)),
+                    Value::Deferred(DeferredValue::Secret(inner)) => check(expected, inner),
+                    Value::Deferred(DeferredValue::ModuleIf(deferred)) => TypeExprValueCheck::all(
+                        deferred.values()[1..]
+                            .iter()
+                            .map(|value| check(expected, value)),
+                    ),
+                    Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                        TypeExprValueCheck::all(
+                            [value.as_ref(), default.as_ref()]
+                                .into_iter()
+                                .map(|value| check(expected, value)),
+                        )
+                    }
+                    Value::Deferred(_) => deferred_provider_check(expected, value),
+                }
+            }
             Ok(resolved) => check(&resolved, value),
             Err(error) => Mismatch(validation_mismatch(expected, value, error.to_string())),
         };
@@ -421,7 +471,9 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Access(_)) => {
             let inferred = match inference {
                 TypecheckInference::Available { bindings, schemas } => {
-                    super::inference::infer_type_from_value(value, bindings, schemas)
+                    super::inference::infer_type_from_value_with_provider_context(
+                        value, bindings, schemas, config,
+                    )
                 }
                 TypecheckInference::Unavailable => {
                     super::inference::infer_type_from_value_without_bindings(value)
@@ -456,7 +508,9 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
             let inferred = match inference {
                 TypecheckInference::Available { bindings, schemas } => {
-                    super::inference::infer_type_from_value(value, bindings, schemas)
+                    super::inference::infer_type_from_value_with_provider_context(
+                        value, bindings, schemas, config,
+                    )
                 }
                 TypecheckInference::Unavailable => {
                     super::inference::infer_type_from_value_without_bindings(value)
@@ -661,15 +715,15 @@ fn inferred_value_check<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-/// Internal parser seam. Parser-produced bootstrap types defer before this
-/// function; public validation and resolver APIs must use one of the witness-
-/// carrying entry points above.
+/// Internal parser seam preserving deferred provider evidence. The caller
+/// consumes the outcome using the authority carried by `config`; public
+/// validation and resolver APIs use the witness-carrying entry points above.
 pub(crate) fn check_type_expr_value_with_context<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
-    config: &ProviderContext,
+    config: TypecheckProviderContext<'_>,
     inference: TypecheckInference<'_, P, B>,
-) -> Result<(), TypeExprValueError> {
+) -> TypeExprValueCheck {
     check_type_expr_value_inner(expected, value, config, inference)
 }
 
@@ -720,16 +774,9 @@ fn custom_type_validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn accepts_interpolation(expected: &TypeExpr) -> bool {
-    is_string_shaped(expected)
+    expected.is_string_shaped()
+        || matches!(expected, TypeExpr::Ref(_))
         || matches!(expected, TypeExpr::Union(members) if members.iter().any(accepts_interpolation))
-}
-
-fn is_string_shaped(type_expr: &TypeExpr) -> bool {
-    match type_expr {
-        TypeExpr::UnloadedSchemaType(_) => false,
-        TypeExpr::Ref(_) => true,
-        _ => type_expr.is_string_shaped(),
-    }
 }
 
 fn is_qualified_enum_identifier(identifier: &str) -> bool {
@@ -753,7 +800,7 @@ fn inferred_type_assignment(
 }
 
 fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
-    !inferred_type_assignment(expected, actual).is_mismatch()
+    inferred_type_assignment(expected, actual).allow_unchecked()
 }
 
 /// Directional compatibility for a declared source flowing into a declared sink.
@@ -776,9 +823,10 @@ mod tests {
         check_type_expr_value_inner(
             expected,
             value,
-            &ProviderContext::default(),
+            TypecheckProviderContext::for_parser(&ProviderContext::default()),
             TypecheckInference::Unavailable,
         )
+        .require_provider_schemas()
     }
 
     #[test]
@@ -794,7 +842,13 @@ mod tests {
         value: &Value,
         config: &ProviderContext,
     ) -> Result<(), TypeExprValueError> {
-        check_type_expr_value_inner(expected, value, config, TypecheckInference::Unavailable)
+        check_type_expr_value_inner(
+            expected,
+            value,
+            TypecheckProviderContext::for_parser(config),
+            TypecheckInference::Unavailable,
+        )
+        .require_provider_schemas()
     }
 
     #[test]
@@ -893,6 +947,72 @@ mod tests {
             crate::parser::parse_type_expr_str("Count", &ProviderContext::default()).unwrap();
         providerless_check(&expected, &Value::Concrete(ConcreteValue::Int(3)))
             .expect("an unloaded bare declaration must defer in providerless mode");
+    }
+
+    #[test]
+    fn providerless_unloaded_annotation_rejects_non_scalar_values() {
+        let config = ProviderContext::default();
+        let expected = crate::parser::parse_type_expr_str("AwsAccountId", &config).unwrap();
+        for value in [
+            Value::Concrete(ConcreteValue::Bool(true)),
+            Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(1))),
+            Value::Concrete(ConcreteValue::List(vec![string("account")])),
+            Value::Concrete(ConcreteValue::StringList(vec!["account".into()])),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "id".into(),
+                string("account"),
+            )]))),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Bool(true),
+            )))),
+        ] {
+            assert!(
+                matches!(
+                    check_type_expr_value_providerless(
+                        &expected,
+                        &value,
+                        &config,
+                        TypecheckInference::Unavailable,
+                    ),
+                    TypeExprValueCheck::Mismatch(_)
+                ),
+                "a provider scalar cannot accept {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_type_expr_value_providerless_with_loaded_catalog_rejects_unloaded_typo() {
+        let expected =
+            crate::parser::parse_type_expr_str("UndeclaredAccountId", ProviderContext::unloaded())
+                .unwrap();
+        let config = ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                Default::default(),
+                Box::new(|_, _| panic!("providerless checking must not validate")),
+            ),
+            ..ProviderContext::default()
+        };
+        let result = check_type_expr_value_providerless(
+            &expected,
+            &string("account"),
+            &config,
+            TypecheckInference::Unavailable,
+        );
+        assert!(
+            matches!(&result, TypeExprValueCheck::Mismatch(_)),
+            "{result:?}"
+        );
+        let TypeExprValueCheck::Mismatch(error) = result else {
+            unreachable!()
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unknown custom type 'UndeclaredAccountId'"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1108,9 +1228,10 @@ mod tests {
         let unloaded = check_type_expr_value_inner(
             &expected,
             &value,
-            &config,
+            TypecheckProviderContext::for_parser(&config),
             TypecheckInference::Unavailable,
-        );
+        )
+        .require_provider_schemas();
         let providerless = check_type_expr_value_providerless(
             &expected,
             &value,

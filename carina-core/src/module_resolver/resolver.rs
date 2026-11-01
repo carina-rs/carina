@@ -145,6 +145,9 @@ impl ResidualModuleResolutionError {
 
     pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
         match self.0.root_cause() {
+            ModuleError::WithProviderTypeWarnings { .. } => {
+                unreachable!("root_cause removes diagnostic wrappers")
+            }
             ModuleError::Multiple(_errors) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::Constraint(diagnostic) => {
                 Some(ResidualModuleResolutionDiagnostic::Constraint {
@@ -251,6 +254,9 @@ impl ResidualModuleResolutionError {
     ) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
+            ModuleError::WithProviderTypeWarnings { .. } => {
+                unreachable!("root_cause removes diagnostic wrappers")
+            }
             ModuleError::Multiple(_errors) => false,
             ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
                 self.finding_owns_error(finding)
@@ -429,6 +435,10 @@ fn without_covered_reference_type_members(
     findings: &[crate::validation::ModuleCallFinding],
 ) -> Option<ModuleError> {
     match error {
+        ModuleError::WithProviderTypeWarnings { error, warnings } => {
+            without_covered_reference_type_members(*error, findings)
+                .map(|error| error.with_provider_type_warnings(warnings))
+        }
         ModuleError::Multiple(errors) => ModuleError::from_errors(
             errors
                 .into_vec()
@@ -980,6 +990,26 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             .collect()
     }
 
+    fn provider_type_warnings(&self) -> Vec<crate::parser::ParseWarning> {
+        let mut warnings = self
+            .module_cache
+            .values()
+            .flat_map(|module| &module.warnings)
+            .filter(|warning| warning.kind == crate::parser::WarningKind::ProviderSchemasNotLoaded)
+            .cloned()
+            .collect::<Vec<_>>();
+        warnings.sort_by_key(|warning| {
+            (
+                warning.file.clone(),
+                warning.line,
+                warning.span.as_ref().map(|span| span.start_column),
+                warning.message.clone(),
+            )
+        });
+        warnings.dedup();
+        warnings
+    }
+
     /// Load and cache a module from a directory path.
     ///
     /// Modules are directory-scoped: a module is a directory containing one or
@@ -1110,6 +1140,11 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         // argument-dependent `if` must derive dependencies only after its
         // call-site branch is selected.
         merged.capture_template_dependency_values();
+        crate::validation::deferred_types::finalize_provider_type_checks(
+            &mut merged,
+            self.config(),
+            &dir_path.join("main.crn"),
+        );
 
         // Resolve references while the module's own binding namespace is still
         // intact. Besides folding module-local values, this records the direct
@@ -1271,8 +1306,14 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         parsed: &'parsed mut crate::parser::File<E>,
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
-        resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
-        let root_witness = resolver.validate_reference_types(parsed)?;
+        resolver
+            .process_imports(&parsed.uses, &parsed.module_calls)
+            .map_err(|error| {
+                error.with_provider_type_warnings(resolver.provider_type_warnings())
+            })?;
+        let root_witness = resolver.validate_reference_types(parsed).map_err(|error| {
+            error.with_provider_type_warnings(resolver.provider_type_warnings())
+        })?;
         Ok(Self {
             parsed,
             resolver,
@@ -1285,6 +1326,9 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
     where
         E: ResolveExportBindingPhase<ParserPlaceholder>,
     {
+        self.parsed
+            .warnings
+            .extend(self.resolver.provider_type_warnings());
         let root = root_expansion_scope();
         let contributions = resolve_modules_with_resolver(
             self.parsed,
@@ -1326,6 +1370,11 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Result<Self, ModuleError> {
+        crate::validation::deferred_types::finalize_provider_type_checks(
+            parsed,
+            config,
+            &base_dir.join("main.crn"),
+        );
         let mut resolver =
             ModuleResolver::<DeferredUpstreamTypeResolution>::for_providerless_upstream(
                 base_dir, config, schemas,
@@ -1343,6 +1392,9 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
     where
         E: ResolveExportBindingPhase<ParserPlaceholder>,
     {
+        self.parsed
+            .warnings
+            .extend(self.resolver.provider_type_warnings());
         let root = root_expansion_scope();
         let contributions = resolve_modules_with_resolver(
             self.parsed,
@@ -1367,6 +1419,17 @@ fn finish_root_expansion<E: ResolveExportBindingPhase<ParserPlaceholder>>(
             crate::config_loader::relabel_export_phase(contribution),
         );
     }
+    let mut provider_warnings = Vec::new();
+    expanded.warnings.retain(|warning| {
+        if warning.kind != crate::parser::WarningKind::ProviderSchemasNotLoaded {
+            return true;
+        }
+        if provider_warnings.contains(warning) {
+            return false;
+        }
+        provider_warnings.push(warning.clone());
+        true
+    });
     expanded
 }
 
@@ -1459,11 +1522,25 @@ pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<Par
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let mut parsed = parsed.into_parsed();
-    let expanded =
-        RefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
-            .expand()?;
-    ensure_expanded_root_graph(&expanded)?;
-    finalize_deferred_for_bodies(expanded)
+    crate::validation::deferred_types::finalize_provider_type_checks(
+        &mut parsed,
+        config,
+        &base_dir.join("main.crn"),
+    );
+    let warnings = parsed
+        .warnings
+        .iter()
+        .filter(|warning| warning.kind == crate::parser::WarningKind::ProviderSchemasNotLoaded)
+        .cloned()
+        .collect::<Vec<_>>();
+    (|| {
+        let expanded =
+            RefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
+                .expand()?;
+        ensure_expanded_root_graph(&expanded)?;
+        finalize_deferred_for_bodies(expanded)
+    })()
+    .map_err(|error: ModuleError| error.with_provider_type_warnings(warnings))
 }
 
 /// Resolve a loader-owned directory while retaining argument-dependent
@@ -1490,10 +1567,24 @@ pub fn resolve_module_template_with_providerless_config<
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let mut parsed = parsed.into_parsed();
-    let expanded =
-        RefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
-            .expand()?;
-    finalize_deferred_for_bodies(expanded)
+    crate::validation::deferred_types::finalize_provider_type_checks(
+        &mut parsed,
+        config,
+        &base_dir.join("main.crn"),
+    );
+    let warnings = parsed
+        .warnings
+        .iter()
+        .filter(|warning| warning.kind == crate::parser::WarningKind::ProviderSchemasNotLoaded)
+        .cloned()
+        .collect::<Vec<_>>();
+    (|| {
+        let expanded =
+            RefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
+                .expand()?;
+        finalize_deferred_for_bodies(expanded)
+    })()
+    .map_err(|error: ModuleError| error.with_provider_type_warnings(warnings))
 }
 
 /// Expand an upstream project's modules using the consumer's necessarily
@@ -1577,7 +1668,12 @@ fn resolve_modules_with_diagnostics_and_resolver<
     config: &ProviderContext,
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
-    let graph = parsed.clone();
+    let mut graph = parsed.clone();
+    crate::validation::deferred_types::finalize_provider_type_checks(
+        &mut graph,
+        config,
+        &resolver.base_dir.join("main.crn"),
+    );
     let root = root_expansion_scope();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
     let mut contributions = Vec::new();
@@ -1594,6 +1690,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
         }
         Err(error) => errors.push(error),
     }
+    graph.warnings.extend(resolver.provider_type_warnings());
     let graph = finish_root_expansion(graph, contributions, &root);
     let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
     errors.extend(deferred_for_errors);

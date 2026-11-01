@@ -310,9 +310,10 @@ fn format_undefined_identifier(
     }
 }
 
-/// A structured warning emitted during parsing (non-fatal).
+/// A non-fatal diagnostic from parsing or providerless validation finalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarningKind {
+    ProviderSchemasNotLoaded,
     DeferredFor,
     NonLiteralPreventDestroy,
     SingleQuotedInterpolation,

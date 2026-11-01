@@ -7338,30 +7338,25 @@ where
     fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
         // Keep incompatible kinds separate so annotation resolution can reject
         // a cross-provider conflict before constructing a SchemaType.
-        let mut owners_by_identity = BTreeMap::<
-            (TypeIdentity, RefinedScalarKind),
-            crate::parser::NonEmptySchemaTypeOwners,
-        >::new();
+        let mut declarations_by_identity =
+            BTreeMap::<(TypeIdentity, RefinedScalarKind), crate::parser::OwnedTypeIdentity>::new();
         for (owner, indexed) in &self.index {
-            let owner_set = crate::parser::NonEmptySchemaTypeOwners::singleton(
-                crate::parser::SchemaTypeOwner::Provider(owner.clone()),
-            );
             for (identity, declarations) in &indexed.declarations {
-                let kind = identified_custom_type_scalar_kind(&declarations[0])
-                    .expect("validated declarations have loaded scalar kinds")
-                    .expect("validated identified declarations have a scalar kind");
-                owners_by_identity
-                    .entry((identity.clone(), kind))
-                    .and_modify(|owners| *owners = owners.union(&owner_set))
-                    .or_insert_with(|| owner_set.clone());
+                let owned = crate::parser::OwnedTypeIdentity::from_declaration(
+                    owner,
+                    crate::parser::IdentifiedCustomTypeDeclaration::new(&declarations[0])
+                        .expect("validated identified declarations have a scalar kind"),
+                );
+                declarations_by_identity
+                    .entry((identity.clone(), owned.scalar_kind()))
+                    .and_modify(|existing| {
+                        *existing =
+                            existing.with_merged_owners(existing.owners().union(owned.owners()));
+                    })
+                    .or_insert(owned);
             }
         }
-        owners_by_identity
-            .into_iter()
-            .map(|((identity, kind), owners)| {
-                crate::parser::OwnedTypeIdentity::with_owners(identity, owners, kind)
-            })
-            .collect()
+        declarations_by_identity.into_values().collect()
     }
 }
 

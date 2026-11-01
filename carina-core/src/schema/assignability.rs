@@ -5,6 +5,7 @@ use crate::parser::CustomTypeValidationError;
 
 /// Missing provider evidence is distinct from a proven type mismatch.
 #[derive(Debug, Clone, PartialEq)]
+#[must_use]
 pub enum TypeAssignability {
     Assignable,
     Mismatch,
@@ -12,8 +13,21 @@ pub enum TypeAssignability {
 }
 
 impl TypeAssignability {
-    pub fn is_mismatch(&self) -> bool {
-        matches!(self, Self::Mismatch)
+    /// Loaded validation must prove assignment using the provider schemas.
+    pub fn require_loaded(self) -> Result<bool, CustomTypeValidationError> {
+        match self {
+            Self::Assignable => Ok(true),
+            Self::Mismatch => Ok(false),
+            Self::Unchecked(reason) => Err(reason),
+        }
+    }
+
+    /// Bootstrap/editor consumers explicitly permit missing scalar evidence.
+    pub fn allow_unchecked(self) -> bool {
+        match self {
+            Self::Assignable | Self::Unchecked(_) => true,
+            Self::Mismatch => false,
+        }
     }
 
     fn all(results: impl IntoIterator<Item = Self>) -> Self {
@@ -177,5 +191,27 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         source_refs.truncate(source.restore_len);
         sink_refs.truncate(target.restore_len);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assignment_consumers_preserve_the_unchecked_policy() {
+        for (assignment, expected) in [
+            (TypeAssignability::Assignable, true),
+            (TypeAssignability::Mismatch, false),
+        ] {
+            assert_eq!(assignment.clone().require_loaded(), Ok(expected));
+            assert_eq!(assignment.allow_unchecked(), expected);
+        }
+        let unchecked = TypeAssignability::Unchecked(CustomTypeValidationError::ProvidersNotLoaded);
+        assert_eq!(
+            unchecked.clone().require_loaded(),
+            Err(CustomTypeValidationError::ProvidersNotLoaded)
+        );
+        assert!(unchecked.allow_unchecked());
     }
 }

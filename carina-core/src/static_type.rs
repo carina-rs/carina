@@ -53,7 +53,7 @@ impl<R> StaticType<R, ConsumerResolvedType> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum StaticTypeResolutionError {
     #[error("unknown custom type '{name}'")]
     UnknownCustomType { name: String },

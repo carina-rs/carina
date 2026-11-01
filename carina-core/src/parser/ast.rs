@@ -2789,6 +2789,10 @@ pub trait ExportParamLike<
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
     fn inference_failed(&self) -> bool;
+    /// Authored export location retained across parser and inference phases.
+    fn source_location(&self) -> Option<(&std::path::Path, SourceSpan)> {
+        None
+    }
 }
 
 impl<P: PlaceholderKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
@@ -2811,6 +2815,9 @@ impl<P: PlaceholderKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     }
     fn inference_failed(&self) -> bool {
         false
+    }
+    fn source_location(&self) -> Option<(&std::path::Path, SourceSpan)> {
+        Some((&self.source.file, self.source.span))
     }
 }
 
@@ -4424,6 +4431,7 @@ pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
     resource_source_files: HashMap<ResourceId, PathBuf>,
     template_dependency_values: HashMap<ResourceId, IndexMap<String, Value<ParserPlaceholder, B>>>,
     argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
+    export_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck<B>>,
 }
 
@@ -4436,6 +4444,7 @@ impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
             resource_source_files: HashMap::new(),
             template_dependency_values: HashMap::new(),
             argument_type_sources: IndexMap::new(),
+            export_type_sources: IndexMap::new(),
             pending_function_type_checks: Vec::new(),
         }
     }
@@ -4450,6 +4459,7 @@ pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingNa
     pub(crate) function_name: String,
     pub(crate) arguments: Vec<FunctionArgument<ParserPlaceholder, B>>,
     pub(crate) source_line: usize,
+    pub(crate) source_column: Option<usize>,
     pub(crate) source_file: Option<PathBuf>,
 }
 
@@ -4501,10 +4511,38 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
             .map(|(source_file, span)| (source_file, *span))
     }
 
+    pub(crate) fn insert_export_type_source(
+        &mut self,
+        name: String,
+        file: PathBuf,
+        span: SourceSpan,
+    ) {
+        self.export_type_sources
+            .insert(name, (SourceFileId::new(file), span));
+    }
+
+    pub(crate) fn export_type_source(&self, name: &str) -> Option<(&SourceFileId, SourceSpan)> {
+        self.export_type_sources
+            .get(name)
+            .map(|(file, span)| (file, *span))
+    }
+
     pub(crate) fn insert_pending_function_type_check(
         &mut self,
         check: PendingFunctionTypeCheck<B>,
     ) {
+        // Evaluation may rediscover a parser-authored call without its column.
+        // Retain the precise site, including distinct calls on the same line.
+        if check.source_column.is_none()
+            && self.pending_function_type_checks.iter().any(|existing| {
+                existing.source_column.is_some()
+                    && existing.function_name == check.function_name
+                    && existing.source_line == check.source_line
+                    && existing.source_file == check.source_file
+            })
+        {
+            return;
+        }
         if !self.pending_function_type_checks.contains(&check) {
             self.pending_function_type_checks.push(check);
         }
@@ -4525,6 +4563,7 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
             resource_source_files: _resource_source_files,
             template_dependency_values,
             argument_type_sources: _argument_type_sources,
+            export_type_sources: _export_type_sources,
             pending_function_type_checks,
         } = self;
         for metadata in value_structural_handles.values() {
@@ -4570,6 +4609,7 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
             .extend(other.template_dependency_values);
         self.argument_type_sources
             .extend(other.argument_type_sources);
+        self.export_type_sources.extend(other.export_type_sources);
         for check in other.pending_function_type_checks {
             self.insert_pending_function_type_check(check);
         }
@@ -4622,6 +4662,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
             resource_source_files,
             template_dependency_values,
             argument_type_sources,
+            export_type_sources,
             pending_function_type_checks,
         } = self;
         ParserBindingMetadata {
@@ -4651,6 +4692,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                 })
                 .collect(),
             argument_type_sources,
+            export_type_sources,
             pending_function_type_checks: pending_function_type_checks
                 .into_iter()
                 .map(|check| {
@@ -4658,6 +4700,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                         function_name,
                         arguments,
                         source_line,
+                        source_column,
                         source_file,
                     } = check;
                     PendingFunctionTypeCheck {
@@ -4667,6 +4710,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                             .map(|argument| argument.resolve_bindings(resolve))
                             .collect(),
                         source_line,
+                        source_column,
                         source_file,
                     }
                 })
@@ -4687,6 +4731,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
             resource_source_files: _resource_source_files,
             template_dependency_values,
             argument_type_sources: _argument_type_sources,
+            export_type_sources: _export_type_sources,
             pending_function_type_checks,
         } = self;
 
@@ -4725,6 +4770,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
                 function_name: _function_name,
                 arguments,
                 source_line: _source_line,
+                source_column: _source_column,
                 source_file: _source_file,
             } = check;
             for argument in arguments {

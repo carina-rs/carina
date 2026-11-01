@@ -241,8 +241,37 @@ pub fn infer_type_from_value<P: PlaceholderKind, B: BindingAddress>(
     bindings: &InferenceBindings<P, B>,
     schemas: &SchemaRegistry,
 ) -> Result<TypeExpr, InferenceIssue> {
+    infer_type_from_value_with_provider_context(
+        value,
+        bindings,
+        schemas,
+        crate::parser::ProviderContext::unloaded(),
+    )
+}
+
+/// Infer with the same provider catalog that owns the binding/type check.
+pub fn infer_type_from_value_with_provider_context<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &InferenceBindings<P, B>,
+    schemas: &SchemaRegistry,
+    provider_context: &crate::parser::ProviderContext,
+) -> Result<TypeExpr, InferenceIssue> {
     let mut visiting = indexmap::IndexSet::new();
-    infer_type_from_value_with_visiting(value, bindings, schemas, &mut visiting)
+    infer_type_from_value_with_visiting(
+        value,
+        bindings,
+        InferenceSchemaContext {
+            schemas,
+            provider_context,
+        },
+        &mut visiting,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct InferenceSchemaContext<'a> {
+    schemas: &'a SchemaRegistry,
+    provider_context: &'a crate::parser::ProviderContext,
 }
 
 fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> InferenceError {
@@ -424,21 +453,22 @@ pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: Bind
 fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &InferenceBindings<P, B>,
-    schemas: &SchemaRegistry,
+    context: InferenceSchemaContext<'_>,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
+    let schemas = context.schemas;
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             let then_type = infer_type_from_value_with_visiting(
                 deferred.then_value(),
                 bindings,
-                schemas,
+                context,
                 visiting,
             )?;
             let else_type = infer_type_from_value_with_visiting(
                 deferred.else_value(),
                 bindings,
-                schemas,
+                context,
                 visiting,
             )?;
             if then_type == else_type {
@@ -456,13 +486,13 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
             let lhs = require_proven_integer_operand(
-                infer_type_from_value_with_visiting(expression.lhs(), bindings, schemas, visiting),
+                infer_type_from_value_with_visiting(expression.lhs(), bindings, context, visiting),
                 expression.op(),
                 crate::integer_arithmetic::IntegerOperandSide::Left,
                 expression.operator_span(),
             )?;
             let rhs = require_proven_integer_operand(
-                infer_type_from_value_with_visiting(expression.rhs(), bindings, schemas, visiting),
+                infer_type_from_value_with_visiting(expression.rhs(), bindings, context, visiting),
                 expression.op(),
                 crate::integer_arithmetic::IntegerOperandSide::Right,
                 expression.operator_span(),
@@ -472,7 +502,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
                 expression.operator_span(),
                 &lhs,
                 &rhs,
-                schemas,
+                context,
             )
         }
         Value::Concrete(ConcreteValue::Float(_)) => Ok(TypeExpr::Float),
@@ -480,27 +510,27 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
         Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            infer_type_from_value_with_visiting(inner, bindings, schemas, visiting)
+            infer_type_from_value_with_visiting(inner, bindings, context, visiting)
         }
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(InferenceError::UnknownType {
             reason: "saved-plan secret has not been rehydrated".to_string(),
         }
         .into()),
         Value::Concrete(ConcreteValue::List(items)) => {
-            infer_collection(items, bindings, schemas, visiting, TypeExpr::List)
+            infer_collection(items, bindings, context, visiting, TypeExpr::List)
         }
         Value::Concrete(ConcreteValue::StringList(_)) => {
             Ok(TypeExpr::List(Box::new(TypeExpr::String)))
         }
         Value::Concrete(ConcreteValue::Map(entries)) => {
-            infer_collection(entries.values(), bindings, schemas, visiting, TypeExpr::Map)
+            infer_collection(entries.values(), bindings, context, visiting, TypeExpr::Map)
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => infer_resource_ref_with_visiting(
             path.binding(),
             path.attribute(),
             path.segments(),
             bindings,
-            schemas,
+            context,
             visiting,
         ),
         // `BindingRef` is a bare-binding placeholder with no attribute
@@ -511,8 +541,8 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         }
         .into()),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            let left = infer_type_from_value_with_visiting(value, bindings, schemas, visiting)?;
-            match infer_type_from_value_with_visiting(default, bindings, schemas, visiting) {
+            let left = infer_type_from_value_with_visiting(value, bindings, context, visiting)?;
+            match infer_type_from_value_with_visiting(default, bindings, context, visiting) {
                 Ok(right) if right == left => Ok(left),
                 Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
                     left: left.to_string(),
@@ -542,7 +572,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(
             DeferredValue::FunctionCall { name, args, .. }
             | DeferredValue::Unavailable { name, args, .. },
-        ) => infer_function_call(name.as_str(), args, bindings, schemas, visiting),
+        ) => infer_function_call(name.as_str(), args, bindings, context, visiting),
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             function.return_type.clone().ok_or_else(|| {
                 InferenceIssue::from(InferenceError::UnknownType {
@@ -555,7 +585,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let base_type =
-                infer_type_from_value_with_visiting(access.base(), bindings, schemas, visiting)?;
+                infer_type_from_value_with_visiting(access.base(), bindings, context, visiting)?;
             super::narrow_type_expr(
                 &base_type,
                 std::slice::from_ref(access.step()),
@@ -628,8 +658,9 @@ fn require_integer_arithmetic_operands(
     operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
     lhs: &TypeExpr,
     rhs: &TypeExpr,
-    schemas: &SchemaRegistry,
+    context: InferenceSchemaContext<'_>,
 ) -> Result<TypeExpr, InferenceIssue> {
+    let schemas = context.schemas;
     for (side, operand) in [
         (crate::integer_arithmetic::IntegerOperandSide::Left, lhs),
         (crate::integer_arithmetic::IntegerOperandSide::Right, rhs),
@@ -637,7 +668,7 @@ fn require_integer_arithmetic_operands(
         let operand = crate::parser::resolve_type_expr_from_schemas(
             operand,
             schemas,
-            crate::parser::ProviderContext::unloaded(),
+            context.provider_context,
         )
         .map_err(|error| {
             InferenceIssue::from(InferenceError::UnknownType {
@@ -694,7 +725,7 @@ fn inferred_scalar_kind(
 fn infer_collection<'a, I, F, P, B>(
     items: I,
     bindings: &InferenceBindings<P, B>,
-    schemas: &SchemaRegistry,
+    context: InferenceSchemaContext<'_>,
     visiting: &mut indexmap::IndexSet<String>,
     wrap: F,
 ) -> Result<TypeExpr, InferenceIssue>
@@ -714,7 +745,7 @@ where
     // can add an explicit annotation to the export.
     let mut iter = items.into_iter();
     let first = match iter.next() {
-        Some(v) => infer_type_from_value_with_visiting(v, bindings, schemas, visiting)?,
+        Some(v) => infer_type_from_value_with_visiting(v, bindings, context, visiting)?,
         None => {
             return Err(InferenceError::UnknownType {
                 reason: "empty collection — element type cannot be inferred".to_string(),
@@ -723,7 +754,7 @@ where
         }
     };
     for next in iter {
-        let next_type = infer_type_from_value_with_visiting(next, bindings, schemas, visiting)?;
+        let next_type = infer_type_from_value_with_visiting(next, bindings, context, visiting)?;
         if next_type != first {
             return Err(heterogeneous_collection_error(&first, &next_type).into());
         }
@@ -736,9 +767,10 @@ fn infer_resource_ref_with_visiting<P: PlaceholderKind, B: BindingAddress>(
     attribute: &str,
     segments: &[crate::resource::PathSegment],
     bindings: &InferenceBindings<P, B>,
-    schemas: &SchemaRegistry,
+    context: InferenceSchemaContext<'_>,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
+    let schemas = context.schemas;
     let target = match bindings.get(binding) {
         Some(InferenceBinding::Resource {
             provider,
@@ -783,7 +815,7 @@ fn infer_resource_ref_with_visiting<P: PlaceholderKind, B: BindingAddress>(
                 return Err(InferenceError::CyclicVirtualBinding { cycle }.into());
             }
             let inner_type_result =
-                infer_type_from_value_with_visiting(inner, bindings, schemas, visiting);
+                infer_type_from_value_with_visiting(inner, bindings, context, visiting);
             visiting.shift_remove(binding);
             let inner_type = inner_type_result?;
             return super::narrow_type_expr(&inner_type, segments, Some(schemas)).ok_or_else(
@@ -967,14 +999,12 @@ pub(super) fn attribute_type_to_type_expr(
         | AttrTypeKind::Union(_)
         | AttrTypeKind::Ref(_) => None,
     };
-    if let Some(id) = scalar_identity {
+    if scalar_identity.is_some() {
         return TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider(
+            owned: crate::parser::OwnedTypeIdentity::from_declaration(
                 schema_owner,
-                id.clone(),
-                crate::provider::identified_custom_type_scalar_kind(attr_type)
-                    .expect("a loaded scalar declaration is required")
-                    .expect("identified scalar declaration has a scalar kind"),
+                crate::parser::IdentifiedCustomTypeDeclaration::new(attr_type)
+                    .expect("identified scalar declaration"),
             ),
         };
     }
@@ -1007,18 +1037,15 @@ pub(super) fn attribute_type_to_type_expr(
         AttrTypeKind::Bool => TypeExpr::Bool,
         AttrTypeKind::Duration => TypeExpr::Duration,
         AttrTypeKind::Enum {
-            identity,
             values,
             validate,
             to_dsl,
             ..
         } if values.is_none() && (validate.is_some() || to_dsl.is_some()) => TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider(
+            owned: crate::parser::OwnedTypeIdentity::from_declaration(
                 schema_owner,
-                identity.clone(),
-                crate::provider::identified_custom_type_scalar_kind(attr_type)
-                    .expect("a loaded scalar declaration is required")
-                    .expect("identified enum declaration has a scalar base"),
+                crate::parser::IdentifiedCustomTypeDeclaration::new(attr_type)
+                    .expect("identified enum declaration"),
             ),
         },
         AttrTypeKind::Enum { .. } => TypeExpr::String,
@@ -1066,7 +1093,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
     name: &str,
     args: &[crate::resource::FunctionArgument<P, B>],
     bindings: &InferenceBindings<P, B>,
-    schemas: &SchemaRegistry,
+    context: InferenceSchemaContext<'_>,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
     let return_type = builtin_functions()
@@ -1119,7 +1146,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
                 infer_type_from_value_with_visiting(
                     inner.walker_value(),
                     bindings,
-                    schemas,
+                    context,
                     visiting,
                 )
             },
@@ -1134,7 +1161,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
 /// Phase transition (#2360 stage 2): attach declared/inferred origin and any
 /// typed unchecked reason to every export.
 pub fn apply_inference<D, B: BindingAddress>(
-    parsed: crate::parser::File<
+    mut parsed: crate::parser::File<
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
@@ -1156,6 +1183,13 @@ where
             B,
         >,
 {
+    for export in &parsed.export_params {
+        parsed.parser_binding_metadata.insert_export_type_source(
+            export.name.clone(),
+            export.source_file().to_path_buf(),
+            export.source_span(),
+        );
+    }
     let inferred_exports = infer_export_params(&parsed, schemas).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`

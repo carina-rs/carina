@@ -69,44 +69,163 @@ impl<'de> serde::Deserialize<'de> for NonEmptySchemaTypeOwners {
     }
 }
 
-/// The routing key for an identified refined type.
+/// The routing key and scalar declaration for an identified refined type.
 ///
-/// A bare [`TypeIdentity`] is descriptive metadata, not routing authority.
-/// Pairing it with its schema owner prevents two factories that expose the
-/// same identity from competing in an identity-only map. The declared scalar
-/// kind travels with the identity so consumers do not need its schema to lift it.
+/// Production construction derives the scalar kind from an admitted schema
+/// declaration. Merging catalog owners retains that same declaration evidence.
+/// Decoding also requires the scalar declaration; independent identity/kind
+/// metadata cannot manufacture a resolved type.
+///
+/// ```compile_fail
+/// use carina_core::parser::OwnedTypeIdentity;
+/// use carina_core::schema::{RefinedScalarKind, TypeIdentity};
+/// let _ = OwnedTypeIdentity::provider("test", TypeIdentity::bare("Count"), RefinedScalarKind::String);
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::parser::{NonEmptySchemaTypeOwners, OwnedTypeIdentity, SchemaTypeOwner};
+/// use carina_core::schema::{RefinedScalarKind, TypeIdentity};
+/// let owners = NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider("test".into()));
+/// let _ = OwnedTypeIdentity::with_owners(TypeIdentity::bare("Count"), owners, RefinedScalarKind::String);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnedTypeIdentity {
+    owners: NonEmptySchemaTypeOwners,
+    declaration: IdentifiedScalarDeclaration,
+}
+
+/// A scalar shape and its identity are one declaration, including on the wire.
+/// The redundant wire metadata is checked against this declaration on decode.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
-pub struct OwnedTypeIdentity {
+enum IdentifiedScalarDeclaration {
+    String(TypeIdentity),
+    Int(TypeIdentity),
+    Float(TypeIdentity),
+}
+
+impl IdentifiedScalarDeclaration {
+    fn identity(&self) -> &TypeIdentity {
+        match self {
+            Self::String(identity) | Self::Int(identity) | Self::Float(identity) => identity,
+        }
+    }
+
+    fn scalar_kind(&self) -> RefinedScalarKind {
+        match self {
+            Self::String(_) => RefinedScalarKind::String,
+            Self::Int(_) => RefinedScalarKind::Int,
+            Self::Float(_) => RefinedScalarKind::Float,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OwnedTypeIdentityWire {
     owners: NonEmptySchemaTypeOwners,
     identity: TypeIdentity,
     scalar_kind: RefinedScalarKind,
+    declaration: IdentifiedScalarDeclaration,
+}
+
+impl serde::Serialize for OwnedTypeIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        OwnedTypeIdentityWire {
+            owners: self.owners.clone(),
+            identity: self.identity().clone(),
+            scalar_kind: self.scalar_kind(),
+            declaration: self.declaration.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OwnedTypeIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = OwnedTypeIdentityWire::deserialize(deserializer)?;
+        if wire.identity != *wire.declaration.identity()
+            || wire.scalar_kind != wire.declaration.scalar_kind()
+        {
+            return Err(serde::de::Error::custom(
+                "schema type identity and scalar kind must match their declaration",
+            ));
+        }
+        let declared_type = wire
+            .declaration
+            .scalar_kind()
+            .identified_type(wire.declaration.identity().clone());
+        let declaration = IdentifiedCustomTypeDeclaration::new(&declared_type)
+            .ok_or_else(|| serde::de::Error::custom("expected an identified scalar declaration"))?;
+        Ok(Self::from_declaration_with_owners(wire.owners, declaration))
+    }
 }
 
 impl OwnedTypeIdentity {
-    pub fn provider(
+    pub(crate) fn from_declaration(
+        owner: impl Into<String>,
+        declaration: IdentifiedCustomTypeDeclaration<'_>,
+    ) -> Self {
+        Self::from_declaration_with_owners(
+            NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider(owner.into())),
+            declaration,
+        )
+    }
+
+    fn from_declaration_with_owners(
+        owners: NonEmptySchemaTypeOwners,
+        declaration: IdentifiedCustomTypeDeclaration<'_>,
+    ) -> Self {
+        let identity = declaration.identity().clone();
+        let kind = declaration.scalar_kind();
+        let declaration = match kind {
+            RefinedScalarKind::String => IdentifiedScalarDeclaration::String(identity),
+            RefinedScalarKind::Int => IdentifiedScalarDeclaration::Int(identity),
+            RefinedScalarKind::Float => IdentifiedScalarDeclaration::Float(identity),
+        };
+        Self {
+            owners,
+            declaration,
+        }
+    }
+
+    pub(crate) fn with_merged_owners(&self, owners: NonEmptySchemaTypeOwners) -> Self {
+        Self {
+            owners,
+            declaration: self.declaration.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider(
         owner: impl Into<String>,
         identity: TypeIdentity,
         scalar_kind: RefinedScalarKind,
     ) -> Self {
-        Self {
-            owners: NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider(owner.into())),
-            identity,
-            scalar_kind,
-        }
+        let declared_type = scalar_kind.identified_type(identity);
+        Self::from_declaration(
+            owner,
+            IdentifiedCustomTypeDeclaration::new(&declared_type).unwrap(),
+        )
     }
 
-    pub fn with_owners(
+    #[cfg(test)]
+    pub(crate) fn with_owners(
         identity: TypeIdentity,
         owners: NonEmptySchemaTypeOwners,
         scalar_kind: RefinedScalarKind,
     ) -> Self {
-        Self {
+        let declared_type = scalar_kind.identified_type(identity);
+        Self::from_declaration_with_owners(
             owners,
-            identity,
-            scalar_kind,
-        }
+            IdentifiedCustomTypeDeclaration::new(&declared_type).unwrap(),
+        )
     }
 
     pub fn owners(&self) -> &NonEmptySchemaTypeOwners {
@@ -120,11 +239,11 @@ impl OwnedTypeIdentity {
     }
 
     pub fn identity(&self) -> &TypeIdentity {
-        &self.identity
+        self.declaration.identity()
     }
 
     pub fn scalar_kind(&self) -> RefinedScalarKind {
-        self.scalar_kind
+        self.declaration.scalar_kind()
     }
 
     /// Render the type's authored semantic name.
@@ -133,7 +252,7 @@ impl OwnedTypeIdentity {
     /// AWSCC-owned `aws.*` identity is still authored as `aws.*`; rendering
     /// the owner here would silently change the public type name.
     pub fn authored_name(&self) -> String {
-        self.identity.to_string()
+        self.identity().to_string()
     }
 
     /// Return whether this key's semantic identity is named by an authored
@@ -144,9 +263,9 @@ impl OwnedTypeIdentity {
         segments: &[String],
         kind: &str,
     ) -> bool {
-        self.identity.provider.as_deref() == Some(semantic_provider)
-            && self.identity.segments == segments
-            && self.identity.kind == kind
+        self.identity().provider.as_deref() == Some(semantic_provider)
+            && self.identity().segments == segments
+            && self.identity().kind == kind
     }
 }
 
@@ -159,15 +278,18 @@ impl OwnedTypeIdentity {
 pub struct IdentifiedCustomTypeDeclaration<'a> {
     declared_type: &'a AttributeType,
     identity: &'a TypeIdentity,
+    scalar_kind: RefinedScalarKind,
 }
 
 impl<'a> IdentifiedCustomTypeDeclaration<'a> {
     pub fn new(declared_type: &'a AttributeType) -> Option<Self> {
-        crate::provider::identified_custom_type_scalar_kind(declared_type).ok()?;
+        let scalar_kind =
+            crate::provider::identified_custom_type_scalar_kind(declared_type).ok()??;
         let identity = crate::provider::identified_custom_type_identity(declared_type)?;
         Some(Self {
             declared_type,
             identity,
+            scalar_kind,
         })
     }
 
@@ -177,6 +299,10 @@ impl<'a> IdentifiedCustomTypeDeclaration<'a> {
 
     pub fn identity(self) -> &'a TypeIdentity {
         self.identity
+    }
+
+    pub fn scalar_kind(self) -> RefinedScalarKind {
+        self.scalar_kind
     }
 }
 
