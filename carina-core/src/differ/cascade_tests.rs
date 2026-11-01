@@ -145,8 +145,9 @@ fn plan_for(
     );
     let plan_input_states =
         crate::resource::into_plan_input_current_map_from_states(current_states, &schemas, &[]);
+    let desired = crate::resource::plan_input_desired_resources(&resolved, &schemas);
     create_plan_with_cascades(
-        &resolved,
+        &desired,
         CascadeDependents::new(
             &unresolved,
             DeferredCreateTargets::partition_for_expansion(
@@ -760,8 +761,9 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         &schemas,
         &[],
     );
+    let desired = crate::resource::plan_input_desired_resources(&managed, &schemas);
     let plan = create_plan_with_cascades(
-        &managed,
+        &desired,
         CascadeDependents::new(
             &unresolved,
             DeferredCreateTargets::partition_for_expansion(
@@ -878,8 +880,9 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
             &schemas,
             &[],
         );
+        let desired = crate::resource::plan_input_desired_resources(&managed, &schemas);
         let plan = create_plan_with_cascades(
-            &managed,
+            &desired,
             CascadeDependents::new(
                 &unresolved,
                 DeferredCreateTargets::partition_for_expansion(
@@ -941,8 +944,9 @@ fn deferred_create_cbd_plan(
         &schemas,
         &[],
     );
+    let desired = crate::resource::plan_input_desired_resources(&managed, &schemas);
     let plan = create_plan_with_cascades(
-        &managed,
+        &desired,
         CascadeDependents::new(
             &unresolved,
             DeferredCreateTargets::partition_for_expansion(

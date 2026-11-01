@@ -764,11 +764,12 @@ impl UnresolvedSavedPlan {
             errors,
             abandoned_deposed,
         } = self;
+        let effects = effects
+            .into_iter()
+            .map(|effect| effect.resolve_with_schemas(schemas))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Plan {
-            effects: effects
-                .into_iter()
-                .map(|effect| effect.resolve_with_schemas(schemas))
-                .collect::<Result<Vec<_>, _>>()?,
+            effects,
             ignored_change_summaries,
             replace_display,
             permanent_name_overrides,

@@ -761,6 +761,48 @@ impl std::error::Error for DestroyDependencyAnalysisError {
     }
 }
 
+/// Failure to resolve the run-scoped base credentials before starting an
+/// AWS-kind provider guest.
+#[derive(Clone, Debug)]
+pub struct AwsCredentialStartupError {
+    source: carina_plugin_host::AwsCredentialError,
+}
+
+impl AwsCredentialStartupError {
+    pub(crate) fn new(source: carina_plugin_host::AwsCredentialError) -> Self {
+        Self { source }
+    }
+
+    /// Returns the typed host credential-source failure.
+    pub fn credential_error(&self) -> &carina_plugin_host::AwsCredentialError {
+        &self.source
+    }
+}
+
+impl std::fmt::Display for AwsCredentialStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Failed to resolve AWS credentials: {}",
+            self.source
+        )?;
+        if matches!(
+            self.source,
+            carina_plugin_host::AwsCredentialError::NotFound(_)
+        ) {
+            formatter.write_str(
+                "\nSet AWS_PROFILE (and run `aws sso login` for SSO), or set \
+                 AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (plus AWS_SESSION_TOKEN when needed).",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// Display is the terminal rendering surface because it adds the actionable
+// CLI hint. The typed source remains available through `credential_error()`.
+impl std::error::Error for AwsCredentialStartupError {}
+
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -882,6 +924,10 @@ pub enum AppError {
     /// Provider errors (AWS API failures, timeouts, etc.)
     #[error(transparent)]
     Provider(#[from] ProviderError),
+
+    /// Host-side AWS credential resolution failed before a guest started.
+    #[error(transparent)]
+    AwsCredentials(#[from] AwsCredentialStartupError),
 
     /// A resource's initialized provider and owner schema could not be paired
     /// for type-aware comparison.

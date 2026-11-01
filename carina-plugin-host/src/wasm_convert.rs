@@ -4557,21 +4557,21 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v13_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 13);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 13);
+    fn test_protocol_version_range_is_v14_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 14);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 14);
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_v12_provider() {
+    fn test_check_protocol_version_rejects_v13_provider() {
         let error = check_protocol_version(
-            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#,
+            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":13}"#,
         )
-        .expect_err("a v13 host must reject a v12 provider");
+        .expect_err("a v14 host must reject a v13 provider");
 
         assert!(error.contains("provider 'old'"));
-        assert!(error.contains("protocol version 12"));
-        assert!(error.contains("requires at least version 13"));
+        assert!(error.contains("protocol version 13"));
+        assert!(error.contains("requires at least version 14"));
     }
 
     #[test]

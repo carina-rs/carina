@@ -153,6 +153,39 @@ fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
 }
 
 #[test]
+fn resolved_ignore_changes_without_comparison_schema_does_not_panic() {
+    use crate::schema::AttributeSchema;
+
+    let schema = ResourceSchema::new("Widget")
+        .attribute(AttributeSchema::optional("function_version", AttributeType::string()).build());
+    let desired = Resource::with_provider("test", "Widget", "alias", None).with_attribute(
+        "function_version",
+        Value::Concrete(ConcreteValue::String("recorded".into())),
+    );
+    let (desired, registry) = resolved_ignored_resource(desired, schema, &["function_version"]);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "function_version".to_string(),
+            Value::Concrete(ConcreteValue::String("external".into())),
+        )]),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+
+    assert!(matches!(
+        diff(
+            &desired,
+            &current,
+            &saved,
+            None,
+            None,
+            &exact_comparison_context(),
+        ),
+        Diff::NoChange(_)
+    ));
+}
+
+#[test]
 fn ignored_readable_struct_leaf_does_not_hide_changed_sibling() {
     use crate::schema::{AttributeSchema, StructField};
 
@@ -992,8 +1025,8 @@ fn type_aware_struct_ignores_default_custom_type() {
 }
 
 #[test]
-fn type_aware_struct_ignores_default_nested_struct_empty() {
-    use crate::schema::StructField;
+fn plan_canonicalization_ignores_default_nested_struct_empty() {
+    use crate::schema::{AttributeSchema, StructField};
 
     let struct_type = AttributeType::struct_(
         "Outer".to_string(),
@@ -1010,14 +1043,13 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
         ],
     );
 
-    // Desired: only name specified
-    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+    let desired_value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("test".into())),
     )])));
 
     // Current: includes inner: {} as default
-    let current = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+    let current_value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("test".into())),
@@ -1028,15 +1060,190 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
         ),
     ])));
 
-    assert!(
-        type_aware_equal(
-            &desired,
-            &current,
-            Some(&struct_type),
-            crate::schema::empty_defs_for_schema_walks()
-        ),
-        "Struct with extra default nested Struct empty map should be considered equal"
+    let schema = ResourceSchema::new("Widget")
+        .attribute(AttributeSchema::optional("rule", struct_type).build());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("", schema.validate().expect("schema fixture must be valid"));
+    let desired = Resource::new("Widget", "example").with_attribute("rule", desired_value);
+    let id = desired.id.clone();
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(
+            id.clone(),
+            State::existing(
+                id.clone(),
+                HashMap::from([("rule".to_string(), current_value)]),
+            )
+            .with_identifier("example"),
+        )]),
+        &registry,
+        std::slice::from_ref(&desired),
     );
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &registry,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(plan.effects().is_empty(), "got {:#?}", plan.effects());
+}
+
+#[test]
+fn type_aware_zero_field_struct_marker_is_not_default_when_nested() {
+    use crate::schema::StructField;
+
+    let struct_type = AttributeType::struct_(
+        "Rule",
+        vec![StructField::optional("count", AttributeType::struct_("Count", Vec::new())).build()],
+    );
+    let missing = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let present = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "count".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+    )])));
+
+    assert!(
+        !type_aware_equal(
+            &present,
+            &missing,
+            Some(&struct_type),
+            crate::schema::empty_defs_for_schema_walks(),
+        ),
+        "a present zero-field struct marker must differ from an absent field"
+    );
+    assert!(
+        !type_aware_equal(
+            &missing,
+            &present,
+            Some(&struct_type),
+            crate::schema::empty_defs_for_schema_walks(),
+        ),
+        "an absent field must differ from a present zero-field struct marker"
+    );
+}
+
+#[test]
+fn plan_treats_empty_non_empty_struct_as_absent_but_marker_as_present() {
+    use crate::schema::{AttributeSchema, StructField};
+
+    let schema = ResourceSchema::new("Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![StructField::optional("label", AttributeType::string()).build()],
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("count", AttributeType::struct_("Count", Vec::new())).build(),
+        );
+    let mut registry = SchemaRegistry::new();
+    registry.insert("", schema.validate().expect("schema fixture must be valid"));
+    let empty_struct = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let plan_for = |desired: Resource, current_attributes: HashMap<String, Value>| {
+        let id = desired.id.clone();
+        let current = crate::resource::into_plan_input_current_map_from_states(
+            HashMap::from([(
+                id.clone(),
+                State::existing(id, current_attributes).with_identifier("example"),
+            )]),
+            &registry,
+            std::slice::from_ref(&desired),
+        );
+        create_plan(
+            &[desired],
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &current,
+            &HashMap::new(),
+            &registry,
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &Orphans::new(),
+            &[],
+        )
+    };
+
+    let config = Resource::new("Widget", "example").with_attribute("config", empty_struct());
+    let config_plan = plan_for(
+        config,
+        HashMap::from([("config".to_string(), empty_struct())]),
+    );
+    assert!(config_plan.effects().is_empty());
+
+    let marker = Resource::new("Widget", "example").with_attribute("count", empty_struct());
+    let marker_plan = plan_for(marker, HashMap::new());
+    assert!(matches!(marker_plan.effects(), [Effect::Update { .. }]));
+}
+
+#[test]
+fn top_level_non_empty_struct_transitions_to_and_from_empty_are_diffs() {
+    use crate::schema::{AttributeSchema, StructField};
+
+    let schema = ResourceSchema::new("Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![StructField::optional("label", AttributeType::string()).build()],
+            ),
+        )
+        .build(),
+    );
+    let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let non_empty = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "label".to_string(),
+        Value::Concrete(ConcreteValue::String("configured".into())),
+    )])));
+
+    let mut registry = SchemaRegistry::new();
+    registry.insert("", schema.validate().expect("schema fixture must be valid"));
+    let explicit = ExplicitFields::Struct {
+        children: HashMap::from([("config".to_string(), ExplicitFields::Leaf)]),
+    };
+    let plan_for = |desired_value: Value, current_value: Value| {
+        let desired = Resource::new("Widget", "example").with_attribute("config", desired_value);
+        let id = desired.id.clone();
+        let current = crate::resource::into_plan_input_current_map_from_states(
+            HashMap::from([(
+                id.clone(),
+                State::existing(
+                    id.clone(),
+                    HashMap::from([("config".to_string(), current_value)]),
+                )
+                .with_identifier("example"),
+            )]),
+            &registry,
+            std::slice::from_ref(&desired),
+        );
+        create_plan(
+            &[desired],
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &current,
+            &HashMap::new(),
+            &registry,
+            &empty_lifted_saved_attrs(),
+            &HashMap::from([(id, explicit.clone())]),
+            &Orphans::new(),
+            &[],
+        )
+    };
+
+    let to_empty = plan_for(empty.clone(), non_empty.clone());
+    assert!(matches!(to_empty.effects(), [Effect::Update { .. }]));
+
+    let from_empty = plan_for(non_empty, empty);
+    assert!(matches!(from_empty.effects(), [Effect::Update { .. }]));
 }
 
 #[test]

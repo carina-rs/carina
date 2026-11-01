@@ -1,0 +1,20 @@
+[package]
+name = "carina-credentials-aws"
+version.workspace = true
+publish.workspace = true
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+aws-config = "1"
+aws-credential-types = "1"
+carina-plugin-host = { path = "../carina-plugin-host" }
+log = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-native-certs = "0.8"
+tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+sha1 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }

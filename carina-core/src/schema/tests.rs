@@ -11112,7 +11112,11 @@ fn canonicalize_union_selects_the_struct_that_accepts_all_fields() {
         ("b", Value::Concrete(ConcreteValue::Int(1))),
     ]);
 
-    let canonicalized = Schema::flat(union).canonicalize_state(value);
+    let crate::value::CanonicalState::Present(canonicalized) =
+        Schema::flat(union).canonicalize_state(value)
+    else {
+        panic!("non-empty Union value must remain present");
+    };
     assert_eq!(
         canonicalized,
         union_map(vec![
@@ -11159,7 +11163,10 @@ fn canonicalize_union_ref_selects_the_struct_that_accepts_all_fields() {
         ("b", Value::Concrete(ConcreteValue::Int(1))),
     ]);
 
-    let canonicalized = schema.canonicalize_state(value);
+    let crate::value::CanonicalState::Present(canonicalized) = schema.canonicalize_state(value)
+    else {
+        panic!("non-empty Ref-to-Struct value must remain present");
+    };
     assert_eq!(
         canonicalized,
         union_map(vec![
@@ -12431,7 +12438,9 @@ fn validate_map_with_ref_enum_key_uses_supplied_defs() {
         root: map_type,
         defs,
     };
-    let Value::Concrete(ConcreteValue::Map(canonical)) = schema.canonicalize_state(value) else {
+    let crate::value::CanonicalState::Present(Value::Concrete(ConcreteValue::Map(canonical))) =
+        schema.canonicalize_state(value)
+    else {
         panic!("canonicalization must retain a map");
     };
     assert_eq!(

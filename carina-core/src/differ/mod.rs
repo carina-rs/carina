@@ -16,8 +16,9 @@ use crate::provider::{
     StateTransformMap,
 };
 use crate::resource::{
-    Current, Directives, PlanInputCurrent, PresentResourceState, ResolvedResource, Resource,
-    ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
+    CanonicalComparisonAttributes, Current, Directives, PlanInputCurrent, PlanInputDesired,
+    PresentResourceState, ResolvedResource, Resource, ResourceId, State, UnidentifiedState, Value,
+    into_plan_input_current_map,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
 
@@ -28,6 +29,40 @@ pub use plan::{
     CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice,
     block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades,
 };
+
+struct PlanInputSavedAttributes {
+    attributes: HashMap<ResourceId, CanonicalComparisonAttributes>,
+}
+
+impl PlanInputSavedAttributes {
+    fn new(saved: &LiftedSavedAttrs, registry: &SchemaRegistry) -> Self {
+        let attributes = saved
+            .resource_ids()
+            .filter_map(|id| {
+                let values = saved.get(id)?.clone();
+                let schema = registry
+                    .get(
+                        &id.provider,
+                        &id.resource_type,
+                        crate::schema::SchemaKind::Resource,
+                    )
+                    .map(|schema| schema.schema().as_schema());
+                let attributes = match schema {
+                    Some(schema) => CanonicalComparisonAttributes::canonicalize(values, schema),
+                    None => CanonicalComparisonAttributes::from_unschematized(
+                        crate::resource::UnschematizedComparisonAttributes::new(values),
+                    ),
+                };
+                Some((id.clone(), attributes))
+            })
+            .collect();
+        Self { attributes }
+    }
+
+    fn get(&self, id: &ResourceId) -> Option<&CanonicalComparisonAttributes> {
+        self.attributes.get(id)
+    }
+}
 
 /// Project the differ's managed-resource decision into the attribute
 /// definitiveness required by reference/coalesce resolution.
@@ -46,26 +81,34 @@ pub fn managed_binding_stability(
     provider: &ProviderRouter,
 ) -> ProviderResult<HashMap<ResourceId, ManagedBindingStability>> {
     let mut result = HashMap::new();
+    let comparison_saved = PlanInputSavedAttributes::new(saved_attrs, registry);
     for resource in managed {
-        let current = current_states
-            .get(&resource.id)
-            .map(PlanInputCurrent::current);
-        let Some(Current::Present(present)) = current else {
+        let Some(current) = current_states.get(&resource.id) else {
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;
         };
+        let Current::Present(present) = current.current() else {
+            result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
+            continue;
+        };
+        let current_attributes = current.comparison_attributes();
         let resolved_comparison = provider.comparison_for(registry, &resource.id)?;
         let owner_schema = resolved_comparison.owner_schema();
         let context = resolved_comparison.context();
         let schema = owner_schema.schema();
+        let desired = PlanInputDesired::with_resource_schema(resource, Some(schema.as_schema()));
         let changed_attributes = match diff_present_with_releases(
-            resource,
+            &desired,
             present,
-            saved_attrs.get(&resource.id),
-            saved_attrs.nested_write_only(&resource.id),
-            prev_explicit.get(&resource.id),
+            ExistingComparisonInputs {
+                current_attributes,
+                saved: comparison_saved.get(&resource.id),
+                nested_write_only: saved_attrs.nested_write_only(&resource.id),
+                prev_explicit: prev_explicit.get(&resource.id),
+                schema: Some(schema.as_schema()),
+                context,
+            },
             schema,
-            context,
         )
         .diff
         {
@@ -1028,9 +1071,9 @@ fn key_field_was_authored(record: &crate::explicit::ExplicitFields, key_field: &
 }
 
 fn find_keyed_partial_update_releases(
-    desired: &HashMap<String, Value>,
-    current: &HashMap<String, Value>,
-    saved: Option<&HashMap<String, Value>>,
+    desired: &CanonicalComparisonAttributes,
+    current: &CanonicalComparisonAttributes,
+    saved: Option<&CanonicalComparisonAttributes>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: &ValidatedResourceSchema,
 ) -> Vec<PlannedListKeyRelease> {
@@ -1114,40 +1157,39 @@ fn filter_explicit_list_elements(
     });
 }
 
+#[derive(Clone, Copy)]
+struct ExistingComparisonInputs<'a, 'context> {
+    current_attributes: &'a CanonicalComparisonAttributes,
+    saved: Option<&'a CanonicalComparisonAttributes>,
+    nested_write_only: &'a NestedWriteOnlyRecord,
+    prev_explicit: Option<&'a crate::explicit::ExplicitFields>,
+    schema: Option<&'a ResourceSchema>,
+    context: &'a ComparisonContext<'context>,
+}
+
 fn diff_present_with_releases(
-    desired: &ResolvedResource,
+    desired: &PlanInputDesired<'_>,
     current: &PresentResourceState,
-    saved: Option<&HashMap<String, Value>>,
-    nested_write_only: &NestedWriteOnlyRecord,
-    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    inputs: ExistingComparisonInputs<'_, '_>,
     schema: &ValidatedResourceSchema,
-    context: &ComparisonContext<'_>,
 ) -> PresentDiffResult {
     let releases = find_keyed_partial_update_releases(
-        &desired.resolved_attributes(),
-        &current.state().attributes,
-        saved,
-        prev_explicit,
+        desired.comparison_attributes(),
+        inputs.current_attributes,
+        inputs.saved,
+        inputs.prev_explicit,
         schema,
     );
     if releases.is_empty() {
         return PresentDiffResult {
-            diff: diff_present(
-                desired,
-                current,
-                saved,
-                nested_write_only,
-                prev_explicit,
-                Some(schema.as_schema()),
-                context,
-            ),
+            diff: diff_present(desired, current, inputs),
             releases,
         };
     }
 
-    let mut filtered_current = current.state().clone();
-    let mut filtered_saved = saved.cloned();
-    let mut filtered_explicit = prev_explicit.cloned();
+    let mut filtered_current = inputs.current_attributes.clone();
+    let mut filtered_saved = inputs.saved.cloned();
+    let mut filtered_explicit = inputs.prev_explicit.cloned();
     for release in &releases {
         let attribute = schema
             .effective_attribute(&release.attribute)
@@ -1159,7 +1201,7 @@ fn diff_present_with_releases(
             .iter()
             .map(ReleasedListKey::key)
             .collect::<HashSet<_>>();
-        if let Some(value) = filtered_current.attributes.get_mut(&release.attribute) {
+        if let Some(value) = filtered_current.get_mut(&release.attribute) {
             remove_keys_from_list(value, key_field, &released);
         }
         if let (Some(saved), Some(crate::explicit::ExplicitFields::Struct { children })) =
@@ -1181,12 +1223,13 @@ fn diff_present_with_releases(
 
     let mut diff = diff_existing_state(
         desired,
-        &filtered_current,
-        filtered_saved.as_ref(),
-        nested_write_only,
-        filtered_explicit.as_ref(),
-        Some(schema.as_schema()),
-        context,
+        current.state(),
+        ExistingComparisonInputs {
+            current_attributes: &filtered_current,
+            saved: filtered_saved.as_ref(),
+            prev_explicit: filtered_explicit.as_ref(),
+            ..inputs
+        },
     );
     if let PresentDiff::Update { from, .. } = &mut diff {
         // Filtering exists only to answer whether omission itself is a
@@ -1198,45 +1241,30 @@ fn diff_present_with_releases(
 }
 
 fn diff_present(
-    desired: &ResolvedResource,
+    desired: &PlanInputDesired<'_>,
     current: &PresentResourceState,
-    saved: Option<&HashMap<String, Value>>,
-    nested_write_only: &NestedWriteOnlyRecord,
-    prev_explicit: Option<&crate::explicit::ExplicitFields>,
-    schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
+    inputs: ExistingComparisonInputs<'_, '_>,
 ) -> PresentDiff {
-    diff_existing_state(
-        desired,
-        current.state(),
-        saved,
-        nested_write_only,
-        prev_explicit,
-        schema,
-        context,
-    )
+    diff_existing_state(desired, current.state(), inputs)
 }
 
 fn diff_existing_state(
-    desired: &ResolvedResource,
+    desired: &PlanInputDesired<'_>,
     current: &State,
-    saved: Option<&HashMap<String, Value>>,
-    nested_write_only: &NestedWriteOnlyRecord,
-    prev_explicit: Option<&crate::explicit::ExplicitFields>,
-    schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
+    inputs: ExistingComparisonInputs<'_, '_>,
 ) -> PresentDiff {
+    let authored = desired.authored();
     let changes = comparison::find_changed_attributes_with_ignores(
         comparison::AttributeValueViews::new(
-            &desired.resolved_attributes(),
-            &current.attributes,
-            saved,
-            nested_write_only,
+            desired.comparison_attributes(),
+            inputs.current_attributes,
+            inputs.saved,
+            inputs.nested_write_only,
         ),
-        prev_explicit,
-        schema,
-        desired.ignore_changes(),
-        context,
+        inputs.prev_explicit,
+        inputs.schema,
+        authored.ignore_changes(),
+        inputs.context,
     );
 
     if changes.changed.is_empty() {
@@ -1245,9 +1273,9 @@ fn diff_existing_state(
         }
     } else {
         PresentDiff::Update {
-            id: desired.id.clone(),
+            id: authored.id.clone(),
             from: Box::new(current.clone()),
-            to: Box::new(desired.as_resource().clone()),
+            to: Box::new(authored.as_resource().clone()),
             changed_attributes: changes.changed,
             ignored_readable_differences: changes.ignored_readable_differences,
         }
@@ -1302,38 +1330,47 @@ pub fn diff(
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
 ) -> Diff {
+    let current_attributes = match schema {
+        Some(schema) => {
+            CanonicalComparisonAttributes::canonicalize(current.attributes.clone(), schema)
+        }
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(current.attributes.clone()),
+        ),
+    };
+    let saved = saved_attrs
+        .get(&desired.id)
+        .cloned()
+        .map(|saved| match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(saved, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                crate::resource::UnschematizedComparisonAttributes::new(saved),
+            ),
+        });
     diff_with_saved_parts(
         desired,
         current,
-        saved_attrs.get(&desired.id),
-        saved_attrs.nested_write_only(&desired.id),
-        prev_explicit,
-        schema,
-        context,
+        ExistingComparisonInputs {
+            current_attributes: &current_attributes,
+            saved: saved.as_ref(),
+            nested_write_only: saved_attrs.nested_write_only(&desired.id),
+            prev_explicit,
+            schema,
+            context,
+        },
     )
 }
 
 fn diff_with_saved_parts(
     desired: &ResolvedResource,
     current: &State,
-    saved: Option<&HashMap<String, Value>>,
-    nested_write_only: &NestedWriteOnlyRecord,
-    prev_explicit: Option<&crate::explicit::ExplicitFields>,
-    schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
+    inputs: ExistingComparisonInputs<'_, '_>,
 ) -> Diff {
     if !current.exists {
         return Diff::Create(desired.as_resource().clone());
     }
-    match diff_existing_state(
-        desired,
-        current,
-        saved,
-        nested_write_only,
-        prev_explicit,
-        schema,
-        context,
-    ) {
+    let comparison_desired = PlanInputDesired::with_resource_schema(desired, inputs.schema);
+    match diff_existing_state(&comparison_desired, current, inputs) {
         PresentDiff::Update {
             id,
             from,
@@ -1359,14 +1396,31 @@ pub(crate) fn diff_test(
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
 ) -> Diff {
+    let current_attributes = match schema {
+        Some(schema) => {
+            CanonicalComparisonAttributes::canonicalize(current.attributes.clone(), schema)
+        }
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(current.attributes.clone()),
+        ),
+    };
+    let saved = saved.cloned().map(|saved| match schema {
+        Some(schema) => CanonicalComparisonAttributes::canonicalize(saved, schema),
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(saved),
+        ),
+    });
     diff_with_saved_parts(
         &ResolvedResource::new(desired.clone()),
         current,
-        saved,
-        &NestedWriteOnlyRecord::new(),
-        prev_explicit,
-        schema,
-        context,
+        ExistingComparisonInputs {
+            current_attributes: &current_attributes,
+            saved: saved.as_ref(),
+            nested_write_only: &NestedWriteOnlyRecord::new(),
+            prev_explicit,
+            schema,
+            context,
+        },
     )
 }
 

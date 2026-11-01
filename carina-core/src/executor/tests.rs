@@ -8974,8 +8974,9 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &schemas,
         managed.iter().map(|resource| &resource.id),
     );
+    let desired = crate::resource::plan_input_desired_resources(&managed, &schemas);
     let plan = create_plan_with_cascades(
-        &managed,
+        &desired,
         CascadeDependents::new(
             &unresolved,
             DeferredCreateTargets::partition_for_expansion(

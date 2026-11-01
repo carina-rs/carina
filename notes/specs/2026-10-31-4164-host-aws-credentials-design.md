@@ -137,9 +137,13 @@ carina-core is not touched. The kind partition and the factory both live
 in carina-plugin-host, so core has nothing to hold.
 
 A new crate, `carina-credentials-aws`, implements `AwsCredentialSource`
-over `aws_config`'s default chain (with SSO) and an identity cache. It
-keeps one `SharedCredentialsProvider` for the run and answers each
-`current()` from the cache, refreshing near expiry. carina-cli depends on
+over `aws_config`'s default chain (with SSO). It keeps one
+`SharedCredentialsProvider` for the run and its own cache of the last
+credentials. Each `current()` is answered from that cache and fetches again
+within five minutes of expiry. If that fetch fails while the cached
+credentials are still valid, it returns the cached ones; it fails only
+after they have expired. Every SDK load and fetch runs under a timeout, so
+an unreachable IMDS cannot stall a run. carina-cli depends on
 it and binds it to the AWS kind (D5). Neither carina-core nor
 carina-plugin-host depends on it.
 
@@ -208,7 +212,7 @@ as today.
 There are two expiry clocks, and each side owns one:
 
 - **Base credentials** (SSO role credentials, env keys, ECS/IMDS) belong
-  to the host. The host's identity cache refreshes them near expiry, using
+  to the host. The host's credential cache refreshes them near expiry, using
   the SSO token cache for SSO. The host never starts an interactive
   login: no browser, no device-code prompt, and no `aws sso login`
   subprocess. It only reads the token cache and refreshes the token with
@@ -272,9 +276,10 @@ today. Sharing it with this source is outside this issue.
 
 ### D6. Protocol
 
-This is a WIT change. The protocol moves to the version after #4168's
-(planned v14 → this is v15), and `MIN_SUPPORTED_PROTOCOL_VERSION` moves
-with it. There is no compatibility shim, per project policy. The order is
+This is a WIT change. Several PRs (#4162, #4168, this one) bump the
+protocol at about the same time, so the number is not fixed in advance:
+it is main's version plus one at the time this PR merges, and
+`MIN_SUPPORTED_PROTOCOL_VERSION` moves with it. There is no compatibility shim, per project policy. The order is
 plugin-wit → carina → aws → awscc, coordinated with the orchestrator,
 together with the egress declarations already in flight.
 

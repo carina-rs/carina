@@ -27,8 +27,9 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, 
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
-    CompositionSourceIdentityResolver, Current, DataSource, ModuleSource, ResolvedResource,
-    Resource, ResourceId, SavedDataSource, SavedModuleSource, State, Value,
+    CanonicalComparisonAttributes, CompositionSourceIdentityResolver, Current, DataSource,
+    ModuleSource, ResolvedResource, Resource, ResourceId, SavedDataSource, SavedModuleSource,
+    State, Value,
 };
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
@@ -1328,9 +1329,19 @@ pub(crate) async fn detect_drift<S: Clone>(
                         &actual_state.attributes,
                     );
                 verified_planned_states.insert(resource.id.clone(), verified_planned.clone());
+                let validated_schema = typed_comparison.owner_schema().schema();
+                let schema = validated_schema.as_schema();
+                let planned_comparison = CanonicalComparisonAttributes::canonicalize(
+                    verified_planned.attributes.clone(),
+                    schema,
+                );
+                let actual_comparison = CanonicalComparisonAttributes::canonicalize(
+                    actual_state.attributes.clone(),
+                    schema,
+                );
                 // Compare attributes for existing resources
                 let mut attr_diffs: Vec<String> = Vec::new();
-                for (key, planned_val) in &verified_planned.attributes {
+                for (key, planned_val) in &planned_comparison {
                     let historical_shape = planned_state
                         .and_then(|state| state.attributes.get(key))
                         .unwrap_or(planned_val);
@@ -1338,7 +1349,7 @@ pub(crate) async fn detect_drift<S: Clone>(
                         planned_val,
                         historical_shape,
                     );
-                    match actual_state.attributes.get(key) {
+                    match actual_comparison.get(key) {
                         Some(actual_val) if secret_drift.contains(key) => {
                             let masked = carina_core::value::mask_plaintext_using_secret_shape(
                                 actual_val,
@@ -1355,7 +1366,7 @@ pub(crate) async fn detect_drift<S: Clone>(
                             if !carina_core::diff_helpers::resource_attribute_values_equal(
                                 actual_val,
                                 planned_val,
-                                Some(typed_comparison.owner_schema().schema()),
+                                Some(validated_schema),
                                 key,
                                 typed_comparison.context(),
                             ) =>
@@ -1381,8 +1392,8 @@ pub(crate) async fn detect_drift<S: Clone>(
                         _ => {}
                     }
                 }
-                for (key, actual_val) in &actual_state.attributes {
-                    if !planned.attributes.contains_key(key) {
+                for (key, actual_val) in &actual_comparison {
+                    if !planned_comparison.contains_key(key) {
                         attr_diffs.push(format!(
                             "      {}: (none) → {}",
                             key,

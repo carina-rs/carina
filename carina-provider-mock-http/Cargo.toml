@@ -9,6 +9,14 @@ license = "MIT"
 name = "carina-provider-mock-http"
 path = "src/main.rs"
 
+[[bin]]
+name = "carina-provider-mock-http-aws"
+path = "src/aws.rs"
+
+[[bin]]
+name = "carina-provider-mock-http-aws-unused"
+path = "src/aws_unused.rs"
+
 [dependencies]
 carina-plugin-sdk = { path = "../carina-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
@@ -18,4 +26,4 @@ aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x", "test
 futures = "0.3"
 serde_json = "1"
 wasi = "0.14"
-wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }
+wit-bindgen = { workspace = true }
