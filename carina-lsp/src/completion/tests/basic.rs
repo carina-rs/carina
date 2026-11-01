@@ -184,6 +184,90 @@ web_tier {
 }
 
 #[test]
+fn module_handle_output_dot_completion_uses_local_and_forwarded_resource_types() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("compute.Instance")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("arn", AttributeType::string()).build())
+            .validate()
+            .expect("instance schema fixture"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::optional("direct", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("forwarded", AttributeType::string()).build())
+            .validate()
+            .expect("consumer schema fixture"),
+    );
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["mock".to_string()], vec![], vec![]);
+
+    let fixture = tempfile::tempdir().expect("module handle completion fixture");
+    let local = fixture.path().join("local");
+    let relay = fixture.path().join("relay");
+    std::fs::create_dir(&local).expect("create local module");
+    std::fs::create_dir(&relay).expect("create relay module");
+    std::fs::write(
+        local.join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"local\" }\n",
+    )
+    .expect("write local resource");
+    std::fs::write(
+        local.join("attributes.crn"),
+        "attributes {\n  r = instance\n}\n",
+    )
+    .expect("write local handle output");
+    std::fs::write(
+        relay.join("arguments.crn"),
+        "arguments {\n  x: mock.compute.Instance\n}\n",
+    )
+    .expect("write relay argument");
+    std::fs::write(relay.join("attributes.crn"), "attributes {\n  r = x\n}\n")
+        .expect("write forwarded handle output");
+
+    let source = r#"let local_module = use { source = "./local" }
+let relay_module = use { source = "./relay" }
+let local = local_module {}
+let source = mock.compute.Instance { name = "source" }
+let relay = relay_module { x = source }
+
+mock.test.Consumer {
+  direct = local.r.
+  forwarded = relay.r.
+}
+"#;
+    std::fs::write(fixture.path().join("main.crn"), source).expect("write root fixture");
+    let document = create_document(source);
+
+    for (line, prefix, expected_prefix) in [
+        (7, "  direct = local.r.", "local.r"),
+        (8, "  forwarded = relay.r.", "relay.r"),
+    ] {
+        let completions = provider.complete(
+            &document,
+            Position::new(line, prefix.chars().count() as u32),
+            Some(fixture.path()),
+        );
+        let labels = completions
+            .iter()
+            .map(|completion| completion.label.as_str())
+            .collect::<Vec<_>>();
+        for attribute in ["name", "arn"] {
+            let label = format!("{expected_prefix}.{attribute}");
+            assert!(
+                labels.contains(&label.as_str()),
+                "expected {label} after {prefix:?}, got: {labels:?}",
+            );
+        }
+    }
+}
+
+#[test]
 fn module_parameter_completion_for_let_binding_module_call() {
     // Regression test for #2423: inside `let <name> = <module> { <CURSOR> }`,
     // completion must surface the module's parameters (from `exports.crn` /

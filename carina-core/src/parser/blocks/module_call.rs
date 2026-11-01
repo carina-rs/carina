@@ -57,7 +57,7 @@ pub(crate) fn parse_module_call(
                 continue;
             }
             let argument = match &eval {
-                crate::eval_value::EvalValue::StructuralHandle(handle) => {
+                crate::eval_value::EvalValue::UnexpandedStructuralHandle(handle) => {
                     ModuleArgument::from_handle(handle.clone())
                 }
                 _ => {

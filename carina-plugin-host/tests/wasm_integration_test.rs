@@ -5235,7 +5235,7 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
         )))),
     );
     let diff = carina_core::differ::diff(
-        &ResolvedResource::new(desired),
+        &ResolvedResource::new(desired.into_value_snapshot()),
         &states[&id],
         &saved_attrs,
         None,

@@ -118,13 +118,18 @@ pub(crate) fn managed_current_from_states(
 }
 
 #[cfg(test)]
-pub(crate) fn plan_input_current_from_states(
+pub(crate) fn plan_input_current_from_states<D>(
     states: std::collections::HashMap<
         carina_core::resource::ResourceId,
         carina_core::resource::State,
     >,
     schemas: &carina_core::schema::SchemaRegistry,
-    resources: &[carina_core::resource::Resource],
+    resources: &[carina_core::resource::Resource<
+        carina_core::resource::ModuleSource,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >],
 ) -> std::collections::HashMap<
     carina_core::resource::ResourceId,
     carina_core::resource::PlanInputCurrent,
@@ -564,5 +569,58 @@ impl DetailLevel {
             DetailLevel::Explicit => carina_core::detail_rows::DetailLevel::Explicit,
             DetailLevel::None => carina_core::detail_rows::DetailLevel::NamesOnly,
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use carina_core::{
+        effect::{DeferredCreatePayload, DeferredReplacePayload, NonEmptyDeletes},
+        parser::{ExpandedDeferredForExpression, ExpandedParsedFile},
+        resource::{PersistedDestroyDependencies, ResolvedResourceId, Resource},
+    };
+    pub fn compiled_loop(template: Box<ExpandedDeferredForExpression>) -> DeferredCreatePayload {
+        let mut configuration = ExpandedParsedFile::default();
+        configuration.upstream_states = ["orgs", "upstream"]
+            .into_iter()
+            .map(|binding| carina_core::parser::UpstreamState {
+                binding: super::absolute_binding_for_test(binding),
+                source: "upstream".into(),
+            })
+            .collect();
+        configuration.resources = ["cert", "parent", "primary", "fallback"]
+            .into_iter()
+            .map(|binding| {
+                Resource::with_provider("mock", "test.resource", binding, None)
+                    .with_absolute_binding(super::absolute_binding_for_test(binding))
+            })
+            .collect();
+        let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
+            .expect("fixture graph");
+        let (template, dependency_template) = graph
+            .compile_deferred_for(*template)
+            .expect("fixture loop dependencies");
+        DeferredCreatePayload::new(Box::new(template), dependency_template)
+    }
+    pub fn compiled_replace(
+        deletes: NonEmptyDeletes,
+        template: Box<ExpandedDeferredForExpression>,
+    ) -> DeferredReplacePayload {
+        let payload = compiled_loop(template);
+        DeferredReplacePayload {
+            deletes,
+            template: payload.template,
+            dependency_template: payload.dependency_template,
+        }
+    }
+    pub fn persisted(
+        rows: impl IntoIterator<Item = ResolvedResourceId>,
+    ) -> PersistedDestroyDependencies {
+        PersistedDestroyDependencies::from_test_dependencies(rows)
+    }
+    pub fn resolved(resource: Resource) -> carina_core::resource::ResolvedResource {
+        carina_core::resource::ResolvedResource::collect_resolved([resource])
+            .expect("fixture graph resolves")
+            .remove(0)
     }
 }

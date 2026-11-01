@@ -469,7 +469,7 @@ fn render_identity_literal(identity: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::path::Path;
 
     use carina_core::effect::{Effect, EffectGeneration};
@@ -494,6 +494,12 @@ mod tests {
     const RESOURCE_TYPE: &str = "ec2.Vpc";
     const CREATE_ONLY_ATTRIBUTE: &str = "cidr_block";
     const CIDR: &str = "10.0.0.0/16";
+
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
+    }
 
     fn detect_moved_block_hints<S>(
         plan: &Plan<S>,
@@ -563,16 +569,16 @@ mod tests {
             generation,
             directives: Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
     }
 
     fn add_create(plan: &mut Plan, resource_id: ResolvedResourceId, value: Value) {
         let resource = Resource::from_id(resource_id.into_inner())
             .with_attribute(CREATE_ONLY_ATTRIBUTE, value);
-        plan.add(Effect::Create(ResolvedResource::new(resource)));
+        plan.add(Effect::Create(resolved(resource)));
     }
 
     fn hint_addresses(hints: &[MovedBlockHint]) -> (Vec<String>, Vec<String>) {
@@ -741,7 +747,7 @@ mod tests {
                 "type",
                 Value::Concrete(ConcreteValue::CanonicalEnum(canonical)),
             );
-        plan.add(Effect::Create(ResolvedResource::new(desired)));
+        plan.add(Effect::Create(resolved(desired)));
 
         let schema = ResourceSchema::new(RESOURCE_TYPE)
             .attribute(
@@ -790,7 +796,7 @@ mod tests {
                 concrete_string("zone-a"),
             ])),
         );
-        plan.add(Effect::Create(ResolvedResource::new(desired)));
+        plan.add(Effect::Create(resolved(desired)));
 
         let schema = ResourceSchema::new(RESOURCE_TYPE)
             .attribute(
@@ -835,7 +841,7 @@ mod tests {
         let desired = Resource::from_id(id("vpcs[0]", None).into_inner())
             .with_attribute(CREATE_ONLY_ATTRIBUTE, concrete_string(CIDR))
             .with_attribute("name", concrete_string("new-provider-name"));
-        plan.add(Effect::Create(ResolvedResource::new(desired)));
+        plan.add(Effect::Create(resolved(desired)));
 
         let schema = ResourceSchema::new(RESOURCE_TYPE)
             .attribute(
@@ -878,7 +884,7 @@ mod tests {
         prior_attributes.insert("name".to_string(), concrete_string("record.example.com"));
         let desired = Resource::from_id(id("records[0]", None).into_inner())
             .with_attribute("name", concrete_string("record.example.com"));
-        plan.add(Effect::Create(ResolvedResource::new(desired)));
+        plan.add(Effect::Create(resolved(desired)));
 
         let schema = ResourceSchema::new(RESOURCE_TYPE)
             .attribute(

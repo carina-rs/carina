@@ -97,8 +97,9 @@ fn resolved_ignored_resource(
         resource.id.provider.clone(),
         schema.validate().expect("ignore_changes schema is valid"),
     );
-    let resource = ResolvedResource::resolve_with_schemas(resource, &registry)
-        .expect("ignore_changes path resolves");
+    let resource =
+        ResolvedResource::resolve_with_schemas(resource.with_dependency_phase(()), &registry)
+            .expect("ignore_changes path resolves");
     (resource, registry)
 }
 

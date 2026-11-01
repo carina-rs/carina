@@ -7,6 +7,8 @@ mod blocks;
 mod config;
 mod context;
 mod deferred_if;
+mod dependencies;
+pub use dependencies::{UnexpandedDependencies, UnexpandedDependencyOperand};
 mod entry;
 mod error;
 mod expressions;
@@ -51,17 +53,17 @@ pub(crate) type ParserValidationBlock =
 pub(crate) type ParserRequireBlock =
     ast::RequireBlock<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
 
-pub use crate::eval_value::StructuralHandleKind;
+pub use crate::eval_value::{UnexpandedResourceHandle, UnexpandedStructuralHandleKind};
 pub use crate::resource::RelativeBindingName;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingScopeId,
-    BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, CallExpansion,
-    ConsumerArgumentParameter, ConsumerAttributeParameter, DeferredForBody,
-    DeferredForExpansionError, DeferredForExpression, DeferredForPhaseTraversal, DeferredForSite,
-    DeferredForTarget, DeferredForTemplateAddress, DeferredForTemplateResource,
-    ExpandedBackendConfig, ExpandedDeferredForExpression, ExpandedFile,
-    ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedExportParam,
+    BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, BoundaryExpression,
+    CallExpansion, CompiledDeferredForExpression, ConsumerArgumentParameter,
+    ConsumerAttributeParameter, DeferredForBody, DeferredForExpansionError, DeferredForExpression,
+    DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, DeferredForTemplateAddress,
+    DeferredForTemplateResource, ExpandedBackendConfig, ExpandedDeferredForExpression,
+    ExpandedFile, ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedExportParam,
     ExpandedParsedFile, ExpandedProviderConfig, ExpandedStateBlock, ExpandedUpstreamState,
     ExpansionKey, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
     InferredFile, IntoExpandedExportParam, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource,
@@ -78,8 +80,8 @@ pub use ast::{
     ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub(crate) use ast::{
-    BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
-    ParsedDeferredForIterableState, ParsedDeferredForParts,
+    BareBindingSource, DeclarationSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
+    ParsedDeferredForIterableState, ParsedDeferredForParts, UnexpandedCompositionAttribute,
 };
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{

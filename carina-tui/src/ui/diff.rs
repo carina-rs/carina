@@ -363,7 +363,8 @@ mod tests {
                 .with_identifier("example-id"),
             ),
             to: ResolvedResource::new(
-                Resource::new("test.Widget", "example").with_attribute("value", new),
+                (Resource::new("test.Widget", "example").with_attribute("value", new))
+                    .into_value_snapshot(),
             ),
             changed_attributes: vec!["value".to_string()],
         };

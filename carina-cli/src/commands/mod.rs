@@ -602,6 +602,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // below runs this same typed resolver over every imported module.
     let mut root_type_resolution_findings = Vec::new();
     let type_resolution = parsed.resolve_type_exprs_report(enriched_context);
+    let resolved_argument_types = type_resolution.resolved_argument_types().clone();
     for diagnostic in type_resolution.into_diagnostics() {
         match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
             Ok(finding) => root_type_resolution_findings.push(finding),
@@ -711,6 +712,15 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // collect concrete constraint outcomes before all typed findings are
     // merged below.
     if !errors.is_empty() {
+        // Dependency diagnostics are independent of unrelated argument-type
+        // failures. The per-argument report preserves every sound result even
+        // when expansion cannot proceed to the final graph check.
+        if !skip_resource_validation {
+            errors.extend(validate_depends_on_with_ctx(
+                parsed.parsed(),
+                &resolved_argument_types,
+            ));
+        }
         extend_module_call_errors(&mut errors, authored_module_call_findings);
         return Err(non_empty_validation_failure(errors));
     }
@@ -858,9 +868,25 @@ pub(crate) fn validate_and_resolve_errors_inner(
         )
     };
 
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(
+        parsed,
+        ctx.schemas(),
+        &upstream_exports,
+        &imported_module_signatures,
+    );
+    if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
+        &parsed.export_params,
+        &bindings,
+    ) {
+        errors.extend(ref_errors.into_iter().map(AppError::from));
+    }
+
     if !skip_resource_validation {
         errors.extend(validate_resources_with_ctx(ctx, parsed, enriched_context));
-        errors.extend(validate_depends_on_with_ctx(parsed));
+        errors.extend(validate_depends_on_with_ctx(
+            parsed,
+            &resolved_argument_types,
+        ));
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
         errors.extend(
@@ -875,12 +901,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
             &parsed.export_params,
             &export_value_bindings,
             enriched_context,
-        );
-        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(
-            parsed,
-            ctx.schemas(),
-            &upstream_exports,
-            &imported_module_signatures,
         );
         // Expansion-only boundary checks consume the final composition graph
         // without reloading the authored module walk.
@@ -916,12 +936,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
             errors.extend(split_validation_message(&message));
         }
         if let Err(msg) = checked_export_values {
-            errors.extend(split_validation_message(&msg));
-        }
-        if let Err(msg) = carina_core::validation::validate_export_param_ref_types_with_bindings(
-            &parsed.export_params,
-            &bindings,
-        ) {
             errors.extend(split_validation_message(&msg));
         }
         if !errors.is_empty() {

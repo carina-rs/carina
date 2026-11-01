@@ -186,6 +186,22 @@ each deferred-for template so apply-time failures retain their source location.
 Absolute diagnostic paths are not persisted. Format 36 and older plans must
 be regenerated; there is no saved-plan backward compatibility.
 
+Saved-plan format 38 stores complete resolved dependency addresses,
+graph-projected managed-row destroy dependencies, and the exact legacy
+dependency migration classification approved during planning. Saved-plan apply
+replays that classification against locked legacy state before any write.
+Deferred effects carry compiled dependency templates; live module handles are
+consumed before saved compositions are encoded. Older plans must be regenerated
+with `carina plan --out`.
+
+State format 21 stores current and deposed dependencies and persisted
+`depends_on` directives as complete managed resource addresses. Pre-v21 state
+must pass configuration-aware legacy classification, warning reporting, and
+strict graph validation before it can be written as v21. Source-less inspection
+leaves that migration pending. `carina state migrate --check` checks a local
+state file offline without rewriting it; unresolved deferred loops report the
+reads required to classify their rows.
+
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
 validates and preserves that continuation through the same typestate path as

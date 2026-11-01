@@ -1,5 +1,6 @@
 //! Semantic checks: provider region, module calls, unused bindings, undefined references.
 
+use carina_core::parser::ExportParamLike;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -401,7 +402,9 @@ impl SemanticLookup for AttributeParameter {
     }
 
     fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
+        self.value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::value)
     }
 }
 
@@ -426,7 +429,9 @@ impl SemanticLookup for ParsedExportParam {
     }
 
     fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
+        self.value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::value)
     }
 }
 
@@ -2353,7 +2358,11 @@ impl DiagnosticEngine {
             .collect::<Vec<_>>();
 
         for attr_param in &parsed.attribute_params {
-            if let Some(value) = &attr_param.value {
+            if let Some(value) = attr_param
+                .value
+                .as_ref()
+                .and_then(carina_core::parser::BoundaryExpression::value)
+            {
                 // Check for undefined binding references in parser-native shapes
                 // (`Value::Deferred(DeferredValue::ResourceRef)` for `name.attr`, `Value::Deferred(DeferredValue::BindingRef)`
                 // for bare `name`, since #2847).
@@ -2591,7 +2600,9 @@ impl DiagnosticEngine {
                                 continue;
                             };
                             fallback = param.clone();
-                            fallback.value = Some(value.clone());
+                            fallback.value = Some(carina_core::parser::BoundaryExpression::Value(
+                                value.clone(),
+                            ));
                             &fallback
                         }
                     };
@@ -2719,24 +2730,39 @@ impl DiagnosticEngine {
         } else {
             self.infer_export_params_without_loaded_provider_schemas(inference_input)
         };
+        let mut boundary_export_params = inferred_export_params.parameters().to_vec();
+        for parameter in &mut boundary_export_params {
+            let Some(type_expr) = parameter.type_expr_opt_mut() else {
+                continue;
+            };
+            if let Ok(resolved) =
+                carina_core::validation::resolve_type_expr(type_expr, &self.provider_context)
+            {
+                *type_expr = resolved;
+            }
+        }
         let export_bindings =
             carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
         if let Err(ref_errors) =
             carina_core::validation::validate_export_param_ref_types_with_bindings(
-                inferred_export_params.parameters(),
+                &boundary_export_params,
                 &export_bindings,
             )
         {
-            for error_msg in ref_errors.split('\n') {
-                if let Some((line, col)) = self.find_ref_error_position(doc, error_msg) {
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        col,
-                        col + 1,
-                        DiagnosticSeverity::WARNING,
-                        error_msg.to_string(),
-                    ));
+            for error in ref_errors {
+                if error.source_file() != doc.source_file() {
+                    continue;
                 }
+                let span = error.source_span();
+                let line = span.start_line().saturating_sub(1) as u32;
+                let col = span.start_column().saturating_sub(1) as u32;
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + error.name.len() as u32,
+                    DiagnosticSeverity::ERROR,
+                    error.to_string(),
+                ));
             }
         }
 
@@ -2757,13 +2783,6 @@ impl DiagnosticEngine {
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
-    }
-
-    /// Find the position of a ref type error in exports by extracting the param name.
-    fn find_ref_error_position(&self, doc: &Document, error_msg: &str) -> Option<(u32, u32)> {
-        // Error format: "export 'NAME': type mismatch ..."
-        let name = error_msg.strip_prefix("export '")?.split('\'').next()?;
-        self.find_exports_param_position(doc, name)
     }
 
     /// Find the position of an exports parameter name in the document.
@@ -2975,6 +2994,8 @@ impl DiagnosticEngine {
         value.visit_resource_refs_with_usage(&mut |path, usage| {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
+            let mut diagnostic_binding = binding_name.to_string();
+            let mut diagnostic_attribute = attribute_name.to_string();
             let message = match binding_index.ref_type(path) {
                 RefType::UnknownAttribute(error)
                     if carina_core::validation::suppress_coalesce_existence_error(
@@ -2984,47 +3005,53 @@ impl DiagnosticEngine {
                     return;
                 }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                    binding,
+                    attribute,
                     known_attributes,
                     target: RefTargetKind::Schema { resource_type },
-                    ..
                 }) => {
+                    diagnostic_binding = binding;
+                    diagnostic_attribute = attribute;
                     let known_attrs: Vec<&str> =
                         known_attributes.iter().map(String::as_str).collect();
-                    let suggestion = suggest_similar_name(attribute_name, &known_attrs)
+                    let suggestion = suggest_similar_name(&diagnostic_attribute, &known_attrs)
                         .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
                         .unwrap_or_default();
                     format!(
                         "Unknown attribute '{}' on '{}' (type '{}'){}",
-                        attribute_name, binding_name, resource_type, suggestion,
+                        diagnostic_attribute, diagnostic_binding, resource_type, suggestion,
                     )
                 }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                    binding,
+                    attribute,
                     known_attributes,
                     target: RefTargetKind::LiveComposition,
-                    ..
                 }) => {
+                    diagnostic_binding = binding;
+                    diagnostic_attribute = attribute;
                     let known_attrs: Vec<&str> =
                         known_attributes.iter().map(String::as_str).collect();
-                    let suffix = suggest_similar_name(attribute_name, &known_attrs)
+                    let suffix = suggest_similar_name(&diagnostic_attribute, &known_attrs)
                         .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
                         .unwrap_or_else(|| ".".to_string());
                     format!(
                         "Unknown attribute '{}' on '{}'{}",
-                        attribute_name, binding_name, suffix,
+                        diagnostic_attribute, diagnostic_binding, suffix,
                     )
                 }
                 RefType::UnknownAttribute(error) => error.to_string(),
                 RefType::Typed(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => return,
             };
 
-            let ref_text = format!("{}.{}", binding_name, attribute_name);
+            let ref_text = format!("{}.{}", diagnostic_binding, diagnostic_attribute);
             if let Some((line, col)) = self.find_ref_value_position(doc, &ref_text) {
                 // Highlight just the attribute part (after the dot)
-                let attr_col = col + binding_name.len() as u32 + 1; // +1 for the dot
+                let attr_col = col + diagnostic_binding.len() as u32 + 1; // +1 for the dot
                 diagnostics.push(carina_diagnostic(
                     line,
                     attr_col,
-                    attr_col + attribute_name.len() as u32,
+                    attr_col + diagnostic_attribute.len() as u32,
                     DiagnosticSeverity::WARNING,
                     message,
                 ));
@@ -3157,9 +3184,14 @@ impl DiagnosticEngine {
     /// `dep_name` hints carried by `DependsOnDiagnostic` (#2874) to
     /// resolve a precise span. Falls back to whole-buffer scan only
     /// for diagnostics that have no hints (e.g. cycle errors).
-    pub(super) fn check_depends_on(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
+    pub(super) fn check_depends_on(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        argument_types: &carina_core::validation::ResolvedArgumentTypes,
+    ) -> Vec<Diagnostic> {
         use carina_core::validation::depends_on::{Severity, validate_depends_on};
-        let diags = validate_depends_on(parsed);
+        let diags = validate_depends_on(parsed, argument_types);
         if diags.is_empty() {
             return Vec::new();
         }

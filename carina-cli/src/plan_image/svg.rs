@@ -1155,6 +1155,7 @@ fn escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::resolved;
     use std::collections::HashMap;
 
     use carina_core::effect::Effect;
@@ -1253,10 +1254,10 @@ mod tests {
         plan.add(Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new("credential-id").unwrap(),
-            to: ResolvedResource::new(resource.clone()),
+            to: resolved(resource.clone()),
             changed_attributes: vec!["secret_token".to_string(), "write_only_token".to_string()],
         });
-        let desired = vec![ResolvedResource::new(resource)];
+        let desired = vec![resolved(resource)];
         let summary = crate::plan_summary::PlanChangeSummary::new(
             &plan,
             &[],
@@ -1308,10 +1309,10 @@ mod tests {
         plan.add(Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new("long-label-id").unwrap(),
-            to: ResolvedResource::new(resource.clone()),
+            to: resolved(resource.clone()),
             changed_attributes,
         });
-        let desired = vec![ResolvedResource::new(resource)];
+        let desired = vec![resolved(resource)];
         let summary = crate::plan_summary::PlanChangeSummary::new(
             &plan,
             &[],
@@ -1399,24 +1400,20 @@ mod tests {
         let mut b = Resource::new("test.Widget", "b");
         b.binding = Some(absolute_binding("b"));
         b.set_attr("input", root_resource_ref("connector", "id"));
+        let desired = ResolvedResource::collect_resolved([a, connector, b]).unwrap();
         let mut plan = Plan::new();
-        for resource in [a.clone(), b.clone()] {
+        for resource in [&desired[0], &desired[2]] {
             plan.add(Effect::Update {
                 from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
                 identifier: AppliedIdentifier::new(format!(
                     "{}-id",
-                    resource
-                        .binding
-                        .as_ref()
-                        .expect("test resource is bound")
-                        .as_str()
+                    resource.binding.as_ref().unwrap()
                 ))
                 .unwrap(),
-                to: ResolvedResource::new(resource),
+                to: resource.clone(),
                 changed_attributes: vec!["description".to_string()],
             });
         }
-        let desired = ResolvedResource::collect_resolved([a, connector, b]).unwrap();
         let unresolved: Vec<_> = desired
             .iter()
             .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))

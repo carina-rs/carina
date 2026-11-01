@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::{
-    DeferredForExpansionError, DeferredForExpression, DeferredForTarget, ShapeMismatch,
-    expand_deferred_children,
+    CompiledDeferredForExpression as DeferredForExpression, DeferredForExpansionError,
+    DeferredForTarget, ShapeMismatch, expand_deferred_children,
 };
-use crate::resource::{ResolvedResource, ResolvedResourceError, ResourceId};
+use crate::resource::{ResolvedResourceError, ResourceId};
 #[cfg(test)]
 use crate::schema::SchemaRegistry;
 
@@ -278,6 +278,7 @@ pub(super) fn materialize_deferred_create<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
     template: &DeferredForExpression<S>,
+    dependencies: &crate::resource::DeferredDependencyTemplate,
     bindings: &ResolvedBindings,
     identity_inputs: &DeferredIdentityInputs<'_>,
 ) -> Result<Vec<Effect<S>>, DeferredCreateFailure> {
@@ -367,17 +368,12 @@ pub(super) fn materialize_deferred_create<
     resources
         .into_iter()
         .map(|resource| {
-            debug_assert!(
-                template
-                    .root_bindings()
-                    .is_subset(&resource.dependency_bindings),
-                "apply-time deferred-for child must retain iterable dependencies"
-            );
-            ResolvedResource::resolve_with_schemas(resource, identity_inputs.schemas)
+            dependencies
+                .materialize(resource, identity_inputs.schemas)
                 .map(Effect::Create)
                 .map_err(|error| DeferredCreateFailure::ResolveResource { error })
         })
-        .collect::<Result<Vec<_>, _>>()
+        .collect()
 }
 
 /// Result of synchronously dispatching a deferred scheduler-meta effect.
@@ -401,10 +397,11 @@ pub(super) fn dispatch_deferred_create<
 >(
     _effect: &Effect<S>,
     template: &DeferredForExpression<S>,
+    dependencies: &crate::resource::DeferredDependencyTemplate,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_>,
 ) -> DeferredDispatchResult<S> {
-    match materialize_deferred_create(template, bindings, &ctx.identity_inputs) {
+    match materialize_deferred_create(template, dependencies, bindings, &ctx.identity_inputs) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
         Err(err) => DeferredDispatchResult::MaterializeFailed(err),
     }
@@ -424,6 +421,27 @@ mod tests {
     };
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
+    fn materialize_compiled_fixture(
+        template: &ExpandedDeferredForExpression,
+        bindings: &ResolvedBindings,
+        identity: &DeferredIdentityInputs<'_>,
+    ) -> Result<Vec<Effect>, DeferredCreateFailure> {
+        let mut configuration = crate::parser::ExpandedParsedFile::default();
+        configuration.upstream_states = ["up", "parent", "upstream"]
+            .into_iter()
+            .map(|binding| crate::parser::UpstreamState {
+                binding: RootScope::new().resolve(binding.into()),
+                source: std::path::PathBuf::from("upstream"),
+            })
+            .collect();
+        let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
+            .expect("fixture upstream declarations");
+        let (template, descriptor) = graph
+            .compile_deferred_for(template.clone())
+            .expect("fixture loop dependencies");
+        materialize_deferred_create(&template, &descriptor, bindings, identity)
+    }
+
     fn coalesced_template() -> ExpandedDeferredForExpression {
         let scope = RootScope::new();
         let mut template_resource: Resource<ModuleSource, LoopSlot, AbsoluteBindingAddress> =
@@ -435,7 +453,7 @@ mod tests {
                 LoopSlot::Value,
             )),
         );
-        DeferredForExpression::new(
+        crate::parser::DeferredForExpression::new(
             None,
             1,
             "for account in (up.accounts ?? [])".to_string(),
@@ -457,7 +475,7 @@ mod tests {
         bindings: &ResolvedBindings,
     ) -> Result<Vec<Effect>, DeferredCreateFailure> {
         let schemas = crate::schema::SchemaRegistry::new();
-        materialize_deferred_create(
+        materialize_compiled_fixture(
             template,
             bindings,
             &DeferredIdentityInputs {
@@ -528,7 +546,7 @@ mod tests {
             factories: &[],
             schemas: &schemas,
         };
-        let children = materialize_deferred_create(&template, &bindings, &identity_inputs)
+        let children = materialize_compiled_fixture(&template, &bindings, &identity_inputs)
             .expect("deferred children must resolve authored ignore paths");
 
         let Effect::Create(child) = &children[0] else {
@@ -586,7 +604,7 @@ mod tests {
             schemas: &schemas,
         };
 
-        let children = materialize_deferred_create(template, &bindings, &identity_inputs)
+        let children = materialize_compiled_fixture(template, &bindings, &identity_inputs)
             .expect("apply-time anonymous child materializes");
 
         let [Effect::Create(child)] = children.as_slice() else {
@@ -654,7 +672,7 @@ mod tests {
             schemas: &schemas,
         };
 
-        let runtime_children = materialize_deferred_create(template, &bindings, &identity_inputs)
+        let runtime_children = materialize_compiled_fixture(template, &bindings, &identity_inputs)
             .expect("apply-time enum child materializes");
         let [Effect::Create(runtime_child)] = runtime_children.as_slice() else {
             panic!("one runtime child expected");
@@ -739,7 +757,7 @@ mod tests {
             schemas: &schemas,
         };
 
-        let error = materialize_deferred_create(template, &bindings, &identity_inputs)
+        let error = materialize_compiled_fixture(template, &bindings, &identity_inputs)
             .expect_err("identical apply-time children must fail identity assignment");
         let source = std::error::Error::source(&error)
             .expect("deferred failure must retain its typed identity source");

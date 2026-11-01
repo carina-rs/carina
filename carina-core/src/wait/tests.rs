@@ -5,15 +5,54 @@ use crate::resource::{
     DataSource, ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value,
     RelativeBindingName, ResolvedResource, Resource, RootScope,
 };
+use crate::wait::BindingPattern;
 use crate::wait::predicate::{AttrPath, WaitPredicate};
-use crate::wait::{BindingPattern, WaitTargetLookup, resolve_wait_target};
+
+enum WaitTargetLookup {
+    Managed(crate::wait::ManagedWaitTarget),
+    DataSource,
+    Missing,
+}
+
+// Legacy v20 spellings alone use the identity catalogue; authored waits never do.
+fn resolve_wait_target(
+    reference: &str,
+    managed: &[ResolvedResource],
+    data_sources: &[DataSource],
+) -> WaitTargetLookup {
+    let mut configuration = crate::parser::ExpandedParsedFile::default();
+    configuration.resources = managed
+        .iter()
+        .map(|row| row.as_inner().clone().into_unexpanded_for_test())
+        .collect();
+    configuration.data_sources = data_sources.to_vec();
+    let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
+        .expect("legacy lookup fixture graph");
+    match graph.project_legacy_dependency(reference, "legacy wait fixture") {
+        Ok(crate::resource::PersistedDestroyDependencyProjection::Managed(rows)) => {
+            match rows.iter().next() {
+                Some(id) => WaitTargetLookup::Managed(crate::wait::ManagedWaitTarget::new(
+                    &ResolvedResource::from_id(id.clone()),
+                )),
+                None => WaitTargetLookup::DataSource,
+            }
+        }
+        Ok(crate::resource::PersistedDestroyDependencyProjection::NoLocalDestroyEdge) => {
+            WaitTargetLookup::DataSource
+        }
+        Err(_) => WaitTargetLookup::Missing,
+    }
+}
 
 fn managed(identity: &'static str, binding: Option<&'static str>) -> ResolvedResource {
     let resource: Resource = Resource::with_provider("aws", "test.Resource", identity, None);
-    ResolvedResource::new(match binding {
-        Some(binding) => resource.with_root_binding(binding),
-        None => resource,
-    })
+    ResolvedResource::new(
+        match binding {
+            Some(binding) => resource.with_root_binding(binding),
+            None => resource,
+        }
+        .into_value_snapshot(),
+    )
 }
 
 fn data_source(identity: &'static str, binding: Option<&'static str>) -> DataSource {

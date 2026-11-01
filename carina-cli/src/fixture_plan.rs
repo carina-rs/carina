@@ -634,7 +634,12 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
+                legacy_dependency_classification: _,
+                migrated_legacy_state,
             } = diagnostics.into_artifacts();
+            if let Some(migrated) = migrated_legacy_state {
+                state_file = Some(migrated);
+            }
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");
@@ -681,7 +686,12 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
+                legacy_dependency_classification: _,
+                migrated_legacy_state,
             } = artifacts;
+            if let Some(migrated) = migrated_legacy_state {
+                state_file = Some(migrated);
+            }
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");

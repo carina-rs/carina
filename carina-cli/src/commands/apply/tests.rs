@@ -1,7 +1,7 @@
 use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
-use carina_core::effect::{Effect, UnresolvedSavedEffect};
+use carina_core::effect::{Effect, ResolvedMovePairs, UnresolvedSavedEffect};
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -9,8 +9,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
-    ModuleConstraintId, PendingModuleConstraint, PlaceholderKind, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, ResourceIdentity,
+    ModuleConstraintId, PendingModuleConstraint, PlaceholderKind, ResolvedResource, Resource,
+    ResourceId, ResourceIdentity,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -477,7 +477,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
 
     let fresh_resource = mock_http_resource("fresh-trap", server_address, "trap_after_send");
     let fresh_id = fresh_resource.id.clone();
-    let fresh_resources = vec![ResolvedResource::new(fresh_resource)];
+    let fresh_resources = vec![resolved(fresh_resource)];
     let mut fresh_plan = Plan::new();
     fresh_plan.add(Effect::Create(fresh_resources[0].clone()));
     let fresh_result = execute_mock_http_plan(
@@ -558,7 +558,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
     )
     .with_identifier("old-applied-id");
     let current_states = HashMap::from([(replacement_id.clone(), old_state)]);
-    let replacement_resources = vec![ResolvedResource::new(desired)];
+    let replacement_resources = vec![resolved(desired)];
     let replacement_raw_resources = replacement_resources
         .iter()
         .map(|resource| resource.as_resource().clone())
@@ -861,7 +861,18 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
 }
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    crate::test_support::resolved(resource)
+}
+
+fn resolved_inner(
+    resource: Resource,
+) -> carina_core::resource::Resource<
+    carina_core::resource::ModuleSource,
+    carina_core::resource::NoPlaceholder,
+    carina_core::resource::AbsoluteBindingAddress,
+    (),
+> {
+    resolved(resource).into_inner()
 }
 
 fn resolved_provider_configs(
@@ -1036,12 +1047,12 @@ for account_id in orgs.accounts {
         to: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
         origin: Some(origin.clone()),
     });
-    plan.add(Effect::DeferredCreate(
-        carina_core::effect::DeferredCreatePayload::new(Box::new(bound)),
-    ));
-    plan.add(Effect::DeferredCreate(
-        carina_core::effect::DeferredCreatePayload::new(Box::new(unbound)),
-    ));
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(bound),
+    )));
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(unbound),
+    )));
 
     let plan_file = record_with_builtin_mock_schemas(PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
@@ -1062,8 +1073,11 @@ for account_id in orgs.accounts {
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![resource.clone()],
-        unresolved_resources: vec![resource],
+        sorted_resources: vec![resource.clone().into_value_snapshot()],
+        unresolved_resources: vec![resource]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -1072,6 +1086,10 @@ for account_id in orgs.accounts {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 1],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
+        legacy_dependency_classification: None,
     });
 
     let encoded = serde_json::to_value(&plan_file).expect("serialize current-format plan");
@@ -1184,8 +1202,11 @@ async fn run_saved_plan_schema_fingerprint_case(
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![resource.clone()],
-        unresolved_resources: vec![resource],
+        sorted_resources: vec![resource.clone().into_value_snapshot()],
+        unresolved_resources: vec![resource]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -1197,6 +1218,10 @@ async fn run_saved_plan_schema_fingerprint_case(
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 1],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_schemas(contents, planning_schemas);
 
@@ -1377,6 +1402,10 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_schemas(contents, &schemas);
 
@@ -1510,7 +1539,7 @@ fn module_composition<P: PlaceholderKind + PartialEq, B: carina_core::resource::
             }],
         },
         binding: Some(binding.clone()),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "checked_module".to_string(),
         instance: "root.checked".to_string(),
         call_path: {
@@ -1645,6 +1674,10 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 0],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        legacy_dependency_classification: None,
     }
     .record_for_test(
         &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
@@ -1735,6 +1768,10 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 0],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        legacy_dependency_classification: None,
     });
     let encoded = serde_json::to_value(plan_file).expect("serialize plan fixture");
     let overlong = "a".repeat(4097);
@@ -1843,6 +1880,34 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         HashMap::from([("name".to_string(), string_value("planned"))]),
     )
     .with_identifier("mock-id");
+    let loaded = carina_state::check_and_migrate(
+        &std::fs::read_to_string(&state_path).expect("read legacy state"),
+    )
+    .expect("decode legacy state")
+    .into_state();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+        configuration.resources = vec![resource.clone()];
+        configuration.into()
+    })
+    .expect("fixture migration graph");
+    let no_moves: Plan = Plan::new();
+    let moves = ResolvedMovePairs::from_saved_plan(no_moves.move_effects());
+    let migration = match loaded
+        .classify_legacy_graph(graph, &moves, Default::default())
+        .expect("legacy classification")
+    {
+        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            panic!("empty state must not need reads: {rows}")
+        }
+    };
+    let legacy_dependency_classification = Some(
+        migration
+            .report_and_validate(|warning| panic!("unexpected warning: {warning:?}"))
+            .expect("migration graph validates")
+            .classification,
+    );
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -1862,8 +1927,14 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         }]),
         backend_config: None,
         plan: Plan::new(),
-        sorted_resources: vec![resource.clone()],
-        unresolved_resources: vec![resource],
+        sorted_resources: vec![resolved_inner(resource.clone())],
+        sorted_value_destroy_dependencies: vec![Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default()],
+        legacy_dependency_classification,
+        unresolved_resources: vec![resource]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -1914,6 +1985,187 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         persisted["version"],
         serde_json::json!(StateFile::CURRENT_VERSION),
         "the pending schema migration must be saved before drift can return early"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write() {
+    let user_dirs = carina_core::TestUserDirs::new();
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp.path().join("carina.state.json");
+    let mock_state_path = tmp.path().join("mock-provider-state.json");
+    let lineage = "22222222-2222-2222-2222-222222222222";
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 9,
+            "lineage": lineage,
+            "carina_version": "0.0.0-test",
+            "resources": [{
+                "resource_type": "test.resource",
+                "identity": "example",
+                "provider": "mock",
+                "binding": "example",
+                "dependency_bindings": ["dependency"],
+                "current": {
+                    "kind": "applied",
+                    "identifier": "example-id",
+                    "attributes": {"name": "planned"},
+                    "nested_write_only": {}
+                }
+            }],
+            "exports": {}
+        }))
+        .expect("serialize v20 state"),
+    )
+    .expect("write v20 state");
+    std::fs::write(
+        &mock_state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "test.resource.example": { "name": "drifted" }
+        }))
+        .expect("serialize provider state"),
+    )
+    .expect("write provider state");
+
+    let mut dependency = Resource::with_provider("mock", "test.resource", "dependency", None);
+    dependency.binding = Some(absolute_binding("dependency"));
+    dependency.set_attr("name", string_value("dependency"));
+    let dependency_id = dependency.id.clone();
+    let mut example = Resource::with_provider("mock", "test.resource", "example", None);
+    example.binding = Some(absolute_binding("example"));
+    example.set_attr("name", string_value("planned"));
+    let example_id = example.id.clone();
+    let migration_resources = vec![dependency.clone(), example.clone()];
+    let graph_file = carina_core::parser::ExpandedParsedFile::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = graph_file;
+        configuration.resources = (&migration_resources).to_vec();
+        configuration.data_sources = (&[]).to_vec();
+        configuration.into()
+    })
+    .expect("saved-plan migration graph resolves");
+    let loaded_state = carina_state::check_and_migrate(
+        &std::fs::read_to_string(&state_path).expect("read v20 classification state"),
+    )
+    .expect("v20 classification state loads")
+    .into_state();
+    let no_move_plan: Plan = Plan::new();
+    let moved_pairs = ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
+    let migration = match loaded_state
+        .classify_legacy_graph(graph, &moved_pairs, Default::default())
+        .expect("saved-plan migration classification resolves")
+    {
+        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            panic!("saved-plan fixture unexpectedly requires reads: {rows}")
+        }
+    };
+    let legacy_dependency_classification = Some(
+        migration
+            .report_and_validate(|_| panic!("fixture has no warnings"))
+            .expect("saved-plan migration graph validates")
+            .classification,
+    );
+    let planned_example = State::existing(
+        example_id.clone(),
+        HashMap::from([("name".to_string(), string_value("planned"))]),
+    )
+    .with_identifier("example-id");
+    let contents = PlanFileContents {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-31T00:00:00Z".to_string(),
+        source_path: tmp.path().display().to_string(),
+        state_lineage: Some(lineage.to_string()),
+        state_serial: Some(9),
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: vec![
+            resolved_inner(dependency.clone()),
+            resolved_inner(example.clone()),
+        ],
+        sorted_value_destroy_dependencies: vec![Default::default(), Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_classification,
+        unresolved_resources: vec![dependency, example]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
+        current_states: vec![
+            crate::commands::plan::CurrentStateEntry::managed(
+                dependency_id.clone(),
+                State::not_found(dependency_id.clone()),
+            ),
+            crate::commands::plan::CurrentStateEntry::managed(example_id, planned_example),
+        ],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+    let plan_file = record_with_builtin_mock_schemas(contents);
+    let backend =
+        Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
+    unsafe {
+        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
+    }
+
+    let observer_factory = fixture.observer_factory();
+    let result = run_apply_from_plan_locked(
+        &user_dirs,
+        inspected_saved_plan(plan_file),
+        &ProviderContext::default(),
+        true,
+        backend,
+        StateLock::disabled_for_test(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).expect("non-zero parallelism"),
+        false,
+    )
+    .await;
+
+    unsafe {
+        std::env::remove_var("CARINA_MOCK_STATE_FILE");
+    }
+    let error = result.expect_err("drift must still abort the saved-plan apply");
+    assert!(error.to_string().contains("drift"), "error: {error}");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read migrated state"))
+            .expect("parse migrated state");
+    assert_eq!(
+        persisted["version"],
+        serde_json::json!(StateFile::CURRENT_VERSION)
+    );
+    assert_eq!(
+        persisted["resources"][0]["dependency_bindings"],
+        serde_json::json!([{
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "dependency"
+        }])
     );
 }
 
@@ -2043,6 +2295,10 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 0],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        legacy_dependency_classification: None,
     }
     .record_for_test(&planning_context, Vec::new())
     .expect("planning context must record provider evidence");
@@ -2138,6 +2394,10 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 0],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        legacy_dependency_classification: None,
     }
     .record_for_test(&planning_context, Vec::new())
     .expect("planning context must record provider evidence");
@@ -3203,9 +3463,10 @@ fn seed_apply_cascade_state(
         .with_attribute("vpc_id", serde_json::json!("vpc-old"))
         .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
         .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-        subnet_state
-            .dependency_bindings
-            .insert(absolute_binding("vpc"));
+        subnet_state.dependency_bindings =
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "vpc", None,
+            )]);
         state_file
             .upsert_resource(subnet_state)
             .expect("test state setup must be valid");
@@ -3232,7 +3493,7 @@ fn seed_apply_cascade_state_with_deposed(
                 ("cidr_block".to_string(), serde_json::json!("10.220.0.0/16")),
                 ("vpc_id".to_string(), serde_json::json!(identifier)),
             ]),
-            BTreeSet::new(),
+            Default::default(),
         ));
     }
 
@@ -3923,7 +4184,9 @@ fn export_only_fast_path_is_disabled_when_deferred_reads_exist() {
     );
     let mut plan = Plan::new();
     plan.add(carina_core::effect::Effect::Read {
-        resource: carina_core::resource::ResolvedDataSource::new(data_source.clone()),
+        resource: carina_core::resource::ResolvedDataSource::new(
+            (data_source.clone()).into_value_snapshot(),
+        ),
     });
     let mut target: Resource = Resource::with_provider("mock", "iam.Role", "target_role", None);
     target.binding = Some(absolute_binding("target_role"));
@@ -3959,7 +4222,8 @@ fn apply_time_classification_uses_folded_data_source_preserved_dependency() {
         .attributes
         .insert("name_regex".to_string(), string_value("^target-role$"));
     data_source
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("registry_publish.target_role"));
     let id = data_source.id.clone();
     let mut target: Resource =
@@ -4002,7 +4266,7 @@ fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
         id: unexpected.id.clone(),
         value: DataSourceValue::deferred_to_apply(Vec::new()),
     };
-    let extra = data_source_values_from_saved_plan::<carina_core::resource::ModuleSource>(
+    let extra = data_source_values_from_saved_plan::<carina_core::resource::ModuleSource, ()>(
         &[],
         &[unexpected_outcome],
     )
@@ -4084,16 +4348,32 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         }),
     );
 
+    let parsed = carina_core::parser::ExpandedParsedFile::default();
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (&[target.clone(), consumer.clone()]).to_vec();
+        configuration.data_sources = (std::slice::from_ref(&lookup)).to_vec();
+        configuration.into()
+    })
+    .expect("saved-plan fixture dependencies must resolve");
+    let schemas = SchemaRegistry::new();
+
     let mut plan = Plan::new();
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        target.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(
+        expanded_graph
+            .resolve_resource(target.clone(), &schemas)
+            .expect("target graph metadata must resolve"),
+    ));
     plan.add(carina_core::effect::Effect::Read {
-        resource: ResolvedDataSource::new(lookup.clone()),
+        resource: expanded_graph
+            .resolve_data_source(lookup.clone())
+            .expect("lookup graph metadata must resolve"),
     });
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        consumer.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(
+        expanded_graph
+            .resolve_resource(consumer.clone(), &schemas)
+            .expect("consumer graph metadata must resolve"),
+    ));
 
     let provider_configs = saved_provider_configs(vec![ProviderConfig {
         name: "mock".to_string(),
@@ -4115,11 +4395,25 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         provider_configs,
         backend_config: None,
         plan,
-        sorted_resources: vec![target.clone(), consumer.clone()],
-        unresolved_resources: vec![target, consumer],
+        sorted_resources: vec![
+            target.clone().into_value_snapshot(),
+            consumer.clone().into_value_snapshot(),
+        ],
+        sorted_value_destroy_dependencies: vec![
+            Default::default(),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::new(target_id.clone()),
+            ]),
+        ],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_classification: None,
+        unresolved_resources: vec![target, consumer]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
-        data_sources: vec![lookup.clone()],
-        data_source_origins: vec![lookup.clone()],
+        data_sources: vec![lookup.clone().into_value_snapshot()],
+        data_source_origins: vec![lookup.clone().into_value_snapshot()],
         data_source_values: vec![crate::commands::plan::SavedDataSourceValue {
             id: lookup.id.clone(),
             value: DataSourceValue::deferred_to_apply(Vec::new()),
@@ -4222,7 +4516,8 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     consumer.set_attr("name", string_value("consumer"));
     consumer.set_attr("comment", root_resource_ref("producer", "identifier"));
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("producer"));
     let consumer_id = consumer.id.clone();
 
@@ -4233,13 +4528,20 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     let saved_composition = composition
         .into_saved_with_resolver(&mut source_identities)
         .expect("save composition");
+    let mut graph_file = carina_core::parser::ExpandedParsedFile::default();
+    graph_file.resources = vec![producer.clone(), consumer.clone()];
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(graph_file.into())
+        .expect("saved constraint fixture graph");
+    let resolved_consumer = graph
+        .resolve_resource(consumer.clone(), &SchemaRegistry::new())
+        .expect("consumer graph dependencies");
+    let consumer_for_sorted = resolved_consumer.as_inner().clone();
+    let consumer_for_unresolved = consumer.clone().into_value_snapshot();
     let mut plan = Plan::new();
     plan.add(carina_core::effect::Effect::Create(resolved(
         producer.clone(),
     )));
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        consumer.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(resolved_consumer));
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -4259,8 +4561,16 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![producer.clone(), consumer.clone()],
-        unresolved_resources: vec![producer, consumer],
+        sorted_resources: vec![resolved_inner(producer.clone()), consumer_for_sorted],
+        sorted_value_destroy_dependencies: vec![
+            Default::default(),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::new(producer_id.clone()),
+            ]),
+        ],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_classification: None,
+        unresolved_resources: vec![producer.into_value_snapshot(), consumer_for_unresolved],
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -4344,6 +4654,9 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
         unresolved_resources: Vec::new(),
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
@@ -4427,6 +4740,10 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 0],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_context(contents);
     let plan_path = tmp.path().join("unresolved-provider-config.plan.json");
@@ -4538,6 +4855,10 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 0],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 0],
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_context(contents);
     let plan_path = tmp.path().join("deferred-default-tags.plan.json");
@@ -4945,8 +5266,11 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![resource.clone()],
-        unresolved_resources: vec![resource],
+        sorted_resources: vec![resource.clone().into_value_snapshot()],
+        unresolved_resources: vec![resource]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -4958,6 +5282,10 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 1],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_builtin_mock_schemas(contents);
     let observer_factory = fixture.observer_factory();
@@ -5605,9 +5933,10 @@ awscc.ec2.Subnet {{
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-    subnet_state
-        .dependency_bindings
-        .insert(absolute_binding("vpc"));
+    subnet_state.dependency_bindings =
+        crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+            "awscc", "ec2.Vpc", "vpc", None,
+        )]);
 
     let mut state_file = carina_state::StateFile::new();
     state_file
@@ -6952,7 +7281,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
         &schemas,
         std::slice::from_ref(&resource),
     );
-    let resolved_resource = ResolvedResource::new(resource);
+    let resolved_resource = resolved(resource);
     let saved_attrs = state_file.build_saved_attrs().lift(&schemas);
     let plan = carina_core::differ::create_plan_for_test(
         std::slice::from_ref(&resolved_resource),
@@ -7903,7 +8232,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     };
 
     let d = diff(
-        &ResolvedResource::new(resource),
+        &resolved(resource),
         &current,
         &saved,
         Some(&prev_explicit),
@@ -8618,11 +8947,11 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
 
     // Export param references registry_prod.account_id using the
     // parser-produced ResourceRef shape.
-    let export_params = vec![ExportParameter {
-        name: "account_id".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("registry_prod", "account_id")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "account_id".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("registry_prod", "account_id")),
+    )];
 
     // Mirror production callers: the resource is in sorted_resources
     // with a binding; provider-returned attributes flow in via
@@ -8640,7 +8969,11 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
-        sorted_resources: &sorted_resources,
+        sorted_resources: &sorted_resources
+            .iter()
+            .cloned()
+            .map(Resource::into_value_snapshot)
+            .collect::<Vec<_>>(),
         pre_resolve_compositions: &[],
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -8722,7 +9055,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
             pending_constraints: Vec::new(),
         },
         binding: Some(absolute_binding("github_actions_carina")),
-        dependency_bindings: std::collections::BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "github_module".to_string(),
         instance: "github_actions_carina".to_string(),
         call_path: crate::test_composition_call_path(),
@@ -8731,11 +9064,11 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     let sorted_resources = vec![role_resource];
     let pre_resolve_compositions = vec![composition];
 
-    let export_params = vec![ExportParameter {
-        name: "role_arn".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("github_actions_carina", "role_arn")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "role_arn".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("github_actions_carina", "role_arn")),
+    )];
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
@@ -8745,7 +9078,11 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
-        sorted_resources: &sorted_resources,
+        sorted_resources: &sorted_resources
+            .iter()
+            .cloned()
+            .map(Resource::into_value_snapshot)
+            .collect::<Vec<_>>(),
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -8831,7 +9168,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
                     pending_constraints: Vec::new(),
                 },
                 binding: Some(absolute_binding(binding)),
-                dependency_bindings: std::collections::BTreeSet::new(),
+                dependency_bindings: Default::default(),
                 module_name: "mod".to_string(),
                 instance: binding.to_string(),
                 call_path: crate::test_composition_call_path(),
@@ -8855,11 +9192,11 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
 
     let sorted_resources = vec![role_resource];
 
-    let export_params = vec![ExportParameter {
-        name: "role_arn".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("outer", "public_role_arn")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "role_arn".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("outer", "public_role_arn")),
+    )];
 
     let pre_resolve_compositions = vec![inner_virtual, outer_virtual];
     let post_apply_states =
@@ -8870,7 +9207,11 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
-        sorted_resources: &sorted_resources,
+        sorted_resources: &sorted_resources
+            .iter()
+            .cloned()
+            .map(Resource::into_value_snapshot)
+            .collect::<Vec<_>>(),
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -9017,7 +9358,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             pending_constraints: Vec::new(),
         },
         binding: Some(absolute_binding("carina_module")),
-        dependency_bindings: std::collections::BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "carina_module".to_string(),
         instance: "carina_module".to_string(),
         call_path: crate::test_composition_call_path(),
@@ -9049,11 +9390,11 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     );
     resolve_managed_refs_with_state_and_remote(&mut sorted_resources, &bindings).unwrap();
 
-    let export_params = vec![ExportParameter {
-        name: "role_arn".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("carina_module", "role_arn")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "role_arn".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("carina_module", "role_arn")),
+    )];
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
@@ -9063,7 +9404,11 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
-        sorted_resources: &sorted_resources,
+        sorted_resources: &sorted_resources
+            .iter()
+            .cloned()
+            .map(Resource::into_value_snapshot)
+            .collect::<Vec<_>>(),
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -9161,11 +9506,11 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     };
 
     // The export: `exports { admin_access_role_arns = admin_access_roles.arns }`.
-    let export_params = vec![ExportParameter {
-        name: "admin_access_role_arns".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("admin_access_roles", "arns")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "admin_access_role_arns".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("admin_access_roles", "arns")),
+    )];
 
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
         DataSourceValue::read(data_source_states[&data_source.id].clone())
@@ -9684,7 +10029,8 @@ mod saved_plan_version_tests {
     use tempfile::TempDir;
 
     use super::{
-        ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir, saved_provider_configs,
+        ApplyTarget, PlanFileHeader, resolved, resolved_inner, saved_plan_replan_project_dir,
+        saved_provider_configs,
     };
 
     #[tokio::test]
@@ -9775,12 +10121,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            37,
-            "carina#4174 requires saved-plan format 37 for diagnostic locations",
+            38,
+            "carina#3803 requires saved-plan format 38 for resolved dependency addresses",
         );
-        let previous = 36;
+        let previous = 37;
 
-        for older_version in [previous, 35, 34, 33, 32] {
+        for older_version in [previous, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
@@ -10590,9 +10936,9 @@ mod saved_plan_version_tests {
         let plan_input_states = crate::plan_input_current_from_states(
             current_states.clone(),
             &SchemaRegistry::new(),
-            &[],
+            &[] as &[carina_core::resource::Resource],
         );
-        let resolved_resource = carina_core::resource::ResolvedResource::new(resource.clone());
+        let resolved_resource = resolved(resource.clone());
         let plan = carina_core::differ::create_plan_for_test(
             std::slice::from_ref(&resolved_resource),
             &[],
@@ -10619,8 +10965,14 @@ mod saved_plan_version_tests {
             provider_configs: saved_provider_configs(Vec::new()),
             backend_config: None,
             plan,
-            sorted_resources: vec![resource.clone()],
-            unresolved_resources: vec![resource],
+            sorted_resources: vec![resolved_inner(resource.clone())],
+            sorted_value_destroy_dependencies: vec![Default::default()],
+            sorted_explicit_destroy_dependencies: vec![Default::default()],
+            legacy_dependency_classification: None,
+            unresolved_resources: vec![resource]
+                .into_iter()
+                .map(|resource| resource.into_value_snapshot())
+                .collect(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
@@ -10984,10 +11336,9 @@ fn interrupted_apply_summary_counts_unknown_outcome() {
 
 #[test]
 fn failed_apply_final_error_names_endpoint_and_typed_cause() {
-    let effect = Effect::Create(carina_core::resource::ResolvedResource::new(Resource::new(
-        "test.resource",
-        "failed",
-    )));
+    let effect = Effect::Create(carina_core::resource::ResolvedResource::new(
+        (Resource::new("test.resource", "failed")).into_value_snapshot(),
+    ));
     let mut result: ExecutionResult = ExecutionResult::empty();
     result.failure_sink().record(
         &carina_core::executor::NoopExecutionObserver,
@@ -11019,4 +11370,52 @@ fn failed_apply_final_error_names_endpoint_and_typed_cause() {
     };
     assert_eq!(report.failures().len(), 1);
     assert!(report.failures()[0].to_string().contains("root detail"));
+}
+
+#[test]
+fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
+    let mut target =
+        Resource::with_provider("mock", "iam.Role", "registry_publish.target_role", None);
+    target.binding = Some(absolute_binding("registry_publish.target_role"));
+
+    let mut data_source =
+        DataSource::with_provider("mock", "iam.Roles", "registry_publish.roles", None);
+    data_source.binding = Some(absolute_binding("registry_publish.roles"));
+    data_source
+        .attributes
+        .insert("name_regex".to_string(), string_value("^target-role$"));
+    data_source
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("registry_publish.target_role"));
+
+    let mut parsed = carina_core::parser::ExpandedParsedFile::default();
+    parsed.resources.push(target.clone());
+    parsed.data_sources.push(data_source.clone());
+    let graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (std::slice::from_ref(&target)).to_vec();
+        configuration.data_sources = (std::slice::from_ref(&data_source)).to_vec();
+        configuration.into()
+    })
+    .expect("module-expanded graph resolves");
+    let resolved = graph
+        .resolve_data_source(data_source)
+        .expect("folded saved-plan data source resolves");
+    let resolved = carina_core::resource::SavedResolvedDataSource::from(resolved);
+    let encoded = serde_json::to_string(&resolved).expect("encode resolved saved-plan data source");
+    let reloaded: carina_core::resource::SavedResolvedDataSource =
+        serde_json::from_str(&encoded).expect("reload resolved saved-plan data source");
+    let id = reloaded.id.clone();
+
+    let classified = crate::wiring::classify_apply_time_resolved_data_source_read_inputs(
+        std::slice::from_ref(&reloaded),
+        std::slice::from_ref(&target),
+        &HashMap::new(),
+    );
+
+    assert!(
+        classified.contains_key(&id),
+        "a folded module data-source input must remain deferred after saved-plan reload",
+    );
 }

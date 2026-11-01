@@ -293,7 +293,7 @@ mod tests {
     };
 
     fn create(resource: Resource) -> Effect {
-        Effect::Create(ResolvedResource::new(resource))
+        Effect::Create(ResolvedResource::new((resource).into_value_snapshot()))
     }
 
     fn absolute(binding: &str) -> AbsoluteBindingAddress {
@@ -368,8 +368,9 @@ mod tests {
                 .with_identifier("widget-id"),
             ),
             to: ResolvedResource::new(
-                Resource::new("test.Widget", "example")
-                    .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into()))),
+                (Resource::new("test.Widget", "example")
+                    .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into()))))
+                .into_value_snapshot(),
             ),
             changed_attributes: vec!["name".to_string()],
         });
@@ -1026,4 +1027,46 @@ mod tests {
         handle_module_info_key(&mut app, KeyCode::Tab);
         assert_eq!(app.focused_panel, FocusedPanel::Tree);
     }
+}
+
+#[cfg(test)]
+fn compiled_loop_fixture(
+    template: Box<carina_core::parser::ExpandedDeferredForExpression>,
+) -> carina_core::effect::DeferredCreatePayload {
+    let producer =
+        carina_core::resource::Resource::with_provider("aws", "acm.Certificate", "cert", None)
+            .with_absolute_binding(carina_core::resource::absolute_binding_address_for_test(
+                "cert",
+            ));
+    let graph = carina_core::resolved_graph::ExpandedBindingIndex::for_test_resources(&[producer])
+        .expect("fixture graph");
+    let (template, dependencies) = graph
+        .compile_deferred_for(*template)
+        .expect("fixture loop compilation");
+    carina_core::effect::DeferredCreatePayload::new(Box::new(template), dependencies)
+}
+#[cfg(test)]
+fn compiled_replace_fixture(
+    deletes: carina_core::effect::NonEmptyDeletes,
+    template: Box<carina_core::parser::ExpandedDeferredForExpression>,
+) -> carina_core::effect::DeferredReplacePayload {
+    let payload = compiled_loop_fixture(template);
+    carina_core::effect::DeferredReplacePayload {
+        deletes,
+        template: payload.template,
+        dependency_template: payload.dependency_template,
+    }
+}
+
+#[cfg(test)]
+fn create_plan_fixture(
+    resources: impl IntoIterator<Item = carina_core::resource::ExpandedResource>,
+) -> Plan {
+    let resources = carina_core::resource::ResolvedResource::collect_resolved(resources)
+        .expect("TUI fixture graph resolves");
+    let mut plan = Plan::new();
+    for resource in resources {
+        plan.add(carina_core::effect::Effect::Create(resource));
+    }
+    plan
 }

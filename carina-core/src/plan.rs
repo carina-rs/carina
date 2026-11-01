@@ -3,6 +3,7 @@
 //! A Plan is an ordered list of Effects to be executed.
 //! No side effects occur until the Plan is applied.
 
+use crate::resource::ResolvedDependencies;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -19,7 +20,7 @@ use crate::provider::{AppliedIdentifier, Timestamp};
 pub use crate::resource::PreventDestroySource;
 use crate::resource::{
     AbsoluteBindingAddress, DeposedKey, Directives, ResolvedResource, ResolvedResourceId,
-    ResourceId, ResourceIdentity, Value,
+    ResourceId, Value,
 };
 pub use crate::resource::{ModuleSource, SavedModuleSource};
 
@@ -585,7 +586,7 @@ pub(crate) struct ReplacementGroup {
     /// Identities of consumer effects (typically Updates) the Delete
     /// must wait for during apply. Populated into
     /// `Effect::Delete.blocked_by_updates`.
-    pub consumer_updates: HashSet<ResourceIdentity>,
+    pub consumer_updates: ResolvedDependencies,
     /// Pre-replace attribute values, captured for display + snapshot.
     /// The redaction walker visits this in Phase 7.
     pub previous_attributes: HashMap<String, Value>,
@@ -596,8 +597,8 @@ pub(crate) struct ReplacementDelete {
     pub identifier: AppliedIdentifier,
     pub directives: Directives,
     pub binding: Option<AbsoluteBindingAddress>,
-    pub dependencies: HashSet<AbsoluteBindingAddress>,
-    pub explicit_dependencies: HashSet<AbsoluteBindingAddress>,
+    pub dependencies: crate::resource::PersistedDestroyDependencies,
+    pub explicit_dependencies: ResolvedDependencies,
 }
 
 /// A malformed historical generation explicitly abandoned by a `removed`
@@ -614,6 +615,35 @@ struct AbandonedDeposedGeneration {
 pub struct IgnoredChangeSummary {
     resource_id: ResourceId,
     count: usize,
+}
+
+/// Completeness of the historical ordering attached to one Delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DestroyOrdering {
+    Known,
+    UnresolvedPersistedDependencies { dependencies: ResolvedDependencies },
+}
+
+/// Typed association between a Delete generation and its ordering status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestroyOrderingNotice {
+    id: ResolvedResourceId,
+    generation: EffectGeneration,
+    ordering: DestroyOrdering,
+}
+
+impl DestroyOrderingNotice {
+    pub fn id(&self) -> &ResolvedResourceId {
+        &self.id
+    }
+
+    pub fn generation(&self) -> &EffectGeneration {
+        &self.generation
+    }
+
+    pub fn ordering(&self) -> &DestroyOrdering {
+        &self.ordering
+    }
 }
 
 impl IgnoredChangeSummary {
@@ -647,6 +677,10 @@ pub struct Plan<S = ModuleSource> {
     /// call because their persisted identifiers are unusable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     abandoned_deposed: Vec<AbandonedDeposedGeneration>,
+    /// Display-only evidence that one legacy orphan/deposed Delete could not
+    /// recover every historical edge. Known edges stay on the Delete itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    destroy_ordering_notices: Vec<DestroyOrderingNotice>,
 }
 
 impl<S> Default for Plan<S> {
@@ -658,6 +692,7 @@ impl<S> Default for Plan<S> {
             permanent_name_overrides: Vec::new(),
             errors: Vec::new(),
             abandoned_deposed: Vec::new(),
+            destroy_ordering_notices: Vec::new(),
         }
     }
 }
@@ -679,6 +714,8 @@ pub struct UnresolvedSavedPlan {
     errors: Vec<PlanError>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     abandoned_deposed: Vec<AbandonedDeposedGeneration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    destroy_ordering_notices: Vec<DestroyOrderingNotice>,
 }
 
 impl From<SavedPlan> for UnresolvedSavedPlan {
@@ -690,6 +727,7 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         } = plan;
         Self {
             effects: effects
@@ -701,6 +739,7 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         }
     }
 }
@@ -762,6 +801,7 @@ impl UnresolvedSavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         } = self;
         let effects = effects
             .into_iter()
@@ -774,6 +814,7 @@ impl UnresolvedSavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         })
     }
 }
@@ -787,6 +828,7 @@ impl From<Plan> for SavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         } = plan;
         Self {
             effects: effects.into_iter().map(SavedEffect::from).collect(),
@@ -795,6 +837,7 @@ impl From<Plan> for SavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         }
     }
 }
@@ -865,8 +908,61 @@ impl<S> Plan<S> {
         &self.effects
     }
 
+    pub fn move_effects(&self) -> crate::effect::SavedMoveEffects<'_, S> {
+        crate::effect::SavedMoveEffects::from_effects(&self.effects)
+    }
+
     pub fn ignored_change_summaries(&self) -> &[IgnoredChangeSummary] {
         &self.ignored_change_summaries
+    }
+
+    pub fn record_unresolvable_destroy_dependencies(
+        &mut self,
+        id: ResolvedResourceId,
+        generation: EffectGeneration,
+        dependencies: ResolvedDependencies,
+    ) {
+        if dependencies.is_empty() {
+            return;
+        }
+        self.destroy_ordering_notices.push(DestroyOrderingNotice {
+            id,
+            generation,
+            ordering: DestroyOrdering::UnresolvedPersistedDependencies { dependencies },
+        });
+    }
+
+    pub fn record_unresolved_delete_ordering_analysis(
+        &mut self,
+        analysis: &crate::effect::deps::DependencyAnalysis,
+    ) {
+        let mut notices: Vec<(ResolvedResourceId, EffectGeneration, ResolvedDependencies)> =
+            Vec::new();
+        for warning in analysis.unresolved_delete_ordering() {
+            if let Some((_, _, dependencies)) =
+                notices
+                    .iter_mut()
+                    .find(|(notice_id, notice_generation, _)| {
+                        notice_id == warning.delete_id()
+                            && notice_generation == warning.generation()
+                    })
+            {
+                dependencies.insert(warning.dependency().clone());
+            } else {
+                notices.push((
+                    warning.delete_id().clone(),
+                    warning.generation().clone(),
+                    std::iter::once(warning.dependency().clone()).collect(),
+                ));
+            }
+        }
+        for (id, generation, dependencies) in notices {
+            self.record_unresolvable_destroy_dependencies(id, generation, dependencies);
+        }
+    }
+
+    pub fn destroy_ordering_notices(&self) -> &[DestroyOrderingNotice] {
+        &self.destroy_ordering_notices
     }
 
     /// Refresh update inputs for ignored paths from the apply-time read.
@@ -931,6 +1027,7 @@ impl<S> Plan<S> {
             permanent_name_overrides: _permanent_name_overrides,
             errors: _errors,
             abandoned_deposed: _abandoned_deposed,
+            destroy_ordering_notices: _destroy_ordering_notices,
         } = self;
 
         effects
@@ -1307,10 +1404,9 @@ impl std::fmt::Display for PlanSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::{DeferredCreatePayload, DeferredReplacePayload};
+
     use crate::resource::{
-        DataSource, RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource,
-        ResourceIdentity, RootScope,
+        DataSource, RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, RootScope,
     };
 
     fn render_plan_error_kind(kind: PlanErrorKind) -> String {
@@ -1328,11 +1424,11 @@ mod tests {
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new(resource.with_dependency_phase(()))
     }
 
     fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-        ResolvedDataSource::new(resource)
+        ResolvedDataSource::new(resource.with_dependency_phase(()))
     }
 
     fn absolute(binding: &str) -> crate::resource::AbsoluteBindingAddress {
@@ -1380,7 +1476,13 @@ mod tests {
         }
     }
 
-    fn replacement_group(consumer_updates: HashSet<ResourceIdentity>) -> ReplacementGroup {
+    fn replacement_group(consumer_updates: ResolvedDependencies) -> ReplacementGroup {
+        let internet_gateway = ResolvedResourceId::with_provider_identity(
+            "mock",
+            "ec2.InternetGateway",
+            "internet_gateway",
+            None,
+        );
         ReplacementGroup {
             create: resolved(Resource::new("ec2.Vpc", "vpc").with_root_binding("vpc")),
             delete: ReplacementDelete {
@@ -1390,8 +1492,8 @@ mod tests {
                 identifier: crate::effect::fixture_applied_identifier("vpc-123"),
                 directives: Directives::default(),
                 binding: Some(absolute("vpc")),
-                dependencies: HashSet::from([absolute("internet_gateway")]),
-                explicit_dependencies: HashSet::from([absolute("internet_gateway")]),
+                dependencies: crate::test_support::persisted([internet_gateway.clone()]),
+                explicit_dependencies: std::iter::once(internet_gateway.clone()).collect(),
             },
             create_before_destroy: true,
             changed_create_only: changed_create_only(),
@@ -1459,7 +1561,7 @@ mod tests {
             "cert",
         ))));
         plan.add(Effect::Wait {
-            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: crate::wait::ManagedWaitTarget::new(&resolved(Resource::new(
                 "acm.Certificate",
                 "cert",
@@ -1472,7 +1574,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         });
         let summary = plan.summary();
         assert_eq!(summary.create, 1);
@@ -1492,9 +1594,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: std::collections::HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: std::collections::HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
 
         let summary = plan.summary();
@@ -1509,7 +1611,7 @@ mod tests {
             "ec2.Subnet",
             "subnet",
         ))));
-        plan.add_replacement(replacement_group(HashSet::new()));
+        plan.add_replacement(replacement_group(Default::default()));
 
         let summary = plan.summary();
         assert_eq!(summary.create, 1);
@@ -1537,7 +1639,7 @@ mod tests {
         plan.add(Effect::Create(resolved(
             Resource::new("acm.Certificate", "cert").with_root_binding("cert"),
         )));
-        plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
             Box::new(deferred),
         )));
 
@@ -1558,8 +1660,6 @@ mod tests {
         use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
         use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
         use crate::resource::{Directives, ResourceId};
-        use std::collections::HashSet;
-
         let template_resource = Resource::new("aws.route53.RecordSet", "ignored");
         let template = DeferredForExpression::new(
             None,
@@ -1585,17 +1685,19 @@ mod tests {
                 identifier: crate::effect::fixture_applied_identifier(format!("record-{idx}")),
                 directives: Directives::default(),
                 binding: Some(absolute(&format!("validation_records[{idx}]"))),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             })
             .collect();
 
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-            deletes: NonEmptyDeletes::try_new(deletes).expect("fixture has deletes"),
-            template: Box::new(template),
-        })));
+        plan.add(Effect::DeferredReplace(Box::new(
+            crate::test_support::compiled_replace(
+                NonEmptyDeletes::try_new(deletes).expect("fixture has deletes"),
+                Box::new(template),
+            ),
+        )));
 
         let summary = plan.summary();
         assert_eq!(summary.replace, 0);
@@ -1611,7 +1713,10 @@ mod tests {
 
     #[test]
     fn plan_add_replacement_registers_create_delete_and_display_atomically() {
-        let consumer_updates = HashSet::from([ResourceIdentity::new("subnet_update")]);
+        let consumer_updates: ResolvedDependencies = std::iter::once(
+            ResolvedResourceId::with_identity("ec2.Subnet", "subnet_update"),
+        )
+        .collect();
         let group = replacement_group(consumer_updates.clone());
         let expected_changed_create_only = group.changed_create_only.clone();
         let expected_cascade_ref_hints = group.cascade_ref_hints.clone();
@@ -1644,7 +1749,7 @@ mod tests {
     #[test]
     fn replace_display_info_exposes_display_fields_without_metadata_visibility() {
         let mut plan = Plan::new();
-        plan.add_replacement(replacement_group(HashSet::new()));
+        plan.add_replacement(replacement_group(Default::default()));
 
         let info = plan
             .replace_display_info()
@@ -1676,7 +1781,7 @@ mod tests {
             "subnet-b",
         ))));
 
-        plan.add_replacement(replacement_group(HashSet::new()));
+        plan.add_replacement(replacement_group(Default::default()));
 
         assert_eq!(plan.effects().len(), 4);
         assert_eq!(plan.replace_display.len(), 1);
@@ -1691,7 +1796,7 @@ mod tests {
             "ec2.Subnet",
             "subnet-a",
         ))));
-        plan.add_replacement(replacement_group(HashSet::new()));
+        plan.add_replacement(replacement_group(Default::default()));
 
         plan.retain(|effect| {
             !matches!(
@@ -1711,7 +1816,7 @@ mod tests {
     #[test]
     fn plan_retain_drops_replace_display_when_one_half_removed() {
         let mut plan = Plan::new();
-        plan.add_replacement(replacement_group(HashSet::new()));
+        plan.add_replacement(replacement_group(Default::default()));
 
         plan.retain(|effect| !matches!(effect, Effect::Delete { .. }));
 
@@ -1723,9 +1828,13 @@ mod tests {
     #[test]
     fn plan_replace_display_round_trips_through_serde() {
         let mut plan = Plan::new();
-        plan.add_replacement(replacement_group(HashSet::from([ResourceIdentity::new(
-            "subnet_update",
-        )])));
+        plan.add_replacement(replacement_group(
+            std::iter::once(ResolvedResourceId::with_identity(
+                "ec2.Subnet",
+                "subnet_update",
+            ))
+            .collect(),
+        ));
         let expected_replace_display = plan.replace_display.clone();
 
         let json = serde_json::to_string(&plan).unwrap();
@@ -1738,7 +1847,7 @@ mod tests {
     #[test]
     fn plan_add_replacement_pushes_permanent_name_override_on_cbd() {
         let override_ = permanent_name_override();
-        let mut group = replacement_group(HashSet::new());
+        let mut group = replacement_group(Default::default());
         group.permanent_name_override = Some(override_.clone());
 
         let mut plan = Plan::new();
@@ -1749,7 +1858,7 @@ mod tests {
 
     #[test]
     fn plan_add_replacement_skips_permanent_name_override_on_dbc() {
-        let mut group = replacement_group(HashSet::new());
+        let mut group = replacement_group(Default::default());
         group.create_before_destroy = false;
         group.temporary_name = None;
         group.permanent_name_override = None;
@@ -1933,7 +2042,7 @@ mod tests {
 
     #[test]
     fn plan_permanent_name_overrides_round_trips_through_serde() {
-        let mut group = replacement_group(HashSet::new());
+        let mut group = replacement_group(Default::default());
         group.permanent_name_override = Some(permanent_name_override());
         let mut plan = Plan::new();
         plan.add_replacement(group);
@@ -2011,9 +2120,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: std::collections::HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: std::collections::HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
 
         let json = serde_json::to_string(&plan).unwrap();

@@ -309,7 +309,7 @@ wait_attr = { wait_until_attr | wait_timeout_attr | wait_depends_on_attr }
 wait_until_attr = { kw_until ~ trivia* ~ equals ~ trivia* ~ validate_expr }
 wait_timeout_attr = { kw_timeout ~ trivia* ~ equals ~ trivia* ~ duration_literal }
 wait_depends_on_attr = {
-    kw_depends_on ~ trivia* ~ equals ~ trivia* ~ open_bracket ~ trivia* ~ (identifier ~ (trivia* ~ comma ~ trivia* ~ identifier)*)? ~ trivia* ~ comma? ~ trivia* ~ close_bracket
+    kw_depends_on ~ trivia* ~ equals ~ trivia* ~ list
 }
 
 // Primary value

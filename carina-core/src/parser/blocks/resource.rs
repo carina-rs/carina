@@ -5,7 +5,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use crate::eval_value::{EvalValue, ParsedSinkValue, StructuralHandleKind};
+use crate::eval_value::{EvalValue, ParsedSinkValue, UnexpandedStructuralHandleKind};
 use crate::parser::context::{
     ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
 };
@@ -23,9 +23,10 @@ use crate::resource::{
     AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
     AuthoredDirectives as Directives, DiagnosticSourceLocations, LoopElementOrigin, LoopProvenance,
     ParsedIgnorePath, ParsedIgnorePathSegment, RelativeBindingName, ResourceId, ResourceIdentity,
+    UnexpandedDependencyFields,
 };
 use indexmap::IndexMap;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 pub(in crate::parser) fn parse_anonymous_resource(
     pair: pest::iterators::Pair<Rule>,
@@ -104,7 +105,10 @@ pub(crate) fn parse_resource_for_target(
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
     let attributes = parsed_contents.attributes;
-    let directives = parsed_contents.directives.unwrap_or_default();
+    let ParsedDirectives {
+        directives,
+        depends_on,
+    } = parsed_contents.directives.unwrap_or_default();
 
     let (id, binding, loop_provenance) = match target {
         ResourceParseTarget::Pending { origin } => (
@@ -145,7 +149,10 @@ pub(crate) fn parse_resource_for_target(
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding,
-        dependency_bindings: BTreeSet::new(),
+        dependencies: UnexpandedDependencyFields {
+            value_bindings: Default::default(),
+            depends_on,
+        },
         module_source: None,
         default_tag_keys: Default::default(),
         loop_provenance,
@@ -170,8 +177,14 @@ pub(crate) fn parse_block_contents_with_mode(
 
 struct ParsedBlockContents {
     attributes: IndexMap<String, Value>,
-    directives: Option<Directives>,
+    directives: Option<ParsedDirectives>,
     pending: bool,
+}
+
+#[derive(Default)]
+struct ParsedDirectives {
+    directives: Directives,
+    depends_on: crate::parser::UnexpandedDependencies<RelativeBindingName>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,7 +435,10 @@ pub(crate) fn parse_read_resource_expr(
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
     let attributes = parsed_contents.attributes;
-    let directives = parsed_contents.directives.unwrap_or_default();
+    let ParsedDirectives {
+        directives,
+        depends_on: _,
+    } = parsed_contents.directives.unwrap_or_default();
 
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
@@ -440,7 +456,7 @@ pub(crate) fn parse_read_resource_expr(
         attributes: attributes.into_iter().collect(),
         directives,
         binding: Some(RelativeBindingName::new(binding_name)),
-        dependency_bindings: BTreeSet::new(),
+        dependencies: Default::default(),
         module_source: None,
         quoted_string_attrs,
     })
@@ -449,8 +465,8 @@ pub(crate) fn parse_read_resource_expr(
 fn parse_directives(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
-) -> Result<Directives, ParseError> {
-    let mut directives = Directives::default();
+) -> Result<ParsedDirectives, ParseError> {
+    let mut parsed_directives = ParsedDirectives::default();
 
     for content_pair in pairs {
         let attr = match content_pair.as_rule() {
@@ -478,20 +494,24 @@ fn parse_directives(
                         ParseError::InvalidExpression {
                             line,
                             message:
-                                "directives.ignore_changes: must be a list of bare attribute paths"
+                                "parsed_directives.directives.ignore_changes: must be a list of bare attribute paths"
                                     .to_string(),
                         }
                     })?;
-                let list = first_inner(primary, "list", "directives.ignore_changes")?;
+                let list = first_inner(
+                    primary,
+                    "list",
+                    "parsed_directives.directives.ignore_changes",
+                )?;
                 if list.as_rule() != Rule::list {
                     return Err(ParseError::InvalidExpression {
                         line,
                         message:
-                            "directives.ignore_changes: must be a list of bare attribute paths"
+                            "parsed_directives.directives.ignore_changes: must be a list of bare attribute paths"
                                 .to_string(),
                     });
                 }
-                directives.ignore_changes = list
+                parsed_directives.directives.ignore_changes = list
                     .into_inner()
                     .map(|element| parse_ignore_change_path(element, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -501,38 +521,37 @@ fn parse_directives(
                     crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
                         ParseError::InvalidExpression {
                             line,
-                            message: "directives.depends_on: must be a list of binding identifiers"
+                            message: "parsed_directives.directives.depends_on: must be a list of binding identifiers"
                                 .to_string(),
                         }
                     })?;
-                let list = first_inner(primary, "list", "directives.depends_on")?;
+                let list = first_inner(primary, "list", "parsed_directives.directives.depends_on")?;
                 if list.as_rule() != Rule::list {
                     return Err(ParseError::InvalidExpression {
                         line,
-                        message: "directives.depends_on: must be a list of binding identifiers"
+                        message: "parsed_directives.directives.depends_on: must be a list of binding identifiers"
                             .to_string(),
                     });
                 }
-                let mut names = Vec::new();
+                let mut operands = Vec::new();
                 let mut source_lines = Vec::new();
                 for element in list.into_inner() {
-                    let element_line = element.line_col().0;
-                    let eval = parse_expression_eval(element, ctx)?;
-                    names.push(eval_as_binding_name(
-                        eval,
-                        "depends_on: list elements",
-                        element_line,
-                        BindingNameUse::Dependency,
-                    )?);
-                    source_lines.push(element_line);
+                    source_lines.push(element.line_col().0);
+                    operands.push(
+                        crate::parser::expressions::dependency::parse_dependency_operand(
+                            element,
+                            ctx,
+                            "parsed_directives.directives.depends_on",
+                        )?,
+                    );
                 }
-                directives.depends_on = names.into_iter().map(RelativeBindingName::new).collect();
-                directives.depends_on_diagnostic_sources =
+                parsed_directives.depends_on = crate::parser::UnexpandedDependencies::new(operands);
+                parsed_directives.directives.depends_on_diagnostic_sources =
                     DiagnosticSourceLocations::authored(ctx.source_file(), source_lines);
             }
             "provider" => {
                 let eval = parse_expression_eval(value_pair, ctx)?;
-                directives.provider_instance = Some(eval_as_binding_name(
+                parsed_directives.directives.provider_instance = Some(eval_as_binding_name(
                     eval,
                     "provider: value",
                     line,
@@ -540,13 +559,13 @@ fn parse_directives(
                 )?);
             }
             "force_delete" => {
-                directives.force_delete = matches!(
+                parsed_directives.directives.force_delete = matches!(
                     parse_expression(value_pair, ctx)?,
                     Value::Concrete(ConcreteValue::Bool(true))
                 );
             }
             "create_before_destroy" => {
-                directives.create_before_destroy = matches!(
+                parsed_directives.directives.create_before_destroy = matches!(
                     parse_expression(value_pair, ctx)?,
                     Value::Concrete(ConcreteValue::Bool(true))
                 );
@@ -575,10 +594,10 @@ fn parse_directives(
                 };
                 let parsed = parse_expression(value_pair, ctx)?;
                 match literal {
-                    Some(value) => directives.set_prevent_destroy(value),
+                    Some(value) => parsed_directives.directives.set_prevent_destroy(value),
                     None => {
                         if matches!(parsed, Value::Concrete(ConcreteValue::Bool(true))) {
-                            directives.set_prevent_destroy(true);
+                            parsed_directives.directives.set_prevent_destroy(true);
                         } else {
                             ctx.push_warning(ParseWarning {
                                 file: None,
@@ -595,7 +614,7 @@ fn parse_directives(
         }
     }
 
-    Ok(directives)
+    Ok(parsed_directives)
 }
 
 fn parse_ignore_change_path(
@@ -671,7 +690,6 @@ fn invalid_ignore_change_path(line: usize, authored: &str) -> ParseError {
 
 #[derive(Clone, Copy)]
 enum BindingNameUse {
-    Dependency,
     Provider,
 }
 
@@ -682,24 +700,17 @@ fn eval_as_binding_name(
     usage: BindingNameUse,
 ) -> Result<String, ParseError> {
     match eval {
-        EvalValue::StructuralHandle(handle) => {
-            let accepted = match usage {
-                BindingNameUse::Dependency => handle.kind().is_dependency_target(),
-                BindingNameUse::Provider => {
-                    matches!(handle.kind(), StructuralHandleKind::Provider)
-                }
-            };
+        EvalValue::UnexpandedStructuralHandle(handle) => {
+            let accepted = matches!(handle.kind(), UnexpandedStructuralHandleKind::Provider);
             if accepted {
                 Ok(handle.canonical_binding_name().to_string())
             } else {
                 let binding = handle
                     .alias_name()
-                    .unwrap_or_else(|| handle.canonical_binding_name());
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|| std::borrow::Cow::Borrowed(handle.canonical_binding_name()));
                 let description = handle.kind().description();
                 let message = match usage {
-                    BindingNameUse::Dependency => format!(
-                        "directives.depends_on: '{binding}' is {description} and cannot be used as a dependency target"
-                    ),
                     BindingNameUse::Provider => format!(
                         "directives.provider: '{binding}' is {description}, not a provider instance"
                     ),
@@ -707,12 +718,6 @@ fn eval_as_binding_name(
                 Err(ParseError::InvalidExpression { line, message })
             }
         }
-        EvalValue::User(Value::Deferred(DeferredValue::Placeholder(
-            crate::resource::ParserPlaceholder::ModuleArgument {
-                name,
-                diagnostic: _,
-            },
-        ))) if matches!(usage, BindingNameUse::Dependency) => Ok(name),
         EvalValue::User(Value::Deferred(DeferredValue::Placeholder(
             crate::resource::ParserPlaceholder::ModuleArgument {
                 name,

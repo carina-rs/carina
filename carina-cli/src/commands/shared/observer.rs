@@ -231,7 +231,7 @@ fn format_wait_observed_attr(observation: &WaitObservation) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
@@ -323,7 +323,7 @@ mod tests {
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new((resource).into_value_snapshot())
     }
 
     fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
@@ -337,13 +337,13 @@ mod tests {
     fn dummy_wait_effect() -> Effect {
         let target = resolved(Resource::new("aws.acm.Certificate", "demo"));
         Effect::Wait {
-            identity: absolute_binding("demo_ready"),
+            id: carina_core::resource::ResolvedResourceId::with_identity("__wait", "demo_ready"),
             target_id: carina_core::wait::ManagedWaitTarget::for_test(&target),
             until: equals_predicate(AttrPath::single("status"), "issued"),
             until_surface: "demo.status == issued".to_string(),
             timeout: Duration::from_secs(300),
             interval: Duration::from_secs(5),
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         }
     }
 
@@ -354,9 +354,9 @@ mod tests {
             generation,
             directives: Default::default(),
             binding: Some(absolute_binding("same")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }
     }
 
@@ -712,7 +712,11 @@ mod tests {
         }
         let effects: Vec<Effect> = ["blocked", "a", "b", "c", "provider"]
             .into_iter()
-            .map(|name| Effect::Create(ResolvedResource::new(Resource::new("test.resource", name))))
+            .map(|name| {
+                Effect::Create(ResolvedResource::new(
+                    (Resource::new("test.resource", name)).into_value_snapshot(),
+                ))
+            })
             .collect();
         let deps = HashMap::from([
             (0, HashSet::from([3])),

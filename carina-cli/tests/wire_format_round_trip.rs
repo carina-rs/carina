@@ -39,8 +39,8 @@ fn assert_module_prefixed_addresses(addresses: BTreeSet<String>) {
 }
 
 #[test]
-fn pre_change_state_binding_addresses_keep_the_existing_wire_shape() {
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.state.json");
+fn current_state_binding_addresses_and_resolved_dependencies_round_trip() {
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v21.state.json");
     let original: Value = serde_json::from_str(fixture).expect("fixture must contain valid JSON");
     let decoded: StateFile = check_and_migrate(fixture)
         .expect("fixture must pass the state version gate")
@@ -48,13 +48,7 @@ fn pre_change_state_binding_addresses_keep_the_existing_wire_shape() {
     let addresses = decoded
         .resources()
         .iter()
-        .flat_map(|resource| {
-            resource
-                .binding
-                .iter()
-                .chain(&resource.dependency_bindings)
-                .chain(&resource.directives.depends_on)
-        })
+        .flat_map(|resource| resource.binding.iter())
         .map(|address| address.as_str().to_string())
         .collect();
     let reserialized = serde_json::to_value(&decoded).expect("fixture must re-serialize");
@@ -64,8 +58,8 @@ fn pre_change_state_binding_addresses_keep_the_existing_wire_shape() {
 }
 
 #[test]
-fn pre_change_saved_plan_binding_addresses_keep_the_existing_wire_shape() {
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.plan.json");
+fn current_saved_plan_binding_addresses_and_resolved_dependencies_round_trip() {
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v38.plan.json");
     assert_json_value_round_trip::<PlanFile>(fixture);
 
     let decoded: PlanFile = serde_json::from_str(fixture).expect("fixture must deserialize");
@@ -77,47 +71,49 @@ fn pre_change_saved_plan_binding_addresses_keep_the_existing_wire_shape() {
             UnresolvedSavedEffect::Create(resource) => Some(resource),
             _ => None,
         })
-        .flat_map(|resource| {
-            resource
-                .binding
-                .iter()
-                .chain(&resource.dependency_bindings)
-                .chain(&resource.directives.depends_on)
-        })
+        .flat_map(|resource| resource.as_resource().binding.iter())
         .map(|address| address.as_str().to_string())
         .collect();
 
     assert_module_prefixed_addresses(addresses);
 }
 
-fn json_strings(value: &Value) -> BTreeSet<String> {
+fn json_dependency_identities(value: &Value) -> BTreeSet<String> {
     value
         .as_array()
-        .expect("binding-address slot must be a JSON array")
+        .expect("resolved-dependency slot must be a JSON array")
         .iter()
         .map(|value| {
-            value
+            assert!(
+                value["provider"].is_string(),
+                "dependency includes provider routing: {value}"
+            );
+            assert!(
+                value["resource_type"].is_string(),
+                "dependency includes resource type: {value}"
+            );
+            value["identity"]
                 .as_str()
-                .expect("binding address must stay a JSON string")
-                .to_string()
+                .expect("dependency includes resolved identity")
+                .to_owned()
         })
         .collect()
 }
 
 #[test]
-fn base_binary_deferred_effects_keep_v37_ids_and_typed_template_addresses() {
+fn current_deferred_effects_keep_bound_wire_ids_and_typed_template_addresses() {
     for (fixture, variant) in [
         (
-            include_str!("fixtures/module_binding_wire_compat/carina.plan.json"),
+            include_str!("fixtures/module_binding_wire_compat/carina.v38.plan.json"),
             "DeferredCreate",
         ),
         (
-            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.plan.json"),
+            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v38.plan.json"),
             "DeferredReplace",
         ),
     ] {
         let round_tripped = assert_json_value_round_trip::<PlanFile>(fixture);
-        assert_eq!(round_tripped["version"], 37);
+        assert_eq!(round_tripped["version"], 38);
         let deferred = round_tripped["plan"]["effects"]
             .as_array()
             .expect("saved effects")
@@ -133,7 +129,7 @@ fn base_binary_deferred_effects_keep_v37_ids_and_typed_template_addresses() {
             bindings.insert(binding.to_owned());
             assert_eq!(
                 effect["id"]["identity"], binding,
-                "v37 wire identity remains the bound spelling"
+                "bound wire identity remains the bound spelling"
             );
             assert_eq!(
                 effect["template"]["template_resource"]["id"]["identity"],
@@ -155,9 +151,9 @@ fn base_binary_deferred_effects_keep_v37_ids_and_typed_template_addresses() {
 }
 
 #[test]
-fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
+fn current_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
     let fixture =
-        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.plan.json");
+        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v38.plan.json");
     let round_tripped = assert_json_value_round_trip::<PlanFile>(fixture);
 
     let wait_bindings = round_tripped["wait_bindings"]
@@ -209,7 +205,7 @@ fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
         .collect::<Vec<_>>();
     assert_eq!(waits.len(), 2, "fixture must exercise Wait effects");
     for wait in waits {
-        let identity = wait["identity"].as_str().expect("wait identity");
+        let identity = wait["id"]["identity"].as_str().expect("wait identity");
         let prefix = identity
             .strip_suffix(".consumer_ready")
             .expect("module-prefixed wait identity");
@@ -220,7 +216,7 @@ fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
             "Wait target must retain its absolute spelling",
         );
         assert_eq!(
-            json_strings(&wait["explicit_dependencies"]),
+            json_dependency_identities(&wait["explicit_dependencies"]),
             BTreeSet::from([format!("{prefix}.seed")]),
             "Wait dependencies must retain absolute spellings",
         );
@@ -237,12 +233,12 @@ fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
             .strip_suffix(".consumer")
             .expect("module-prefixed consumer update");
         assert_eq!(
-            json_strings(&update["from"]["dependency_bindings"]),
+            json_dependency_identities(&update["from"]["dependency_bindings"]),
             BTreeSet::from([format!("{prefix}.seed"), "root".to_string()]),
             "Update.from dependency bindings must retain absolute spellings",
         );
         assert_eq!(
-            json_strings(&update["to"]["directives"]["depends_on"]),
+            json_dependency_identities(&update["to"]["explicit_dependencies"]),
             BTreeSet::from([format!("{prefix}.seed"), "root".to_string()]),
             "Update.to directive dependencies must retain absolute spellings",
         );
@@ -289,8 +285,8 @@ fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
     );
     for delete in source_deletes {
         assert_eq!(delete["id"]["identity"], delete["binding"]);
-        assert!(json_strings(&delete["dependencies"]).is_empty());
-        assert!(json_strings(&delete["explicit_dependencies"]).is_empty());
+        assert!(json_dependency_identities(&delete["dependencies"]).is_empty());
+        assert!(json_dependency_identities(&delete["explicit_dependencies"]).is_empty());
     }
     for delete in nested_deletes {
         let binding = delete["binding"].as_str().expect("delete binding");
@@ -299,19 +295,18 @@ fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
             .expect("module-prefixed nested delete");
         let expected = BTreeSet::from([format!("{prefix}.consumer")]);
         assert_eq!(
-            json_strings(&delete["dependencies"]),
+            json_dependency_identities(&delete["dependencies"]),
             expected,
             "Delete dependencies must retain absolute spellings",
         );
         assert_eq!(
-            json_strings(&delete["explicit_dependencies"]),
+            json_dependency_identities(&delete["explicit_dependencies"]),
             expected,
             "Delete explicit dependencies must retain absolute spellings",
         );
-        assert_eq!(
-            json_strings(&delete["directives"]["depends_on"]),
-            expected,
-            "Delete directive dependencies must retain absolute spellings",
+        assert!(
+            delete["directives"].get("depends_on").is_none(),
+            "authored dependency operands cannot reappear on a resolved delete"
         );
     }
 }

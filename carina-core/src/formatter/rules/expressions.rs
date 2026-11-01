@@ -461,25 +461,13 @@ impl Formatter {
         let key = "depends_on";
         self.write(key);
         self.write_alignment_padding(key.len(), align_to);
-        self.write(" = [");
+        self.write(" = ");
 
-        let mut first = true;
         for child in &node.children {
-            if let CstChild::Token(token) = child {
-                match token.text.as_str() {
-                    "depends_on" | "=" | "[" | "]" | "," => continue,
-                    s if self.is_identifier(s) => {
-                        if !first {
-                            self.write(", ");
-                        }
-                        self.write_token(s);
-                        first = false;
-                    }
-                    _ => {}
-                }
+            if let CstChild::Node(list) = child {
+                self.format_node(list);
             }
         }
-        self.write("]");
         self.write_newline();
     }
 

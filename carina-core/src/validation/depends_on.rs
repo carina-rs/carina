@@ -14,7 +14,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
-use crate::parser::{File, ResourceRef};
+use crate::parser::{File, ResourceRef, UnexpandedDependencyOperand};
+
+use super::{DependencyArgumentResolution, ResolvedArgumentTypes, ResolvedDependencyArgumentType};
 use crate::resource::{BindingAddress, ModuleSource, ParserPlaceholder};
 
 type ParsedResourceRef<'a, D, B> =
@@ -77,25 +79,33 @@ impl DependsOnDiagnostic {
 
 /// The `directives.depends_on` list of a resource, or an empty slice.
 ///
-/// `LiveComposition` carries no directives — [`ResourceRef::directives`]
-/// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<B, D>(rref: ParsedResourceRef<'_, D, B>) -> &[B]
+/// `LiveComposition` carries no explicit dependencies and is treated as an
+/// empty `depends_on` list.
+fn depends_on_of<'a, B: BindingAddress, D>(
+    rref: ParsedResourceRef<'a, D, B>,
+) -> Option<&'a crate::parser::UnexpandedDependencies<B>>
 where
-    B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    rref.directives()
-        .map_or(&[][..], |d| d.depends_on.as_slice())
+    rref.explicit_dependencies()
 }
 
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
-pub fn validate_depends_on<E, B, D>(
+///
+/// Raw parses cannot be checked without the argument-type resolution witness:
+///
+/// ```compile_fail,E0061
+/// use carina_core::{parser::ParsedFile, validation::depends_on::validate_depends_on};
+/// let unresolved = ParsedFile::default();
+/// validate_depends_on(&unresolved);
+/// ```
+pub fn validate_depends_on<E, B: BindingAddress, D>(
     parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    argument_types: &ResolvedArgumentTypes,
 ) -> Vec<DependsOnDiagnostic>
 where
-    B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     // Common-case fast path: the vast majority of resources will have
@@ -104,7 +114,7 @@ where
     // (per the carina-core "directory-scoped, never single-file" rule).
     let resources_have_no_depends_on = parsed
         .iter_all_resources()
-        .all(|rref| depends_on_of(rref).is_empty());
+        .all(|rref| depends_on_of(rref).is_none_or(|dependencies| dependencies.is_empty()));
     if resources_have_no_depends_on {
         return Vec::new();
     }
@@ -126,17 +136,35 @@ where
     // it from the module signature instead of reconstructing validity from
     // `bindings_by_name`. Expansion performs the corresponding value-vs-handle
     // check and rewrites the dependency to the caller's canonical binding.
-    let module_parameter_names: HashSet<&str> = parsed
-        .arguments
+    let module_parameters = &argument_types.types;
+    let mut managed_group_names = parsed
+        .parser_binding_metadata
+        .structural_handles()
         .iter()
-        .map(|argument| argument.name.as_str())
-        .collect();
+        .filter(|(_binding, handle)| handle.is_for_binding())
+        .map(|(binding, _handle)| binding.to_string())
+        .collect::<HashSet<_>>();
+    for resource in parsed.iter_all_resources() {
+        if !matches!(
+            resource,
+            ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
+        ) {
+            continue;
+        }
+        if let Some(binding) = resource.binding_address() {
+            managed_group_names.extend(
+                crate::resolved_graph::loop_group_bindings(binding)
+                    .into_iter()
+                    .map(|group| group.to_string()),
+            );
+        }
+    }
 
     let mut check_resource =
         |binding: Option<&str>,
          attributes: &indexmap::IndexMap<String, crate::resource::Value<ParserPlaceholder, B>>,
          dependency_bindings: &std::collections::BTreeSet<B>,
-         depends_on: &[B]| {
+         depends_on: &crate::parser::UnexpandedDependencies<B>| {
             if depends_on.is_empty() {
                 return;
             }
@@ -153,30 +181,31 @@ where
                 value_ref_deps.insert(name.clone());
             }
 
-            let mut seen: HashSet<&str> = HashSet::new();
-            let mut duplicate_warned: HashSet<&str> = HashSet::new();
-            for dep_name in depends_on {
-                if !seen.insert(dep_name.as_str()) {
-                    if duplicate_warned.insert(dep_name.as_str()) {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut duplicate_warned: HashSet<String> = HashSet::new();
+            for operand in depends_on.iter() {
+                let dep_name = operand.diagnostic_reference();
+                if !seen.insert(dep_name.clone()) {
+                    if duplicate_warned.insert(dep_name.clone()) {
                         diags.push(
                         DependsOnDiagnostic::warning(format!(
                             "directives.depends_on on '{}': binding '{}' is listed multiple times",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name.as_str()),
+                        .at_element(self_name, &dep_name),
                     );
                     }
                     continue;
                 }
 
-                if dep_name.as_str() == self_name {
+                if dep_name == self_name {
                     diags.push(
                         DependsOnDiagnostic::error(format!(
                             "directives.depends_on on '{}': self-reference is not allowed \
                          (binding '{}' depends on itself)",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name.as_str()),
+                        .at_element(self_name, &dep_name),
                     );
                     continue;
                 }
@@ -188,21 +217,45 @@ where
                          is not a valid depends_on target",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name.as_str()),
+                        .at_element(self_name, &dep_name),
                     );
                     continue;
                 }
 
                 let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
-                    if module_parameter_names.contains(dep_name.as_str()) {
+                    if matches!(operand, UnexpandedDependencyOperand::BareBinding(_))
+                        && managed_group_names.contains(dep_name.as_str())
+                    {
                         continue;
+                    }
+                    if matches!(operand, UnexpandedDependencyOperand::Handle(_)) {
+                        continue;
+                    }
+                    if let Some(parameter_type) = module_parameters.get(dep_name.as_str()) {
+                        match parameter_type {
+                            DependencyArgumentResolution::Unresolved
+                            | DependencyArgumentResolution::Resolved(
+                                ResolvedDependencyArgumentType::ManagedHandle,
+                            ) => continue,
+                            DependencyArgumentResolution::Resolved(
+                                ResolvedDependencyArgumentType::Value(parameter_type),
+                            ) => {
+                                diags.push(
+                                DependsOnDiagnostic::error(format!(
+                                    "directives.depends_on: expected a managed resource handle; got {parameter_type}",
+                                ))
+                                .at_element(self_name, &dep_name),
+                            );
+                                continue;
+                            }
+                        }
                     }
                     diags.push(
                     DependsOnDiagnostic::error(format!(
                         "directives.depends_on on '{}': binding '{}' is not declared in this scope",
                         self_name, dep_name
                     ))
-                    .at_element(self_name, dep_name.as_str()),
+                    .at_element(self_name, &dep_name),
                 );
                     continue;
                 };
@@ -214,31 +267,34 @@ where
                          depends_on targets (binding '{}')",
                             self_name, dep_name
                         ))
-                        .at_element(self_name, dep_name.as_str()),
+                        .at_element(self_name, &dep_name),
                     );
                     continue;
                 }
 
-                if value_ref_deps.contains(dep_name) {
+                if value_ref_deps.contains(&operand.binding_reference()) {
                     diags.push(
                         DependsOnDiagnostic::warning(format!(
                             "directives.depends_on on '{}': edge to '{}' is redundant; \
                          '{}' is already referenced by value",
                             self_name, dep_name, dep_name
                         ))
-                        .at_element(self_name, dep_name.as_str()),
+                        .at_element(self_name, &dep_name),
                     );
                 }
             }
         };
 
     for resource in parsed.iter_all_resources() {
+        let Some(depends_on) = depends_on_of(resource) else {
+            continue;
+        };
         let attributes = resource.attributes();
         check_resource(
             resource.binding(),
             &attributes,
             resource.dependency_bindings(),
-            depends_on_of(resource),
+            depends_on,
         );
     }
 
@@ -266,6 +322,26 @@ mod tests {
     use super::*;
     use crate::parser::{ProviderContext, parse, parse_and_resolve};
 
+    fn check<
+        E: crate::parser::ExportParamLike + Clone,
+        D: crate::parser::DeferredForPhaseTraversal + Clone,
+    >(
+        parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
+    ) -> Vec<DependsOnDiagnostic> {
+        let mut parsed = parsed.clone();
+        let report = super::super::resolve_file_type_exprs_report(
+            &mut parsed,
+            &ProviderContext::default(),
+            None,
+        );
+        assert!(
+            report.diagnostics().is_empty(),
+            "{:?}",
+            report.diagnostics()
+        );
+        validate_depends_on(&parsed, report.resolved_argument_types())
+    }
+
     fn diag_messages(diags: &[DependsOnDiagnostic], sev: Severity) -> Vec<String> {
         diags
             .iter()
@@ -283,7 +359,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -311,7 +387,7 @@ mod tests {
         .expect("fixture must parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
 
-        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        let errors = diag_messages(&check(&parsed), Severity::Error);
         assert!(
             errors
                 .iter()
@@ -329,7 +405,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -353,7 +429,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -377,7 +453,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         let role_warnings: Vec<_> = warnings
             .iter()
@@ -388,6 +464,25 @@ mod tests {
             1,
             "expected exactly one duplicate warning per binding, got {:?}",
             warnings
+        );
+    }
+
+    #[test]
+    fn managed_for_group_is_a_valid_explicit_dependency() {
+        let src = r#"
+            let records = for name in ["one", "two"] {
+                aws.s3.Bucket { bucket_name = name }
+            }
+            let consumer = aws.s3.Bucket {
+                bucket_name = "consumer"
+                directives { depends_on = [records] }
+            }
+        "#;
+        let parsed = parse_and_resolve(src).unwrap();
+        let errors = diag_messages(&check(&parsed), Severity::Error);
+        assert!(
+            errors.is_empty(),
+            "expanded managed groups are valid dependency targets: {errors:?}",
         );
     }
 
@@ -404,7 +499,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -428,7 +523,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -452,8 +547,8 @@ mod tests {
         let rendered = error.to_string();
         assert!(
             rendered.contains("line 5")
-                && rendered.contains("'orgs' is an upstream state")
-                && rendered.contains("cannot be used as a dependency target"),
+                && rendered.contains("expected a managed resource handle")
+                && rendered.contains("got an upstream state"),
             "expected a typed upstream-state directive error, got {rendered:?}",
         );
     }
@@ -470,7 +565,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -497,7 +592,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -521,7 +616,7 @@ mod tests {
             }
         "#;
         let parsed = parse(src, &ProviderContext::default()).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -553,7 +648,7 @@ mod tests {
             }
         "#;
         let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -577,7 +672,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = validate_depends_on(&parsed);
+        let diags = check(&parsed);
         assert!(
             diags.is_empty(),
             "expected zero diagnostics for valid depends_on, got {:?}",

@@ -903,6 +903,9 @@ impl std::error::Error for AwsCredentialStartupError {}
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error(transparent)]
+    ExportBoundary(#[from] carina_core::validation::ExportBoundaryError),
+
     /// Provider installation, egress consent, or initialization failed.
     #[error(transparent)]
     Init(Box<crate::commands::init::InitError>),
@@ -945,6 +948,11 @@ pub enum AppError {
     /// Identity assignment was incomplete at a resolved-only pipeline boundary.
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
+
+    /// A post-expansion handle or dependency operand could not be mapped to
+    /// one complete scheduler address.
+    #[error(transparent)]
+    ExpandedGraphResolution(Box<carina_core::resolved_graph::ExpandedGraphResolutionError>),
 
     /// A resource's authored lifecycle paths could not cross the
     /// schema-resolved planning boundary.
@@ -1039,9 +1047,9 @@ pub enum AppError {
     #[error(transparent)]
     DestroyDependencyAnalysis(#[from] DestroyDependencyAnalysisError),
 
-    /// Distinct desired resources resolved to the same execution identity.
+    /// Authored resource origins could not be indexed by resolved identity.
     #[error(transparent)]
-    DuplicateResolvedResourceId(#[from] crate::wiring::DuplicateResolvedResourceIdError),
+    ResolvedResourceOriginIndex(#[from] crate::wiring::ResolvedResourceOriginIndexError),
 
     /// A provider-boundary check failed for a resource before dispatch.
     #[error(transparent)]
@@ -1398,6 +1406,12 @@ impl From<carina_core::resource::LeftoverPlaceholders> for AppError {
     }
 }
 
+impl From<carina_core::resolved_graph::ExpandedGraphResolutionError> for AppError {
+    fn from(error: carina_core::resolved_graph::ExpandedGraphResolutionError) -> Self {
+        Self::ExpandedGraphResolution(Box::new(error))
+    }
+}
+
 impl From<String> for AppError {
     fn from(s: String) -> Self {
         AppError::Config(s)
@@ -1421,16 +1435,12 @@ mod tests {
     use super::*;
 
     fn dependency_analysis_failure() -> carina_core::effect::deps::DependencyAnalysisFailure {
-        use std::collections::{HashMap, HashSet};
-
-        use carina_core::effect::deps::{
-            ScheduleInputs, UnresolvedResource, build_effect_dependency_analysis,
-        };
+        use carina_core::effect::deps::{ScheduleInputs, build_effect_dependency_analysis};
         use carina_core::effect::{Effect, EffectGeneration};
         use carina_core::resource::ResolvedResourceId;
 
         let id = ResourceId::with_provider_identity("mock", "test.Widget", "example", None);
-        let effect = Effect::Delete {
+        let effect: Effect = Effect::Delete {
             id: ResolvedResourceId::try_new(id).expect("fixture identity is resolved"),
             identifier: carina_core::provider::AppliedIdentifier::new("provider-id")
                 .expect("fixture provider identifier is non-empty"),
@@ -1439,17 +1449,20 @@ mod tests {
             binding: Some(carina_core::resource::absolute_binding_address_for_test(
                 "example",
             )),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::from(["missing-consumer".into()]),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: std::iter::once(
+                carina_core::resource::ResolvedResourceId::with_provider_identity(
+                    "mock",
+                    "test.Resource",
+                    "missing-consumer",
+                    None,
+                ),
+            )
+            .collect(),
         };
-        build_effect_dependency_analysis(
-            &[effect],
-            &HashMap::<ResourceId, UnresolvedResource>::new(),
-            &[],
-            ScheduleInputs::Apply,
-        )
-        .expect_err("missing required target must fail dependency analysis")
+        build_effect_dependency_analysis(&[effect], std::iter::empty(), ScheduleInputs::Apply)
+            .expect_err("missing required target must fail dependency analysis")
     }
 
     #[test]

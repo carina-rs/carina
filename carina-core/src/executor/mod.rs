@@ -62,8 +62,7 @@ pub struct PlanSchedulerEndpoint {
 /// scheduler's behavior for unaffected effects.
 pub fn build_plan_scheduler_dependency_edges(
     plan_effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::LiveComposition],
+    unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
     let parallel::ExpandedEffects {
         effects,
@@ -77,7 +76,6 @@ pub fn build_plan_scheduler_dependency_edges(
     let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps_from_resources(
         &effects,
         unresolved_resources,
-        compositions,
         &deferred_replace_delete_deps,
     );
 
@@ -105,6 +103,7 @@ pub fn build_plan_scheduler_dependency_edges(
         .collect()
 }
 
+use crate::resource::ResolvedResourceId;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -382,9 +381,14 @@ impl AcceptedRequest {
     /// accepted request. Production executor paths retain resolved values;
     /// provider-ready bootstrap and test paths may use the supplied resource
     /// as their already-resolved fallback.
-    pub fn sent_desired_attributes<'a, S>(
+    pub fn sent_desired_attributes<'a, S, D>(
         &'a self,
-        fallback_resource: &'a Resource<S>,
+        fallback_resource: &'a Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> SentDesiredAttributes<'a> {
         match self.resolved_desired_attributes.as_ref() {
             Some(attributes) => {
@@ -529,23 +533,11 @@ impl RuntimeCompositions<'_> {
     fn scheduler_dependencies<S>(
         self,
         effects: &[Effect<S>],
-        unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
+        unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
         deferred_replace_delete_deps: &[(usize, usize)],
     ) -> scheduler::SchedulerDeps {
-        match self {
-            Self::Live(compositions) => scheduler::build_scheduler_deps(
-                effects,
-                unresolved_resources,
-                compositions,
-                deferred_replace_delete_deps,
-            ),
-            Self::Saved(compositions) => scheduler::build_saved_scheduler_deps(
-                effects,
-                unresolved_resources,
-                compositions,
-                deferred_replace_delete_deps,
-            ),
-        }
+        let _ = self;
+        scheduler::build_scheduler_deps(effects, unresolved_resources, deferred_replace_delete_deps)
     }
 }
 
@@ -657,13 +649,18 @@ impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a, SavedModule
 pub enum ProviderCheckInputs<'a, S = ModuleSource> {
     Authored,
     PlanNormalized {
-        resource_origins: &'a HashMap<ResourceId, UnresolvedResource<S>>,
-        data_source_origins: &'a [DataSource<S>],
+        resource_origins: &'a HashMap<ResolvedResourceId, UnresolvedResource<S>>,
+        data_source_origins: &'a [DataSource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >],
     },
 }
 
 impl<S: Clone> ProviderCheckInputs<'_, S> {
-    fn resource_origins(&self) -> Option<&HashMap<ResourceId, UnresolvedResource<S>>> {
+    fn resource_origins(&self) -> Option<&HashMap<ResolvedResourceId, UnresolvedResource<S>>> {
         match self {
             Self::Authored => None,
             Self::PlanNormalized {
@@ -674,9 +671,30 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
 
     pub(in crate::executor) fn resource_input(
         &self,
-        resolved: &Resource<S>,
+        resolved: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >,
         runtime_authored: bool,
-    ) -> Result<provider_ready::CheckInput<Resource<S>>, String> {
+    ) -> Result<
+        provider_ready::CheckInput<
+            Resource<
+                S,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                (),
+            >,
+            Resource<
+                S,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                (),
+            >,
+        >,
+        String,
+    > {
         if runtime_authored || matches!(self, Self::Authored) {
             return Ok(provider_ready::CheckInput::Authored(resolved.clone()));
         }
@@ -700,8 +718,29 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
 
     pub(in crate::executor) fn data_source_input(
         &self,
-        resolved: &DataSource<S>,
-    ) -> Result<provider_ready::CheckInput<DataSource<S>>, String> {
+        resolved: &DataSource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >,
+    ) -> Result<
+        provider_ready::CheckInput<
+            DataSource<
+                S,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                (),
+            >,
+            DataSource<
+                S,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                (),
+            >,
+        >,
+        String,
+    > {
         match self {
             Self::Authored => Ok(provider_ready::CheckInput::Authored(resolved.clone())),
             Self::PlanNormalized {
@@ -779,8 +818,13 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
     }
 }
 
-pub fn unresolved_data_source_inputs<S>(
-    resource: &DataSource<S>,
+pub fn unresolved_data_source_inputs<S, D>(
+    resource: &DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> Vec<UnresolvedDataSourceInput> {
     resource
         .attributes

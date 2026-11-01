@@ -82,16 +82,6 @@ fn validate_rejects_bare_resource_handles_in_value_positions() {
             2,
         ),
         (
-            "let vpc = mock.test.resource { name = \"vpc\" }\nexports { handle: String = vpc }\n",
-            "vpc",
-            2,
-        ),
-        (
-            "let vpc = mock.test.resource { name = \"vpc\" }\nexports { handle = vpc }\n",
-            "vpc",
-            2,
-        ),
-        (
             "let vpc = mock.test.resource { name = \"vpc\" }\nlet rendered = \"prefix-${vpc}\"\n",
             "vpc",
             2,
@@ -214,7 +204,7 @@ fn validate_rejects_sibling_and_module_boundary_bare_handles() {
                 "let internal = mock.test.resource { name = \"internal\" }\nattributes { handle: String = internal }\n",
             ),
         ],
-        "'internal' is a resource, not a value",
+        "attribute 'handle': expected String; got resource handle mock.test.resource",
         2,
     );
 }
@@ -248,7 +238,7 @@ fn validate_names_the_file_that_owns_a_sibling_bare_handle_error() {
 }
 
 #[test]
-fn cli_defers_ref_annotation_checks_and_preserves_sibling_function_handles() {
+fn cli_rejects_value_arguments_to_ref_functions_and_preserves_handle_arguments() {
     let value_fixture = tempfile::tempdir().expect("temporary project");
     write_file(
         value_fixture.path(),
@@ -271,9 +261,13 @@ mock.test.resource {
         "backend local { path = \"carina.state.json\" }\nprovider mock {}\n",
     );
     let validate = run(value_fixture.path(), &["validate", "."]);
-    assert_success(
-        "bootstrap validation of a value passed to a Ref-annotated parameter",
-        &validate,
+    let text = output_text(&validate);
+    assert!(
+        !validate.status.success()
+            && text.contains("function 'tag': parameter 'r'")
+            && text.contains("expected mock.compute.Instance")
+            && text.contains("line 4"),
+        "a resource attribute value must not satisfy a Ref-typed function parameter:\n{text}",
     );
 
     let handle_fixture = tempfile::tempdir().expect("temporary project");
@@ -352,8 +346,8 @@ mock.test.resource {
     let text = output_text(&output);
     assert!(
         !output.status.success()
-            && text.contains("expects resource type 'mock.compute.Instance'")
-            && text.contains("got mock.test.resource"),
+            && text.contains("expected resource handle mock.compute.Instance")
+            && text.contains("got resource handle mock.test.resource"),
         "the enriched function boundary must reject the wrong handle type:\n{text}",
     );
 }
@@ -398,7 +392,7 @@ mock.test.resource {
 }
 
 #[test]
-fn cli_applies_module_parameter_access_to_value_arguments() {
+fn cli_rejects_value_arguments_before_module_parameter_access() {
     let fixture = tempfile::tempdir().expect("temporary project");
     write_file(
         fixture.path(),
@@ -426,18 +420,19 @@ mock.test.resource {
 
     let output = run(fixture.path(), &["validate", "."]);
     let text = output_text(&output);
-    let lowercase = text.to_ascii_lowercase();
     assert!(
         !output.status.success()
-            && lowercase.contains("cannot apply access .name to string")
-            && text.contains("module/main.crn")
-            && text.contains("line 4"),
-        "module value access must be applied, not dropped:\n{text}",
+            && text.contains(
+                "argument 'r': expected resource handle mock.compute.Instance; got String"
+            )
+            && text.contains("main.crn")
+            && text.contains("line 3"),
+        "the call boundary must reject a value before expanding the module body:\n{text}",
     );
 }
 
 #[test]
-fn cli_binds_function_and_module_parameters_from_argument_shape() {
+fn cli_rejects_value_shapes_at_ref_boundaries_and_bare_handle_function_bodies() {
     let value_fixture = tempfile::tempdir().expect("temporary project");
     write_file(
         value_fixture.path(),
@@ -462,11 +457,14 @@ mock.test.resource {
         "providers.crn",
         "backend local { path = \"carina.state.json\" }\nprovider mock {}\n",
     );
-    assert_success(
-        "value-shaped function arguments",
-        &run(value_fixture.path(), &["validate", "."]),
+    let output = run(value_fixture.path(), &["validate", "."]);
+    let text = output_text(&output);
+    assert!(
+        !output.status.success()
+            && text.contains("function 'identity': parameter 'r'")
+            && text.contains("expected mock.compute.Instance"),
+        "value-shaped function arguments must not satisfy Ref parameters:\n{text}",
     );
-    assert_init_and_plan_succeed(value_fixture.path());
 
     let module_value_fixture = tempfile::tempdir().expect("temporary project");
     write_file(
@@ -493,11 +491,15 @@ mock.test.resource {
         "providers.crn",
         "backend local { path = \"carina.state.json\" }\nprovider mock {}\n",
     );
-    assert_success(
-        "value-shaped module arguments",
-        &run(module_value_fixture.path(), &["validate", "."]),
+    let output = run(module_value_fixture.path(), &["validate", "."]);
+    let text = output_text(&output);
+    assert!(
+        !output.status.success()
+            && text.contains(
+                "argument 'r': expected resource handle mock.compute.Instance; got String"
+            ),
+        "value-shaped module arguments must not satisfy Ref parameters:\n{text}",
     );
-    assert_init_and_plan_succeed(module_value_fixture.path());
 
     let handle_fixture = tempfile::tempdir().expect("temporary project");
     write_file(
@@ -563,13 +565,27 @@ fn imported_module_bare_handle_errors_name_the_owning_file() {
 }
 
 #[test]
-fn validate_rejects_structural_kinds_that_depends_on_cannot_honor() {
+fn validate_accepts_for_group_in_depends_on() {
+    let fixture = tempfile::tempdir().expect("temporary project");
+    write_file(
+        fixture.path(),
+        "decl.crn",
+        "let xs = for n in [\"a\", \"b\"] { mock.test.resource { name = n } }\n",
+    );
+    write_file(
+        fixture.path(),
+        "use.crn",
+        "mock.test.resource {\n  name = \"consumer\"\n  directives { depends_on = [xs] }\n}\n",
+    );
+    write_file(fixture.path(), "providers.crn", "provider mock {}\n");
+
+    let output = run(fixture.path(), &["validate", "."]);
+    assert_success("validate for-group depends_on", &output);
+}
+
+#[test]
+fn validate_rejects_non_managed_structural_kinds_that_depends_on_cannot_honor() {
     for (declaration, binding, kind) in [
-        (
-            "let xs = for n in [\"a\", \"b\"] { mock.test.resource { name = n } }",
-            "xs",
-            "for binding",
-        ),
         (
             "let src = mock.test.resource { name = \"src\" }\nlet ready = wait src { until = src.name == \"src\" }",
             "ready",
@@ -603,9 +619,8 @@ fn validate_rejects_structural_kinds_that_depends_on_cannot_honor() {
             !output.status.success()
                 && text.contains("use.crn")
                 && text.contains("line 3")
-                && text.contains(binding)
                 && text.contains(kind)
-                && text.contains("cannot be used as a dependency target"),
+                && text.contains("expected a managed resource handle"),
             "depends_on must reject {kind} '{binding}' at the directive:\n{text}",
         );
     }
@@ -733,8 +748,8 @@ fn cli_checks_module_parameter_handles_at_the_nested_function_call_site() {
         !output.status.success()
             && text.contains("module/main.crn")
             && text.contains("line 3")
-            && text.contains("expects resource type 'mock.test.resource'")
-            && text.contains("got mock.compute.Instance"),
+            && text.contains("expected resource handle mock.test.resource")
+            && text.contains("got resource handle mock.compute.Instance"),
         "the substituted module handle must be checked at the nested call site:\n{text}",
     );
     assert!(
@@ -843,6 +858,223 @@ fn cli_accepts_module_parameter_dependency_targets_in_root_and_module_scope() {
 }
 
 #[test]
+fn annotated_module_handle_outputs_accept_matches_and_reject_mismatches() {
+    let valid = tempfile::tempdir().expect("temporary valid handle-output project");
+    write_file(
+        valid.path(),
+        "main.crn",
+        r#"let imported = use { source = "./module" }
+let child = imported {}
+mock.test.resource {
+  name = "consumer"
+  directives { depends_on = [child.r] }
+}
+"#,
+    );
+    write_file(
+        valid.path(),
+        "module/resources.crn",
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    );
+    write_file(
+        valid.path(),
+        "module/attributes.crn",
+        "attributes {\n  r: mock.compute.Instance = instance\n}\n",
+    );
+    write_file(valid.path(), "providers.crn", "provider mock {}\n");
+    assert_success(
+        "matching annotated resource-handle output",
+        &run(valid.path(), &["validate", "."]),
+    );
+
+    assert_validate_rejects(
+        &[
+            (
+                "main.crn",
+                "let imported = use { source = \"./module\" }\nimported {}\n",
+            ),
+            (
+                "module/resources.crn",
+                "let instance = mock.compute.Instance { name = \"instance\" }\n",
+            ),
+            (
+                "module/attributes.crn",
+                "attributes {\n  r: mock.test.resource = instance\n}\n",
+            ),
+            ("providers.crn", "provider mock {}\n"),
+        ],
+        "attribute 'r': expected resource handle mock.test.resource; got resource handle mock.compute.Instance",
+        2,
+    );
+}
+
+#[test]
+fn module_handle_output_attribute_access_checks_the_underlying_resource_schema() {
+    let write_module = |root: &Path| {
+        write_file(
+            root,
+            "module/resources.crn",
+            "let instance = mock.compute.Instance { name = \"instance\" }\n",
+        );
+        write_file(
+            root,
+            "module/attributes.crn",
+            "attributes {\n  r = instance\n}\n",
+        );
+        write_file(
+            root,
+            "providers.crn",
+            "backend local { path = \"carina.state.json\" }\nprovider mock {}\n",
+        );
+    };
+
+    let valid = tempfile::tempdir().expect("valid module-output access fixture");
+    write_module(valid.path());
+    write_file(
+        valid.path(),
+        "main.crn",
+        r#"let imported = use { source = "./module" }
+let child = imported {}
+mock.test.resource {
+  name   = "consumer"
+  parent = child.r.arn
+}
+"#,
+    );
+    assert_success(
+        "module handle output attribute validation",
+        &run(valid.path(), &["validate", "."]),
+    );
+    assert_init_and_plan_succeed(valid.path());
+
+    let unknown = tempfile::tempdir().expect("unknown module-output access fixture");
+    write_module(unknown.path());
+    write_file(
+        unknown.path(),
+        "main.crn",
+        r#"let imported = use { source = "./module" }
+let child = imported {}
+mock.test.resource {
+  name   = "consumer"
+  parent = child.r.missing
+}
+"#,
+    );
+    let output = run(unknown.path(), &["validate", "."]);
+    let text = output_text(&output);
+    assert!(
+        !output.status.success()
+            && text.contains("missing")
+            && text.contains("on 'child.r'")
+            && text.contains("child.r.missing")
+            && text.to_ascii_lowercase().contains("unknown attribute"),
+        "unknown child.r attribute must be diagnosed against the handle schema:\n{text}",
+    );
+
+    let mismatch = tempfile::tempdir().expect("mismatched module-output access fixture");
+    write_module(mismatch.path());
+    write_file(
+        mismatch.path(),
+        "main.crn",
+        r#"let imported = use { source = "./module" }
+let child = imported {}
+mock.iam.Role {
+  role_name            = "consumer"
+  max_session_duration = child.r.arn
+}
+"#,
+    );
+    let output = run(mismatch.path(), &["validate", "."]);
+    let text = output_text(&output);
+    assert!(
+        !output.status.success() && text.contains("expected Int") && text.contains("got String"),
+        "child.r attribute type must participate in normal value checking:\n{text}",
+    );
+
+    let bare = tempfile::tempdir().expect("bare module-output handle fixture");
+    write_module(bare.path());
+    write_file(
+        bare.path(),
+        "main.crn",
+        r#"let imported = use { source = "./module" }
+let child = imported {}
+mock.test.resource {
+  name   = "consumer"
+  parent = child.r
+}
+"#,
+    );
+    let output = run(bare.path(), &["validate", "."]);
+    let text = output_text(&output);
+    assert!(
+        !output.status.success()
+            && text.contains("child.r")
+            && text.contains("resource handle")
+            && text.contains("not a value"),
+        "bare child.r must not enter a provider value:\n{text}",
+    );
+}
+
+#[test]
+fn validate_lint_plan_and_module_validation_reject_handle_exports() {
+    for (declaration, expected) in [
+        (
+            "inferred = instance",
+            "export 'inferred': inferred resource handle mock.compute.Instance cannot cross a state boundary; export an identity value such as mock.compute.Instance.Id instead",
+        ),
+        (
+            "declared: mock.compute.Instance = instance",
+            "export 'declared': resource handle mock.compute.Instance cannot cross a state boundary; export an identity value such as mock.compute.Instance.Id instead",
+        ),
+    ] {
+        let fixture = tempfile::tempdir().expect("temporary handle-export project");
+        write_file(
+            fixture.path(),
+            "main.crn",
+            &format!(
+                "let instance = mock.compute.Instance {{ name = \"instance\" }}\nexports {{\n  {declaration}\n}}\n"
+            ),
+        );
+        write_file(
+            fixture.path(),
+            "providers.crn",
+            "backend local { path = \"carina.state.json\" }\nprovider mock {}\n",
+        );
+
+        for args in [["validate", "."], ["lint", "."]] {
+            let output = run(fixture.path(), &args);
+            let text = output_text(&output);
+            assert!(
+                !output.status.success() && text.contains(expected),
+                "carina {} must reject the handle export:\n{text}",
+                args[0],
+            );
+        }
+
+        assert_success("carina init", &run(fixture.path(), &["init", "."]));
+        let output = run(fixture.path(), &["plan", "--refresh=false", "."]);
+        let text = output_text(&output);
+        assert!(
+            !output.status.success() && text.contains(expected),
+            "carina plan must reject the handle export:\n{text}",
+        );
+
+        write_file(fixture.path(), "providers.crn", "");
+        write_file(
+            fixture.path(),
+            "arguments.crn",
+            "arguments { label: String = \"module\" }\n",
+        );
+        let output = run(fixture.path(), &["validate", "."]);
+        let text = output_text(&output);
+        assert!(
+            !output.status.success() && text.contains(expected),
+            "standalone module validation must reject the handle export:\n{text}",
+        );
+    }
+}
+
+#[test]
 fn cli_locates_deferred_function_type_errors_at_the_sibling_call() {
     let fixture = tempfile::tempdir().expect("temporary project");
     write_file(
@@ -868,8 +1100,8 @@ fn cli_locates_deferred_function_type_errors_at_the_sibling_call() {
         !output.status.success()
             && text.contains("./consumer.crn")
             && text.contains("line 3")
-            && text.contains("expects resource type 'mock.compute.Instance'")
-            && text.contains("got mock.test.resource"),
+            && text.contains("expected resource handle mock.compute.Instance")
+            && text.contains("got resource handle mock.test.resource"),
         "the deferred check must retain the call site's file and line:\n{text}",
     );
 }

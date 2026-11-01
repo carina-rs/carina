@@ -71,11 +71,15 @@ fn format_destroy_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
 }
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-    ResolvedDataSource::new(resource)
+    ResolvedDataSource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 /// Strip ANSI escape codes from a string for snapshot readability.
@@ -945,6 +949,25 @@ fn snapshot_replace_with_non_forcing_diffs() {
 fn snapshot_delete_orphan() {
     let (plan, current_states, schemas, _moved) =
         build_plan_and_states_from_fixture("delete_orphan");
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_legacy_orphan_unknown_destroy_ordering() {
+    let (plan, current_states, schemas, _moved) =
+        build_plan_and_states_from_fixture("legacy_orphan_unknown_destroy_ordering");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_plan(
         &plan,
@@ -2814,11 +2837,28 @@ fn snapshot_deferred_for_with_dependent_wait() {
             Effect::Create(resource)
                 if resource.id.resource_type == "acm.CertificateValidation" =>
             {
-                let mut resource = resource.into_inner();
-                resource.directives.depends_on.push(
-                    carina_core::resource::absolute_binding_address_for_test("validation_records"),
-                );
-                Effect::Create(resolved(resource))
+                let deferred_id = fp
+                    .plan
+                    .effects()
+                    .iter()
+                    .find_map(|effect| match effect {
+                        Effect::DeferredCreate(payload) => Some(payload.id()),
+                        _ => None,
+                    })
+                    .expect("fixture deferred producer");
+                let mut explicit = resource.explicit_dependencies().clone();
+                explicit.insert(deferred_id.clone());
+                Effect::Create(
+                    ResolvedResource::from_resolved_parts(
+                        resource.as_inner().clone(),
+                        resource.value_dependencies().clone(),
+                        explicit,
+                    )
+                    .with_saved_destroy_dependencies(
+                        resource.persisted_value_destroy_dependencies().clone(),
+                        resource.persisted_explicit_destroy_dependencies().clone(),
+                    ),
+                )
             }
             effect => effect,
         };

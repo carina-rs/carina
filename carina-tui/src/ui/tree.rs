@@ -178,7 +178,7 @@ mod tests {
     };
 
     fn create(resource: Resource) -> Effect {
-        Effect::Create(ResolvedResource::new(resource))
+        Effect::Create(ResolvedResource::new((resource).into_value_snapshot()))
     }
 
     fn absolute(binding: &str) -> AbsoluteBindingAddress {
@@ -202,20 +202,21 @@ mod tests {
 
     #[test]
     fn tree_connector_single_child() {
-        let mut plan = Plan::new();
-        plan.add(create(
+        let mut resources = Vec::new();
+        resources.push(
             Resource::new("ec2.Vpc", "my-vpc")
                 .with_absolute_binding(absolute("vpc"))
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 ),
-        ));
-        plan.add(create(
+        );
+        resources.push(
             Resource::new("ec2.Subnet", "my-subnet")
                 .with_absolute_binding(absolute("subnet"))
                 .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-        ));
+        );
+        let plan = crate::create_plan_fixture(resources);
         let app = App::for_plan(&plan, &SchemaRegistry::new());
 
         // Subnet is the only (last) child of VPC
@@ -225,20 +226,19 @@ mod tests {
 
     #[test]
     fn tree_connector_multiple_children() {
-        let mut plan = Plan::new();
-        plan.add(create(
-            Resource::new("ec2.Vpc", "my-vpc").with_absolute_binding(absolute("vpc")),
-        ));
-        plan.add(create(
+        let mut resources = Vec::new();
+        resources.push(Resource::new("ec2.Vpc", "my-vpc").with_absolute_binding(absolute("vpc")));
+        resources.push(
             Resource::new("ec2.Subnet", "subnet-a")
                 .with_absolute_binding(absolute("subnet_a"))
                 .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-        ));
-        plan.add(create(
+        );
+        resources.push(
             Resource::new("ec2.Subnet", "subnet-b")
                 .with_absolute_binding(absolute("subnet_b"))
                 .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-        ));
+        );
+        let plan = crate::create_plan_fixture(resources);
         let app = App::for_plan(&plan, &SchemaRegistry::new());
 
         // First child gets ├─, last child gets └─
@@ -252,24 +252,23 @@ mod tests {
 
     #[test]
     fn selected_ancestor_row_keeps_connector_indent_unstyled() {
-        let mut plan = Plan::new();
-        plan.add(create(
-            Resource::new("test.Root", "root").with_absolute_binding(absolute("root")),
-        ));
-        plan.add(create(
+        let mut resources = Vec::new();
+        resources.push(Resource::new("test.Root", "root").with_absolute_binding(absolute("root")));
+        resources.push(
             Resource::new("test.Parent", "parent")
                 .with_absolute_binding(absolute("parent"))
                 .with_attribute("root_id", root_ref("root", "id")),
-        ));
-        plan.add(create(
+        );
+        resources.push(
             Resource::new("test.Ancestor", "ancestor")
                 .with_absolute_binding(absolute("ancestor"))
                 .with_attribute("parent_id", root_ref("parent", "id")),
-        ));
-        plan.add(create(
+        );
+        resources.push(
             Resource::new("test.Leaf", "matching-leaf")
                 .with_attribute("ancestor_id", root_ref("ancestor", "id")),
-        ));
+        );
+        let plan = crate::create_plan_fixture(resources);
         let mut app = App::for_plan(&plan, &SchemaRegistry::new());
         app.search_query = "matching-leaf".to_string();
         app.update_search_matches();
