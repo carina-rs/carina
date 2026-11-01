@@ -407,24 +407,27 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
 pub fn unique_list_schema() -> ResourceSchema {
     use carina_core::schema::{ListElements, TypeIdentity};
 
-    ResourceSchema::new("actions.OidcSubject").attribute(
-        AttributeSchema::required(
-            "claim_keys",
-            AttributeType::refined_list(
-                AttributeType::enum_(
-                    TypeIdentity::new(Some("mock"), ["actions", "OidcSubject"], "ClaimKey"),
-                    Some(vec!["repo".into(), "context".into()]),
-                    Vec::new(),
-                    None,
-                    None,
-                ),
-                true,
-                Some((Some(1), None)),
-                ListElements::Unique,
-            ),
+    let claim_keys = AttributeType::refined_list(
+        AttributeType::enum_(
+            TypeIdentity::new(Some("mock"), ["actions", "OidcSubject"], "ClaimKey"),
+            Some(vec!["repo".into(), "context".into()]),
+            Vec::new(),
+            None,
+            None,
+        ),
+        true,
+        Some((Some(1), None)),
+        ListElements::Unique,
+    );
+    ResourceSchema::new("actions.OidcSubject")
+        .attribute(AttributeSchema::required("claim_keys", claim_keys.clone()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "claim_keys_or_number",
+                AttributeType::union(vec![claim_keys, AttributeType::int()]),
+            )
+            .build(),
         )
-        .build(),
-    )
 }
 
 /// Identity schemas shared by the built-in and process mock providers.

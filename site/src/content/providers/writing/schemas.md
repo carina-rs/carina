@@ -212,9 +212,10 @@ values also support uniqueness.
 Elements containing secrets, environment-derived (diagnostic-sensitive) values,
 or unresolved values are excluded from duplicate comparison; known,
 nonsensitive elements in the same list are still checked. A secret wrapping the
-whole list is also excluded. Provider read-back and persisted state values are
-not checked for uniqueness. List length constraints still apply in all these
-cases. `list()` and `unordered_list()` allow duplicates.
+whole list is also excluded. Provider read-back, persisted state values, and
+wait-condition right-hand sides are not checked for uniqueness. List length
+constraints still apply in all these cases. `list()` and `unordered_list()`
+allow duplicates.
 
 Protocol v17 requires every list schema JSON record to carry `elements` as
 `"allow_duplicates"` or `"unique"`, including ordinary lists. There is no

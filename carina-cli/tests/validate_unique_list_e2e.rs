@@ -6,6 +6,14 @@ fn run(command: &str, claims: &str) -> std::process::Output {
 }
 
 fn project(claims: &str, declarations: &str) -> tempfile::TempDir {
+    project_with_provider_attributes(claims, declarations, "")
+}
+
+fn project_with_provider_attributes(
+    claims: &str,
+    declarations: &str,
+    provider_attributes: &str,
+) -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -18,7 +26,7 @@ fn project(claims: &str, declarations: &str) -> tempfile::TempDir {
     let source = format!("file://{}", wasm.display());
     std::fs::write(
         directory.path().join("providers.crn"),
-        format!("provider mock {{ source = '{source}' }}\n"),
+        format!("provider mock {{\n  source = '{source}'\n  {provider_attributes}\n}}\n"),
     )
     .unwrap();
     std::fs::write(
@@ -78,6 +86,56 @@ fn validate_accepts_distinct_list_elements() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn validate_rejects_duplicate_provider_config_list_elements() {
+    // Provider-config validation goes through the authored validate path.
+    for (values, valid) in [("'first', 'second'", true), ("'first', 'first'", false)] {
+        let directory =
+            project_with_provider_attributes("repo", "", &format!("unique_values = [{values}]"));
+        let output = run_in(directory.path(), "validate");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if valid {
+            assert!(output.status.success(), "{stderr}");
+        } else {
+            assert!(
+                !output.status.success(),
+                "duplicates were accepted: {stderr}"
+            );
+            assert!(stderr.contains("Duplicate list element"), "{stderr}");
+            assert!(stderr.contains("unique_values"), "{stderr}");
+            assert!(stderr.contains("mock"), "{stderr}");
+            assert!(stderr.contains("index 1 (first at index 0)"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn validate_reports_duplicate_in_unique_enum_list_union_member() {
+    let directory = project("repo", "");
+    for claims in ["repo, repo", "repo, mock.actions.OidcSubject.ClaimKey.repo"] {
+        std::fs::write(
+            directory.path().join("main.crn"),
+            format!(
+                "let subject = mock.actions.OidcSubject {{\n  claim_keys = [repo]\n  claim_keys_or_number = [{claims}]\n}}\n"
+            ),
+        )
+        .unwrap();
+        let output = run_in(directory.path(), "validate");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "duplicates were accepted: {stderr}"
+        );
+        assert!(stderr.contains("Duplicate list element"), "{stderr}");
+        assert!(stderr.contains("claim_keys_or_number"), "{stderr}");
+        assert!(stderr.contains("index 1 (first at index 0)"), "{stderr}");
+        assert!(
+            !stderr.contains("did not match any Union member"),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]

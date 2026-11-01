@@ -415,7 +415,7 @@ fn unique_list_only_checks_authored_purposes_and_always_checks_length() {
             },
             true,
         ),
-        (CanonicalizationPurpose::WaitRhs, true),
+        (CanonicalizationPurpose::WaitRhs, false),
         (
             CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
             false,

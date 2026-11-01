@@ -4841,7 +4841,7 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
 /// Canonicalization preserves integer/float spellings and struct block aliases,
 /// so those spellings remain distinct keys: uniqueness can miss duplicates but
 /// must never invent them (including by rounding large integers to floats).
-/// WaitRhs does not rewrite enums, so its enum spellings can remain distinct.
+/// Wait-condition right-hand sides are not checked for uniqueness.
 /// Nested unordered lists compare in order, another possible missed duplicate.
 #[derive(PartialEq, Eq, Hash)]
 struct KnownListElement(serde_json::Value);
@@ -4903,9 +4903,10 @@ impl ListConstraints {
         let mut seen: HashMap<KnownListElement, usize> = HashMap::new();
         let authored = match purpose {
             CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl)
-            | CanonicalizationPurpose::ProviderConfig { .. }
-            | CanonicalizationPurpose::WaitRhs => true,
-            CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput)
+            | CanonicalizationPurpose::ProviderConfig { .. } => true,
+            // A wait RHS compares against observed state; it is not provider input.
+            CanonicalizationPurpose::WaitRhs
+            | CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput)
             | CanonicalizationPurpose::State => false,
         };
         length_error

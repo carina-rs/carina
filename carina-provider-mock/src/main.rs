@@ -804,7 +804,16 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
-        CoreValidatedConfigSchema::default()
+        CoreValidatedConfigSchema::validate(BTreeMap::from([(
+            "unique_values".to_string(),
+            CoreAttributeType::refined_list(
+                CoreAttributeType::string(),
+                true,
+                None,
+                carina_core::schema::ListElements::Unique,
+            ),
+        )]))
+        .expect("mock provider config schema must be valid")
     }
 
     fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
