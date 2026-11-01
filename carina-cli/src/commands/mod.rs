@@ -1654,10 +1654,6 @@ child { values = [source] }
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "ap-northeast-1".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,

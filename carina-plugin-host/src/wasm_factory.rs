@@ -4983,12 +4983,6 @@ impl ProviderFactory for WasmProviderFactory {
         })
     }
 
-    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String {
-        // Provider-ready config enums are already canonical host values;
-        // strings remain literal and are never shape-decoded here.
-        carina_core::utils::extract_region_from_attrs(attributes, "ap-northeast-1")
-    }
-
     fn config_completions(&self) -> HashMap<String, Vec<CompletionValue>> {
         self.cached_config_completions.clone()
     }

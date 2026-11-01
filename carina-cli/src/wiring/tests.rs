@@ -316,10 +316,6 @@ impl ProviderFactory for RawEnumStateFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -2204,10 +2200,6 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -3125,10 +3117,6 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -3245,10 +3233,6 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -3309,6 +3293,57 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
 }
 
 #[tokio::test]
+async fn provider_progress_uses_schema_region() {
+    let ctx = WiringContext::new_for_test(
+        vec![
+            Box::new(RawEnumStateFactory),
+            Box::new(RegionIdentityFactory),
+        ],
+        &[],
+    );
+    let configs = validated_provider_configs(vec![
+        ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::from([(
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("us-west-2".into())),
+            )]),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        },
+        region_provider_config("aws.Region.ap_northeast_1"),
+    ]);
+    let lines = Box::leak(Box::new(RecordedProgressLines::default()));
+    let mut router = ProviderRouter::new();
+
+    for config in configs.iter() {
+        instantiate_provider_into_router(
+            &ctx,
+            &mut router,
+            config,
+            None,
+            ProgressSink::Recorded(lines),
+        )
+        .await
+        .expect("provider initialization must succeed");
+    }
+
+    assert_eq!(
+        lines.snapshot(),
+        [
+            "Using test (instance=default)".cyan().to_string(),
+            "Using awscc (region: ap-northeast-1, instance=default)"
+                .cyan()
+                .to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
     struct FailingInitializeFactory;
 
@@ -3330,10 +3365,6 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
         }
 
         fn create_provider(
@@ -3433,10 +3464,6 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "local".to_string()
     }
 
     fn create_provider(
@@ -3623,10 +3650,6 @@ impl ProviderFactory for CascadeAwsccFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -3980,10 +4003,6 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "local".to_string()
     }
 
     fn create_provider(
@@ -4359,10 +4378,6 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -4479,10 +4494,6 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
         }
 
         fn create_provider(
@@ -6554,10 +6565,6 @@ impl ProviderFactory for DeferredForCollisionFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -6685,10 +6692,6 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -9830,10 +9833,6 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -12101,7 +12100,7 @@ mod using_line_format_tests {
             .parse()
             .unwrap();
         assert_eq!(
-            format_provider_using_line("awscc", "ap-northeast-1", None, Some(&source),),
+            format_provider_using_line("awscc", Some("ap-northeast-1"), None, Some(&source)),
             "Using awscc (region: ap-northeast-1, instance=default, \
              source: github.com/carina-rs/carina-provider-awscc)",
         );
@@ -12114,7 +12113,7 @@ mod using_line_format_tests {
         // identify what got wired up.
         let source = "github.com/carina-rs/carina-provider-aws".parse().unwrap();
         assert_eq!(
-            format_provider_using_line("aws", "us-east-1", Some("us"), Some(&source),),
+            format_provider_using_line("aws", Some("us-east-1"), Some("us"), Some(&source)),
             "Using aws (region: us-east-1, instance=us, \
              source: github.com/carina-rs/carina-provider-aws)",
         );
@@ -12125,7 +12124,7 @@ mod using_line_format_tests {
         // The kind's default instance must be labeled "instance=default"
         // explicitly, not omitted — the omission is what made the old
         // default-line and named-line shapes diverge.
-        let line = format_provider_using_line("aws", "ap-northeast-1", None, None);
+        let line = format_provider_using_line("aws", Some("ap-northeast-1"), None, None);
         assert!(
             line.contains("instance=default"),
             "default instance must surface as 'instance=default'; got: {line}",
@@ -12140,10 +12139,29 @@ mod using_line_format_tests {
         // ("AWS provider"). The old named-instance path used
         // display_name, which made the two log lines disagree on
         // what to call the same construct.
-        let line = format_provider_using_line("aws", "us-east-1", Some("us"), None);
+        let line = format_provider_using_line("aws", Some("us-east-1"), Some("us"), None);
         assert!(
             line.starts_with("Using aws "),
             "kind label must be the kind name, not a display name; got: {line}",
+        );
+    }
+
+    #[test]
+    fn default_instance_without_region_with_source() {
+        let source = "github.com/carina-rs/carina-provider-github"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            format_provider_using_line("github", None, None, Some(&source)),
+            "Using github (instance=default, source: github.com/carina-rs/carina-provider-github)",
+        );
+    }
+
+    #[test]
+    fn named_instance_without_region_or_source() {
+        assert_eq!(
+            format_provider_using_line("github", None, Some("team"), None),
+            "Using github (instance=team)",
         );
     }
 }
@@ -12847,10 +12865,6 @@ mod resolved_value_constraint_gate {
             }
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "local".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -12963,10 +12977,6 @@ mod resolved_value_constraint_gate {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "local".to_string()
         }
 
         fn create_provider(

@@ -4109,6 +4109,7 @@ pub(crate) fn prepare_default_provider_ready_config(
 /// - `kind` is the kind name (`aws`, `awscc`) — what the user writes
 ///   in `provider <kind> {}` and routes to via `directives.provider`.
 ///   Use `ProviderFactory::name()`, not `display_name()`.
+/// - `region = None` omits the region from the rendered line.
 /// - `binding = None` is the kind's default instance and is rendered
 ///   as `instance=default`. Explicit, not omitted: the omission is
 ///   exactly what made the old shape ambiguous.
@@ -4117,14 +4118,17 @@ pub(crate) fn prepare_default_provider_ready_config(
 ///   default's source.
 fn format_provider_using_line(
     kind: &str,
-    region: &str,
+    region: Option<&str>,
     binding: Option<&str>,
     source: Option<&ProviderSource>,
 ) -> String {
     let instance = binding.unwrap_or("default");
+    let region = region
+        .map(|region| format!("region: {region}, "))
+        .unwrap_or_default();
     match source {
-        Some(src) => format!("Using {kind} (region: {region}, instance={instance}, source: {src})"),
-        None => format!("Using {kind} (region: {region}, instance={instance})"),
+        Some(src) => format!("Using {kind} ({region}instance={instance}, source: {src})"),
+        None => format!("Using {kind} ({region}instance={instance})"),
     }
 }
 
@@ -4143,14 +4147,14 @@ async fn instantiate_provider_into_router(
     let binding = provider_config.binding();
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
         let config = prepare_provider_ready_config(factory, provider_config)?;
-        let region = factory.extract_region(config.attributes());
         let displayed_source = provider_config.source().or(inherited_source);
         let provider = factory
             .create_initialized_provider(binding, &config)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
         progress_sink.line(
-            format_provider_using_line(factory.name(), &region, binding, displayed_source).cyan(),
+            format_provider_using_line(factory.name(), config.region(), binding, displayed_source)
+                .cyan(),
         );
         router.add_normalizer(
             provider_config.name().to_string(),

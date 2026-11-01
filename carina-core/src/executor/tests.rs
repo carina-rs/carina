@@ -1262,9 +1262,6 @@ impl ProviderFactory for AliasFactory {
     ) -> crate::provider::ProviderResult<()> {
         Ok(())
     }
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        String::new()
-    }
     fn create_provider(
         &self,
         _binding: Option<&str>,

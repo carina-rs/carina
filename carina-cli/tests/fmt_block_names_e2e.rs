@@ -6,11 +6,9 @@ use std::time::Duration;
 
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
-use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use carina_lsp::Backend;
 use carina_lsp::backend::FactoryBuilder;
-use indexmap::IndexMap;
 use serde_json::{Value as JsonValue, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_lsp::{LspService, Server};
@@ -55,10 +53,6 @@ impl ProviderFactory for FormattingFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        String::new()
     }
 
     fn create_provider(
