@@ -823,17 +823,7 @@ fn map_state_file_decode_error(
                 Some(version) => format!("Failed to migrate state file from v{version}"),
                 None => "Failed to parse state file".to_string(),
             };
-            let detail = if source
-                .to_string()
-                .contains("binding address cannot be empty")
-            {
-                ": the binding address is empty".to_string()
-            } else {
-                String::new()
-            };
-            BackendError::InvalidStateJson(InvalidStateJsonError::new(
-                context, json_path, detail, source,
-            ))
+            BackendError::InvalidStateJson(InvalidStateJsonError::new(context, json_path, source))
         }
         StateFileDecodeError::Validation(message) => match migration_from {
             Some(version) => BackendError::InvalidState(format!(
@@ -1580,13 +1570,9 @@ impl StateFile {
         fn canonicalize_binding(
             binding: AbsoluteBindingAddress,
         ) -> Result<AbsoluteBindingAddress, BackendError> {
-            let original = binding.as_str().to_string();
-            let canonical = carina_core::utils::canonicalize_map_key_address(&original);
-            serde_json::from_value(serde_json::Value::String(canonical)).map_err(|error| {
-                BackendError::InvalidState(format!(
-                    "cannot canonicalize persisted binding address {original:?}: {error}"
-                ))
-            })
+            let canonical = carina_core::utils::canonicalize_map_key_address(binding.as_str());
+            serde_json::from_value(serde_json::Value::String(canonical))
+                .map_err(|error| BackendError::invalid_canonical_binding(binding, error))
         }
 
         for r in &mut self.resources {

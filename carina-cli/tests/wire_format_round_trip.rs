@@ -105,6 +105,56 @@ fn json_strings(value: &Value) -> BTreeSet<String> {
 }
 
 #[test]
+fn base_binary_deferred_effects_keep_v36_ids_and_typed_template_addresses() {
+    for (fixture, variant) in [
+        (
+            include_str!("fixtures/module_binding_wire_compat/carina.plan.json"),
+            "DeferredCreate",
+        ),
+        (
+            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.plan.json"),
+            "DeferredReplace",
+        ),
+    ] {
+        let round_tripped = assert_json_value_round_trip::<PlanFile>(fixture);
+        assert_eq!(round_tripped["version"], 36);
+        let deferred = round_tripped["plan"]["effects"]
+            .as_array()
+            .expect("saved effects")
+            .iter()
+            .filter_map(|effect| effect.get(variant))
+            .collect::<Vec<_>>();
+        assert_eq!(deferred.len(), 2, "fixture must exercise {variant}");
+        let mut bindings = BTreeSet::new();
+        for effect in deferred {
+            let binding = effect["template"]["target"]["binding"]
+                .as_str()
+                .expect("bound loop");
+            bindings.insert(binding.to_owned());
+            assert_eq!(
+                effect["id"]["identity"], binding,
+                "v36 wire identity remains the bound spelling"
+            );
+            assert_eq!(
+                effect["template"]["template_resource"]["id"]["identity"],
+                format!("{binding}[?]")
+            );
+            assert_eq!(
+                effect["template"]["template_resource"]["binding"],
+                format!("{binding}[?]")
+            );
+        }
+        assert_eq!(
+            bindings,
+            BTreeSet::from([
+                "direct.children".to_owned(),
+                "looped[0].children".to_owned()
+            ])
+        );
+    }
+}
+
+#[test]
 fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
     let fixture =
         include_str!("fixtures/module_binding_wire_compat/carina.update-delete.plan.json");
@@ -202,8 +252,47 @@ fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
         .iter()
         .filter_map(|effect| effect.get("Delete"))
         .collect::<Vec<_>>();
-    assert_eq!(deletes.len(), 2, "fixture must exercise Delete effects");
-    for delete in deletes {
+    assert_eq!(
+        deletes.len(),
+        4,
+        "nested removals and deferred-source replacements"
+    );
+    let nested_deletes = deletes
+        .iter()
+        .copied()
+        .filter(|delete| {
+            delete["binding"]
+                .as_str()
+                .expect("delete binding")
+                .ends_with(".nested.leaf")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        nested_deletes.len(),
+        2,
+        "fixture must retain both nested Delete effects"
+    );
+    let source_deletes = deletes
+        .iter()
+        .copied()
+        .filter(|delete| {
+            delete["binding"]
+                .as_str()
+                .expect("delete binding")
+                .ends_with(".deferred_source")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_deletes.len(),
+        2,
+        "both deferred sources must be replaced"
+    );
+    for delete in source_deletes {
+        assert_eq!(delete["id"]["identity"], delete["binding"]);
+        assert!(json_strings(&delete["dependencies"]).is_empty());
+        assert!(json_strings(&delete["explicit_dependencies"]).is_empty());
+    }
+    for delete in nested_deletes {
         let binding = delete["binding"].as_str().expect("delete binding");
         let prefix = binding
             .strip_suffix(".nested.leaf")

@@ -2,7 +2,7 @@
   "version": 20,
   "exports_version": 1,
   "serial": 3,
-  "lineage": "c2b6fa7f-22a0-447b-bfb1-574889c55962",
+  "lineage": "0013ddc0-bda1-4627-841f-c1d2a00ce909",
   "carina_version": "0.9.0",
   "resources": [
     {
@@ -37,6 +37,40 @@
         }
       },
       "binding": "root",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "direct.deferred_source",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "direct-deferred-source",
+          "identifier": "direct-deferred-source-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "direct.deferred_source",
       "dependency_bindings": []
     },
     {
@@ -81,10 +115,10 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "identifier": "direct-consumer-id",
           "comment": {
-            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$U3LtYg+6DE/6f7Uvj2eVGQ$wmL3Q64d//mG5QwAHWm6OhhV3MWUUxMV8xvwyC6yqhQ"
+            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$jYvwA3NDgRAYjJs/f7axkw$ghTkQvIvNlYXa0OU4CJLsczvABSzq5hUwrZETXWHKWQ"
           },
+          "identifier": "direct-consumer-id",
           "name": "direct-consumer"
         },
         "nested_write_only": {}
@@ -161,6 +195,40 @@
     },
     {
       "resource_type": "test.resource",
+      "identity": "looped[0].deferred_source",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "loop-deferred-source",
+          "identifier": "loop-deferred-source-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "looped[0].deferred_source",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "test.resource",
       "identity": "looped[0].seed",
       "provider": "mock",
       "current": {
@@ -201,11 +269,11 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "identifier": "loop-consumer-id",
-          "name": "loop-consumer",
           "comment": {
-            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$LbFW9oG/ehwoFzDBwJOJKA$nIMwiMLnbHRJ1HEUMeoESsgejhfAbv/Sn96iAyMOJBg"
-          }
+            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$n+KFZTqwMWNhtWT46ua29g$FQKn8yhNT8cgNOkQ0uhdHNFReO08OvxBvMBwmYWSk58"
+          },
+          "name": "loop-consumer",
+          "identifier": "loop-consumer-id"
         },
         "nested_write_only": {}
       },
@@ -226,10 +294,10 @@
       "explicit": {
         "kind": "struct",
         "children": {
-          "name": {
+          "comment": {
             "kind": "leaf"
           },
-          "comment": {
+          "name": {
             "kind": "leaf"
           }
         }
@@ -277,6 +345,78 @@
       "binding": "looped[0].nested.leaf",
       "dependency_bindings": [
         "looped[0].consumer"
+      ]
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "direct.children.first",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "direct-first-child",
+          "identifier": "direct-first-child-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "direct.children.first",
+      "dependency_bindings": [
+        "direct.deferred_source"
+      ]
+    },
+    {
+      "resource_type": "test.resource",
+      "identity": "looped[0].children.first",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "loop-first-child",
+          "identifier": "loop-first-child-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "looped[0].children.first",
+      "dependency_bindings": [
+        "looped[0].deferred_source"
       ]
     }
   ]

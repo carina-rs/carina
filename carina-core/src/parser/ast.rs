@@ -538,21 +538,18 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>
     /// Preserve the v36 scheduler-id spelling only at the wire boundary.
     /// Runtime resource identity remains the distinct template identity;
     /// dependency lookup uses the phase-typed target binding.
-    pub(crate) fn deferred_effect_wire_id(&self) -> impl serde::Serialize + '_ {
-        #[derive(serde::Serialize)]
-        struct Wire<'a> {
-            provider: &'a str,
-            resource_type: &'a str,
-            identity: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            provider_instance: Option<&'a str>,
-        }
-        Wire {
-            provider: self.template_resource.provider(),
-            resource_type: self.template_resource.resource_type(),
-            identity: self.target.scheduler_key(),
-            provider_instance: self.template_resource.provider_instance(),
-        }
+    pub(crate) fn deferred_effect_wire_id(&self) -> ResourceId {
+        // v36 encoded a bound loop's scheduling spelling in the id field.
+        // This compatibility-only ID is serialized immediately, never used as
+        // a runtime resource identity or a binding-phase conversion.
+        ResourceId::with_provider_identity(
+            self.template_resource.provider(),
+            self.template_resource.resource_type(),
+            ResourceIdentity::new(self.target.scheduler_key()),
+            self.template_resource
+                .provider_instance()
+                .map(str::to_owned),
+        )
     }
 
     pub(crate) fn template_attributes_mut(&mut self) -> &mut IndexMap<String, Value<T, B>> {
@@ -4756,101 +4753,6 @@ pub struct UntilPredicateAst<B: BindingAddress = RelativeBindingName> {
     pub rhs: crate::resource::Value<NoPlaceholder, B>,
 }
 
-/// A binding identifier (a `let`/`wait`/`depends_on` name such as
-/// `cert_issued` or its instance-prefixed form `r.cert_issued`).
-///
-/// This newtype exists so a binding name cannot be confused with an
-/// arbitrary `String` at a binding-expecting position, and so the
-/// instance-prefix operation is typed as `BindingName -> BindingName`
-/// (see `module_resolver::apply_instance_prefix`). It deliberately does
-/// **not** encode prefix state (Raw vs Prefixed): the wait-binding list
-/// mixes top-level (never-prefixed) and module-derived (prefixed)
-/// entries in one `Vec`, so a state-in-the-type distinction is not
-/// expressible here — that larger data-flow reshape is tracked
-/// separately (carina#3066).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BindingName(String);
-
-impl BindingName {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl std::ops::Deref for BindingName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for BindingName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<String> for BindingName {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for BindingName {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
-
-/// Compare a `BindingName` directly against a string slice so existing
-/// `wb.target == some_str` / lookup sites don't need `.as_str()`
-/// ceremony. The newtype's value is preventing *accidental* String
-/// substitution at construction/parameter boundaries, not forbidding
-/// equality checks.
-impl PartialEq<str> for BindingName {
-    fn eq(&self, other: &str) -> bool {
-        self.0 == other
-    }
-}
-
-impl PartialEq<&str> for BindingName {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<BindingName> for str {
-    fn eq(&self, other: &BindingName) -> bool {
-        self == other.0
-    }
-}
-
-impl PartialEq<BindingName> for &str {
-    fn eq(&self, other: &BindingName) -> bool {
-        *self == other.0
-    }
-}
-
-impl PartialEq<String> for BindingName {
-    fn eq(&self, other: &String) -> bool {
-        &self.0 == other
-    }
-}
-
-impl PartialEq<BindingName> for String {
-    fn eq(&self, other: &BindingName) -> bool {
-        self == &other.0
-    }
-}
-
 /// A `wait <target> { ... }` declaration captured during parse.
 ///
 /// Carries the parsed surface form of the `until` predicate so plan
@@ -8470,6 +8372,25 @@ mod substitute_placeholder_tests {
             ForBinding::Simple("child".to_string()),
             resource,
         )
+    }
+
+    #[test]
+    fn deferred_effect_wire_id_uses_the_resource_id_serializer() {
+        let expression = saved_bound_deferred_expression_fixture();
+        let wire_id: ResourceId = expression.deferred_effect_wire_id();
+        assert_eq!(wire_id.identity_str(), Some("children"));
+        assert_eq!(
+            expression.deferred_effect_id().identity_str(),
+            "children[?]"
+        );
+        let effect = crate::effect::Effect::DeferredCreate(
+            crate::effect::DeferredCreatePayload::new(Box::new(expression)),
+        );
+        let json = serde_json::to_value(effect).expect("serialize deferred effect");
+        assert_eq!(
+            json["DeferredCreate"]["id"],
+            serde_json::to_value(wire_id).unwrap()
+        );
     }
 
     #[test]

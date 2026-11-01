@@ -162,10 +162,26 @@ pub fn render_deferred_for_template_value(
 /// Intermediate data for tree-building: maps from effect indices to their
 /// bindings, dependency sets, and resource types.
 pub struct DependencyGraph {
-    pub binding_to_effect: HashMap<String, usize>,
-    pub effect_deps: HashMap<usize, HashSet<String>>,
+    pub(crate) binding_to_effect: HashMap<SchedulerKey, usize>,
+    pub(crate) effect_deps: HashMap<usize, HashSet<SchedulerKey>>,
     pub effect_bindings: HashMap<usize, String>,
     pub effect_types: HashMap<usize, String>,
+}
+
+impl DependencyGraph {
+    /// Dependency/dependent effect-index pairs, without exposing scheduler keys
+    /// as untyped display strings to graph consumers.
+    pub fn dependency_edges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.effect_deps
+            .iter()
+            .flat_map(move |(dependent, dependencies)| {
+                dependencies.iter().filter_map(move |dependency| {
+                    self.binding_to_effect
+                        .get(dependency)
+                        .map(|dependency| (*dependency, *dependent))
+                })
+            })
+    }
 }
 
 /// Build the dependency graph maps from a plan's effects.
@@ -185,8 +201,8 @@ pub fn build_dependency_graph_from_effects<'a, E, S>(
 where
     E: AsRef<Effect<S>>,
 {
-    let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
-    let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
+    let mut binding_to_effect: HashMap<SchedulerKey, usize> = HashMap::new();
+    let mut effect_deps: HashMap<usize, HashSet<SchedulerKey>> = HashMap::new();
     let mut effect_bindings: HashMap<usize, String> = HashMap::new();
     let mut effect_types: HashMap<usize, String> = HashMap::new();
     let replacement_display: Vec<_> = replacement_display.into_iter().collect();
@@ -217,15 +233,7 @@ where
                 let rl = effect
                     .as_resource_ref()
                     .expect("variant carries a resource");
-                let deps: HashSet<String> = effect
-                    .blocking_keys()
-                    .into_iter()
-                    .map(|key| match key {
-                        SchedulerKey::Binding(binding) => binding.to_string(),
-                        SchedulerKey::Resource(identity) => identity.to_string(),
-                        SchedulerKey::Loop(template) => template.scheduler_key().to_string(),
-                    })
-                    .collect();
+                let deps: HashSet<SchedulerKey> = effect.blocking_keys().into_iter().collect();
                 (Some(rl), deps)
             }
             Effect::Delete {
@@ -235,19 +243,22 @@ where
                 dependencies,
                 ..
             } => {
-                let deps = dependencies.iter().map(ToString::to_string).collect();
+                let deps = dependencies
+                    .iter()
+                    .cloned()
+                    .map(SchedulerKey::Binding)
+                    .collect();
                 let is_current = generation.is_current();
+                if is_current {
+                    for key in effect.scheduling_keys() {
+                        binding_to_effect.insert(key, idx);
+                    }
+                }
                 if let Some(b) = binding {
                     let b = b.to_string();
-                    if is_current {
-                        binding_to_effect.insert(b.clone(), idx);
-                    }
                     effect_bindings.insert(idx, b.clone());
                 } else {
                     let fallback = id.to_string();
-                    if is_current {
-                        binding_to_effect.insert(fallback.clone(), idx);
-                    }
                     effect_bindings.insert(idx, fallback);
                 }
                 effect_types.insert(idx, id.resource_type.clone());
@@ -256,7 +267,9 @@ where
             }
             Effect::Import { id, .. } | Effect::Remove { id, .. } => {
                 let fallback = id.to_string();
-                binding_to_effect.insert(fallback.clone(), idx);
+                for key in effect.scheduling_keys() {
+                    binding_to_effect.insert(key, idx);
+                }
                 effect_bindings.insert(idx, fallback);
                 effect_types.insert(idx, id.resource_type.clone());
                 effect_deps.insert(idx, HashSet::new());
@@ -264,7 +277,9 @@ where
             }
             Effect::Move { to, .. } => {
                 let fallback = to.to_string();
-                binding_to_effect.insert(fallback.clone(), idx);
+                for key in effect.scheduling_keys() {
+                    binding_to_effect.insert(key, idx);
+                }
                 effect_bindings.insert(idx, fallback);
                 effect_types.insert(idx, to.resource_type.clone());
                 effect_deps.insert(idx, HashSet::new());
@@ -288,9 +303,9 @@ where
                 // uses only the target edge because it visualizes the
                 // structural "wait gates this resource" relationship.
                 let mut deps = HashSet::new();
-                deps.insert(target_id.id().identity_str().to_string());
+                deps.insert(SchedulerKey::Resource(target_id.id().identity().clone()));
                 let binding = identity.to_string();
-                binding_to_effect.insert(binding.clone(), idx);
+                binding_to_effect.insert(SchedulerKey::Binding(identity.clone()), idx);
                 effect_bindings.insert(idx, binding.clone());
                 effect_types.insert(idx, "wait".to_string());
                 effect_deps.insert(idx, deps);
@@ -299,8 +314,9 @@ where
             Effect::DeferredCreate(payload) => {
                 let template = &payload.template;
                 let fallback = payload.id().to_string();
-                binding_to_effect.insert(fallback.clone(), idx);
-                binding_to_effect.insert(template.target().scheduler_key().to_string(), idx);
+                for key in effect.scheduling_keys() {
+                    binding_to_effect.insert(key, idx);
+                }
                 effect_bindings.insert(idx, fallback);
                 effect_types.insert(idx, "deferred_for".to_string());
                 effect_deps.insert(
@@ -308,19 +324,21 @@ where
                     template
                         .root_bindings()
                         .into_iter()
-                        .map(|binding| binding.to_string())
+                        .map(SchedulerKey::Binding)
                         .collect(),
                 );
                 continue;
             }
             Effect::DeferredReplace(payload) => {
                 let fallback = payload.id().to_string();
-                binding_to_effect.insert(fallback.clone(), idx);
-                binding_to_effect
-                    .insert(payload.template.target().scheduler_key().to_string(), idx);
+                for key in effect.scheduling_keys() {
+                    binding_to_effect.insert(key, idx);
+                }
                 for delete in payload.deletes.iter() {
+                    binding_to_effect
+                        .insert(SchedulerKey::Resource(delete.id.identity().clone()), idx);
                     if let Some(binding) = &delete.binding {
-                        binding_to_effect.insert(binding.to_string(), idx);
+                        binding_to_effect.insert(SchedulerKey::Binding(binding.clone()), idx);
                     }
                 }
                 effect_bindings.insert(idx, fallback);
@@ -331,7 +349,7 @@ where
                         .template
                         .root_bindings()
                         .into_iter()
-                        .map(|binding| binding.to_string())
+                        .map(SchedulerKey::Binding)
                         .collect(),
                 );
                 continue;
@@ -340,7 +358,6 @@ where
 
         if let Some(r) = resource {
             let mut replacement_binding = None;
-            let mut replacement_binding_aliases = Vec::new();
             if let Some(metadata) = replacement_create_info.get(&idx)
                 && let Some(Effect::Delete {
                     id,
@@ -349,28 +366,21 @@ where
                     ..
                 }) = effects.get(metadata.delete_idx).map(AsRef::as_ref)
             {
-                deps.extend(dependencies.iter().map(ToString::to_string));
+                deps.extend(dependencies.iter().cloned().map(SchedulerKey::Binding));
+                binding_to_effect.insert(SchedulerKey::Resource(id.identity().clone()), idx);
                 if let Some(binding) = binding {
-                    replacement_binding = Some(binding.to_string());
-                    replacement_binding_aliases.push(binding.to_string());
-                } else {
-                    replacement_binding_aliases.push(id.to_string());
+                    replacement_binding = Some(binding);
+                    binding_to_effect.insert(SchedulerKey::Binding(binding.clone()), idx);
                 }
             }
 
-            let resource_binding = r.binding().map(str::to_string);
             let binding = replacement_binding
-                .or_else(|| resource_binding.clone())
+                .or_else(|| r.binding_address())
+                .map(ToString::to_string)
                 .unwrap_or_else(|| r.id().to_string());
-            for alias in replacement_binding_aliases {
-                binding_to_effect.insert(alias, idx);
+            for key in effect.scheduling_keys() {
+                binding_to_effect.insert(key, idx);
             }
-            if let Some(resource_binding) = resource_binding
-                && resource_binding != binding
-            {
-                binding_to_effect.insert(resource_binding, idx);
-            }
-            binding_to_effect.insert(binding.clone(), idx);
             effect_bindings.insert(idx, binding);
             effect_types.insert(idx, r.id().resource_type.clone());
         }
@@ -402,8 +412,6 @@ pub fn build_single_parent_tree<S>(
     let effect_deps = &graph.effect_deps;
     let effect_bindings = &graph.effect_bindings;
     let effect_types = &graph.effect_types;
-
-    let effect_binding_set: HashSet<&str> = binding_to_effect.keys().map(|s| s.as_str()).collect();
 
     // Step 1: Build the full reverse dependency map (all parents)
     let mut all_dependents: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -442,12 +450,12 @@ pub fn build_single_parent_tree<S>(
         let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
         children.sort_by_key(|a| sort_key(a));
         if !children.is_empty() {
-            let binding_of_idx = effect_bindings.get(&idx).map(|s| s.as_str());
             let all_dependents_have_other_deps = children.iter().all(|&child_idx| {
                 effect_deps.get(&child_idx).is_some_and(|child_deps| {
                     child_deps.iter().any(|d| {
-                        effect_binding_set.contains(d.as_str())
-                            && Some(d.as_str()) != binding_of_idx
+                        binding_to_effect
+                            .get(d)
+                            .is_some_and(|dependency_idx| *dependency_idx != idx)
                     })
                 })
             });
@@ -659,6 +667,51 @@ mod tests {
     }
 
     #[test]
+    fn binding_spelling_cannot_steal_a_resource_identity_dependency() {
+        let actual = Resource::new("test.Resource", "shared").with_root_binding("actual");
+        let alias = Resource::new("test.Resource", "unrelated").with_root_binding("shared");
+        let consumer = Resource::new("test.Resource", "consumer")
+            .with_root_binding("consumer")
+            .with_attribute(
+                "comment",
+                Value::root_resource_ref("shared", "identifier", vec![]),
+            );
+        let actual = resolved(actual);
+        let target_id = crate::wait::ManagedWaitTarget::new(&actual);
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(actual));
+        plan.add(Effect::Create(resolved(alias)));
+        plan.add(Effect::Wait {
+            identity: absolute("ready"),
+            target_id,
+            until: WaitPredicate::equals(
+                AttrPath::single("identifier"),
+                Value::Concrete(ConcreteValue::String("ready".into())),
+            )
+            .expect("valid wait predicate"),
+            until_surface: "actual.identifier == 'ready'".to_string(),
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(1),
+            explicit_dependencies: HashSet::new(),
+        });
+        plan.add(Effect::Create(resolved(consumer)));
+
+        let graph = build_dependency_graph(&plan);
+        let (roots, dependents) = build_single_parent_tree(&plan, &graph);
+        assert_eq!(roots, vec![0, 1]);
+        assert_eq!(
+            dependents.get(&0),
+            Some(&vec![2]),
+            "wait must use the resource identity"
+        );
+        assert_eq!(
+            dependents.get(&1),
+            Some(&vec![3]),
+            "value reference must use the binding"
+        );
+    }
+
+    #[test]
     fn deferred_for_source_renders_the_complete_coalesce_expression() {
         let template_resource = LoopResource::new("test.Child", "children");
         let deferred = DeferredForExpression::new(
@@ -810,14 +863,14 @@ mod tests {
 
         let bucket_idx = *graph
             .binding_to_effect
-            .get("bucket")
+            .get(&SchedulerKey::Binding(absolute("bucket")))
             .expect("bucket effect indexed by binding");
         let bucket_deps = graph
             .effect_deps
             .get(&bucket_idx)
             .expect("bucket effect has deps map entry");
         assert!(
-            bucket_deps.contains("role"),
+            bucket_deps.contains(&SchedulerKey::Binding(absolute("role"))),
             "explicit depends_on edge should be in dependency graph; got {:?}",
             bucket_deps
         );
@@ -859,17 +912,26 @@ mod tests {
             !graph.effect_deps.contains_key(&2),
             "replacement delete should not be a graph entry"
         );
-        assert_eq!(graph.binding_to_effect.get("vpc_old"), Some(&1));
-        assert_eq!(graph.binding_to_effect.get("vpc_new"), Some(&1));
+        assert_eq!(
+            graph
+                .binding_to_effect
+                .get(&SchedulerKey::Binding(absolute("vpc_old"))),
+            Some(&1)
+        );
+        assert_eq!(
+            graph
+                .binding_to_effect
+                .get(&SchedulerKey::Binding(absolute("vpc_new"))),
+            Some(&1)
+        );
         assert_eq!(
             graph.effect_bindings.get(&1).map(String::as_str),
             Some("vpc_old")
         );
         assert!(
-            graph
-                .effect_deps
-                .get(&1)
-                .is_some_and(|deps| deps.contains("internet_gateway")),
+            graph.effect_deps.get(&1).is_some_and(
+                |deps| deps.contains(&SchedulerKey::Binding(absolute("internet_gateway")))
+            ),
             "delete-side dependencies should be merged into create deps"
         );
 
@@ -926,7 +988,9 @@ mod tests {
 
         let graph = build_dependency_graph(&plan);
         assert_eq!(
-            graph.binding_to_effect.get("main"),
+            graph
+                .binding_to_effect
+                .get(&SchedulerKey::Binding(absolute("main"))),
             Some(&0),
             "current instance must keep the binding used by dependents"
         );
@@ -1079,21 +1143,25 @@ mod tests {
 
         let graph = build_dependency_graph(&plan);
         assert_eq!(
-            graph.binding_to_effect.get("validation_records[0]"),
+            graph
+                .binding_to_effect
+                .get(&SchedulerKey::Binding(absolute("validation_records[0]"))),
             Some(&0)
         );
 
         let wait_idx = *graph
             .binding_to_effect
-            .get("wait_validation_record_0")
+            .get(&SchedulerKey::Binding(absolute("wait_validation_record_0")))
             .expect("wait effect indexed by binding");
         let wait_deps = graph
             .effect_deps
             .get(&wait_idx)
             .expect("wait effect has deps map entry");
         assert!(
-            wait_deps.contains("validation_records[0]"),
-            "wait should depend on the deferred replace's absorbed delete binding; got {wait_deps:?}"
+            wait_deps.contains(&SchedulerKey::Resource(
+                crate::resource::ResourceIdentity::new("validation_records[0]")
+            )),
+            "wait should depend on the deferred replace's absorbed resource identity; got {wait_deps:?}"
         );
 
         let (_roots, dependents) = build_single_parent_tree(&plan, &graph);

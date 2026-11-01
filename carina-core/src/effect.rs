@@ -1105,6 +1105,9 @@ impl UnresolvedSavedEffect {
         }
     }
 
+    /// Returns the effect's resource ID. For a bound deferred loop this uses
+    /// the derived template identity (`children[?]`), not the bare binding
+    /// spelling retained only by the legacy v36 JSON projection.
     pub fn resource_id(&self) -> &ResourceId {
         match self {
             Self::Read { resource } => &resource.id,
@@ -1834,7 +1837,12 @@ impl<S> EffectWithSource<S> {
         }
     }
 
-    /// Returns the resource ID for this effect
+    /// Returns the resource ID for this effect.
+    ///
+    /// A bound deferred loop uses its derived template identity (for example,
+    /// `children[?]`), not its `children` binding address. An unbound deferred
+    /// loop uses its source-derived loop identity. These IDs describe the
+    /// deferred effect, not a concrete expanded child resource.
     pub fn resource_id(&self) -> &ResourceId {
         match self {
             Effect::Read { resource } => &resource.id,
@@ -1852,11 +1860,14 @@ impl<S> EffectWithSource<S> {
         }
     }
 
-    /// Returns the scheduler identity for this effect.
+    /// Returns the effect's resource identity, not its typed scheduling key.
     ///
     /// `Effect::identity()` is total because all scheduler-bound payloads went
     /// through the `Resolved*` checked constructors after the resolver boundary.
-    /// `Wait` is keyed by the wait effect's own identity, not by its target.
+    /// `Wait` returns the wait effect's own identity, not its target's.
+    /// Bound deferred loops return the template identity (`children[?]`),
+    /// while dependency scheduling uses the distinct `children` binding key.
+    /// Unbound deferred loops return their source-derived loop identity.
     pub fn identity(&self) -> ResourceIdentity {
         match self {
             Effect::Read { resource } => resource.identity().clone(),

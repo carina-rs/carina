@@ -314,24 +314,15 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
     let dependency_graph =
         build_dependency_graph_from_effects(&analysis_effects, input.plan.replace_display_info());
     let mut logical_edge_set = HashSet::new();
-    let mut effect_dependencies: Vec<_> = dependency_graph.effect_deps.iter().collect();
-    effect_dependencies.sort_by_key(|(idx, _)| **idx);
-    for (dependent_idx, bindings) in effect_dependencies {
-        let mut bindings: Vec<_> = bindings.iter().collect();
-        bindings.sort();
-        for binding in bindings {
-            let Some(dependency_idx) = dependency_graph.binding_to_effect.get(binding) else {
-                continue;
-            };
-            let (Some(dependency), Some(dependent)) = (
-                effect_nodes.get(*dependency_idx).and_then(Clone::clone),
-                effect_nodes.get(*dependent_idx).and_then(Clone::clone),
-            ) else {
-                continue;
-            };
-            if dependency != dependent {
-                logical_edge_set.insert((dependency, dependent));
-            }
+    for (dependency_idx, dependent_idx) in dependency_graph.dependency_edges() {
+        let (Some(dependency), Some(dependent)) = (
+            effect_nodes.get(dependency_idx).and_then(Clone::clone),
+            effect_nodes.get(dependent_idx).and_then(Clone::clone),
+        ) else {
+            continue;
+        };
+        if dependency != dependent {
+            logical_edge_set.insert((dependency, dependent));
         }
     }
     let mut logical_edges: Vec<_> = logical_edge_set

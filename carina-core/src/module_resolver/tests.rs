@@ -154,6 +154,66 @@ impl ModuleResolutionFixture {
     }
 }
 
+fn assert_secret_resource_reference_is_module_qualified(call: &str) -> AbsoluteBindingAddress {
+    let fixture = ModuleResolutionFixture::new();
+    let caller = format!("let app_module = use {{ source = \"./modules/app\" }}\n{call}\n");
+    let caller_file = fixture.write("main.crn", &caller);
+    fixture.write(
+        "modules/app/main.crn",
+        r#"arguments { marker: String = "app" }
+let consumer = mock.test.resource {
+  name = "consumer"
+  comment = secret(role.identifier)
+}
+"#,
+    );
+    fixture.write(
+        "modules/app/iam.crn",
+        "let role = mock.test.resource { name = \"role\" }\n",
+    );
+    let parsed = crate::parser::parse_file(&caller, &caller_file, &ProviderContext::default())
+        .expect("caller parses");
+    let prefix = instance_prefix_for_call(&parsed.module_calls[0]);
+    let expanded = resolve_modules(parsed, &fixture.root).expect("module expands");
+    let consumer = expanded
+        .resources
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str() == format!("{prefix}.consumer"))
+        })
+        .expect("expanded consumer");
+    let ExpandedValue::Deferred(ExpandedDeferredValue::Secret(inner)) =
+        consumer.get_attr("comment").expect("secret comment")
+    else {
+        panic!("comment must remain a secret expression")
+    };
+    let ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) = inner.as_ref()
+    else {
+        panic!("secret must retain the inner resource reference")
+    };
+    assert_eq!(path.binding_address().as_str(), format!("{prefix}.role"));
+    assert_ne!(path.binding_address().as_str(), "role");
+    path.binding_address().clone()
+}
+
+#[test]
+fn named_module_secret_inner_resource_reference_is_absolute() {
+    assert_eq!(
+        assert_secret_resource_reference_is_module_qualified("let app = app_module {}").as_str(),
+        "app.role",
+    );
+}
+
+#[test]
+fn anonymous_module_secret_inner_resource_reference_is_absolute() {
+    let address = assert_secret_resource_reference_is_module_qualified("app_module {}");
+    assert!(address.as_str().starts_with("app_module_"));
+    assert!(address.as_str().ends_with(".role"));
+}
+
 #[test]
 fn module_argument_if_resolves_true_and_false_value_branches() {
     let root = tempfile::tempdir().expect("temporary module fixture");
@@ -4534,8 +4594,7 @@ fn test_nested_module_cycle_detection() {
     );
 }
 
-#[test]
-fn test_expand_module_call_with_function_call_argument() {
+fn expand_module_call_with_cidr_function_argument(cidr: Value) -> ExpandedValue {
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules
@@ -4551,7 +4610,7 @@ fn test_expand_module_call_with_function_call_argument() {
             Value::Deferred(DeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::cidr_subnet,
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())).into(),
+                    cidr.into(),
                     Value::Concrete(ConcreteValue::Int(8)).into(),
                     Value::Concrete(ConcreteValue::Int(0)).into(),
                 ],
@@ -4573,21 +4632,39 @@ fn test_expand_module_call_with_function_call_argument() {
 
     let vpc = &expanded[0];
 
-    // FunctionCall argument should be substituted as-is (resolved at apply time)
+    vpc.get_attr("cidr_block").expect("expanded CIDR").clone()
+}
+
+#[test]
+fn test_expand_module_call_with_function_call_argument() {
+    // Expansion evaluates pure calls once every substituted operand is known.
     assert_eq!(
-        vpc.get_attr("cidr_block"),
-        Some(&ExpandedValue::Deferred(
-            ExpandedDeferredValue::FunctionCall {
-                name: crate::builtins::BuiltinFunction::cidr_subnet,
-                args: vec![
-                    ExpandedValue::Concrete(ExpandedConcreteValue::String("10.0.0.0/16".into()))
-                        .into(),
-                    ExpandedValue::Concrete(ExpandedConcreteValue::Int(8)).into(),
-                    ExpandedValue::Concrete(ExpandedConcreteValue::Int(0)).into(),
-                ],
-                source_line: (0).into(),
-            }
-        ))
+        expand_module_call_with_cidr_function_argument(Value::Concrete(ConcreteValue::String(
+            "10.0.0.0/16".into(),
+        ))),
+        ExpandedValue::Concrete(ExpandedConcreteValue::String("10.0.0.0/24".into())),
+    );
+}
+
+#[test]
+fn test_expand_module_call_with_unresolved_function_call_argument_stays_deferred() {
+    // An unresolved caller reference must keep the function deferred, without
+    // treating that caller binding as a module-local name.
+    assert_eq!(
+        expand_module_call_with_cidr_function_argument(Value::resource_ref(
+            "network",
+            "cidr_block",
+            Vec::new(),
+        )),
+        ExpandedValue::Deferred(ExpandedDeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::cidr_subnet,
+            args: vec![
+                expanded_resource_ref("network", "cidr_block", Vec::new()).into(),
+                ExpandedValue::Concrete(ExpandedConcreteValue::Int(8)).into(),
+                ExpandedValue::Concrete(ExpandedConcreteValue::Int(0)).into(),
+            ],
+            source_line: (0).into(),
+        })
     );
 }
 

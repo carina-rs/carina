@@ -705,7 +705,7 @@ fn v19_state_rejects_partial_read_marker_with_empty_missing_attributes() {
         "exports": {}
     });
 
-    let message = invalid_state_message(check_and_migrate(&json.to_string()));
+    let message = invalid_state_json_message(check_and_migrate(&json.to_string()));
 
     assert!(
         message.contains("partial-read marker must contain at least one missing attribute"),
@@ -5436,7 +5436,7 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
         "exports": {},
     });
 
-    let message = invalid_state_message(check_and_migrate(&state.to_string()));
+    let message = invalid_state_json_message(check_and_migrate(&state.to_string()));
     assert!(
         message.contains("persisted attribute \"event_pattern\""),
         "{message}"
@@ -5453,7 +5453,7 @@ fn current_state_attribute_errors_include_the_attribute_and_reserved_payload_rea
         },
         "dependency_bindings": [],
     }]);
-    let message = invalid_state_message(check_and_migrate(&state.to_string()));
+    let message = invalid_state_json_message(check_and_migrate(&state.to_string()));
     assert!(
         message.contains("persisted attribute \"mode\""),
         "{message}"
@@ -5843,11 +5843,90 @@ fn state_json_with_resources(version: u32, resources: Vec<serde_json::Value>) ->
     state.to_string()
 }
 
+#[test]
+fn canonical_binding_error_preserves_the_typed_serde_source() {
+    let terminal = serde_json::from_value::<AbsoluteBindingAddress>(serde_json::json!(""))
+        .expect_err("empty persisted addresses are invalid");
+    let detail = terminal.to_string();
+    // A valid address cannot currently canonicalize to an empty one. Exercise
+    // the production error mapper directly to guard that defensive path.
+    let error = BackendError::invalid_canonical_binding(
+        absolute_binding("app.children[\"key\"]"),
+        terminal,
+    )
+    .with_state_read_location("/tmp/project/carina.state.json");
+    let source = std::error::Error::source(&error).expect("serde error must not be flattened");
+    let source = source
+        .downcast_ref::<serde_json::Error>()
+        .expect("typed serde source");
+    assert_eq!(source.classify(), serde_json::error::Category::Data);
+    assert_eq!(source.to_string(), detail);
+    assert!(error.to_string().contains("app.children"));
+    assert!(error.to_string().contains("/tmp/project/carina.state.json"));
+}
+
+#[test]
+fn state_json_wrapper_renders_serde_detail_without_rewording_it() {
+    for (binding, detail) in [
+        (
+            serde_json::json!(""),
+            "an absolute binding address cannot be empty",
+        ),
+        (serde_json::json!(true), "invalid type: boolean"),
+    ] {
+        let mut resource = persisted_resource("mock", "test.resource", "valid");
+        resource["binding"] = binding;
+        let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![resource]);
+        let error = check_and_migrate(&json)
+            .expect_err("invalid binding must fail to load")
+            .with_state_read_location("/tmp/project/carina.state.json");
+        let message = error.to_string();
+        assert!(
+            message.contains(detail),
+            "serde detail must be rendered: {message}"
+        );
+        assert!(
+            message.contains("/tmp/project/carina.state.json"),
+            "{message}"
+        );
+        assert!(
+            message.contains("at JSON location resources[0].binding"),
+            "{message}"
+        );
+        assert!(message.contains("corrupted or hand-edited"), "{message}");
+        assert!(message.contains("restore it from a backup"), "{message}");
+        let source = std::error::Error::source(&error).expect("typed serde source is retained");
+        assert!(source.is::<serde_json::Error>(), "{source:?}");
+    }
+}
+
 fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
     match result.expect_err("invalid state must be rejected") {
         BackendError::InvalidState(message) => message,
         other => panic!("expected InvalidState, got {other}"),
     }
+}
+
+fn invalid_state_json_message(result: Result<MigratedStateFile, BackendError>) -> String {
+    let error = result.expect_err("invalid persisted JSON must be rejected");
+    assert!(
+        matches!(&error, BackendError::InvalidStateJson(_error)),
+        "expected a typed JSON failure, got {error:?}"
+    );
+    let source = std::error::Error::source(&error).expect("serde cause must be retained");
+    assert_eq!(
+        source
+            .downcast_ref::<serde_json::Error>()
+            .expect("typed serde cause")
+            .classify(),
+        serde_json::error::Category::Data
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("at JSON location resources[0]"),
+        "{message}"
+    );
+    message
 }
 
 #[test]

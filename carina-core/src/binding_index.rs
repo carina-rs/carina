@@ -1384,8 +1384,9 @@ impl BindingNameSet {
 
 /// A `wait` binding's value-layer contract: `binding`'s
 /// `<binding>.<attr>` is a passthrough to `<target>.<attr>`
-/// (carina#3085). Both sides are the typed [`BindingName`] newtype so
-/// the wait→target edge cannot be confused with an arbitrary string.
+/// (carina#3085). Both sides of [`WaitAliasSpec<B>`] retain the binding
+/// phase `B`; expanded aliases use [`AbsoluteBindingAddress`], so the
+/// wait→target edge cannot be confused with an arbitrary string.
 ///
 /// This is the *only* thing `ResolvedBindings` needs from a wait
 /// declaration — deliberately **not** the full parser

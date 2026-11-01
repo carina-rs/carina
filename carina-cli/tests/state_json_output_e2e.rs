@@ -143,7 +143,7 @@ fn state_show_reports_empty_binding_with_file_path_and_recovery() {
     assert!(
         stderr.contains("carina.state.json")
             && stderr.contains("resources[0].binding")
-            && stderr.contains("binding address is empty")
+            && stderr.contains("an absolute binding address cannot be empty")
             && stderr.contains("corrupted or hand-edited")
             && stderr.contains("restore it from a backup"),
         "state error must be located and actionable:\n{stderr}",

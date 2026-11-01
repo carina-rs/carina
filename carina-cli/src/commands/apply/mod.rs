@@ -3717,8 +3717,9 @@ async fn run_apply_from_plan_locked_owned(
             // Rebuild the wait passthrough aliases from the persisted
             // `(binding, target)` pairs so `apply --plan`'s cascade
             // re-resolution resolves `<wait-binding>.<attr>` exactly as the
-            // plan path did (carina#3085). `PlanWaitBinding` (String) →
-            // `WaitAliasSpec` (typed `BindingName`); the parser `WaitBinding`
+            // plan path did (carina#3085). `PlanWaitBinding` and
+            // `WaitAliasSpec<AbsoluteBindingAddress>` both retain absolute
+            // binding addresses; the parser `WaitBinding`
             // is not serializable so it is reconstructed here, not deserialized.
             let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
                 .wait_bindings()

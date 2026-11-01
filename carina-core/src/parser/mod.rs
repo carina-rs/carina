@@ -55,8 +55,8 @@ pub use crate::eval_value::StructuralHandleKind;
 pub use crate::resource::RelativeBindingName;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
-    AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
-    BindingScopeId, BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, CallExpansion,
+    AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingScopeId,
+    BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, CallExpansion,
     ConsumerArgumentParameter, ConsumerAttributeParameter, DeferredForBody,
     DeferredForExpansionError, DeferredForExpression, DeferredForPhaseTraversal, DeferredForSite,
     DeferredForTarget, DeferredForTemplateAddress, DeferredForTemplateResource,

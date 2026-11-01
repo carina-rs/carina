@@ -1,7 +1,7 @@
 {
   "version": 36,
   "carina_version": "0.9.0",
-  "timestamp": "2026-11-01T02:19:34.045464+00:00",
+  "timestamp": "2026-11-01T04:10:54.035021+00:00",
   "source_path": "carina-cli/tests/fixtures/module_binding_wire_compat",
   "state_lineage": null,
   "state_serial": null,
@@ -113,6 +113,36 @@
           "id": {
             "provider": "mock",
             "resource_type": "test.resource",
+            "identity": "direct.deferred_source"
+          },
+          "attributes": {
+            "name": {
+              "String": "direct-deferred-source"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "direct.deferred_source",
+          "dependency_bindings": [],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "direct"
+            }
+          }
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
             "identity": "direct.seed"
           },
           "attributes": {
@@ -151,7 +181,7 @@
             },
             "comment": {
               "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$U3LtYg+6DE/6f7Uvj2eVGQ$wmL3Q64d//mG5QwAHWm6OhhV3MWUUxMV8xvwyC6yqhQ"
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$jYvwA3NDgRAYjJs/f7axkw$ghTkQvIvNlYXa0OU4CJLsczvABSzq5hUwrZETXWHKWQ"
               }
             }
           },
@@ -217,6 +247,36 @@
           "id": {
             "provider": "mock",
             "resource_type": "test.resource",
+            "identity": "looped[0].deferred_source"
+          },
+          "attributes": {
+            "name": {
+              "String": "loop-deferred-source"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "looped[0].deferred_source",
+          "dependency_bindings": [],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "looped[0]"
+            }
+          }
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
             "identity": "looped[0].seed"
           },
           "attributes": {
@@ -255,7 +315,7 @@
             },
             "comment": {
               "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$LbFW9oG/ehwoFzDBwJOJKA$nIMwiMLnbHRJ1HEUMeoESsgejhfAbv/Sn96iAyMOJBg"
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$n+KFZTqwMWNhtWT46ua29g$FQKn8yhNT8cgNOkQ0uhdHNFReO08OvxBvMBwmYWSk58"
               }
             }
           },
@@ -315,6 +375,180 @@
             }
           }
         }
+      },
+      {
+        "DeferredCreate": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.children"
+          },
+          "template": {
+            "header": "for key, value in deferred_source.tags ?? {first: 'child'}",
+            "resource_type": "mock.test.resource",
+            "target": {
+              "kind": "bound",
+              "binding": "direct.children"
+            },
+            "iterable": {
+              "Coalesce": {
+                "value": {
+                  "ResourceRef": {
+                    "path": {
+                      "binding": "direct.deferred_source",
+                      "attribute": "tags"
+                    }
+                  }
+                },
+                "default": {
+                  "Map": {
+                    "first": {
+                      "String": "child"
+                    }
+                  }
+                }
+              }
+            },
+            "binding": {
+              "Map": [
+                "key",
+                "value"
+              ]
+            },
+            "template_resource": {
+              "id": {
+                "provider": "mock",
+                "resource_type": "test.resource",
+                "identity": "direct.children[?]"
+              },
+              "attributes": {
+                "name": {
+                  "Interpolation": [
+                    {
+                      "Literal": "direct-"
+                    },
+                    {
+                      "Expr": {
+                        "Unknown": "ForKey"
+                      }
+                    },
+                    {
+                      "Literal": "-"
+                    },
+                    {
+                      "Expr": {
+                        "Unknown": "ForValue"
+                      }
+                    }
+                  ]
+                }
+              },
+              "directives": {
+                "force_delete": false,
+                "create_before_destroy": false,
+                "prevent_destroy": {
+                  "kind": "unspecified"
+                }
+              },
+              "prefixes": {},
+              "binding": "direct.children[?]",
+              "dependency_bindings": [],
+              "module_source": {
+                "Module": {
+                  "name": "app_module",
+                  "instance": "direct"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "DeferredCreate": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].children"
+          },
+          "template": {
+            "header": "for key, value in deferred_source.tags ?? {first: 'child'}",
+            "resource_type": "mock.test.resource",
+            "target": {
+              "kind": "bound",
+              "binding": "looped[0].children"
+            },
+            "iterable": {
+              "Coalesce": {
+                "value": {
+                  "ResourceRef": {
+                    "path": {
+                      "binding": "looped[0].deferred_source",
+                      "attribute": "tags"
+                    }
+                  }
+                },
+                "default": {
+                  "Map": {
+                    "first": {
+                      "String": "child"
+                    }
+                  }
+                }
+              }
+            },
+            "binding": {
+              "Map": [
+                "key",
+                "value"
+              ]
+            },
+            "template_resource": {
+              "id": {
+                "provider": "mock",
+                "resource_type": "test.resource",
+                "identity": "looped[0].children[?]"
+              },
+              "attributes": {
+                "name": {
+                  "Interpolation": [
+                    {
+                      "Literal": "loop-"
+                    },
+                    {
+                      "Expr": {
+                        "Unknown": "ForKey"
+                      }
+                    },
+                    {
+                      "Literal": "-"
+                    },
+                    {
+                      "Expr": {
+                        "Unknown": "ForValue"
+                      }
+                    }
+                  ]
+                }
+              },
+              "directives": {
+                "force_delete": false,
+                "create_before_destroy": false,
+                "prevent_destroy": {
+                  "kind": "unspecified"
+                }
+              },
+              "prefixes": {},
+              "binding": "looped[0].children[?]",
+              "dependency_bindings": [],
+              "module_source": {
+                "Module": {
+                  "name": "app_module",
+                  "instance": "looped[0]"
+                }
+              }
+            }
+          }
+        }
       }
     ]
   },
@@ -341,6 +575,34 @@
       "binding": "root",
       "dependency_bindings": [],
       "module_source": null
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.deferred_source"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-deferred-source"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "direct.deferred_source",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
     },
     {
       "id": {
@@ -382,7 +644,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$U3LtYg+6DE/6f7Uvj2eVGQ$wmL3Q64d//mG5QwAHWm6OhhV3MWUUxMV8xvwyC6yqhQ"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$jYvwA3NDgRAYjJs/f7axkw$ghTkQvIvNlYXa0OU4CJLsczvABSzq5hUwrZETXWHKWQ"
           }
         }
       },
@@ -444,6 +706,34 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
+        "identity": "looped[0].deferred_source"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-deferred-source"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "looped[0].deferred_source",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
         "identity": "looped[0].seed"
       },
       "attributes": {
@@ -480,7 +770,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$LbFW9oG/ehwoFzDBwJOJKA$nIMwiMLnbHRJ1HEUMeoESsgejhfAbv/Sn96iAyMOJBg"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$n+KFZTqwMWNhtWT46ua29g$FQKn8yhNT8cgNOkQ0uhdHNFReO08OvxBvMBwmYWSk58"
           }
         }
       },
@@ -567,6 +857,34 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
+        "identity": "direct.deferred_source"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-deferred-source"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "direct.deferred_source",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
         "identity": "direct.seed"
       },
       "attributes": {
@@ -603,7 +921,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$xduE59zIEGDcs79VmCe+fQ$sSJ+W+rH1nz9AIdn0V3+8xuUSEe/6fC1NhDYe7YJOEw"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$F6fhOXkGf12MCJM3Mp3lpA$nnbC5C4hF9Jc7A3lwqDKdeIJw726ONcL5eRLKFtfB+M"
           }
         }
       },
@@ -665,6 +983,34 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
+        "identity": "looped[0].deferred_source"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-deferred-source"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "looped[0].deferred_source",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
         "identity": "looped[0].seed"
       },
       "attributes": {
@@ -701,7 +1047,7 @@
         },
         "comment": {
           "RedactedSecret": {
-            "hash": "$argon2id$v=19$m=19456,t=2,p=1$jyGs0jshjZmYM5KSdYbguw$ufniXFH/ViiTU3v6vXAgM3db0jL6BmlO75vEtVvFy8k"
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$vFpOOKcFfQvU0fK3Nd7nwQ$6z1PoUcJZSJZXTo/DS38GXyrxoP3ftlCRldmaKNEijw"
           }
         }
       },
@@ -808,11 +1154,11 @@
               "path": "modules/app/nested.crn"
             },
             "call_span": {
-              "start_byte": 63,
-              "end_byte": 120,
-              "start_line": 5,
+              "start_byte": 60,
+              "end_byte": 114,
+              "start_line": 2,
               "start_column": 14,
-              "end_line": 8,
+              "end_line": 5,
               "end_column": 2
             },
             "expansion": {
@@ -913,11 +1259,11 @@
               "path": "modules/app/nested.crn"
             },
             "call_span": {
-              "start_byte": 63,
-              "end_byte": 120,
-              "start_line": 5,
+              "start_byte": 60,
+              "end_byte": 114,
+              "start_line": 2,
               "start_column": 14,
-              "end_line": 8,
+              "end_line": 5,
               "end_column": 2
             },
             "expansion": {
@@ -1134,94 +1480,6 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
-        "identity": "root"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "root"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.seed"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.seed"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.nested.leaf"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.nested.leaf"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.consumer"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.consumer"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
         "identity": "looped[0].consumer"
       },
       "current": {
@@ -1231,6 +1489,28 @@
             "provider": "mock",
             "resource_type": "test.resource",
             "identity": "looped[0].consumer"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].seed"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].seed"
           },
           "identifier": null,
           "attributes": {},
@@ -1266,7 +1546,7 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
-        "identity": "looped[0].seed"
+        "identity": "root"
       },
       "current": {
         "status": "absent",
@@ -1274,7 +1554,117 @@
           "id": {
             "provider": "mock",
             "resource_type": "test.resource",
-            "identity": "looped[0].seed"
+            "identity": "root"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].deferred_source"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].deferred_source"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.deferred_source"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.deferred_source"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.seed"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.seed"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.consumer"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.nested.leaf"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.nested.leaf"
           },
           "identifier": null,
           "attributes": {},

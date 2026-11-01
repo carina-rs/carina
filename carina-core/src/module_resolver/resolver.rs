@@ -1405,20 +1405,20 @@ pub fn prepare_root_export_validation(
     (parameter, bindings)
 }
 
-/// Resolve all modules in a directory parser result.
+/// Resolve all modules in a directory parser result without a loaded provider catalog.
 ///
 /// A caller-built file is not evidence that its bindings belong to the root
 /// directory being expanded:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use std::path::Path;
-/// use carina_core::module_resolver::resolve_modules;
+/// use carina_core::module_resolver::resolve_modules_providerless;
 /// use carina_core::parser::ParsedFile;
 ///
 /// let parsed = ParsedFile::default();
-/// let _ = resolve_modules(parsed, Path::new("."));
+/// let _ = resolve_modules_providerless(parsed, Path::new("."));
 /// ```
-pub fn resolve_modules(
+pub fn resolve_modules_providerless(
     parsed: ParsedRootDirectory,
     base_dir: &Path,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
@@ -1428,14 +1428,6 @@ pub fn resolve_modules(
         &ProviderContext::default(),
         &SchemaRegistry::new(),
     )
-}
-
-/// Resolve all modules without a loaded provider catalog.
-pub fn resolve_modules_providerless(
-    parsed: ParsedRootDirectory,
-    base_dir: &Path,
-) -> Result<ModuleResolvedParsedFile, ModuleError> {
-    resolve_modules(parsed, base_dir)
 }
 
 /// Resolve all modules in a parsed file with the given parser configuration.

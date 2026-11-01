@@ -896,6 +896,52 @@ fn deferred_validation_records_effect() -> Effect {
     )))
 }
 
+#[test]
+fn format_effect_bound_deferred_for_uses_the_template_identity() {
+    assert_eq!(
+        format_effect(&deferred_validation_records_effect()),
+        "Expand deferred for aws.route53.Record validation_records[?] (waits on cert)",
+    );
+}
+
+#[test]
+fn format_effect_unbound_deferred_for_uses_the_source_identity() {
+    let source = "let upstream = mock.test.resource { name = \"upstream\" }\n\
+        for value in upstream.tags { mock.test.resource { name = value } }\n";
+    let parsed = carina_core::parser::parse_file(
+        source,
+        std::path::Path::new("deferred-progress.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("unbound loop parses");
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("root bindings resolve")
+    .into_expanded()
+    .expect("loop slots finalize");
+    let deferred = parsed
+        .deferred_for_expressions()
+        .iter()
+        .next()
+        .expect("deferred loop")
+        .clone();
+    assert!(matches!(
+        deferred.target(),
+        carina_core::parser::DeferredForTarget::Unbound {
+            template: _template
+        }
+    ));
+    let effect = Effect::DeferredCreate(carina_core::effect::DeferredCreatePayload::new(Box::new(
+        deferred,
+    )));
+    assert_eq!(
+        format_effect(&effect),
+        "Expand deferred for mock.test.resource _loop_39ec86fd0e24c726 (waits on upstream)",
+    );
+}
+
 fn delete_record_effect(binding: &'static str) -> Effect {
     Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
