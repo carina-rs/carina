@@ -12,7 +12,9 @@ use carina_core::detail_rows::{
 #[cfg(test)]
 use carina_core::effect::DeletedInstanceKey;
 use carina_core::effect::Effect;
-use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart, ReplaceDisplayInfo};
+use carina_core::plan::{
+    DeferredSummaryAction, DestroyOrdering, Plan, PlanSummaryPart, ReplaceDisplayInfo,
+};
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
 use carina_core::plan_tree::{
@@ -201,7 +203,21 @@ fn module_child_prefix() -> String {
 }
 
 /// Check if a resource has a `let` binding (i.e., is not anonymous).
-fn has_binding<S>(resource: carina_core::parser::ResourceRef<'_, S>) -> bool {
+fn has_binding<S, R>(
+    resource: carina_core::parser::ResourceRef<
+        '_,
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::LoopSlot,
+        carina_core::parser::ResolvedDeferredForPhase<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::LoopSlot,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+        carina_core::resource::AbsoluteBindingAddress,
+        R,
+    >,
+) -> bool {
     resource.binding().is_some()
 }
 
@@ -211,8 +227,20 @@ fn has_binding<S>(resource: carina_core::parser::ResourceRef<'_, S>) -> bool {
 /// `name` is the display name of the resource (typically `id.name`).
 /// `parent_binding` is the binding name of the parent in the tree, used to skip
 /// redundant ResourceRef hints.
-fn format_compact_name<S>(
-    resource: carina_core::parser::ResourceRef<'_, S>,
+fn format_compact_name<S, R>(
+    resource: carina_core::parser::ResourceRef<
+        '_,
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::LoopSlot,
+        carina_core::parser::ResolvedDeferredForPhase<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::LoopSlot,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+        carina_core::resource::AbsoluteBindingAddress,
+        R,
+    >,
     name: &str,
     parent_binding: Option<&str>,
 ) -> String {
@@ -482,6 +510,7 @@ fn format_plan_display<S>(
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
 ) -> ProviderResult<String> {
+    let plan = display.plan();
     let mut out = String::new();
 
     if !summary.has_changes() {
@@ -508,6 +537,7 @@ fn format_plan_display<S>(
             expansion_trace,
             provider,
         )?);
+        append_destroy_ordering_warnings(&mut out, plan);
 
         // Show deferred for-expressions
         for deferred in summary.residual_deferred_for() {
@@ -693,8 +723,32 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
         None, // ExpansionTrace doesn't apply to destroy plans (no compositions in state)
         provider,
     )?);
+    append_destroy_ordering_warnings(&mut out, plan);
 
     Ok(out)
+}
+
+fn append_destroy_ordering_warnings<S>(out: &mut String, plan: &Plan<S>) {
+    for notice in plan.destroy_ordering_notices() {
+        match notice.ordering() {
+            DestroyOrdering::Known => {}
+            DestroyOrdering::UnresolvedPersistedDependencies { dependencies } => {
+                for dependency in dependencies.iter() {
+                    writeln!(
+                        out,
+                        "{}",
+                        format!(
+                            "Warning: destroy ordering for {} is partially unknown: persisted dependency `{}` no longer resolves.",
+                            notice.id(),
+                            dependency,
+                        )
+                        .yellow()
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
 }
 
 /// Holds shared state and configuration for recursive tree rendering.
@@ -771,7 +825,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         .map(|from| format!(" (moved from: {})", from.identity_display()));
                     if self.detail == DetailLevel::None {
                         let name_part = format_compact_name(
-                            carina_core::parser::ResourceRef::Resource(r),
+                            carina_core::parser::ResourceRef::Resource(r.as_inner()),
                             r.identity_str(),
                             parent_binding,
                         );
@@ -801,7 +855,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     }
                 } else if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
-                        carina_core::parser::ResourceRef::Resource(r),
+                        carina_core::parser::ResourceRef::Resource(r.as_inner()),
                         r.identity_str(),
                         parent_binding,
                     );
@@ -850,7 +904,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     .map(|from| format!(" (moved from: {})", from.identity_display()));
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
-                        carina_core::parser::ResourceRef::Resource(to),
+                        carina_core::parser::ResourceRef::Resource(to.as_inner()),
                         to.identity_str(),
                         parent_binding,
                     );
@@ -909,7 +963,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             Effect::Read { resource } => {
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
-                        carina_core::parser::ResourceRef::DataSource(resource),
+                        carina_core::parser::ResourceRef::DataSource(resource.as_inner()),
                         resource.identity_str(),
                         parent_binding,
                     );
@@ -1025,11 +1079,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 .unwrap();
             }
             Effect::Wait {
-                identity,
-                until_surface,
-                ..
+                id, until_surface, ..
             } => {
-                let binding = identity.to_string();
+                let binding = id.identity_str();
                 writeln!(
                     self.out,
                     "{}{} {}",
@@ -2414,11 +2466,9 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
             )
         }
         Effect::Wait {
-            identity,
-            until_surface,
-            ..
+            id, until_surface, ..
         } => {
-            let binding = identity.to_string();
+            let binding = id.identity_str().to_string();
             format!("Wait {} (until {})", binding, until_surface)
         }
         Effect::DeferredCreate(payload) => {

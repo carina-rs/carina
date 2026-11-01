@@ -308,7 +308,9 @@ fn integer_arithmetic_accepts_typed_function_and_module_operands() {
     .expect("a typed Int module argument is a valid deferred arithmetic operand");
     assert!(matches!(
         module.attribute_params[0].value,
-        Some(Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+        Some(BoundaryExpression::Value(Value::Deferred(
+            DeferredValue::IntegerArithmetic(_)
+        )))
     ));
 }
 
@@ -402,7 +404,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
 
 #[test]
 fn structural_for_resource_pipe_is_not_exported_as_a_value() {
-    let error = parse(
+    let parsed = parse(
         r#"
         fn f(value) { 7 }
         let n = for x in [1] {
@@ -412,13 +414,16 @@ fn structural_for_resource_pipe_is_not_exported_as_a_value() {
         "#,
         &ProviderContext::default(),
     )
-    .expect_err("a resource and a computed pipe value cannot share one exported name");
+    .expect("the parser must retain the structural side of the resource pipe");
 
-    assert!(
-        error
-            .to_string()
-            .contains("'n' is a resource, not a value; reference one of its attributes"),
-        "unexpected exported resource pipe diagnostic: {error}",
+    assert_eq!(
+        parsed.export_params[0]
+            .value
+            .as_ref()
+            .and_then(BoundaryExpression::handle)
+            .map(|handle| handle.diagnostic_name()),
+        Some("n"),
+        "the computed pipe value must not escape under the resource binding name",
     );
 }
 
@@ -831,7 +836,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
             ),
         },
         timeout_secs: None,
-        depends_on: Vec::new(),
+        depends_on: Default::default(),
         line: 1,
     });
     file.requires.push(RequireBlock::dummy(
@@ -1658,7 +1663,8 @@ fn fully_qualified_shape_keeps_bound_value_head_semantics_in_every_value_positio
             .export_params
             .iter()
             .find(|export| export.name == "exported")
-            .and_then(|export| export.value.as_ref()),
+            .and_then(|export| export.value.as_ref())
+            .and_then(BoundaryExpression::value),
         Some(&expected),
     );
     assert_eq!(parsed.resources[0].get_attr("name"), Some(&expected),);
@@ -1711,7 +1717,8 @@ fn fully_qualified_shape_keeps_bound_structural_head_semantics_in_every_value_po
                 .export_params
                 .iter()
                 .find(|export| export.name == "exported")
-                .and_then(|export| export.value.as_ref()),
+                .and_then(|export| export.value.as_ref())
+                .and_then(BoundaryExpression::value),
             Some(&expected),
         );
         assert_eq!(
@@ -5343,7 +5350,12 @@ fn parse_empty_interpolation_does_not_break_sibling_bindings() {
     let resource_names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.binding.as_deref().unwrap_or(""))
+        .map(|r| {
+            r.binding
+                .as_ref()
+                .map(|binding| binding.as_str())
+                .unwrap_or("")
+        })
         .collect();
     assert!(
         resource_names.contains(&"bucket") && resource_names.contains(&"vpc"),
@@ -6976,7 +6988,9 @@ fn parse_if_module_argument_defers_nested_value_carriers() {
 
     assert!(matches!(
         parsed.attribute_params[0].value,
-        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+        Some(BoundaryExpression::Value(Value::Deferred(
+            DeferredValue::ModuleIf(_)
+        )))
     ));
     assert!(matches!(
         parsed.resources[0].get_attr("direct"),
@@ -12541,12 +12555,13 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
     for resource in &parsed.resources {
         assert!(
             resource
-                .dependency_bindings
+                .dependencies
+                .value_bindings
                 .iter()
                 .any(|binding| binding.as_str() == "orgs"),
             "expanded deferred-for child {} should depend on iterable binding `orgs`, got {:?}",
             resource.id,
-            resource.dependency_bindings
+            resource.dependencies.value_bindings
         );
     }
 }
@@ -12614,11 +12629,12 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
     let child = &parsed.resources[0];
     assert!(
         child
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .any(|binding| binding.as_str() == "orgs"),
         "resolve_refs_for_plan must preserve deferred-for iterable dependency binding, got {:?}",
-        child.dependency_bindings
+        child.dependencies.value_bindings
     );
 }
 
@@ -13451,7 +13467,7 @@ fn quoted_string_attrs_distinguish_quoted_from_bare_and_namespaced() {
         parsed
             .resources
             .iter()
-            .find(|r| r.binding.as_deref() == Some(binding))
+            .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some(binding))
             .map(|r| r.quoted_string_attrs.contains("target_type"))
             .unwrap_or(false)
     };
@@ -13487,7 +13503,7 @@ fn quoted_string_attrs_are_top_level_only() {
     let sg = parsed
         .resources
         .iter()
-        .find(|r| r.binding.as_deref() == Some("sg"))
+        .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("sg"))
         .expect("sg resource present");
     assert!(sg.quoted_string_attrs.contains("name"));
     // `protocol` lives inside the `rules` block; only top-level
@@ -13509,7 +13525,7 @@ fn quoted_string_attrs_skipped_for_interpolated_strings() {
     let r = parsed
         .resources
         .iter()
-        .find(|r| r.binding.as_deref() == Some("r"))
+        .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("r"))
         .expect("r resource present");
     // Interpolations parse to `Value::Deferred(DeferredValue::Interpolation)`, not a plain
     // string, so they are never recorded in `quoted_string_attrs`.
@@ -13688,11 +13704,11 @@ fn parsed_file_is_file_of_parsed_export_param() {
 
 #[test]
 fn inferred_file_holds_inferred_export_param() {
-    let one = InferredExportParam {
-        name: "vpc_id".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::String),
-        value: None,
-    };
+    let one = InferredExportParam::for_test(
+        "vpc_id",
+        crate::static_type::ExportStaticType::Declared(TypeExpr::String),
+        None,
+    );
     let f: InferredFile = InferredFile {
         export_params: vec![one],
         ..Default::default()
@@ -14221,7 +14237,7 @@ fn parse_directory_preserves_export_param_dotted_string_literal() {
         .expect("domain export present");
 
     assert_eq!(
-        export.value.as_ref(),
+        export.value.as_ref().and_then(BoundaryExpression::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "publish.example.com".into()
         )))
@@ -14285,7 +14301,7 @@ fn parse_preserves_attribute_param_default_dotted_string_literal() {
         .expect("domain attribute param present");
 
     assert_eq!(
-        attr.value.as_ref(),
+        attr.value.as_ref().and_then(BoundaryExpression::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "publish.example.com".into()
         )))
@@ -14972,7 +14988,7 @@ fn extract_directives_reads_depends_on_list() {
         .find(|r| r.id.identity_str().expect("resolved identity") == "bucket")
         .expect("bucket binding");
     assert_eq!(
-        bucket.directives.depends_on,
+        bucket.dependencies.depends_on.diagnostic_references(),
         vec!["role".to_string(), "key".to_string()]
     );
 }
@@ -15271,9 +15287,9 @@ fn extract_directives_accepts_empty_depends_on_list() {
         .find(|r| r.id.identity_str().expect("resolved identity") == "bucket")
         .expect("bucket binding");
     assert!(
-        bucket.directives.depends_on.is_empty(),
+        bucket.dependencies.depends_on.is_empty(),
         "empty depends_on list should produce an empty Vec, got {:?}",
-        bucket.directives.depends_on
+        bucket.dependencies.depends_on
     );
 }
 
@@ -15309,7 +15325,7 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         panic!("deferred fixture body must be a resource")
     };
     assert_eq!(
-        template.directives().depends_on,
+        template.dependencies().depends_on.diagnostic_references(),
         vec!["role".to_string()],
         "for-body resource template should carry directives.depends_on"
     );
@@ -16502,6 +16518,7 @@ fn postfix_index_on_sibling_let_bound_computed_value_is_directory_scoped() {
         .iter()
         .find(|export| export.name == "account_id")
         .and_then(|export| export.value.as_ref())
+        .and_then(BoundaryExpression::value)
         .expect("account_id export value");
 
     assert!(matches!(
@@ -16830,27 +16847,49 @@ fn assert_bare_handle_is_pending_for_typed_resource_value(source: &str, binding:
 }
 
 #[test]
-fn bare_resource_handle_is_rejected_in_untyped_value_positions() {
+fn bare_resource_handle_is_rejected_in_runtime_value_positions() {
     for source in [
         r#"let vpc = mock.test.Thing { name = "source" }
 let values = [vpc, "ok"]"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 let values = { primary = vpc }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
-exports { handle: String = vpc }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
-exports { handle = vpc }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
 let rendered = "prefix-${vpc}""#,
         r#"let vpc = mock.test.Thing { name = "source" }
 mock.test.Consumer { name = "prefix-${vpc}" }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 mock.test.Consumer { name = upper(vpc) }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
-attributes { handle: String = vpc }"#,
     ] {
         assert_bare_handle_error(source, "vpc", "a resource");
     }
+}
+
+#[test]
+fn boundary_blocks_preserve_bare_resource_handles_for_typed_validation() {
+    let parsed = parse(
+        r#"let vpc = mock.test.Thing { name = "source" }
+attributes { output = vpc }
+exports { exported = vpc }"#,
+        &ProviderContext::default(),
+    )
+    .expect("boundary blocks retain structural handles until validation");
+
+    assert_eq!(
+        parsed.attribute_params[0]
+            .value
+            .as_ref()
+            .and_then(crate::parser::BoundaryExpression::handle)
+            .map(|handle| handle.diagnostic_name()),
+        Some("vpc"),
+    );
+    assert_eq!(
+        parsed.export_params[0]
+            .value
+            .as_ref()
+            .and_then(crate::parser::BoundaryExpression::handle)
+            .map(|handle| handle.diagnostic_name()),
+        Some("vpc"),
+    );
 }
 
 #[test]
@@ -17369,7 +17408,9 @@ fn integer_arithmetic_retains_provisional_metadata_for_both_operands() {
         parsed
             .parser_binding_metadata
             .value_structural_handles_by_name("n"),
-        Some(crate::eval_value::StructuralHandleMetadata::ExpressionOperands(operands))
+        Some(
+            crate::eval_value::UnexpandedStructuralHandleMetadata::ExpressionOperands(operands),
+        )
             if operands.len() == 2
     ));
 }
@@ -17424,9 +17465,14 @@ let us = provider mock {}
     let consumer = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("consumer"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("consumer")
+        })
         .expect("consumer");
-    assert_eq!(consumer.directives.depends_on, vec!["dependency"]);
+    assert_eq!(
+        consumer.dependencies.depends_on.diagnostic_references(),
+        vec!["dependency"]
+    );
     assert_eq!(consumer.directives.provider_instance.as_deref(), Some("us"));
 }
 
@@ -17454,6 +17500,42 @@ let consumer = mock.test.Consumer {
         "unexpected error: {message}"
     );
     assert!(message.contains("line 5"), "unexpected error: {message}");
+}
+
+#[test]
+fn dependency_boundaries_reject_a_string_module_argument_with_the_same_message() {
+    for (boundary, source) in [
+        (
+            "directives.depends_on",
+            r#"
+arguments { dependency: String }
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [dependency] }
+}
+"#,
+        ),
+        (
+            "wait.depends_on",
+            r#"
+arguments { dependency: String }
+let target = mock.test.Thing { name = "target" }
+let ready = wait target {
+  until = target.name == "ready"
+  depends_on = [dependency]
+}
+"#,
+        ),
+    ] {
+        let error = parse(source, &ProviderContext::default())
+            .expect_err("a value-typed module argument is not a dependency handle");
+        assert!(
+            error.to_string().contains(&format!(
+                "{boundary}: expected a managed resource handle; got String"
+            )),
+            "unexpected {boundary} error: {error}",
+        );
+    }
 }
 
 #[test]
@@ -17585,6 +17667,7 @@ fn postfix_access_preserves_sibling_deferred_for_binding_as_resource_address() {
             .iter()
             .find(|export| export.name == name)
             .and_then(|export| export.value.as_ref())
+            .and_then(BoundaryExpression::value)
             .unwrap()
     };
     assert_eq!(value("role_grouped"), value("role_name"));
@@ -18212,6 +18295,7 @@ fn deferred_user_calls_share_the_root_lexical_scope() {
             .iter()
             .find(|parameter| parameter.name == name)
             .and_then(|parameter| parameter.value.as_ref())
+            .and_then(BoundaryExpression::value)
             .unwrap_or_else(|| panic!("missing attribute {name}"));
         let Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
@@ -18234,6 +18318,16 @@ fn deferred_user_calls_share_the_root_lexical_scope() {
         std::ptr::eq(first_scope, second_scope),
         "deferred calls must share one lexical scope allocation",
     );
+}
+#[test]
+fn wait_depends_on_accepts_bare_and_dotted_dependency_operands() {
+    let parsed = parse("let ready = wait cert { until = cert.status == \"issued\" depends_on = [r, producer.validation_record] }\n", &ProviderContext::default()).unwrap();
+    let operands = parsed.wait_bindings[0]
+        .depends_on
+        .iter()
+        .map(|operand| operand.diagnostic_reference())
+        .collect::<Vec<_>>();
+    assert_eq!(operands, ["r", "producer.validation_record"]);
 }
 
 #[test]

@@ -8,7 +8,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Struct
 use carina_core::value::format_value;
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::new((resource).into_value_snapshot())
 }
 
 fn create(resource: Resource) -> Effect {
@@ -47,9 +47,9 @@ fn app_from_plan_with_effects() {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
@@ -134,9 +134,9 @@ fn deferred_create_uses_create_symbol_and_kind() {
     );
 
     let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate(
-        carina_core::effect::DeferredCreatePayload::new(Box::new(deferred)),
-    ));
+    plan.add(Effect::DeferredCreate(crate::compiled_loop_fixture(
+        Box::new(deferred),
+    )));
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.nodes.len(), 1);
@@ -351,20 +351,18 @@ fn format_value_display() {
 #[test]
 fn tree_structure_with_dependencies() {
     // Create a plan where subnet depends on vpc via ResourceRef
-    let mut plan = Plan::new();
-    plan.add(create(
+    let resources = vec![
         Resource::new("ec2.Vpc", "my-vpc")
             .with_absolute_binding(absolute("vpc"))
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
-    ));
-    plan.add(create(
         Resource::new("ec2.Subnet", "my-subnet")
             .with_absolute_binding(absolute("subnet"))
             .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
-    ));
+    ];
+    let plan = crate::create_plan_fixture(resources);
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
 

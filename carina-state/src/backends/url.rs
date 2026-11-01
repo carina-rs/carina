@@ -18,12 +18,71 @@
 //! `StateUrl::parse`, which is the seam where the "bare path vs
 //! scheme-prefixed" classification lives. The loader cannot be reached
 //! with an unclassified raw string.
+//!
+//! Offline commands use [`LocalStateFile`] and [`load_local_state_file`], which
+//! admit only local paths and never reach the general backend selector.
 
 use std::path::PathBuf;
 
-use crate::backend::{BackendError, BackendResult};
+use crate::backend::{BackendError, BackendResult, StateBackend};
 use crate::backend_selection::BackendSelection;
 use crate::state::{PublishedExports, StateFile};
+
+/// A local state file for offline commands. Remote URLs cannot inhabit this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalStateFile {
+    path: PathBuf,
+}
+
+impl LocalStateFile {
+    /// Accept a bare path or `file:///<absolute-path>`, rejecting remote schemes.
+    pub fn parse(raw: &str) -> BackendResult<Self> {
+        let path = if let Some(rest) = raw.strip_prefix("file://") {
+            if rest.is_empty() {
+                return Err(BackendError::configuration(format!(
+                    "Invalid file:// URL '{}': path is empty",
+                    raw
+                )));
+            }
+            if !rest.starts_with('/') {
+                return Err(BackendError::configuration(format!(
+                    "Invalid file:// URL '{}': use file:///<absolute-path> \
+                     (host form file://host/path is not supported)",
+                    raw
+                )));
+            }
+            rest
+        } else if raw.contains("://") {
+            return Err(BackendError::configuration(format!(
+                "Unsupported URL scheme in '{}': expected a local state file \
+                 (file:///<absolute-path> or a bare local path)",
+                raw
+            )));
+        } else if raw.is_empty() {
+            return Err(BackendError::configuration("Empty state URL"));
+        } else {
+            raw
+        };
+        Ok(Self { path: path.into() })
+    }
+}
+
+/// Read a local state file without constructing a remote backend or writing state.
+///
+/// A general state URL cannot be passed to the offline loader:
+///
+/// ```compile_fail,E0308
+/// use carina_state::{StateUrl, load_local_state_file};
+/// let remote = StateUrl::parse("s3://bucket/state.json").unwrap();
+/// let _ = load_local_state_file(&remote);
+/// ```
+pub async fn load_local_state_file(file: &LocalStateFile) -> BackendResult<StateFile> {
+    super::LocalBackend::with_path(file.path.clone())
+        .read_state()
+        .await?
+        .map(|loaded| loaded.into_state())
+        .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", file.path.display())))
+}
 
 /// A parsed `--state-url` argument.
 ///
@@ -79,30 +138,7 @@ impl StateUrl {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             })
-        } else if let Some(rest) = raw.strip_prefix("file://") {
-            if rest.is_empty() {
-                return Err(BackendError::configuration(format!(
-                    "Invalid file:// URL '{}': path is empty",
-                    raw
-                )));
-            }
-            // Reject `file://host/path` (RFC 8089 host form) and
-            // `file://./relative` style inputs — silently treating
-            // `file://localhost/foo` as the relative path
-            // `localhost/foo` is the kind of bug operators only catch
-            // after the lookup returns "No state at localhost/foo".
-            // Require the local-file form `file:///abs/path`.
-            if !rest.starts_with('/') {
-                return Err(BackendError::configuration(format!(
-                    "Invalid file:// URL '{}': use file:///<absolute-path> \
-                     (host form file://host/path is not supported)",
-                    raw
-                )));
-            }
-            Ok(StateUrl::File {
-                path: PathBuf::from(rest),
-            })
-        } else if raw.contains("://") {
+        } else if raw.contains("://") && !raw.starts_with("file://") {
             // Reject other URL schemes explicitly rather than silently
             // treating them as bare paths — the user almost certainly
             // meant something else.
@@ -111,13 +147,8 @@ impl StateUrl {
                 raw
             )))
         } else {
-            if raw.is_empty() {
-                return Err(BackendError::configuration(
-                    "Empty --state-url is not allowed",
-                ));
-            }
             Ok(StateUrl::File {
-                path: PathBuf::from(raw),
+                path: LocalStateFile::parse(raw)?.path,
             })
         }
     }
@@ -167,6 +198,39 @@ pub async fn load_published_exports_from_url(url: &StateUrl) -> BackendResult<Pu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_local_state_file_rejects_remote_schemes() {
+        for raw in [
+            "s3://bucket/state.json",
+            "https://example.com/state.json",
+            "gs://bucket/state.json",
+        ] {
+            let error = LocalStateFile::parse(raw).unwrap_err();
+            assert!(error.to_string().contains("local state file"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_local_state_file_loads_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let mut state = StateFile::new();
+        state.increment_serial();
+        let bytes = serde_json::to_vec_pretty(&state).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        for raw in [
+            path.display().to_string(),
+            format!("file://{}", path.display()),
+        ] {
+            let local = LocalStateFile::parse(&raw).unwrap();
+            assert_eq!(
+                load_local_state_file(&local).await.unwrap().serial,
+                state.serial
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
 
     // ---- StateUrl::parse ----
 

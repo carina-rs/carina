@@ -1,9 +1,8 @@
 //! State file structures for persisting infrastructure state
 
 use carina_core::binding_index::SecretPreservingAttributes;
-use carina_core::deps::get_resource_dependencies;
 use carina_core::differ::{ComparisonContext, Orphan, ReferenceEquality};
-use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect};
+use carina_core::effect::{MoveAuthority, ReleaseListKeysEffect, ResolvedMovePairs};
 use carina_core::executor::{AcceptedRequest, AcceptedRequestKind};
 use carina_core::explicit::{self, ExplicitFields};
 use carina_core::name_override::NameOverrideSource;
@@ -18,15 +17,17 @@ use carina_core::provider::{
     StateRowInFlightCreate, StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
     merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
+use carina_core::resolved_graph::{
+    ConfiguredResources, ExpandedBindingIndex, ExpandedGraphResolutionError,
+    LegacyClassificationGraph, ResolvedExpandedGraph,
+};
 pub use carina_core::resource::DeposedKey;
 #[cfg(test)]
 use carina_core::resource::Resource;
-#[cfg(any(test, feature = "test-utils"))]
-use carina_core::resource::absolute_binding_address_for_test;
 use carina_core::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, Directives, PartialReadMarker,
-    PendingReRead, PersistedDirectives, ResolvedResource, ResolvedResourceId, ResourceId,
-    ResourceIdentity, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, PartialReadMarker, PendingReRead,
+    PersistedDestroyDependencies, PersistedDestroyDependencyProjection, PersistedDirectives,
+    ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::{
     CompiledResourceSchema as ResourceSchema, FieldName, SchemaKind, SchemaRegistry,
@@ -39,7 +40,8 @@ use carina_core::value::{
 };
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::backend::{BackendError, InvalidResourceIdentityError, InvalidStateJsonError};
 
@@ -491,11 +493,10 @@ impl Serialize for CurrentExportsVersion {
 }
 
 /// The main state file structure that persists to the backend
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct StateFile {
     /// State file format version
     pub version: u32,
-    #[serde(rename = "exports_version")]
     exports_version_marker: CurrentExportsVersion,
     /// Monotonically increasing number for each state modification
     pub serial: u64,
@@ -506,8 +507,57 @@ pub struct StateFile {
     /// All managed resources and their current state
     resources: Vec<ResourceState>,
     /// Published exports for remote_state consumers
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub exports: HashMap<String, PersistedExportValue>,
+    /// Pre-v21 kind-blind binding snapshots. These are deliberately outside
+    /// [`ResourceState`]: source-less commands may inspect them, but only the
+    /// expanded-graph classifier can clear them and make the file writable.
+    legacy_dependencies: BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
+    dependency_encoding: DependencyEncoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyEncoding {
+    PendingLegacy,
+    Current,
+}
+
+#[derive(Serialize)]
+struct WritableStateFile<'a> {
+    version: u32,
+    #[serde(rename = "exports_version")]
+    exports_version_marker: CurrentExportsVersion,
+    serial: u64,
+    lineage: &'a str,
+    carina_version: &'a str,
+    resources: &'a [ResourceState],
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    exports: &'a HashMap<String, PersistedExportValue>,
+}
+
+impl Serialize for StateFile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.dependency_encoding != DependencyEncoding::Current
+            || self.version != Self::CURRENT_VERSION
+            || !self.legacy_dependencies.is_empty()
+        {
+            return Err(serde::ser::Error::custom(
+                "pre-v21 dependency names require configuration-aware migration before state can be written",
+            ));
+        }
+        WritableStateFile {
+            version: self.version,
+            exports_version_marker: self.exports_version_marker,
+            serial: self.serial,
+            lineage: &self.lineage,
+            carina_version: &self.carina_version,
+            resources: &self.resources,
+            exports: &self.exports,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// Classification used by import planning without weakening the general
@@ -835,6 +885,95 @@ fn map_state_file_decode_error(
     }
 }
 
+fn take_legacy_dependency_names(
+    owner: &mut serde_json::Value,
+    field: &str,
+    location: &str,
+) -> Result<LegacyDependencyNames, StateFileDecodeError> {
+    use carina_core::utils::canonicalize_map_key_address;
+
+    let Some(object) = owner.as_object_mut() else {
+        return Err(StateFileDecodeError::Validation(format!(
+            "{location} owner must be an object"
+        )));
+    };
+    let Some(value) = object.remove(field) else {
+        return Ok(LegacyDependencyNames::default());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| StateFileDecodeError::Validation(format!("{location} must be an array")))?;
+    let names = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(canonicalize_map_key_address)
+                .ok_or_else(|| {
+                    StateFileDecodeError::Validation(format!(
+                        "{location}[{index}] must be a string in pre-v21 state"
+                    ))
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(LegacyDependencyNames(names))
+}
+
+fn extract_legacy_row_dependencies(
+    row: &mut serde_json::Value,
+    row_index: usize,
+) -> Result<LegacyRowDependencies, StateFileDecodeError> {
+    let value_dependencies = take_legacy_dependency_names(
+        row,
+        "dependency_bindings",
+        &format!("resources[{row_index}].dependency_bindings"),
+    )?;
+    let explicit_dependencies = match row.get_mut("directives") {
+        Some(directives) => take_legacy_dependency_names(
+            directives,
+            "depends_on",
+            &format!("resources[{row_index}].directives.depends_on"),
+        )?,
+        None => LegacyDependencyNames::default(),
+    };
+    let mut deposed_dependencies = HashMap::new();
+    if let Some(deposed) = row.get_mut("deposed") {
+        let deposed = deposed.as_array_mut().ok_or_else(|| {
+            StateFileDecodeError::Validation(format!(
+                "resources[{row_index}].deposed must be an array"
+            ))
+        })?;
+        for (generation_index, generation) in deposed.iter_mut().enumerate() {
+            let names = take_legacy_dependency_names(
+                generation,
+                "dependency_bindings",
+                &format!("resources[{row_index}].deposed[{generation_index}].dependency_bindings"),
+            )?;
+            if !names.is_empty() {
+                let key = generation
+                    .get("key")
+                    .cloned()
+                    .ok_or_else(|| {
+                        StateFileDecodeError::Validation(format!(
+                            "resources[{row_index}].deposed[{generation_index}].key is missing"
+                        ))
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value::<DeposedKey>(value)
+                            .map_err(StateFileDecodeError::json_at_root)
+                    })?;
+                deposed_dependencies.insert(key, names);
+            }
+        }
+    }
+    Ok(LegacyRowDependencies {
+        value_dependencies,
+        explicit_dependencies,
+        deposed_dependencies,
+    })
+}
+
 impl StateFile {
     /// Crate-private validated parse seam. `StateFile` intentionally has no
     /// public `Deserialize` impl: every external parse must go through the
@@ -844,7 +983,7 @@ impl StateFile {
     /// every parse (carina#2858).
     pub(crate) fn from_json_str(content: &str) -> Result<Self, StateFileDecodeError> {
         let mut deserializer = serde_json::Deserializer::from_str(content);
-        let unchecked: UncheckedStateFile = serde_path_to_error::deserialize(&mut deserializer)
+        let mut unchecked: UncheckedStateFile = serde_path_to_error::deserialize(&mut deserializer)
             .map_err(|error| {
                 let path = error.path().clone();
                 StateFileDecodeError::json_at_path(&path, error.into_inner())
@@ -853,6 +992,16 @@ impl StateFile {
             .end()
             .map_err(StateFileDecodeError::json_at_root)?;
         classify_exports_version(unchecked.version, unchecked.exports_version)?;
+        let legacy_rows = if unchecked.version <= 20 {
+            unchecked
+                .resources
+                .iter_mut()
+                .enumerate()
+                .map(|(index, row)| extract_legacy_row_dependencies(row, index))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![LegacyRowDependencies::default(); unchecked.resources.len()]
+        };
         let resources = unchecked
             .resources
             .into_iter()
@@ -904,6 +1053,18 @@ impl StateFile {
             })
             .collect::<Result<Vec<ResourceState>, StateFileDecodeError>>()?;
         let exports = decode_persisted_exports(unchecked.exports)?;
+        let legacy_dependencies = resources
+            .iter()
+            .zip(legacy_rows)
+            .filter_map(|(row, dependencies)| {
+                (!dependencies.is_empty()).then(|| {
+                    (
+                        ResolvedResourceId::new(Self::id_for_resource_state(row)),
+                        dependencies,
+                    )
+                })
+            })
+            .collect();
         let state = Self {
             version: unchecked.version,
             exports_version_marker: CurrentExportsVersion,
@@ -912,6 +1073,12 @@ impl StateFile {
             carina_version: unchecked.carina_version,
             resources,
             exports,
+            legacy_dependencies,
+            dependency_encoding: if unchecked.version < Self::CURRENT_VERSION {
+                DependencyEncoding::PendingLegacy
+            } else {
+                DependencyEncoding::Current
+            },
         };
         state
             .validate_unique_identities()
@@ -959,8 +1126,12 @@ impl StateFile {
     /// v19: Replaced the partial-read marker's untyped detail with a typed
     ///      pending re-read reason. The v18 migration classifies legacy
     ///      details as incomplete reads.
-    /// v20: Added a token-less create-outcome-unknown current instance.
-    pub const CURRENT_VERSION: u32 = 20;
+    /// v20: Added a token-less create-outcome-unknown current instance and
+    ///      made `prevent_destroy` tri-state so explicit false remains
+    ///      distinct from an unspecified schema-defaulted value.
+    /// v21: Replaced binding-text dependency records on current/deposed
+    ///      instances and persisted directives with complete resolved IDs.
+    pub const CURRENT_VERSION: u32 = 21;
 
     /// State file version that introduced the independent exports version.
     /// This value is fixed forever.
@@ -976,6 +1147,8 @@ impl StateFile {
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
             resources: Vec::new(),
             exports: HashMap::new(),
+            legacy_dependencies: BTreeMap::new(),
+            dependency_encoding: DependencyEncoding::Current,
         }
     }
 
@@ -1031,6 +1204,8 @@ impl StateFile {
             exports_version_marker: CurrentExportsVersion,
             serial: 0,
             lineage,
+            legacy_dependencies: BTreeMap::new(),
+            dependency_encoding: DependencyEncoding::Current,
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
             resources: Vec::new(),
             exports: HashMap::new(),
@@ -1053,6 +1228,287 @@ impl StateFile {
     /// APIs rather than exposing the backing vector.
     pub fn resources(&self) -> &[ResourceState] {
         &self.resources
+    }
+
+    /// Whether this file still carries the unwritable pre-v21 dependency
+    /// typestate. Even a v20 file whose dependency arrays were empty must
+    /// cross the graph-aware transition before it can be written as v21.
+    pub fn requires_legacy_dependency_migration(&self) -> bool {
+        self.version < Self::CURRENT_VERSION
+    }
+
+    /// Complete the pending transition when no current or deposed rows remain.
+    /// Nonempty state still requires graph-aware classification, even when its
+    /// legacy dependency arrays are empty. Mutating commands call this before
+    /// deciding whether they can persist a loaded migration under their lock.
+    pub fn finish_rowless_dependency_migration(&mut self) {
+        if self.resources.is_empty()
+            && self.legacy_dependencies.is_empty()
+            && self.requires_legacy_dependency_migration()
+        {
+            // With no current or deposed rows there are no dependency names
+            // to classify. Lock-held no-op commands can persist this state.
+            self.version = Self::CURRENT_VERSION;
+            self.dependency_encoding = DependencyEncoding::Current;
+        }
+    }
+
+    /// Whether graph projection is needed to classify any pre-v21 names.
+    pub fn has_legacy_dependency_names(&self) -> bool {
+        !self.legacy_dependencies.is_empty()
+    }
+
+    /// Names source-less commands should display for one row while migration
+    /// is pending.
+    pub fn legacy_dependency_names_for(
+        &self,
+        row: &ResourceState,
+    ) -> Option<LegacyDependencyNames> {
+        let id = ResolvedResourceId::new(Self::id_for_resource_state(row));
+        self.legacy_dependencies
+            .get(&id)
+            .map(LegacyRowDependencies::all_names)
+            .filter(|names| !names.is_empty())
+            .map(LegacyDependencyNames)
+    }
+
+    /// Classify pre-v21 dependency names without mutating the loaded state.
+    ///
+    /// State rows win over current graph names. Resolved move destinations supply
+    /// instance scopes; unmoved rows retain their persisted binding's scopes,
+    /// including orphan and deposed rows. Configured rows fail closed on missing
+    /// or ambiguous names; orphan and deposed deletes retain known edges and
+    /// return explicit display warnings for the rest.
+    fn classify_legacy_dependencies(
+        &self,
+        input: &LegacyMigrationInput<'_>,
+    ) -> Result<
+        LegacyClassificationOutcome<LegacyDependencyClassification>,
+        LegacyDependencyMigrationError,
+    > {
+        use carina_core::utils::canonicalize_map_key_address;
+
+        if !self.requires_legacy_dependency_migration() {
+            return Ok(LegacyClassificationOutcome::Classified(
+                LegacyDependencyClassification {
+                    lineage: self.lineage.clone(),
+                    sources: BTreeMap::new(),
+                    rows: BTreeMap::new(),
+                    warnings: Vec::new(),
+                },
+            ));
+        }
+
+        let mut unread_rows = self
+            .resources
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                let row_id = ResolvedResourceId::new(Self::id_for_resource_state(row));
+                if !self.legacy_dependencies.contains_key(&row_id) {
+                    return None;
+                }
+                let classified_id = input
+                    .moved_pairs
+                    .iter()
+                    .find_map(|(from, to)| (from == &row_id).then_some(to))
+                    .unwrap_or(&row_id);
+                let owned_by_residual_loop = !input.configured.contains(classified_id)
+                    && input.offline_unmaterialized.iter().any(|prefix| {
+                        [
+                            Some(row.identity.as_str()),
+                            row.binding.as_ref().map(AbsoluteBindingAddress::as_str),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .any(|address| {
+                            address == prefix
+                                || address.strip_prefix(prefix).is_some_and(|suffix| {
+                                    suffix.starts_with('[') || suffix.starts_with('.')
+                                })
+                        })
+                    });
+                owned_by_residual_loop.then_some(LegacyReadRequiredRow {
+                    row_index,
+                    row: row_id,
+                })
+            });
+        if let Some(first) = unread_rows.next() {
+            return Ok(LegacyClassificationOutcome::RequiresReads(
+                LegacyReadRequiredRows {
+                    first,
+                    rest: unread_rows.collect(),
+                },
+            ));
+        }
+
+        let mut state_candidates: HashMap<String, Vec<LegacyStateCandidate>> = HashMap::new();
+        for (row_index, row) in self.resources.iter().enumerate() {
+            let id = ResolvedResourceId::new(Self::id_for_resource_state(row));
+            let display = format!(
+                "resources[{row_index}] ({}.{} {:?}, binding {:?})",
+                row.provider,
+                row.resource_type,
+                row.identity.as_str(),
+                row.binding
+            );
+            let mut names = BTreeSet::from([canonicalize_map_key_address(row.identity.as_str())]);
+            if let Some(binding) = &row.binding {
+                names.insert(canonicalize_map_key_address(binding.as_str()));
+            }
+            for name in names {
+                state_candidates
+                    .entry(name)
+                    .or_default()
+                    .push(LegacyStateCandidate {
+                        id: id.clone(),
+                        display: display.clone(),
+                    });
+            }
+        }
+        for candidates in state_candidates.values_mut() {
+            candidates.sort_by(|left, right| left.id.cmp(&right.id));
+            candidates.dedup_by(|left, right| left.id == right.id);
+        }
+
+        let mut migrated = BTreeMap::new();
+        let mut warnings = Vec::new();
+
+        for (row_index, row) in self.resources.iter().enumerate() {
+            let row_id = ResolvedResourceId::new(Self::id_for_resource_state(row));
+            let Some(legacy) = self.legacy_dependencies.get(&row_id) else {
+                continue;
+            };
+            let move_destination = input
+                .moved_pairs
+                .iter()
+                .find_map(|(from, to)| (from == &row_id).then_some(to));
+            let classified_id = move_destination.unwrap_or(&row_id);
+            let configured = input.configured.contains(classified_id);
+            let scopes = legacy_row_scopes(row, move_destination);
+            let row_description = format!(
+                "resources[{row_index}] ({}.{} {:?})",
+                row.provider,
+                row.resource_type,
+                row.identity.as_str()
+            );
+            let strict = configured;
+            let (value_dependencies, value_unknown) = classify_legacy_names(
+                input.graph,
+                &legacy.value_dependencies,
+                LegacyNameClassificationContext {
+                    scopes: &scopes,
+                    state_candidates: &state_candidates,
+                    strict,
+                    row_index,
+                    row: &row_description,
+                    location: format!("resources[{row_index}].dependency_bindings"),
+                },
+            )?;
+            let (explicit_dependencies, explicit_unknown) = classify_legacy_names(
+                input.graph,
+                &legacy.explicit_dependencies,
+                LegacyNameClassificationContext {
+                    scopes: &scopes,
+                    state_candidates: &state_candidates,
+                    strict,
+                    row_index,
+                    row: &row_description,
+                    location: format!("resources[{row_index}].directives.depends_on"),
+                },
+            )?;
+            let current_unknown = value_unknown
+                .into_iter()
+                .chain(explicit_unknown)
+                .collect::<BTreeSet<_>>();
+            if !current_unknown.is_empty() {
+                warnings.push(LegacyDestroyOrderingWarning {
+                    row: classified_id.clone(),
+                    generation: None,
+                    legacy_names: current_unknown,
+                });
+            }
+
+            let mut deposed_dependencies = HashMap::new();
+            for (key, names) in &legacy.deposed_dependencies {
+                let (known, unknown) = classify_legacy_names(
+                    input.graph,
+                    names,
+                    LegacyNameClassificationContext {
+                        scopes: &scopes,
+                        state_candidates: &state_candidates,
+                        strict: false,
+                        row_index,
+                        row: &row_description,
+                        location: format!(
+                            "resources[{row_index}].deposed[{key}].dependency_bindings"
+                        ),
+                    },
+                )?;
+                deposed_dependencies.insert(key.clone(), known);
+                if !unknown.is_empty() {
+                    warnings.push(LegacyDestroyOrderingWarning {
+                        row: classified_id.clone(),
+                        generation: Some(key.clone()),
+                        legacy_names: unknown,
+                    });
+                }
+            }
+            migrated.insert(
+                row_id,
+                MigratedLegacyRowDependencies {
+                    value_dependencies,
+                    explicit_dependencies,
+                    deposed_dependencies,
+                },
+            );
+        }
+
+        Ok(LegacyClassificationOutcome::Classified(
+            LegacyDependencyClassification {
+                lineage: self.lineage.clone(),
+                sources: self.legacy_dependencies.clone(),
+                rows: migrated,
+                warnings,
+            },
+        ))
+    }
+
+    /// Apply a classification only to the exact legacy source snapshot from
+    /// which it was produced.
+    fn with_legacy_classification(
+        mut self,
+        classification: LegacyDependencyClassification,
+    ) -> Result<StateFile, LegacyDependencyMigrationError> {
+        if self.lineage != classification.lineage
+            || self.legacy_dependencies != classification.sources
+        {
+            return Err(LegacyDependencyMigrationError::StaleClassification);
+        }
+
+        let LegacyDependencyClassification {
+            lineage: _,
+            sources: _,
+            rows: mut migrated,
+            warnings: _,
+        } = classification;
+        for row in &mut self.resources {
+            let row_id = ResolvedResourceId::new(Self::id_for_resource_state(row));
+            let Some(migration) = migrated.remove(&row_id) else {
+                continue;
+            };
+            row.dependency_bindings = migration.value_dependencies;
+            row.directives.depends_on = migration.explicit_dependencies;
+            for deposed in &mut row.deposed {
+                if let Some(dependencies) = migration.deposed_dependencies.get(&deposed.key) {
+                    deposed.dependency_bindings = dependencies.clone();
+                }
+            }
+        }
+        self.legacy_dependencies.clear();
+        self.version = Self::CURRENT_VERSION;
+        self.dependency_encoding = DependencyEncoding::Current;
+        Ok(self)
     }
 
     /// Insert already-encoded export JSON in cross-crate tests while still
@@ -1309,12 +1765,12 @@ impl StateFile {
         Some(removed)
     }
 
-    /// Build a map of ResourceId -> Directives from this state file.
-    pub fn build_directives(&self) -> HashMap<ResourceId, Directives> {
+    /// Build a map of resource IDs to the typed directives persisted in state.
+    pub fn build_directives(&self) -> HashMap<ResourceId, PersistedDirectives> {
         let mut directives_map = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
-            directives_map.insert(id, Directives::from(&rs.directives));
+            directives_map.insert(id, rs.directives.clone());
         }
         directives_map
     }
@@ -1348,7 +1804,15 @@ impl StateFile {
     /// resource table. Match both the complete typed address supplied by the
     /// parser and the legacy row shape. An identifier-bearing row is managed
     /// state even when a new data source now occupies the same address.
-    pub fn remove_legacy_data_source_rows<S>(&mut self, data_sources: &[DataSource<S>]) -> usize {
+    pub fn remove_legacy_data_source_rows<S, D>(
+        &mut self,
+        data_sources: &[DataSource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            AbsoluteBindingAddress,
+            D,
+        >],
+    ) -> usize {
         let data_source_ids: HashSet<_> = data_sources.iter().map(|source| &source.id).collect();
         let original_len = self.resources.len();
         self.resources.retain(|row| {
@@ -1359,6 +1823,16 @@ impl StateFile {
                     | CurrentInstance::CreateOutcomeUnknown { .. }
             ) || !data_source_ids.contains(&Self::id_for_resource_state(row))
         });
+        if self.resources.len() != original_len {
+            let surviving_ids = self
+                .resources
+                .iter()
+                .map(|row| ResolvedResourceId::new(Self::id_for_resource_state(row)))
+                .collect::<HashSet<_>>();
+            self.legacy_dependencies
+                .retain(|id, _dependencies| surviving_ids.contains(id));
+            self.finish_rowless_dependency_migration();
+        }
         original_len - self.resources.len()
     }
 
@@ -1511,18 +1985,18 @@ impl StateFile {
             let orphan = match self.build_state_for_resource(&id) {
                 Current::Absent(_state) => continue,
                 Current::Present(present) => {
-                    Orphan::present(present, rs.binding.clone(), (&rs.directives).into())
+                    Orphan::present(present, rs.binding.clone(), rs.directives.clone())
                 }
                 Current::CreateInFlight(pending) => {
-                    Orphan::create_in_flight(pending, rs.binding.clone(), (&rs.directives).into())
+                    Orphan::create_in_flight(pending, rs.binding.clone(), rs.directives.clone())
                 }
                 Current::CreateOutcomeUnknown(unknown) => Orphan::create_outcome_unknown(
                     unknown,
                     rs.binding.clone(),
-                    (&rs.directives).into(),
+                    rs.directives.clone(),
                 ),
                 Current::MissingIdentifier(state) => {
-                    Orphan::missing_identifier(state, rs.binding.clone(), (&rs.directives).into())
+                    Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
                 }
             };
             loaded.insert(orphan);
@@ -1591,11 +2065,38 @@ impl StateFile {
             if let Some(binding) = r.binding.take() {
                 r.binding = Some(canonicalize_binding(binding)?);
             }
-            r.dependency_bindings = std::mem::take(&mut r.dependency_bindings)
-                .into_iter()
-                .map(canonicalize_binding)
-                .collect::<Result<_, _>>()?;
+            r.dependency_bindings = canonicalize_resolved_dependencies(
+                std::mem::take(&mut r.dependency_bindings),
+                "current resource",
+            )?;
+            r.directives.depends_on = canonicalize_resolved_dependencies(
+                std::mem::take(&mut r.directives.depends_on),
+                "current directives",
+            )?;
+            for generation in &mut r.deposed {
+                generation.dependency_bindings = canonicalize_resolved_dependencies(
+                    std::mem::take(&mut generation.dependency_bindings),
+                    "deposed generation",
+                )?;
+            }
         }
+        let mut canonical_legacy = BTreeMap::new();
+        for (row, dependencies) in std::mem::take(&mut self.legacy_dependencies) {
+            let mut id = row.into_inner();
+            let canonical = canonicalize_map_key_address(
+                id.identity_str()
+                    .expect("legacy row dependency owner always has an identity"),
+            );
+            let identity = ResourceIdentity::try_from(canonical).map_err(|error| {
+                BackendError::InvalidStateIdentity {
+                    context: "cannot canonicalize legacy dependency owner".to_string(),
+                    error,
+                }
+            })?;
+            id.set_identity(identity);
+            canonical_legacy.insert(ResolvedResourceId::new(id), dependencies);
+        }
+        self.legacy_dependencies = canonical_legacy;
         Ok(())
     }
 
@@ -1834,6 +2335,29 @@ impl StateFile {
     }
 }
 
+fn canonicalize_resolved_dependencies(
+    dependencies: PersistedDestroyDependencies,
+    context: &str,
+) -> Result<PersistedDestroyDependencies, BackendError> {
+    use carina_core::utils::canonicalize_map_key_address;
+
+    dependencies.try_map_addresses(|dependency| {
+        let mut id = dependency.into_inner();
+        let canonical = canonicalize_map_key_address(
+            id.identity_str()
+                .expect("resolved dependency identity is always present"),
+        );
+        let identity = ResourceIdentity::try_from(canonical).map_err(|error| {
+            BackendError::InvalidStateIdentity {
+                context: format!("cannot canonicalize dependency for {context}"),
+                error,
+            }
+        })?;
+        id.set_identity(identity);
+        Ok(ResolvedResourceId::new(id))
+    })
+}
+
 const _: () = assert!(StateFile::EXPORTS_VERSION_INTRODUCED <= StateFile::CURRENT_VERSION);
 
 impl Default for StateFile {
@@ -1986,6 +2510,464 @@ pub struct MigrationInfo {
     pub to: u32,
 }
 
+/// A legacy string dependency could not be converted to one complete state
+/// address. The row and JSON field identify the owner of the bad edge; the
+/// original dependency text is retained verbatim for repair tooling.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LegacyDependencyMigrationError {
+    #[error(transparent)]
+    GraphValidation(Box<ExpandedGraphResolutionError>),
+    #[error("legacy dependency classification is stale for this state")]
+    StaleClassification,
+    #[error(
+        "{location} on {row} references legacy dependency {dependency:?}, but it matches neither a state row nor the current expanded graph"
+    )]
+    Missing {
+        row_index: usize,
+        row: String,
+        location: String,
+        dependency: String,
+    },
+    #[error(
+        "{location} on {row} references ambiguous legacy dependency {dependency:?}; matching rows: {candidates:?}"
+    )]
+    Ambiguous {
+        row_index: usize,
+        row: String,
+        location: String,
+        dependency: String,
+        candidates: Vec<String>,
+    },
+    #[error("{location} on {row} could not classify legacy dependency {dependency:?}: {reason}")]
+    Resolution {
+        row_index: usize,
+        row: String,
+        location: String,
+        dependency: String,
+        reason: Box<ExpandedGraphResolutionError>,
+    },
+    #[error("{location} on {row} could not classify legacy dependency {dependency:?}: {reason}")]
+    InvalidStateDependency {
+        row_index: usize,
+        row: String,
+        location: String,
+        dependency: String,
+        reason: Box<carina_core::resource::NotAManagedRow>,
+    },
+}
+
+impl From<ExpandedGraphResolutionError> for LegacyDependencyMigrationError {
+    fn from(error: ExpandedGraphResolutionError) -> Self {
+        Self::GraphValidation(Box::new(error))
+    }
+}
+
+/// Binding texts retained from the kind-blind dependency snapshot written by
+/// state v20 and older.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyDependencyNames(BTreeSet<String>);
+
+impl LegacyDependencyNames {
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyRowDependencies {
+    value_dependencies: LegacyDependencyNames,
+    explicit_dependencies: LegacyDependencyNames,
+    deposed_dependencies: HashMap<DeposedKey, LegacyDependencyNames>,
+}
+
+impl LegacyRowDependencies {
+    fn is_empty(&self) -> bool {
+        self.value_dependencies.is_empty()
+            && self.explicit_dependencies.is_empty()
+            && self
+                .deposed_dependencies
+                .values()
+                .all(LegacyDependencyNames::is_empty)
+    }
+
+    fn all_names(&self) -> BTreeSet<String> {
+        self.value_dependencies
+            .0
+            .iter()
+            .chain(self.explicit_dependencies.0.iter())
+            .chain(
+                self.deposed_dependencies
+                    .values()
+                    .flat_map(|names| names.0.iter()),
+            )
+            .cloned()
+            .collect()
+    }
+}
+
+/// One delete whose historical ordering could be recovered only partially.
+/// Known managed edges are still scheduled; these names are display-only and
+/// are never written to v21 state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyDestroyOrderingWarning {
+    pub row: ResolvedResourceId,
+    pub generation: Option<DeposedKey>,
+    pub legacy_names: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LegacyStateCandidate {
+    id: ResolvedResourceId,
+    display: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct MigratedLegacyRowDependencies {
+    #[serde(deserialize_with = "deserialize_destroy_dependencies")]
+    value_dependencies: PersistedDestroyDependencies,
+    #[serde(deserialize_with = "deserialize_destroy_dependencies")]
+    explicit_dependencies: PersistedDestroyDependencies,
+    #[serde(deserialize_with = "deserialize_deposed_destroy_dependencies")]
+    deposed_dependencies: HashMap<DeposedKey, PersistedDestroyDependencies>,
+}
+
+fn deserialize_destroy_dependencies<'de, D>(
+    deserializer: D,
+) -> Result<PersistedDestroyDependencies, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let dependencies = BTreeSet::<ResolvedResourceId>::deserialize(deserializer)?;
+    PersistedDestroyDependencies::decode_persisted(dependencies).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_deposed_destroy_dependencies<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<DeposedKey, PersistedDestroyDependencies>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    HashMap::<DeposedKey, BTreeSet<ResolvedResourceId>>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(key, dependencies)| {
+            PersistedDestroyDependencies::decode_persisted(dependencies)
+                .map(|dependencies| (key, dependencies))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(serde::de::Error::custom)
+}
+
+/// Classification either retains the complete result or identifies every row
+/// whose configured ownership cannot be established without materializing loops.
+/// Commands supply their own recovery advice for `RequiresReads`.
+#[derive(Debug)]
+pub enum LegacyClassificationOutcome<T> {
+    Classified(T),
+    RequiresReads(LegacyReadRequiredRows),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyReadRequiredRow {
+    pub row_index: usize,
+    pub row: ResolvedResourceId,
+}
+
+/// A nonempty collection of state rows requiring loop materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyReadRequiredRows {
+    first: LegacyReadRequiredRow,
+    rest: Vec<LegacyReadRequiredRow>,
+}
+
+impl LegacyReadRequiredRows {
+    pub fn iter(&self) -> impl Iterator<Item = &LegacyReadRequiredRow> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
+impl std::fmt::Display for LegacyReadRequiredRows {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, row) in self.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "resources[{}] ({})", row.row_index, row.row)?;
+        }
+        Ok(())
+    }
+}
+
+/// Pure, replayable result of classifying every pre-v21 dependency spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyDependencyClassification {
+    lineage: String,
+    #[serde(
+        serialize_with = "serialize_legacy_source_rows",
+        deserialize_with = "deserialize_legacy_source_rows"
+    )]
+    sources: BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
+    #[serde(
+        serialize_with = "serialize_migrated_legacy_rows",
+        deserialize_with = "deserialize_migrated_legacy_rows"
+    )]
+    rows: BTreeMap<ResolvedResourceId, MigratedLegacyRowDependencies>,
+    warnings: Vec<LegacyDestroyOrderingWarning>,
+}
+
+fn serialize_legacy_source_rows<S>(
+    rows: &BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    rows.iter().collect::<Vec<_>>().serialize(serializer)
+}
+
+fn deserialize_legacy_source_rows<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<ResolvedResourceId, LegacyRowDependencies>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows = Vec::<(ResolvedResourceId, LegacyRowDependencies)>::deserialize(deserializer)?;
+    collect_unique_legacy_rows(rows, "legacy dependency classification source")
+}
+
+fn serialize_migrated_legacy_rows<S>(
+    rows: &BTreeMap<ResolvedResourceId, MigratedLegacyRowDependencies>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    rows.iter().collect::<Vec<_>>().serialize(serializer)
+}
+
+fn deserialize_migrated_legacy_rows<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<ResolvedResourceId, MigratedLegacyRowDependencies>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows =
+        Vec::<(ResolvedResourceId, MigratedLegacyRowDependencies)>::deserialize(deserializer)?;
+    collect_unique_legacy_rows(rows, "legacy dependency classification row")
+}
+
+fn collect_unique_legacy_rows<E, V>(
+    rows: Vec<(ResolvedResourceId, V)>,
+    label: &str,
+) -> Result<BTreeMap<ResolvedResourceId, V>, E>
+where
+    E: serde::de::Error,
+{
+    let mut collected = BTreeMap::new();
+    for (id, row) in rows {
+        if collected.insert(id.clone(), row).is_some() {
+            return Err(E::custom(format!("duplicate {label} `{id}`")));
+        }
+    }
+    Ok(collected)
+}
+
+impl LegacyDependencyClassification {
+    pub fn warnings(&self) -> &[LegacyDestroyOrderingWarning] {
+        &self.warnings
+    }
+
+    pub fn row_ids(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.rows.keys()
+    }
+
+    pub fn source_row_ids(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.sources.keys()
+    }
+}
+
+/// Configuration and move evidence bound to one legacy-classification run.
+struct LegacyMigrationInput<'a> {
+    graph: &'a ExpandedBindingIndex,
+    configured: &'a ConfiguredResources,
+    moved_pairs: &'a ResolvedMovePairs,
+    offline_unmaterialized: BTreeSet<String>,
+}
+
+struct LegacyNameClassificationContext<'a> {
+    scopes: &'a [&'a str],
+    state_candidates: &'a HashMap<String, Vec<LegacyStateCandidate>>,
+    strict: bool,
+    row_index: usize,
+    row: &'a str,
+    location: String,
+}
+
+/// A resolved move classifies every generation in its destination's scope, even
+/// before the move executes. Otherwise persisted bindings retain module ancestry
+/// after the module has disappeared from configuration. Probe enclosing address
+/// scopes from inside out; dots within a quoted map key belong to that key.
+fn legacy_row_scopes<'a>(
+    row: &'a ResourceState,
+    move_destination: Option<&'a ResolvedResourceId>,
+) -> Vec<&'a str> {
+    let address = move_destination
+        .map(ResolvedResourceId::identity_str)
+        .unwrap_or_else(|| {
+            row.binding
+                .as_ref()
+                .map(AbsoluteBindingAddress::as_str)
+                .unwrap_or(row.identity.as_str())
+        });
+    let mut brackets = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut scopes = Vec::new();
+    for (offset, ch) in address.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+        } else {
+            match ch {
+                '\'' | '"' if brackets > 0 => quote = Some(ch),
+                '[' => brackets += 1,
+                ']' => brackets = brackets.saturating_sub(1),
+                '.' if brackets == 0 => scopes.push(&address[..offset]),
+                _ => {}
+            }
+        }
+    }
+    scopes.reverse();
+    scopes
+}
+
+fn legacy_dependency_spellings<'a>(scopes: &[&str], dependency: &'a str) -> Vec<Cow<'a, str>> {
+    if scopes.iter().any(|scope| {
+        dependency == *scope
+            || dependency
+                .strip_prefix(*scope)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    }) {
+        return vec![Cow::Borrowed(dependency)];
+    }
+    scopes
+        .iter()
+        .map(|scope| Cow::Owned(format!("{scope}.{dependency}")))
+        .chain(std::iter::once(Cow::Borrowed(dependency)))
+        .collect()
+}
+
+fn classify_legacy_names(
+    graph: &ExpandedBindingIndex,
+    names: &LegacyDependencyNames,
+    context: LegacyNameClassificationContext<'_>,
+) -> Result<(PersistedDestroyDependencies, BTreeSet<String>), LegacyDependencyMigrationError> {
+    use carina_core::resolved_graph::ExpandedGraphResolutionError;
+
+    let LegacyNameClassificationContext {
+        scopes,
+        state_candidates,
+        strict,
+        row_index,
+        row,
+        location,
+    } = context;
+
+    let mut known = PersistedDestroyDependencies::default();
+    let mut unknown = BTreeSet::new();
+    for dependency in names.iter() {
+        let mut classified = None;
+        for spelling in legacy_dependency_spellings(scopes, dependency) {
+            if let Some(candidates) = state_candidates.get(spelling.as_ref()) {
+                match candidates.as_slice() {
+                    [candidate] => {
+                        let dependencies =
+                            PersistedDestroyDependencies::decode_persisted(BTreeSet::from([
+                                candidate.id.clone(),
+                            ]))
+                            .map_err(|error| {
+                                LegacyDependencyMigrationError::InvalidStateDependency {
+                                    row_index,
+                                    row: row.to_string(),
+                                    location: location.clone(),
+                                    dependency: dependency.to_string(),
+                                    reason: Box::new(error),
+                                }
+                            })?;
+                        classified =
+                            Some(PersistedDestroyDependencyProjection::Managed(dependencies));
+                        break;
+                    }
+                    [] => {}
+                    many => {
+                        let mut candidates = many
+                            .iter()
+                            .map(|candidate| candidate.display.clone())
+                            .collect::<Vec<_>>();
+                        candidates.sort();
+                        candidates.dedup();
+                        if strict {
+                            return Err(LegacyDependencyMigrationError::Ambiguous {
+                                row_index,
+                                row: row.to_string(),
+                                location,
+                                dependency: dependency.to_string(),
+                                candidates,
+                            });
+                        }
+                        unknown.insert(dependency.to_string());
+                        classified = Some(PersistedDestroyDependencyProjection::NoLocalDestroyEdge);
+                        break;
+                    }
+                }
+            }
+            match graph.project_legacy_dependency(spelling.as_ref(), row) {
+                Ok(projection) => {
+                    classified = Some(projection);
+                    break;
+                }
+                Err(ExpandedGraphResolutionError::MissingDependency { .. }) => {}
+                Err(error) => {
+                    return Err(LegacyDependencyMigrationError::Resolution {
+                        row_index,
+                        row: row.to_string(),
+                        location,
+                        dependency: dependency.to_string(),
+                        reason: Box::new(error),
+                    });
+                }
+            }
+        }
+
+        match classified {
+            Some(PersistedDestroyDependencyProjection::Managed(dependencies)) => {
+                known.extend_projected(&dependencies);
+            }
+            Some(PersistedDestroyDependencyProjection::NoLocalDestroyEdge) => {}
+            None if strict => {
+                return Err(LegacyDependencyMigrationError::Missing {
+                    row_index,
+                    row: row.to_string(),
+                    location,
+                    dependency: dependency.to_string(),
+                });
+            }
+            None => {
+                unknown.insert(dependency.to_string());
+            }
+        }
+    }
+    Ok((known, unknown))
+}
+
 /// Successful outcome of [`check_and_migrate`].
 ///
 /// Always carries the parsed (and possibly schema-upgraded) state.
@@ -2110,9 +3092,10 @@ pub fn log_state_migration_once(
 
 pub(crate) fn log_state_migration(info: MigrationInfo, display_target: &str) {
     eprintln!(
-        "Warning: state file {} is v{} on disk; in-memory migration \
-         to v{} applied for this run. Disk state will be rewritten \
-         during the next apply or state refresh of that project.",
+        "Warning: state file {} is v{} on disk; migration toward v{} \
+         was loaded in memory. Legacy dependency names, if present, \
+         will be classified against the expanded configuration and the \
+         disk state will be rewritten by the next apply, destroy, or state refresh.",
         display_target, info.from, info.to
     );
 }
@@ -2148,14 +3131,15 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
                 from: v,
                 to: StateFile::CURRENT_VERSION,
             });
+            let pre_value_migration = content;
             // v12 → v13: migrate every value tree before typed state
             // deserialization validates the reserved `$` namespace.
             let migrated_v12 = if v <= 12 {
-                Some(migrate_v12_persisted_values(content)?)
+                Some(migrate_v12_persisted_values(pre_value_migration)?)
             } else {
                 None
             };
-            let pre_secret_migration = migrated_v12.as_deref().unwrap_or(content);
+            let pre_secret_migration = migrated_v12.as_deref().unwrap_or(pre_value_migration);
             let migrated_v13 = if v <= 13 {
                 Some(migrate_v13_resource_secret_markers(pre_secret_migration)?)
             } else {
@@ -2232,7 +3216,12 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             // were migrated in raw JSON before typed deserialization above.
             // v12 → v13 key/tag migration ran first so a newly inserted
             // `$secret` host tag could not be mistaken for a user key.
-            state.version = StateFile::CURRENT_VERSION;
+            // v19 → v20 is the last source-independent transition. The v20
+            // kind-blind dependency names remain in an unwritable in-memory
+            // typestate until an expanded graph performs the v20 → v21
+            // classification.
+            state.version = 20;
+            state.dependency_encoding = DependencyEncoding::PendingLegacy;
             state
         }
     };
@@ -2293,7 +3282,7 @@ pub struct DeposedInstance {
     /// Last known attributes of the old instance.
     attributes: PersistedAttributes,
     /// Binding dependencies inherited from the old row.
-    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
+    pub dependency_bindings: PersistedDestroyDependencies,
 }
 
 /// Attributes admitted to a deposed generation by a state-owned writeback
@@ -2331,7 +3320,7 @@ impl DeposedInstance {
         identifier: String,
         provider_instance: Option<String>,
         attributes: DeposedAttributes,
-        dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
+        dependency_bindings: PersistedDestroyDependencies,
     ) -> Self {
         Self {
             key,
@@ -2350,17 +3339,14 @@ impl DeposedInstance {
         identifier: String,
         provider_instance: Option<String>,
         attributes: HashMap<String, serde_json::Value>,
-        dependency_bindings: BTreeSet<String>,
+        dependency_bindings: PersistedDestroyDependencies,
     ) -> Self {
         Self::from_persisted_attributes(
             key,
             identifier,
             provider_instance,
             DeposedAttributes(persisted_attributes_from_test_json(attributes)),
-            dependency_bindings
-                .into_iter()
-                .map(absolute_binding_address_for_test)
-                .collect(),
+            dependency_bindings,
         )
     }
 
@@ -2528,15 +3514,15 @@ pub struct ResourceState {
     /// Stored so orphan Delete effects can have tree structure.
     #[serde(default)]
     pub binding: Option<AbsoluteBindingAddress>,
-    /// Binding names of resources this resource depends on (via ResourceRef).
+    /// Complete resource addresses this resource depends on (via value refs).
     /// Stored so orphan Delete effects can have tree structure.
     ///
-    /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
-    /// Old state files persisted as JSON arrays continue to deserialize
-    /// (serde transparently coerces array → BTreeSet, deduping any
-    /// duplicates and re-serializing in sorted order on next write).
+    /// Set semantics are provided by
+    /// [`carina_core::resource::ResolvedDependencies`]. State v20 and
+    /// older string arrays are converted by the version-gated raw migration
+    /// before this current representation is deserialized.
     #[serde(default)]
-    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
+    pub dependency_bindings: PersistedDestroyDependencies,
 }
 
 /// Owned resource row proven not to contain a create continuation.
@@ -2572,7 +3558,8 @@ struct EncodedDeposedInstance {
     #[serde(default)]
     provider_instance: Option<String>,
     attributes: HashMap<String, serde_json::Value>,
-    dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
+    #[serde(default)]
+    dependency_bindings: BTreeSet<ResolvedResourceId>,
 }
 
 #[derive(Deserialize)]
@@ -2597,7 +3584,7 @@ struct EncodedResourceState {
     #[serde(default)]
     binding: Option<AbsoluteBindingAddress>,
     #[serde(default)]
-    dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
+    dependency_bindings: BTreeSet<ResolvedResourceId>,
 }
 
 impl<'de> Deserialize<'de> for ResourceState {
@@ -2654,17 +3641,29 @@ impl<'de> Deserialize<'de> for ResourceState {
         let deposed = encoded
             .deposed
             .into_iter()
-            .map(|instance| {
+            .enumerate()
+            .map(|(index, instance)| {
                 Ok(DeposedInstance {
                     key: instance.key,
                     identifier: instance.identifier,
                     provider_instance: instance.provider_instance,
                     attributes: PersistedAttributes::from_encoded(instance.attributes)
                         .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
-                    dependency_bindings: instance.dependency_bindings,
+                    dependency_bindings: PersistedDestroyDependencies::decode_persisted(
+                        instance.dependency_bindings,
+                    )
+                    .map_err(|error| {
+                        serde::de::Error::custom(format!(
+                            "deposed[{index}].dependency_bindings: {error}"
+                        ))
+                    })?,
                 })
             })
             .collect::<Result<Vec<_>, D::Error>>()?;
+        let dependency_bindings = PersistedDestroyDependencies::decode_persisted(
+            encoded.dependency_bindings,
+        )
+        .map_err(|error| serde::de::Error::custom(format!("dependency_bindings: {error}")))?;
         Ok(Self {
             resource_type: encoded.resource_type,
             identity: encoded.identity,
@@ -2677,7 +3676,7 @@ impl<'de> Deserialize<'de> for ResourceState {
             name_overrides: encoded.name_overrides,
             explicit: encoded.explicit,
             binding: encoded.binding,
-            dependency_bindings: encoded.dependency_bindings,
+            dependency_bindings,
         })
     }
 }
@@ -3068,7 +4067,7 @@ impl ResourceState {
             name_overrides: HashMap::new(),
             explicit: ExplicitFields::default(),
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: PersistedDestroyDependencies::default(),
         }
     }
 
@@ -3336,7 +4335,7 @@ impl ResourceState {
             self.protected = existing.protected;
             self.name_overrides = existing.name_overrides.clone();
         }
-        self.directives = PersistedDirectives::desired_for(resource.as_resource());
+        self.directives = PersistedDirectives::desired_for(resource);
         self.prefixes = resource.prefixes.clone();
         self.explicit = match authoring_basis {
             DesiredAuthoringBasis::Sent(sent_desired) => {
@@ -3375,10 +4374,7 @@ impl ResourceState {
             ),
         };
         self.binding = resource.binding.clone();
-        let dependencies = get_resource_dependencies(resource);
-        if !dependencies.is_empty() {
-            self.dependency_bindings = dependencies.into_iter().collect();
-        }
+        self.dependency_bindings = resource.persisted_value_destroy_dependencies().clone();
     }
 
     fn carried_explicit_for_stored_values<S, R: ReferenceEquality>(
@@ -4155,7 +5151,9 @@ fn migrate_v19_create_outcome_unknown(content: &str) -> Result<String, BackendEr
         };
         directives.insert("prevent_destroy".to_string(), migrated);
     }
-    root["version"] = serde_json::json!(StateFile::CURRENT_VERSION);
+    // This transition must stop at v20. The graph-aware v20 -> v21
+    // dependency classification is a separate, configuration-aware step.
+    root["version"] = serde_json::json!(20);
     serde_json::to_string(&root).map_err(|error| {
         BackendError::InvalidState(format!("Failed to migrate state file from v19: {error}"))
     })
@@ -4336,3 +5334,227 @@ fn migrate_v10_reserved_attributes(state: &mut StateFile) {
 
 #[cfg(test)]
 mod tests;
+
+impl StateFile {
+    /// Bind classification to the consumed graph until reporting and strict
+    /// validation release both the saved classification and writable state.
+    pub fn classify_legacy_graph<E, D>(
+        self,
+        graph: LegacyClassificationGraph<E, D>,
+        moves: &ResolvedMovePairs,
+        offline_unmaterialized: BTreeSet<String>,
+    ) -> Result<
+        LegacyClassificationOutcome<UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>>,
+        LegacyDependencyMigrationError,
+    > {
+        let input = LegacyMigrationInput {
+            graph: graph.classification_index(),
+            configured: graph.configured(),
+            moved_pairs: moves,
+            offline_unmaterialized,
+        };
+        match self.classify_legacy_dependencies(&input)? {
+            LegacyClassificationOutcome::Classified(classification) => Ok(
+                LegacyClassificationOutcome::Classified(UnvalidatedLegacyMigration {
+                    graph,
+                    classification,
+                    state: self,
+                }),
+            ),
+            LegacyClassificationOutcome::RequiresReads(rows) => {
+                Ok(LegacyClassificationOutcome::RequiresReads(rows))
+            }
+        }
+    }
+
+    /// Replay the complete managed-row graph persisted by a strictly validated
+    /// plan. It crosses the same reporting and validation owner as a live graph;
+    /// source fingerprints are checked before any writable state is produced.
+    pub fn replay_legacy_graph(
+        self,
+        classification: LegacyDependencyClassification,
+    ) -> UnvalidatedLegacyMigration<LegacyDependencyClassification> {
+        UnvalidatedLegacyMigration {
+            graph: classification.clone(),
+            classification,
+            state: self,
+        }
+    }
+}
+
+/// Neither its classification nor its state may escape before strict graph
+/// validation. Warnings remain inspectable so read-only checks can count them.
+///
+/// Raw classification is private, so callers cannot detach it from the graph
+/// that must later pass strict validation:
+///
+/// ```compile_fail,E0624
+/// use carina_state::StateFile;
+///
+/// fn classify_without_graph(state: StateFile) {
+///     let _ = state.classify_legacy_dependencies(todo!());
+/// }
+/// ```
+///
+/// Consume the graph through the public pathway instead:
+///
+/// ```
+/// use carina_core::{effect::ResolvedMovePairs, resolved_graph::LegacyClassificationGraph};
+/// use carina_state::{LegacyClassificationOutcome, LegacyDependencyMigrationError, StateFile, UnvalidatedLegacyMigration};
+///
+/// fn classify<E, D>(
+///     state: StateFile,
+///     graph: LegacyClassificationGraph<E, D>,
+///     moves: &ResolvedMovePairs,
+/// ) -> Result<LegacyClassificationOutcome<UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>>, LegacyDependencyMigrationError> {
+///     state.classify_legacy_graph(graph, moves, Default::default())
+/// }
+/// ```
+///
+/// Raw writeback cannot release a writable state from a saved classification:
+///
+/// ```compile_fail,E0624
+/// use carina_state::{LegacyDependencyClassification, StateFile};
+///
+/// fn write_without_validation(state: StateFile, classification: LegacyDependencyClassification) {
+///     let _ = state.with_legacy_classification(classification);
+/// }
+/// ```
+///
+/// Saved-plan replay also reports warnings and validates before releasing state:
+///
+/// ```
+/// use carina_state::{LegacyDependencyClassification, LegacyDependencyMigrationError, StateFile};
+///
+/// fn replay(
+///     state: StateFile,
+///     classification: LegacyDependencyClassification,
+/// ) -> Result<StateFile, LegacyDependencyMigrationError> {
+///     let validated = state.replay_legacy_graph(classification)
+///         .report_and_validate(|warning| eprintln!("{warning:?}"))?;
+///     Ok(validated.state)
+/// }
+/// ```
+///
+/// The raw input type is private; downstream callers cannot construct their own
+/// classification input through the former planned/offline constructors:
+///
+/// ```compile_fail,E0603
+/// use carina_state::state::LegacyMigrationInput;
+/// ```
+///
+/// Build the graph from configuration and let the pathway create its input:
+///
+/// ```
+/// use carina_core::{
+///     effect::{AddressedMoves, ResolvedMovePairs},
+///     parser::ExpandedParsedFile,
+///     resolved_graph::resolve_expanded_graph_for_legacy_classification,
+/// };
+/// use carina_state::{LegacyClassificationOutcome, StateFile};
+///
+/// let configuration = ExpandedParsedFile::default();
+/// let moves = ResolvedMovePairs::from_addressed_moves(
+///     AddressedMoves::preserve_addresses(&configuration.state_blocks),
+/// );
+/// let graph = resolve_expanded_graph_for_legacy_classification(configuration.into()).unwrap();
+/// let outcome = StateFile::new()
+///     .classify_legacy_graph(graph, &moves, Default::default()).unwrap();
+/// match outcome {
+///     LegacyClassificationOutcome::Classified(pending) => assert!(pending.warnings().is_empty()),
+///     LegacyClassificationOutcome::RequiresReads(rows) => panic!("unexpected unread rows: {rows}"),
+/// }
+/// ```
+///
+/// Reporting alone cannot release the state; the pending owner has no
+/// report-only transition:
+///
+/// ```compile_fail,E0599
+/// use carina_state::{StateFile, UnvalidatedLegacyMigration};
+///
+/// fn skip_validation<G>(migration: UnvalidatedLegacyMigration<G>) -> StateFile {
+///     migration.report(|_| {})
+/// }
+/// ```
+///
+/// Consume the pending owner through reporting and strict graph validation:
+///
+/// ```
+/// use carina_core::resolved_graph::LegacyClassificationGraph;
+/// use carina_state::{LegacyDependencyMigrationError, StateFile, UnvalidatedLegacyMigration};
+///
+/// fn validate<E, D>(
+///     migration: UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>,
+/// ) -> Result<StateFile, LegacyDependencyMigrationError> {
+///     let validated = migration.report_and_validate(|warning| eprintln!("{warning:?}"))?;
+///     Ok(validated.state)
+/// }
+/// ```
+pub type UnvalidatedLegacyMigration<G> = UnreportedMigratedState<G>;
+
+pub struct UnreportedMigratedState<G> {
+    graph: G,
+    classification: LegacyDependencyClassification,
+    state: StateFile,
+}
+
+pub struct ValidatedLegacyMigration<G> {
+    pub graph: G,
+    pub classification: LegacyDependencyClassification,
+    pub state: StateFile,
+}
+
+impl<G> UnreportedMigratedState<G> {
+    pub fn migrated_rows(&self) -> usize {
+        self.classification.sources.len()
+    }
+    pub fn warnings(&self) -> &[LegacyDestroyOrderingWarning] {
+        self.classification.warnings()
+    }
+
+    fn finish<V>(
+        self,
+        mut sink: impl FnMut(&LegacyDestroyOrderingWarning),
+        validate: impl FnOnce(G) -> Result<V, LegacyDependencyMigrationError>,
+    ) -> Result<ValidatedLegacyMigration<V>, LegacyDependencyMigrationError> {
+        for warning in self.classification.warnings() {
+            sink(warning);
+        }
+        let graph = validate(self.graph)?;
+        let state = self
+            .state
+            .with_legacy_classification(self.classification.clone())?;
+        Ok(ValidatedLegacyMigration {
+            graph,
+            classification: self.classification,
+            state,
+        })
+    }
+}
+
+impl<E, D> UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>> {
+    pub fn report_and_validate(
+        self,
+        sink: impl FnMut(&LegacyDestroyOrderingWarning),
+    ) -> Result<ValidatedLegacyMigration<ResolvedExpandedGraph<E, D>>, LegacyDependencyMigrationError>
+    {
+        self.finish(sink, |graph| graph.validate().map_err(Into::into))
+    }
+}
+
+impl UnvalidatedLegacyMigration<LegacyDependencyClassification> {
+    pub fn report_and_validate(
+        self,
+        sink: impl FnMut(&LegacyDestroyOrderingWarning),
+    ) -> Result<
+        ValidatedLegacyMigration<LegacyDependencyClassification>,
+        LegacyDependencyMigrationError,
+    > {
+        self.finish(sink, |graph| {
+            if !graph.sources.keys().eq(graph.rows.keys()) {
+                return Err(LegacyDependencyMigrationError::StaleClassification);
+            }
+            Ok(graph)
+        })
+    }
+}

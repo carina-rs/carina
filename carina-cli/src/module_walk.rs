@@ -70,23 +70,24 @@ fn visit_module(
         return;
     }
 
-    let Some(loaded) = module_resolver::load_module_with_diagnostics(module_path) else {
+    let Some(loaded) = module_resolver::load_module_with_diagnostics(&guard_path) else {
         return;
     };
+    let diagnostic_path = carina_core::utils::normalize_source_path(diagnostic_path);
     let child_paths: Vec<_> = loaded
         .parsed
         .uses
         .iter()
         .map(|import| {
             (
-                module_path.join(&import.path),
+                guard_path.join(&import.path),
                 diagnostic_path.join(&import.path),
             )
         })
         .collect();
     modules.push(LoadedModuleAtPath {
-        diagnostic_path: diagnostic_path.to_path_buf(),
-        module_path: module_path.to_path_buf(),
+        diagnostic_path,
+        module_path: guard_path,
         loaded,
     });
 

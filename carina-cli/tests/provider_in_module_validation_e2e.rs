@@ -259,7 +259,7 @@ fn provider_in_imported_but_uncalled_nested_module_is_rejected() {
 
     assert!(
         diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("../module/./helper:")
+            diagnostic.contains("../module/helper:")
                 && diagnostic.contains("provider blocks are not allowed inside modules")
         }),
         "an imported-but-uncalled helper is still part of the module directory unit: {diagnostics:#?}",

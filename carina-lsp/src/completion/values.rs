@@ -247,6 +247,96 @@ fn type_completion_item(label: String, detail: String, range: Range) -> Completi
 }
 
 impl CompletionProvider {
+    pub(super) fn module_handle_dot_completions(
+        &self,
+        text: &str,
+        position: Position,
+        base_path: Option<&Path>,
+    ) -> Option<Vec<CompletionItem>> {
+        let line = text.lines().nth(position.line as usize)?;
+        let prefix = line
+            .chars()
+            .take(position.character as usize)
+            .collect::<String>();
+        let token_start = prefix
+            .char_indices()
+            .rev()
+            .find_map(|(index, character)| {
+                (!character.is_alphanumeric() && character != '_' && character != '.')
+                    .then_some(index + character.len_utf8())
+            })
+            .unwrap_or(0);
+        let token = &prefix[token_start..];
+        let segments = token.split('.').collect::<Vec<_>>();
+        if segments.len() != 3
+            || segments[0].is_empty()
+            || segments[1].is_empty()
+            || !segments.iter().all(|segment| {
+                segment
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+            })
+        {
+            return None;
+        }
+        let call_binding = segments[0];
+        let output_name = segments[1];
+
+        let mut merged = String::new();
+        let source = DslSource::resolve_directory(text, base_path, &mut merged);
+        let (_, rhs) = Self::extract_let_bindings(source)
+            .into_iter()
+            .find(|(binding, _)| binding == call_binding)?;
+        if self.extract_resource_type(&rhs).is_some() {
+            return None;
+        }
+        let call_expression = rhs
+            .split(|character: char| character.is_whitespace() || character == '{')
+            .find(|segment| !segment.is_empty())?;
+        let header = format!("let {call_binding} = {call_expression} {{");
+        let module_name = crate::enclosing_block::named_module_call_name(header.trim())?;
+        let parsed = self.load_called_module(module_name, text, base_path)?;
+        let output = parsed
+            .attribute_params
+            .iter()
+            .find(|attribute| attribute.name == output_name)?;
+        let resource_type = output
+            .value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::handle)
+            .map(|handle| handle.resource_type().to_string())
+            .or_else(|| match output.static_type.as_ref() {
+                Some(TypeExpr::Ref(path)) => Some(path.to_string()),
+                Some(TypeExpr::DottedUnresolved(path))
+                    if self.lookup_schema(&path.to_string()).is_some() =>
+                {
+                    Some(path.to_string())
+                }
+                Some(TypeExpr::DottedUnresolved(_)) => None,
+                Some(
+                    TypeExpr::String
+                    | TypeExpr::Bool
+                    | TypeExpr::Int
+                    | TypeExpr::Float
+                    | TypeExpr::Duration
+                    | TypeExpr::Simple(_)
+                    | TypeExpr::List(_)
+                    | TypeExpr::Map(_)
+                    | TypeExpr::SchemaType { .. }
+                    | TypeExpr::Struct { .. }
+                    | TypeExpr::StringLiteral(_)
+                    | TypeExpr::Union(_),
+                )
+                | None => None,
+            })?;
+        let start_character = prefix[..token_start].chars().count() as u32;
+        Some(self.binding_attribute_completions(
+            &format!("{call_binding}.{output_name}"),
+            &resource_type,
+            Range::new(Position::new(position.line, start_character), position),
+        ))
+    }
+
     pub(super) fn attribute_completions_for_type(
         &self,
         resource_type: &str,

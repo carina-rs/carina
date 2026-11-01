@@ -8,7 +8,10 @@ mod url;
 
 pub use local::LocalBackend;
 pub use s3::S3Backend;
-pub use url::{StateUrl, load_published_exports_from_url, load_state_from_url};
+pub use url::{
+    LocalStateFile, StateUrl, load_local_state_file, load_published_exports_from_url,
+    load_state_from_url,
+};
 
 use std::path::Path;
 

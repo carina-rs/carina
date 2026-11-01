@@ -81,6 +81,14 @@ impl CompletionProvider {
         let text = doc.text();
         let provider_ctx = doc.provider_context();
 
+        // A module resource-handle output preserves the underlying resource
+        // schema for postfix access. Detect the depth-2 shape before the
+        // generic value-position dispatcher, which otherwise sees only the
+        // module-call binding and falls back to in-scope names.
+        if let Some(completions) = self.module_handle_dot_completions(&text, position, base_path) {
+            return completions;
+        }
+
         // `<binding>.<key>.<partial>` (depth-2) is checked first because
         // its prefix shape also matches the depth-1 walker's tail (which
         // would treat `<key>` as the binding and decline). #2041.

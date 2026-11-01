@@ -129,7 +129,14 @@ pub enum ExplicitFields {
 /// writeback must use one of the evidence-specific stored-value builders
 /// instead.
 #[cfg(test)]
-pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
+pub(crate) fn build_from_resource<S, D>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> ExplicitFields {
     ExplicitFields::Struct {
         children: resource
             .attributes
@@ -145,8 +152,13 @@ pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
 /// not evidence that the provider added them. Use
 /// [`build_from_resource_for_stored_values_after_send`] only when typed send
 /// evidence is available.
-pub fn build_from_read_resource_for_stored_values<S, R: ReferenceEquality>(
-    resource: &Resource<S>,
+pub fn build_from_read_resource_for_stored_values<S, D, R: ReferenceEquality>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
     comparison: &ComparisonContext<'_, R>,
@@ -177,8 +189,13 @@ pub fn build_from_read_resource_for_stored_values<S, R: ReferenceEquality>(
 /// lists without a concrete stored-list counterpart use the legacy union
 /// [`ExplicitFields::List`] representation rather than recording unjustified
 /// indices.
-pub fn build_from_resource_for_stored_values_after_send<S, R: ReferenceEquality>(
-    resource: &Resource<S>,
+pub fn build_from_resource_for_stored_values_after_send<S, D, R: ReferenceEquality>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     prior_stored_authoring: Option<(&HashMap<String, Value>, &ExplicitFields)>,
     stored_attributes: &HashMap<String, Value>,
     sent_desired: &SentDesiredAttributes<'_>,
@@ -252,8 +269,13 @@ impl StoredValueAuthoringBasis {
     }
 }
 
-fn build_for_stored_values<S, R: ReferenceEquality>(
-    resource: &Resource<S>,
+fn build_for_stored_values<S, D, R: ReferenceEquality>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
     basis: StoredValueAuthoringBasis,
@@ -294,8 +316,13 @@ fn build_for_stored_values<S, R: ReferenceEquality>(
 /// removal crosses an ambiguous list identity, the list becomes
 /// [`ExplicitFields::WholeValue`]. That keeps the removal visible without assigning
 /// it to a guessed element.
-pub fn build_carried_from_resource_for_stored_values<S, R: ReferenceEquality>(
-    resource: &Resource<S>,
+pub fn build_carried_from_resource_for_stored_values<S, D, R: ReferenceEquality>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     prior_stored_attributes: &HashMap<String, Value>,
     prior_explicit: &ExplicitFields,
     fresh_stored_attributes: &HashMap<String, Value>,
@@ -1882,8 +1909,13 @@ mod tests {
         RootScope::new().resolve(RelativeBindingName::new(binding))
     }
 
-    fn build_carried_from_resource_for_stored_values<S>(
-        resource: &Resource<S>,
+    fn build_carried_from_resource_for_stored_values<S, D>(
+        resource: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
         prior_stored_attributes: &HashMap<String, Value>,
         prior_explicit: &ExplicitFields,
         fresh_stored_attributes: &HashMap<String, Value>,

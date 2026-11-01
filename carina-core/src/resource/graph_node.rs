@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn graph_node_from_composition_round_trip() {
         use indexmap::IndexMap;
-        use std::collections::{BTreeSet, HashSet};
+        use std::collections::HashSet;
         let c = LiveComposition {
             id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "m")),
             signature: super::super::LiveCompositionSignature {
@@ -168,7 +168,7 @@ mod tests {
                 pending_constraints: Vec::new(),
             },
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "m".to_string(),
             instance: "i".to_string(),
             call_path: Default::default(),

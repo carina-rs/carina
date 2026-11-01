@@ -143,12 +143,12 @@ fn parse_resolve_yields_canonical_interpolations() {
         check_value(v, &format!("let {}", name));
     }
     for param in &parsed.attribute_params {
-        if let Some(ref v) = param.value {
+        if let Some(v) = param.value.as_ref().and_then(|value| value.value()) {
             check_value(v, &format!("attributes.{}", param.name));
         }
     }
     for export in &parsed.export_params {
-        if let Some(ref v) = export.value {
+        if let Some(v) = export.value.as_ref().and_then(|value| value.value()) {
             check_value(v, &format!("exports.{}", export.name));
         }
     }

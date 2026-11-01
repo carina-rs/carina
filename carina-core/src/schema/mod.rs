@@ -54,7 +54,7 @@
 //! let _ = AttributeSchema::provider_populated("value", AttributeType::string()).create_only();
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0599
 //! use carina_core::schema::{AttributeSchema, AttributeType};
 //! let _ = AttributeSchema::optional("value", AttributeType::string()).identity();
 //! ```
@@ -124,12 +124,12 @@
 //! let _ = StructField::optional("value", AttributeType::string()).identity();
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0599
 //! use carina_core::schema::{AttributeType, StructField};
 //! let _ = StructField::provider_populated("value", AttributeType::string()).create_only();
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0599
 //! use carina_core::schema::{AttributeType, StructField};
 //! let _ = StructField::provider_populated("value", AttributeType::string()).identity();
 //! ```
@@ -945,7 +945,7 @@ impl IdentityMode {
 ///
 /// Only an optional create-only field exposes when-present identity:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::schema::{AttributeType, StructField};
 /// let _ = StructField::required("value", AttributeType::string())
 ///     .create_only()
@@ -1420,7 +1420,7 @@ pub struct PatternAttributeType<R: PatternForm = Draft> {
 ///
 /// Drafts cannot enter a value-validation API:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::resource::EnumValueResolver;
 /// use carina_core::schema::{AttributeType, ResourceSchema, TypeIdentity};
 /// let draft = AttributeType::enum_(
@@ -1493,9 +1493,9 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     },
     /// A resource handle used only by the schema-level boundary relation.
     ///
-    /// Handles are string-backed until #3803's transport work lands, but they
-    /// retain the declared resource path so assignability can reject a handle
-    /// flowing into a scalar or a different resource type.
+    /// This is a structural capability, not a provider value. It is
+    /// assignable only to the same resource-handle type and cannot validate a
+    /// concrete scalar.
     ResourceHandle {
         provider: String,
         resource_type: String,
@@ -4089,7 +4089,6 @@ impl PatternAttributeType<Compiled> {
                 },
                 ConcreteValueRef::String(s),
             ) => validate_string_refinement(Some(identity), pattern.as_ref(), *length, s),
-            (AttrTypeKind::ResourceHandle { .. }, ConcreteValueRef::String(_)) => Ok(()),
             (AttrTypeKind::StringLiteralSet { values }, ConcreteValueRef::String(value))
                 if values.iter().any(|candidate| candidate == value) =>
             {
@@ -4507,12 +4506,6 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ..
                 },
             ) => source_provider == sink_provider && source_resource == sink_resource,
-            // #3803 transport is not implemented yet, so resource handles are
-            // represented by id strings at runtime. Preserve main's
-            // compatibility with every open string-shaped sink while keeping
-            // closed literal sets closed.
-            (ResourceHandle { .. }, String { .. }) => true,
-            (ResourceHandle { .. }, StringLiteralSet { .. }) => false,
             (ResourceHandle { .. }, _) => false,
             // Literal declarations carry string evidence but not the identity
             // evidence required by a provider custom type (#2648).
@@ -4529,13 +4522,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             (StringLiteralSet { values: source, .. }, StringLiteralSet { values: sink, .. }) => {
                 source.iter().all(|value| sink.contains(value))
             }
-            // String-backed values and attributes may still flow into a Ref
-            // sink until resource-handle transport is implemented. Numeric and
-            // structural sources never reach this arm.
-            (String { .. } | Enum { .. } | StringLiteralSet { .. }, ResourceHandle { .. }) => true,
             // Preserve the pre-existing declared String -> literal-union
-            // behavior while ensuring ResourceHandle took the rejecting arm
-            // above.
+            // behavior.
             (String { .. }, StringLiteralSet { .. }) => true,
             (_, ResourceHandle { .. } | StringLiteralSet { .. }) => false,
             (
@@ -5666,7 +5654,6 @@ fn union_member_judgement_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
         // Same-constructor match — second tier.
         (AT::Map { .. }, ConcreteValueRef::Map(_))
         | (AT::String { .. }, ConcreteValueRef::String(_))
-        | (AT::ResourceHandle { .. }, ConcreteValueRef::String(_))
         | (AT::StringLiteralSet { .. }, ConcreteValueRef::String(_))
         | (AT::Int { .. }, ConcreteValueRef::Int(_))
         | (AT::Float { .. }, ConcreteValueRef::Float(_))
@@ -7854,7 +7841,7 @@ impl CompletionValue {
 ///
 /// Only an optional create-only attribute exposes when-present identity:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::schema::{AttributeSchema, AttributeType};
 /// let _ = AttributeSchema::required("name", AttributeType::string())
 ///     .create_only()
@@ -12160,8 +12147,8 @@ fn find_block_name_alias_in_value<P: PlaceholderKind, B: BindingAddress>(
 /// This uses the same field matcher as the rename pass, including the narrow
 /// ambiguous-name rule for parser-produced lists. Union values are left to
 /// normal schema validation.
-pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind, B: BindingAddress>(
-    resource: &Resource<S, P, B>,
+pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind, B: BindingAddress, D>(
+    resource: &Resource<S, P, B, D>,
     schema: &CompiledResourceSchema,
 ) -> Option<BlockNameConflict> {
     find_block_name_alias_in_map(
@@ -13201,7 +13188,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// witness, so callers cannot pair one provider's lookup with another
 /// provider's schema:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use std::collections::HashMap;
 /// use carina_core::schema::{ResourceSchema, no_lookup};
 ///
@@ -13215,7 +13202,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 ///
 /// An unbound witness also has no public structural-only validation shortcut:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use std::collections::HashMap;
 /// use carina_core::schema::ResourceSchema;
 ///
@@ -13225,7 +13212,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 ///
 /// Nor can external callers install an approve-all lookup for provider config:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0603
 /// use carina_core::schema::no_lookup;
 ///
 /// let _ = no_lookup();
@@ -13233,7 +13220,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 ///
 /// A rootless config type likewise cannot accept an arbitrary lookup:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use std::collections::BTreeMap;
 /// use carina_core::resource::{ConcreteValue, Value};
 /// use carina_core::schema::{AttributeType, ValidatedConfigSchema};
@@ -13533,9 +13520,14 @@ impl SchemaRegistry {
     }
 
     /// Look up the `Managed` schema for a given [`Resource`].
-    pub fn get_for<S, P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>(
+    pub fn get_for<
+        S,
+        P: crate::resource::PlaceholderKind,
+        B: crate::resource::BindingAddress,
+        D,
+    >(
         &self,
-        resource: &crate::resource::Resource<S, P, B>,
+        resource: &crate::resource::Resource<S, P, B, D>,
     ) -> Option<OwnerBoundResourceSchema<'_>> {
         self.get(
             &resource.id.provider,
@@ -13580,9 +13572,10 @@ impl SchemaRegistry {
         S,
         P: crate::resource::PlaceholderKind,
         B: crate::resource::BindingAddress,
+        D,
     >(
         &self,
-        resource: &crate::resource::DataSource<S, P, B>,
+        resource: &crate::resource::DataSource<S, P, B, D>,
     ) -> Option<OwnerBoundResourceSchema<'_>> {
         self.get(
             &resource.id.provider,

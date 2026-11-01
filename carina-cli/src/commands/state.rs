@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::wiring::AddressedDataSourceReadInputs;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -32,8 +33,8 @@ use carina_core::shutdown::{
 use carina_core::value::format_value;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
-    DeposedKey, LoadedOrphans, LockInfo, ResourceState, RowBasis, StateBackend, StateFile,
-    StateUrl, load_state_from_url,
+    DeposedKey, LoadedOrphans, LocalStateFile, LockInfo, ResourceState, RowBasis, StateBackend,
+    StateFile, StateUrl, load_local_state_file, load_state_from_url,
 };
 
 use super::{
@@ -54,7 +55,7 @@ use crate::commands::state_output::{StateShowCurrentKind, StateShowDocument, Sta
 use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
+    MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
     prepare_default_provider_ready_config, refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
@@ -98,7 +99,13 @@ fn format_deferred_state_refresh_warning(
         })
         .collect::<Vec<_>>();
     if refs.is_empty() {
-        refs.extend(resource.dependency_bindings.iter().map(ToString::to_string));
+        refs.extend(
+            resource
+                .dependencies
+                .value_bindings
+                .iter()
+                .map(ToString::to_string),
+        );
     }
     let refs = if refs.is_empty() {
         "unknown input dependency".to_string()
@@ -223,6 +230,20 @@ pub enum StateCommands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
     },
+    /// Check a legacy state's dependency migration without provider I/O or writes
+    Migrate {
+        /// Directory containing the current .crn configuration
+        #[arg(long, value_name = "DIR")]
+        check: PathBuf,
+
+        /// Copied local state file (file:///<absolute-path> or a bare path; no remote URLs)
+        #[arg(long, value_parser = LocalStateFile::parse)]
+        state_url: LocalStateFile,
+
+        /// Trusted local provider schema artifact (repeatable KIND=PATH)
+        #[arg(long = "provider-schema", value_name = "KIND=PATH")]
+        provider_schemas: Vec<String>,
+    },
     /// Forget a create-outcome-unknown row after confirming the resource is absent
     Forget {
         /// Namespaced resource type, for example awscc.ec2.Vpc
@@ -299,6 +320,7 @@ impl StateCommands {
             Self::BucketDelete { path, .. }
             | Self::Refresh { path, .. }
             | Self::Forget { path, .. } => Some(path),
+            Self::Migrate { check, .. } => Some(check),
             Self::List { path, state_url }
             | Self::Lookup {
                 path, state_url, ..
@@ -332,6 +354,11 @@ pub async fn run_state_command(
         StateCommands::Refresh { path, lock } => {
             run_state_refresh(user_dirs, &path, lock, provider_context, cancel).await
         }
+        StateCommands::Migrate {
+            check,
+            state_url,
+            provider_schemas,
+        } => run_state_migration_check(user_dirs, &check, &state_url, &provider_schemas).await,
         StateCommands::Forget {
             resource_type,
             identity,
@@ -382,6 +409,91 @@ pub async fn run_state_command(
             .await
         }
     }
+}
+
+/// Classify a copied pre-v21 state against the current expanded graph without
+/// initializing a provider, reading upstream state, or writing any state.
+async fn run_state_migration_check(
+    user_dirs: &carina_core::UserDirs,
+    config_dir: &Path,
+    state_file: &LocalStateFile,
+    provider_schema_args: &[String],
+) -> Result<(), AppError> {
+    let mut provider_schema_overrides = HashMap::new();
+    for argument in provider_schema_args {
+        let (name, path) = argument.split_once('=').ok_or_else(|| {
+            AppError::Config(format!(
+                "invalid --provider-schema {argument:?}: expected KIND=PATH"
+            ))
+        })?;
+        if name.is_empty() || path.is_empty() {
+            return Err(AppError::Config(format!(
+                "invalid --provider-schema {argument:?}: expected non-empty KIND and PATH"
+            )));
+        }
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(AppError::Config(format!(
+                "invalid --provider-schema {argument:?}: PATH must be absolute"
+            )));
+        }
+        if provider_schema_overrides
+            .insert(name.to_string(), path)
+            .is_some()
+        {
+            return Err(AppError::Config(format!(
+                "provider schema override for {name:?} was supplied more than once"
+            )));
+        }
+    }
+
+    // A migration check must never acquire a KMS client through the command's
+    // ordinary parser context. Provider-owned custom types are loaded below;
+    // decrypt() remains unavailable on this read-only/offline path.
+    let loaded = load_configuration_with_config(
+        config_dir,
+        &ProviderContext::default(),
+        &carina_core::schema::SchemaRegistry::new(),
+    )?;
+    let duplicate_declarations = loaded.duplicate_declarations;
+    let parsed = loaded.parsed;
+    let state = load_local_state_file(state_file).await?;
+    if !state.requires_legacy_dependency_migration() {
+        println!(
+            "State dependency migration check passed: state is already version {}.",
+            StateFile::CURRENT_VERSION
+        );
+        return Ok(());
+    }
+    let base_dir = get_base_dir(config_dir);
+    let providers = MigrationCheckProviderLoad::load(
+        user_dirs,
+        &parsed.providers,
+        base_dir,
+        &provider_schema_overrides,
+    )?;
+    let validated =
+        providers.validate_evaluated_config(parsed, base_dir, &duplicate_declarations)?;
+
+    // The owner performs parser-aware cleanup, late identity preparation,
+    // moved-address projection, and graph construction as one transition.
+    // Historical identifier-less read rows are removed only from this copy.
+    let migration = match validated.migrate_legacy_dependencies_from_copied_state(state)? {
+        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            return Err(AppError::Validation(format!(
+                "{rows}: cannot classify offline: rows owned by a deferred loop over upstream_state or unread data sources; run plan/apply (which reads) to migrate"
+            )));
+        }
+    };
+    let migrated_rows = migration.migrated_rows();
+    let warning_count = migration.warning_count();
+    let _validated = migration.report_and_validate()?;
+    println!(
+        "State dependency migration check passed: {} row(s) classified, {} orphan/deposed warning(s); no state was written.",
+        migrated_rows, warning_count
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,6 +651,41 @@ pub async fn run_state_forget(
     release
 }
 
+struct StateForgetWriteState(StateFile);
+
+impl StateForgetWriteState {
+    fn from_loaded(state: StateFile, project_dir: &Path) -> Result<Self, AppError> {
+        if state.requires_legacy_dependency_migration() {
+            let forget = ProjectCommand::new("state forget", project_dir);
+            let refresh = ProjectCommand::new("state refresh", project_dir);
+            return Err(AppError::Config(format!(
+                "Cannot run `{forget}` while state contains unmigrated pre-v21 dependency names. Run `{refresh}` first; state refresh classifies those names without discarding create-outcome-unknown recovery rows."
+            )));
+        }
+        Ok(Self(state))
+    }
+}
+
+impl std::ops::Deref for StateForgetWriteState {
+    type Target = StateFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StateForgetWriteState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsMut<StateFile> for StateForgetWriteState {
+    fn as_mut(&mut self) -> &mut StateFile {
+        &mut self.0
+    }
+}
+
 async fn run_state_forget_locked<R>(
     backend: &dyn StateBackend,
     lock: &LockInfo,
@@ -551,10 +698,11 @@ async fn run_state_forget_locked<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    let mut state =
+    let state =
         crate::commands::apply::load_state_persist_if_migrated(backend, StateLockRef::Held(lock))
             .await?
             .unwrap_or_default();
+    let mut state = StateForgetWriteState::from_loaded(state, project_dir)?;
     let row = state
         .find_outcome_unknown(address)
         .map_err(|source| AppError::from_state_forget(source, project_dir))?;
@@ -571,7 +719,7 @@ where
             StateFile::forget(row);
         }
     }
-    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    crate::commands::apply::save_state_locked(backend, lock, state.as_mut()).await?;
     println!(
         "{} {}",
         "Forgot create-outcome-unknown current instance:"
@@ -761,6 +909,15 @@ fn create_outcome_unknown_status(unknown: &UnknownCreateOutcome) -> String {
     )
 }
 
+fn pending_legacy_dependencies_text(state: &StateFile, row: &ResourceState) -> Option<String> {
+    state.legacy_dependency_names_for(row).map(|legacy| {
+        format!(
+            "dependencies not yet migrated (legacy: {})",
+            legacy.iter().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
 /// Format state list output. Returns each line as a string.
 fn format_state_list(state: &StateFile) -> Vec<String> {
     let mut lines = Vec::new();
@@ -804,6 +961,9 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
                 row_prefix,
                 deposed_state_marker(&deposed.key, &deposed.identifier)
             ));
+        }
+        if let Some(pending) = pending_legacy_dependencies_text(state, rs) {
+            lines.push(format!("{row_prefix}  ({pending})"));
         }
     }
     lines
@@ -859,7 +1019,13 @@ fn format_state_lookup(
             return format_state_lookup_json(state, rs, attribute);
         }
         let current = current_for_state_command(state, rs);
-        return format_resource_value(rs, &current, attribute, false);
+        let value = format_resource_value(rs, &current, attribute, false)?;
+        if attribute.is_none()
+            && let Some(pending) = pending_legacy_dependencies_text(state, rs)
+        {
+            return Ok(format!("{pending}\n{value}"));
+        }
+        return Ok(value);
     }
 
     // (2) Nothing matched — report the full query so the operator
@@ -921,7 +1087,7 @@ fn format_state_lookup_json(
     row: &ResourceState,
     attribute: Option<&str>,
 ) -> Result<String, AppError> {
-    let resource = StateShowResource::from_row(row)
+    let resource = StateShowResource::from_row(row, state.legacy_dependency_names_for(row))
         .map_err(|error| AppError::Config(format!("Failed to render state JSON: {error}")))?;
 
     let value = match attribute {
@@ -1101,31 +1267,28 @@ async fn run_state_lookup(
 fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
     for rs in state.resources() {
-        let identity = rs.identity.clone();
-        // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
-        let mut resource = carina_core::resource::DataSource::with_provider(
+        let id = ResolvedResourceId::with_provider_identity(
             &rs.provider,
             &rs.resource_type,
-            identity,
+            rs.identity.clone(),
             rs.directives.provider_instance.clone(),
         );
-        resource.directives = rs.directives.clone().into();
-
-        // Set typed metadata fields from state
-        resource.binding = rs.binding.clone();
-        resource.dependency_bindings = rs.dependency_bindings.clone();
-
-        // Convert persisted JSON attributes through the state-only decoder.
-        for (key, value) in rs
+        let attributes = rs
             .persisted_attributes()
             .map(PersistedAttributes::to_values)
             .unwrap_or_default()
-        {
-            resource.set_attr(key, value);
-        }
+            .into_iter()
+            .collect();
 
         plan.add(Effect::Read {
-            resource: ResolvedDataSource::new(resource),
+            resource: ResolvedDataSource::from_persisted_parts(
+                id,
+                attributes,
+                rs.directives.clone().into(),
+                rs.binding.clone(),
+                rs.dependency_bindings.to_resolved_dependencies(),
+                rs.directives.depends_on.to_resolved_dependencies(),
+            ),
         });
     }
     plan
@@ -1149,6 +1312,9 @@ fn format_state_show(state: &StateFile) -> String {
             "# {}.{} ({})\n",
             rs.provider, rs.resource_type, display_name
         ));
+        if let Some(pending) = pending_legacy_dependencies_text(state, rs) {
+            output.push_str(&format!("  {pending}\n"));
+        }
 
         let current = current_for_state_command(state, rs);
         match StateCommandCurrent::from(&current) {
@@ -1233,6 +1399,19 @@ async fn run_state_show(
     }
 
     if tui {
+        for row in state.resources() {
+            if let Some(legacy) = state.legacy_dependency_names_for(row) {
+                let display_name = row
+                    .binding
+                    .as_ref()
+                    .map(AbsoluteBindingAddress::as_str)
+                    .unwrap_or(row.identity.as_str());
+                println!(
+                    "Warning: {display_name}: dependencies not yet migrated (legacy: {})",
+                    legacy.iter().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
         let plan = build_plan_from_state(&state);
         let historical_display =
             carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
@@ -1662,7 +1841,10 @@ pub(crate) async fn run_state_refresh_locked(
         state_file.as_ref(),
     )
     .await?;
-    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<AbsoluteBindingAddress>> = state_file
+    let saved_dep_bindings: HashMap<
+        ResourceId,
+        carina_core::resource::PersistedDestroyDependencies,
+    > = state_file
         .as_ref()
         .map(|sf| {
             sorted_resources
@@ -1707,9 +1889,7 @@ pub(crate) async fn run_state_refresh_locked(
         }
     }
     let mut prepared_expansion = addressed_expansion.seal(data_source_values);
-    let crate::wiring::ExpandedRefreshState {
-        sorted_resources: resorted,
-    } = validated_config
+    let materialization = validated_config
         .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
             provider: &provider,
             comparison_provider: &provider,
@@ -1721,6 +1901,7 @@ pub(crate) async fn run_state_refresh_locked(
             refresh_phase: &refresh_phase,
         })
         .await?;
+    let (validated_config, resorted) = validated_config.finish_legacy_expansion(materialization);
     let (ctx, parsed) = validated_config.context_and_resources();
     let sorted_resources = resorted;
     let crate::wiring::PreparedDeferredForExpansionParts {
@@ -1812,10 +1993,45 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
-        sorted_resources.iter().cloned(),
-        ctx.schemas(),
+    // State refresh does not build a plan, but every consumer below still
+    // requires the same post-expansion dependency phase as planning. Resolve
+    // the refreshed resource set through the one graph-address transition;
+    // converting each raw resource independently would either reject its
+    // authored snapshots or silently discard ordering metadata.
+    let moved_pairs = crate::wiring::resolve_moved_pairs(
+        ctx,
+        parsed,
+        &sorted_resources,
+        &parsed.data_sources,
+        &state_file,
     )?;
+    let validated = match validated_config
+        .resolve_legacy_graph(&moved_pairs, state_file.as_ref())?
+    {
+        carina_state::LegacyClassificationOutcome::Classified(validated) => validated,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            return Err(AppError::Validation(format!(
+                "{rows}: legacy dependency migration requires reads; run plan/apply (which reads upstream_state) to migrate"
+            )));
+        }
+    };
+    let (ctx, expanded_graph) = validated.config.context_and_resources();
+    let parsed = expanded_graph.configuration();
+    if let Some(migrated) = validated.migrated_state {
+        state_file = Some(migrated);
+        if let Some(state) = state_file.as_ref() {
+            for (id, current) in &mut managed_current {
+                if let Some(row) = state.find_resource_for_id(id) {
+                    current.set_dependency_bindings(row.dependency_bindings.clone());
+                }
+            }
+        }
+    }
+    let resolved_resources = sorted_resources
+        .iter()
+        .cloned()
+        .map(|resource| expanded_graph.resolve_resource(resource, ctx.schemas()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut state = state_file.take().unwrap();
 
@@ -2744,11 +2960,16 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::Context,
+    };
 
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new((resource).into_value_snapshot())
     }
 
     fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
@@ -3734,7 +3955,7 @@ mod tests {
                 }],
             },
             binding: Some(absolute_binding("checked")),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
@@ -3819,7 +4040,7 @@ mod tests {
                 }],
             },
             binding: Some(absolute_binding("checked")),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
@@ -3909,6 +4130,73 @@ mod tests {
         )
         .expect("outcome-unknown fixture must decode")
         .into_state()
+    }
+
+    fn legacy_outcome_unknown_state_fixture() -> StateFile {
+        carina_state::check_and_migrate(
+            &serde_json::json!({
+                "version": 20,
+                "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+                "serial": 4,
+                "lineage": "legacy-state-forget-test",
+                "carina_version": "test",
+                "resources": [{
+                    "resource_type": "test.Resource",
+                    "identity": "unknown",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "create_outcome_unknown",
+                        "started_at": "2026-10-30T03:00:00Z"
+                    },
+                    "dependency_bindings": ["removed_dependency"]
+                }],
+                "exports": {}
+            })
+            .to_string(),
+        )
+        .expect("legacy outcome-unknown fixture must decode")
+        .into_state()
+    }
+
+    struct ReadProbe(Arc<AtomicBool>);
+
+    impl tokio::io::AsyncRead for ReadProbe {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.0.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn state_forget_rejects_legacy_dependencies_before_prompting() {
+        let state = legacy_outcome_unknown_state_fixture();
+        assert!(state.requires_legacy_dependency_migration());
+        let backend = ModuleConstraintRefreshBackend { state };
+        let read = Arc::new(AtomicBool::new(false));
+
+        let error = run_state_forget_locked(
+            &backend,
+            &LockInfo::for_test("state forget"),
+            &StateBlockAddress::new("mock", "test.Resource", "unknown"),
+            Path::new("infra/project"),
+            false,
+            tokio::io::BufReader::new(ReadProbe(Arc::clone(&read))),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("legacy dependency names must be rejected before confirmation");
+
+        assert!(!read.load(Ordering::SeqCst), "confirmation input was read");
+        assert!(
+            error
+                .to_string()
+                .contains("carina state refresh infra/project"),
+            "the recovery must name the graph-aware migration command: {error}"
+        );
     }
 
     fn outcome_unknown_state_with_deposed_fixture() -> StateFile {
@@ -4277,7 +4565,7 @@ mod tests {
             identifier.to_string(),
             provider_instance.map(str::to_string),
             attributes,
-            BTreeSet::new(),
+            Default::default(),
         )
     }
 
@@ -4970,7 +5258,7 @@ mod tests {
     fn lookup_json_in_flight_resource_returns_public_row_and_rejects_attributes() {
         let id =
             ResourceId::with_provider_identity("mock", "test.resource", "pending-resource", None);
-        let resource = ResolvedResource::new(Resource::from_id(id.clone()));
+        let resource = resolved(Resource::from_id(id.clone()));
         let pending = crate::fixture_in_flight_create(
             &id,
             "resume-token",
@@ -5086,7 +5374,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_migrates_v8_state_before_producing_candidates() {
+    fn completion_loads_v8_state_as_pending_v20_before_producing_candidates() {
         let contents = json!({
             "version": 8,
             "serial": 3,
@@ -5105,7 +5393,8 @@ mod tests {
 
         let state = parse_local_state_for_completion(&contents)
             .expect("older state should migrate for completion");
-        assert_eq!(state.version, StateFile::CURRENT_VERSION);
+        assert_eq!(state.version, 20);
+        assert!(state.requires_legacy_dependency_migration());
         assert_eq!(
             candidate_values(&complete_state_lookup_from(&state, "v")),
             vec!["vpc"]
@@ -5654,7 +5943,7 @@ mod tests {
                 "password".to_string(),
                 structural_legacy_secret(&"ab".repeat(32)),
             )]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         state
             .upsert_resource(row)
@@ -5718,7 +6007,7 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("tags".to_string(), previous_tags.clone())]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         state
             .upsert_resource(row)
@@ -5794,13 +6083,19 @@ mod tests {
         let mut row = ResourceState::try_applied("ec2.Subnet", "main", "awscc", "subnet-current")
             .expect("fixture identifier is non-empty")
             .with_attribute("token", json!("old-token"));
-        row.directives = carina_core::resource::Directives::default()
-            .with_force_delete(true)
-            .with_create_before_destroy(true)
-            .with_depends_on(vec![absolute_binding("security_group")])
-            .with_provider_instance("west")
-            .with_prevent_destroy(true)
-            .into();
+        row.directives = carina_core::resource::PersistedDirectives::from_resolved(
+            &carina_core::resource::Directives::default()
+                .with_force_delete(true)
+                .with_create_before_destroy(true)
+                .with_provider_instance("west")
+                .with_prevent_destroy(true),
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.SecurityGroup",
+                "security_group",
+                None,
+            )]),
+        );
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
@@ -5811,7 +6106,10 @@ mod tests {
             },
         );
         row.binding = Some(absolute_binding("subnet"));
-        row.dependency_bindings = BTreeSet::from([absolute_binding("vpc")]);
+        row.dependency_bindings =
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "vpc", None,
+            )]);
         row.explicit = carina_core::explicit::ExplicitFields::Struct {
             children: HashMap::from([(
                 "cidr_block".to_string(),
@@ -5872,16 +6170,25 @@ mod tests {
         );
         assert_eq!(
             refreshed.dependency_bindings,
-            BTreeSet::from([absolute_binding("vpc")])
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "vpc", None
+            )])
         );
         assert_eq!(
             refreshed.directives,
-            carina_core::resource::Directives::default()
-                .with_force_delete(true)
-                .with_create_before_destroy(true)
-                .with_depends_on(vec![absolute_binding("security_group")])
-                .with_provider_instance("west")
-                .with_prevent_destroy(true)
+            carina_core::resource::PersistedDirectives::from_resolved(
+                &carina_core::resource::Directives::default()
+                    .with_force_delete(true)
+                    .with_create_before_destroy(true)
+                    .with_provider_instance("west")
+                    .with_prevent_destroy(true),
+                crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                    "awscc",
+                    "ec2.SecurityGroup",
+                    "security_group",
+                    None
+                )])
+            )
         );
         assert_eq!(
             refreshed.prefixes,
@@ -7103,6 +7410,7 @@ mod tests {
         assert_eq!(
             vpc_effect
                 .binding_address()
+                .as_deref()
                 .map(carina_core::resource::BindingAddress::as_str),
             Some("vpc"),
         );
@@ -7113,9 +7421,14 @@ mod tests {
         let state = load_fixture_state();
         let plan = build_plan_from_state(&state);
 
-        let vpc_resource = plan.effects()[0].as_resource_ref().unwrap();
-        assert!(vpc_resource.attributes().contains_key("cidr_block"));
-        assert!(vpc_resource.attributes().contains_key("vpc_id"));
+        let Effect::Read {
+            resource: vpc_resource,
+        } = &plan.effects()[0]
+        else {
+            panic!("refresh read")
+        };
+        assert!(vpc_resource.attributes.contains_key("cidr_block"));
+        assert!(vpc_resource.attributes.contains_key("vpc_id"));
     }
 
     #[test]
@@ -7131,10 +7444,17 @@ mod tests {
         let plan = build_plan_from_state(&state);
 
         // subnet depends on vpc
-        let subnet_resource = plan.effects()[1].as_resource_ref().unwrap();
+        let Effect::Read {
+            resource: subnet_resource,
+        } = &plan.effects()[1]
+        else {
+            panic!("refresh read")
+        };
         assert_eq!(
-            subnet_resource.dependency_bindings(),
-            &std::collections::BTreeSet::from([absolute_binding("vpc")])
+            subnet_resource.value_dependencies(),
+            &state.resources()[1]
+                .dependency_bindings
+                .to_resolved_dependencies()
         );
     }
 
@@ -7164,7 +7484,8 @@ mod tests {
         let mut resource: DataSource =
             DataSource::with_provider("mock", "iam.Roles", "roles", None);
         resource
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .insert(absolute_binding("registry_publish.target"));
 
         let warning = format_deferred_state_refresh_warning(&resource, &[]);

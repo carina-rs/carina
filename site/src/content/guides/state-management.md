@@ -17,10 +17,40 @@ By default, state is stored locally as `carina.state.json`. Use `backend local {
 
 State format v20 records a token-less `create_outcome_unknown` row when an
 initial create fails after a request may have reached the cloud but before the
-provider returns an identifier or continuation. Carina does not refresh,
-destroy, or re-create that address automatically. If the resource exists, add
-the import block shown by `carina plan`. If it does not exist, remove only that
+provider returns an identifier or continuation. It also makes
+`prevent_destroy` tri-state, preserving the difference between an omitted
+directive and an explicit `false` so provider-schema defaults can protect an
+unspecified resource. Carina does not refresh, destroy, or re-create a
+token-less unknown address automatically. If the resource exists, add the
+import block shown by `carina plan`. If it does not exist, remove only that
 recovery row with `carina state forget <TYPE> <IDENTITY>` and then plan again.
+
+State format v21 stores current and deposed dependency metadata as complete,
+typed resource IDs instead of binding-name strings. When Carina reads a v20
+file, it classifies every legacy dependency against state rows and the current
+expanded resource graph. A missing or ambiguous name on a configured row is a
+migration error. An orphan or deposed row retains every known edge and prints
+a warning for each unknown name before rewrite; unknown names are displayed,
+never silently dropped or persisted in v21.
+
+You can test this migration against a copy without changing either the copy or
+the configured backend:
+
+```bash
+cp carina.state.json /tmp/carina-state-migration-check.json
+carina state migrate \
+  --check /absolute/path/to/infra \
+  --state-url /tmp/carina-state-migration-check.json
+```
+
+`state migrate --check` performs the same graph-aware classification as
+plan/apply without credentials, provider initialization, CRUD or data-source
+calls, upstream-state reads, backend access, locks, network access, cache
+writes, or state writes. It loads schema metadata only from exact installed
+provider artifacts. Repeat `--provider-schema KIND=/absolute/provider.wasm`
+to select explicit artifacts; this metadata-only path also understands
+released protocol-v12 schema signatures. A successful run reports configured
+rows plus orphan/deposed warnings and confirms that no state was written.
 
 State format v17 adds a top-level `exports_version` that versions the exports
 encoding separately from the rest of the state file. Readers that only need
@@ -279,6 +309,12 @@ awscc.ec2.SecurityGroup {
 ```
 
 The `upstream_state` expression points at an upstream project's directory. Carina loads that directory's configuration, resolves its backend, reads its state, and exposes the upstream's `exports` through the `let`-bound name. If that project has a pending backend migration, Carina warns and reads its locked old backend. In this example, `network.vpc_id` references the `vpc_id` value published by the `../network` project's `exports` block.
+
+Exports and `upstream_state` are value-only state boundaries. A module may
+expose a same-stack resource handle through `attributes`, but an `exports`
+entry whose declared or inferred type is a resource handle is rejected. Export
+an ID, ARN, or another resource attribute value instead; no handle is written
+to state.
 
 `source` is required and resolved relative to the enclosing `.crn` file's directory. The upstream directory must contain a valid Carina configuration (one or more `.crn` files — no filename is privileged) with an `exports` block that publishes the values consumers need.
 

@@ -121,6 +121,22 @@ impl ProviderFactory for AwsccTestFactory {
             }
 
             vec![
+                ResourceSchema::new("route53.RecordSet").attribute(
+                    AttributeSchema::optional(
+                        "id",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::new(
+                                Some("aws"),
+                                ["route53", "RecordSet"],
+                                "Id",
+                            )),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                ),
                 ResourceSchema::new("ec2.Vpc")
                     .attribute(
                         AttributeSchema::optional("cidr_block", AttributeType::string()).build(),
@@ -229,6 +245,148 @@ fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
     carina_cli::wiring::LoadedProviderFactory::for_test(vec![Box::new(AwsccTestFactory {
         include_generic_arn: false,
     }) as Box<dyn ProviderFactory>])
+}
+
+#[test]
+fn validate_and_lsp_reject_custom_value_depends_on_with_same_error() {
+    let module = tempfile::tempdir().unwrap();
+    let main = "let consumer = awscc.ec2.Vpc {\n  directives { depends_on = [rec] }\n}\n";
+    std::fs::write(module.path().join("main.crn"), main).unwrap();
+    std::fs::write(
+        module.path().join("arguments.crn"),
+        "arguments { rec: aws.route53.RecordSet.Id }\n",
+    )
+    .unwrap();
+    let expected =
+        "directives.depends_on: expected a managed resource handle; got aws.route53.RecordSet.Id";
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(module.path(), factories());
+    assert!(
+        errors.iter().any(|error| error.contains(expected)),
+        "{errors:#?}"
+    );
+
+    let providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(vec![Box::new(AwsccTestFactory {
+            include_generic_arn: false,
+        }) as Box<dyn ProviderFactory>]),
+        carina_core::schema::SchemaRegistry::new(),
+    );
+    let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
+        std::sync::Arc::new(providers),
+        vec!["awscc".to_string()],
+    );
+    let path = module.path().join("main.crn");
+    let document = carina_lsp::document::Document::new_with_path(
+        main.to_string(),
+        path.clone(),
+        std::sync::Arc::new(Default::default()),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == expected)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        matching[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+fn assert_depends_on_survives_unresolved_argument(
+    bad_type: &str,
+    main: &str,
+    sibling: &str,
+    expected: &str,
+) {
+    let module = tempfile::tempdir().unwrap();
+    let main = format!("arguments {{ bad: {bad_type} }}\n{main}");
+    std::fs::write(module.path().join("main.crn"), &main).unwrap();
+    std::fs::write(module.path().join("sibling.crn"), sibling).unwrap();
+    let errors =
+        carina_cli::commands::validate::validate_with_factories(module.path(), factories());
+
+    let providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(vec![Box::new(AwsccTestFactory {
+            include_generic_arn: false,
+        }) as Box<dyn ProviderFactory>]),
+        carina_core::schema::SchemaRegistry::new(),
+    );
+    let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
+        std::sync::Arc::new(providers),
+        vec!["awscc".to_string()],
+    );
+    let path = module.path().join("main.crn");
+    let document = carina_lsp::document::Document::new_with_path(
+        main,
+        path.clone(),
+        std::sync::Arc::new(Default::default()),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert!(
+        errors.iter().any(|error| error.contains(bad_type)),
+        "CLI must retain the declaration error: {errors:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains(bad_type)),
+        "LSP must retain the declaration error: {diagnostics:#?}"
+    );
+    let cli_reports_dependency = errors.iter().any(|error| error.contains(expected));
+    let lsp_reports_dependency = diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains(expected)
+            && diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    });
+    assert!(
+        cli_reports_dependency && lsp_reports_dependency,
+        "both frontends must report {expected:?} despite the unrelated argument error; \
+         CLI reported it: {cli_reports_dependency}, LSP reported it: {lsp_reports_dependency}; \
+         CLI: {errors:#?}; LSP: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn unresolved_argument_preserves_depends_on_cycle_in_validate_and_multifile_lsp() {
+    assert_depends_on_survives_unresolved_argument(
+        "TotallyMadeUpType",
+        r#"let a = awscc.ec2.Vpc {
+  directives { depends_on = [b] }
+}
+let b = awscc.ec2.Vpc {
+  directives { depends_on = [a] }
+}
+"#,
+        "arguments { other: String }\n",
+        "Circular dependency",
+    );
+    assert_depends_on_survives_unresolved_argument(
+        "aws.route53.Missing.Id",
+        "let a = awscc.ec2.Vpc {\n  directives { depends_on = [b] }\n}\n",
+        "let b = awscc.ec2.Vpc {\n  directives { depends_on = [a] }\n}\n",
+        "Circular dependency",
+    );
+}
+
+#[test]
+fn unresolved_argument_preserves_data_source_target_in_validate_and_multifile_lsp() {
+    assert_depends_on_survives_unresolved_argument(
+        "TotallyMadeUpType",
+        r#"let consumer = awscc.ec2.Vpc {
+  directives { depends_on = [source] }
+}
+let source = read awscc.ec2.Vpc { cidr_block = "10.0.0.0/16" }
+"#,
+        "arguments { other: String }\n",
+        "data sources cannot be depends_on targets",
+    );
+    assert_depends_on_survives_unresolved_argument(
+        "aws.route53.Missing.Id",
+        "let consumer = awscc.ec2.Vpc {\n  directives { depends_on = [source] }\n}\n",
+        "let source = read awscc.ec2.Vpc { cidr_block = \"10.0.0.0/16\" }\n",
+        "data sources cannot be depends_on targets",
+    );
 }
 
 fn factories_with_generic_arn() -> Vec<carina_cli::wiring::LoadedProviderFactory> {

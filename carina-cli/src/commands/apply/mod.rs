@@ -1,5 +1,6 @@
 pub(crate) mod saved_plan;
 
+use carina_core::resource::ResolvedResourceId;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::num::NonZeroUsize;
@@ -45,10 +46,11 @@ use carina_core::parser::{
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
-    CheckExportsPreApplyInput, PlanFile, PreparedPlanIdentityData, ProviderUpstreamScope,
-    ReloadedCompositionRehydrationError, ReloadedPlanFile, ResolvedProviderInputs,
-    SavedDataSourceValue, UpstreamMissingStatePolicy, collect_historical_display_attributes,
-    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
+    CheckExportsPreApplyInput, PlanFile, PlanFileDecodeError, PreparedPlanIdentityData,
+    ProviderUpstreamScope, ReloadedCompositionRehydrationError, ReloadedPlanFile,
+    ResolvedProviderInputs, SavedDataSourceValue, UpstreamMissingStatePolicy,
+    collect_historical_display_attributes, load_and_resolve_provider_configs,
+    prepare_plan_identity_and_provider_inputs,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -76,8 +78,7 @@ use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
 use crate::error::{
-    AppError, PlanFileJsonError, SavedPlanDirectiveChangesMismatchError,
-    SavedPlanSecretVerificationError,
+    AppError, SavedPlanDirectiveChangesMismatchError, SavedPlanSecretVerificationError,
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
@@ -444,10 +445,15 @@ fn finalize_saved_module_constraints(
         .map_err(AppError::from)
 }
 
-fn data_source_values_from_saved_plan<S: Clone>(
-    data_sources: &[carina_core::resource::DataSource<S>],
+fn data_source_values_from_saved_plan<S: Clone, D: Clone>(
+    data_sources: &[carina_core::resource::DataSource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >],
     saved_values: &[SavedDataSourceValue],
-) -> Result<DataSourceValues<S>, AppError> {
+) -> Result<DataSourceValues<S, D>, AppError> {
     let mut by_id = HashMap::with_capacity(saved_values.len());
     for saved in saved_values {
         if by_id
@@ -476,11 +482,21 @@ fn data_source_values_from_saved_plan<S: Clone>(
     Ok(values)
 }
 
-fn saved_plan_unresolved_by_resolved_id<S: Clone>(
-    sorted_resources: &[carina_core::resource::Resource<S>],
-    unresolved_resources: &[carina_core::resource::Resource<S>],
+fn saved_plan_unresolved_by_resolved_id<S: Clone, D>(
+    sorted_resources: &[carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    unresolved_resources: &[carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        (),
+    >],
     apply_target: ApplyTarget<'_>,
-) -> Result<HashMap<ResourceId, UnresolvedResource<S>>, AppError> {
+) -> Result<HashMap<ResolvedResourceId, UnresolvedResource<S>>, AppError> {
     if sorted_resources.len() != unresolved_resources.len() {
         return Err(AppError::Config(format!(
             "Saved plan resource snapshot mismatch: {} sorted resources but {} unresolved resources. Re-run `{}`.",
@@ -506,11 +522,11 @@ fn saved_plan_unresolved_by_resolved_id<S: Clone>(
 
         let mut source = unresolved.clone();
         source.id = resolved.id.clone();
+        let resolved_id = ResolvedResourceId::try_new(resolved.id.clone()).ok_or_else(|| {
+            carina_core::resource::PendingResourceIdentityError::new(resolved.id.clone())
+        })?;
         if by_id
-            .insert(
-                resolved.id.clone(),
-                UnresolvedResource::from_pre_resolve(source),
-            )
+            .insert(resolved_id, UnresolvedResource::from_pre_resolve(source))
             .is_some()
         {
             return Err(AppError::Config(format!(
@@ -632,7 +648,7 @@ async fn execute_effects_with_observer(
     bindings: &mut ResolvedBindings,
     managed_current: &mut HashMap<ResourceId, Current>,
     data_source_values: ExecutableDataSourceValues,
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource>,
     data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::LiveComposition],
     precompleted_success_count: usize,
@@ -641,11 +657,16 @@ async fn execute_effects_with_observer(
     parallelism: NonZeroUsize,
     observer: &dyn ExecutionObserver,
 ) -> ExecutionOutcome {
+    let data_source_origins = data_source_origins
+        .iter()
+        .cloned()
+        .map(|source| source.into_value_snapshot())
+        .collect::<Vec<_>>();
     let input = LiveExecutionInput {
         plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: unresolved_resources,
-            data_source_origins,
+            data_source_origins: &data_source_origins,
         },
         compositions,
         bindings: bindings.clone(),
@@ -686,7 +707,7 @@ async fn execute_rehydrated_saved_plan(
     bindings: &mut ResolvedBindings,
     managed_current: &mut HashMap<ResourceId, Current>,
     data_source_values: ExecutableDataSourceValues<SavedModuleSource>,
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<SavedModuleSource>>,
+    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<SavedModuleSource>>,
     data_source_origins: &[SavedDataSource],
     compositions: &[carina_core::resource::SavedComposition],
     precompleted_success_count: usize,
@@ -1078,6 +1099,13 @@ pub(crate) async fn load_state_persist_if_migrated(
         None => Ok(None),
         Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
         Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
+            state.finish_rowless_dependency_migration();
+            if state.requires_legacy_dependency_migration() {
+                // v20 dependency names are an intentionally unwritable
+                // typestate. The expanded graph later classifies them before
+                // any state mutation or persistence is allowed.
+                return Ok(Some(state));
+            }
             match lock {
                 StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
                 StateLockRef::Disabled(disabled) => {
@@ -1108,6 +1136,12 @@ pub(crate) async fn prune_legacy_data_source_rows_persist_if_changed(
         return Ok(());
     };
     if state.remove_legacy_data_source_rows(data_sources) == 0 {
+        return Ok(());
+    }
+    if state.requires_legacy_dependency_migration() {
+        // The pre-v21 typestate is intentionally not serializable. The
+        // expanded-graph phase below persists this parser-aware cleanup
+        // together with the configuration-aware dependency migration.
         return Ok(());
     }
     match lock {
@@ -1224,7 +1258,12 @@ impl DriftCheckResult {
 /// verification pass for the saved-plan gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn detect_drift<S: Clone>(
-    sorted_resources: &[carina_core::resource::Resource<S>],
+    sorted_resources: &[carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        (),
+    >],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
     operation_provider: &dyn Provider,
@@ -1452,8 +1491,18 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
         schemas,
         sorted_resources.iter().map(|resource| &resource.id),
     );
+    let index =
+        carina_core::resolved_graph::ExpandedBindingIndex::for_test_resources(sorted_resources)?;
+    let sorted_resources = sorted_resources
+        .iter()
+        .cloned()
+        .map(|resource| index.resolve_resource(resource, &schemas))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(ResolvedResource::into_inner)
+        .collect::<Vec<_>>();
     detect_drift(
-        sorted_resources,
+        &sorted_resources,
         planned_state_entries,
         historical_addresses,
         operation_provider,
@@ -1830,7 +1879,7 @@ enum SourceApplyAfterHeartbeat {
 
 struct SourceApplyPersistExports {
     validated_config: ValidatedConfig<
-        crate::wiring::ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
+        crate::wiring::PostExpansionConfiguration<carina_core::parser::ExpandedInferredExportParam>,
     >,
     state_file: Option<StateFile>,
     resources: Vec<Resource>,
@@ -2156,7 +2205,13 @@ async fn run_apply_locked_owned(
                 moved_origins,
                 prev_explicit,
                 wait_aliases,
+                legacy_dependency_classification: _,
+                migrated_legacy_state,
             } = artifacts;
+            let legacy_state_migrated = migrated_legacy_state.is_some();
+            if let Some(migrated) = migrated_legacy_state {
+                state_file = Some(migrated);
+            }
             #[cfg(any(test, feature = "test-utils"))]
             capture_live_apply_plan_for_test(&plan)?;
             let crate::wiring::PostExpansionApplyResources {
@@ -2212,6 +2267,27 @@ async fn run_apply_locked_owned(
                 let directive_change_count = directive_changes.len();
 
                 if export_changes.is_empty() && directive_change_count == 0 {
+                    if legacy_state_migrated {
+                        println!(
+                            "{}",
+                            "Persisting configuration-aware state dependency migration.".cyan()
+                        );
+                        let pre_resolve_compositions_noop = parsed.compositions.clone();
+                        return Ok(SourceApplyAfterHeartbeat::PersistExports(Box::new(
+                            SourceApplyPersistExports {
+                                validated_config: validated_expansion,
+                                state_file,
+                                resources: paired_unresolved_resources,
+                                compositions: pre_resolve_compositions_noop,
+                                checked_exports: checked_exports_pre_apply,
+                                wait_aliases,
+                                managed_current,
+                                data_source_values,
+                                directive_change_count: 0,
+                                export_change_count: 0,
+                            },
+                        )));
+                    }
                     println!("{}", "No changes needed.".green());
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
@@ -2517,7 +2593,14 @@ async fn run_apply_locked_owned(
                     provider_context,
                     cancel,
                 } = *context;
-                let export_resources: Vec<Resource> = state_save_inputs
+                let export_resources: Vec<
+                    Resource<
+                        ModuleSource,
+                        carina_core::resource::NoPlaceholder,
+                        carina_core::resource::AbsoluteBindingAddress,
+                        (),
+                    >,
+                > = state_save_inputs
                     .sorted_resources()
                     .iter()
                     .map(|resource| resource.as_resource().clone())
@@ -2666,7 +2749,14 @@ trait SavedPlanResourceLike {
     fn attributes(&self) -> &indexmap::IndexMap<String, Value>;
 }
 
-impl<S> SavedPlanResourceLike for carina_core::resource::Resource<S> {
+impl<S, D> SavedPlanResourceLike
+    for carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >
+{
     fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -2680,7 +2770,14 @@ impl<S> SavedPlanResourceLike for carina_core::resource::Resource<S> {
     }
 }
 
-impl<S> SavedPlanResourceLike for carina_core::resource::DataSource<S> {
+impl<S, D> SavedPlanResourceLike
+    for carina_core::resource::DataSource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >
+{
     fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -3070,8 +3167,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 38
-    // retains authored lifecycle values, default origins, and loop call sites;
+    // Validate version compatibility before decoding the payload. Format 39
+    // stores resolved dependency addresses and legacy migration classifications.
+    // Format 38 retains lifecycle values, default origins, and loop call sites;
     // earlier binaries could silently discard safety directives. Format 37
     // requires a relative diagnostic file (or null) and line on each deferred-for
     // template. Format 36 adds typed deferred-for templates and stage-specific
@@ -3160,14 +3258,18 @@ async fn run_apply_from_plan_with_observer_factory(
         });
     }
 
-    let plan_file: PlanFile = (|| {
-        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-        let plan_file = serde_path_to_error::deserialize(&mut deserializer)
-            .map_err(PlanFileJsonError::from_path_error)?;
-        deserializer.end().map_err(PlanFileJsonError::at_root)?;
-        Ok::<PlanFile, PlanFileJsonError>(plan_file)
-    })()
-    .map_err(|error| AppError::corrupt_plan_file(plan_path.to_path_buf(), replan_command, error))?;
+    let plan_file = PlanFile::decode_json(&bytes).map_err(|error| match error {
+        PlanFileDecodeError::Json(error) => {
+            AppError::corrupt_plan_file(plan_path.to_path_buf(), replan_command, error)
+        }
+        PlanFileDecodeError::ProviderEvidence(error) => {
+            AppError::invalid_saved_plan_provider_evidence(
+                plan_path.to_path_buf(),
+                replan_command,
+                *error,
+            )
+        }
+    })?;
     let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let apply_target = ApplyTarget::SavedPlan {
         plan_file: plan_path,
@@ -3423,8 +3525,27 @@ async fn run_apply_from_plan_locked_owned(
     let removed_legacy_data_source_rows = state_file
         .as_mut()
         .is_some_and(|state| state.remove_legacy_data_source_rows(&legacy_data_source_origins) > 0);
+    if let Some(mut state) = state_file.take() {
+        if state.requires_legacy_dependency_migration() {
+            let classification = try_with_lock!(
+                inspected_plan
+                    .legacy_dependency_classification()
+                    .cloned()
+                    .ok_or_else(|| AppError::Config(
+                        "saved plan does not contain the pending legacy dependency classification"
+                            .to_string(),
+                    ))
+            );
+            state = try_with_lock!(crate::wiring::replay_legacy_migration(
+                state,
+                classification
+            ));
+        }
+        state_file = Some(state);
+    }
     if (pending_migration.is_some() || removed_legacy_data_source_rows)
         && let Some(state) = state_file.as_mut()
+        && !state.requires_legacy_dependency_migration()
     {
         match lock.as_ref() {
             StateLockRef::Held(held) => {
@@ -3545,10 +3666,36 @@ async fn run_apply_from_plan_locked_owned(
 
             let plan = rehydrated_plan_file.plan();
             let sorted_resources = rehydrated_plan_file.sorted_resources();
+            let saved_value_destroy_dependencies = rehydrated_plan_file
+                .reloaded_plan_file()
+                .sorted_value_destroy_dependencies()
+                .to_vec();
+            let saved_explicit_destroy_dependencies = rehydrated_plan_file
+                .reloaded_plan_file()
+                .sorted_explicit_destroy_dependencies()
+                .to_vec();
+            if sorted_resources.len() != saved_value_destroy_dependencies.len()
+                || sorted_resources.len() != saved_explicit_destroy_dependencies.len()
+            {
+                return Err(AppError::Config(format!(
+                    "saved plan destroy-dependency projection count does not match its {} sorted resources; create a new plan",
+                    sorted_resources.len()
+                )));
+            }
             let resolved_sorted_resources = ResolvedResource::collect_resolved_with_schemas(
                 sorted_resources.iter().cloned(),
                 wiring.schemas(),
-            )?;
+            )?
+            .into_iter()
+            .zip(saved_value_destroy_dependencies)
+            .zip(saved_explicit_destroy_dependencies)
+            .map(|((resource, value_dependencies), explicit_dependencies)| {
+                resource.with_saved_destroy_dependencies(
+                    value_dependencies,
+                    explicit_dependencies,
+                )
+            })
+            .collect::<Vec<_>>();
             let plan_compositions = rehydrated_plan_file.compositions();
             let plan_data_sources = rehydrated_plan_file.data_sources();
             let plan_data_source_origins: &[SavedDataSource] =

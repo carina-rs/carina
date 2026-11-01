@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -23,7 +23,37 @@ use indexmap::IndexMap;
 use tempfile::TempDir;
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    {
+        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+        let mut dependencies = resource.dependencies.value_bindings.clone();
+        for value in resource.attributes.values() {
+            value.visit_resource_refs(&mut |path| {
+                dependencies.insert(path.binding_address().clone());
+            });
+            value.visit_binding_refs(&mut |binding| {
+                dependencies.insert(binding.clone());
+            });
+        }
+        configuration.resources = dependencies
+            .into_iter()
+            .map(|binding| {
+                Resource::with_provider(
+                    "mock",
+                    "test.resource",
+                    carina_core::resource::ResourceIdentity::try_from(binding.as_str().to_owned())
+                        .unwrap(),
+                    None,
+                )
+                .with_absolute_binding(binding)
+            })
+            .collect();
+        configuration.resources.push(resource.clone());
+        let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
+            .expect("explicit fixture rows");
+        graph
+            .resolve_resource(resource, &carina_core::schema::SchemaRegistry::new())
+            .expect("fixture dependency resolution")
+    }
 }
 
 fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
@@ -208,7 +238,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
                 ConcreteValue::String("new-validation-token".into()),
             )])),
         );
-    cert.dependency_bindings.clear();
+    cert.dependencies.value_bindings.clear();
 
     let lb = mock_resource("load_balancer", "lb")
         .with_attribute("name", Value::Concrete(ConcreteValue::String("lb".into())));
@@ -249,21 +279,37 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         template_resource,
     );
 
+    let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+    configuration.resources = vec![cert.clone()];
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
+        .expect("deferred producer graph");
+    let (template, dependency_template) = graph
+        .compile_deferred_for(template)
+        .expect("deferred dependencies");
     let validation_id =
         ResourceId::with_provider_identity("mock", "test.resource", "validation_records[0]", None);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(lb.clone())));
     plan.add(Effect::Create(resolved(cert.clone())));
+
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+        dependency_template,
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
             identifier: AppliedIdentifier::new("old-validation-id")
                 .expect("fixture identifier is non-empty"),
             directives: Directives::default(),
             binding: Some(absolute_binding("validation_records[0]")),
-            dependencies: HashSet::from([absolute_binding("cert")]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                [carina_core::resource::ResolvedResourceId::new(
+                    cert.id.clone(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }])
         .expect("fixture has one delete"),
         template: Box::new(template),
@@ -293,8 +339,26 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             attribute_spans: Default::default(),
         }),
         plan,
-        sorted_resources: sorted_resources.clone(),
-        unresolved_resources: sorted_resources,
+        sorted_resources: sorted_resources
+            .iter()
+            .cloned()
+            .map(|resource| resolved(resource).into_inner())
+            .collect(),
+        sorted_value_destroy_dependencies: sorted_resources
+            .iter()
+            .cloned()
+            .map(|resource| {
+                resolved(resource)
+                    .persisted_value_destroy_dependencies()
+                    .clone()
+            })
+            .collect(),
+        sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
+        legacy_dependency_classification: None,
+        unresolved_resources: sorted_resources
+            .into_iter()
+            .map(Resource::into_value_snapshot)
+            .collect(),
         compositions: vec![],
         data_sources: vec![],
         data_source_origins: vec![],
@@ -362,7 +426,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
             ("name".to_string(), serde_json::json!("main-old")),
             ("status".to_string(), serde_json::json!("STALE")),
         ]),
-        std::collections::BTreeSet::new(),
+        Default::default(),
     ));
     state
         .upsert_resource(row)
@@ -392,9 +456,9 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         generation: EffectGeneration::Deposed(deposed_key),
         directives: Directives::default(),
         binding: Some(absolute_binding("main")),
-        dependencies: HashSet::new(),
-        explicit_dependencies: HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
@@ -414,6 +478,9 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         }),
         plan,
         sorted_resources: vec![],
+        sorted_value_destroy_dependencies: vec![],
+        sorted_explicit_destroy_dependencies: vec![],
+        legacy_dependency_classification: None,
         unresolved_resources: vec![],
         compositions: vec![],
         data_sources: vec![],

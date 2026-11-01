@@ -16,7 +16,7 @@ use carina_core::provider::{
     ProviderResult, ReadOutcome, ReadRequest, Sent, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
-    Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
 };
 use carina_core::schema::TypeIdentity;
 use carina_core::value::canonicalize_resources_with_schemas;
@@ -229,8 +229,12 @@ fn validation_failure_type_rejects_an_empty_error_vector() {
 #[tokio::test]
 async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
     let context = WiringContext::new_for_test(Vec::new(), &[]);
+    let resources = canonical_unresolved(Vec::new(), context.schemas());
+    let materialization =
+        DeferredForExpansionWitness::after_expansion(resources.parsed().deferred_for_expressions());
     let expanded_resources = ExpandedCanonicalResources {
-        resources: canonical_unresolved(Vec::new(), context.schemas()),
+        resources,
+        materialization,
     };
     let residual_deferred_for = expanded_resources
         .parsed()
@@ -246,7 +250,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
                 orphans: Orphans::new(),
                 saved_attrs: crate::empty_lifted_saved_attrs(),
                 prev_explicit: HashMap::new(),
-                moved_pairs: Vec::new(),
+                moved_pairs: resolved_move_pairs_for_test([]),
             },
             data_source_values: DataSourceValues::empty(),
             wait_aliases: Vec::new(),
@@ -1884,7 +1888,9 @@ enum ReadBehavior {
 }
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 fn test_data_source_values(
@@ -2652,7 +2658,7 @@ fn create_plan(
     data_sources: &[carina_core::resource::DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, carina_core::resource::PlanInputCurrent>,
-    directives_map: &HashMap<ResourceId, Directives>,
+    directives_map: &HashMap<ResourceId, carina_core::resource::PersistedDirectives>,
     registry: &SchemaRegistry,
     saved_attrs: &carina_core::provider::LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -2661,17 +2667,39 @@ fn create_plan(
         carina_core::resource::AbsoluteBindingAddress,
     >],
 ) -> Plan {
-    let managed = ResolvedResource::collect_resolved(managed.iter().cloned()).unwrap();
+    let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+    configuration.resources = managed.to_vec();
+    configuration.data_sources = data_sources.to_vec();
+    configuration.wait_bindings = wait_bindings.to_vec();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
+        .expect("plan fixture graph");
+    let managed = managed
+        .iter()
+        .cloned()
+        .map(|resource| graph.resolve_resource(resource, registry))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("fixture resource dependencies");
+    let data_sources = data_sources
+        .iter()
+        .cloned()
+        .map(|source| graph.resolve_data_source(source))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("fixture data-source dependencies");
+    let wait_bindings = wait_bindings
+        .iter()
+        .map(|wait| graph.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("fixture wait dependencies");
     carina_core::differ::create_plan_for_test(
         &managed,
-        data_sources,
+        &data_sources,
         provider,
         carina_core::differ::PlanPriorStates::new(current_states, orphans),
         directives_map,
         registry,
         saved_attrs,
         prev_explicit,
-        wait_bindings,
+        &wait_bindings,
     )
     .expect("test provider hints should succeed")
 }
@@ -2894,7 +2922,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     let mut orphans = Orphans::from([carina_core::differ::Orphan::present(
         present,
         Some(absolute_binding("resource")),
-        Directives::default(),
+        carina_core::resource::PersistedDirectives::default(),
     )]);
     let normalizer = TransformingNormalizer;
     let saved_attrs = crate::empty_lifted_saved_attrs();
@@ -2991,7 +3019,10 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         resources.resources(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_current_map::<carina_core::resource::ModuleSource>(
+        &carina_core::resource::into_plan_input_current_map::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::UnexpandedDependencyFields,
+        >(
             current_states,
             &SchemaRegistry::new(),
             resources.resources(),
@@ -4247,7 +4278,7 @@ async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provi
     let orphan = Orphan::create_outcome_unknown(
         unknown.clone(),
         Some(absolute_binding("unknown")),
-        Directives::default(),
+        carina_core::resource::PersistedDirectives::default(),
     );
     let refreshed_orphan =
         refresh_loaded_orphan_with_retry(&provider, orphan, None, &SchemaRegistry::new())
@@ -4274,8 +4305,6 @@ use carina_core::parser::ParsedFile;
 #[test]
 #[ignore = "requires provider binary for state normalization"]
 fn test_normalize_state_prevents_false_enum_diff() {
-    use carina_core::resource::Directives;
-
     let ctx = WiringContext::new_for_test(vec![], &[]);
 
     // Desired resource with the parser-authored typed enum value.
@@ -4305,7 +4334,8 @@ fn test_normalize_state_prevents_false_enum_diff() {
 
     // Without normalize_state, the differ would see a false diff
     let resources_without = vec![resource.clone()];
-    let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
+    let directives_map: HashMap<ResourceId, carina_core::resource::PersistedDirectives> =
+        HashMap::new();
     let schemas = SchemaRegistry::new();
     let saved_attrs = crate::empty_lifted_saved_attrs();
     let prev_explicit = HashMap::new();
@@ -4314,10 +4344,13 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &resources_without,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_current_map::<carina_core::resource::ModuleSource>(
+        &carina_core::resource::into_plan_input_current_map::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::UnexpandedDependencyFields,
+        >(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
-            &[],
+            &[] as &[Resource],
         ),
         &directives_map,
         &schemas,
@@ -4339,7 +4372,10 @@ fn test_normalize_state_prevents_false_enum_diff() {
         &resources_with,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_current_map::<carina_core::resource::ModuleSource>(
+        &carina_core::resource::into_plan_input_current_map::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::UnexpandedDependencyFields,
+        >(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -4598,8 +4634,6 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
 /// pipeline to maintain parity.
 #[test]
 fn test_merge_default_tags_prevents_false_diff() {
-    use carina_core::resource::Directives;
-
     // Build a minimal schema with the map(string) `tags` attribute required by
     // host default-tag merging.
     let schema = PatternResourceSchema::new("s3.Bucket").attribute(
@@ -4661,14 +4695,15 @@ fn test_merge_default_tags_prevents_false_diff() {
     // but state has tags and prev_explicit says "tags" was previously desired.
     // The differ sees this as attribute removal → false Update diff.
     let resources_without = vec![resource.clone()];
-    let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
+    let directives_map: HashMap<ResourceId, carina_core::resource::PersistedDirectives> =
+        HashMap::new();
     let saved_attrs = crate::empty_lifted_saved_attrs();
     let orphan_deps = Orphans::new();
     let plan_without = create_plan(
         &resources_without,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &crate::plan_input_current_from_states(
+        &crate::plan_input_current_from_states::<carina_core::resource::UnexpandedDependencyFields>(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -4704,7 +4739,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         &resources_with,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &crate::plan_input_current_from_states(
+        &crate::plan_input_current_from_states::<carina_core::resource::UnexpandedDependencyFields>(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
             &[],
@@ -4842,8 +4877,8 @@ fn same_type_moved_block_parses_and_materializes_state() {
     .expect("fixture move routes must agree with current state");
 
     assert_eq!(
-        moved_pairs,
-        vec![(
+        moved_pairs.as_slice(),
+        &[(
             ResolvedResourceId::new(from.clone()),
             ResolvedResourceId::new(to.clone())
         )]
@@ -4890,7 +4925,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
     let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
     let to = ResourceId::with_provider_identity("mock", "test.resource", "new_name", None);
     let desired = Resource::with_provider("mock", "test.resource", "new_name", None);
-    let old_resource = ResolvedResource::new(Resource::with_provider(
+    let old_resource = resolved(Resource::with_provider(
         "mock",
         "test.resource",
         "old_name",
@@ -4927,8 +4962,8 @@ fn moved_in_flight_rebinds_resume_to_destination() {
     .expect("fixture move routes must agree with current state");
 
     assert_eq!(
-        moved_pairs,
-        vec![(
+        moved_pairs.as_slice(),
+        &[(
             ResolvedResourceId::new(from),
             ResolvedResourceId::new(to.clone())
         )]
@@ -5001,8 +5036,8 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
     )
     .expect("fixture move routes must agree with current state");
     assert_eq!(
-        moved_pairs,
-        vec![(
+        moved_pairs.as_slice(),
+        &[(
             ResolvedResourceId::new(from),
             ResolvedResourceId::new(to.clone())
         )]
@@ -5016,21 +5051,21 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
         Some("retired")
     );
 
-    let plan =
-        create_plan(
-            &[],
-            &[],
-            &carina_core::provider::ProviderRouter::new(),
-            &carina_core::resource::into_plan_input_current_map::<
-                carina_core::resource::ModuleSource,
-            >(current_states, &SchemaRegistry::new(), &[]),
-            &state_file.build_directives(),
-            &SchemaRegistry::new(),
-            &crate::empty_lifted_saved_attrs(),
-            &HashMap::new(),
-            &orphans,
-            &[],
-        );
+    let plan = create_plan(
+        &[],
+        &[],
+        &carina_core::provider::ProviderRouter::new(),
+        &carina_core::resource::into_plan_input_current_map::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::UnexpandedDependencyFields,
+        >(current_states, &SchemaRegistry::new(), &[]),
+        &state_file.build_directives(),
+        &SchemaRegistry::new(),
+        &crate::empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
 
     assert!(matches!(
         plan.effects(),
@@ -5078,9 +5113,9 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
         generation: carina_core::effect::EffectGeneration::Current,
         directives: carina_core::resource::Directives::default(),
         binding: None,
-        dependencies: std::collections::HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: std::collections::HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
 
     // `removed` block addresses are routing-agnostic by construction
@@ -5091,7 +5126,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
 
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects(
+    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
         &mut plan,
         &state_blocks,
         &Some(state_file),
@@ -5128,7 +5163,7 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
     use carina_core::plan::Plan;
     use carina_core::resource::ResourceId;
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     let deposed_key = DeposedKey::new_unique();
     let mut state_file = StateFile::new();
@@ -5144,7 +5179,7 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
         "record-deposed".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     state_file
         .upsert_resource(rs)
@@ -5159,9 +5194,9 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
         generation: EffectGeneration::Current,
         directives: carina_core::resource::Directives::default(),
         binding: None,
-        dependencies: std::collections::HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: std::collections::HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     });
     add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
 
@@ -5170,7 +5205,7 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
     }];
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects(
+    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
         &mut plan,
         &state_blocks,
         &Some(state_file),
@@ -5217,11 +5252,11 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
 fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
     use carina_core::effect::{Effect, EffectGeneration};
     use carina_core::provider::Sent;
-    use carina_core::resource::{ResolvedResource, Resource};
+    use carina_core::resource::Resource;
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
-    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::collections::{HashMap, HashSet};
 
-    let resource = ResolvedResource::new(Resource::with_provider(
+    let resource = resolved(Resource::with_provider(
         "mock",
         "example.Widget",
         "pending",
@@ -5248,7 +5283,7 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
         "old-id".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state_file = StateFile::new();
     state_file
@@ -5279,14 +5314,14 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
     ));
     add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
 
-    add_state_block_effects(
+    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
         &mut plan,
         &[StateBlock::Removed {
             from: StateBlockAddress::new("mock", "example.Widget", "pending"),
         }],
         &Some(state_file),
         &[],
-        &[],
+        &[] as &[Resource],
         &carina_core::binding_index::ResolvedBindings::default(),
         &HashSet::new(),
     );
@@ -5310,7 +5345,7 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
 fn deposed_delete_without_provider_identifier_becomes_plan_error() {
     use carina_core::plan::{Plan, PlanErrorKind};
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     let mut row = ResourceState::new("example.Widget", "broken", "mock");
     let deposed_key = DeposedKey::new_unique();
@@ -5319,7 +5354,7 @@ fn deposed_delete_without_provider_identifier_becomes_plan_error() {
         String::new(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state_file = StateFile::new();
     state_file
@@ -5348,7 +5383,7 @@ fn deposed_delete_without_provider_identifier_becomes_plan_error() {
 fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimport() {
     use carina_core::plan::Plan;
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     let mut row =
         ResourceState::try_applied("example.Widget", "healthy-current", "mock", "current-id")
@@ -5358,7 +5393,7 @@ fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimpor
         String::new(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state_file = StateFile::new();
     state_file
@@ -5378,11 +5413,9 @@ fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimpor
 fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
     use carina_core::effect::{Effect, EffectGeneration};
     use carina_core::plan::Plan;
-    use carina_core::resource::{
-        ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value,
-    };
+    use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     let producer_id =
         ResourceId::with_provider_identity("aws", "example.Producer", "producer-id", None);
@@ -5397,7 +5430,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
             "producer-old".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
     let mut state_file = StateFile::new();
     state_file
@@ -5412,7 +5445,9 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
         )]),
     )
     .with_identifier("consumer-id")
-    .with_dependency_bindings(BTreeSet::from([absolute_binding("producer")]));
+    .with_dependency_bindings(crate::test_support::persisted([ResolvedResourceId::new(
+        producer_id.clone(),
+    )]));
     let to = Resource::with_provider("aws", "example.Consumer", "consumer-id", None)
         .with_absolute_binding(absolute_binding("consumer"))
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
@@ -5420,7 +5455,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("consumer-id"),
         from: Box::new(from),
-        to: ResolvedResource::new(to),
+        to: resolved(to),
         changed_attributes: vec!["version".to_string()],
     });
 
@@ -5451,7 +5486,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
     assert!(
         blocked_by_updates
             .iter()
-            .any(|identity| identity.as_str() == "consumer-id")
+            .any(|id| id.as_inner() == &consumer_id)
     );
 }
 
@@ -5460,9 +5495,9 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
     use carina_core::effect::{Effect, EffectGeneration};
     use carina_core::provider::Sent;
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState};
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
-    let resource = ResolvedResource::new(Resource::with_provider(
+    let resource = resolved(Resource::with_provider(
         "mock",
         "example.Widget",
         "pending",
@@ -5485,7 +5520,7 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
         "old-id".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
 
     let (effects, errors) = deposed_delete_effects_for_row(&row, &[]);
@@ -5504,7 +5539,7 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
     assert_eq!(actual_key, &key);
     assert_eq!(
         blocked_by_updates,
-        &std::collections::HashSet::from([resource.identity().clone()])
+        &[resource.resolved_id()].into_iter().collect()
     );
 }
 
@@ -5549,7 +5584,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
 
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects(
+    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
         &mut plan,
         &state_blocks,
         &None,
@@ -5637,7 +5672,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
     let mut plan = Plan::new();
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects(
+    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
         &mut plan,
         &state_blocks,
         &state_file,
@@ -5732,7 +5767,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(imported.clone())));
     plan.add_error(PlanError::create_outcome_unknown(unknown_id.clone()));
-    add_state_block_effects(
+    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
         &mut plan,
         &state_blocks,
         &state_file,
@@ -5810,8 +5845,7 @@ fn bucket_resource(name: &str) -> Resource {
 }
 
 fn resolved_desired_ids(resources: &[Resource]) -> ResolvedDesiredIds {
-    ResolvedDesiredIds::from_resources(resources, &SchemaRegistry::new())
-        .expect("test desired identities must be resolved")
+    ResolvedDesiredIds::from_resources(resources).expect("test desired identities must be resolved")
 }
 
 fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
@@ -6029,7 +6063,7 @@ fn resource_move_invariants_missing_detected_source_is_an_error() {
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
 
     let result = apply_detected_resource_moves(
@@ -6105,7 +6139,7 @@ fn explicit_move_accepts_deposed_only_source_that_is_present_in_state() {
     )
     .expect("a persisted deposed-only source is a valid move source");
 
-    assert_eq!(moved_pairs, vec![(from, to.clone())]);
+    assert_eq!(moved_pairs.as_slice(), &[(from, to.clone())]);
     assert!(matches!(
         managed_current.get(to.as_inner()),
         Some(Current::Absent(state)) if state.state().id == *to.as_inner()
@@ -6138,7 +6172,7 @@ fn detected_move_accepts_deposed_only_source_that_is_present_in_state() {
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
 
     apply_detected_resource_moves(
@@ -6169,7 +6203,7 @@ fn resource_move_invariants_chained_moves_are_composed() {
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
 
     apply_detected_resource_moves(
@@ -6183,7 +6217,10 @@ fn resource_move_invariants_chained_moves_are_composed() {
     )
     .expect("both links have a loaded source");
 
-    assert_eq!(addressed.moved_pairs, vec![(source, target.clone())]);
+    assert_eq!(
+        addressed.moved_pairs.as_slice(),
+        &[(source, target.clone())]
+    );
     assert!(
         addressed.managed_current.contains_key(target.as_inner()),
         "the state maps must be re-keyed to the final destination"
@@ -6208,7 +6245,10 @@ fn resource_move_invariants_detected_target_cannot_be_an_explicit_source() {
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: vec![(explicit_source.clone(), explicit_target.clone())],
+        moved_pairs: resolved_move_pairs_for_test([(
+            explicit_source.clone(),
+            explicit_target.clone(),
+        )]),
     };
 
     let detected = DetectedAutomaticMoves::from_moves(vec![test_detected_bucket_move(
@@ -6234,8 +6274,8 @@ fn resource_move_invariants_detected_target_cannot_be_an_explicit_source() {
         "the pre-refresh projection cannot be applied across an explicit move"
     );
     assert_eq!(
-        addressed.moved_pairs,
-        vec![(explicit_source.clone(), explicit_target)]
+        addressed.moved_pairs.as_slice(),
+        &[(explicit_source.clone(), explicit_target)]
     );
     assert!(
         addressed
@@ -6263,7 +6303,10 @@ fn resource_move_invariants_detected_source_cannot_be_an_explicit_target() {
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: vec![(explicit_source.clone(), explicit_target.clone())],
+        moved_pairs: resolved_move_pairs_for_test([(
+            explicit_source.clone(),
+            explicit_target.clone(),
+        )]),
     };
 
     let detected = DetectedAutomaticMoves::from_moves(vec![test_detected_bucket_move(
@@ -6289,8 +6332,8 @@ fn resource_move_invariants_detected_source_cannot_be_an_explicit_target() {
         "an automatic projection cannot compose through an explicit move"
     );
     assert_eq!(
-        addressed.moved_pairs,
-        vec![(explicit_source, explicit_target.clone())]
+        addressed.moved_pairs.as_slice(),
+        &[(explicit_source, explicit_target.clone())]
     );
     assert!(
         addressed
@@ -6318,7 +6361,7 @@ fn resource_move_invariants_late_move_can_extend_an_early_chain() {
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: vec![(source.clone(), intermediate.clone())],
+        moved_pairs: resolved_move_pairs_for_test([(source.clone(), intermediate.clone())]),
     };
 
     apply_detected_resource_moves(
@@ -6333,7 +6376,10 @@ fn resource_move_invariants_late_move_can_extend_an_early_chain() {
     )
     .expect("late detection may extend the already-applied early move");
 
-    assert_eq!(addressed.moved_pairs, vec![(source, target.clone())]);
+    assert_eq!(
+        addressed.moved_pairs.as_slice(),
+        &[(source, target.clone())]
+    );
     assert!(addressed.managed_current.contains_key(target.as_inner()));
     assert!(
         !addressed
@@ -7749,7 +7795,7 @@ fn resource_move_invariants_unprojected_in_flight_target_blocks_orphan_match() {
         "subnet_id",
         Value::Concrete(ConcreteValue::String("subnet-a".into())),
     );
-    let resolved_persisted_target = ResolvedResource::new(persisted_target);
+    let resolved_persisted_target = resolved(persisted_target);
     let pending = crate::fixture_in_flight_create(
         &desired.id,
         "opaque-token",
@@ -7804,9 +7850,9 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let old_name = "ec2_subnet_route_table_association_11111111";
     let new_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let mut prior = association_state(old_name, "rtb-private", "subnet-a");
-    prior
-        .dependency_bindings
-        .insert(absolute_binding("private_rtb"));
+    let route_table_id =
+        ResolvedResourceId::with_provider_identity("awscc", "ec2.RouteTable", "private_rtb", None);
+    prior.dependency_bindings = crate::test_support::persisted([route_table_id.clone()]);
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -7837,7 +7883,7 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     assert_eq!(loaded.id().identity_str(), Some(old_name));
     assert_eq!(
         saved.get(&parsed.resources[0].id),
-        Some(&[absolute_binding("private_rtb")].into_iter().collect()),
+        Some(&crate::test_support::persisted([route_table_id])),
         "phase-1 metadata lookup must read the moved source row"
     );
 }
@@ -8484,9 +8530,10 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-    subnet_state
-        .dependency_bindings
-        .insert(absolute_binding("vpc"));
+    subnet_state.dependency_bindings =
+        crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+            "awscc", "ec2.Vpc", "vpc", None,
+        )]);
 
     let mut state_file = StateFile::new();
     state_file
@@ -8542,12 +8589,17 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .map(|resource| resource.as_resource().id.to_string())
         .collect();
 
-    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = plan_ctx
+    let unresolved_resources: HashMap<ResolvedResourceId, UnresolvedResource> = plan_ctx
         .unresolved_resources
         .iter()
-        .map(|resource| (resource.as_resource().id.clone(), resource.clone()))
+        .map(|resource| {
+            (
+                ResolvedResourceId::new(resource.as_resource().id.clone()),
+                resource.clone(),
+            )
+        })
         .collect();
-    let sorted_resources: Vec<Resource> = plan_ctx
+    let sorted_resources: Vec<_> = plan_ctx
         .sorted_resources
         .iter()
         .map(|resource| resource.as_inner().clone())
@@ -8572,11 +8624,17 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .into_executable()
         .expect("fixture plan must not contain blocked data sources");
     let provider = CascadeCreateProvider::default();
+    let data_source_origins = plan_ctx
+        .data_sources
+        .iter()
+        .cloned()
+        .map(|source| source.into_value_snapshot())
+        .collect::<Vec<_>>();
     let input = LiveExecutionInput {
         plan: &plan_ctx.plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
-            data_source_origins: &plan_ctx.data_sources,
+            data_source_origins: &data_source_origins,
         },
         compositions: &[],
         bindings,
@@ -8960,7 +9018,8 @@ fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_depende
         Value::Concrete(ConcreteValue::String("^target$".into())),
     );
     lookup
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("registry_publish.target"));
 
     let resolved = resolve_data_source_refs_for_refresh(
@@ -10024,7 +10083,7 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
     let comparison_provider =
         comparison_provider_for_resources(ctx.schemas(), resources.resources());
@@ -10078,7 +10137,7 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
     let comparison_provider =
         comparison_provider_for_resources(ctx.schemas(), resources.resources());
@@ -10185,7 +10244,7 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
         orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
     let claims = StateBlockClaims::empty();
     let state_view =
@@ -10213,7 +10272,10 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
     )
     .expect("early move must re-key its orphan state");
     let early_pair = (early_source_id, desired_id.clone());
-    assert_eq!(addressed.moved_pairs, vec![early_pair.clone()]);
+    assert_eq!(
+        addressed.moved_pairs.as_slice(),
+        std::slice::from_ref(&early_pair)
+    );
     assert!(addressed.orphans.contains_key(other_orphan_id.as_inner()));
     let comparison_provider =
         comparison_provider_for_resources(ctx.schemas(), resources.resources());
@@ -10233,8 +10295,8 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
     .expect("late anonymous identity must resolve");
 
     assert_eq!(
-        addressed.moved_pairs,
-        vec![early_pair],
+        addressed.moved_pairs.as_slice(),
+        &[early_pair],
         "the projected early destination must make late reconciliation a no-op"
     );
     assert!(
@@ -10297,7 +10359,7 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
         orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
     let claims = StateBlockClaims::empty();
     let state_view =
@@ -10317,8 +10379,8 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
     )
     .expect("early move must re-key its orphan state");
     assert_eq!(
-        addressed.moved_pairs,
-        vec![(origin_id.clone(), early_id.clone())]
+        addressed.moved_pairs.as_slice(),
+        &[(origin_id.clone(), early_id.clone())]
     );
 
     resources.resources_mut()[0].id = ResourceId::with_provider_identity(
@@ -10345,7 +10407,10 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
     )
     .expect("late reconciliation must extend the early move chain");
 
-    assert_eq!(addressed.moved_pairs, vec![(origin_id, late_id.clone())]);
+    assert_eq!(
+        addressed.moved_pairs.as_slice(),
+        &[(origin_id, late_id.clone())]
+    );
     assert!(addressed.managed_current.contains_key(late_id.as_inner()));
     assert!(!addressed.managed_current.contains_key(early_id.as_inner()));
 }
@@ -10411,7 +10476,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
             .into_plan_orphans(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
         prev_explicit: HashMap::new(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
     let claims = StateBlockClaims::empty();
     let comparison_provider =
@@ -10526,7 +10591,7 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
         orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
         prev_explicit: HashMap::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
-        moved_pairs: Vec::new(),
+        moved_pairs: resolved_move_pairs_for_test([]),
     };
     let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[], &resources);
     let detection = detect_anonymous_to_named_moves_with_ctx(
@@ -10550,8 +10615,8 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
     .unwrap();
 
     assert_eq!(
-        addressed.moved_pairs,
-        vec![(
+        addressed.moved_pairs.as_slice(),
+        &[(
             ResolvedResourceId::with_provider_identity(
                 "awscc",
                 "ec2.Route",
@@ -11222,7 +11287,7 @@ mod expand_same_config_deferred_for_tests {
         let orphan_owned = Orphans::from([carina_core::differ::Orphan::present(
             present,
             Some(absolute_binding("a")),
-            Directives::default(),
+            carina_core::resource::PersistedDirectives::default(),
         )]);
         let selected: Vec<&ResourceId> = refreshable
             .select(&resources, &orphan_owned)
@@ -11436,7 +11501,8 @@ mod expand_same_config_deferred_for_tests {
         for assignment in assignments {
             assert!(
                 assignment
-                    .dependency_bindings
+                    .dependencies
+                    .value_bindings
                     .contains(&absolute_binding("cert")),
                 "pre-expanded child must retain the iterable binding dependency"
             );
@@ -13241,7 +13307,7 @@ mod resolved_value_constraint_gate {
                 pending_constraints: vec![constraint],
             },
             binding: Some(absolute_binding("checked")),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
@@ -13809,6 +13875,54 @@ exports { team_prefix: String = "x" }"#,
         assert!(!rendered.contains("\"bad\""), "{rendered}");
         assert!(!rendered.contains("Secret("), "{rendered}");
     }
+}
+
+fn resolved_move_pairs_for_test(
+    pairs: impl IntoIterator<Item = (ResolvedResourceId, ResolvedResourceId)>,
+) -> carina_core::effect::ResolvedMovePairs {
+    let mut plan = Plan::new();
+    for (from, to) in pairs {
+        plan.add(Effect::Move {
+            from,
+            to,
+            origin: None,
+        });
+    }
+    carina_core::effect::ResolvedMovePairs::from_saved_plan(plan.move_effects())
+}
+
+#[test]
+fn validate_rejects_empty_interpolation_in_export_value() {
+    let parsed = parse(
+        "exports { url = \"${}\" }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("export fixture parses");
+    let parsed = resolve_file_for_test(parsed);
+    let errors = parsed
+        .validate_expansion_boundary(carina_core::parser::ParserPlaceholderBoundary::ExpandedFile)
+        .expect_err("empty interpolation must fail expansion")
+        .into_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let message = errors[0].to_string();
+    assert!(
+        message.contains("exports") && message.contains("url"),
+        "{message}"
+    );
+}
+#[test]
+fn validate_rejects_empty_interpolation_in_attribute_param_default() {
+    let parsed = parse(
+        "attributes { region = \"${}\" }\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("attribute fixture parses");
+    let parsed = resolve_file_for_test(parsed);
+    let errors = parsed
+        .validate_expansion_boundary(carina_core::parser::ParserPlaceholderBoundary::ExpandedFile)
+        .expect_err("empty interpolation must fail expansion")
+        .into_errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
 }
 
 #[tokio::test]

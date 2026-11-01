@@ -223,7 +223,7 @@ pub fn bindings_from_parts<S, P: PlaceholderKind + PartialEq, B: BindingAddress>
                     .signature
                     .attributes
                     .iter()
-                    .map(|(k, attr)| (k.clone(), attr.to_value()))
+                    .filter_map(|(k, attr)| attr.value().map(|value| (k.clone(), value)))
                     .collect(),
             },
         );
@@ -1175,25 +1175,43 @@ where
         .export_params
         .iter()
         .map(|parameter| {
-            let static_type = match &parameter.static_type {
-                Some(type_expr) => ExportStaticType::Declared(type_expr.clone()),
-                None => match &parameter.value {
+            let static_type = match (&parameter.static_type, &parameter.value) {
+                (Some(type_expr @ (TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_))), _) => {
+                    ExportStaticType::Declared(type_expr.clone())
+                }
+                (_, Some(crate::parser::BoundaryExpression::Handle(handle))) => {
+                    ExportStaticType::Inferred(StaticType::Known(TypeExpr::Ref(
+                        handle.resource_type().clone(),
+                    )))
+                }
+                (Some(type_expr), _) => ExportStaticType::Declared(type_expr.clone()),
+                (None, value) => match value {
                     None => ExportStaticType::Inferred(StaticType::Unchecked(
                         InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
                     )),
-                    Some(value) => match infer_type_from_value(value, &bindings, schemas) {
-                        Ok(type_expr) => ExportStaticType::Inferred(StaticType::Known(type_expr)),
-                        Err(issue) => {
-                            ExportStaticType::Inferred(StaticType::Unchecked(issue.into()))
+                    Some(crate::parser::BoundaryExpression::Value(value)) => {
+                        match infer_type_from_value(value, &bindings, schemas) {
+                            Ok(type_expr) => {
+                                ExportStaticType::Inferred(StaticType::Known(type_expr))
+                            }
+                            Err(issue) => {
+                                ExportStaticType::Inferred(StaticType::Unchecked(issue.into()))
+                            }
                         }
-                    },
+                    }
+                    Some(crate::parser::BoundaryExpression::Handle(_handle)) => {
+                        unreachable!("handle expressions are classified before value inference")
+                    }
                 },
             };
-            crate::parser::InferredExportParam {
-                name: parameter.name.clone(),
-                static_type,
-                value: parameter.value.clone(),
-            }
+            let value = parameter
+                .value
+                .as_ref()
+                .and_then(|expression| match expression {
+                    crate::parser::BoundaryExpression::Value(value) => Some(value.clone()),
+                    crate::parser::BoundaryExpression::Handle(_handle) => None,
+                });
+            crate::parser::InferredExportParam::from_parsed(parameter, static_type, value)
         })
         .collect();
     SchemaCheckedExportParams { parameters }
@@ -1357,7 +1375,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::parser::ModuleCall;
+    use crate::parser::{ModuleCall, ProviderContext};
     use crate::resource::{
         AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
         AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
@@ -2361,6 +2379,64 @@ mod tests {
     }
 
     #[test]
+    fn handle_exports_retain_provenance_until_the_state_boundary_rejects_them() {
+        let mut context = ProviderContext::default();
+        context
+            .resource_types
+            .insert(("mock".to_string(), "test.Record".to_string()));
+        let mut parsed = crate::parser::parse(
+            r#"
+let record = mock.test.Record { name = "record" }
+exports {
+  inferred = record
+  declared: mock.test.Record = "record-id"
+  annotated_value: String = record
+}
+"#,
+            &context,
+        )
+        .expect("handle export fixture parses");
+        crate::parser::resolve_resource_refs_with_config(&mut parsed, &context)
+            .expect("handle export fixture resolves declared resource types");
+        assert!(
+            crate::validation::resolve_file_type_exprs(&mut parsed, &context).is_empty(),
+            "handle export fixture resolves its declaration types",
+        );
+
+        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let handle_type =
+            TypeExpr::Ref(crate::parser::ResourceTypePath::new("mock", "test.Record"));
+        assert_eq!(
+            inferred.export_params[0].static_type,
+            ExportStaticType::Inferred(StaticType::Known(handle_type.clone())),
+        );
+        assert_eq!(
+            inferred.export_params[1].static_type,
+            ExportStaticType::Declared(handle_type),
+        );
+        assert!(
+            matches!(
+                inferred.export_params[2].static_type,
+                ExportStaticType::Inferred(StaticType::Known(TypeExpr::Ref(_)))
+            ),
+            "a handle RHS must not disappear behind a value annotation",
+        );
+
+        let errors = crate::validation::validate_export_handle_boundaries(&inferred.export_params)
+            .expect_err("resource handles cannot cross state boundaries");
+        assert_eq!(
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "export 'inferred': inferred resource handle mock.test.Record cannot cross a state boundary; export an identity value such as mock.test.Record.Id instead\n\
+export 'declared': resource handle mock.test.Record cannot cross a state boundary; export an identity value such as mock.test.Record.Id instead\n\
+export 'annotated_value': inferred resource handle mock.test.Record cannot cross a state boundary; export an identity value such as mock.test.Record.Id instead",
+        );
+    }
+
+    #[test]
     fn apply_inference_keeps_not_inferable_reasons_distinct() {
         use crate::parser::UpstreamState;
         use crate::static_type::{
@@ -2586,7 +2662,7 @@ mod tests {
                 pending_constraints: Vec::new(),
             },
             binding: Some("github_actions_carina".into()),
-            dependency_bindings: std::collections::BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "github_module".to_string(),
             instance: "github_actions_carina".to_string(),
             call_path: crate::resource::AuthoredCompositionCallPath::direct(

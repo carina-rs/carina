@@ -5,8 +5,8 @@ arguments {
 }
 
 attributes {
-  bucket_id: awscc.s3.Bucket = logs_bucket.id
-  queue_url: awscc.sqs.Queue = event_queue.id
+  bucket_id = logs_bucket.id
+  queue_url = event_queue.id
 }
 
 let logs_bucket = awscc.s3.Bucket {
