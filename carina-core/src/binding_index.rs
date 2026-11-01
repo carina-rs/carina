@@ -528,7 +528,7 @@ pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     /// until the expanded-graph seam can resolve them to complete resource
     /// IDs. Validation still needs their resource schema before that seam, so
     /// keep this index-only view keyed by the visible composition binding.
-    pending_composition_handles: HashMap<String, HashMap<String, crate::parser::ResourceTypePath>>,
+    pending_composition_handles: HashMap<B, HashMap<String, crate::parser::ResourceTypePath>>,
     registry: &'a SchemaRegistry,
     user_functions: &'a HashMap<String, crate::parser::UserFunction<B>>,
 }
@@ -612,30 +612,16 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
         let mut resource_handles = HashMap::new();
-        let composition_bindings = parsed
-            .compositions
-            .iter()
-            .filter_map(|composition| {
-                composition
-                    .binding
-                    .as_ref()
-                    .map(|binding| (composition.instance.as_str(), binding.as_str()))
-            })
-            .collect::<HashMap<_, _>>();
         let mut pending_composition_handles: HashMap<
-            String,
+            B,
             HashMap<String, crate::parser::ResourceTypePath>,
         > = HashMap::new();
         for attribute in &parsed
             .parser_binding_metadata
             .unexpanded_composition_attributes
         {
-            let Some(binding) = composition_bindings.get(attribute.composition_instance.as_str())
-            else {
-                continue;
-            };
             pending_composition_handles
-                .entry((*binding).to_string())
+                .entry(attribute.composition_binding.clone())
                 .or_default()
                 .insert(
                     attribute.name.clone(),
@@ -931,7 +917,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         if let ReferencePathRef::Access(path) = reference
             && let Some(resource_type) = self
                 .pending_composition_handles
-                .get(path.binding())
+                .get(path.binding_address())
                 .and_then(|attributes| attributes.get(path.attribute()))
         {
             let result = self.resource_handle_output_ref_type(path, resource_type, check);

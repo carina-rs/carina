@@ -9667,6 +9667,90 @@ fn handle_output_provider_context() -> ProviderContext {
 }
 
 #[test]
+fn anonymous_module_handle_output_resolves_after_instance_reconciliation() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("producer/arguments.crn", "arguments { name: String }\n");
+    fixture.write(
+        "producer/resources.crn",
+        "let record = mock.test.Record { name = name }\n",
+    );
+    fixture.write("producer/attributes.crn", "attributes { r = record }\n");
+    fixture.write("providers.crn", "provider mock {}\n");
+    fixture.write("backend.crn", "backend local { path = './state.json' }\n");
+    fixture.write("exports.crn", "exports { message: String = message }\n");
+    let context = handle_output_provider_context();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let resolve = |name: &str| {
+        let caller = fixture.write(
+            "main.crn",
+            &format!(
+                "let message = 'directory export'\nlet producer = use {{ source = './producer' }}\nproducer {{ name = '{name}' }}\n"
+            ),
+        );
+        let loaded = crate::config_loader::load_configuration_with_config(
+            caller.parent().unwrap(),
+            &context,
+            &schemas,
+        )
+        .expect("multi-file project directory loads");
+        assert_eq!(loaded.parsed.providers.len(), 1);
+        assert!(loaded.parsed.backend.is_some());
+        assert_eq!(loaded.parsed.export_params.len(), 1);
+        super::resolve_modules_with_providerless_config(
+            loaded.parsed,
+            &fixture.root,
+            &context,
+            &schemas,
+        )
+        .expect("anonymous module expands")
+    };
+    let previous = resolve("before-edit");
+    let mut edited = resolve("after-edit");
+    let prior_instance = &previous.compositions[0].instance;
+    let new_instance = &edited.compositions[0].instance;
+    assert!(edited.compositions[0].binding.is_none());
+    let (_, prior_hash) = parse_synthetic_instance_prefix(prior_instance).unwrap();
+    let (_, new_hash) = parse_synthetic_instance_prefix(new_instance).unwrap();
+    assert_ne!(prior_hash, new_hash, "argument edit must move the SimHash");
+    assert!(prior_hash.distance(new_hash) < crate::identifier::SIMHASH_HAMMING_THRESHOLD);
+    let prior_record = &previous.resources[0].id;
+    let prior_state = crate::resource::State::existing(
+        prior_record.clone(),
+        HashMap::from([(
+            "name".to_string(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "before-edit".into(),
+            )),
+        )]),
+    );
+    let state_lookup = |provider: &str, resource_type: &str| {
+        assert_eq!(provider, prior_state.id.provider);
+        assert_eq!(resource_type, prior_state.id.resource_type);
+        vec![prior_state.id.identity_str().unwrap().to_string()]
+    };
+    crate::module_resolver::reconcile_anonymous_module_instances(
+        &mut edited,
+        &state_lookup,
+        &crate::identifier::StateBlockClaims::empty(),
+    );
+    assert_eq!(edited.compositions[0].instance, *prior_instance);
+    assert_eq!(edited.resources[0].id, *prior_record);
+
+    let expanded = edited.into_expanded(&schemas).unwrap();
+    let graph = crate::resolved_graph::resolve_expanded_graph(expanded.into())
+        .expect("anonymous handle output must resolve through the remapped composition");
+    let composition = &graph.configuration().compositions[0];
+    assert_eq!(composition.instance, *prior_instance);
+    assert_eq!(
+        composition.signature.attributes["r"]
+            .handle()
+            .map(AsRef::as_ref),
+        Some(prior_record),
+        "the reconciled composition must expose its remapped resource handle",
+    );
+}
+
+#[test]
 fn unannotated_local_and_argument_handle_outputs_forward_across_modules() {
     let tmp = tempfile::tempdir().expect("temporary handle-output fixture");
     let producer = tmp.path().join("producer");

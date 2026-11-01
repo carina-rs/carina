@@ -869,6 +869,15 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // and anonymous calls. Besides exposing outputs for bound calls, the
         // node is the post-expansion record of the call boundary itself.
         {
+            let composition_id =
+                crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "_virtual",
+                    crate::resource::ResourceIdentity::new(instance_prefix.to_string()),
+                ));
+            let composition_binding = call
+                .binding_name
+                .clone()
+                .unwrap_or_else(|| composition_id.binding_address());
             let mut composition_attrs: IndexMap<
                 String,
                 crate::resource::LiveCompositionAttribute<
@@ -915,7 +924,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     expanded_parser_metadata
                         .unexpanded_composition_attributes
                         .push(crate::parser::UnexpandedCompositionAttribute {
-                            composition_instance: instance_prefix.to_owned(),
+                            composition_binding: composition_binding.clone(),
                             name: attr_param.name.clone(),
                             handle,
                             declared_type,
@@ -1003,10 +1012,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             }
 
             let composition = crate::resource::LiveComposition {
-                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                    "_virtual",
-                    crate::resource::ResourceIdentity::new(instance_prefix.to_string()),
-                )),
+                id: composition_id,
                 signature: crate::resource::LiveCompositionSignature {
                     arguments: signature_arguments,
                     attributes: composition_attrs,
@@ -4846,9 +4852,9 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// case by Hamming-distance matching: for each current DSL instance prefix
 /// whose address is absent from state, find a state-only prefix for the same
 /// module within `SIMHASH_HAMMING_THRESHOLD` bits; if exactly one candidate
-/// qualifies, rewrite every identity-bearing resource/composition and then
-/// traverse the complete finalized file to move every absolute binding slot
-/// to the same state-backed address.
+/// qualifies, rewrite managed state identities and then traverse the complete
+/// finalized file to move composition identities and every absolute binding
+/// slot together to the same state-backed address.
 ///
 /// `find_state_names_by_type` returns every state resource name for a given
 /// `(provider, resource_type)` — the reconciler uses them to discover which
@@ -5003,8 +5009,9 @@ pub fn reconcile_anonymous_module_instances<E, P, T>(
         return;
     }
 
-    // Apply remaps to string identities first. Typed binding addresses move
-    // together in one exhaustive traversal below.
+    // State-row identities retain their existing provenance transition.
+    // Composition identities and references move together in the exhaustive
+    // file traversal below, through the same binding mapper.
     for r in &mut file.resources {
         let Some(identity) = r.id.identity_str() else {
             continue;
@@ -5025,19 +5032,13 @@ pub fn reconcile_anonymous_module_instances<E, P, T>(
                 &ResourceIdentity::new(new_prefix.clone()),
             );
             if let Some(crate::resource::ModuleSource::Module(module)) = &r.module_source {
-                let mut remapped_call_path = module.module_call_path().clone();
-                for call in remapped_call_path.calls_mut() {
-                    if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
-                        call.instance = rewritten;
-                    }
-                }
                 r.module_source = Some(crate::resource::ModuleSource::expanded_module(
                     module.name(),
                     new_prefix.clone(),
                     module
                         .identity_scope()
                         .remap_prefix(&old_prefix, &new_prefix),
-                    remapped_call_path,
+                    module.module_call_path().clone(),
                 ));
             }
         }
@@ -5061,36 +5062,14 @@ pub fn reconcile_anonymous_module_instances<E, P, T>(
                 .set_identity(ResourceIdentity::new(format!("{}.{}", new_prefix, rest)));
             if let Some(crate::resource::ModuleSource::Module(module)) = &data_source.module_source
             {
-                let mut remapped_call_path = module.module_call_path().clone();
-                for call in remapped_call_path.calls_mut() {
-                    if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
-                        call.instance = rewritten;
-                    }
-                }
                 data_source.module_source = Some(crate::resource::ModuleSource::expanded_module(
                     module.name(),
                     new_prefix.clone(),
                     module
                         .identity_scope()
                         .remap_prefix(&old_prefix, &new_prefix),
-                    remapped_call_path,
+                    module.module_call_path().clone(),
                 ));
-            }
-        }
-    }
-
-    for composition in &mut file.compositions {
-        if let Some(identity) = rewrite_name_prefix(composition.id.identity_str(), &prefix_remap) {
-            composition.id = composition
-                .id
-                .instantiate_with_identity(ResourceIdentity::new(identity));
-        }
-        if let Some(rewritten) = rewrite_name_prefix(&composition.instance, &prefix_remap) {
-            composition.instance = rewritten;
-        }
-        for call in composition.call_path.calls_mut() {
-            if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
-                call.instance = rewritten;
             }
         }
     }
@@ -5101,27 +5080,14 @@ pub fn reconcile_anonymous_module_instances<E, P, T>(
     file.map_absolute_bindings(&mut remap_binding);
 }
 
-fn rewrite_name_prefix(
-    name: &str,
-    remap: &std::collections::HashMap<(String, SimHash), SimHash>,
-) -> Option<String> {
-    let (prefix, suffix) = name
-        .split_once('.')
-        .map_or((name, None), |(prefix, rest)| (prefix, Some(rest)));
-    let (module, simhash) = parse_synthetic_instance_prefix(prefix)?;
-    let target = remap.get(&(module.to_string(), simhash))?;
-    let new_prefix = format!("{}_{:016x}", module, target);
-    Some(match suffix {
-        Some(rest) => format!("{new_prefix}.{rest}"),
-        None => new_prefix,
-    })
-}
-
 fn rewrite_binding_prefix(
     binding: &crate::resource::AbsoluteBindingAddress,
     remap: &std::collections::HashMap<(String, SimHash), SimHash>,
 ) -> Option<crate::resource::AbsoluteBindingAddress> {
-    let (prefix, _) = split_instance_prefix(binding.as_str())?;
+    let prefix = binding
+        .as_str()
+        .split_once('.')
+        .map_or(binding.as_str(), |(prefix, _suffix)| prefix);
     let (module, simhash) = parse_synthetic_instance_prefix(prefix)?;
     let target = remap.get(&(module.to_string(), simhash))?;
     let new_prefix = format!("{}_{:016x}", module, target);

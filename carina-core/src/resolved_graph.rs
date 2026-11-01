@@ -1361,17 +1361,17 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
                 parsed
                     .compositions
                     .iter()
-                    .find(|composition| composition.instance == attribute.composition_instance)
+                    .find(|composition| {
+                        composition.binding_address() == attribute.composition_binding
+                    })
                     .map(|composition| {
                         composition
-                            .binding
-                            .clone()
-                            .unwrap_or_else(|| composition.id.binding_address())
+                            .binding_address()
                             .with_attribute(&attribute.name)
                     })
                     .ok_or_else(|| ExpandedGraphResolutionError::MissingComposition {
                         output: attribute.name.clone(),
-                        composition: attribute.composition_instance.clone(),
+                        composition: attribute.composition_binding.to_string(),
                     })?,
                 attribute,
             ))
@@ -1395,10 +1395,10 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
         let composition = parsed
             .compositions
             .iter_mut()
-            .find(|composition| composition.instance == attribute.composition_instance)
+            .find(|composition| composition.binding_address() == attribute.composition_binding)
             .ok_or_else(|| ExpandedGraphResolutionError::MissingComposition {
                 output: key.to_string(),
-                composition: attribute.composition_instance.clone(),
+                composition: attribute.composition_binding.to_string(),
             })?;
         composition.signature.attributes.insert(
             attribute.name.clone(),

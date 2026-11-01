@@ -173,6 +173,53 @@ pub struct DependencyGraph {
     pub effect_types: HashMap<usize, String>,
 }
 
+/// Display keeps both dependency representations: complete graph IDs survive
+/// value resolution, while still-deferred values carry typed binding addresses.
+/// Binding references are resolved against this plan's producers, never by
+/// treating their spelling as a resource identity.
+struct PlanTreeDependencies {
+    resolved: crate::resource::ResolvedDependencies,
+    referenced_bindings: HashSet<AbsoluteBindingAddress>,
+}
+
+impl PlanTreeDependencies {
+    fn from_effect<S>(effect: &Effect<S>) -> Self {
+        let mut referenced_bindings = HashSet::new();
+        let (resolved, attributes) = match effect {
+            Effect::Read { resource } => (effect.blocking_keys(), Some(&resource.attributes)),
+            Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
+                (effect.blocking_keys(), Some(&resource.attributes))
+            }
+            Effect::Update { to, .. } => (effect.blocking_keys(), Some(&to.attributes)),
+            Effect::Wait { target_id, .. } => {
+                (std::iter::once(target_id.id().clone()).collect(), None)
+            }
+            Effect::Delete { dependencies, .. } => (dependencies.to_resolved_dependencies(), None),
+            Effect::DeferredCreate(payload) => {
+                referenced_bindings.extend(payload.template.root_bindings());
+                (effect.blocking_keys(), None)
+            }
+            Effect::DeferredReplace(payload) => {
+                referenced_bindings.extend(payload.template.root_bindings());
+                (effect.blocking_keys(), None)
+            }
+            Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. } => (Default::default(), None),
+        };
+        if let Some(attributes) = attributes {
+            for value in attributes.values() {
+                crate::deps::collect_dependencies(value, &mut referenced_bindings);
+            }
+        }
+        Self {
+            resolved,
+            referenced_bindings,
+        }
+    }
+}
+
 impl DependencyGraph {
     /// Dependency/dependent effect-index pairs, without exposing scheduler keys
     /// as untyped display strings to graph consumers.
@@ -222,26 +269,18 @@ where
         effect_bindings: HashMap::new(),
         effect_types: HashMap::new(),
     };
+    let mut value_references = HashMap::new();
     for (index, effect) in effects.iter().enumerate() {
         if suppressed_deletes.contains(&index) {
             continue;
         }
         let effect = effect.as_ref();
         let id = effect.scheduler_id();
-        let mut dependencies = match effect {
-            Effect::Wait { target_id, .. } => std::iter::once(target_id.id().clone()).collect(),
-            Effect::Delete { dependencies, .. } => dependencies.to_resolved_dependencies(),
-            Effect::Read { .. }
-            | Effect::Create(_)
-            | Effect::ResumeCreate { .. }
-            | Effect::Update { .. }
-            | Effect::DeferredCreate(_)
-            | Effect::DeferredReplace(_) => effect.blocking_keys(),
-            Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::ReleaseListKeys { .. } => Default::default(),
-        };
+        let PlanTreeDependencies {
+            resolved: mut dependencies,
+            referenced_bindings,
+        } = PlanTreeDependencies::from_effect(effect);
+        value_references.insert(index, referenced_bindings);
         let mut visible_binding = effect.binding_address().map(std::borrow::Cow::into_owned);
         if let Some(delete_index) = replacement_creates.get(&index)
             && let Some(Effect::Delete {
@@ -271,7 +310,10 @@ where
             } else {
                 graph.id_to_effect.insert(id.clone(), index);
             }
-            graph.binding_to_effect.insert(id.binding_address(), index);
+            graph
+                .binding_to_effect
+                .entry(id.binding_address())
+                .or_insert(index);
             if let Some(binding) = effect.binding_address() {
                 graph.binding_to_effect.insert(binding.into_owned(), index);
             }
@@ -327,6 +369,21 @@ where
         graph.effect_bindings.insert(index, binding);
         graph.effect_types.insert(index, resource_type);
         graph.effect_deps.insert(index, dependencies);
+    }
+    // Index all producers before resolving value references so declaration
+    // order cannot drop an edge. The result has one complete-ID representation
+    // for the CLI, TUI, and plan-image consumers.
+    for (index, references) in value_references {
+        graph
+            .effect_deps
+            .get_mut(&index)
+            .expect("every visible effect has a dependency entry")
+            .extend(references.iter().filter_map(|binding| {
+                graph
+                    .binding_to_effect
+                    .get(binding)
+                    .map(|producer| effects[*producer].as_ref().scheduler_id())
+            }));
     }
     graph
 }
@@ -687,6 +744,56 @@ mod tests {
             Some(&vec![3]),
             "value reference must use the binding"
         );
+    }
+
+    #[test]
+    fn display_dependencies_merge_typed_ids_and_value_bindings_in_either_order() {
+        for alias_first in [false, true] {
+            let actual =
+                resolved(Resource::new("test.Resource", "shared").with_root_binding("actual"));
+            let alias =
+                resolved(Resource::new("test.Resource", "unrelated").with_root_binding("shared"));
+            let expected = crate::resource::ResolvedDependencies::from_iter([
+                actual.resolved_id(),
+                alias.resolved_id(),
+            ]);
+            let consumer = ResolvedResource::from_resolved_parts(
+                Resource::new("test.Resource", "consumer")
+                    .with_root_binding("consumer")
+                    .with_attribute(
+                        "references",
+                        Value::Concrete(ConcreteValue::List(vec![Value::root_resource_ref(
+                            "shared",
+                            "identifier",
+                            vec![],
+                        )])),
+                    )
+                    .into_value_snapshot(),
+                std::iter::once(actual.resolved_id()).collect(),
+                Default::default(),
+            );
+            let mut plan = Plan::new();
+            let (first, second) = if alias_first {
+                (alias, actual)
+            } else {
+                (actual, alias)
+            };
+            plan.add(Effect::Create(first));
+            plan.add(Effect::Create(second));
+            plan.add(Effect::Create(consumer));
+
+            let graph = build_dependency_graph(&plan);
+            assert_eq!(
+                graph.effect_deps.get(&2),
+                Some(&expected),
+                "surviving value bindings and resolved IDs must both produce display edges",
+            );
+            assert_eq!(
+                graph.binding_to_effect.get(&absolute("shared")),
+                Some(&usize::from(!alias_first)),
+                "an authored binding takes precedence over an identity's fallback address",
+            );
+        }
     }
 
     #[test]

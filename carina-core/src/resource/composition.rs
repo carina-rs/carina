@@ -24,13 +24,11 @@ use serde::{Deserialize, Serialize};
 use crate::parser::ValidateExpr;
 use crate::static_type::ConsumerStaticType;
 
-#[cfg(test)]
-use super::RootScope;
 use super::{
     AbsoluteBindingAddress, AccessPath, BindingAddress, DeferredValue, LeftoverPlaceholder,
     LeftoverPlaceholderContext, LeftoverPlaceholderPolicy, ModuleInstanceScope, NoPlaceholder,
-    ParserPlaceholder, PlaceholderKind, RelativeBindingName, ResolvedResourceId, StructuralOperand,
-    Value,
+    ParserPlaceholder, PlaceholderKind, RelativeBindingName, ResolvedResourceId, ResourceIdentity,
+    RootScope, StructuralOperand, Value,
 };
 
 /// How a composition attribute is produced from the rest of the
@@ -804,7 +802,7 @@ impl CompositionCall<AbsoluteBindingAddress> {
             id: _id,
             module_name: _module_name,
             binding,
-            instance: _instance,
+            instance,
             module_source: _module_source,
             module_directory: _module_directory,
             loop_origin: _loop_origin,
@@ -812,6 +810,8 @@ impl CompositionCall<AbsoluteBindingAddress> {
         if let Some(binding) = binding {
             *binding = map(binding);
         }
+        *instance =
+            map(&RootScope::new().resolve(RelativeBindingName::new(instance.as_str()))).to_string();
     }
 }
 
@@ -1649,20 +1649,31 @@ impl<P: PlaceholderKind> LiveComposition<P, RelativeBindingName> {
 }
 
 impl<P: PlaceholderKind> LiveComposition<P, AbsoluteBindingAddress> {
+    /// Graph address for both bound and anonymous module calls.
+    pub(crate) fn binding_address(&self) -> AbsoluteBindingAddress {
+        self.binding
+            .clone()
+            .unwrap_or_else(|| self.id.binding_address())
+    }
+
     pub(crate) fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
         let Self {
-            id: _id,
+            id,
             signature,
             binding,
             dependency_bindings,
             module_name: _module_name,
-            instance: _instance,
+            instance,
             call_path,
             quoted_string_attrs: _quoted_string_attrs,
         } = self;
+        *id = id
+            .instantiate_with_identity(ResourceIdentity::new(map(&id.binding_address()).as_str()));
+        *instance =
+            map(&RootScope::new().resolve(RelativeBindingName::new(instance.as_str()))).to_string();
         let LiveCompositionSignature {
             arguments,
             attributes,

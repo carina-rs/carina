@@ -4684,7 +4684,7 @@ impl ModuleCallDiagnosticSource {
 /// Handle outputs awaiting the single post-expansion graph transition.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UnexpandedCompositionAttribute<B: BindingAddress = RelativeBindingName> {
-    pub(crate) composition_instance: String,
+    pub(crate) composition_binding: B,
     pub(crate) name: String,
     pub(crate) handle: UnexpandedResourceHandle<B>,
     pub(crate) declared_type: Option<ConsumerStaticType>,
@@ -4698,7 +4698,7 @@ impl<B: BindingAddress> UnexpandedCompositionAttribute<B> {
         map: &mut impl FnMut(B) -> C,
     ) -> UnexpandedCompositionAttribute<C> {
         let Self {
-            composition_instance,
+            composition_binding,
             name,
             handle,
             declared_type,
@@ -4707,7 +4707,7 @@ impl<B: BindingAddress> UnexpandedCompositionAttribute<B> {
             source_span,
         } = self;
         UnexpandedCompositionAttribute {
-            composition_instance,
+            composition_binding: map(composition_binding),
             name,
             handle: handle.map_bindings(map),
             declared_type,
@@ -4715,6 +4715,25 @@ impl<B: BindingAddress> UnexpandedCompositionAttribute<B> {
             source_file,
             source_span,
         }
+    }
+}
+
+impl UnexpandedCompositionAttribute<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            composition_binding,
+            name: _name,
+            handle,
+            declared_type: _declared_type,
+            source_argument: _source_argument,
+            source_file: _source_file,
+            source_span: _source_span,
+        } = self;
+        *composition_binding = map(composition_binding);
+        handle.map_absolute_bindings(map);
     }
 }
 
@@ -5010,7 +5029,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
         } = self;
 
         for attribute in unexpanded_composition_attributes {
-            attribute.handle.map_absolute_bindings(map);
+            attribute.map_absolute_bindings(map);
         }
         let mut mapped_structural_handles = IndexMap::new();
         for (binding, mut handle) in std::mem::take(structural_handles) {
@@ -6610,7 +6629,8 @@ where
     T: PlaceholderKind,
     E: ExportParamLike<P, AbsoluteBindingAddress>,
 {
-    /// Rewrite every expanded binding address held by a file.
+    /// Rewrite every expanded graph address held by a file, including
+    /// composition identities, their call paths, and pending handle outputs.
     ///
     /// The exhaustive destructure is intentional: adding a top-level slot
     /// forces this traversal to classify it before the crate compiles.
