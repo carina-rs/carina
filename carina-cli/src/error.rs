@@ -690,19 +690,28 @@ impl std::error::Error for CorruptPlanFileError {
 }
 
 /// Semantic evidence failure with file and recovery context. Boxing this
-/// wrapper keeps AppError compact while its source remains the original type.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "Invalid saved plan '{}'. {}",
-    path.display(),
-    plan_file_recreation_guidance(replan_command.as_deref())
-)]
+/// wrapper keeps AppError compact while retaining the original typed cause.
+#[derive(Debug)]
 pub struct SavedPlanProviderEvidenceError {
     path: PathBuf,
     replan_command: Option<String>,
-    #[source]
     source: crate::commands::plan::ProviderEvidenceError,
 }
+
+impl std::fmt::Display for SavedPlanProviderEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Invalid saved plan '{}': {source}. {}",
+            self.path.display(),
+            plan_file_recreation_guidance(self.replan_command.as_deref()),
+            source = self.source,
+        )
+    }
+}
+
+// Terminal CLI diagnostic: Display already includes the typed cause once.
+impl std::error::Error for SavedPlanProviderEvidenceError {}
 
 /// Render a provider initialization error as user-facing text.
 ///
@@ -1891,15 +1900,22 @@ mod tests {
                 provider: "mock".to_string(),
             },
         );
-        let source = std::error::Error::source(&error)
-            .and_then(|source| source.downcast_ref::<ProviderEvidenceError>())
-            .expect("semantic provider evidence must retain its original typed cause");
+        let AppError::SavedPlanProviderEvidence(context) = &error else {
+            panic!("semantic provider evidence must retain its typed wrapper");
+        };
+        let source = &context.source;
         assert!(
             matches!(source, ProviderEvidenceError::MissingProviderArtifact { provider } if provider == "mock")
         );
         let rendered = format_error_with_source_chain(&error);
         assert!(rendered.contains("Invalid saved plan 'reviewed-plan.json'"));
-        assert!(rendered.contains("invalid saved-plan provider evidence"));
+        assert_eq!(
+            rendered
+                .matches("invalid saved-plan provider evidence")
+                .count(),
+            1
+        );
+        assert!(std::error::Error::source(&error).is_none());
         assert!(rendered.contains("carina plan --out"));
         assert!(!rendered.contains("Failed to parse"));
     }
