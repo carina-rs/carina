@@ -2133,12 +2133,14 @@ fn plan_snapshot_exports() {
         ExportChange::Added {
             name: "vpc_id".to_string(),
             type_expr: Some(TypeExpr::String),
-            new_value: Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+            new_value: Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![])
+                .resolve_root_for_test(),
         },
         ExportChange::Added {
             name: "cidr".to_string(),
             type_expr: None,
-            new_value: Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![]),
+            new_value: Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![])
+                .resolve_root_for_test(),
         },
     ];
     let output = format_plan(
@@ -2817,10 +2819,9 @@ fn snapshot_deferred_for_with_dependent_wait() {
                 if resource.id.resource_type == "acm.CertificateValidation" =>
             {
                 let mut resource = resource.into_inner();
-                resource
-                    .directives
-                    .depends_on
-                    .push("validation_records".to_string());
+                resource.directives.depends_on.push(
+                    carina_core::resource::absolute_binding_address_for_test("validation_records"),
+                );
                 Effect::Create(resolved(resource))
             }
             effect => effect,
@@ -3107,15 +3108,28 @@ fn snapshot_top_level_sigil_alignment() {
     });
     plan.add(Effect::Create(resolved(cluster)));
 
-    let mut deferred_template = Resource::new("aws.route53.RecordSet", "validation_records");
-    deferred_template.set_attr("name", Value::resource_ref("option", "name", vec![]));
+    let mut deferred_template: Resource<
+        carina_core::resource::ModuleSource,
+        carina_core::resource::LoopSlot,
+    > = Resource::new("aws.route53.RecordSet", "validation_records");
+    deferred_template.set_attr(
+        "name",
+        Value::<
+            carina_core::resource::LoopSlot,
+            carina_core::resource::RelativeBindingName,
+        >::resource_ref("option", "name", vec![])
+        .resolve_root_for_test(),
+    );
     let deferred = DeferredForExpression::new(
         None,
         1,
         "for option in cert.domain_validation_options".to_string(),
-        carina_core::parser::DeferredForTarget::bound("validation_records")
-            .expect("fixture binding is valid"),
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        carina_core::parser::DeferredForTarget::bound(
+            carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        Value::resource_ref("cert", "domain_validation_options", Vec::new())
+            .resolve_root_for_test(),
         ForBinding::Simple("option".to_string()),
         deferred_template,
     );

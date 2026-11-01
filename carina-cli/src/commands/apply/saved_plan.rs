@@ -4,7 +4,8 @@ use std::path::Path;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
 use carina_core::parser::{
-    BackendConfig, ExpandedInferredExportParam as InferredExportParam, SavedProviderConfigs,
+    ExpandedBackendConfig as BackendConfig, ExpandedInferredExportParam as InferredExportParam,
+    SavedProviderConfigs,
 };
 use carina_core::plan::SavedPlan;
 use carina_core::provider::{
@@ -283,7 +284,9 @@ impl ProviderBoundPlanFile {
             InspectedPlanFile::NeedsSecretVerification(plan) => {
                 let unresolved = carina_core::parser::ParsedFile::default();
                 let providers = providers.check_saved_plan_config_pair(
-                    carina_core::parser::InferredFile::default(),
+                    carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(
+                        carina_core::parser::InferredFile::default(),
+                    ),
                     carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
                     base_dir,
                     false,
@@ -1165,15 +1168,15 @@ mod tests {
 
     use carina_core::data_source_value::DataSourceValue;
     use carina_core::effect::Effect;
-    use carina_core::parser::ProviderConfig;
+    use carina_core::parser::{ExpandedProviderConfig, ProviderConfig};
     use carina_core::plan::Plan;
     use carina_core::provider::{
         BoxFuture, InitializedProvider, ProviderFactory, ProviderInstanceKey, ProviderResult,
         ProviderRouter, ReferenceScope,
     };
     use carina_core::resource::{
-        ConcreteValue, Current, DataSource, DeferredValue, ResolvedResourceId, Resource,
-        ResourceId, State, Value,
+        BindingAddress, ConcreteValue, Current, DataSource, DeferredValue, NoPlaceholder,
+        ResolvedResourceId, Resource, ResourceId, State, Value,
     };
     use carina_state::{ResourceState, StateFile};
     use indexmap::IndexMap;
@@ -1246,7 +1249,7 @@ mod tests {
         }
     }
 
-    fn provider_config(name: &str) -> ProviderConfig {
+    fn provider_config<B: BindingAddress>(name: &str) -> ProviderConfig<NoPlaceholder, B> {
         ProviderConfig {
             name: name.to_string(),
             source: Some(format!("file://{name}.wasm").parse().unwrap()),
@@ -1259,7 +1262,10 @@ mod tests {
         }
     }
 
-    fn remote_provider_config(name: &str, source: &str) -> ProviderConfig {
+    fn remote_provider_config<B: BindingAddress>(
+        name: &str,
+        source: &str,
+    ) -> ProviderConfig<NoPlaceholder, B> {
         ProviderConfig {
             source: Some(source.parse().unwrap()),
             ..provider_config(name)
@@ -1292,11 +1298,14 @@ mod tests {
     }
 
     fn builtin_load() -> ProviderLoad {
-        ProviderLoad::for_test::<carina_core::resource::NoPlaceholder>(Vec::new(), &[])
+        ProviderLoad::for_test_with_provider_phase::<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >(Vec::new(), &[])
     }
 
     fn saved_provider_configs(
-        configs: Vec<ProviderConfig>,
+        configs: Vec<ExpandedProviderConfig>,
     ) -> carina_core::parser::SavedProviderConfigs {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
@@ -1309,7 +1318,7 @@ mod tests {
         carina_core::parser::SavedProviderConfigs::from(&resolved)
     }
 
-    fn empty_plan_contents(provider_configs: Vec<ProviderConfig>) -> PlanFileContents {
+    fn empty_plan_contents(provider_configs: Vec<ExpandedProviderConfig>) -> PlanFileContents {
         PlanFileContents {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
@@ -1335,7 +1344,7 @@ mod tests {
 
     fn plan_recorded_with<R>(
         ctx: &ValidatedConfig<R>,
-        provider_configs: Vec<ProviderConfig>,
+        provider_configs: Vec<ExpandedProviderConfig>,
     ) -> PlanFile {
         empty_plan_contents(provider_configs)
             .record_for_test(ctx, Vec::new())
@@ -1771,8 +1780,11 @@ mod tests {
 
     #[tokio::test]
     async fn historical_verification_rehydrates_read_outcome_without_current_state_row() {
-        let data_source =
-            DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
+        let mut data_source: DataSource =
+            DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        data_source.binding = Some(carina_core::resource::absolute_binding_address_for_test(
+            "roles",
+        ));
         let plaintext = Value::Concrete(ConcreteValue::String("provider-secret".into()));
         let state_with_secret = State::existing(
             data_source.id.clone(),

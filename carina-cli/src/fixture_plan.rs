@@ -45,6 +45,12 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
             .create_only()
             .build()
     };
+    let identity_string = |name| {
+        AttributeSchema::optional(name, AttributeType::string())
+            .create_only()
+            .identity()
+            .build()
+    };
     let aws = |schema| ("aws".to_string(), schema);
     let awscc = |schema| ("awscc".to_string(), schema);
     let schemas = vec![
@@ -94,7 +100,9 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
         aws(ResourceSchema::new("acm.CertificateValidation")
             .attribute(create_only_string("certificate_arn"))
             .attribute(create_only_string("validation_record_id"))),
-        aws(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
+        aws(ResourceSchema::new("iam.Role")
+            .attribute(identity_string("role_name"))
+            .with_unique_name_attribute("role_name")),
         aws(ResourceSchema::new("route53.RecordSet")
             .attribute(create_only_string("hosted_zone_id"))
             .attribute(create_only_string("name"))
@@ -171,7 +179,11 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
                         .build(),
                 ),
         ),
-        awscc(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
+        awscc(
+            ResourceSchema::new("iam.Role")
+                .attribute(identity_string("role_name"))
+                .with_unique_name_attribute("role_name"),
+        ),
         awscc(
             ResourceSchema::new("issue3885.Role")
                 .attribute(create_only_string("role_name"))
@@ -187,7 +199,11 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
                     AttributeSchema::optional("policy_document", AttributeType::string()).build(),
                 ),
         ),
-        awscc(ResourceSchema::new("logs.LogGroup").attribute(create_only_string("log_group_name"))),
+        awscc(
+            ResourceSchema::new("logs.LogGroup")
+                .attribute(identity_string("log_group_name"))
+                .with_unique_name_attribute("log_group_name"),
+        ),
         awscc(ResourceSchema::new("s3.Bucket").attribute(create_only_string("bucket_name"))),
         awscc(
             ResourceSchema::new("sso.Assignment")
@@ -433,7 +449,7 @@ where
             .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok())
             .map(|exports| exports.build_remote_bindings())
             .unwrap_or_default();
-        remote_bindings.insert(us.binding.clone(), bindings);
+        remote_bindings.insert(us.binding.to_string(), bindings);
     }
     let resolved_provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
         parsed,
@@ -552,11 +568,12 @@ where
     // a display residual instead of turning it into an executable deferred
     // create. This stays fixture-only because production must retain those
     // deferred creates for apply-time expansion.
-    let managed_bindings: HashSet<String> = expansion_prelude
-        .sorted_resources()
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .collect();
+    let managed_bindings: HashSet<carina_core::resource::AbsoluteBindingAddress> =
+        expansion_prelude
+            .sorted_resources()
+            .iter()
+            .filter_map(|resource| resource.binding.clone())
+            .collect();
     let (non_managed_deferred_for, _managed_deferred_for) = parsed
         .deferred_for_expressions()
         .clone()

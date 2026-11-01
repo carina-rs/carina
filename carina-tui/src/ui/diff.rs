@@ -322,8 +322,10 @@ mod tests {
     };
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, Value};
-    use carina_core::resource::{ResolvedResource, Resource, ResourceId, State};
+    use carina_core::resource::{
+        ExpandedConcreteValue as ConcreteValue, ExpandedResource as Resource,
+        ExpandedValue as Value, ResolvedResource, ResourceId, State,
+    };
     use carina_core::value::{PrettyValue, RenderedKey};
     use indexmap::IndexMap;
 

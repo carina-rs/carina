@@ -23,7 +23,8 @@ use crate::provider::{
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, Resource, ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, Resource,
+    ResourceId, State, Value,
 };
 use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
@@ -48,7 +49,7 @@ pub(super) enum BasicEffectResult {
         completed: CompletedEffect,
         resource_id: ResourceId,
         resolved_attrs: Option<SecretPreservingAttributes>,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
     },
     PartialSuccess {
         completed: CompletedEffect,
@@ -56,7 +57,7 @@ pub(super) enum BasicEffectResult {
         diagnostic: PartialReadDiagnostic,
         read_back_end: ReadBackEnd,
         resolved_attrs: Option<SecretPreservingAttributes>,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
     },
     Failure {
         failure: EffectFailureKind,
@@ -66,13 +67,13 @@ pub(super) enum BasicEffectResult {
         completed: CompletedResume,
         resource_id: ResourceId,
         resolved_attrs: SecretPreservingAttributes,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
     },
     ResumePartialSuccess {
         partial: PartialResume,
         resource_id: ResourceId,
         resolved_attrs: SecretPreservingAttributes,
-        binding: Option<String>,
+        binding: Option<AbsoluteBindingAddress>,
     },
     ClassifiedFailure {
         failure: EffectFailureKind,
@@ -413,9 +414,9 @@ fn assert_fully_resolved(
         Value::Deferred(DeferredValue::BindingRef { binding }) => Err(unresolved_binding_message(
             attribute_key,
             UnresolvedSite::Ref {
-                path: binding.clone(),
+                path: binding.to_string(),
             },
-            binding,
+            binding.as_str(),
             bindings,
             value,
         )),
@@ -486,7 +487,7 @@ fn assert_fully_resolved(
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(ReportedError::new(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::WasmBoundary,
             }))
         }
@@ -684,7 +685,7 @@ pub(super) fn process_basic_result<S: Clone>(
                 accumulated.success_count += 1;
                 if let Some(attrs) = &resolved_attrs {
                     accumulated.bindings.record_applied(
-                        binding.as_deref(),
+                        binding.as_ref().map(|binding| binding.as_str()),
                         attrs,
                         &state,
                         BindingCompleteness::Complete,
@@ -721,7 +722,7 @@ pub(super) fn process_basic_result<S: Clone>(
             exec.accumulator.mutate(|accumulated| {
                 accumulated.success_count += 1;
                 accumulated.bindings.record_applied(
-                    binding.as_deref(),
+                    binding.as_ref().map(|binding| binding.as_str()),
                     &resolved_attrs,
                     &state,
                     BindingCompleteness::Complete,
@@ -751,7 +752,7 @@ pub(super) fn process_basic_result<S: Clone>(
             exec.accumulator.mutate(|accumulated| {
                 accumulated.partial_count += 1;
                 accumulated.bindings.record_applied(
-                    binding.as_deref(),
+                    binding.as_ref().map(|binding| binding.as_str()),
                     &resolved_attrs,
                     &state,
                     completeness,
@@ -798,7 +799,7 @@ pub(super) fn process_basic_result<S: Clone>(
                 accumulated.partial_count += 1;
                 if let Some(attrs) = &resolved_attrs {
                     accumulated.bindings.record_applied(
-                        binding.as_deref(),
+                        binding.as_ref().map(|binding| binding.as_str()),
                         attrs,
                         &state,
                         completeness,
@@ -1451,7 +1452,9 @@ mod process_basic_result_tests {
                     diagnostic: diagnostic.clone(),
                     read_back_end: ReadBackEnd::ProviderReported,
                     resolved_attrs: Some(resolved_attrs),
-                    binding: Some("upstream".to_string()),
+                    binding: Some(crate::resource::absolute_binding_address_for_test(
+                        "upstream",
+                    )),
                 },
             ),
             &mut exec,
@@ -1550,7 +1553,7 @@ mod process_basic_result_tests {
                     &HashMap::new(),
                     &HashMap::new(),
                 )),
-                binding: Some("source".to_string()),
+                binding: Some(crate::resource::absolute_binding_address_for_test("source")),
             },
             &mut exec,
         );
@@ -1608,7 +1611,7 @@ mod process_basic_result_tests {
                     &HashMap::new(),
                     &HashMap::new(),
                 )),
-                binding: Some("source".to_string()),
+                binding: Some(crate::resource::absolute_binding_address_for_test("source")),
             },
             &mut exec,
         );
@@ -1616,7 +1619,7 @@ mod process_basic_result_tests {
         let bindings = &accumulator.result().bindings;
         let fallback = Value::Concrete(ConcreteValue::String("fallback".into()));
         let expression = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("source", "optional_unset", vec![])),
+            value: Box::new(Value::root_resource_ref("source", "optional_unset", vec![])),
             default: Box::new(fallback.clone()),
         });
         assert_eq!(
@@ -1685,11 +1688,15 @@ mod assert_fully_resolved_tests {
     use crate::binding_index::{BindingValueSource, ResolvedBindings};
     use crate::resource::{
         AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, PathSegment,
-        Subscript, Value,
+        RelativeBindingName, RootScope, Subscript, Value,
     };
 
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
+    }
+
     fn dvo_chained_ref() -> Value {
-        let path = AccessPath::with_segments(
+        let path = AccessPath::root_with_segments(
             "cert",
             "domain_validation_options",
             vec![
@@ -1730,7 +1737,7 @@ mod assert_fully_resolved_tests {
     fn unknown_is_rejected_at_apply_seam() {
         let v = Value::Deferred(DeferredValue::Unknown(
             ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".to_string(),
+                binding: absolute_binding("upstream"),
             },
         ));
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
@@ -1788,14 +1795,14 @@ mod assert_fully_resolved_tests {
                     ),
                 ),
             );
-            let reference = Value::resource_ref("cert", "unlisted", vec![]);
+            let reference = Value::root_resource_ref("cert", "unlisted", vec![]);
             for value in [
                 reference.clone(),
                 Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
                     reference,
                 )])),
                 Value::Deferred(DeferredValue::BindingRef {
-                    binding: "cert".into(),
+                    binding: absolute_binding("cert"),
                 }),
             ] {
                 let error = assert_fully_resolved(&value, "records", &bindings)
@@ -1939,7 +1946,7 @@ mod assert_fully_resolved_tests {
     #[test]
     fn binding_ref_is_rejected() {
         let v = Value::Deferred(DeferredValue::BindingRef {
-            binding: "vpc".to_string(),
+            binding: crate::resource::RootScope::new().resolve("vpc".into()),
         });
         let err = assert_fully_resolved(&v, "vpc_id", &empty_bindings())
             .expect_err("bare BindingRef must be rejected");
@@ -1984,7 +1991,7 @@ mod assert_fully_resolved_tests {
                 name: crate::builtins::BuiltinFunction::split,
                 args: vec![
                     Value::Concrete(ConcreteValue::String("-".into())).into(),
-                    Value::resource_ref("q", "identifier", vec![]).into(),
+                    Value::root_resource_ref("q", "identifier", vec![]).into(),
                 ],
                 source_line: (0).into(),
             }),
@@ -2028,7 +2035,7 @@ mod assert_fully_resolved_tests {
     /// stack first", not at `wait`.
     #[test]
     fn resource_ref_to_upstream_state_binding_does_not_suggest_wait() {
-        let path = AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+        let path = AccessPath::root_with_segments("infra", "cloudfront_distribution_id", vec![]);
         let v = Value::Deferred(DeferredValue::ResourceRef { path });
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
 
@@ -2059,7 +2066,7 @@ mod assert_fully_resolved_tests {
     /// `let` chain.
     #[test]
     fn interpolation_into_upstream_state_binding_does_not_suggest_wait() {
-        let path = AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+        let path = AccessPath::root_with_segments("infra", "cloudfront_distribution_id", vec![]);
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("arn:aws:cloudfront::123:distribution/".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef { path })),
@@ -2087,7 +2094,7 @@ mod assert_fully_resolved_tests {
     fn integer_arithmetic_names_its_unresolved_upstream_binding() {
         let value = crate::integer_arithmetic::evaluate_integer_values(
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("infra", "port"),
+                path: AccessPath::root_with_segments("infra", "port", Vec::new()),
             }),
             crate::integer_arithmetic::IntegerOp::Add,
             Value::Concrete(ConcreteValue::Int(1)),
@@ -2115,7 +2122,7 @@ mod assert_fully_resolved_tests {
     #[test]
     fn binding_ref_to_upstream_state_binding_does_not_suggest_wait() {
         let v = Value::Deferred(DeferredValue::BindingRef {
-            binding: "infra".to_string(),
+            binding: crate::resource::RootScope::new().resolve("infra".into()),
         });
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
 
@@ -2142,9 +2149,10 @@ mod assert_fully_resolved_tests {
     /// and `wait` (the local-binding remediation) cannot fix it.
     #[test]
     fn interpolation_with_mixed_bindings_prefers_upstream_state_remediation() {
-        let local_path = AccessPath::with_segments("cert", "domain_validation_options", vec![]);
+        let local_path =
+            AccessPath::root_with_segments("cert", "domain_validation_options", vec![]);
         let upstream_path =
-            AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
+            AccessPath::root_with_segments("infra", "cloudfront_distribution_id", vec![]);
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                 path: local_path,
@@ -2179,7 +2187,7 @@ mod assert_fully_resolved_tests {
     /// the kind-aware branch only kicks in for `Upstream`.
     #[test]
     fn local_binding_keeps_existing_wait_block_hint() {
-        let path = AccessPath::with_segments("cert", "domain_validation_options", vec![]);
+        let path = AccessPath::root_with_segments("cert", "domain_validation_options", vec![]);
         let v = Value::Deferred(DeferredValue::ResourceRef { path });
         let bindings = bindings_with("cert", BindingValueSource::Local);
 

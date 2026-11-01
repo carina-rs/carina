@@ -3,6 +3,8 @@
 //! A Provider defines operations for a specific infrastructure (AWS, GCP, etc.).
 //! It is responsible for converting Effects into actual API calls.
 
+#[cfg(any(test, feature = "test-utils"))]
+use crate::schema::PatternResourceSchema;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
@@ -38,8 +40,9 @@ use crate::resource::{
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
 use crate::schema::{
-    AttributeType, LeafPath, RawShape, RefinedScalarKind, ResourceSchema, SchemaRegistry, Shape,
-    TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, LeafPath,
+    RawShape, RefinedScalarKind, SchemaRegistry, Shape, TypeIdentity, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 use crate::value::{
     PersistedListView, PersistedValue, PersistedValueDecodeError, PersistedView, SerializationError,
@@ -911,6 +914,7 @@ impl DeleteRequest {
 ///     force_delete: false,
 ///     create_before_destroy: false,
 ///     prevent_destroy: false,
+///     prevent_destroy_source: None,
 /// };
 /// ```
 ///
@@ -925,6 +929,20 @@ pub struct ProviderDirectives {
     create_before_destroy: bool,
     prevent_destroy: bool,
     prevent_destroy_source: Option<PreventDestroySource>,
+}
+
+/// Read-only projection used at the provider protocol boundary.
+///
+/// The projection is intentionally constructed only by
+/// [`ProviderDirectives::protocol_parts`]. Keeping the exhaustive projection
+/// beside the private fields means adding an effective directive cannot be
+/// silently omitted from the wire conversion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderDirectiveProtocolParts {
+    pub(crate) force_delete: bool,
+    pub(crate) create_before_destroy: bool,
+    pub(crate) prevent_destroy: bool,
+    pub(crate) prevent_destroy_source: Option<PreventDestroySource>,
 }
 
 impl ProviderDirectives {
@@ -977,6 +995,21 @@ impl ProviderDirectives {
     /// Provenance for effective destruction protection, when enabled.
     pub fn prevent_destroy_source(&self) -> Option<PreventDestroySource> {
         self.prevent_destroy_source
+    }
+
+    pub(crate) fn protocol_parts(&self) -> ProviderDirectiveProtocolParts {
+        let Self {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            prevent_destroy_source,
+        } = *self;
+        ProviderDirectiveProtocolParts {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            prevent_destroy_source,
+        }
     }
 }
 
@@ -5257,9 +5290,14 @@ impl ProviderInstanceKey {
     }
 }
 
-impl From<&ProviderConfig> for ProviderInstanceKey {
-    fn from(config: &ProviderConfig) -> Self {
-        Self::new(config.name.clone(), config.binding.clone())
+impl<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>
+    From<&ProviderConfig<P, B>> for ProviderInstanceKey
+{
+    fn from(config: &ProviderConfig<P, B>) -> Self {
+        Self::new(
+            config.name.clone(),
+            config.binding.as_ref().map(ToString::to_string),
+        )
     }
 }
 
@@ -5354,7 +5392,10 @@ impl std::error::Error for DefaultTagEncodingError {}
 /// Records which tag keys came from defaults as host-owned provenance on the
 /// resource, separate from provider-facing attributes.
 pub fn merge_default_tags<S>(
-    config: &ProviderConfig,
+    config: &ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >,
     resources: &mut [Resource<S>],
     registry: &SchemaRegistry,
 ) -> ProviderResult<()> {
@@ -5833,7 +5874,7 @@ pub fn comparison_fixture_with_scope_for_test<'a>(
     for (owner, resource_type) in missing_schemas {
         registry.insert(
             owner,
-            crate::schema::ResourceSchema::new(resource_type)
+            PatternResourceSchema::new(resource_type)
                 .validate()
                 .expect("empty comparison fixture schema must validate"),
         );
@@ -5955,7 +5996,14 @@ impl ProviderRouter {
 
     /// Register a provider under the same route derived from its config by
     /// host-owned normalization.
-    pub fn add_provider_config(&mut self, config: &ProviderConfig, provider: InitializedProvider) {
+    pub fn add_provider_config<
+        P: crate::resource::PlaceholderKind,
+        B: crate::resource::BindingAddress,
+    >(
+        &mut self,
+        config: &ProviderConfig<P, B>,
+        provider: InitializedProvider,
+    ) {
         self.providers
             .insert(ProviderInstanceKey::from(config), provider);
     }
@@ -6890,7 +6938,7 @@ pub fn collect_custom_type_names(registry: &SchemaRegistry) -> Vec<TypeIdentity>
 /// Recursively collect Custom type identities from an AttributeType
 /// (identities only, no closures).
 fn collect_type_names_from_type(
-    attr_type: &crate::schema::AttributeType,
+    attr_type: &crate::schema::CompiledAttributeType,
     names: &mut BTreeSet<TypeIdentity>,
 ) {
     use crate::schema::RawShape;
@@ -7363,7 +7411,7 @@ where
     fn validate<'a>(
         &self,
         target: crate::parser::CustomTypeValidationTarget<'a>,
-        value: &'a Value,
+        value: &'a crate::resource::Value,
     ) -> Result<(), crate::parser::CustomTypeValidationError> {
         let factories = self.factories.as_factories();
         match target {
@@ -7708,7 +7756,20 @@ impl Provider for Box<dyn Provider> {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
+
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
+    type DeferredValue = crate::resource::ExpandedDeferredValue;
+
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::unavailable(Box::new(provider))
@@ -7720,14 +7781,14 @@ mod tests {
 
     #[test]
     fn schema_derived_guest_dispatch_restores_the_typed_scalar() {
-        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use crate::schema::legacy_validator;
 
         let identity = TypeIdentity::new(Some("test"), ["number"], "GuardedInt");
-        let schema = ResourceSchema::new("test.Guarded")
+        let schema = PatternResourceSchema::new("test.Guarded")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "value",
-                    AttributeType::refined_int_with_validator(
+                    PatternAttributeType::refined_int_with_validator(
                         identity.clone(),
                         None,
                         legacy_validator(|value| match value {
@@ -7753,14 +7814,12 @@ mod tests {
 
     #[test]
     fn schema_derived_guest_dispatch_uses_the_declared_scalar_kind() {
-        use crate::schema::{AttributeSchema, ResourceSchema};
-
         let identity = TypeIdentity::new(Some("test"), ["number"], "GuardedInt");
-        let schema = ResourceSchema::new("test.Guarded")
+        let schema = PatternResourceSchema::new("test.Guarded")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "value",
-                    AttributeType::refined_int(Some(identity.clone()), None),
+                    PatternAttributeType::refined_int(Some(identity.clone()), None),
                 )
                 .build(),
             )
@@ -7781,14 +7840,12 @@ mod tests {
 
     #[test]
     fn schema_derived_guest_dispatch_rejects_an_unknown_identity() {
-        use crate::schema::{AttributeSchema, ResourceSchema};
-
         let known_identity = TypeIdentity::new(Some("test"), ["number"], "GuardedInt");
-        let schema = ResourceSchema::new("test.Guarded")
+        let schema = PatternResourceSchema::new("test.Guarded")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "value",
-                    AttributeType::refined_int(Some(known_identity), None),
+                    PatternAttributeType::refined_int(Some(known_identity), None),
                 )
                 .build(),
             )
@@ -7809,22 +7866,20 @@ mod tests {
 
     #[test]
     fn custom_type_names_for_completion_are_in_identity_order() {
-        use crate::schema::{AttributeSchema, ResourceSchema};
-
         let alpha = TypeIdentity::new(Some("test"), ["value"], "Alpha");
         let zed = TypeIdentity::new(Some("test"), ["value"], "Zed");
-        let schema = ResourceSchema::new("test.Values")
+        let schema = PatternResourceSchema::new("test.Values")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "z_declared_first",
-                    AttributeType::refined_string(Some(zed.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(zed.clone()), None, None, None),
                 )
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "a_declared_second",
-                    AttributeType::refined_string(Some(alpha.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(alpha.clone()), None, None, None),
                 )
                 .build(),
             )
@@ -7838,24 +7893,22 @@ mod tests {
 
     #[test]
     fn aggregate_dispatch_validation_rejects_cross_schema_scalar_kind_reuse() {
-        use crate::schema::{AttributeSchema, ResourceSchema};
-
         let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
-        let string_schema = ResourceSchema::new("test.StringValue")
+        let string_schema = PatternResourceSchema::new("test.StringValue")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "value",
-                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
                 )
                 .build(),
             )
             .validate()
             .expect("single-kind schema must validate");
-        let int_schema = ResourceSchema::new("test.IntValue")
+        let int_schema = PatternResourceSchema::new("test.IntValue")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "value",
-                    AttributeType::refined_int(Some(identity), None),
+                    PatternAttributeType::refined_int(Some(identity), None),
                 )
                 .build(),
             )
@@ -7872,7 +7925,7 @@ mod tests {
 
     #[test]
     fn aggregate_dispatch_runs_distinct_validators_for_one_identity() {
-        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use crate::schema::legacy_validator;
         use std::sync::{Arc, Mutex};
 
         let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
@@ -7896,11 +7949,11 @@ mod tests {
             // canonical names. A raw HashMap walk can run either failing
             // callback first; the ordered declaration walk must always run
             // `a`, then `m`, and short-circuit before `z`.
-            let schema = ResourceSchema::new("test.Values")
+            let schema = PatternResourceSchema::new("test.Values")
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "z_declared_first",
-                        AttributeType::refined_string_with_validator(
+                        PatternAttributeType::refined_string_with_validator(
                             identity.clone(),
                             None,
                             None,
@@ -7911,9 +7964,9 @@ mod tests {
                     .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "a_declared_second",
-                        AttributeType::refined_string_with_validator(
+                        PatternAttributeType::refined_string_with_validator(
                             identity.clone(),
                             None,
                             None,
@@ -7924,9 +7977,9 @@ mod tests {
                     .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "m_declared_third",
-                        AttributeType::refined_string_with_validator(
+                        PatternAttributeType::refined_string_with_validator(
                             identity.clone(),
                             None,
                             None,
@@ -7959,17 +8012,17 @@ mod tests {
 
     #[test]
     fn aggregate_dispatch_applies_identity_callback_to_callback_free_declarations() {
-        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use crate::schema::legacy_validator;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let callback_calls = calls.clone();
-        let with_callback = ResourceSchema::new("test.WithCallback")
+        let with_callback = PatternResourceSchema::new("test.WithCallback")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "value",
-                    AttributeType::refined_string_with_validator(
+                    PatternAttributeType::refined_string_with_validator(
                         identity.clone(),
                         None,
                         None,
@@ -7984,11 +8037,11 @@ mod tests {
             )
             .validate()
             .expect("callback schema must validate");
-        let without_callback = ResourceSchema::new("test.WithoutCallback")
+        let without_callback = PatternResourceSchema::new("test.WithoutCallback")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "value",
-                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
                 )
                 .build(),
             )
@@ -8008,15 +8061,15 @@ mod tests {
 
     #[test]
     fn aggregate_dispatch_accepts_fresh_callbacks_from_repeated_constructor_calls() {
-        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use crate::schema::legacy_validator;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        fn provider_type(
+        fn provider_type<R: crate::schema::PatternForm>(
             identity: &TypeIdentity,
             calls: &std::sync::Arc<AtomicUsize>,
-        ) -> AttributeType {
+        ) -> crate::schema::PatternAttributeType<R> {
             let calls = calls.clone();
-            AttributeType::refined_string_with_validator(
+            PatternAttributeType::refined_string_with_validator(
                 identity.clone(),
                 None,
                 None,
@@ -8031,9 +8084,10 @@ mod tests {
         let identity = TypeIdentity::new(Some("aws"), ["common"], "Region");
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let schemas = ["aws.First", "aws.Second"].map(|resource_type| {
-            ResourceSchema::new(resource_type)
+            PatternResourceSchema::new(resource_type)
                 .attribute(
-                    AttributeSchema::optional("region", provider_type(&identity, &calls)).build(),
+                    PatternAttributeSchema::optional("region", provider_type(&identity, &calls))
+                        .build(),
                 )
                 .validate()
                 .expect("repeated provider-type constructor schema must validate")
@@ -8078,7 +8132,7 @@ mod tests {
         fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
             ValidatedConfigSchema::validate(BTreeMap::from([(
                 "endpoint".to_string(),
-                AttributeType::refined_string(
+                PatternAttributeType::refined_string(
                     Some(TypeIdentity::new(Some("test"), ["config"], "Endpoint")),
                     None,
                     None,
@@ -8149,11 +8203,11 @@ mod tests {
 
         fn schemas(&self) -> Vec<ValidatedResourceSchema> {
             vec![
-                ResourceSchema::new("test.Item")
+                PatternResourceSchema::new("test.Item")
                     .attribute(
-                        crate::schema::AttributeSchema::optional(
+                        PatternAttributeSchema::optional(
                             "identifier",
-                            AttributeType::refined_string(
+                            PatternAttributeType::refined_string(
                                 Some(TypeIdentity::new(Some("test"), ["item"], "Identifier")),
                                 None,
                                 None,
@@ -8229,7 +8283,7 @@ mod tests {
 
     #[test]
     fn aggregate_dispatch_deduplicates_one_shared_validator_pointer() {
-        use crate::schema::{AttributeSchema, ResourceSchema, legacy_validator};
+        use crate::schema::legacy_validator;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let identity = TypeIdentity::new(Some("test"), ["value"], "Shared");
@@ -8239,11 +8293,11 @@ mod tests {
             observed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
-        let schema = ResourceSchema::new("test.Values")
+        let schema = PatternResourceSchema::new("test.Values")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "first",
-                    AttributeType::refined_string_with_validator(
+                    PatternAttributeType::refined_string_with_validator(
                         identity.clone(),
                         None,
                         None,
@@ -8254,9 +8308,9 @@ mod tests {
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "second",
-                    AttributeType::refined_string_with_validator(
+                    PatternAttributeType::refined_string_with_validator(
                         identity.clone(),
                         None,
                         None,
@@ -8902,14 +8956,14 @@ mod tests {
                     ("S".to_string(), placeholder.clone()),
                     (
                         "Vpc".to_string(),
-                        Value::resource_ref("vpc", "identifier", Vec::new()),
+                        Value::root_resource_ref("vpc", "identifier", Vec::new()),
                     ),
                 ]))),
             ),
             (
                 "items".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::resource_ref("vpc", "identifier", Vec::new()),
+                    Value::root_resource_ref("vpc", "identifier", Vec::new()),
                     placeholder,
                 ])),
             ),
@@ -8975,12 +9029,12 @@ mod tests {
                 ),
                 (
                     "Owner".to_string(),
-                    Value::resource_ref("management", "owner", Vec::new()),
+                    Value::root_resource_ref("management", "owner", Vec::new()),
                 ),
                 (
                     "Count".to_string(),
                     crate::integer_arithmetic::evaluate_integer_values(
-                        Value::resource_ref("management", "count", Vec::new()),
+                        Value::root_resource_ref("management", "count", Vec::new()),
                         crate::integer_arithmetic::IntegerOp::Add,
                         Value::Concrete(ConcreteValue::Int(1)),
                         crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
@@ -8994,19 +9048,15 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut resources = vec![Resource::with_provider(
-            "aws",
-            "service.Widget",
-            "example",
-            None,
-        )];
+        let resource: Resource = Resource::with_provider("aws", "service.Widget", "example", None);
+        let mut resources = vec![resource];
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (crate::schema::ResourceSchema::new("service.Widget").attribute(
-                crate::schema::AttributeSchema::optional(
+            (PatternResourceSchema::new("service.Widget").attribute(
+                PatternAttributeSchema::optional(
                     "tags",
-                    crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                    PatternAttributeType::map(PatternAttributeType::string()),
                 )
                 .build(),
             ))
@@ -9050,22 +9100,22 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut resources = vec![
-            Resource::with_provider("aws", "service.Widget", "example", None).with_attribute(
+        let resource: Resource = Resource::with_provider("aws", "service.Widget", "example", None)
+            .with_attribute(
                 "tags",
                 Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "Name".to_string(),
                     Value::Concrete(ConcreteValue::String("example".into())),
                 )]))),
-            ),
-        ];
+            );
+        let mut resources = vec![resource];
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (crate::schema::ResourceSchema::new("service.Widget").attribute(
-                crate::schema::AttributeSchema::optional(
+            (PatternResourceSchema::new("service.Widget").attribute(
+                PatternAttributeSchema::optional(
                     "tags",
-                    crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                    PatternAttributeType::map(PatternAttributeType::string()),
                 )
                 .build(),
             ))
@@ -9096,7 +9146,7 @@ mod tests {
 
         config.default_tags.insert(
             "ManagedBy".to_string(),
-            Value::resource_ref("management", "owner", Vec::new()),
+            Value::root_resource_ref("management", "owner", Vec::new()),
         );
         config.default_tags.insert(
             "Team".to_string(),
@@ -9133,10 +9183,10 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (crate::schema::ResourceSchema::new("service.Widget").attribute(
-                crate::schema::AttributeSchema::optional(
+            (PatternResourceSchema::new("service.Widget").attribute(
+                PatternAttributeSchema::optional(
                     "status",
-                    crate::schema::AttributeType::enum_(
+                    PatternAttributeType::enum_(
                         crate::schema::enum_identity("Status", Some("aws.service.Widget")),
                         Some(vec!["Enabled".to_string()]),
                         vec![("Enabled".to_string(), "enabled".to_string())],
@@ -9199,16 +9249,14 @@ mod tests {
 
     #[test]
     fn raw_saved_attrs_lift_structurally_canonicalizes_nested_values() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
-        let statement = AttributeType::struct_(
+        let statement = PatternAttributeType::struct_(
             "Statement".to_string(),
             vec![
-                StructField::optional(
+                PatternStructField::optional(
                     "action",
-                    AttributeType::union(vec![
-                        AttributeType::string(),
-                        AttributeType::list(AttributeType::string()),
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::string(),
+                        PatternAttributeType::list(PatternAttributeType::string()),
                     ]),
                 )
                 .build(),
@@ -9217,8 +9265,8 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (ResourceSchema::new("iam.policy")
-                .attribute(AttributeSchema::optional("statement", statement).build()))
+            (PatternResourceSchema::new("iam.policy")
+                .attribute(PatternAttributeSchema::optional("statement", statement).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -9285,16 +9333,14 @@ mod tests {
 
     #[test]
     fn raw_saved_attrs_lift_is_idempotent() {
-        use crate::schema::{AttributeSchema, ResourceSchema};
-
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (ResourceSchema::new("service.Widget")
+            (PatternResourceSchema::new("service.Widget")
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "status",
-                        crate::schema::AttributeType::enum_(
+                        PatternAttributeType::enum_(
                             crate::schema::enum_identity("Status", Some("aws.service.Widget")),
                             Some(vec!["Enabled".to_string()]),
                             vec![("Enabled".to_string(), "enabled".to_string())],
@@ -9305,13 +9351,11 @@ mod tests {
                     .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "subjects",
-                        crate::schema::AttributeType::union(vec![
-                            crate::schema::AttributeType::string(),
-                            crate::schema::AttributeType::list(
-                                crate::schema::AttributeType::string(),
-                            ),
+                        PatternAttributeType::union(vec![
+                            PatternAttributeType::string(),
+                            PatternAttributeType::list(PatternAttributeType::string()),
                         ]),
                     )
                     .build(),
@@ -9355,16 +9399,14 @@ mod tests {
 
     #[test]
     fn raw_saved_attrs_lift_preserves_redacted_secret_in_string_or_list_union() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
-        let config = AttributeType::struct_(
+        let config = PatternAttributeType::struct_(
             "Config".to_string(),
             vec![
-                StructField::optional(
+                PatternStructField::optional(
                     "password",
-                    AttributeType::union(vec![
-                        AttributeType::string(),
-                        AttributeType::list(AttributeType::string()),
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::string(),
+                        PatternAttributeType::list(PatternAttributeType::string()),
                     ]),
                 )
                 .build(),
@@ -9373,8 +9415,8 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
-            (ResourceSchema::new("service.Widget")
-                .attribute(AttributeSchema::optional("config", config).build()))
+            (PatternResourceSchema::new("service.Widget")
+                .attribute(PatternAttributeSchema::optional("config", config).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -9407,9 +9449,7 @@ mod tests {
 
     #[test]
     fn raw_saved_attrs_lift_uses_state_text_for_union_wrapped_enum_identifier() {
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, StructField, enum_identity,
-        };
+        use crate::schema::enum_identity;
 
         // Persisted JSON strings currently decode as ConcreteValue::String, so
         // EnumIdentifier is a seam-only phase probe rather than a reachable
@@ -9417,19 +9457,22 @@ mod tests {
         // RawDsl would treat it as the alias for the different member `API_A`.
         // The Union wrapper ensures the separate enum-lift walker does not
         // perform the conversion first.
-        let mode = AttributeType::enum_(
+        let mode = PatternAttributeType::enum_(
             enum_identity("Mode", Some("awscc.example.Widget")),
             Some(vec!["API_A".to_string(), "FOO".to_string()]),
             vec![("API_A".to_string(), "foo".to_string())],
             None,
             None,
         );
-        let settings = AttributeType::struct_(
+        let settings = PatternAttributeType::struct_(
             "Settings".to_string(),
             vec![
-                StructField::optional(
+                PatternStructField::optional(
                     "mode",
-                    AttributeType::union(vec![mode.clone(), AttributeType::list(mode)]),
+                    PatternAttributeType::union(vec![
+                        mode.clone(),
+                        PatternAttributeType::list(mode),
+                    ]),
                 )
                 .build(),
             ],
@@ -9437,8 +9480,8 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
-            (ResourceSchema::new("example.Widget")
-                .attribute(AttributeSchema::optional("settings", settings).build()))
+            (PatternResourceSchema::new("example.Widget")
+                .attribute(PatternAttributeSchema::optional("settings", settings).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -9676,7 +9719,9 @@ mod tests {
             };
             assert_eq!(pending, expected);
             let rendered =
-                crate::value::render_unknown(&ApplyTimeUnknown::PendingReRead(pending.clone()));
+                crate::value::render_unknown(&ApplyTimeUnknown::<
+                    crate::resource::AbsoluteBindingAddress,
+                >::PendingReRead(pending.clone()));
             assert_eq!(
                 rendered,
                 "(unknown until next refresh: read after apply was incomplete — provider returned a partial read)"
@@ -10590,7 +10635,7 @@ mod tests {
 
     #[test]
     fn build_update_patch_classifies_ops() {
-        use crate::schema::ResourceSchema;
+        use crate::schema::CompiledResourceSchema as ResourceSchema;
 
         let id = ResourceId::with_identity("test", "example");
         let mut from_attrs = HashMap::new();
@@ -10646,27 +10691,31 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.into()))
     }
 
-    fn nested_write_only_patch_fixture() -> (ResourceSchema, Value) {
-        use crate::schema::{AttributeSchema, AttributeType, StructField};
-
-        let schema = ResourceSchema::new("test")
-            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+    fn nested_write_only_patch_fixture() -> (crate::schema::ValidatedResourceSchema, Value) {
+        let schema = PatternResourceSchema::new("test")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional("description", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
                     "default_actions",
-                    AttributeType::list(AttributeType::struct_(
+                    PatternAttributeType::list(PatternAttributeType::struct_(
                         "Action",
                         vec![
-                            StructField::optional(
+                            PatternStructField::optional(
                                 "authenticate_oidc_config",
-                                AttributeType::struct_(
+                                PatternAttributeType::struct_(
                                     "AuthenticateOidcConfig",
                                     vec![
-                                        StructField::optional("issuer", AttributeType::string())
-                                            .build(),
-                                        StructField::optional(
+                                        PatternStructField::optional(
+                                            "issuer",
+                                            PatternAttributeType::string(),
+                                        )
+                                        .build(),
+                                        PatternStructField::optional(
                                             "client_secret",
-                                            AttributeType::string(),
+                                            PatternAttributeType::string(),
                                         )
                                         .write_only()
                                         .build(),
@@ -10696,30 +10745,35 @@ mod tests {
                 ]))),
             )])),
         )]));
+        let schema = schema.validate().expect("patch schema must validate");
         (schema, value)
     }
 
-    fn nested_struct_write_only_patch_fixture() -> (ResourceSchema, Value) {
-        use crate::schema::{AttributeSchema, AttributeType, StructField};
-
-        let schema = ResourceSchema::new("test")
-            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+    fn nested_struct_write_only_patch_fixture() -> (crate::schema::ValidatedResourceSchema, Value) {
+        let schema = PatternResourceSchema::new("test")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional("description", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
                     "default_actions",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Action",
                         vec![
-                            StructField::optional(
+                            PatternStructField::optional(
                                 "authenticate_oidc_config",
-                                AttributeType::struct_(
+                                PatternAttributeType::struct_(
                                     "AuthenticateOidcConfig",
                                     vec![
-                                        StructField::optional("issuer", AttributeType::string())
-                                            .build(),
-                                        StructField::optional(
+                                        PatternStructField::optional(
+                                            "issuer",
+                                            PatternAttributeType::string(),
+                                        )
+                                        .build(),
+                                        PatternStructField::optional(
                                             "client_secret",
-                                            AttributeType::string(),
+                                            PatternAttributeType::string(),
                                         )
                                         .write_only()
                                         .build(),
@@ -10747,6 +10801,7 @@ mod tests {
                 ),
             ]))),
         )])));
+        let schema = schema.validate().expect("patch schema must validate");
         (schema, value)
     }
 
@@ -10763,18 +10818,12 @@ mod tests {
 
     fn ready_with_ignored_path(
         mut resource: Resource,
-        schema: &ResourceSchema,
+        schema: &crate::schema::ValidatedResourceSchema,
         path: crate::resource::ParsedIgnorePath,
     ) -> ProviderReadyResource {
         resource.directives.ignore_changes = vec![path];
         let mut registry = crate::schema::SchemaRegistry::new();
-        registry.insert(
-            "",
-            schema
-                .clone()
-                .validate()
-                .expect("ignore_changes patch schema must be valid"),
-        );
+        registry.insert("", schema.clone());
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let context = crate::executor::ProviderPreparationContext::new(
@@ -10800,7 +10849,9 @@ mod tests {
                 ("description".to_string(), patch_test_value("before")),
                 (
                     "default_actions".to_string(),
-                    schema.strip_write_only_leaves("default_actions", &default_actions),
+                    schema
+                        .as_schema()
+                        .strip_write_only_leaves("default_actions", &default_actions),
                 ),
             ]),
         );
@@ -10816,8 +10867,9 @@ mod tests {
             ]),
         );
 
-        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
-            .expect("fully ignored write-only leaves need no reassertion");
+        let patch =
+            build_update_patch(&["description".to_string()], &to, &from, schema.as_schema())
+                .expect("fully ignored write-only leaves need no reassertion");
 
         assert!(matches!(
             &patch.ops[..],
@@ -10834,7 +10886,9 @@ mod tests {
                 ("description".to_string(), patch_test_value("before")),
                 (
                     "default_actions".to_string(),
-                    schema.strip_write_only_leaves("default_actions", &default_actions),
+                    schema
+                        .as_schema()
+                        .strip_write_only_leaves("default_actions", &default_actions),
                 ),
             ]),
         );
@@ -10851,9 +10905,9 @@ mod tests {
         );
         let changed = ["description".to_string()];
 
-        let planned = plan_update_patch(&changed, to.as_inner(), &from, &schema)
+        let planned = plan_update_patch(&changed, to.as_inner(), &from, schema.as_schema())
             .expect("planning must accept the patch");
-        let applied = build_update_patch(&changed, &to, &from, &schema)
+        let applied = build_update_patch(&changed, &to, &from, schema.as_schema())
             .expect("apply must accept the same patch");
 
         assert_eq!(planned.ops, applied.ops);
@@ -10861,21 +10915,24 @@ mod tests {
 
     #[test]
     fn ignored_readable_leaf_uses_observed_value_when_sibling_is_sent() {
-        use crate::schema::{AttributeSchema, AttributeType, StructField};
-
-        let schema = ResourceSchema::new("test").attribute(
-            AttributeSchema::optional(
-                "config",
-                AttributeType::struct_(
-                    "Config",
-                    vec![
-                        StructField::optional("version", AttributeType::string()).build(),
-                        StructField::optional("memory", AttributeType::int()).build(),
-                    ],
-                ),
+        let schema = PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "config",
+                    PatternAttributeType::struct_(
+                        "Config",
+                        vec![
+                            PatternStructField::optional("version", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::optional("memory", PatternAttributeType::int())
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
             )
-            .build(),
-        );
+            .validate()
+            .expect("ignore_changes patch schema must validate");
         let struct_value = |version: &str, memory: i64| {
             Value::Concrete(ConcreteValue::Map(IndexMap::from([
                 ("version".to_string(), patch_test_value(version)),
@@ -10896,7 +10953,7 @@ mod tests {
             ignored_path(&["config", "version"]),
         );
 
-        let patch = build_update_patch(&["config".to_string()], &to, &from, &schema)
+        let patch = build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
             .expect("readable ignored leaf can be filled from the read");
         let PatchOp::Replace { value, .. } = &patch.ops[0] else {
             panic!("expected config replacement: {:?}", patch.ops);
@@ -10910,23 +10967,25 @@ mod tests {
 
     #[test]
     fn sending_parent_of_ignored_write_only_leaf_is_a_typed_error() {
-        use crate::schema::{AttributeSchema, AttributeType, StructField};
-
-        let schema = ResourceSchema::new("test").attribute(
-            AttributeSchema::optional(
-                "config",
-                AttributeType::struct_(
-                    "Config",
-                    vec![
-                        StructField::optional("secret", AttributeType::string())
-                            .write_only()
-                            .build(),
-                        StructField::optional("memory", AttributeType::int()).build(),
-                    ],
-                ),
+        let schema = PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "config",
+                    PatternAttributeType::struct_(
+                        "Config",
+                        vec![
+                            PatternStructField::optional("secret", PatternAttributeType::string())
+                                .write_only()
+                                .build(),
+                            PatternStructField::optional("memory", PatternAttributeType::int())
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
             )
-            .build(),
-        );
+            .validate()
+            .expect("ignore_changes patch schema must validate");
         let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("secret".to_string(), patch_test_value("recorded")),
             (
@@ -10948,7 +11007,7 @@ mod tests {
             ignored_path(&["config", "secret"]),
         );
 
-        let error = build_update_patch(&["config".to_string()], &to, &from, &schema)
+        let error = build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
             .expect_err("the current ignored write-only value is unknowable");
 
         assert_eq!(error.resource_id(), &to.id);
@@ -10959,7 +11018,10 @@ mod tests {
 
     #[test]
     fn nested_write_only_record_sent_skips_non_bearing_keys() {
-        use crate::schema::{AttributeSchema, AttributeType, StructField};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+            CompiledStructField as StructField,
+        };
 
         let schema = ResourceSchema::new("test")
             .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
@@ -11020,8 +11082,9 @@ mod tests {
             .expect("fixture includes default_actions")
             .clone();
 
-        let patch = build_update_patch(&["description".to_string()], &to, &from, &schema)
-            .expect("valid reassert patch");
+        let patch =
+            build_update_patch(&["description".to_string()], &to, &from, schema.as_schema())
+                .expect("valid reassert patch");
 
         assert!(matches!(
             &patch.ops[..],
@@ -11036,7 +11099,10 @@ mod tests {
 
     #[test]
     fn build_update_patch_reasserts_only_desired_updatable_write_only_keys() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+            CompiledResourceSchema as ResourceSchema,
+        };
 
         let id = ResourceId::with_identity("test", "example");
         let from = State::existing(
@@ -11100,7 +11166,10 @@ mod tests {
 
     #[test]
     fn build_update_patch_does_not_duplicate_changed_write_only_keys() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+            CompiledResourceSchema as ResourceSchema,
+        };
 
         let id = ResourceId::with_identity("test", "example");
         let from = State::existing(
@@ -11161,7 +11230,10 @@ mod tests {
 
     #[test]
     fn build_update_patch_never_creates_a_reassert_only_patch() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+            CompiledResourceSchema as ResourceSchema,
+        };
 
         let id = ResourceId::with_identity("test", "example");
         let from = State::existing(
@@ -11200,7 +11272,7 @@ mod tests {
             Resource::new("test", "nested").with_attribute("default_actions", default_actions),
         );
         assert!(
-            build_update_patch(&[], &to, &from, &schema)
+            build_update_patch(&[], &to, &from, schema.as_schema())
                 .expect("empty nested patch is valid")
                 .ops
                 .is_empty(),
@@ -11210,7 +11282,10 @@ mod tests {
 
     #[test]
     fn build_update_patch_generated_inputs_preserve_reassert_invariants() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+        use crate::schema::{
+            CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+            CompiledResourceSchema as ResourceSchema,
+        };
 
         const KEYS: [&str; 3] = ["a", "b", "c"];
         for desired_mask in 0_u8..8 {
@@ -11238,12 +11313,11 @@ mod tests {
                                 let attribute =
                                     match (write_only_mask & bit != 0, create_only_mask & bit != 0)
                                     {
-                                        (false, false) => builder,
-                                        (true, false) => builder.write_only(),
-                                        (false, true) => builder.create_only(),
-                                        (true, true) => builder.write_only().create_only(),
-                                    }
-                                    .build();
+                                        (false, false) => builder.build(),
+                                        (true, false) => builder.write_only().build(),
+                                        (false, true) => builder.create_only().build(),
+                                        (true, true) => builder.write_only().create_only().build(),
+                                    };
                                 schema = schema.attribute(attribute);
                                 if changed_mask & bit != 0 {
                                     changed.push((*key).to_string());
@@ -11331,7 +11405,7 @@ mod tests {
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
         let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
-        let schema = crate::schema::ResourceSchema::new("test");
+        let schema = crate::schema::CompiledResourceSchema::new("test");
         let request = UpdateRequest::checked(from, &[], &ready, &schema)
             .expect("fixture has no ignored write-only paths");
         let identifier =
@@ -11445,7 +11519,10 @@ mod tests {
             "mock".to_string(),
             initialized(TaggedProvider { tag: "default" }),
         );
-        let named_config = ProviderConfig {
+        let named_config: ProviderConfig<
+            crate::resource::NoPlaceholder,
+            crate::resource::RelativeBindingName,
+        > = ProviderConfig {
             name: "mock".to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
@@ -11485,14 +11562,14 @@ mod tests {
 
     fn reference_form_registry(owner: &str) -> (crate::schema::SchemaRegistry, AttributeType) {
         use crate::schema::{
-            AttributeSchema, ReferenceForm, ReferenceForms, ReferenceTemplate, ResourceSchema,
-            ValidatedProviderSchemaWitness,
+            ReferenceForm, ReferenceForms, ReferenceTemplate, ValidatedProviderSchemaWitness,
         };
 
         let identity = TypeIdentity::new(Some(owner), ["lambda", "Function"], "Name");
-        let attr_type = AttributeType::refined_string(Some(identity.clone()), None, None, None);
-        let schema = ResourceSchema::new("lambda.Permission")
-            .attribute(AttributeSchema::optional("function_name", attr_type.clone()).build())
+        let attr_type =
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let schema = PatternResourceSchema::new("lambda.Permission")
+            .attribute(PatternAttributeSchema::optional("function_name", attr_type.clone()).build())
             .validate()
             .expect("fixture schema must validate");
         let forms = ReferenceForms::from([(
@@ -11514,6 +11591,11 @@ mod tests {
         registry
             .insert_provider_witness(owner, &witness)
             .expect("fixture owner has one validated witness");
+        let attr_type = witness.resources()[0]
+            .effective_attribute("function_name")
+            .unwrap()
+            .field_type()
+            .clone();
         (registry, attr_type)
     }
 
@@ -11952,7 +12034,7 @@ mod tests {
         // Test normalize_desired
         let ext = SchemaOnlyProvider;
         let mut resources = vec![
-            Resource::new("test", "example")
+            Resource::<crate::resource::ModuleSource>::new("test", "example")
                 .with_attribute(
                     "key",
                     Value::Concrete(ConcreteValue::String("value".into())),
@@ -12118,19 +12200,17 @@ mod tests {
         router.add_provider("normalizing".to_string(), initialized(NormalizingProvider));
         router.add_normalizer("normalizing", Box::new(TestNormalizer));
 
-        let peer_ref = Value::resource_ref("peer", "identifier", Vec::new());
+        let peer_ref = Value::root_resource_ref("peer", "identifier", Vec::new());
         let pending = Value::Deferred(DeferredValue::Unknown(
             crate::resource::ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".to_string(),
+                binding: absolute_binding("upstream"),
             },
         ));
-        let mut resources = vec![
-            Resource::with_provider("normalizing", "test", "example", None)
-                .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
-                .with_attribute("peer", peer_ref.clone())
-                .with_attribute("pending", pending.clone())
-                .into_provider_resource(),
-        ];
+        let resource: Resource = Resource::with_provider("normalizing", "test", "example", None)
+            .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into())))
+            .with_attribute("peer", peer_ref.clone())
+            .with_attribute("pending", pending.clone());
+        let mut resources = vec![resource.into_provider_resource()];
         router.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),

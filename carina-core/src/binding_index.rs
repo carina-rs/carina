@@ -43,34 +43,44 @@
 //! ```
 
 use crate::data_source_value::{DataSourceValue, DataSourceValues};
-use crate::parser::{BindingName, DeferredIfBody, TopLevelResourceRef};
+use crate::parser::{DeferredIfBody, TopLevelResourceRef};
 use crate::resource::composition::CompositionRuntimeRef;
 use crate::resource::{
-    AccessPath, LiveComposition, ParserPlaceholder, PathSegment, PlaceholderKind, PlanInputCurrent,
-    ReferencePathRef, Resource, ResourceId, SavedComposition, SavedModuleSource, SavedResource,
-    State, Subscript, Value,
+    AbsoluteBindingAddress, AccessPath, BindingAddress, LiveComposition, ParserPlaceholder,
+    PathSegment, PlaceholderKind, PlanInputCurrent, ReferencePathRef, RelativeBindingName,
+    Resource, ResourceId, SavedComposition, SavedModuleSource, SavedResource, State, Subscript,
+    Value,
 };
 use crate::schema::{
-    AttributeType, ResourceSchema, SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Statically known validation surface for a binding.
-#[derive(Debug, Clone, Copy)]
-pub enum BindingTarget<'a> {
+#[derive(Debug)]
+pub enum BindingTarget<'a, B: BindingAddress = RelativeBindingName> {
     Schema(&'a ResourceSchema),
-    LiveComposition(&'a LiveComposition<ParserPlaceholder>),
+    LiveComposition(&'a LiveComposition<ParserPlaceholder, B>),
     ModuleCall(&'a crate::module_resolver::ResolvedModuleSignature),
     Argument(&'a crate::parser::TypeExpr),
     UpstreamState(&'a crate::upstream_exports::UpstreamExportEntries),
+}
+
+impl<B: BindingAddress> Copy for BindingTarget<'_, B> {}
+
+impl<B: BindingAddress> Clone for BindingTarget<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 /// One entry in the binding index. The target is non-`Option`: managed/data
 /// bindings whose schemas cannot be resolved are skipped, while compositions
 /// always carry their declared attribute map directly.
 #[derive(Debug)]
-pub struct BindingEntry<'a> {
-    pub target: BindingTarget<'a>,
+pub struct BindingEntry<'a, B: BindingAddress = RelativeBindingName> {
+    pub target: BindingTarget<'a, B>,
 }
 
 /// Whether a path-shape mismatch is owned by this lookup or by a dedicated
@@ -90,7 +100,10 @@ enum InvalidAccessPolicy {
 }
 
 impl ReferenceTypeCheck {
-    fn invalid_access_policy(self, target: BindingTarget<'_>) -> InvalidAccessPolicy {
+    fn invalid_access_policy<B: BindingAddress>(
+        self,
+        target: BindingTarget<'_, B>,
+    ) -> InvalidAccessPolicy {
         match (self, target) {
             // Upstream shape errors carry purpose-built guidance such as
             // "iterate the list" and must remain authoritative.
@@ -121,14 +134,14 @@ impl ResolvedTypeConstraint {
         Self { attr_type, defs }
     }
 
-    fn type_in_schema(&self) -> TypeInSchema<'_> {
+    fn type_in_schema(&self) -> TypeInSchema<'_, crate::schema::Compiled> {
         self.attr_type.in_schema(&self.defs)
     }
 
-    fn narrow(
+    fn narrow<B: BindingAddress>(
         self,
         segments: &[PathSegment],
-        path: &AccessPath,
+        path: &AccessPath<B>,
         invalid_access: InvalidAccessPolicy,
     ) -> Result<Option<Self>, RefTypeError> {
         let rendered_path = path.to_dot_string();
@@ -168,10 +181,10 @@ impl AuthoritativeTypeConstraint {
         }
     }
 
-    fn narrow(
+    fn narrow<B: BindingAddress>(
         self,
         segments: &[PathSegment],
-        path: &AccessPath,
+        path: &AccessPath<B>,
         invalid_access: InvalidAccessPolicy,
     ) -> Result<Option<Self>, RefTypeError> {
         match self {
@@ -222,7 +235,7 @@ impl RefTypeMismatch {
         self.declared.as_deref()
     }
 
-    pub fn origin_description(&self, path: ReferencePathRef<'_>) -> String {
+    pub fn origin_description<B: BindingAddress>(&self, path: ReferencePathRef<'_, B>) -> String {
         match &self.declared {
             Some(declared) => format!("from {}, declared {}", path.to_dot_string(), declared),
             None => format!("from {}", path.to_dot_string()),
@@ -231,6 +244,40 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
+    /// A lexical value declaration is authoritative independently of the
+    /// caller expression later substituted for that value.
+    pub(crate) fn from_value_declaration(type_expr: &crate::parser::TypeExpr) -> Option<Self> {
+        fn is_value_constraint(type_expr: &crate::parser::TypeExpr) -> bool {
+            use crate::parser::TypeExpr;
+
+            match type_expr {
+                // Legacy Ref annotations also accept value-shaped arguments.
+                // Their handle transport type must not erase the actual
+                // value's identity evidence at a resource schema sink.
+                TypeExpr::Ref(_path) | TypeExpr::DottedUnresolved(_path) => false,
+                TypeExpr::List(inner) | TypeExpr::Map(inner) => is_value_constraint(inner),
+                TypeExpr::Struct { fields } => fields
+                    .iter()
+                    .all(|(_name, field)| is_value_constraint(field)),
+                TypeExpr::Union(members) => members.iter().all(is_value_constraint),
+                TypeExpr::String
+                | TypeExpr::Bool
+                | TypeExpr::Int
+                | TypeExpr::Float
+                | TypeExpr::Duration
+                | TypeExpr::Simple(_)
+                | TypeExpr::SchemaType { owned: _ }
+                | TypeExpr::StringLiteral(_) => true,
+            }
+        }
+
+        if !is_value_constraint(type_expr) {
+            return None;
+        }
+        crate::validation::lift_type_expr(type_expr)
+            .map(|attr_type| Self::new(attr_type, BTreeMap::new()))
+    }
+
     fn new(attr_type: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
         Self {
             authoritative: AuthoritativeTypeConstraint::Direct(ResolvedTypeConstraint::new(
@@ -252,10 +299,10 @@ impl ResolvedRefType {
         }
     }
 
-    fn narrow(
+    fn narrow<B: BindingAddress>(
         self,
         segments: &[PathSegment],
-        path: &AccessPath,
+        path: &AccessPath<B>,
         invalid_access: InvalidAccessPolicy,
     ) -> Result<Option<Self>, RefTypeError> {
         let Some(authoritative) = self.authoritative.narrow(segments, path, invalid_access)? else {
@@ -291,7 +338,10 @@ impl ResolvedRefType {
     /// `sink`. The returned mismatch identifies the first failing constraint;
     /// inferred failures also retain the current boundary's declaration for
     /// diagnostics.
-    pub fn is_assignable_to_sink(&self, sink: TypeInSchema<'_>) -> Result<(), RefTypeMismatch> {
+    pub fn is_assignable_to_sink(
+        &self,
+        sink: TypeInSchema<'_, crate::schema::Compiled>,
+    ) -> Result<(), RefTypeMismatch> {
         let authoritative = self.authoritative.constraint().type_in_schema();
         if !authoritative.is_assignable_to(sink) {
             return Err(RefTypeMismatch {
@@ -442,14 +492,14 @@ fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
 /// named addressable binding even when its type surface is unavailable, so
 /// callers can distinguish "unknown binding" from "known but unchecked".
 #[derive(Debug)]
-pub struct BindingIndex<'a> {
-    entries: HashMap<String, BindingEntry<'a>>,
+pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
+    entries: HashMap<String, BindingEntry<'a, B>>,
     known_names: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
-    user_functions: &'a HashMap<String, crate::parser::UserFunction>,
+    user_functions: &'a HashMap<String, crate::parser::UserFunction<B>>,
 }
 
-impl<'a> BindingIndex<'a> {
+impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     /// Build the index from a parsed file and a [`SchemaRegistry`]. The
     /// registry handles the `(provider, resource_type, kind) -> schema`
     /// lookup, including the kind-aware split between managed resources
@@ -460,9 +510,12 @@ impl<'a> BindingIndex<'a> {
     /// types as a separate diagnostic, so reporting them again here would
     /// double-count. LiveComposition bindings do not need a registry lookup.
     pub fn from_parsed<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self::build(parsed, registry, None, None)
     }
 
@@ -471,10 +524,13 @@ impl<'a> BindingIndex<'a> {
     /// the module call is not a [`LiveComposition`] yet, but its imported
     /// signature already declares the output type.
     pub fn from_parsed_with_module_signatures<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self::build(parsed, registry, None, Some(module_signatures))
     }
 
@@ -482,20 +538,26 @@ impl<'a> BindingIndex<'a> {
     /// Bindings whose source could not be loaded are still recorded as known
     /// and therefore resolve to [`RefType::Unchecked`].
     pub fn from_parsed_with_upstream_exports<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-        upstream_exports: &'a crate::upstream_exports::UpstreamExports,
-    ) -> Self {
+        upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self::build(parsed, registry, Some(upstream_exports), None)
     }
 
     /// Build the complete pre-expansion validation index used by the LSP.
     pub fn from_parsed_with_upstream_exports_and_module_signatures<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-        upstream_exports: &'a crate::upstream_exports::UpstreamExports,
+        upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         Self::build(
             parsed,
             registry,
@@ -505,11 +567,14 @@ impl<'a> BindingIndex<'a> {
     }
 
     fn build<E, D>(
-        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
-        upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports>,
+        upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
         module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
         let mut resource_handles = HashMap::new();
@@ -566,7 +631,7 @@ impl<'a> BindingIndex<'a> {
         {
             match body {
                 DeferredIfBody::Resource(resource) => {
-                    let Some(binding_name) = resource.binding.as_deref() else {
+                    let Some(binding_name) = resource.binding.as_ref() else {
                         continue;
                     };
                     known_names.insert(binding_name.to_string());
@@ -586,7 +651,7 @@ impl<'a> BindingIndex<'a> {
                     }
                 }
                 DeferredIfBody::DataSource(data_source) => {
-                    let Some(binding_name) = data_source.binding.as_deref() else {
+                    let Some(binding_name) = data_source.binding.as_ref() else {
                         continue;
                     };
                     known_names.insert(binding_name.to_string());
@@ -606,7 +671,7 @@ impl<'a> BindingIndex<'a> {
                     }
                 }
                 DeferredIfBody::ModuleCall(call) => {
-                    let Some(binding_name) = call.binding_name.as_deref() else {
+                    let Some(binding_name) = call.binding_name.as_ref() else {
                         continue;
                     };
                     known_names.insert(binding_name.to_string());
@@ -620,19 +685,6 @@ impl<'a> BindingIndex<'a> {
                             });
                     }
                 }
-                DeferredIfBody::ExpandedModuleCall(contribution) => {
-                    for composition in &contribution.compositions {
-                        let Some(binding_name) = composition.binding.as_deref() else {
-                            continue;
-                        };
-                        known_names.insert(binding_name.to_string());
-                        entries
-                            .entry(binding_name.to_string())
-                            .or_insert(BindingEntry {
-                                target: BindingTarget::LiveComposition(composition),
-                            });
-                    }
-                }
             }
         }
         // Module-call bindings expose the imported module's declared output
@@ -641,7 +693,7 @@ impl<'a> BindingIndex<'a> {
         // Resource/composition entries above retain precedence on malformed
         // duplicate names.
         for call in &parsed.module_calls {
-            let Some(binding_name) = call.binding_name.as_deref() else {
+            let Some(binding_name) = call.binding_name.as_ref() else {
                 continue;
             };
             known_names.insert(binding_name.to_string());
@@ -692,12 +744,12 @@ impl<'a> BindingIndex<'a> {
         // a successfully loaded empty export map is a typed surface on which
         // every field access produces the canonical "does not export" error.
         for upstream in &parsed.upstream_states {
-            known_names.insert(upstream.binding.clone());
+            known_names.insert(upstream.binding.to_string());
             if let Some(exports) =
                 upstream_exports.and_then(|all_exports| all_exports.get(&upstream.binding))
             {
                 entries
-                    .entry(upstream.binding.clone())
+                    .entry(upstream.binding.to_string())
                     .or_insert(BindingEntry {
                         target: BindingTarget::UpstreamState(exports),
                     });
@@ -711,11 +763,11 @@ impl<'a> BindingIndex<'a> {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&BindingEntry<'a>> {
+    pub fn get(&self, name: &str) -> Option<&BindingEntry<'a, B>> {
         self.entries.get(name)
     }
 
-    pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction> {
+    pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction<B>> {
         self.user_functions.get(name)
     }
 
@@ -727,7 +779,7 @@ impl<'a> BindingIndex<'a> {
     /// recursively inherits the target path's type. Derived values and
     /// typed unchecked reasons remain unchecked. The active path set bounds
     /// malformed/cyclic forwarded chains.
-    pub fn ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p>>) -> RefType {
+    pub fn ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p, B>>) -> RefType {
         self.ref_type_inner(
             path.into(),
             &mut HashSet::new(),
@@ -738,7 +790,7 @@ impl<'a> BindingIndex<'a> {
     /// Resolve a reference for postfix type checking. Schema-backed bindings
     /// (including wait aliases) report wrong-shape suffixes, while upstream
     /// bindings retain their dedicated shape-diagnostic authority.
-    pub(crate) fn postfix_ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p>>) -> RefType {
+    pub(crate) fn postfix_ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p, B>>) -> RefType {
         self.ref_type_inner(
             path.into(),
             &mut HashSet::new(),
@@ -748,7 +800,7 @@ impl<'a> BindingIndex<'a> {
 
     fn ref_type_inner(
         &self,
-        reference: ReferencePathRef<'_>,
+        reference: ReferencePathRef<'_, B>,
         visiting: &mut HashSet<String>,
         check: ReferenceTypeCheck,
     ) -> RefType {
@@ -758,7 +810,7 @@ impl<'a> BindingIndex<'a> {
         }
 
         if let ReferencePathRef::Binding(binding) = reference
-            && let Some(handle) = self.resource_handles.get(binding)
+            && let Some(handle) = self.resource_handles.get(binding.as_str())
         {
             visiting.remove(&key);
             return RefType::Typed(ResolvedRefType::new(
@@ -1092,8 +1144,8 @@ impl<'a> BindingIndex<'a> {
     }
 }
 
-fn unknown_attribute<'a>(
-    path: &AccessPath,
+fn unknown_attribute<'a, B: BindingAddress>(
+    path: &AccessPath<B>,
     known: impl IntoIterator<Item = &'a String>,
     target: RefTargetKind,
 ) -> RefTypeError {
@@ -1169,16 +1221,12 @@ fn narrow_type<'a>(
 /// identifiers that the resolver/executor never need to look up
 /// attributes on.
 ///
-/// `#[non_exhaustive]` so adding a new declaration form (a future
-/// `data` block, etc.) does not break downstream `match` arms.
-///
-/// Not `Copy`: `Wait` carries an owned `BindingName` (the wait→target
+/// Not `Copy`: `Wait` carries an owned `RelativeBindingName` (the wait→target
 /// edge is a typed value, carina#3085 — not a string convention). The
 /// enum is read out by reference (`kind()` / `iter()`); the only
 /// in-crate consumers are within this module, so dropping `Copy` is
 /// contained.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum BindingNameKind {
     /// `let <name> = ...` resource binding.
     Resource,
@@ -1205,9 +1253,9 @@ pub enum BindingNameKind {
     /// `<target>.<attr>` (see `notes/specs/2026-05-09-wait-construct-design.md`
     /// value semantics). The `target` is the binding name of the
     /// resource the wait observes; carried here as a typed
-    /// [`BindingName`] so the wait→target edge cannot be confused with
+    /// [`RelativeBindingName`] so the wait→target edge cannot be confused with
     /// an arbitrary string or point at a non-existent name undetected.
-    Wait { target: BindingName },
+    Wait { target: RelativeBindingName },
 }
 
 /// Name-only scope view: every identifier a parsed Carina configuration
@@ -1253,8 +1301,16 @@ impl BindingNameSet {
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             D,
+            RelativeBindingName,
         >,
-    ) -> Self {
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                crate::resource::ParserPlaceholder,
+                crate::resource::ParserPlaceholder,
+                RelativeBindingName,
+            >,
+    {
         let mut by_name: HashMap<String, BindingNameKind> = HashMap::new();
 
         // carina#3181: walk the typed top-level slices — managed
@@ -1284,7 +1340,7 @@ impl BindingNameSet {
                 });
         }
         for call in &parsed.module_calls {
-            if let Some(name) = call.binding_name.as_deref() {
+            if let Some(name) = call.binding_name.as_ref() {
                 by_name
                     .entry(name.to_string())
                     .or_insert(BindingNameKind::ModuleCall);
@@ -1292,7 +1348,7 @@ impl BindingNameSet {
         }
         for upstream in &parsed.upstream_states {
             by_name
-                .entry(upstream.binding.clone())
+                .entry(upstream.binding.to_string())
                 .or_insert(BindingNameKind::UpstreamState);
         }
         for arg in &parsed.arguments {
@@ -1312,7 +1368,7 @@ impl BindingNameSet {
         }
         for structural in &parsed.structural_bindings {
             by_name
-                .entry(structural.clone())
+                .entry(structural.to_string())
                 .or_insert(BindingNameKind::Structural);
         }
         // Parser-classified structural handles include aliases such as
@@ -1322,7 +1378,7 @@ impl BindingNameSet {
         // sibling files by the directory loader.
         for structural in parsed.parser_binding_metadata.structural_handles().keys() {
             by_name
-                .entry(structural.clone())
+                .entry(structural.as_str().to_owned())
                 .or_insert(BindingNameKind::Structural);
         }
         for var_name in parsed.variables.keys() {
@@ -1366,8 +1422,9 @@ impl BindingNameSet {
 
 /// A `wait` binding's value-layer contract: `binding`'s
 /// `<binding>.<attr>` is a passthrough to `<target>.<attr>`
-/// (carina#3085). Both sides are the typed [`BindingName`] newtype so
-/// the wait→target edge cannot be confused with an arbitrary string.
+/// (carina#3085). Both sides of [`WaitAliasSpec<B>`] retain the binding
+/// phase `B`; expanded aliases use [`AbsoluteBindingAddress`], so the
+/// wait→target edge cannot be confused with an arbitrary string.
 ///
 /// This is the *only* thing `ResolvedBindings` needs from a wait
 /// declaration — deliberately **not** the full parser
@@ -1382,13 +1439,13 @@ impl BindingNameSet {
 /// plan-file path builds it from its serialized `(binding, target)`
 /// pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WaitAliasSpec {
-    pub binding: BindingName,
-    pub target: BindingName,
+pub struct WaitAliasSpec<B: BindingAddress = AbsoluteBindingAddress> {
+    pub binding: B,
+    pub target: B,
 }
 
-impl From<&crate::parser::WaitBinding> for WaitAliasSpec {
-    fn from(wb: &crate::parser::WaitBinding) -> Self {
+impl<B: BindingAddress> From<&crate::parser::WaitBinding<B>> for WaitAliasSpec<B> {
+    fn from(wb: &crate::parser::WaitBinding<B>) -> Self {
         Self {
             binding: wb.binding.clone(),
             target: wb.target.clone(),
@@ -1400,18 +1457,12 @@ impl From<&crate::parser::WaitBinding> for WaitAliasSpec {
 /// in the current configuration; `Upstream` means an `upstream_state` data
 /// source bringing values in from another state file.
 ///
-/// Marked `#[non_exhaustive]` because #2301 will introduce structural
-/// sources (`for` / `if` / module) — flagging the intent now keeps
-/// downstream `match` arms from becoming exhaustive against the current
-/// two variants.
-///
-/// Not `Copy`: `WaitAlias` carries an owned `BindingName` (the
+/// Not `Copy`: `WaitAlias` carries an owned absolute binding address (the
 /// wait→target edge is a typed value, carina#3085). `source()` returns
 /// a borrow; the only in-crate value-position use is a `matches!`
 /// (`Copy`-independent), so dropping `Copy` is contained.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BindingValueSource {
+pub enum BindingValueSource<B: BindingAddress = AbsoluteBindingAddress> {
     Local,
     Upstream,
     /// The binding is a `wait` binding whose `<name>.<attr>` is a
@@ -1426,7 +1477,7 @@ pub enum BindingValueSource {
     /// `Effect::Wait` lowering and is not affected by this value-layer
     /// alias.
     WaitAlias {
-        target: BindingName,
+        target: B,
     },
 }
 
@@ -1542,9 +1593,12 @@ pub enum ManagedBindingStability {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResolvedBinding<P: PlaceholderKind = crate::resource::NoPlaceholder> {
-    pub attributes: HashMap<String, Value<P>>,
-    pub source: BindingValueSource,
+pub struct ResolvedBinding<
+    P: PlaceholderKind = crate::resource::NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    pub attributes: HashMap<String, Value<P, B>>,
+    pub source: BindingValueSource<B>,
     pub completeness: BindingCompleteness,
     /// Attributes whose present values are authoritative even when the
     /// surrounding snapshot is incomplete. For managed resources these are
@@ -1565,7 +1619,7 @@ pub struct ResolvedBinding<P: PlaceholderKind = crate::resource::NoPlaceholder> 
     removed_sensitive_attributes: HashSet<String>,
 }
 
-impl<P: PlaceholderKind> ResolvedBinding<P> {
+impl<P: PlaceholderKind, B: BindingAddress> ResolvedBinding<P, B> {
     /// Changed authored values describe the desired view, not a provider
     /// snapshot: nested provider-filled fields can still be unpublished.
     fn attribute_snapshot_is_known(&self, attribute: &str) -> bool {
@@ -1620,11 +1674,14 @@ impl SecretPreservingAttributes {
 /// borrow from. Owning the merged map avoids a self-referential
 /// structure.
 #[derive(Debug, Clone)]
-pub struct ResolvedBindings<P: PlaceholderKind = crate::resource::NoPlaceholder> {
-    by_name: HashMap<String, ResolvedBinding<P>>,
+pub struct ResolvedBindings<
+    P: PlaceholderKind = crate::resource::NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
+    by_name: HashMap<String, ResolvedBinding<P, B>>,
 }
 
-impl<P: PlaceholderKind> Default for ResolvedBindings<P> {
+impl<P: PlaceholderKind, B: BindingAddress> Default for ResolvedBindings<P, B> {
     fn default() -> Self {
         Self {
             by_name: HashMap::new(),
@@ -1632,12 +1689,12 @@ impl<P: PlaceholderKind> Default for ResolvedBindings<P> {
     }
 }
 
-impl<P: PlaceholderKind> ResolvedBindings<P> {
-    pub fn get(&self, name: &str) -> Option<&HashMap<String, Value<P>>> {
+impl<P: PlaceholderKind, B: BindingAddress> ResolvedBindings<P, B> {
+    pub fn get(&self, name: &str) -> Option<&HashMap<String, Value<P, B>>> {
         self.by_name.get(name).map(|binding| &binding.attributes)
     }
 
-    pub fn source(&self, name: &str) -> Option<&BindingValueSource> {
+    pub fn source(&self, name: &str) -> Option<&BindingValueSource<B>> {
         self.by_name.get(name).map(|binding| &binding.source)
     }
 
@@ -1673,6 +1730,28 @@ impl<P: PlaceholderKind> ResolvedBindings<P> {
         self.by_name.get(name).is_some_and(|binding| {
             binding.completeness.all_attributes_known() && binding.refreshable_attributes.is_empty()
         })
+    }
+
+    fn layer_typed_wait_aliases(&mut self, wait_aliases: &[WaitAliasSpec<B>]) {
+        for spec in wait_aliases {
+            let Some(target) = self.by_name.get(spec.target.as_str()).cloned() else {
+                continue;
+            };
+            self.by_name.insert(
+                spec.binding.as_str().to_string(),
+                ResolvedBinding {
+                    attributes: target.attributes,
+                    source: BindingValueSource::WaitAlias {
+                        target: spec.target.clone(),
+                    },
+                    completeness: target.completeness,
+                    definitive_attributes: target.definitive_attributes,
+                    changed_attributes: target.changed_attributes,
+                    refreshable_attributes: target.refreshable_attributes,
+                    removed_sensitive_attributes: target.removed_sensitive_attributes,
+                },
+            );
+        }
     }
 }
 
@@ -1723,22 +1802,58 @@ pub struct LivePreDataSourceReadInputs<'a> {
 }
 
 impl ResolvedBindings<ParserPlaceholder> {
-    /// Build the value-level binding view used before the parser-to-expanded
-    /// boundary. Parser placeholders remain typed as such until
-    /// `ResolvedFile` consumes the complete file.
-    pub fn for_validation<E, D>(
-        parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
-    ) -> Self {
+    /// Build the parser-placeholder validation view while resolving every
+    /// authored binding name into the caller-provided root scope.
+    pub(crate) fn for_root_validation<E, D>(
+        parsed: &crate::parser::File<
+            E,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            RelativeBindingName,
+        >,
+        root: &crate::resource::RootScope,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                ParserPlaceholder,
+                ParserPlaceholder,
+                RelativeBindingName,
+            >,
+    {
+        Self::build_validation(
+            parsed,
+            |value: &Value<ParserPlaceholder, RelativeBindingName>| {
+                value
+                    .clone()
+                    .resolve_bindings(&mut |binding| root.resolve(binding))
+            },
+            |binding| root.resolve(binding.clone()),
+        )
+    }
+
+    fn build_validation<E, B: BindingAddress, Out: BindingAddress, D>(
+        parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        mut map_value: impl FnMut(&Value<ParserPlaceholder, B>) -> Value<ParserPlaceholder, Out>,
+        mut map_binding: impl FnMut(&B) -> Out,
+    ) -> ResolvedBindings<ParserPlaceholder, Out>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
         let mut by_name = HashMap::new();
 
         for resource in &parsed.resources {
             let Some(binding) = resource.binding.as_ref() else {
                 continue;
             };
-            let attributes = resource.resolved_attributes();
+            let attributes = resource
+                .attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), map_value(value)))
+                .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
-                binding.clone(),
+                map_binding(binding).to_string(),
                 ResolvedBinding {
                     attributes,
                     source: BindingValueSource::Local,
@@ -1755,10 +1870,14 @@ impl ResolvedBindings<ParserPlaceholder> {
             let Some(binding) = data_source.binding.as_ref() else {
                 continue;
             };
-            let attributes = crate::resource::attrs_to_hashmap(&data_source.attributes);
+            let attributes = data_source
+                .attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), map_value(value)))
+                .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
-                binding.clone(),
+                map_binding(binding).to_string(),
                 ResolvedBinding {
                     attributes,
                     source: BindingValueSource::Local,
@@ -1779,15 +1898,18 @@ impl ResolvedBindings<ParserPlaceholder> {
                 .signature
                 .attributes
                 .iter()
-                .map(|(name, attribute)| (name.clone(), attribute.to_value()))
+                .map(|(name, attribute)| {
+                    let value = attribute.to_value();
+                    (name.clone(), map_value(&value))
+                })
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
-                binding.clone(),
+                map_binding(binding).to_string(),
                 ResolvedBinding {
                     attributes,
                     source: BindingValueSource::Local,
-                    completeness: BindingCompleteness::Complete,
+                    completeness: BindingCompleteness::Incomplete,
                     definitive_attributes,
                     changed_attributes: HashSet::new(),
                     refreshable_attributes: HashSet::new(),
@@ -1796,36 +1918,69 @@ impl ResolvedBindings<ParserPlaceholder> {
             );
         }
 
-        let mut bindings = Self { by_name };
+        let mut bindings = ResolvedBindings { by_name };
         let wait_aliases = parsed
             .wait_bindings
             .iter()
-            .map(WaitAliasSpec::from)
+            .map(|wait| WaitAliasSpec {
+                binding: map_binding(&wait.binding),
+                target: map_binding(&wait.target),
+            })
             .collect::<Vec<_>>();
-        bindings.layer_wait_aliases(&wait_aliases);
+        bindings.layer_typed_wait_aliases(&wait_aliases);
         bindings
     }
 
-    fn layer_wait_aliases(&mut self, wait_aliases: &[WaitAliasSpec]) {
-        for spec in wait_aliases {
-            let Some(target) = self.by_name.get(spec.target.as_str()).cloned() else {
-                continue;
-            };
-            self.by_name.insert(
-                spec.binding.as_str().to_string(),
-                ResolvedBinding {
-                    attributes: target.attributes,
-                    source: BindingValueSource::WaitAlias {
-                        target: spec.target.clone(),
-                    },
-                    completeness: target.completeness,
-                    definitive_attributes: target.definitive_attributes,
-                    changed_attributes: target.changed_attributes,
-                    refreshable_attributes: target.refreshable_attributes,
-                    removed_sensitive_attributes: target.removed_sensitive_attributes,
-                },
-            );
-        }
+    /// Build the same incomplete validation view after scope expansion.
+    pub fn for_expanded_validation<E, D>(
+        parsed: &crate::parser::File<
+            E,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            AbsoluteBindingAddress,
+        >,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                ParserPlaceholder,
+                ParserPlaceholder,
+                AbsoluteBindingAddress,
+            >,
+    {
+        ResolvedBindings::<ParserPlaceholder>::build_validation(
+            parsed,
+            |value| value.clone(),
+            |binding| binding.clone(),
+        )
+    }
+}
+
+impl ResolvedBindings<ParserPlaceholder, RelativeBindingName> {
+    /// Build the incomplete validation view without crossing the root-binding
+    /// expansion seam. Editor/source diagnostics use this view while their
+    /// values still carry authored relative names.
+    pub fn for_authored_validation<E, D>(
+        parsed: &crate::parser::File<
+            E,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            RelativeBindingName,
+        >,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<
+                ParserPlaceholder,
+                ParserPlaceholder,
+                RelativeBindingName,
+            >,
+    {
+        ResolvedBindings::<ParserPlaceholder>::build_validation(
+            parsed,
+            |value| value.clone(),
+            |binding| binding.clone(),
+        )
     }
 }
 
@@ -2035,7 +2190,7 @@ impl ResolvedBindings {
                 }
             }
             by_name.insert(
-                binding_name.clone(),
+                binding_name.to_string(),
                 ResolvedBinding {
                     attributes: merged,
                     source: BindingValueSource::Local,
@@ -2261,7 +2416,7 @@ impl ResolvedBindings {
                 DataSourceValue::DeferredToApply(_) | DataSourceValue::BlockedByPlanError => {}
             }
             self.by_name.insert(
-                binding_name.clone(),
+                binding_name.to_string(),
                 ResolvedBinding {
                     attributes: merged,
                     source: BindingValueSource::Local,
@@ -2283,7 +2438,7 @@ impl ResolvedBindings {
             let attributes = crate::resource::attrs_to_hashmap(&data_source.attributes);
             let definitive_attributes = attributes.keys().cloned().collect();
             self.by_name.insert(
-                binding_name.clone(),
+                binding_name.to_string(),
                 ResolvedBinding {
                     attributes,
                     source: BindingValueSource::Local,
@@ -2310,10 +2465,10 @@ impl ResolvedBindings {
     ) {
         let stability = managed_binding_stability_from_plan(managed, plan, schemas);
         for resource in managed {
-            let Some(binding_name) = resource.binding.as_deref() else {
+            let Some(binding_name) = resource.binding.as_ref() else {
                 continue;
             };
-            let Some(binding) = self.by_name.get_mut(binding_name) else {
+            let Some(binding) = self.by_name.get_mut(binding_name.as_str()) else {
                 continue;
             };
             match stability.get(&resource.id) {
@@ -2373,7 +2528,7 @@ impl ResolvedBindings {
             });
         });
         value.visit_binding_refs(&mut |name| {
-            definitive &= self.binding_is_fully_definitive(name);
+            definitive &= self.binding_is_fully_definitive(name.as_str());
         });
         if definitive {
             crate::resource::AccessMissPolicy::Error
@@ -2658,15 +2813,41 @@ impl<'a> IterableBindings<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+    #[test]
+    fn value_declaration_source_keeps_legacy_handle_values_inferred() {
+        use crate::parser::{ResourceTypePath, TypeExpr};
+
+        let handle = TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc"));
+        for declaration in [
+            handle.clone(),
+            TypeExpr::List(Box::new(handle.clone())),
+            TypeExpr::Map(Box::new(handle.clone())),
+            TypeExpr::Struct {
+                fields: vec![("value".to_string(), handle.clone())],
+            },
+            TypeExpr::Union(vec![TypeExpr::String, handle]),
+        ] {
+            assert!(
+                super::ResolvedRefType::from_value_declaration(&declaration).is_none(),
+                "a legacy handle annotation must not erase substituted value evidence: {declaration:?}",
+            );
+        }
+        assert!(super::ResolvedRefType::from_value_declaration(&TypeExpr::String).is_some());
+    }
+
     use super::*;
     use crate::parser::{
-        ArgumentParameter, BindingName, ResourceTypePath, TypeExpr, UntilPredicateAst,
+        ArgumentParameter, RelativeBindingName, ResourceTypePath, TypeExpr, UntilPredicateAst,
         UpstreamState, WaitBinding, parse,
     };
-    use crate::resource::{LiveCompositionAttribute, LiveCompositionSignature};
-    use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, TypeInSchema,
+    use crate::resource::{
+        AuthoredAccessPath as AccessPath, AuthoredCompositionCall, AuthoredCompositionCallPath,
+        AuthoredConcreteValue as ConcreteValue, AuthoredLiveComposition,
+        AuthoredLiveCompositionAttribute as LiveCompositionAttribute,
+        AuthoredLiveCompositionSignature as LiveCompositionSignature, AuthoredValue as Value,
     };
+    use crate::schema::{CompiledAttributeType as AttributeType, TypeIdentity, TypeInSchema};
 
     fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
         crate::validation::resolve_consumer_static_type_for_signature(
@@ -2692,10 +2873,15 @@ mod tests {
         }
     }
 
-    fn vpc_schema() -> ResourceSchema {
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+    fn vpc_schema<R: crate::schema::PatternForm>() -> crate::schema::PatternResourceSchema<R> {
+        PatternResourceSchema::new("ec2.Vpc")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
+                    .build(),
+            )
     }
 
     fn registry_with_vpc() -> SchemaRegistry {
@@ -2709,8 +2895,8 @@ mod tests {
         r
     }
 
-    fn composition(binding: &'static str) -> LiveComposition<ParserPlaceholder> {
-        LiveComposition {
+    fn composition(binding: &'static str) -> AuthoredLiveComposition {
+        AuthoredLiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", binding,
             )),
@@ -2718,7 +2904,7 @@ mod tests {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::indexmap! {
                     "target_group_arn".to_string() => LiveCompositionAttribute::from_value(
-                        Value::Concrete(crate::resource::ConcreteValue::String(
+                        Value::Concrete(ConcreteValue::String(
                             "arn:example".into(),
                         )),
                         None,
@@ -2726,11 +2912,21 @@ mod tests {
                 },
                 pending_constraints: Vec::new(),
             },
-            binding: Some(binding.to_string()),
+            binding: Some(RelativeBindingName::new(binding)),
             dependency_bindings: Default::default(),
             module_name: "test_module".to_string(),
             instance: binding.to_string(),
-            call_path: Default::default(),
+            call_path: AuthoredCompositionCallPath::direct(AuthoredCompositionCall {
+                id: crate::parser::ModuleCallId::test_dummy_in(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+                ),
+                module_name: "test_module".to_string(),
+                binding: Some(RelativeBindingName::new(binding)),
+                instance: binding.to_string(),
+                module_source: None,
+                module_directory: None,
+                loop_origin: None,
+            }),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -2860,13 +3056,20 @@ let existing = read aws.ec2.Vpc {
         let mut parsed = parse("", &Default::default()).expect("parse");
         parsed.compositions.push(composition("instance"));
         parsed.wait_bindings.push(WaitBinding {
-            binding: BindingName::from("ready"),
-            target: BindingName::from("instance"),
+            binding: RelativeBindingName::from("ready"),
+            target: RelativeBindingName::from("instance"),
             until_raw: "instance.target_group_arn == 'ready'".to_string(),
-            until_predicate: UntilPredicateAst {
-                lhs_segments: vec!["instance".to_string(), "target_group_arn".to_string()],
-                rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
-            },
+            until_predicate:
+                UntilPredicateAst {
+                    root: RelativeBindingName::new("instance"),
+                    attribute_segments: vec!["target_group_arn".to_string()],
+                    rhs: crate::resource::Value::<
+                        crate::resource::NoPlaceholder,
+                        RelativeBindingName,
+                    >::Concrete(crate::resource::ConcreteValue::String(
+                        "ready".into(),
+                    )),
+                },
             timeout_secs: None,
             depends_on: Vec::new(),
             line: 1,
@@ -3086,20 +3289,20 @@ let vpc = aws.ec2.Vpc {
     #[derive(Clone)]
     struct ChainType {
         name: &'static str,
-        attr: AttributeType,
+        attr: crate::schema::AttributeType,
         declaration: Option<TypeExpr>,
     }
 
     fn composition_chain_type_universe() -> Vec<ChainType> {
-        let string = AttributeType::string();
-        let bool_ = AttributeType::bool();
-        let vpc_id = AttributeType::refined_string(
+        let string = crate::schema::AttributeType::string();
+        let bool_ = crate::schema::AttributeType::bool();
+        let vpc_id = crate::schema::AttributeType::refined_string(
             Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
             None,
             None,
             None,
         );
-        let security_group_id = AttributeType::refined_string(
+        let security_group_id = crate::schema::AttributeType::refined_string(
             Some(TypeIdentity::from_schema_type(
                 "aws",
                 "ec2.SecurityGroup",
@@ -3123,17 +3326,32 @@ let vpc = aws.ec2.Vpc {
             },
             ChainType {
                 name: "String(pattern=alpha)",
-                attr: AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None),
+                attr: crate::schema::AttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".to_string()),
+                    None,
+                    None,
+                ),
                 declaration: None,
             },
             ChainType {
                 name: "String(pattern=digits)",
-                attr: AttributeType::refined_string(None, Some("^[0-9]+$".to_string()), None, None),
+                attr: crate::schema::AttributeType::refined_string(
+                    None,
+                    Some("^[0-9]+$".to_string()),
+                    None,
+                    None,
+                ),
                 declaration: None,
             },
             ChainType {
                 name: "String(length=..1024)",
-                attr: AttributeType::refined_string(None, None, Some((None, Some(1024))), None),
+                attr: crate::schema::AttributeType::refined_string(
+                    None,
+                    None,
+                    Some((None, Some(1024))),
+                    None,
+                ),
                 declaration: None,
             },
             ChainType {
@@ -3162,27 +3380,29 @@ let vpc = aws.ec2.Vpc {
             },
             ChainType {
                 name: "List<String>",
-                attr: AttributeType::list(string.clone()),
+                attr: crate::schema::AttributeType::list(string.clone()),
                 declaration: Some(TypeExpr::List(Box::new(TypeExpr::String))),
             },
             ChainType {
                 name: "List<String(pattern=alpha)>",
-                attr: AttributeType::list(AttributeType::refined_string(
-                    None,
-                    Some("^[a-z]+$".to_string()),
-                    None,
-                    None,
-                )),
+                attr: crate::schema::AttributeType::list(
+                    crate::schema::AttributeType::refined_string(
+                        None,
+                        Some("^[a-z]+$".to_string()),
+                        None,
+                        None,
+                    ),
+                ),
                 declaration: None,
             },
             ChainType {
                 name: "Map<String>",
-                attr: AttributeType::map(string.clone()),
+                attr: crate::schema::AttributeType::map(string.clone()),
                 declaration: Some(TypeExpr::Map(Box::new(TypeExpr::String))),
             },
             ChainType {
                 name: "Union<String | Bool>",
-                attr: AttributeType::union(vec![string, bool_]),
+                attr: crate::schema::AttributeType::union(vec![string, bool_]),
                 declaration: Some(TypeExpr::Union(vec![TypeExpr::String, TypeExpr::Bool])),
             },
         ]
@@ -3195,6 +3415,13 @@ let vpc = aws.ec2.Vpc {
     #[test]
     fn composition_attribute_chain_requires_declared_and_inferred_types() {
         let universe = composition_chain_type_universe();
+        let compiled = crate::schema::ValidatedConfigSchema::validate(
+            universe
+                .iter()
+                .map(|ty| (ty.name.to_string(), ty.attr.clone()))
+                .collect(),
+        )
+        .unwrap();
 
         for actual in &universe {
             for declared in &universe {
@@ -3217,8 +3444,8 @@ let vpc = aws.ec2.Vpc {
                 let mut registry = SchemaRegistry::new();
                 registry.insert(
                     "test",
-                    (ResourceSchema::new("source.Node").attribute(
-                        AttributeSchema::optional("value", actual.attr.clone()).build(),
+                    (PatternResourceSchema::new("source.Node").attribute(
+                        PatternAttributeSchema::optional("value", actual.attr.clone()).build(),
                     ))
                     .validate()
                     .expect("schema fixture must be valid"),
@@ -3234,12 +3461,17 @@ let vpc = aws.ec2.Vpc {
 
                 for sink in &universe {
                     let accepted = chain
-                        .is_assignable_to_sink(TypeInSchema::schemaless(&sink.attr))
+                        .is_assignable_to_sink(TypeInSchema::schemaless(
+                            &compiled.parts()[sink.name],
+                        ))
                         .is_ok();
-                    let actual_accepts = TypeInSchema::schemaless(&actual.attr)
-                        .is_assignable_to(TypeInSchema::schemaless(&sink.attr));
-                    let declared_accepts = TypeInSchema::schemaless(&declared.attr)
-                        .is_assignable_to(TypeInSchema::schemaless(&sink.attr));
+                    let actual_accepts = TypeInSchema::schemaless(&compiled.parts()[actual.name])
+                        .is_assignable_to(TypeInSchema::schemaless(&compiled.parts()[sink.name]));
+                    let declared_accepts =
+                        TypeInSchema::schemaless(&compiled.parts()[declared.name])
+                            .is_assignable_to(TypeInSchema::schemaless(
+                                &compiled.parts()[sink.name],
+                            ));
                     assert!(
                         !accepted || (actual_accepts && declared_accepts),
                         "checker accepted {} ->(declared {})→ {}, but direct constraints were actual={} declared={}",
@@ -3278,7 +3510,8 @@ let vpc = aws.ec2.Vpc {
         let registry = SchemaRegistry::new();
         let index = BindingIndex::from_parsed(&parsed, &registry);
 
-        let RefType::Typed(name) = index.ref_type("name") else {
+        let name_binding = RelativeBindingName::new("name");
+        let RefType::Typed(name) = index.ref_type(&name_binding) else {
             panic!("bare module argument must resolve to its declared type");
         };
         assert_eq!(name.display_type_name(), "String");
@@ -3302,7 +3535,8 @@ let vpc = aws.ec2.Vpc {
         let registry = SchemaRegistry::new();
         let index = BindingIndex::from_parsed(&parsed, &registry);
 
-        let RefType::Typed(vpc) = index.ref_type("vpc") else {
+        let vpc_binding = RelativeBindingName::new("vpc");
+        let RefType::Typed(vpc) = index.ref_type(&vpc_binding) else {
             panic!("Ref-typed module argument must resolve to a resource handle");
         };
         let same = crate::validation::lift_type_expr(&TypeExpr::Ref(ResourceTypePath::new(
@@ -3351,7 +3585,8 @@ let vpc = aws.ec2.Vpc {
         let registry = registry_with_vpc();
         let index = BindingIndex::from_parsed(&parsed, &registry);
 
-        let RefType::Typed(vpc) = index.ref_type("vpc") else {
+        let vpc_binding = RelativeBindingName::new("vpc");
+        let RefType::Typed(vpc) = index.ref_type(&vpc_binding) else {
             panic!("a bare resource binding must resolve to its resource-handle type");
         };
         assert_eq!(vpc.display_type_name(), "aws.ec2.Vpc");
@@ -3361,11 +3596,11 @@ let vpc = aws.ec2.Vpc {
     fn ref_type_resolves_upstream_export_and_reports_missing_export() {
         let mut parsed = parse("", &Default::default()).expect("parse");
         parsed.upstream_states.push(UpstreamState {
-            binding: "up".to_string(),
+            binding: RelativeBindingName::new("up"),
             source: "../upstream".into(),
         });
         let exports = HashMap::from([(
-            "up".to_string(),
+            RelativeBindingName::new("up"),
             HashMap::from([(
                 "vpc".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
@@ -3407,11 +3642,11 @@ let vpc = aws.ec2.Vpc {
     fn ref_type_leaves_inferred_but_unannotated_upstream_export_unchecked() {
         let mut parsed = parse("", &Default::default()).expect("parse");
         parsed.upstream_states.push(UpstreamState {
-            binding: "up".to_string(),
+            binding: RelativeBindingName::new("up"),
             source: "../upstream".into(),
         });
         let exports = HashMap::from([(
-            "up".to_string(),
+            RelativeBindingName::new("up"),
             HashMap::from([(
                 "opaque".to_string(),
                 crate::upstream_exports::UpstreamExportEntry {
@@ -3437,7 +3672,7 @@ let vpc = aws.ec2.Vpc {
     fn ref_type_leaves_unloadable_upstream_binding_unchecked() {
         let mut parsed = parse("", &Default::default()).expect("parse");
         parsed.upstream_states.push(UpstreamState {
-            binding: "up".to_string(),
+            binding: RelativeBindingName::new("up"),
             source: "../missing".into(),
         });
         let exports = HashMap::new();
@@ -3452,7 +3687,7 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_forwarded_composition_cycle_is_unchecked() {
-        let make_forwarder = |binding: &'static str, target: &str| LiveComposition {
+        let make_forwarder = |binding: &'static str, target: &str| AuthoredLiveComposition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", binding,
             )),
@@ -3466,11 +3701,21 @@ let vpc = aws.ec2.Vpc {
                 },
                 pending_constraints: Vec::new(),
             },
-            binding: Some(binding.to_string()),
+            binding: Some(RelativeBindingName::new(binding)),
             dependency_bindings: Default::default(),
             module_name: "cycle".to_string(),
             instance: binding.to_string(),
-            call_path: Default::default(),
+            call_path: AuthoredCompositionCallPath::direct(AuthoredCompositionCall {
+                id: crate::parser::ModuleCallId::test_dummy_in(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+                ),
+                module_name: "cycle".to_string(),
+                binding: Some(RelativeBindingName::new(binding)),
+                instance: binding.to_string(),
+                module_source: None,
+                module_directory: None,
+                loop_origin: None,
+            }),
             quoted_string_attrs: Default::default(),
         };
         let mut parsed = parse("", &Default::default()).expect("parse");
@@ -3491,13 +3736,18 @@ mod resolved_bindings_tests {
     use super::*;
     use crate::data_source_value::{DataSourceValue, DataSourceValues};
     use crate::resource::{
-        ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue, PartialReadMarker,
-        PendingReRead, Resource, ResourceId, State, Value,
+        ApplyTimeUnknown, ExpandedConcreteValue as ConcreteValue, ExpandedDataSource as DataSource,
+        ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource,
+        ExpandedValue as Value, PartialReadMarker, PendingReRead, ResourceId, RootScope, State,
     };
     use std::collections::BTreeSet;
 
     fn secret_preserving(attributes: &HashMap<String, Value>) -> SecretPreservingAttributes {
         SecretPreservingAttributes::from_provider_values(attributes, attributes)
+    }
+
+    fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(binding))
     }
 
     fn test_data_source_values(
@@ -3519,7 +3769,7 @@ mod resolved_bindings_tests {
     ) -> Resource {
         let mut r = Resource::new("test.resource", name);
         r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        r.binding = binding.map(|b| b.to_string());
+        r.binding = binding.map(absolute_binding);
         r
     }
 
@@ -3628,10 +3878,7 @@ mod resolved_bindings_tests {
         let b = make_resource(
             "b",
             Some("b"),
-            vec![(
-                "target",
-                Value::resource_ref("a".to_string(), "dns_name".to_string(), vec![]),
-            )],
+            vec![("target", Value::root_resource_ref("a", "dns_name", vec![]))],
         );
         let mut partial_a =
             State::existing(id_a.clone(), HashMap::new()).with_identifier("aws-id-A");
@@ -4089,8 +4336,8 @@ mod resolved_bindings_tests {
 
     fn wait_spec(binding: &str, target: &str) -> WaitAliasSpec {
         WaitAliasSpec {
-            binding: BindingName::new(binding),
-            target: BindingName::new(target),
+            binding: absolute_binding(binding),
+            target: absolute_binding(target),
         }
     }
 
@@ -4128,7 +4375,7 @@ mod resolved_bindings_tests {
         assert_eq!(
             resolved.source("cert_issued"),
             Some(&BindingValueSource::WaitAlias {
-                target: BindingName::new("cert")
+                target: absolute_binding("cert")
             }),
             "source must record the wait→target edge, not flatten to Local"
         );
@@ -4278,7 +4525,7 @@ mod resolved_bindings_tests {
         let ds_id = ResourceId::with_identity("aws.iam.Roles", "admin_access_roles");
         let mut ds = DataSource::new("aws.iam.Roles", "admin_access_roles");
         ds.id = ds_id.clone();
-        ds.binding = Some("admin_access_roles".to_string());
+        ds.binding = Some(absolute_binding("admin_access_roles"));
         ds.attributes.insert(
             "path_prefix".to_string(),
             Value::Concrete(ConcreteValue::String(
@@ -4359,7 +4606,7 @@ mod resolved_bindings_tests {
         let id = ResourceId::with_identity("test.Lookup", "lookup");
         let mut data_source = DataSource::new("test.Lookup", "lookup");
         data_source.id = id.clone();
-        data_source.binding = Some("lookup".to_string());
+        data_source.binding = Some(absolute_binding("lookup"));
         let states = HashMap::from([(id.clone(), State::not_found(id))]);
 
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
@@ -4377,7 +4624,7 @@ mod resolved_bindings_tests {
 
         let fallback = Value::Concrete(ConcreteValue::String("fallback".into()));
         let expression = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("lookup", "result", Vec::new())),
+            value: Box::new(Value::root_resource_ref("lookup", "result", Vec::new())),
             default: Box::new(fallback.clone()),
         });
         assert_eq!(
@@ -4391,7 +4638,7 @@ mod resolved_bindings_tests {
         let id = ResourceId::with_identity("aws.sts.CallerIdentity", "caller");
         let mut data_source = DataSource::new("aws.sts.CallerIdentity", "caller");
         data_source.id = id.clone();
-        data_source.binding = Some("caller".to_string());
+        data_source.binding = Some(absolute_binding("caller"));
         let data_source_states = HashMap::from([(
             id.clone(),
             State::existing(
@@ -4438,7 +4685,7 @@ mod resolved_bindings_tests {
         let ds_id = ResourceId::with_identity("aws.example.Echo", "echo");
         let mut ds = DataSource::new("aws.example.Echo", "echo");
         ds.id = ds_id.clone();
-        ds.binding = Some("echo".to_string());
+        ds.binding = Some(absolute_binding("echo"));
         ds.attributes.insert(
             "filter".to_string(),
             Value::Concrete(ConcreteValue::String("dsl-input".into())),
@@ -4494,7 +4741,7 @@ mod resolved_bindings_tests {
         let ds_id = ResourceId::with_provider_identity("aws", "sts.CallerIdentity", "caller", None);
         let mut ds = DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None);
         ds.id = ds_id.clone();
-        ds.binding = Some("caller".to_string());
+        ds.binding = Some(absolute_binding("caller"));
         assert!(
             ds.attributes.is_empty(),
             "this test covers the no-DSL-input shape",
@@ -4682,9 +4929,6 @@ let chosen = if true { "primary" } else { "fallback" }
 "#;
         let parsed = parsed_with(src);
         let names = BindingNameSet::from_parsed(&parsed);
-        let parsed = parsed
-            .into_expanded()
-            .expect("structural binding fixture contains no parser placeholders");
 
         // Scope-side: `chosen` is in scope as a Structural kind.
         assert!(
@@ -4697,7 +4941,7 @@ let chosen = if true { "primary" } else { "fallback" }
         // Value-side: `ResolvedBindings` does NOT carry an entry for
         // `chosen`, so a `ResourceRef` to `chosen.foo` cannot resolve.
         let resolved = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
-            managed: &parsed.resources,
+            managed: &[],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
@@ -4737,7 +4981,7 @@ let cert_issued = wait cert {
         assert_eq!(
             names.kind("cert_issued"),
             Some(&BindingNameKind::Wait {
-                target: BindingName::new("cert")
+                target: RelativeBindingName::new("cert")
             }),
             "wait binding must carry its typed target edge"
         );

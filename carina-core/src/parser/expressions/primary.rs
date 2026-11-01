@@ -17,7 +17,8 @@ use crate::parser::{
     parse_expression_eval_with_mode,
 };
 use crate::resource::{
-    AccessMissPolicy, AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript,
+    AccessMissPolicy, AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
+    AuthoredDeferredValue as DeferredValue, PathSegment, RelativeBindingName, Subscript,
     ValuePathSegmentResult, ValueString, apply_value_path_segment,
 };
 use indexmap::IndexMap;
@@ -130,13 +131,16 @@ pub(crate) fn apply_postfix_path_segment(
             let binding = handle.canonical_binding_name();
             if let PathSegment::Subscript { index } = &step {
                 let binding = match index {
-                    Subscript::Int { index } => format!("{binding}[{index}]"),
-                    Subscript::Str { key } => {
-                        crate::utils::map_key_address(binding, key.expose_plaintext())
-                    }
+                    Subscript::Int { index } => ValueString::plain(format!("{binding}[{index}]")),
+                    Subscript::Str { key } => ValueString::derived_from(
+                        crate::utils::map_key_address(binding, key.expose_plaintext()),
+                        [key],
+                    ),
                 };
                 return Ok(EvalValue::from_value(Value::Deferred(
-                    DeferredValue::BindingRef { binding },
+                    DeferredValue::BindingRef {
+                        binding: RelativeBindingName::new(binding),
+                    },
                 )));
             }
             handle.access_base_value()
@@ -273,7 +277,13 @@ fn parse_namespaced_id_value(
             })
             .collect();
         segments.extend(trailing_segments);
-        let path = AccessPath::with_segments(parts[0].to_string(), parts[1].to_string(), segments);
+        let path = AccessPath::with_segments_at_source(
+            parts[0].to_string(),
+            parts[1].to_string(),
+            segments,
+            ctx.source_file(),
+            line,
+        );
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
@@ -291,10 +301,12 @@ fn parse_namespaced_id_value(
                 })
                 .collect();
             segments.extend(trailing_segments);
-            let path = AccessPath::with_segments(
+            let path = AccessPath::with_segments_at_source(
                 handle.canonical_binding_name().to_string(),
                 parts[1].to_string(),
                 segments,
+                ctx.source_file(),
+                line,
             );
             return Ok(EvalValue::from_value(Value::Deferred(
                 DeferredValue::ResourceRef { path },
@@ -820,7 +832,7 @@ pub(crate) fn parse_primary_eval_with_mode(
                     ) {
                         return Ok(EvalValue::from_value(Value::Deferred(
                             DeferredValue::BindingRef {
-                                binding: binding_name.into_plaintext(),
+                                binding: RelativeBindingName::new(binding_name),
                             },
                         )));
                     }
@@ -837,7 +849,7 @@ pub(crate) fn parse_primary_eval_with_mode(
                         }
                         ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => Ok(
                             EvalValue::from_value(Value::Deferred(DeferredValue::BindingRef {
-                                binding: binding_name.into_plaintext(),
+                                binding: RelativeBindingName::new(binding_name),
                             })),
                         ),
                     }

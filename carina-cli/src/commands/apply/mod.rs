@@ -35,8 +35,11 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
+#[cfg(test)]
+use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
-    LoadedProviderContext, ProviderConfig, ProviderContext, ResolvedProviderConfigs,
+    ExpandedProviderConfig, ExpandedUpstreamState, LoadedProviderContext, ProviderContext,
+    ResolvedProviderConfigs,
 };
 
 use super::{DriftCommand, verify_for_mutation};
@@ -73,7 +76,8 @@ use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
 use crate::error::{
-    AppError, SavedPlanDirectiveChangesMismatchError, SavedPlanSecretVerificationError,
+    AppError, PlanFileJsonError, SavedPlanDirectiveChangesMismatchError,
+    SavedPlanSecretVerificationError,
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
@@ -622,7 +626,7 @@ async fn execute_effects_with_observer(
     plan: &Plan,
     provider: &ProviderRouter,
     normalizer: &dyn ProviderNormalizer,
-    provider_configs: &[ProviderConfig],
+    provider_configs: &[ExpandedProviderConfig],
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
@@ -676,7 +680,7 @@ async fn execute_rehydrated_saved_plan(
     plan_file: &ExecutablePlanFile,
     provider: &ProviderRouter,
     normalizer: &dyn ProviderNormalizer,
-    provider_configs: &[ProviderConfig],
+    provider_configs: &[ExpandedProviderConfig],
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
     bindings: &mut ResolvedBindings,
@@ -730,11 +734,10 @@ async fn verify_upstream_snapshot(
     snapshot: &HashMap<String, HashMap<String, Value>>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    use carina_core::parser::UpstreamState;
     let project_dir = apply_target.source_dir();
-    let upstream_states: Vec<UpstreamState> = sources
+    let upstream_states: Vec<ExpandedUpstreamState> = sources
         .iter()
-        .map(|s| UpstreamState {
+        .map(|s| ExpandedUpstreamState {
             binding: s.binding.clone(),
             source: s.source.clone(),
         })
@@ -2647,8 +2650,8 @@ async fn run_apply_locked_canonical(
 }
 
 fn ensure_saved_plan_backend_matches_current(
-    plan_backend_config: Option<&carina_core::parser::BackendConfig>,
-    current_backend_config: Option<&carina_core::parser::BackendConfig>,
+    plan_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
+    current_backend_config: Option<&carina_core::parser::ExpandedBackendConfig>,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
     let planned = BackendLock::for_config(plan_backend_config).map_err(AppError::Backend)?;
@@ -2679,7 +2682,7 @@ impl<S> SavedPlanResourceLike for carina_core::resource::Resource<S> {
     }
 
     fn binding(&self) -> Option<&str> {
-        self.binding.as_deref()
+        self.binding.as_ref().map(|binding| binding.as_str())
     }
 
     fn attributes(&self) -> &indexmap::IndexMap<String, Value> {
@@ -2693,7 +2696,7 @@ impl<S> SavedPlanResourceLike for carina_core::resource::DataSource<S> {
     }
 
     fn binding(&self) -> Option<&str> {
-        self.binding.as_deref()
+        self.binding.as_ref().map(|binding| binding.as_str())
     }
 
     fn attributes(&self) -> &indexmap::IndexMap<String, Value> {
@@ -3165,12 +3168,14 @@ async fn run_apply_from_plan_with_observer_factory(
         });
     }
 
-    let plan_file: PlanFile =
-        serde_json::from_slice(&bytes).map_err(|error| AppError::CorruptPlanFile {
-            path: plan_path.to_path_buf(),
-            replan_command,
-            error,
-        })?;
+    let plan_file: PlanFile = (|| {
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        let plan_file = serde_path_to_error::deserialize(&mut deserializer)
+            .map_err(PlanFileJsonError::from_path_error)?;
+        deserializer.end().map_err(PlanFileJsonError::at_root)?;
+        Ok::<PlanFile, PlanFileJsonError>(plan_file)
+    })()
+    .map_err(|error| AppError::corrupt_plan_file(plan_path.to_path_buf(), replan_command, error))?;
     let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let apply_target = ApplyTarget::SavedPlan {
         plan_file: plan_path,
@@ -3232,7 +3237,7 @@ async fn run_apply_from_plan_with_observer_factory(
                 .ok()
                 .map(|config| {
                     config
-                        .parsed
+                        .into_root_expanded()
                         .backend
                         .map(carina_core::parser::BackendConfig::into_expanded)
                         .transpose()
@@ -3247,17 +3252,6 @@ async fn run_apply_from_plan_with_observer_factory(
             let current_config = loaded_current_config.map_err(|source| {
                 saved_plan_secret_evaluation_error(AppError::Config(source), apply_target)
             })?;
-            let parsed_backend = Some(
-                current_config
-                    .parsed
-                    .backend
-                    .clone()
-                    .map(carina_core::parser::BackendConfig::into_expanded)
-                    .transpose()
-                    .map_err(|source| {
-                        saved_plan_secret_evaluation_error(source.into(), apply_target)
-                    })?,
-            );
             let parsed = current_config.parsed;
             let unresolved = current_config.unresolved_parsed;
             let duplicate_declarations = current_config.duplicate_declarations;
@@ -3270,6 +3264,7 @@ async fn run_apply_from_plan_with_observer_factory(
                     &duplicate_declarations,
                 )
                 .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
+            let parsed_backend = Some(providers.parsed().backend.clone());
             (
                 ProviderBoundPlanFile::needs_secret_verification(plan, providers),
                 parsed_backend,
@@ -3609,8 +3604,8 @@ async fn run_apply_from_plan_locked_owned(
                     .wait_bindings()
                     .iter()
                     .map(|wb| WaitAliasSpec {
-                        binding: carina_core::parser::BindingName::new(wb.binding.clone()),
-                        target: carina_core::parser::BindingName::new(wb.target.clone()),
+                        binding: wb.binding.clone(),
+                        target: wb.target.clone(),
                     })
                     .collect();
                 let terminal_input_current = carina_core::resource::into_plan_input_current_map(
@@ -3731,15 +3726,16 @@ async fn run_apply_from_plan_locked_owned(
             // Rebuild the wait passthrough aliases from the persisted
             // `(binding, target)` pairs so `apply --plan`'s cascade
             // re-resolution resolves `<wait-binding>.<attr>` exactly as the
-            // plan path did (carina#3085). `PlanWaitBinding` (String) →
-            // `WaitAliasSpec` (typed `BindingName`); the parser `WaitBinding`
+            // plan path did (carina#3085). `PlanWaitBinding` and
+            // `WaitAliasSpec<AbsoluteBindingAddress>` both retain absolute
+            // binding addresses; the parser `WaitBinding`
             // is not serializable so it is reconstructed here, not deserialized.
             let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
                 .wait_bindings()
                 .iter()
                 .map(|wb| WaitAliasSpec {
-                    binding: carina_core::parser::BindingName::new(wb.binding.clone()),
-                    target: carina_core::parser::BindingName::new(wb.target.clone()),
+                    binding: wb.binding.clone(),
+                    target: wb.target.clone(),
                 })
                 .collect();
             // carina#3248: saved plans (version 4) persist both

@@ -1,22 +1,28 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::resource::{ConcreteValue, DataSource, ResolvedResource, Resource, Value};
+use crate::resource::{
+    DataSource, ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value,
+    RelativeBindingName, ResolvedResource, Resource, RootScope,
+};
 use crate::wait::predicate::{AttrPath, WaitPredicate};
 use crate::wait::{BindingPattern, WaitTargetLookup, resolve_wait_target};
 
 fn managed(identity: &'static str, binding: Option<&'static str>) -> ResolvedResource {
-    let resource = Resource::with_provider("aws", "test.Resource", identity, None);
+    let resource: Resource = Resource::with_provider("aws", "test.Resource", identity, None);
     ResolvedResource::new(match binding {
-        Some(binding) => resource.with_binding(binding),
+        Some(binding) => resource.with_root_binding(binding),
         None => resource,
     })
 }
 
 fn data_source(identity: &'static str, binding: Option<&'static str>) -> DataSource {
-    let resource = DataSource::with_provider("aws", "test.Lookup", identity, None);
+    let mut resource: DataSource = DataSource::with_provider("aws", "test.Lookup", identity, None);
     match binding {
-        Some(binding) => resource.with_binding(binding),
+        Some(binding) => {
+            resource.binding = Some(RootScope::new().resolve(RelativeBindingName::new(binding)));
+            resource
+        }
         None => resource,
     }
 }

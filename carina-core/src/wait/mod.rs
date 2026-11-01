@@ -68,13 +68,13 @@ pub(crate) fn resolve_wait_target(
 ) -> WaitTargetLookup {
     if let Some(resource) = managed
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some(target))
+        .find(|resource| resource.binding.as_ref().map(|binding| binding.as_str()) == Some(target))
     {
         return WaitTargetLookup::Managed(ManagedWaitTarget::new(resource));
     }
     if data_sources
         .iter()
-        .any(|resource| resource.binding.as_deref() == Some(target))
+        .any(|resource| resource.binding.as_ref().map(|binding| binding.as_str()) == Some(target))
     {
         return WaitTargetLookup::DataSource;
     }

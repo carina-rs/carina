@@ -7,22 +7,29 @@ use crate::parser::{
     LoadedProviderContext, ProviderContext, TypeExpr, validate_custom_type,
     validate_schema_custom_type_with_context,
 };
-use crate::resource::{ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind, Value};
+use crate::resource::{
+    BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind,
+    RelativeBindingName, Value,
+};
 
 /// Static authority available while checking deferred computed values.
 /// Callers without a binding/schema view must say so explicitly rather than
 /// passing empty registries that look authoritative.
-pub enum TypecheckInference<'a, P: PlaceholderKind = NoPlaceholder> {
+pub enum TypecheckInference<
+    'a,
+    P: PlaceholderKind = NoPlaceholder,
+    B: BindingAddress = RelativeBindingName,
+> {
     Available {
-        bindings: &'a super::inference::InferenceBindings<P>,
+        bindings: &'a super::inference::InferenceBindings<P, B>,
         schemas: &'a crate::schema::SchemaRegistry,
     },
     Unavailable,
 }
 
-impl<P: PlaceholderKind> Copy for TypecheckInference<'_, P> {}
+impl<P: PlaceholderKind, B: BindingAddress> Copy for TypecheckInference<'_, P, B> {}
 
-impl<P: PlaceholderKind> Clone for TypecheckInference<'_, P> {
+impl<P: PlaceholderKind, B: BindingAddress> Clone for TypecheckInference<'_, P, B> {
     fn clone(&self) -> Self {
         *self
     }
@@ -62,11 +69,11 @@ impl<'a> TypecheckProviderContext<'a> {
         }
     }
 
-    pub(crate) fn check<P: PlaceholderKind>(
+    pub(crate) fn check<P: PlaceholderKind, B: BindingAddress>(
         self,
         expected: &TypeExpr,
-        value: &Value<P>,
-        inference: TypecheckInference<'_, P>,
+        value: &Value<P, B>,
+        inference: TypecheckInference<'_, P, B>,
     ) -> Result<(), TypeExprValueError> {
         match self {
             Self::Loaded(config) => check_type_expr_value(expected, value, config, inference),
@@ -193,11 +200,11 @@ impl fmt::Display for TypeExprValueError {
 ///
 /// Unresolved values defer until the binding/reference validation or
 /// evaluation phase that has their types.
-pub fn check_type_expr_value<P: PlaceholderKind>(
+pub fn check_type_expr_value<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value<P>,
+    value: &Value<P, B>,
     config: &LoadedProviderContext,
-    inference: TypecheckInference<'_, P>,
+    inference: TypecheckInference<'_, P, B>,
 ) -> Result<(), TypeExprValueError> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -213,11 +220,11 @@ pub fn check_type_expr_value<P: PlaceholderKind>(
 /// Structural checks and provider-independent leaves run normally. A
 /// provider-owned custom-type leaf is accepted only after its scalar shape is
 /// checked; the provider resolver is never called.
-pub fn check_type_expr_value_providerless<P: PlaceholderKind>(
+pub fn check_type_expr_value_providerless<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value<P>,
+    value: &Value<P, B>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_, P>,
+    inference: TypecheckInference<'_, P, B>,
 ) -> Result<(), TypeExprValueError> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -236,11 +243,11 @@ enum ProviderCustomTypeValidation {
 
 /// Raw parser seam retaining main's historical unloaded-context behaviour.
 /// Public validation callers must use a witness-carrying entry point above.
-fn check_type_expr_value_inner<P: PlaceholderKind>(
+fn check_type_expr_value_inner<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value<P>,
+    value: &Value<P, B>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_, P>,
+    inference: TypecheckInference<'_, P, B>,
 ) -> Result<(), TypeExprValueError> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -251,11 +258,11 @@ fn check_type_expr_value_inner<P: PlaceholderKind>(
     )
 }
 
-fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
+fn check_type_expr_value_inner_with_mode<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value<P>,
+    value: &Value<P, B>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_, P>,
+    inference: TypecheckInference<'_, P, B>,
     provider_custom_types: ProviderCustomTypeValidation,
 ) -> Result<(), TypeExprValueError> {
     match value {
@@ -586,16 +593,19 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
 /// Internal parser seam. Parser-produced bootstrap types defer before this
 /// function; public validation and resolver APIs must use one of the witness-
 /// carrying entry points above.
-pub(crate) fn check_type_expr_value_with_context<P: PlaceholderKind>(
+pub(crate) fn check_type_expr_value_with_context<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value<P>,
+    value: &Value<P, B>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_, P>,
+    inference: TypecheckInference<'_, P, B>,
 ) -> Result<(), TypeExprValueError> {
     check_type_expr_value_inner(expected, value, config, inference)
 }
 
-fn mismatch<P: PlaceholderKind>(expected: &TypeExpr, value: &Value<P>) -> TypeExprValueError {
+fn mismatch<P: PlaceholderKind, B: BindingAddress>(
+    expected: &TypeExpr,
+    value: &Value<P, B>,
+) -> TypeExprValueError {
     let hint = matches!(
         (expected, value),
         (TypeExpr::Bool, Value::Concrete(ConcreteValue::String(_)))
@@ -610,9 +620,9 @@ fn mismatch<P: PlaceholderKind>(expected: &TypeExpr, value: &Value<P>) -> TypeEx
     }
 }
 
-fn validation_mismatch<P: PlaceholderKind>(
+fn validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value<P>,
+    value: &Value<P, B>,
     message: String,
 ) -> TypeExprValueError {
     TypeExprValueError::Mismatch {
@@ -625,9 +635,9 @@ fn validation_mismatch<P: PlaceholderKind>(
     }
 }
 
-fn custom_type_validation_mismatch<P: PlaceholderKind>(
+fn custom_type_validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
-    value: &Value<P>,
+    value: &Value<P, B>,
     error: crate::parser::CustomTypeValidationError,
 ) -> TypeExprValueError {
     TypeExprValueError::CustomTypeValidation {
@@ -638,9 +648,9 @@ fn custom_type_validation_mismatch<P: PlaceholderKind>(
     }
 }
 
-fn identified_scalar_shape_is_supported<P: PlaceholderKind>(
+fn identified_scalar_shape_is_supported<P: PlaceholderKind, B: BindingAddress>(
     identity: &crate::schema::TypeIdentity,
-    value: &Value<P>,
+    value: &Value<P, B>,
     config: &ProviderContext,
     owner_routed: bool,
 ) -> bool {
@@ -824,11 +834,17 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
 /// Directional compatibility for a declared source flowing into a declared sink.
 #[cfg(test)]
 mod tests {
+    use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+
     use indexmap::IndexMap;
 
     use super::*;
     use crate::parser::ResourceTypePath;
-    use crate::resource::{ApplyTimeUnknown, CanonicalEnumValue, InterpolationPart};
+    use crate::resource::{
+        ApplyTimeUnknown, AuthoredConcreteValue as ConcreteValue,
+        AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
+        AuthoredValue as Value, CanonicalEnumValue, RelativeBindingName,
+    };
     use crate::schema::TypeIdentity;
 
     fn check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
@@ -1177,11 +1193,11 @@ mod tests {
         });
         let unknown = Value::Deferred(DeferredValue::Unknown(
             ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".to_string(),
+                binding: RelativeBindingName::new("upstream"),
             },
         ));
         let untyped_binding = Value::Deferred(DeferredValue::BindingRef {
-            binding: "outside".to_string(),
+            binding: "outside".into(),
         });
 
         for expected in all_type_shapes() {
@@ -1293,9 +1309,15 @@ mod tests {
                         return Ok(());
                     }
                     let text = match value {
-                        Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext(),
-                        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => value.as_str(),
-                        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => value.api_value(),
+                        crate::resource::ExpandedValue::Concrete(
+                            crate::resource::ExpandedConcreteValue::String(value),
+                        ) => value.expose_plaintext(),
+                        crate::resource::ExpandedValue::Concrete(
+                            crate::resource::ExpandedConcreteValue::EnumIdentifier(value),
+                        ) => value.as_str(),
+                        crate::resource::ExpandedValue::Concrete(
+                            crate::resource::ExpandedConcreteValue::CanonicalEnum(value),
+                        ) => value.api_value(),
                         _ => {
                             return Err(crate::parser::fixture_custom_type_rejection(
                                 target,
@@ -1370,7 +1392,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
-        let declared_type = crate::schema::AttributeType::enum_(
+        let declared_type = crate::schema::CompiledAttributeType::enum_(
             identity.clone(),
             Some(vec!["API_VALUE".to_string()]),
             vec![("API_VALUE".to_string(), "dsl_value".to_string())],
@@ -1420,7 +1442,12 @@ mod tests {
                 Default::default(),
                 Box::new(|target, value| {
                     if target.identity().kind == "PositiveInt"
-                        && matches!(value, Value::Concrete(ConcreteValue::Int(value)) if *value > 0)
+                        && matches!(
+                            value,
+                            crate::resource::ExpandedValue::Concrete(
+                                crate::resource::ExpandedConcreteValue::Int(value)
+                            ) if *value > 0
+                        )
                     {
                         Ok(())
                     } else {
@@ -1455,25 +1482,23 @@ mod tests {
 
     #[test]
     fn native_refined_int_typecheck_preserves_the_integer_value() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+        use crate::schema::legacy_validator;
 
         fn schema(identity: TypeIdentity, accepted: i64) -> crate::schema::ValidatedResourceSchema {
-            ResourceSchema::new(format!("test.number_{accepted}"))
+            PatternResourceSchema::new(format!("test.number_{accepted}"))
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "value",
-                        AttributeType::refined_int_with_validator(
+                        PatternAttributeType::refined_int_with_validator(
                             identity,
                             None,
                             legacy_validator(move |value| match value {
-                                Value::Concrete(ConcreteValue::Int(value))
-                                    if *value == accepted =>
-                                {
-                                    Ok(())
-                                }
-                                Value::Concrete(ConcreteValue::Int(value)) => {
-                                    Err(format!("expected {accepted}, got {value}"))
-                                }
+                                crate::resource::ExpandedValue::Concrete(
+                                    crate::resource::ExpandedConcreteValue::Int(value),
+                                ) if *value == accepted => Ok(()),
+                                crate::resource::ExpandedValue::Concrete(
+                                    crate::resource::ExpandedConcreteValue::Int(value),
+                                ) => Err(format!("expected {accepted}, got {value}")),
                                 _ => Err("Expected integer".to_string()),
                             }),
                         ),
@@ -1528,7 +1553,7 @@ mod tests {
         let bare_identity = TypeIdentity::bare("Mode");
         let schema_identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
         let enum_type = |identity| {
-            crate::schema::AttributeType::enum_(
+            crate::schema::CompiledAttributeType::enum_(
                 identity,
                 Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
                 vec![("Enabled".to_string(), "enabled".to_string())],

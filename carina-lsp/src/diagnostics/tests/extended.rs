@@ -1,7 +1,7 @@
 use super::*;
 use crate::backend::document_end_position;
 use carina_core::parser::TypeExpr;
-use carina_core::resource::Value;
+use carina_core::resource::AuthoredValue as Value;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
 const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
@@ -9,7 +9,7 @@ mutable attributes for multiple 'mock.test.resource' declarations using provider
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
 fn anonymous_loop_engine() -> DiagnosticEngine {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -28,6 +28,58 @@ fn anonymous_loop_engine() -> DiagnosticEngine {
         ))
         .validate()
         .expect("stable-identity fixture schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.identity")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .expect("declared-identity fixture schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.optional_identity")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .identity_when_present()
+                    .build(),
+            )
+            .validate()
+            .expect("when-present identity fixture schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.composite_identity")
+            .attribute(
+                AttributeSchema::optional("scope", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "identity_details",
+                    AttributeType::struct_(
+                        "IdentityDetails",
+                        vec![
+                            StructField::optional("name", AttributeType::string())
+                                .create_only()
+                                .identity()
+                                .build(),
+                        ],
+                    ),
+                )
+                .with_block_name("identity_detail")
+                .build(),
+            )
+            .validate()
+            .expect("composite identity fixture schema must be valid"),
     );
     custom_engine(schemas)
 }
@@ -182,6 +234,222 @@ fn anonymous_loop_identical_identity_diagnostic_has_exact_range() {
             .message
             .contains("to = mock.test.resource 'resource[1]'")
     );
+}
+
+#[test]
+fn anonymous_loop_missing_declared_identity_uses_the_loop_range() {
+    let source = "for ignored in ['one'] {\n  mock.test.identity {}\n}\n";
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 0), Position::new(2, 1))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resource of type 'mock.test.identity' cannot derive an address because ",
+            "identity value 'name' is not available as a written value or authored expression ",
+            "at plan time. Write the identity value or give the resource a name with `let`.",
+        )
+    );
+}
+
+#[test]
+fn anonymous_secret_declared_identity_reports_the_shared_incomplete_error() {
+    let source = concat!(
+        "mock.test.identity {\n",
+        "  name = secret(\"must-not-reach-the-address-hash\")\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 0), Position::new(0, 18))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resource of type 'mock.test.identity' cannot derive an address because ",
+            "identity value 'name' is not available as a written value or authored expression ",
+            "at plan time. Write the identity value or give the resource a name with `let`.",
+        )
+    );
+}
+
+#[test]
+fn anonymous_absent_when_present_identity_matches_validate_and_is_complete() {
+    let diagnostics = analyze_anonymous_loop_source("mock.test.optional_identity {}\n");
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("not available as a written value or authored expression")),
+        "validate accepts absence for when-present identity, so the LSP must too: {diagnostics:#?}",
+    );
+
+    let diagnostics = analyze_anonymous_loop_source(concat!(
+        "mock.test.optional_identity {\n",
+        "  name = secret(\"known only at apply\")\n",
+        "}\n",
+    ));
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+    assert!(
+        diagnostic.message.contains("identity value 'name'"),
+        "a written unknown must still report incomplete identity: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn anonymous_written_unknown_when_present_identity_matches_validate_error() {
+    let source = concat!(
+        "mock.test.optional_identity {\n",
+        "  name = secret(\"known only at apply\")\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resource of type 'mock.test.optional_identity' cannot derive an address ",
+            "because identity value 'name' is not available as a written value or authored ",
+            "expression at plan time. Write the identity value or give the resource a name with ",
+            "`let`.",
+        )
+    );
+}
+
+#[test]
+fn incomplete_declared_identity_with_block_alias_is_anchored_from_typed_member() {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    let source = concat!(
+        "mock.test.composite_identity {\n",
+        "  identity_detail = {\n",
+        "    name = 'nested'\n",
+        "  }\n",
+        "}\n",
+    );
+    let path = temp.path().join("main.crn");
+    std::fs::write(&path, source).expect("write main fixture");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+
+    let diagnostics =
+        anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("identity value 'scope' is not available")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 0);
+    assert_eq!(matching[0].range.start.character, 0);
+}
+
+#[test]
+fn equal_declared_identity_under_two_module_instances_marks_every_call() {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    let child = temp.path().join("child");
+    std::fs::create_dir(&child).expect("create child module");
+    std::fs::write(child.join("arguments.crn"), "arguments { scope: String }\n")
+        .expect("write child arguments");
+    std::fs::write(
+        child.join("resources.crn"),
+        "mock.test.identity { name = 'same' }\n",
+    )
+    .expect("write child resource");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+    let source = concat!(
+        "let child = use { source = './child' }\n",
+        "let first = child { scope = 'one' }\n",
+        "let second = child { scope = 'two' }\n",
+    );
+    let path = temp.path().join("main.crn");
+    std::fs::write(&path, source).expect("write root fixture");
+
+    let diagnostics =
+        anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let collisions = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("equal declared identity values")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(collisions.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(collisions[0].range.start.line, 1);
+    assert_eq!(collisions[1].range.start.line, 2);
+}
+
+#[test]
+fn cross_module_declared_identity_collision_reports_every_origin_loop() {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    let child = temp.path().join("child");
+    std::fs::create_dir(&child).expect("create child module");
+    std::fs::write(child.join("arguments.crn"), "arguments { scope: String }\n")
+        .expect("write child arguments");
+    std::fs::write(
+        child.join("resources.crn"),
+        "mock.test.identity { name = 'same' }\n",
+    )
+    .expect("write child resource");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+    let source = concat!(
+        "let child = use { source = './child' }\n",
+        "for scope in ['one'] {\n",
+        "  child { scope = scope }\n",
+        "}\n",
+        "for scope in ['two'] {\n",
+        "  child { scope = scope }\n",
+        "}\n",
+    );
+    let path = temp.path().join("main.crn");
+    std::fs::write(&path, source).expect("write root fixture");
+
+    let diagnostics =
+        anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let collisions = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("equal declared identity values even though their module-scoped")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(collisions.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(collisions[0].range.start.line, 1);
+    assert_eq!(collisions[1].range.start.line, 4);
+    assert!(collisions.iter().all(|diagnostic| diagnostic.message == concat!(
+        "Anonymous resources of type 'mock.test.identity' on the same provider route have equal ",
+        "declared identity values even though their module-scoped addresses differ. Give one of ",
+        "them a name with `let`.",
+    )));
 }
 
 #[test]
@@ -2261,9 +2529,7 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
     let attributes = std::collections::HashMap::from([
         (
             "name".to_string(),
-            Value::<carina_core::resource::NoPlaceholder>::Concrete(ConcreteValue::String(
-                "record".into(),
-            )),
+            Value::Concrete(ConcreteValue::String("record".into())),
         ),
         (
             "hosted_zone_id".to_string(),
@@ -5995,7 +6261,9 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         let call = CompositionCall {
             id: parsed.module_calls[0].id().clone(),
             module_name: "missing".to_string(),
-            binding: Some(call_binding.to_string()),
+            binding: Some(carina_core::resource::absolute_binding_address_for_test(
+                call_binding,
+            )),
             instance: call_binding.to_string(),
             module_source: Some("../missing".to_string()),
             module_directory: None,
@@ -6010,7 +6278,9 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
                 attributes: IndexMap::new(),
                 pending_constraints: Vec::new(),
             },
-            binding: Some(binding.to_string()),
+            binding: Some(carina_core::resource::absolute_binding_address_for_test(
+                binding,
+            )),
             dependency_bindings: Default::default(),
             module_name: "missing".to_string(),
             instance: call_binding.to_string(),
@@ -6026,7 +6296,7 @@ let first = unrelated { }
 "#,
     );
     let parsed = doc.parsed().expect("fixture must parse");
-    let mut binding_input = parsed.clone();
+    let mut binding_input = parsed.clone().resolve_root_for_test();
 
     let mut source = composition("source", "missing-source-call");
     source.signature.attributes.insert(
@@ -6040,7 +6310,7 @@ let first = unrelated { }
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
         LiveCompositionArgument::from_value(
-            Value::resource_ref("source", "missing", vec![]),
+            Value::resource_ref("source", "missing", vec![]).resolve_root_for_test(),
             consumer_type(schema_type("ec2.Vpc")),
             ArgumentOrigin::Defaulted,
         ),
@@ -6837,7 +7107,9 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
 
     let path = fixture.path().join("main.crn");
     let document = create_document_at(source, path.clone());
-    let resolver_input = document.parsed().expect("root parse").clone();
+    let resolver_input = carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(
+        document.parsed().expect("root parse").clone(),
+    );
     let report = match &engine.provider_context {
         DiagnosticProviderContext::Loaded(provider_context) => {
             carina_core::module_resolver::resolve_modules_with_diagnostics(
@@ -7285,21 +7557,27 @@ let instance = component {
 
     let diagnostics = analyze_with_buffer(&engine, &root, "resources.crn", resources);
 
-    assert!(
-        diagnostics.iter().any(|diagnostic| {
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
             diagnostic.message.contains("Type mismatch")
                 && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
                 && diagnostic
                     .message
                     .contains("from instance.security_group_id")
-        }),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mismatches.len(),
+        1,
         "LSP must report the same composition-consumer mismatch as validate: {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)
             .collect::<Vec<_>>(),
     );
+    assert_eq!(mismatches[0].range.start.line, 2);
 }
 
 #[test]
@@ -13070,6 +13348,89 @@ fn module_parameter_dependency_and_ref_attribute_are_valid_in_module_scope() {
 }
 
 #[test]
+fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("modules/bad");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(root.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        root.path().join("imports.crn"),
+        "let imported = use { source = \"./modules/bad\" }\n",
+    )
+    .unwrap();
+    let call_source = "\n\n\n\n\n\n\nlet instance = imported { marker = \"root\" }\n";
+    let call_path = root.path().join("call.crn");
+    std::fs::write(&call_path, call_source).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { marker: String }\n",
+    )
+    .unwrap();
+    let module_source = "\n\nlet consumer = mock.test.resource {\n  name = marker\n  directives { depends_on = [missing] }\n}\n";
+    let module_path = module.join("resource.crn");
+    std::fs::write(&module_path, module_source).unwrap();
+
+    let engine = structural_ref_engine();
+    let call_doc = crate::document::Document::new_with_path(
+        call_source.to_string(),
+        call_path,
+        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    let merged = engine
+        .parse_merged_with_buffer(&call_doc, Some("call.crn"), root.path())
+        .expect("root directory parses before module expansion");
+    let errors = match &merged.module_resolution {
+        crate::diagnostics::checks::MergedModuleResolution::ConstraintFailed {
+            findings: _,
+            errors,
+        }
+        | crate::diagnostics::checks::MergedModuleResolution::Unowned { errors } => errors,
+        crate::diagnostics::checks::MergedModuleResolution::Expanded { graph: _ } => {
+            panic!("unknown module reference must reject expansion")
+        }
+    };
+    let error = errors
+        .iter()
+        .find(|error| {
+            error
+                .display_relative_to(root.path())
+                .to_string()
+                .contains("unknown binding 'missing'")
+        })
+        .unwrap_or_else(|| {
+            let rendered = errors
+                .iter()
+                .map(|error| error.display_relative_to(root.path()).to_string())
+                .collect::<Vec<_>>();
+            panic!("missing resolver error: {rendered:#?}")
+        });
+    let module_doc = crate::document::Document::new_with_path(
+        module_source.to_string(),
+        module_path.clone(),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    let diagnostics = engine.module_resolver_error_diagnostics(
+        &module_doc,
+        merged.directory.parsed.parsed(),
+        error,
+        root.path(),
+        Some(&module_path),
+    );
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("unknown binding 'missing'"))
+        .unwrap_or_else(|| panic!("missing module-file diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.range.start.line, 4, "{diagnostic:#?}");
+    assert!(
+        diagnostic
+            .message
+            .contains("modules/bad/resource.crn) at line 5"),
+        "CLI/LSP must render the same authored location: {diagnostic:#?}",
+    );
+}
+
+#[test]
 fn module_parameter_function_mismatch_is_an_error_in_the_root_document() {
     let root = tempfile::tempdir().unwrap();
     let module = root.path().join("module");
@@ -13935,33 +14296,31 @@ let app = awscc.ec2.Vpc {
 #[test]
 fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
     let temp = tempfile::tempdir().unwrap();
-    let current_file = temp.path().join("main.crn");
-    let sibling_file = temp.path().join("defaults.crn");
-    let current_source = "tags = {\n\u{3000}\u{3000}managed_by = \"carina\"\n}";
-    let sibling_source =
-        "tags = {\n    Name = \"application\"\n    Environment = \"production\"\n}";
-    let merged_result = carina_core::config_loader::DirectoryParseResult {
-        parsed: carina_core::parser::ParsedFile::default(),
-        authored_bindings: carina_core::config_loader::AuthoredBindingView::parse_file_source(
-            "",
-            std::path::Path::new("test.crn"),
+    let current_source = "let current = mock.test.resource {\n    tags = {\n\u{3000}\u{3000}managed_by = \"carina\"\n    }\n}";
+    let parseable_current_source =
+        "let current = mock.test.resource {\n    tags = {\n  managed_by = \"carina\"\n    }\n}";
+    let sibling_source = "let defaults = mock.test.resource {\n    tags = {\n        Name = \"application\"\n        Environment = \"production\"\n    }\n}";
+    std::fs::write(temp.path().join("main.crn"), parseable_current_source).unwrap();
+    std::fs::write(temp.path().join("defaults.crn"), sibling_source).unwrap();
+    let mut merged_result =
+        carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+            temp.path(),
             &carina_core::parser::ProviderContext::default(),
+            &std::collections::HashMap::new(),
         )
-        .unwrap(),
-        duplicate_declarations: Vec::new(),
-        source_files: vec![
-            (current_file, current_source.to_string()),
-            (sibling_file, sibling_source.to_string()),
-        ],
-        sole_backend_file: None,
-        semantic_files: Vec::new(),
-    };
+        .expect("directory fixture must parse");
+    let (_, parsed_source) = merged_result
+        .source_files
+        .iter_mut()
+        .find(|(path, _)| path.ends_with("main.crn"))
+        .expect("parsed directory retains main.crn source");
+    *parsed_source = current_source.to_string();
 
     let diagnostics =
         test_engine().check_mixed_tag_key_styles("main.crn", temp.path(), &merged_result);
 
     assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
-    assert_eq!(diagnostics[0].range.start.line, 1);
+    assert_eq!(diagnostics[0].range.start.line, 2);
     assert_eq!(diagnostics[0].range.start.character, 2);
     assert_eq!(diagnostics[0].range.end.character, 12);
 }
@@ -14139,6 +14498,43 @@ fn nested_forwarded_handle_remains_a_dependency_operand_in_lsp() {
             "a forwarded parameter is still pending handle classification: {diagnostics:#?}",
         );
     }
+}
+
+#[test]
+fn forwarded_module_parameter_is_pending_for_waits_in_lsp() {
+    let root = tempfile::tempdir().unwrap();
+    let outer = root.path().join("outer");
+    let inner = root.path().join("inner");
+    std::fs::create_dir(&outer).unwrap();
+    std::fs::create_dir(&inner).unwrap();
+    let outer_source = r#"arguments { dep: mock.test.resource }
+let inner_mod = use { source = "../inner" }
+let i = inner_mod { dep = dep }
+"#;
+    std::fs::write(outer.join("main.crn"), outer_source).unwrap();
+    std::fs::write(outer.join("extra.crn"), "let note = \"outer\"\n").unwrap();
+    std::fs::write(
+        inner.join("main.crn"),
+        "arguments { dep: mock.test.resource }\nlet r = mock.test.resource { name = \"inner\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        inner.join("waits.crn"),
+        "let dependency_wait = wait r { until = r.name == \"inner\" depends_on = [dep] }\n\
+         let target_wait = wait dep { until = dep.name == \"outer\" }\n",
+    )
+    .unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), &outer, "main.crn", outer_source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic
+                .message
+                .contains("unresolved forwarded module parameter 'dep'")
+        }),
+        "LSP diagnostics must treat forwarded wait operands as pending, matching the CLI: {diagnostics:#?}",
+    );
 }
 
 #[test]

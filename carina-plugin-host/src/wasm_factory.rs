@@ -7633,8 +7633,8 @@ mod tests {
     use super::*;
     use carina_core::provider::SentRecord;
     use carina_core::resource::{
-        AccessPath, ApplyTimeUnknown, ConcreteValue, Current, DeferredValue, InterpolationPart,
-        ModuleSource,
+        ApplyTimeUnknown, AuthoredAccessPath as AccessPath, ConcreteValue, Current, DeferredValue,
+        InterpolationPart, ModuleSource, absolute_binding_address_for_test,
     };
     use std::borrow::Cow;
     use std::io::{Read, Write};
@@ -7890,7 +7890,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v15_wit_surface_compiles() {
+    fn protocol_v16_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::ReferenceScopeValues>();
@@ -7911,6 +7911,13 @@ mod tests {
 
     fn test_string_value(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
+    }
+
+    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
+        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+            .resolve_root_for_test()
+            .into_expanded()
+            .expect("root resource reference contains no placeholders")
     }
 
     fn boundary_resource() -> (ResourceId, wit_types::ResourceId, wit_types::CreateRequest) {
@@ -9147,11 +9154,11 @@ mod tests {
             "pending",
             Value::Deferred(DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "pending".to_string(),
+                    binding: absolute_binding_address_for_test("pending"),
                 },
             )),
         );
-        first.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        first.set_attr("peer", root_resource_ref("peer", "identifier"));
         let mut second = Resource::new("test.t", "second");
         second.set_attr("known", test_string_value("known"));
         let mut third = Resource::new("test.t", "third");
@@ -9159,7 +9166,7 @@ mod tests {
             "nested",
             Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
                 DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "nested".to_string(),
+                    binding: absolute_binding_address_for_test("nested"),
                 }),
             )])),
         );
@@ -9185,12 +9192,12 @@ mod tests {
             "pending",
             Value::Deferred(DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "pending".to_string(),
+                    binding: absolute_binding_address_for_test("pending"),
                 },
             )),
         );
         resource.set_attr("middle", test_string_value("middle"));
-        resource.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        resource.set_attr("peer", root_resource_ref("peer", "identifier"));
         resource.set_attr("after", test_string_value("after"));
         let mut resources = vec![resource];
         let original_attributes = resources[0].attributes.clone();
@@ -9234,10 +9241,10 @@ mod tests {
     async fn wasm_serializable_resources_restores_duplicate_resource_ids_by_position() {
         let first_hidden: Value = Value::Deferred(DeferredValue::Unknown(
             ApplyTimeUnknown::UpstreamAllExports {
-                binding: "pending".to_string(),
+                binding: absolute_binding_address_for_test("pending"),
             },
         ));
-        let second_hidden = Value::resource_ref("peer", "identifier", vec![]);
+        let second_hidden = root_resource_ref("peer", "identifier");
 
         let mut first = Resource::new("test.t", "shared");
         first.set_attr("visible", test_string_value("first"));
@@ -9280,13 +9287,14 @@ mod tests {
 
     #[tokio::test]
     async fn wasm_serializable_resources_strips_values_in_nested_wrappers() {
-        let upstream_path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let upstream_path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
+            .resolve_root_for_test();
         let unknown = || {
             Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
                 path: upstream_path.clone(),
             }))
         };
-        let resource_ref = || Value::resource_ref("admins", "group_id", vec![]);
+        let resource_ref = || root_resource_ref("admins", "group_id");
 
         let mut resource = Resource::new("test.t", "n");
         resource.set_attr("stable", test_string_value("visible"));
@@ -9378,12 +9386,12 @@ mod tests {
     async fn wasm_serializable_resources_restores_attributes_on_error() {
         let mut resource = Resource::new("test.t", "n");
         resource.set_attr("stable", test_string_value("visible"));
-        resource.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
+        resource.set_attr("peer", root_resource_ref("peer", "identifier"));
         resource.set_attr(
             "pending",
             Value::Deferred(DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "pending".to_string(),
+                    binding: absolute_binding_address_for_test("pending"),
                 },
             )),
         );
@@ -10003,6 +10011,36 @@ mod tests {
         );
         assert!(!err.contains("carina init"), "{err}");
         assert!(!err.contains("bump the provider lock"), "{err}");
+    }
+
+    #[test]
+    fn pattern_diagnostics_are_rendered_once_in_provider_load_error() {
+        let detail = wasm_convert::json_to_attribute_types(
+            r#"{
+                "first":{"type":"String","pattern":"(?=x)"},
+                "second":{"type":"String","pattern":"["}
+            }"#,
+        )
+        .unwrap_err();
+        let diagnostic = ProviderSchemaDecodeDiagnostic(detail);
+        let rendered = diagnostic.to_string();
+        assert!(std::error::Error::source(&diagnostic).is_none());
+        for pattern in ["(?=x)", "["] {
+            let error = carina_core::schema::CompiledPattern::try_new(pattern).unwrap_err();
+            assert_eq!(
+                rendered.matches(&error.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(&error.reason.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+        }
+        let error = provider_schema_decode_error("bad-provider", "9.9.9", diagnostic.0);
+        assert_eq!(error.to_string().matches(&rendered).count(), 1);
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

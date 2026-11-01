@@ -10,6 +10,10 @@ use tempfile::TempDir;
 
 const DELETE_DELAY_MS: &str = "1500";
 
+fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
 struct Scenario {
     _tmp: TempDir,
     project: PathBuf,
@@ -99,7 +103,7 @@ let lst = mock.test.resource {{
             .with_attribute("name", serde_json::json!(cert_name))
             .with_attribute("id", serde_json::json!("cert-id"))
             .with_attribute("status", serde_json::json!("ISSUED"));
-        cert.binding = Some("cert".to_string());
+        cert.binding = Some(absolute_binding("cert"));
         state
             .upsert_resource(cert)
             .expect("test state setup must be valid");
@@ -109,8 +113,9 @@ let lst = mock.test.resource {{
             .with_attribute("name", serde_json::json!("lst"))
             .with_attribute("id", serde_json::json!("lst-id"))
             .with_attribute("upstream", serde_json::json!("cert-id"));
-        lst.binding = Some("lst".to_string());
-        lst.dependency_bindings.insert("cert_issued".to_string());
+        lst.binding = Some(absolute_binding("lst"));
+        lst.dependency_bindings
+            .insert(absolute_binding("cert_issued"));
         state
             .upsert_resource(lst)
             .expect("test state setup must be valid");
@@ -153,7 +158,7 @@ let lst = mock.test.resource {{
             .with_attribute("name", serde_json::json!("main"))
             .with_attribute("id", serde_json::json!("main-current"))
             .with_attribute("status", serde_json::json!("ACTIVE"));
-        main.binding = Some("main".to_string());
+        main.binding = Some(absolute_binding("main"));
         main.deposed.push(DeposedInstance::from_persisted_json(
             DeposedKey::new_unique(),
             "main-old".to_string(),

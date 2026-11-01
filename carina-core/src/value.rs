@@ -9,11 +9,11 @@ use thiserror::Error;
 
 use crate::parser::{display_double_quoted_literal_part, display_string_literal};
 use crate::resource::{
-    ApplyTimeUnknown, CanonicalEnumValue, ConcreteValue, DeferredValue, InterpolationPart,
-    LoopSlot, PlaceholderKind, RedactedSecretHash, UnavailableCoalescePolicy,
+    ApplyTimeUnknown, BindingAddress, CanonicalEnumValue, ConcreteValue, DeferredValue,
+    InterpolationPart, LoopSlot, PlaceholderKind, RedactedSecretHash, UnavailableCoalescePolicy,
     UnavailableSecretPolicy, Value, find_unavailable_evaluation,
 };
-use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
+use crate::schema::{AttrTypeKind, CompiledAttributeType as AttributeType, TypeIdentity};
 use crate::utils::is_identifier_safe;
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
@@ -66,7 +66,7 @@ pub enum SerializationError {
     /// detection before crossing a serialization boundary.
     #[error("cannot serialize at {context}: value is not yet known ({reason})")]
     UnknownNotAllowed {
-        reason: ApplyTimeUnknown,
+        reason: Box<ApplyTimeUnknown>,
         context: SerializationContext,
     },
     /// A non-finite float (`NaN`, `±∞`) reached JSON serialization.
@@ -231,7 +231,7 @@ impl std::fmt::Display for SecretRehydrationSiteError {
 
 impl std::error::Error for SecretRehydrationSiteError {}
 
-impl std::fmt::Display for ApplyTimeUnknown {
+impl<B: BindingAddress> std::fmt::Display for ApplyTimeUnknown<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApplyTimeUnknown::UpstreamExport { path } => {
@@ -262,7 +262,7 @@ impl std::fmt::Display for crate::resource::PendingReRead {
 }
 
 /// Render an `ApplyTimeUnknown` to its plan-display string.
-pub fn render_unknown(reason: &ApplyTimeUnknown) -> String {
+pub fn render_unknown<B: BindingAddress>(reason: &ApplyTimeUnknown<B>) -> String {
     match reason {
         ApplyTimeUnknown::UpstreamExport { path } => {
             format!("(known after upstream apply: {})", path.to_dot_string())
@@ -778,7 +778,7 @@ fn value_to_json_inner(
                 // pass before reaching any serialization boundary. Report
                 // through the same channel as `ResourceRef` so the same
                 // diagnostic path covers both producer kinds.
-                path: binding.clone(),
+                path: binding.to_string(),
                 context: ctx,
             })
         }
@@ -826,7 +826,7 @@ fn value_to_json_inner(
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: ctx,
             })
         }
@@ -1218,7 +1218,7 @@ fn canonical_enum_from_payload(
 }
 
 /// Format a `Value` for display
-pub fn format_value<P: PlaceholderKind>(value: &Value<P>) -> String {
+pub fn format_value<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> String {
     format_value_with_key(value, None)
 }
 
@@ -1371,8 +1371,8 @@ fn render_persisted_json(value: PersistedView<'_>) -> RenderedValue {
 /// Render a value for a deferred-for template, replacing typed upstream
 /// placeholders while the value tree is still available. No rendered text is
 /// inspected to identify the placeholder.
-pub(crate) fn render_value_with_upstream_deferred_label<P: PlaceholderKind>(
-    value: &Value<P>,
+pub(crate) fn render_value_with_upstream_deferred_label<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
     upstream_binding: &str,
     verb: &str,
 ) -> RenderedValue {
@@ -1413,7 +1413,9 @@ pub(crate) fn render_string_text(text: &str) -> RenderedValue {
 
 /// Format a `Value` for user-visible messages where DSL literal quotes
 /// around bare strings get in the way.
-pub fn format_value_user_facing<P: PlaceholderKind>(value: &Value<P>) -> String {
+pub fn format_value_user_facing<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().to_string(),
         _ => format_value(value),
@@ -1421,7 +1423,10 @@ pub fn format_value_user_facing<P: PlaceholderKind>(value: &Value<P>) -> String 
 }
 
 /// Format a `Value` for display, with an optional key for context
-pub fn format_value_with_key<P: PlaceholderKind>(value: &Value<P>, _key: Option<&str>) -> String {
+pub fn format_value_with_key<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    _key: Option<&str>,
+) -> String {
     let mut sink = StringSink::default();
     // `StringSink::write_token` never returns Err (it has no overflow
     // budget), so the `Result` here is structurally `Ok(())`. Treat the
@@ -1567,8 +1572,8 @@ pub fn render_duration(d: std::time::Duration) -> String {
 /// truth for plan-display value formatting; sinks downstream of this
 /// function decide whether to materialise a `String` or just count
 /// bytes (#2434).
-pub(crate) fn format_value_into<P: PlaceholderKind>(
-    value: &Value<P>,
+pub(crate) fn format_value_into<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
     sink: &mut dyn FormatSink,
 ) -> Result<(), Overflow> {
     format_value_into_context(value, sink, FormatContext::default())
@@ -1579,8 +1584,8 @@ struct FormatContext<'a> {
     upstream_deferred_label: Option<(&'a str, &'a str)>,
 }
 
-fn format_value_into_context<P: PlaceholderKind>(
-    value: &Value<P>,
+fn format_value_into_context<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
     sink: &mut dyn FormatSink,
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
@@ -1665,7 +1670,7 @@ fn format_value_into_context<P: PlaceholderKind>(
             sink.write_token(ValueSpanKind::Reference, &path.to_dot_string())
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            sink.write_token(ValueSpanKind::Reference, binding)
+            sink.write_token(ValueSpanKind::Reference, binding.as_str())
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             let parenthesize_left = matches!(
@@ -1769,8 +1774,8 @@ fn format_value_into_context<P: PlaceholderKind>(
     }
 }
 
-fn format_integer_arithmetic<P: PlaceholderKind>(
-    expression: &crate::integer_arithmetic::ValidatedIntegerExpr<P>,
+fn format_integer_arithmetic<P: PlaceholderKind, B: BindingAddress>(
+    expression: &crate::integer_arithmetic::ValidatedIntegerExpr<P, B>,
     sink: &mut dyn FormatSink,
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
@@ -1782,8 +1787,8 @@ fn format_integer_arithmetic<P: PlaceholderKind>(
     format_integer_operand(expression.rhs(), expression.op(), true, sink, context)
 }
 
-fn format_integer_operand<P: PlaceholderKind>(
-    value: &Value<P>,
+fn format_integer_operand<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
     parent_op: crate::integer_arithmetic::IntegerOp,
     right_operand: bool,
     sink: &mut dyn FormatSink,
@@ -1871,8 +1876,8 @@ fn format_decoded_persisted_json_into(
     }
 }
 
-fn write_unknown(
-    reason: &ApplyTimeUnknown,
+fn write_unknown<B: BindingAddress>(
+    reason: &ApplyTimeUnknown<B>,
     sink: &mut dyn FormatSink,
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
@@ -1896,14 +1901,16 @@ fn write_upstream_deferred_label(
     )
 }
 
-fn is_upstream_deferred_reason(reason: &ApplyTimeUnknown) -> bool {
+fn is_upstream_deferred_reason<B: BindingAddress>(reason: &ApplyTimeUnknown<B>) -> bool {
     matches!(
         reason,
         ApplyTimeUnknown::UpstreamExport { .. } | ApplyTimeUnknown::UpstreamAllExports { .. }
     )
 }
 
-pub(crate) fn is_upstream_deferred_marker_value<P: PlaceholderKind>(value: &Value<P>) -> bool {
+pub(crate) fn is_upstream_deferred_marker_value<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> bool {
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => is_upstream_deferred_reason(reason),
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -1926,11 +1933,11 @@ pub(crate) fn is_upstream_deferred_marker_value<P: PlaceholderKind>(value: &Valu
 /// The semantic placeholder remains `Placeholder(LoopSlot::Value)`; the binding name is
 /// display-only parser metadata on `AccessExpr`, so no obsolete unknown reason
 /// or independently navigable path representation is reintroduced.
-fn deferred_for_access_display_path<P: PlaceholderKind>(
-    access: &crate::resource::AccessExpr<P>,
+fn deferred_for_access_display_path<P: PlaceholderKind, B: BindingAddress>(
+    access: &crate::resource::AccessExpr<P, B>,
 ) -> Option<String> {
-    fn append_all_steps<P: PlaceholderKind>(
-        access: &crate::resource::AccessExpr<P>,
+    fn append_all_steps<P: PlaceholderKind, B: BindingAddress>(
+        access: &crate::resource::AccessExpr<P, B>,
         output: &mut String,
     ) {
         if let Value::Deferred(DeferredValue::Access(inner)) = access.base() {
@@ -1939,8 +1946,8 @@ fn deferred_for_access_display_path<P: PlaceholderKind>(
         output.push_str(&access.step().to_dot_string());
     }
 
-    fn append_steps<P: PlaceholderKind>(
-        access: &crate::resource::AccessExpr<P>,
+    fn append_steps<P: PlaceholderKind, B: BindingAddress>(
+        access: &crate::resource::AccessExpr<P, B>,
         output: &mut String,
     ) -> bool {
         let rooted_at_loop_slot = match access.base() {
@@ -1966,18 +1973,18 @@ fn deferred_for_access_display_path<P: PlaceholderKind>(
     append_steps(access, &mut path).then_some(path)
 }
 
-pub(crate) enum AccessChainRoot<'a> {
+pub(crate) enum AccessChainRoot<'a, B: BindingAddress = crate::resource::AbsoluteBindingAddress> {
     LoopSlot(LoopSlot),
-    Unknown(&'a ApplyTimeUnknown),
+    Unknown(&'a ApplyTimeUnknown<B>),
 }
 
 /// Return the typed root of a direct postfix-access chain.
 /// Function calls and all other expression nodes intentionally stop the
 /// search: `unknown.field` is still unknown, while `split(unknown)[0]`
 /// remains a useful expression in diagnostics and plans.
-pub(crate) fn access_chain_root<P: PlaceholderKind>(
-    value: &Value<P>,
-) -> Option<AccessChainRoot<'_>> {
+pub(crate) fn access_chain_root<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> Option<AccessChainRoot<'_, B>> {
     match value {
         Value::Deferred(DeferredValue::Access(access)) => access_chain_root(access.base()),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
@@ -1989,7 +1996,7 @@ pub(crate) fn access_chain_root<P: PlaceholderKind>(
 }
 
 /// Check if a Value contains any Secret values at any nesting depth.
-pub fn contains_secret<P: PlaceholderKind>(value: &Value<P>) -> bool {
+pub fn contains_secret<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred.values().into_iter().any(contains_secret)
@@ -2580,7 +2587,7 @@ fn canonical_secret_template<P: PlaceholderKind>(
             serde_json::to_value(path).expect("AccessPath is serializable"),
         ),
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            tagged("binding_ref", JsonValue::String(binding.clone()))
+            tagged("binding_ref", JsonValue::String(binding.to_string()))
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => tagged(
             "coalesce",
@@ -2685,7 +2692,9 @@ fn canonical_secret_template<P: PlaceholderKind>(
 }
 
 /// Return whether a value tree contains a saved-plan secret placeholder.
-pub fn contains_redacted_secret<P: PlaceholderKind>(value: &Value<P>) -> bool {
+pub fn contains_redacted_secret<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> bool {
     match value {
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -2717,8 +2726,8 @@ pub fn contains_redacted_secret<P: PlaceholderKind>(value: &Value<P>) -> bool {
     }
 }
 
-fn attributes_contain_redacted_secret<'a, P: PlaceholderKind + 'a>(
-    values: impl Iterator<Item = &'a Value<P>>,
+fn attributes_contain_redacted_secret<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
+    values: impl Iterator<Item = &'a Value<P, B>>,
 ) -> bool {
     values.into_iter().any(contains_redacted_secret)
 }
@@ -3732,7 +3741,7 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::SecretRedaction,
             })
         }
@@ -5222,14 +5231,14 @@ impl<'a> CanonicalizationPurpose<'a> {
     }
 }
 
-trait CanonicalizationErrorPolicy<H: PlaceholderKind>: Copy {
+trait CanonicalizationErrorPolicy: Copy {
     type Error;
 
-    fn canonicalization_failed(
+    fn canonicalization_failed<H: PlaceholderKind, B: BindingAddress>(
         self,
-        original: Value<H>,
+        original: Value<H, B>,
         source: crate::schema::TypeError,
-    ) -> Result<Value<H>, Self::Error>;
+    ) -> Result<Value<H, B>, Self::Error>;
 
     fn mask_secret(self, error: Self::Error) -> Self::Error;
 
@@ -5247,14 +5256,14 @@ trait CanonicalizationErrorPolicy<H: PlaceholderKind>: Copy {
 #[derive(Clone, Copy)]
 struct RejectEnumResolutionErrors;
 
-impl<H: PlaceholderKind> CanonicalizationErrorPolicy<H> for RejectEnumResolutionErrors {
+impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
     type Error = crate::schema::TypeError;
 
-    fn canonicalization_failed(
+    fn canonicalization_failed<H: PlaceholderKind, B: BindingAddress>(
         self,
-        _original: Value<H>,
+        _original: Value<H, B>,
         source: crate::schema::TypeError,
-    ) -> Result<Value<H>, Self::Error> {
+    ) -> Result<Value<H, B>, Self::Error> {
         Err(source)
     }
 
@@ -5291,8 +5300,7 @@ impl<H: PlaceholderKind> CanonicalizationErrorPolicy<H> for RejectEnumResolution
     }
 
     fn map_key_collision(self, key: String, canonical_key: String) -> Result<(), Self::Error> {
-        Err(CanonicalizationErrorPolicy::<H>::at_map_key(
-            self,
+        Err(self.at_map_key(
             key,
             crate::schema::TypeError::ValidationFailed {
                 message: format!(
@@ -5306,14 +5314,14 @@ impl<H: PlaceholderKind> CanonicalizationErrorPolicy<H> for RejectEnumResolution
 #[derive(Clone, Copy)]
 struct PreserveEnumResolutionErrors;
 
-impl<H: PlaceholderKind> CanonicalizationErrorPolicy<H> for PreserveEnumResolutionErrors {
+impl CanonicalizationErrorPolicy for PreserveEnumResolutionErrors {
     type Error = Infallible;
 
-    fn canonicalization_failed(
+    fn canonicalization_failed<H: PlaceholderKind, B: BindingAddress>(
         self,
-        original: Value<H>,
+        original: Value<H, B>,
         _source: crate::schema::TypeError,
-    ) -> Result<Value<H>, Self::Error> {
+    ) -> Result<Value<H, B>, Self::Error> {
         Ok(original)
     }
 
@@ -5352,12 +5360,12 @@ fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
 /// Canonicalize a desired value completely. Success guarantees that no
 /// [`ConcreteValue::EnumIdentifier`] remains anywhere in the value tree.
 #[cfg(test)]
-fn canonicalize_desired_with_type<H: PlaceholderKind>(
-    value: Value<H>,
+fn canonicalize_desired_with_type<H: PlaceholderKind, B: BindingAddress>(
+    value: Value<H, B>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     source: DesiredValueSource,
-) -> Result<Value<H>, crate::schema::TypeError> {
+) -> Result<Value<H, B>, crate::schema::TypeError> {
     canonicalize_desired_with_type_and_ancestry(
         value,
         attr_type,
@@ -5367,13 +5375,13 @@ fn canonicalize_desired_with_type<H: PlaceholderKind>(
     )
 }
 
-fn canonicalize_desired_with_type_and_ancestry<H: PlaceholderKind>(
-    value: Value<H>,
+fn canonicalize_desired_with_type_and_ancestry<H: PlaceholderKind, B: BindingAddress>(
+    value: Value<H, B>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     source: DesiredValueSource,
-) -> Result<Value<H>, crate::schema::TypeError> {
+) -> Result<Value<H, B>, crate::schema::TypeError> {
     let canonical = canonicalize_with_type_for_purpose(
         value,
         attr_type,
@@ -5395,7 +5403,7 @@ fn canonicalize_desired_with_type_and_ancestry<H: PlaceholderKind>(
 /// canonical enum values share the same API-value representation.
 pub(crate) fn canonicalize_desired_attribute_value_with_schema(
     mut value: Value,
-    schema: &crate::schema::ResourceSchema,
+    schema: &crate::schema::CompiledResourceSchema,
     attribute: &str,
 ) -> Result<Value, crate::schema::TypeError> {
     // Already-canonical enums may carry an equivalent historical provider
@@ -5450,7 +5458,7 @@ fn reparse_canonical_enum_leaves(value: &mut Value) {
 /// schema while preserving the attribute's effective input ancestry.
 pub(crate) fn canonicalize_state_attribute_value_with_schema(
     value: Value,
-    schema: &crate::schema::ResourceSchema,
+    schema: &crate::schema::CompiledResourceSchema,
     attribute: &str,
 ) -> CanonicalState {
     let Some(attribute_schema) = schema.attributes.get(attribute) else {
@@ -5499,10 +5507,10 @@ pub(crate) fn canonicalize_state_with_type_and_ancestry(
 
 /// Resolve typed wait-RHS enum syntax without reclassifying quoted strings or
 /// applying unrelated structural rewrites.
-pub(crate) fn canonicalize_wait_rhs_with_type(
-    value: Value,
+pub(crate) fn canonicalize_wait_rhs_with_type<P: PlaceholderKind, B: BindingAddress>(
+    value: Value<P, B>,
     effective_type: &crate::schema::EffectiveType<'_>,
-) -> Value {
+) -> Value<P, B> {
     unwrap_infallible(canonicalize_with_type_for_purpose(
         value,
         effective_type.as_type(),
@@ -5513,14 +5521,18 @@ pub(crate) fn canonicalize_wait_rhs_with_type(
     ))
 }
 
-fn canonicalize_with_type_for_purpose<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
-    value: Value<H>,
+fn canonicalize_with_type_for_purpose<
+    H: PlaceholderKind,
+    B: BindingAddress,
+    P: CanonicalizationErrorPolicy,
+>(
+    value: Value<H, B>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value<H>, P::Error> {
+) -> Result<Value<H, B>, P::Error> {
     let mut visited_refs = Vec::new();
     let resolved_type = attr_type.resolve_refs_with_defs_on_path(defs, &mut visited_refs);
     canonicalize_resolved_value_for_purpose(
@@ -5534,7 +5546,7 @@ fn canonicalize_with_type_for_purpose<H: PlaceholderKind, P: CanonicalizationErr
     )
 }
 
-fn canonicalize_state_entry_with_type<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
+fn canonicalize_state_entry_with_type<H: PlaceholderKind, P: CanonicalizationErrorPolicy>(
     value: Value<H>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
@@ -5564,16 +5576,17 @@ fn canonicalize_state_entry_with_type<H: PlaceholderKind, P: CanonicalizationErr
 fn canonicalize_resolved_value_for_purpose<
     'a,
     H: PlaceholderKind,
-    P: CanonicalizationErrorPolicy<H>,
+    B: BindingAddress,
+    P: CanonicalizationErrorPolicy,
 >(
-    value: Value<H>,
-    resolved_type: crate::schema::ResolvedAttrType<'a>,
+    value: Value<H, B>,
+    resolved_type: crate::schema::ResolvedAttrType<'a, crate::schema::Compiled>,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
     visited_refs: &mut Vec<&'a str>,
-) -> Result<Value<H>, P::Error> {
+) -> Result<Value<H, B>, P::Error> {
     let resolved_attr = resolved_type.as_attr();
     if let Some(fit) = crate::schema::fit_value_to_resolved_type_on_path(
         resolved_attr,
@@ -5600,13 +5613,13 @@ fn canonicalize_resolved_value_for_purpose<
 /// Consume a successful fit witness without re-validating any selected Union
 /// member or re-resolving any enum. The value and witness have identical tree
 /// shapes by construction.
-fn canonicalize_with_fit<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
-    value: Value<H>,
+fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
+    value: Value<H, B>,
     fit: crate::schema::Fit<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value<H>, P::Error> {
+) -> Result<Value<H, B>, P::Error> {
     if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(fit.attr.as_attr(), defs)
     {
         return Ok(canonicalize_to_string_list(value));
@@ -5756,10 +5769,14 @@ fn canonicalize_with_fit<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
     }
 }
 
-fn collect_canonicalized_map<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
-    entries: Vec<(String, String, Value<H>)>,
+fn collect_canonicalized_map<
+    H: PlaceholderKind,
+    B: BindingAddress,
+    P: CanonicalizationErrorPolicy,
+>(
+    entries: Vec<(String, String, Value<H, B>)>,
     error_policy: P,
-) -> Result<IndexMap<String, Value<H>>, P::Error> {
+) -> Result<IndexMap<String, Value<H, B>>, P::Error> {
     let mut seen = BTreeSet::new();
     let collision = entries.iter().find_map(|(original_key, canonical_key, _)| {
         (!seen.insert(canonical_key.clone())).then(|| (original_key.clone(), canonical_key.clone()))
@@ -5779,8 +5796,8 @@ fn collect_canonicalized_map<H: PlaceholderKind, P: CanonicalizationErrorPolicy<
         .collect())
 }
 
-fn canonical_map_key_text<H: PlaceholderKind>(
-    value: Value<H>,
+fn canonical_map_key_text<H: PlaceholderKind, B: BindingAddress>(
+    value: Value<H, B>,
 ) -> Result<String, crate::schema::TypeError> {
     match value {
         Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
@@ -5866,13 +5883,13 @@ fn type_contains_enum(
     walk(attr_type, defs, &mut std::collections::HashSet::new())
 }
 
-fn finish_no_fit<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
-    value: Value<H>,
+fn finish_no_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
+    value: Value<H, B>,
     expected: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
-) -> Result<Value<H>, P::Error> {
+) -> Result<Value<H, B>, P::Error> {
     if purpose.rejects_unrecognized_enum_text() && type_contains_enum(expected, defs) {
         let source = crate::schema::TypeError::TypeMismatch {
             expected: expected.type_name(),
@@ -5888,15 +5905,20 @@ fn finish_no_fit<H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
 /// not fit at all. Union acceptance never comes from this path. Provider output
 /// alone follows the closest failure shape so invalid enum text fails closed;
 /// persisted state retains its established forward-compatible lenience.
-fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPolicy<H>>(
-    value: Value<H>,
+fn canonicalize_without_fit<
+    'a,
+    H: PlaceholderKind,
+    B: BindingAddress,
+    P: CanonicalizationErrorPolicy,
+>(
+    value: Value<H, B>,
     unwrapped: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
     visited_refs: &mut Vec<&'a str>,
-) -> Result<Value<H>, P::Error> {
+) -> Result<Value<H, B>, P::Error> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         return canonicalize_without_fit(
             *inner,
@@ -6031,7 +6053,7 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
             let canonicalized = map
                 .into_iter()
                 .map(|(key, value)| {
-                    let lifted_key = crate::schema::lift_map_key(key_type, &key, defs)
+                    let lifted_key: Value<H, B> = crate::schema::lift_map_key(key_type, &key, defs)
                         .into_placeholder_type::<H>();
                     let canonical_key_value = canonicalize_with_type_for_purpose(
                         lifted_key,
@@ -6046,7 +6068,9 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
                         Ok(canonical_key) => canonical_key,
                         Err(source) => error_policy
                             .canonicalization_failed(
-                                Value::Concrete(ConcreteValue::String(key.clone().into())),
+                                Value::<H, B>::Concrete(ConcreteValue::<H, B>::String(
+                                    key.clone().into(),
+                                )),
                                 source,
                             )
                             .map(|_| key.clone())
@@ -6083,27 +6107,20 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
                 .filter_map(|(key, value)| {
                     match crate::schema::struct_field_for_key(fields, &key, ancestry) {
                         Some(field) => {
-                            let canonicalized = if matches!(purpose, CanonicalizationPurpose::State)
-                            {
-                                canonicalize_state_entry_with_type(
-                                    value,
-                                    &field.field_type,
-                                    defs,
-                                    ancestry.descend(field),
-                                    error_policy,
-                                )
-                                .map(CanonicalState::into_present)
-                            } else {
-                                canonicalize_with_type_for_purpose(
-                                    value,
-                                    &field.field_type,
-                                    defs,
-                                    ancestry.descend(field),
-                                    purpose,
-                                    error_policy,
-                                )
-                                .map(Some)
-                            };
+                            let canonicalized = canonicalize_with_type_for_purpose(
+                                value,
+                                &field.field_type,
+                                defs,
+                                ancestry.descend(field),
+                                purpose,
+                                error_policy,
+                            )
+                            .map(|value| {
+                                let resolved_type = field.field_type.resolve_refs_with_defs(defs);
+                                (!(matches!(purpose, CanonicalizationPurpose::State)
+                                    && crate::schema::reads_as_absent(&value, resolved_type)))
+                                .then_some(value)
+                            });
                             canonicalized
                                 .map_err(|error| error_policy.at_struct_field(key.clone(), error))
                                 .transpose()
@@ -6188,7 +6205,7 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
 }
 
 pub(crate) fn resolve_provider_config_enum_identifier(
-    resolver: &crate::resource::EnumValueResolver<'_>,
+    resolver: &crate::resource::EnumValueResolver<'_, crate::schema::Compiled>,
     raw: &crate::resource::RawEnumIdentifier,
     expected_identity: &crate::schema::TypeIdentity,
     provider_name: &str,
@@ -6235,14 +6252,14 @@ struct EnumIdentifierOccurrence<'a> {
     inside_secret: bool,
 }
 
-fn first_enum_identifier<H: PlaceholderKind>(
-    value: &Value<H>,
+fn first_enum_identifier<H: PlaceholderKind, B: BindingAddress>(
+    value: &Value<H, B>,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
     first_enum_identifier_inner(value, false)
 }
 
-fn first_enum_identifier_inner<H: PlaceholderKind>(
-    value: &Value<H>,
+fn first_enum_identifier_inner<H: PlaceholderKind, B: BindingAddress>(
+    value: &Value<H, B>,
     inside_secret: bool,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
     match value {
@@ -6296,7 +6313,9 @@ fn first_enum_identifier_inner<H: PlaceholderKind>(
 
 /// Body of state and desired canonicalization for the
 /// `string_or_list_of_strings` case.
-fn canonicalize_to_string_list<H: PlaceholderKind>(value: Value<H>) -> Value<H> {
+fn canonicalize_to_string_list<H: PlaceholderKind, B: BindingAddress>(
+    value: Value<H, B>,
+) -> Value<H, B> {
     match value {
         Value::Concrete(ConcreteValue::StringList(items)) => {
             Value::Concrete(ConcreteValue::StringList(items))
@@ -6333,12 +6352,13 @@ pub struct CanonicalizedResources<
     'a,
     S = crate::resource::ModuleSource,
     H: PlaceholderKind = crate::resource::NoPlaceholder,
+    B: BindingAddress = crate::resource::AbsoluteBindingAddress,
 > {
-    resources: &'a mut [crate::resource::Resource<S, H>],
+    resources: &'a mut [crate::resource::Resource<S, H, B>],
 }
 
-impl<'a, S, H: PlaceholderKind> CanonicalizedResources<'a, S, H> {
-    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S, H>] {
+impl<'a, S, H: PlaceholderKind, B: BindingAddress> CanonicalizedResources<'a, S, H, B> {
+    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S, H, B>] {
         self.resources
     }
 }
@@ -6402,8 +6422,8 @@ fn mask_enum_identifier_error_for_secret(
     }
 }
 
-fn unresolved_enum_identifier_type_error_in<H: PlaceholderKind>(
-    value: &Value<H>,
+fn unresolved_enum_identifier_type_error_in<H: PlaceholderKind, B: BindingAddress>(
+    value: &Value<H, B>,
 ) -> Option<crate::schema::TypeError> {
     let occurrence = first_enum_identifier(value)?;
     Some(mask_enum_identifier_error_for_secret(
@@ -6412,16 +6432,20 @@ fn unresolved_enum_identifier_type_error_in<H: PlaceholderKind>(
     ))
 }
 
-fn canonicalize_desired_attribute_map_with_schema<H: PlaceholderKind, Attributes>(
+fn canonicalize_desired_attribute_map_with_schema<
+    H: PlaceholderKind,
+    B: BindingAddress,
+    Attributes,
+>(
     attributes: &mut Attributes,
-    schema: &crate::schema::ResourceSchema,
+    schema: &crate::schema::CompiledResourceSchema,
     resource: &crate::resource::ResourceId,
     source: DesiredValueSource,
 ) -> Result<(), EnumCanonicalizationError>
 where
     Attributes: Default
-        + IntoIterator<Item = (String, Value<H>)>
-        + std::iter::FromIterator<(String, Value<H>)>,
+        + IntoIterator<Item = (String, Value<H, B>)>
+        + std::iter::FromIterator<(String, Value<H, B>)>,
 {
     let mut canonicalized = Vec::new();
     for (key, value) in std::mem::take(attributes) {
@@ -6453,9 +6477,13 @@ where
     Ok(())
 }
 
-fn reject_unresolved_enum_identifiers_in_attributes<'a, H: PlaceholderKind + 'a>(
+fn reject_unresolved_enum_identifiers_in_attributes<
+    'a,
+    H: PlaceholderKind + 'a,
+    B: BindingAddress + 'a,
+>(
     resource: &crate::resource::ResourceId,
-    attributes: impl IntoIterator<Item = (&'a String, &'a Value<H>)>,
+    attributes: impl IntoIterator<Item = (&'a String, &'a Value<H, B>)>,
 ) -> Result<(), EnumCanonicalizationError> {
     for (attribute, value) in attributes {
         if let Some(source) = unresolved_enum_identifier_type_error_in(value) {
@@ -6474,7 +6502,7 @@ fn reject_unresolved_enum_identifiers_in_attributes<'a, H: PlaceholderKind + 'a>
 /// unrecognized enum-positioned strings as literal state text.
 pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
     attributes: &mut Attributes,
-    schema: &crate::schema::ResourceSchema,
+    schema: &crate::schema::CompiledResourceSchema,
 ) where
     Attributes:
         Default + IntoIterator<Item = (String, Value)> + std::iter::FromIterator<(String, Value)>,
@@ -6501,10 +6529,10 @@ pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
-pub fn canonicalize_resources_with_schemas<'a, S, H: PlaceholderKind>(
-    resources: &'a mut [crate::resource::Resource<S, H>],
+pub fn canonicalize_resources_with_schemas<'a, S, H: PlaceholderKind, B: BindingAddress>(
+    resources: &'a mut [crate::resource::Resource<S, H, B>],
     registry: &crate::schema::SchemaRegistry,
-) -> Result<CanonicalizedResources<'a, S, H>, EnumCanonicalizationError> {
+) -> Result<CanonicalizedResources<'a, S, H, B>, EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
         if let Some(schema) = registry.get_for(resource) {
             canonicalize_desired_attribute_map_with_schema(
@@ -6560,27 +6588,34 @@ type ProviderConfigSchemaFn<'a> = dyn Fn(&str) -> Option<crate::schema::Validate
 /// canonicalization at the hash seam.
 #[derive(Debug, Clone)]
 pub struct CanonicalizedProviderConfigs<H: PlaceholderKind = crate::resource::NoPlaceholder> {
-    providers: Vec<crate::parser::ProviderConfig<H>>,
+    providers: Vec<crate::parser::ProviderConfig<H, crate::resource::AbsoluteBindingAddress>>,
 }
 
 impl<H: PlaceholderKind> CanonicalizedProviderConfigs<H> {
-    pub fn as_slice(&self) -> &[crate::parser::ProviderConfig<H>] {
+    pub fn as_slice(
+        &self,
+    ) -> &[crate::parser::ProviderConfig<H, crate::resource::AbsoluteBindingAddress>] {
         &self.providers
     }
 
     #[cfg(test)]
-    pub(crate) fn from_configs_for_test(providers: Vec<crate::parser::ProviderConfig<H>>) -> Self {
+    pub(crate) fn from_configs_for_test(
+        providers: Vec<crate::parser::ProviderConfig<H, crate::resource::AbsoluteBindingAddress>>,
+    ) -> Self {
         Self { providers }
     }
 }
 
-pub(crate) fn canonicalize_provider_config_with_type_and_ancestry<H: PlaceholderKind>(
+pub(crate) fn canonicalize_provider_config_with_type_and_ancestry<
+    H: PlaceholderKind,
+    B: BindingAddress,
+>(
     provider_name: &str,
-    value: Value<H>,
+    value: Value<H, B>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
-) -> Result<Value<H>, crate::schema::TypeError> {
+) -> Result<Value<H, B>, crate::schema::TypeError> {
     let canonical = canonicalize_with_type_for_purpose(
         value,
         attr_type,
@@ -6627,11 +6662,14 @@ impl ProviderConfigCanonicalizationError {
 /// Canonicalize one provider configuration attribute map using its
 /// host-declared types. Typed canonicalization is total; the only explicit
 /// identifier check is therefore for attributes without a declared type.
-pub(crate) fn canonicalize_provider_config_attributes_with_types<H: PlaceholderKind>(
+pub(crate) fn canonicalize_provider_config_attributes_with_types<
+    H: PlaceholderKind,
+    B: BindingAddress,
+>(
     provider_name: &str,
-    attributes: &IndexMap<String, Value<H>>,
+    attributes: &IndexMap<String, Value<H, B>>,
     attr_types: &BTreeMap<String, AttributeType>,
-) -> Result<IndexMap<String, Value<H>>, ProviderConfigCanonicalizationError> {
+) -> Result<IndexMap<String, Value<H, B>>, ProviderConfigCanonicalizationError> {
     let mut canonical = IndexMap::with_capacity(attributes.len());
     for (attribute, value) in attributes {
         let value = match attr_types.get(attribute) {
@@ -6667,7 +6705,7 @@ pub(crate) fn canonicalize_provider_config_attributes_with_types<H: PlaceholderK
 /// such as provider identity `region` before those values feed durable
 /// identity hashing.
 pub fn canonicalize_provider_configs_with_schemas<H: PlaceholderKind>(
-    providers: &[crate::parser::ProviderConfig<H>],
+    providers: &[crate::parser::ProviderConfig<H, crate::resource::AbsoluteBindingAddress>],
     provider_config_schema_fn: &ProviderConfigSchemaFn<'_>,
 ) -> Result<CanonicalizedProviderConfigs<H>, ProviderConfigCanonicalizationError> {
     let mut providers = providers.to_vec();
@@ -6688,8 +6726,8 @@ pub fn canonicalize_provider_configs_with_schemas<H: PlaceholderKind>(
 /// authored `read` inputs, so `EnumIdentifier` uses authored-DSL semantics. Unknown
 /// non-enum values pass through, while an identifier without a resolvable
 /// schema is rejected (carina#3181, carina#3740).
-pub fn canonicalize_data_sources_with_schemas<S, H: PlaceholderKind>(
-    data_sources: &mut [crate::resource::DataSource<S, H>],
+pub fn canonicalize_data_sources_with_schemas<S, H: PlaceholderKind, B: BindingAddress>(
+    data_sources: &mut [crate::resource::DataSource<S, H, B>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for data_source in data_sources.iter_mut() {
@@ -6753,18 +6791,28 @@ pub fn canonicalize_states_with_schemas(
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
 
+    type Value = crate::resource::ExpandedValue;
+    type ConcreteValue = crate::resource::ExpandedConcreteValue;
+    type DeferredValue = crate::resource::ExpandedDeferredValue;
+    type InterpolationPart = crate::resource::ExpandedInterpolationPart;
+
+    fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
+        crate::resource::RootScope::new()
+            .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
+
     fn resolved_deferred_templates(
-        expressions: impl IntoIterator<Item = crate::parser::DeferredForExpression>,
+        expressions: impl IntoIterator<Item = crate::parser::ExpandedDeferredForExpression>,
     ) -> crate::parser::ResolvedDeferredForExpressions {
         crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
     }
 
-    type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
-    type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
-    type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
-    type InterpolationPart = crate::resource::InterpolationPart<crate::resource::NoPlaceholder>;
     type LoopValue = crate::resource::Value<LoopSlot>;
     type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
 
@@ -6806,11 +6854,12 @@ mod tests {
 
     #[test]
     fn parser_placeholder_display_keeps_render_unknown_parentheses() {
-        let value = crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
-            crate::resource::ParserPlaceholder::FnParam {
-                name: "input".to_string(),
-            },
-        ));
+        let value: crate::resource::Value<crate::resource::ParserPlaceholder> =
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::FnParam {
+                    name: "input".to_string(),
+                },
+            ));
 
         assert_eq!(
             format_value(&value),
@@ -6821,28 +6870,31 @@ mod tests {
     #[test]
     fn state_canonicalization_fits_provider_output_with_missing_declared_required_field() {
         use crate::resource::ValueString;
-        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
 
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::provider_populated(
+                PatternAttributeSchema::provider_populated(
                     "output",
-                    AttributeType::union(vec![
-                        AttributeType::struct_(
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::struct_(
                             "Output",
                             vec![
-                                StructField::required("eventual", AttributeType::string()).build(),
-                                StructField::optional(
+                                PatternStructField::required(
+                                    "eventual",
+                                    PatternAttributeType::string(),
+                                )
+                                .build(),
+                                PatternStructField::optional(
                                     "mode",
-                                    AttributeType::union(vec![
-                                        AttributeType::string(),
-                                        AttributeType::list(AttributeType::string()),
+                                    PatternAttributeType::union(vec![
+                                        PatternAttributeType::string(),
+                                        PatternAttributeType::list(PatternAttributeType::string()),
                                     ]),
                                 )
                                 .build(),
                             ],
                         ),
-                        AttributeType::map(AttributeType::string()),
+                        PatternAttributeType::map(PatternAttributeType::string()),
                     ]),
                 )
                 .build(),
@@ -6871,27 +6923,30 @@ mod tests {
 
     #[test]
     fn state_canonicalization_cascades_without_a_fit_and_is_idempotent() {
-        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
-
-        let archive_policy = AttributeType::struct_(
+        let archive_policy = PatternAttributeType::struct_(
             "ArchivePolicy",
-            vec![StructField::required("retention_days", AttributeType::int()).build()],
+            vec![
+                PatternStructField::required("retention_days", PatternAttributeType::int()).build(),
+            ],
         );
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .with_def("ArchivePolicy", archive_policy)
             .attribute(
-                AttributeSchema::optional("archive_policy", AttributeType::ref_("ArchivePolicy"))
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "archive_policy",
+                    PatternAttributeType::ref_("ArchivePolicy"),
+                )
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Settings",
                         vec![
-                            StructField::optional(
+                            PatternStructField::optional(
                                 "archive_policy",
-                                AttributeType::ref_("ArchivePolicy"),
+                                PatternAttributeType::ref_("ArchivePolicy"),
                             )
                             .build(),
                         ],
@@ -6939,23 +6994,21 @@ mod tests {
 
     #[test]
     fn state_canonicalization_cascades_empty_required_struct_from_successful_fit() {
-        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
-
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::provider_populated(
+                PatternAttributeSchema::provider_populated(
                     "output",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Output",
                         vec![
-                            StructField::optional(
+                            PatternStructField::optional(
                                 "archive_policy",
-                                AttributeType::struct_(
+                                PatternAttributeType::struct_(
                                     "ArchivePolicy",
                                     vec![
-                                        StructField::required(
+                                        PatternStructField::required(
                                             "retention_days",
-                                            AttributeType::int(),
+                                            PatternAttributeType::int(),
                                         )
                                         .build(),
                                     ],
@@ -6987,24 +7040,25 @@ mod tests {
 
     #[test]
     fn state_canonicalization_is_idempotent_when_dropping_a_required_field_changes_fit() {
-        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
-
-        let settings_type = AttributeType::struct_(
+        let settings_type = PatternAttributeType::struct_(
             "Settings",
             vec![
-                StructField::required(
+                PatternStructField::required(
                     "config",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Config",
-                        vec![StructField::optional("label", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("label", PatternAttributeType::string())
+                                .build(),
+                        ],
                     ),
                 )
                 .build(),
-                StructField::optional("keep", AttributeType::string()).build(),
+                PatternStructField::optional("keep", PatternAttributeType::string()).build(),
             ],
         );
-        let schema = ResourceSchema::new("test.Widget")
-            .attribute(AttributeSchema::optional("settings", settings_type).build())
+        let schema = PatternResourceSchema::new("test.Widget")
+            .attribute(PatternAttributeSchema::optional("settings", settings_type).build())
             .validate()
             .expect("schema fixture must be valid");
         let settings = Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -7059,26 +7113,26 @@ mod tests {
 
     #[test]
     fn state_canonicalization_drops_empty_all_optional_struct_and_keeps_zero_field_marker() {
-        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
-
-        let optional_config = AttributeType::struct_(
+        let optional_config = PatternAttributeType::struct_(
             "OptionalConfig",
-            vec![StructField::optional("label", AttributeType::string()).build()],
+            vec![PatternStructField::optional("label", PatternAttributeType::string()).build()],
         );
-        let marker = AttributeType::struct_("Marker", Vec::new());
-        let schema = ResourceSchema::new("test.Widget")
-            .attribute(AttributeSchema::optional("marker", marker.clone()).build())
+        let marker = PatternAttributeType::struct_("Marker", Vec::new());
+        let schema = PatternResourceSchema::new("test.Widget")
+            .attribute(PatternAttributeSchema::optional("marker", marker.clone()).build())
             .attribute(
-                AttributeSchema::optional("optional_config", optional_config.clone()).build(),
+                PatternAttributeSchema::optional("optional_config", optional_config.clone())
+                    .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Settings",
                         vec![
-                            StructField::optional("optional_config", optional_config).build(),
-                            StructField::optional("marker", marker).build(),
+                            PatternStructField::optional("optional_config", optional_config)
+                                .build(),
+                            PatternStructField::optional("marker", marker).build(),
                         ],
                     ),
                 )
@@ -7139,7 +7193,7 @@ mod tests {
 
     #[test]
     fn reads_as_absent_owns_the_empty_value_and_resolved_struct_type_decision() {
-        use crate::schema::StructField;
+        use crate::schema::CompiledStructField as StructField;
 
         let non_empty_struct = AttributeType::struct_(
             "Config",
@@ -7174,15 +7228,13 @@ mod tests {
 
     #[test]
     fn state_canonicalization_does_not_resolve_top_level_block_aliases() {
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "rules",
-                    AttributeType::union(vec![
-                        AttributeType::string(),
-                        AttributeType::list(AttributeType::string()),
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::string(),
+                        PatternAttributeType::list(PatternAttributeType::string()),
                     ]),
                 )
                 .with_block_name("rule")
@@ -7436,8 +7488,8 @@ mod tests {
 
     #[test]
     fn render_unknown_upstream_export() {
-        use crate::resource::AccessPath;
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        use crate::resource::ExpandedAccessPath as AccessPath;
+        let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".to_string()]);
         let r = ApplyTimeUnknown::UpstreamExport { path };
         assert_eq!(
             render_unknown(&r),
@@ -7447,8 +7499,8 @@ mod tests {
 
     #[test]
     fn render_unknown_upstream_export_with_subscript() {
-        use crate::resource::{AccessPath, Subscript};
-        let path = AccessPath::with_fields_and_subscripts(
+        use crate::resource::{ExpandedAccessPath as AccessPath, Subscript};
+        let path = AccessPath::root_with_fields_and_subscripts(
             "network",
             "accounts",
             Vec::new(),
@@ -7463,8 +7515,8 @@ mod tests {
 
     #[test]
     fn render_unknown_upstream_export_with_string_subscript() {
-        use crate::resource::{AccessPath, Subscript};
-        let path = AccessPath::with_fields_and_subscripts(
+        use crate::resource::{ExpandedAccessPath as AccessPath, Subscript};
+        let path = AccessPath::root_with_fields_and_subscripts(
             "vpc",
             "tags",
             Vec::new(),
@@ -7501,7 +7553,8 @@ mod tests {
         ];
 
         for (reason, expected) in cases {
-            let unknown = ApplyTimeUnknown::PendingReRead(PendingReRead::new(reason));
+            let unknown: ApplyTimeUnknown<crate::resource::AbsoluteBindingAddress> =
+                ApplyTimeUnknown::PendingReRead(PendingReRead::new(reason));
             assert_eq!(render_unknown(&unknown), expected);
         }
     }
@@ -7512,8 +7565,8 @@ mod tests {
     /// the diagnostic.
     #[test]
     fn unknown_reason_display_wording() {
-        use crate::resource::AccessPath;
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        use crate::resource::ExpandedAccessPath as AccessPath;
+        let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".into()]);
         assert_eq!(
             format!("{}", ApplyTimeUnknown::UpstreamExport { path }),
             "upstream value network.vpc.vpc_id"
@@ -7522,9 +7575,11 @@ mod tests {
         assert_eq!(
             format!(
                 "{}",
-                ApplyTimeUnknown::PendingReRead(PendingReRead::new(ReReadReason::ReadFailed {
-                    detail: "AccessDenied".to_string(),
-                }))
+                ApplyTimeUnknown::<crate::resource::AbsoluteBindingAddress>::PendingReRead(
+                    PendingReRead::new(ReReadReason::ReadFailed {
+                        detail: "AccessDenied".to_string(),
+                    }),
+                )
             ),
             "read after apply failed: AccessDenied"
         );
@@ -7631,7 +7686,7 @@ mod tests {
         // serialization is a resolver bug — surface as a structured
         // `UnresolvedResourceRef` Err instead of the legacy
         // `"${vpc.id}"` debug-string fallback.
-        let v = Value::resource_ref("vpc", "id", vec![]);
+        let v = Value::root_resource_ref("vpc", "id", vec![]);
         let err = value_to_json(&v).unwrap_err();
         assert!(
             matches!(
@@ -7648,7 +7703,7 @@ mod tests {
     #[test]
     fn test_value_to_json_coalesce_returns_err() {
         let value = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("up", "optional", vec![])),
+            value: Box::new(Value::root_resource_ref("up", "optional", vec![])),
             default: Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))),
         });
         let error = value_to_json(&value).unwrap_err();
@@ -7663,7 +7718,7 @@ mod tests {
     #[test]
     fn format_value_renders_residual_coalesce() {
         let value = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("up", "optional", vec![])),
+            value: Box::new(Value::root_resource_ref("up", "optional", vec![])),
             default: Box::new(Value::Concrete(ConcreteValue::List(Vec::new()))),
         });
         assert_eq!(format_value(&value), "up.optional ?? []");
@@ -7672,8 +7727,8 @@ mod tests {
     #[test]
     fn format_value_parenthesizes_a_coalesce_used_as_the_left_operand() {
         let inner = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("r", "comment", vec![])),
-            default: Box::new(Value::resource_ref("r", "parent", vec![])),
+            value: Box::new(Value::root_resource_ref("r", "comment", vec![])),
+            default: Box::new(Value::root_resource_ref("r", "parent", vec![])),
         });
         let value = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(inner),
@@ -7686,7 +7741,7 @@ mod tests {
     #[test]
     fn format_value_parenthesizes_a_coalesce_used_as_an_arithmetic_operand() {
         let coalesce = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("r", "count", vec![])),
+            value: Box::new(Value::root_resource_ref("r", "count", vec![])),
             default: Box::new(Value::Concrete(ConcreteValue::Int(0))),
         });
         let value = crate::integer_arithmetic::evaluate_integer_values(
@@ -8037,10 +8092,10 @@ mod tests {
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Deferred(DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamAllExports {
-                    binding: "upstream".to_string(),
+                    binding: absolute_binding("upstream"),
                 },
             )),
-            Value::resource_ref("vpc", "id", vec![]),
+            Value::root_resource_ref("vpc", "id", vec![]),
         ] {
             assert_eq!(format_value_user_facing(&value), format_value(&value));
         }
@@ -8248,11 +8303,9 @@ mod tests {
 
     #[test]
     fn canonicalize_resources_with_schemas_replaces_enum_leaves_recursively() {
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
-        };
+        use crate::schema::{SchemaRegistry, TypeIdentity};
 
-        let domain = AttributeType::enum_(
+        let domain = PatternAttributeType::enum_(
             TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
             Some(vec!["vpc".to_string(), "standard".to_string()]),
             Vec::new(),
@@ -8262,19 +8315,27 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (ResourceSchema::new("ec2.Eip")
-                .attribute(AttributeSchema::optional("domain", domain.clone()).build())
+            (PatternResourceSchema::new("ec2.Eip")
+                .attribute(PatternAttributeSchema::optional("domain", domain.clone()).build())
                 .attribute(
-                    AttributeSchema::optional("domains", AttributeType::list(domain.clone()))
-                        .build(),
+                    PatternAttributeSchema::optional(
+                        "domains",
+                        PatternAttributeType::list(domain.clone()),
+                    )
+                    .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional("domain_by_name", AttributeType::map(domain)).build(),
+                    PatternAttributeSchema::optional(
+                        "domain_by_name",
+                        PatternAttributeType::map(domain),
+                    )
+                    .build(),
                 ))
             .validate()
             .expect("schema fixture must be valid"),
         );
-        let mut resource = crate::resource::Resource::with_provider("aws", "ec2.Eip", "eip", None);
+        let mut resource: crate::resource::Resource =
+            crate::resource::Resource::with_provider("aws", "ec2.Eip", "eip", None);
         resource.set_attr(
             "domain",
             Value::Concrete(ConcreteValue::enum_identifier("aws.ec2.Eip.Domain.vpc")),
@@ -8323,12 +8384,9 @@ mod tests {
 
     #[test]
     fn canonicalize_route53_union_keeps_quoted_hosted_zone_id_on_string_arm() {
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-            TypeIdentity,
-        };
+        use crate::schema::{SchemaRegistry, TypeIdentity};
 
-        let hosted_zone = AttributeType::enum_(
+        let hosted_zone = PatternAttributeType::enum_(
             TypeIdentity::new(
                 Some("aws"),
                 ["route53", "RecordSet", "AliasTarget"],
@@ -8339,12 +8397,12 @@ mod tests {
             None,
             None,
         );
-        let alias_target = AttributeType::struct_(
+        let alias_target = PatternAttributeType::struct_(
             "AliasTarget",
             vec![
-                StructField::optional(
+                PatternStructField::optional(
                     "hosted_zone_id",
-                    AttributeType::union(vec![hosted_zone, AttributeType::string()]),
+                    PatternAttributeType::union(vec![hosted_zone, PatternAttributeType::string()]),
                 )
                 .build(),
             ],
@@ -8352,14 +8410,14 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (ResourceSchema::new("route53.RecordSet")
-                .attribute(AttributeSchema::optional("alias_target", alias_target).build()))
+            (PatternResourceSchema::new("route53.RecordSet")
+                .attribute(PatternAttributeSchema::optional("alias_target", alias_target).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );
 
         let canonicalize = |text: &str| {
-            let mut resource = crate::resource::Resource::with_provider(
+            let mut resource: crate::resource::Resource = crate::resource::Resource::with_provider(
                 "aws",
                 "route53.RecordSet",
                 "record",
@@ -8397,7 +8455,10 @@ mod tests {
 
     #[test]
     fn desired_union_selects_the_struct_that_validation_accepts() {
-        use crate::schema::{AttributeType, StructField, TypeIdentity};
+        use crate::schema::{
+            CompiledAttributeType as AttributeType, CompiledStructField as StructField,
+            TypeIdentity,
+        };
 
         let mode = AttributeType::enum_(
             TypeIdentity::new(Some("test"), ["widget", "A"], "Mode"),
@@ -8449,7 +8510,7 @@ mod tests {
 
     #[test]
     fn desired_union_prefers_string_over_enum_for_quoted_literal_in_either_order() {
-        use crate::schema::{AttributeType, TypeIdentity};
+        use crate::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
 
         let enum_type = AttributeType::enum_(
             TypeIdentity::new(Some("test"), ["widget"], "Effect"),
@@ -8866,11 +8927,13 @@ mod tests {
         );
         let enum_struct = AttributeType::struct_(
             "EnumArm",
-            vec![crate::schema::StructField::optional("a", open_enum).build()],
+            vec![crate::schema::CompiledStructField::optional("a", open_enum).build()],
         );
         let string_struct = AttributeType::struct_(
             "StringArm",
-            vec![crate::schema::StructField::optional("a", AttributeType::string()).build()],
+            vec![
+                crate::schema::CompiledStructField::optional("a", AttributeType::string()).build(),
+            ],
         );
         let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "a".to_string(),
@@ -8975,7 +9038,10 @@ mod tests {
 
     #[test]
     fn desired_union_list_selection_validates_past_a_deferred_first_item() {
-        use crate::schema::{AttributeType, StructField, TypeIdentity};
+        use crate::schema::{
+            CompiledAttributeType as AttributeType, CompiledStructField as StructField,
+            TypeIdentity,
+        };
 
         let mode = AttributeType::enum_(
             TypeIdentity::new(Some("test"), ["widget", "A"], "Mode"),
@@ -9003,7 +9069,7 @@ mod tests {
         ]);
         let value = Value::Concrete(ConcreteValue::List(vec![
             Value::Deferred(DeferredValue::BindingRef {
-                binding: "later".to_string(),
+                binding: absolute_binding("later"),
             }),
             Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "kind".to_string(),
@@ -9041,18 +9107,16 @@ mod tests {
 
     #[test]
     fn canonicalize_union_enum_identifier_resolves_against_second_matching_enum() {
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
-        };
+        use crate::schema::{SchemaRegistry, TypeIdentity};
 
-        let first = AttributeType::enum_(
+        let first = PatternAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["widget"], "FirstMode"),
             Some(vec!["FIRST".to_string()]),
             Vec::new(),
             None,
             None,
         );
-        let second = AttributeType::enum_(
+        let second = PatternAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["widget"], "SecondMode"),
             Some(vec!["SECOND".to_string()]),
             vec![("SECOND".to_string(), "second".to_string())],
@@ -9062,14 +9126,17 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
-            (ResourceSchema::new("widget").attribute(
-                AttributeSchema::optional("mode", AttributeType::union(vec![first, second]))
-                    .build(),
+            (PatternResourceSchema::new("widget").attribute(
+                PatternAttributeSchema::optional(
+                    "mode",
+                    PatternAttributeType::union(vec![first, second]),
+                )
+                .build(),
             ))
             .validate()
             .expect("schema fixture must be valid"),
         );
-        let mut resource =
+        let mut resource: crate::resource::Resource =
             crate::resource::Resource::with_provider("test", "widget", "example", None);
         resource.set_attr(
             "mode",
@@ -9091,12 +9158,10 @@ mod tests {
 
     #[test]
     fn canonicalize_secret_enum_error_masks_plaintext() {
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
-        };
+        use crate::schema::{SchemaRegistry, TypeIdentity};
 
         let plaintext = "plaintext-must-not-leak";
-        let mode = AttributeType::enum_(
+        let mode = PatternAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["widget"], "Mode"),
             Some(vec!["allowed".to_string()]),
             Vec::new(),
@@ -9106,12 +9171,12 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
-            (ResourceSchema::new("widget")
-                .attribute(AttributeSchema::optional("mode", mode).build()))
+            (PatternResourceSchema::new("widget")
+                .attribute(PatternAttributeSchema::optional("mode", mode).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );
-        let mut resource =
+        let mut resource: crate::resource::Resource =
             crate::resource::Resource::with_provider("test", "widget", "secret", None);
         resource.set_attr(
             "mode",
@@ -9151,7 +9216,7 @@ mod tests {
 
     #[test]
     fn desired_none_schema_branches_mask_secret_enum_identifier() {
-        use crate::schema::{ResourceSchema, SchemaRegistry};
+        use crate::schema::SchemaRegistry;
 
         let plaintext = "none-schema-plaintext-must-not-leak";
         let secret = || {
@@ -9163,7 +9228,7 @@ mod tests {
             let mut registry = SchemaRegistry::new();
             registry.insert(
                 "test",
-                (ResourceSchema::new("widget"))
+                (PatternResourceSchema::new("widget"))
                     .validate()
                     .expect("schema fixture must be valid"),
             );
@@ -9171,10 +9236,10 @@ mod tests {
         }];
 
         for registry in registries {
-            let mut resources = vec![
+            let resource: crate::resource::Resource =
                 crate::resource::Resource::with_provider("test", "widget", "secret", None)
-                    .with_attribute("unknown", secret()),
-            ];
+                    .with_attribute("unknown", secret());
+            let mut resources = vec![resource];
             let error = canonicalize_resources_with_schemas(&mut resources, &registry)
                 .expect_err("an unresolved secret enum must fail without a declared attribute");
             let display = error.to_string();
@@ -9218,12 +9283,9 @@ mod tests {
 
     #[test]
     fn canonicalize_resources_with_schemas_rejects_unresolved_enum_at_every_typed_depth() {
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-            TypeIdentity,
-        };
+        use crate::schema::{SchemaRegistry, TypeIdentity};
 
-        let mode = AttributeType::enum_(
+        let mode = PatternAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["widget"], "Mode"),
             Some(vec!["Allow".to_string(), "Deny".to_string()]),
             vec![("Allow".to_string(), "allow".to_string())],
@@ -9233,27 +9295,31 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
-            (ResourceSchema::new("widget")
-                .attribute(AttributeSchema::optional("top", mode.clone()).build())
+            (PatternResourceSchema::new("widget")
+                .attribute(PatternAttributeSchema::optional("top", mode.clone()).build())
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "nested",
-                        AttributeType::struct_(
+                        PatternAttributeType::struct_(
                             "Settings",
-                            vec![StructField::optional("mode", mode.clone()).build()],
+                            vec![PatternStructField::optional("mode", mode.clone()).build()],
                         ),
                     )
                     .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional("items", AttributeType::list(mode.clone())).build(),
+                    PatternAttributeSchema::optional(
+                        "items",
+                        PatternAttributeType::list(mode.clone()),
+                    )
+                    .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "unselected_union",
-                        AttributeType::union(vec![
-                            AttributeType::list(mode),
-                            AttributeType::map(AttributeType::string()),
+                        PatternAttributeType::union(vec![
+                            PatternAttributeType::list(mode),
+                            PatternAttributeType::map(PatternAttributeType::string()),
                         ]),
                     )
                     .build(),
@@ -9284,7 +9350,7 @@ mod tests {
         ];
 
         for (attribute, value) in cases {
-            let mut resource =
+            let mut resource: crate::resource::Resource =
                 crate::resource::Resource::with_provider("test", "widget", attribute, None);
             resource.set_attr(attribute, value);
             let mut resources = vec![resource];
@@ -9316,10 +9382,10 @@ mod tests {
     fn canonicalize_resources_with_schemas_keeps_deferred_enum_expressions_in_static_parity() {
         use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
         use crate::resource::InterpolationPart;
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+        use crate::schema::SchemaRegistry;
 
         let raw = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.allow"));
-        let runtime_ref = || Value::resource_ref("source", "suffix", Vec::new());
+        let runtime_ref = || Value::root_resource_ref("source", "suffix", Vec::new());
         let runtime = [
             Value::Deferred(DeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::join,
@@ -9355,13 +9421,14 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
-            (ResourceSchema::new("widget")
-                .attribute(AttributeSchema::optional("value", AttributeType::string()).build()))
+            (PatternResourceSchema::new("widget").attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::string()).build(),
+            ))
             .validate()
             .expect("schema fixture must be valid"),
         );
         let source = crate::resource::Resource::with_provider("test", "source", "source", None)
-            .with_binding("source")
+            .with_root_binding("source")
             .with_attribute(
                 "suffix",
                 Value::Concrete(ConcreteValue::String("-suffix".into())),
@@ -9379,7 +9446,7 @@ mod tests {
         });
 
         for (runtime, static_value) in runtime.into_iter().zip(static_values) {
-            let mut resource =
+            let mut resource: crate::resource::Resource =
                 crate::resource::Resource::with_provider("test", "widget", "example", None);
             resource.set_attr("value", runtime);
             let mut resources = vec![resource];
@@ -9400,7 +9467,7 @@ mod tests {
     #[test]
     fn canonicalize_provider_configs_replaces_region_enum_with_canonical_api_value() {
         use crate::parser::ProviderConfig;
-        use crate::schema::{AttributeType, TypeIdentity};
+        use crate::schema::TypeIdentity;
 
         let providers = vec![
             ProviderConfig {
@@ -9436,7 +9503,7 @@ mod tests {
         let providers = canonicalize_provider_configs_with_schemas(&providers, &|_provider| {
             crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "region".to_string(),
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
                     Some(vec!["ap-northeast-1".to_string()]),
                     vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
@@ -9463,7 +9530,7 @@ mod tests {
 
     #[test]
     fn provider_config_accepts_identity_or_configured_provider_namespace_only() {
-        use crate::schema::{AttributeType, TypeIdentity};
+        use crate::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
 
         let attr_types = BTreeMap::from([(
             "region".to_string(),
@@ -9509,7 +9576,7 @@ mod tests {
 
     #[test]
     fn provider_config_alias_namespace_must_preserve_type_segments() {
-        use crate::schema::{AttributeType, TypeIdentity};
+        use crate::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
 
         let attr_types = BTreeMap::from([(
             "state".to_string(),
@@ -9582,7 +9649,7 @@ mod tests {
 
     #[test]
     fn provider_config_canonicalization_masks_secret_enum_errors() {
-        use crate::schema::AttributeType;
+        use crate::schema::CompiledAttributeType as AttributeType;
 
         let plaintext = "provider-config-plaintext-must-not-leak";
         let secret = || {
@@ -9653,7 +9720,7 @@ mod tests {
 
     #[test]
     fn test_format_value_resource_ref() {
-        let v = Value::resource_ref("vpc", "id", vec![]);
+        let v = Value::root_resource_ref("vpc", "id", vec![]);
         assert_eq!(format_value(&v), "vpc.id");
     }
 
@@ -9713,13 +9780,13 @@ mod tests {
     #[test]
     fn stale_loop_display_root_does_not_hide_the_substituted_access_cause() {
         use crate::resource::{
-            AccessMissPolicy, AccessPath, ApplyTimeUnknown, PathSegment, Subscript,
-            apply_postfix_access,
+            AccessMissPolicy, ApplyTimeUnknown, ExpandedAccessPath as AccessPath, PathSegment,
+            Subscript, apply_postfix_access,
         };
 
         let upstream = apply_postfix_access(
             Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-                path: AccessPath::new("up", "value"),
+                path: AccessPath::root("up", "value"),
             })),
             PathSegment::Field {
                 name: "nested".to_string(),
@@ -9765,8 +9832,8 @@ mod tests {
     /// `Value::Concrete(ConcreteValue::String)` sentinel from #2367.
     #[test]
     fn test_format_value_unresolved_upstream() {
-        use crate::resource::{AccessPath, ApplyTimeUnknown};
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        use crate::resource::ExpandedAccessPath as AccessPath;
+        let path = AccessPath::root_with_fields("network", "vpc", vec!["vpc_id".to_string()]);
         let v = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path,
         }));
@@ -9786,9 +9853,9 @@ mod tests {
             matches!(
                 err,
                 SerializationError::UnknownNotAllowed {
-                    reason: ApplyTimeUnknown::PendingReRead(_),
+                    ref reason,
                     context: SerializationContext::ValueToJson,
-                }
+                } if matches!(reason.as_ref(), ApplyTimeUnknown::PendingReRead(_))
             ),
             "expected UnknownNotAllowed/PendingReRead/ValueToJson, got: {err:?}"
         );
@@ -9796,13 +9863,13 @@ mod tests {
 
     #[test]
     fn test_format_value_resource_ref_with_field_path() {
-        let v = Value::resource_ref("web", "network", vec!["vpc_id".to_string()]);
+        let v = Value::root_resource_ref("web", "network", vec!["vpc_id".to_string()]);
         assert_eq!(format_value(&v), "web.network.vpc_id");
     }
 
     #[test]
     fn test_value_to_json_resource_ref_with_field_path_returns_err() {
-        let v = Value::resource_ref(
+        let v = Value::root_resource_ref(
             "web",
             "output",
             vec!["network".to_string(), "vpc_id".to_string()],
@@ -10070,7 +10137,7 @@ mod tests {
 
     #[test]
     fn unresolved_secret_with_null_provider_value_returns_an_error() {
-        let desired = Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
+        let desired = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
             "upstream",
             "value",
             Vec::new(),
@@ -10085,7 +10152,7 @@ mod tests {
     #[test]
     fn non_structural_expression_containing_secret_masks_whole_observed_value() {
         let desired = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("resource", "comment", Vec::new())),
+            value: Box::new(Value::root_resource_ref("resource", "comment", Vec::new())),
             default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                 Value::Concrete(ConcreteValue::String("fallback-secret".into())),
             )))),
@@ -10186,11 +10253,9 @@ mod tests {
             .expect("nested marker-shaped plaintext can be hashed");
         assert_eq!(refreshed.as_json(), previous.as_json());
 
-        let unresolved = Value::Deferred(DeferredValue::Secret(Box::new(Value::resource_ref(
-            "upstream",
-            "value",
-            Vec::new(),
-        ))));
+        let unresolved = Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::root_resource_ref("upstream", "value", Vec::new()),
+        )));
         let merged = merge_secrets_into_provider_json(&unresolved, &provider, Some(&previous))
             .expect("provider material with a nested marker-shaped string can be hashed");
         assert_eq!(merged.as_json(), previous.as_json());
@@ -10290,7 +10355,7 @@ mod tests {
             DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("DEFPLAIN-".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::new("r", "identifier"),
+                    path: crate::resource::ExpandedAccessPath::root("r", "identifier"),
                 })),
                 InterpolationPart::Literal("-TAIL".into()),
             ]),
@@ -10313,7 +10378,7 @@ mod tests {
             DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("CHANGED-".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                    path: crate::resource::AccessPath::new("r", "identifier"),
+                    path: crate::resource::ExpandedAccessPath::root("r", "identifier"),
                 })),
                 InterpolationPart::Literal("-TAIL".into()),
             ]),
@@ -10351,14 +10416,14 @@ mod tests {
 
     fn deferred_interpolation_hash_material(secret: &str) -> Value {
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(Value::resource_ref("origin", "identifier", vec![])),
+            InterpolationPart::Expr(Value::root_resource_ref("origin", "identifier", vec![])),
             InterpolationPart::Literal(format!("-{secret}").into()),
         ]))
     }
 
     fn deferred_coalesce_hash_material(default: Value) -> Value {
         Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("origin", "comment", vec![])),
+            value: Box::new(Value::root_resource_ref("origin", "comment", vec![])),
             default: Box::new(default),
         })
     }
@@ -10411,7 +10476,7 @@ mod tests {
             upper_with_secret_hash_material(Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
                     ApplyTimeUnknown::UpstreamExport {
-                        path: crate::resource::AccessPath::new("upstream", "identifier"),
+                        path: crate::resource::ExpandedAccessPath::root("upstream", "identifier"),
                     },
                 ))),
                 InterpolationPart::Literal("-same-secret".into()),
@@ -10517,7 +10582,11 @@ mod tests {
             (
                 deferred_interpolation_hash_material("planned-secret"),
                 Value::Deferred(DeferredValue::Interpolation(vec![
-                    InterpolationPart::Expr(Value::resource_ref("origin", "identifier", vec![])),
+                    InterpolationPart::Expr(Value::root_resource_ref(
+                        "origin",
+                        "identifier",
+                        vec![],
+                    )),
                     InterpolationPart::Literal("-".into()),
                     InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(Box::new(
                         unavailable_env_evaluation(),
@@ -10733,7 +10802,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("RESOLVED_REFERENCE_SECRET".into())),
             ))))
             .expect("redact resolved reference secret");
-        let reference = Value::resource_ref("producer", "comment", vec![]);
+        let reference = Value::root_resource_ref("producer", "comment", vec![]);
 
         let resource = crate::resource::Resource::new("mock.test.resource", "consumer")
             .with_attribute(
@@ -10801,7 +10870,7 @@ mod tests {
     fn saved_plan_redaction_preserves_canonical_update_from_without_secrets() {
         use crate::effect::Effect;
         use crate::plan::Plan;
-        use crate::resource::{ResolvedResource, Resource, ResourceId, State};
+        use crate::resource::{ExpandedResource as Resource, ResolvedResource, ResourceId, State};
 
         let id = ResourceId::with_identity("mock.test.resource", "canonical");
         let canonical_from = State::existing(
@@ -11009,7 +11078,7 @@ mod tests {
     fn fail_closed_mask_promotes_plaintext_for_non_structural_secret_shape() {
         let plaintext = Value::Concrete(ConcreteValue::String("selected-secret".into()));
         let shape = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("producer", "comment", vec![])),
+            value: Box::new(Value::root_resource_ref("producer", "comment", vec![])),
             default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                 Value::Concrete(ConcreteValue::String("fallback".into())),
             )))),
@@ -11058,7 +11127,7 @@ mod tests {
             (
                 "selected".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                    value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
                     default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                         Value::Concrete(ConcreteValue::String("fallback".into())),
                     )))),
@@ -11102,7 +11171,7 @@ mod tests {
     fn resolved_public_branch_overrides_unselected_authored_secret_fallback() {
         let applied = Value::Concrete(ConcreteValue::String("selected-public".into()));
         let authored = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+            value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
             default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                 Value::Concrete(ConcreteValue::String("fallback".into())),
             )))),
@@ -11120,7 +11189,7 @@ mod tests {
         let public = Value::Concrete(ConcreteValue::String("selected-public".into()));
         let plain = Value::Concrete(ConcreteValue::String("plain".into()));
         let authored_coalesce = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+            value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
             default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                 Value::Concrete(ConcreteValue::String("fallback".into())),
             )))),
@@ -11148,7 +11217,7 @@ mod tests {
         ]));
         let authored = Value::Concrete(ConcreteValue::List(vec![
             Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
                 default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                     Value::Concrete(ConcreteValue::String("fallback".into())),
                 )))),
@@ -11172,7 +11241,7 @@ mod tests {
             (
                 "selected".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(Value::resource_ref("producer", "missing", vec![])),
+                    value: Box::new(Value::root_resource_ref("producer", "missing", vec![])),
                     default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                         Value::Concrete(ConcreteValue::String("fallback".into())),
                     )))),
@@ -11207,7 +11276,7 @@ mod tests {
 
     #[test]
     fn unprojectable_authored_secret_fails_closed_at_the_child_only() {
-        let unresolved = Value::resource_ref("runtime", "value", vec![]);
+        let unresolved = Value::root_resource_ref("runtime", "value", vec![]);
         let plain = Value::Concrete(ConcreteValue::String("plain".into()));
         let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("unresolved".to_string(), unresolved.clone()),
@@ -11217,7 +11286,7 @@ mod tests {
             (
                 "unresolved".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(Value::resource_ref("producer", "identifier", vec![])),
+                    value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
                     default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
                         Value::Concrete(ConcreteValue::String("fallback".into())),
                     )))),
@@ -11258,8 +11327,11 @@ mod tests {
         // block (which lands as a `Value::Secret` in the composition's
         // attribute map) must be redacted before serialization, the
         // same way managed-resource attributes are redacted.
-        use crate::resource::LiveCompositionAttribute;
-        use crate::resource::{LiveComposition, LiveCompositionSignature, ResourceId};
+        use crate::resource::ExpandedLiveCompositionAttribute as LiveCompositionAttribute;
+        use crate::resource::{
+            ExpandedLiveComposition as LiveComposition,
+            ExpandedLiveCompositionSignature as LiveCompositionSignature, ResourceId,
+        };
         use std::collections::{BTreeSet, HashSet};
         let mut attrs: indexmap::IndexMap<String, LiveCompositionAttribute> =
             indexmap::IndexMap::new();
@@ -11289,7 +11361,7 @@ mod tests {
                 attributes: attrs,
                 pending_constraints: Vec::new(),
             },
-            binding: Some("module_instance".to_string()),
+            binding: Some(absolute_binding("module_instance")),
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "module_instance".to_string(),
@@ -11326,7 +11398,10 @@ mod tests {
 
         // The rest of the LiveComposition (id, binding, etc.) is
         // preserved verbatim.
-        assert_eq!(redacted.binding.as_deref(), Some("module_instance"));
+        assert_eq!(
+            redacted.binding.as_ref().map(|binding| binding.as_str()),
+            Some("module_instance")
+        );
         assert_eq!(redacted.id.resource_type, "_virtual");
     }
 
@@ -11434,7 +11509,7 @@ mod tests {
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Concrete(ConcreteValue::Int(42)),
             Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
-            Value::resource_ref("server", "id", Vec::new()),
+            Value::root_resource_ref("server", "id", Vec::new()),
         ]));
 
         let rendered = render_value(&value);
@@ -11466,7 +11541,7 @@ mod tests {
         let value = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix ".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
-                binding: "cert".to_string(),
+                binding: absolute_binding("cert"),
             })),
             InterpolationPart::Literal(".example".into()),
         ]));
@@ -11504,7 +11579,7 @@ mod tests {
         );
 
         let binding = render_value(&Value::Deferred(DeferredValue::BindingRef {
-            binding: "x".to_string(),
+            binding: absolute_binding("x"),
         }));
         assert_eq!(
             binding
@@ -11521,7 +11596,7 @@ mod tests {
                 args: vec![
                     Value::Concrete(ConcreteValue::String("/".into())).into(),
                     Value::Deferred(DeferredValue::BindingRef {
-                        binding: "x".to_string(),
+                        binding: absolute_binding("x"),
                     })
                     .into(),
                 ],
@@ -11751,7 +11826,7 @@ mod tests {
     fn render_value_pretty_unknown_renders_like_format_value() {
         let v = Value::Deferred(DeferredValue::Unknown(
             ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".to_string(),
+                binding: absolute_binding("upstream"),
             },
         ));
         assert_eq!(
@@ -12264,9 +12339,9 @@ mod tests {
     #[test]
     fn render_value_pretty_scalar_variants_match_format_value() {
         // Lock the "scalar fallthrough" contract.
-        use crate::resource::AccessPath;
+        use crate::resource::ExpandedAccessPath as AccessPath;
 
-        let path = AccessPath::new("vpc", "id");
+        let path = AccessPath::root("vpc", "id");
         let cases = vec![
             Value::Concrete(ConcreteValue::String("hello".into())),
             Value::Concrete(ConcreteValue::Int(42)),
@@ -12304,10 +12379,11 @@ mod tests {
 
     // ---- canonicalize_with_type tests (#2481, #2510) ----
 
-    fn string_or_list_of_strings() -> AttributeType {
-        AttributeType::union(vec![
-            AttributeType::string(),
-            AttributeType::list(AttributeType::string()),
+    fn string_or_list_of_strings<R: crate::schema::PatternForm>()
+    -> crate::schema::PatternAttributeType<R> {
+        PatternAttributeType::union(vec![
+            PatternAttributeType::string(),
+            PatternAttributeType::list(PatternAttributeType::string()),
         ])
     }
 
@@ -12425,7 +12501,8 @@ mod tests {
         let t = AttributeType::struct_(
             "Statement".to_string(),
             vec![
-                crate::schema::StructField::optional("action", string_or_list_of_strings()).build(),
+                crate::schema::CompiledStructField::optional("action", string_or_list_of_strings())
+                    .build(),
             ],
         );
         let mut map = IndexMap::new();
@@ -12454,16 +12531,23 @@ mod tests {
         let statement = AttributeType::struct_(
             "Statement".to_string(),
             vec![
-                crate::schema::StructField::optional("action", string_or_list_of_strings()).build(),
-                crate::schema::StructField::optional("resource", string_or_list_of_strings())
+                crate::schema::CompiledStructField::optional("action", string_or_list_of_strings())
                     .build(),
+                crate::schema::CompiledStructField::optional(
+                    "resource",
+                    string_or_list_of_strings(),
+                )
+                .build(),
             ],
         );
         let policy_document = AttributeType::struct_(
             "PolicyDocument".to_string(),
             vec![
-                crate::schema::StructField::optional("statement", AttributeType::list(statement))
-                    .build(),
+                crate::schema::CompiledStructField::optional(
+                    "statement",
+                    AttributeType::list(statement),
+                )
+                .build(),
             ],
         );
         let schema = crate::schema::Schema::flat(policy_document);
@@ -12508,9 +12592,12 @@ mod tests {
         let t = AttributeType::struct_(
             "Statement".to_string(),
             vec![
-                crate::schema::StructField::optional("actions", string_or_list_of_strings())
-                    .with_block_name("action")
-                    .build(),
+                crate::schema::CompiledStructField::optional(
+                    "actions",
+                    string_or_list_of_strings(),
+                )
+                .with_block_name("action")
+                .build(),
             ],
         );
         let mut map = IndexMap::new();
@@ -12539,7 +12626,7 @@ mod tests {
         let t = AttributeType::struct_(
             "Statement".to_string(),
             vec![
-                crate::schema::StructField::optional("action", string_or_list_of_strings())
+                crate::schema::CompiledStructField::optional("action", string_or_list_of_strings())
                     .with_provider_name("Action")
                     .build(),
             ],
@@ -12577,8 +12664,11 @@ mod tests {
             AttributeType::struct_(
                 "PrincipalStruct".to_string(),
                 vec![
-                    crate::schema::StructField::optional("service", string_or_list_of_strings())
-                        .build(),
+                    crate::schema::CompiledStructField::optional(
+                        "service",
+                        string_or_list_of_strings(),
+                    )
+                    .build(),
                 ],
             ),
             AttributeType::string(),
@@ -12646,8 +12736,11 @@ mod tests {
             AttributeType::struct_(
                 "PrincipalStruct".to_string(),
                 vec![
-                    crate::schema::StructField::optional("service", string_or_list_of_strings())
-                        .build(),
+                    crate::schema::CompiledStructField::optional(
+                        "service",
+                        string_or_list_of_strings(),
+                    )
+                    .build(),
                 ],
             ),
         )]);
@@ -12676,8 +12769,11 @@ mod tests {
             AttributeType::struct_(
                 "PrincipalStruct".to_string(),
                 vec![
-                    crate::schema::StructField::optional("service", string_or_list_of_strings())
-                        .build(),
+                    crate::schema::CompiledStructField::optional(
+                        "service",
+                        string_or_list_of_strings(),
+                    )
+                    .build(),
                 ],
             ),
             AttributeType::ref_("A"),
@@ -13110,10 +13206,11 @@ mod tests {
     // ---- canonicalize_resources_with_schemas tests (#2481, #2511) ----
 
     fn build_test_registry() -> crate::schema::SchemaRegistry {
-        use crate::schema::{AttributeSchema, ResourceSchema, SchemaRegistry};
+        use crate::schema::SchemaRegistry;
         let mut reg = SchemaRegistry::new();
-        let schema = ResourceSchema::new("iam.policy")
-            .attribute(AttributeSchema::optional("subject", string_or_list_of_strings()).build());
+        let schema = PatternResourceSchema::new("iam.policy").attribute(
+            PatternAttributeSchema::optional("subject", string_or_list_of_strings()).build(),
+        );
         reg.insert(
             "aws",
             schema.validate().expect("schema fixture must be valid"),
@@ -13122,7 +13219,7 @@ mod tests {
     }
 
     fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
-        use crate::resource::{Resource, ResourceId};
+        use crate::resource::{ExpandedResource as Resource, ResourceId};
         use std::collections::{BTreeSet, HashMap, HashSet};
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
@@ -13134,7 +13231,7 @@ mod tests {
             directives: Default::default(),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
-            binding: Some("p1".to_string()),
+            binding: Some(absolute_binding("p1")),
             dependency_bindings: BTreeSet::new(),
             module_source: None,
             default_tag_keys: Default::default(),
@@ -13236,12 +13333,10 @@ mod tests {
 
     #[test]
     fn canonicalize_data_sources_with_schemas_rewrites_authored_inputs() {
-        use crate::resource::DataSource;
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, enum_identity,
-        };
+        use crate::resource::ExpandedDataSource as DataSource;
+        use crate::schema::{SchemaRegistry, enum_identity};
 
-        let mode = AttributeType::enum_(
+        let mode = PatternAttributeType::enum_(
             enum_identity("Mode", Some("awscc.example.Widget")),
             Some(vec!["API_A".to_string(), "FOO".to_string()]),
             vec![("API_A".to_string(), "foo".to_string())],
@@ -13251,16 +13346,18 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
-            (ResourceSchema::new("example.Widget")
+            (PatternResourceSchema::new("example.Widget")
                 .as_data_source()
                 .attribute(
-                    AttributeSchema::optional("subject", string_or_list_of_strings()).build(),
+                    PatternAttributeSchema::optional("subject", string_or_list_of_strings())
+                        .build(),
                 )
-                .attribute(AttributeSchema::optional("mode", mode).build()))
+                .attribute(PatternAttributeSchema::optional("mode", mode).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );
-        let mut data_source = DataSource::with_provider("awscc", "example.Widget", "widget", None);
+        let mut data_source: DataSource =
+            DataSource::with_provider("awscc", "example.Widget", "widget", None);
         data_source.set_attr(
             "subject",
             Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
@@ -13468,19 +13565,19 @@ mod tests {
     #[test]
     fn canonicalize_pipeline_dynamic_az_enum_state_api_spelling_has_no_diff() {
         use crate::differ::{Diff, diff_test};
-        use crate::resource::{Resource, ResourceId, State};
-        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+        use crate::resource::{ExpandedResource as Resource, ResourceId, State};
+        use crate::schema::SchemaRegistry;
         use std::collections::HashMap;
 
-        let az_enum = AttributeType::enum_(
+        let az_enum = PatternAttributeType::enum_(
             crate::schema::enum_identity("ZoneName", Some("aws.AvailabilityZone")),
             None,
             vec![],
             None,
             Some(crate::schema::DslTransform::HyphenToUnderscore),
         );
-        let schema = ResourceSchema::new("ec2.Subnet")
-            .attribute(AttributeSchema::optional("availability_zone", az_enum).build());
+        let schema = PatternResourceSchema::new("ec2.Subnet")
+            .attribute(PatternAttributeSchema::optional("availability_zone", az_enum).build());
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "awscc",
@@ -13528,7 +13625,16 @@ mod tests {
             current,
             None,
             None,
-            Some(&schema),
+            Some(
+                registry
+                    .get(
+                        "awscc",
+                        schema.resource_type(),
+                        crate::schema::SchemaKind::Resource,
+                    )
+                    .unwrap()
+                    .as_schema(),
+            ),
             &crate::differ::exact_comparison_schema_for_tests(),
         );
         assert!(
@@ -13548,21 +13654,19 @@ mod tests {
     /// the differ is a bug") is then satisfied, not worked around.
     #[test]
     fn canonicalize_pipeline_folds_union_nested_string_or_list_both_sides() {
-        use crate::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-        };
-        let principal = AttributeType::union(vec![
-            AttributeType::struct_(
+        use crate::schema::SchemaRegistry;
+        let principal = PatternAttributeType::union(vec![
+            PatternAttributeType::struct_(
                 "PrincipalStruct".to_string(),
-                vec![StructField::optional("service", string_or_list_of_strings()).build()],
+                vec![PatternStructField::optional("service", string_or_list_of_strings()).build()],
             ),
-            AttributeType::string(),
+            PatternAttributeType::string(),
         ]);
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
-            (ResourceSchema::new("iam.policy")
-                .attribute(AttributeSchema::optional("principal", principal).build()))
+            (PatternResourceSchema::new("iam.policy")
+                .attribute(PatternAttributeSchema::optional("principal", principal).build()))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -13634,7 +13738,7 @@ mod tests {
         // as the structural equivalent of `Value::Concrete(ConcreteValue::List([String, ...]))`,
         // so a Union[String, list(String)] member's `list(String)`
         // branch validates the canonical form cleanly.
-        use crate::schema::AttributeType;
+        use crate::schema::CompiledAttributeType as AttributeType;
         let list_of_string = AttributeType::list(AttributeType::string());
         let v = Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()]));
         assert!(list_of_string.validate(&v).is_ok());
@@ -13669,7 +13773,7 @@ mod tests {
     fn format_value_interpolation_escapes_literal_parts() {
         let value = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("say \"hello\"".into()),
-            InterpolationPart::Expr(Value::resource_ref("server", "name", Vec::new())),
+            InterpolationPart::Expr(Value::root_resource_ref("server", "name", Vec::new())),
         ]));
 
         assert_eq!(format_value(&value), "\"say \\\"hello\\\"${server.name}\"");
@@ -13741,8 +13845,11 @@ mod tests {
         use crate::resource::{
             AccessPath, ApplyTimeUnknown, DeferredValue, InterpolationPart, ResourceId, Value,
         };
-        let path =
-            AccessPath::with_fields("management_route53", "apex_zone_id", Vec::<String>::new());
+        let path = AccessPath::root_with_fields(
+            "management_route53",
+            "apex_zone_id",
+            Vec::<String>::new(),
+        );
         let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamExport { path },
@@ -13781,7 +13888,10 @@ mod tests {
     #[test]
     fn redact_secrets_in_effect_walks_import_identifier_interpolation() {
         use crate::effect::Effect;
-        use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, ResourceId, Value};
+        use crate::resource::{
+            ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+            ExpandedInterpolationPart as InterpolationPart, ExpandedValue as Value, ResourceId,
+        };
         let secret_inner = Value::Concrete(ConcreteValue::String("super-secret".into()));
         let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(Box::new(
@@ -13807,7 +13917,10 @@ mod tests {
                 );
                 // The redactor emits a typed placeholder for the secret leaf.
                 fn walk(v: &Value) -> bool {
-                    use crate::resource::{DeferredValue, InterpolationPart, Value};
+                    use crate::resource::{
+                        ExpandedDeferredValue as DeferredValue,
+                        ExpandedInterpolationPart as InterpolationPart, ExpandedValue as Value,
+                    };
                     match v {
                         Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
                         Value::Deferred(DeferredValue::Interpolation(parts)) => {
@@ -13867,9 +13980,11 @@ mod tests {
                 None,
                 1,
                 "for opt in cert.domain_validation_options".to_string(),
-                crate::parser::DeferredForTarget::bound("validation_records")
-                    .expect("fixture binding is valid"),
-                Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                crate::parser::DeferredForTarget::bound(
+                    crate::resource::absolute_binding_address_for_test("validation_records"),
+                )
+                .expect("fixture binding is valid"),
+                Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 ForBinding::Simple("opt".to_string()),
                 template_resource,
             ),
@@ -13933,9 +14048,11 @@ mod tests {
                 None,
                 1,
                 "for opt in cert.options".to_string(),
-                crate::parser::DeferredForTarget::bound("records")
-                    .expect("fixture binding is valid"),
-                Value::resource_ref("cert", "options", Vec::new()),
+                crate::parser::DeferredForTarget::bound(
+                    crate::resource::absolute_binding_address_for_test("records"),
+                )
+                .expect("fixture binding is valid"),
+                Value::root_resource_ref("cert", "options", Vec::new()),
                 ForBinding::Simple("opt".to_string()),
                 template_resource,
             ),
@@ -13979,8 +14096,11 @@ mod tests {
             None,
             1,
             "for child in parent.children".to_string(),
-            crate::parser::DeferredForTarget::bound("children").expect("fixture binding is valid"),
-            Value::resource_ref("parent", "children", Vec::new()),
+            crate::parser::DeferredForTarget::bound(
+                crate::resource::absolute_binding_address_for_test("children"),
+            )
+            .expect("fixture binding is valid"),
+            Value::root_resource_ref("parent", "children", Vec::new()),
             ForBinding::Simple("child".to_string()),
             template_resource,
         );
@@ -14021,13 +14141,14 @@ mod tests {
         use crate::effect::ChangedCreateOnly;
         use crate::plan::{ReplacementDelete, ReplacementGroup};
         use crate::resource::{
-            Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+            ExpandedDirectives as Directives, ExpandedResource as Resource, ResolvedResource,
+            ResolvedResourceId, ResourceId,
         };
         use std::collections::HashSet;
 
         let id = ResourceId::with_identity("aws.s3.Bucket", "bucket");
         let mut create = Resource::new("aws.s3.Bucket", "bucket");
-        create.binding = Some("bucket".to_string());
+        create.binding = Some(absolute_binding("bucket"));
 
         let mut plan = crate::plan::Plan::new();
         plan.add_replacement(ReplacementGroup {
@@ -14036,7 +14157,7 @@ mod tests {
                 id: ResolvedResourceId::new(id.clone()),
                 identifier: crate::effect::fixture_applied_identifier("bucket-old"),
                 directives: Directives::default(),
-                binding: Some("bucket".to_string()),
+                binding: Some(absolute_binding("bucket")),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
             },
@@ -14054,7 +14175,7 @@ mod tests {
 
     #[test]
     fn redact_secrets_in_plan_preserves_replace_display() {
-        use crate::resource::{ConcreteValue, Value};
+        use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
         use std::collections::HashMap;
 
         let plan = replacement_plan_with_previous_attributes(
@@ -14096,7 +14217,10 @@ mod tests {
 
     #[test]
     fn redact_secrets_in_plan_redacts_secret_in_previous_attributes() {
-        use crate::resource::{ConcreteValue, DeferredValue, Value};
+        use crate::resource::{
+            ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+            ExpandedValue as Value,
+        };
         use std::collections::HashMap;
 
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(

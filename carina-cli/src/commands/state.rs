@@ -23,8 +23,8 @@ use carina_core::provider::{
     ProviderError, ProviderNormalizer, ProviderRouter, RawSavedAttrs, UnknownCreateOutcome,
 };
 use carina_core::resource::{
-    Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
-    ResourceIdentity, State, Value,
+    AbsoluteBindingAddress, Current, DataSource, ResolvedDataSource, ResolvedResource,
+    ResolvedResourceId, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
@@ -89,7 +89,7 @@ fn format_deferred_state_refresh_warning(
         .iter()
         .flat_map(|input| {
             let paths = input.paths.iter().map(|path| path.to_dot_string());
-            let bindings = input.bindings.iter().cloned();
+            let bindings = input.bindings.iter().map(ToString::to_string);
             let unknowns = input
                 .unknowns
                 .iter()
@@ -98,7 +98,7 @@ fn format_deferred_state_refresh_warning(
         })
         .collect::<Vec<_>>();
     if refs.is_empty() {
-        refs.extend(resource.dependency_bindings.iter().cloned());
+        refs.extend(resource.dependency_bindings.iter().map(ToString::to_string));
     }
     let refs = if refs.is_empty() {
         "unknown input dependency".to_string()
@@ -186,7 +186,11 @@ fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<Completio
     // Top-level resource bindings and identities.
     let mut candidates: Vec<CompletionCandidate> = Vec::new();
     for rs in state.resources() {
-        let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+        let display_name = rs
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str())
+            .unwrap_or(rs.identity.as_str());
         if display_name.starts_with(current) {
             candidates.push(CompletionCandidate::new(display_name));
         }
@@ -491,13 +495,13 @@ pub async fn run_state_forget(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let address = state_forget_address(namespaced_type, identity)?;
-    let parsed = load_configuration_with_config(
+    let loaded = load_configuration_with_config(
         path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?
-    .parsed;
-    let backend_config = parsed
+    )?;
+    let backend_config = loaded
+        .into_root_expanded()
         .backend
         .map(carina_core::parser::BackendConfig::into_expanded)
         .transpose()?;
@@ -685,7 +689,7 @@ fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a Re
     state
         .resources()
         .iter()
-        .find(|r| r.binding.as_deref() == Some(name))
+        .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some(name))
         .or_else(|| {
             // Fall back to identity
             state
@@ -761,7 +765,11 @@ fn create_outcome_unknown_status(unknown: &UnknownCreateOutcome) -> String {
 fn format_state_list(state: &StateFile) -> Vec<String> {
     let mut lines = Vec::new();
     for rs in state.resources() {
-        let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+        let display_name = rs
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str())
+            .unwrap_or(rs.identity.as_str());
         let row_prefix = format!("{}.{} {}", rs.provider, rs.resource_type, display_name);
         let current = current_for_state_command(state, rs);
         match StateCommandCurrent::from(&current) {
@@ -925,7 +933,11 @@ fn format_state_lookup_json(
             else {
                 unreachable!("public and internal current kinds must agree")
             };
-            let display_name = row.binding.as_deref().unwrap_or(row.identity.as_str());
+            let display_name = row
+                .binding
+                .as_ref()
+                .map(|binding| binding.as_str())
+                .unwrap_or(row.identity.as_str());
             return Err(AppError::Config(format!(
                 "Cannot look up attribute '{attribute}' on resource '{display_name}': {}.",
                 create_in_flight_status(pending)
@@ -937,7 +949,11 @@ fn format_state_lookup_json(
             .get(attribute)
             .cloned()
             .ok_or_else(|| {
-                let display_name = row.binding.as_deref().unwrap_or(row.identity.as_str());
+                let display_name = row
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str())
+                    .unwrap_or(row.identity.as_str());
                 AppError::Config(format!(
                     "Attribute '{attribute}' not found on resource '{display_name}'."
                 ))
@@ -952,8 +968,8 @@ fn format_state_lookup_json(
 /// longest-prefix tie-break can prefer bindings over identities.
 fn candidate_addresses(rs: &ResourceState) -> impl Iterator<Item = (&str, bool)> {
     rs.binding
-        .as_deref()
-        .map(|b| (b, true))
+        .as_ref()
+        .map(|binding| (binding.as_str(), true))
         .into_iter()
         .chain(std::iter::once((rs.identity.as_str(), false)))
 }
@@ -992,7 +1008,11 @@ fn format_resource_value(
         },
         StateCommandCurrent::CreateInFlight(pending) => match attribute {
             Some(attr) => {
-                let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+                let display_name = rs
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str())
+                    .unwrap_or(rs.identity.as_str());
                 Err(AppError::Config(format!(
                     "Cannot look up attribute '{attr}' on resource '{display_name}': {}.",
                     create_in_flight_status(pending)
@@ -1010,7 +1030,11 @@ fn format_resource_value(
         },
         StateCommandCurrent::CreateOutcomeUnknown(unknown) => match attribute {
             Some(attr) => {
-                let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+                let display_name = rs
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str())
+                    .unwrap_or(rs.identity.as_str());
                 Err(AppError::Config(format!(
                     "Cannot look up attribute '{attr}' on resource '{display_name}': {}.",
                     create_outcome_unknown_status(unknown)
@@ -1045,7 +1069,11 @@ fn format_resource_full_value_with_deposed(rs: &ResourceState) -> Result<String,
 }
 
 fn missing_attribute_error<T>(rs: &ResourceState, attr: &str) -> Result<T, AppError> {
-    let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+    let display_name = rs
+        .binding
+        .as_ref()
+        .map(|binding| binding.as_str())
+        .unwrap_or(rs.identity.as_str());
     Err(AppError::Config(format!(
         "Attribute '{}' not found on resource '{}'.",
         attr, display_name
@@ -1112,7 +1140,11 @@ fn format_state_show(state: &StateFile) -> String {
         if i > 0 {
             output.push('\n');
         }
-        let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
+        let display_name = rs
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str())
+            .unwrap_or(rs.identity.as_str());
         output.push_str(&format!(
             "# {}.{} ({})\n",
             rs.provider, rs.resource_type, display_name
@@ -1628,7 +1660,7 @@ pub(crate) async fn run_state_refresh_locked(
         state_file.as_ref(),
     )
     .await?;
-    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
+    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<AbsoluteBindingAddress>> = state_file
         .as_ref()
         .map(|sf| {
             sorted_resources
@@ -2717,11 +2749,40 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(name)
+    }
+
     fn resolve_file_for_test<E>(
         parsed: carina_core::parser::ExpandedFile<E>,
         _base_dir: &Path,
     ) -> carina_core::parser::ExpandedFile<E> {
         parsed
+    }
+
+    fn resolve_authored_file_for_test<E>(
+        parsed: carina_core::parser::File<E>,
+        base_dir: &Path,
+    ) -> carina_core::parser::ExpandedFile<
+        <E::Absolute as carina_core::parser::IntoExpandedExportParam<
+            carina_core::resource::AbsoluteBindingAddress,
+        >>::Expanded,
+    >
+    where
+        E: carina_core::parser::ResolveExportBindingPhase<carina_core::resource::ParserPlaceholder>,
+        E::Absolute: carina_core::parser::IntoExpandedExportParam<
+                carina_core::resource::AbsoluteBindingAddress,
+            >,
+    {
+        carina_core::module_resolver::resolve_modules_with_providerless_config(
+            carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+            base_dir,
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("test fixture crosses module resolution")
+        .into_expanded()
+        .expect("test fixture contains no leftover parser placeholders")
     }
 
     fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
@@ -2925,12 +2986,10 @@ mod tests {
     #[tokio::test]
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = parsed
-            .into_expanded()
-            .expect("provider upstream fixture has no parser placeholders");
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2971,15 +3030,13 @@ mod tests {
         parsed
             .upstream_states
             .push(carina_core::parser::UpstreamState {
-                binding: "unrelated".to_string(),
+                binding: carina_core::resource::RelativeBindingName::new("unrelated"),
                 source: PathBuf::from("../unrelated"),
             });
-        let parsed = parsed
-            .into_expanded()
-            .expect("provider upstream fixture has no parser placeholders");
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -3008,12 +3065,10 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
-        let parsed = parsed
-            .into_expanded()
-            .expect("provider upstream fixture has no parser placeholders");
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -3067,7 +3122,12 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &downstream, true, &[])
+            .validate_evaluated_config(
+                carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                &downstream,
+                true,
+                &[],
+            )
             .unwrap();
 
         run_state_refresh_locked(
@@ -3089,7 +3149,12 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[])
+            .validate_evaluated_config(
+                carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                &base_dir,
+                true,
+                &[],
+            )
             .unwrap();
 
         run_state_refresh_locked(
@@ -3111,7 +3176,12 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[])
+            .validate_evaluated_config(
+                carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                &base_dir,
+                true,
+                &[],
+            )
             .unwrap();
 
         run_state_refresh_locked(
@@ -3129,9 +3199,7 @@ mod tests {
     #[tokio::test]
     async fn state_bucket_delete_prepares_resolved_upstream_provider_config() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = parsed
-            .into_expanded()
-            .expect("provider upstream fixture has no parser placeholders");
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &downstream,
@@ -3140,7 +3208,7 @@ mod tests {
         .await
         .expect("state bucket delete provider inputs must resolve");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = ValidatedConfig::from_factories_for_test(
+        let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3188,9 +3256,7 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
-        let parsed = parsed
-            .into_expanded()
-            .expect("provider upstream fixture has no parser placeholders");
+        let parsed = resolve_authored_file_for_test(parsed, &downstream);
 
         let error = match load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3215,9 +3281,7 @@ mod tests {
     async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         parsed.providers[0].name = "test".to_string();
-        let parsed = parsed
-            .into_expanded()
-            .expect("provider default-tags fixture has no parser placeholders");
+        let parsed = resolve_authored_file_for_test(parsed, &base_dir);
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &base_dir,
@@ -3226,7 +3290,7 @@ mod tests {
         .await
         .expect("bucket delete must not load tag-only upstream state");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = ValidatedConfig::from_factories_for_test(
+        let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3272,9 +3336,7 @@ mod tests {
                 .contains_key("default_tags"),
             "the fixture must exercise the parser shape used by bucket delete"
         );
-        let parsed = parsed
-            .into_expanded()
-            .expect("bucket-delete fixture has no leftover parser placeholders");
+        let parsed = resolve_authored_file_for_test(parsed, temp.path());
 
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3284,7 +3346,7 @@ mod tests {
         .await
         .expect("deferred default tags must not block bucket provider construction");
         let received_role_arn = Arc::new(Mutex::new(None));
-        let ctx = ValidatedConfig::from_factories_for_test(
+        let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3624,7 +3686,7 @@ mod tests {
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(CancellingDataSourceRefreshFactory {
                 reads: reads.clone(),
@@ -3677,14 +3739,14 @@ mod tests {
                     message: "value must not be bad".to_string(),
                 }],
             },
-            binding: Some("checked".to_string()),
+            binding: Some(absolute_binding("checked")),
             dependency_bindings: BTreeSet::new(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
         };
-        let data_source = DataSource::with_provider("test", "lookup", "unrelated", None)
+        let data_source = <DataSource>::with_provider("test", "lookup", "unrelated", None)
             .with_attribute(
                 "query",
                 Value::Concrete(ConcreteValue::String("literal".into())),
@@ -3715,7 +3777,7 @@ mod tests {
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory {
                 reads: reads.clone(),
@@ -3762,7 +3824,7 @@ mod tests {
                     message: "value must not be bad".to_string(),
                 }],
             },
-            binding: Some("checked".to_string()),
+            binding: Some(absolute_binding("checked")),
             dependency_bindings: BTreeSet::new(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
@@ -3793,7 +3855,7 @@ mod tests {
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
-        let validated_config = ValidatedConfig::from_factories_for_test(
+        let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory { reads })],
             &provider_configs,
@@ -4277,7 +4339,7 @@ mod tests {
         let mut initial_state = StateFile::new();
         let mut managed = ResourceState::try_applied("test.resource", "managed", "mock", "mock-id")
             .expect("fixture identifier is non-empty");
-        managed.binding = Some("managed".to_string());
+        managed.binding = Some(absolute_binding("managed"));
         managed.set_persisted_attribute("name".to_string(), serde_json::json!("managed"));
         initial_state
             .upsert_resource(managed)
@@ -4385,15 +4447,15 @@ mod tests {
         )
         .expect("test config should parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
-        let parsed = parsed
-            .into_expanded()
-            .expect("state-refresh fixture must contain only loop slots");
+        let parsed = resolve_authored_file_for_test(parsed, Path::new("."));
 
         let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let source = parsed
             .resources
             .iter()
-            .find(|resource| resource.binding.as_deref() == Some("source"))
+            .find(|resource| {
+                resource.binding.as_ref().map(|binding| binding.as_str()) == Some("source")
+            })
             .expect("source resource");
         let current_states = HashMap::from([(
             source.id.clone(),
@@ -4477,7 +4539,10 @@ mod tests {
             assert!(child.binding.is_none());
             assert!(child.loop_provenance.display_origin().is_some());
         } else {
-            assert_eq!(child.binding.as_deref(), Some("widgets[0]"));
+            assert_eq!(
+                child.binding.as_ref().map(|binding| binding.as_str()),
+                Some("widgets[0]")
+            );
         }
 
         let mut state_file = StateFile::new();
@@ -4529,7 +4594,10 @@ mod tests {
             .seal(carina_core::data_source_value::DataSourceValues::empty());
         let progress = ProgressBackend::plain(std::io::sink());
         let refresh_phase = RefreshPhase::start(&progress);
-        let mut validated_config = ValidatedConfig::from_factories_with_additional_schemas_for_test(
+        let mut validated_config = ValidatedConfig::from_factories_with_additional_schemas_for_test::<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >(
             parsed,
             Vec::new(),
             &[],
@@ -4599,7 +4667,7 @@ mod tests {
             .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", json!("10.0.0.0/16"))
             .with_attribute("vpc_id", json!("vpc-new"));
-        row.binding = Some("main".to_string());
+        row.binding = Some(absolute_binding("main"));
         row.deposed.push(deposed_instance(
             deposed_key("dep-a"),
             "vpc-old",
@@ -4680,7 +4748,7 @@ mod tests {
     fn binding_takes_precedence_over_name() {
         let mut state = StateFile::new();
         let mut rs1 = ResourceState::new("ec2.Vpc", "vpc", "awscc");
-        rs1.binding = Some("my_vpc".to_string());
+        rs1.binding = Some(absolute_binding("my_vpc"));
         let mut rs2 = ResourceState::new("ec2.Subnet", "my_vpc", "awscc");
         rs2.binding = None;
         state
@@ -4871,7 +4939,7 @@ mod tests {
             ResourceState::try_applied("test.resource", "target-resource", "mock", "target-id")
                 .expect("fixture identifier must be non-empty")
                 .with_attribute("name", json!("target"));
-        target.binding = Some("target".to_string());
+        target.binding = Some(absolute_binding("target"));
 
         let trailing =
             ResourceState::try_applied("test.resource", "trailing-resource", "mock", "trailing-id")
@@ -4924,7 +4992,7 @@ mod tests {
             &carina_core::differ::exact_comparison_context_for_tests(),
         )
         .expect("in-flight fixture must be encodable");
-        row.binding = Some("pending".to_string());
+        row.binding = Some(absolute_binding("pending"));
         let mut state = StateFile::new();
         state
             .upsert_resource(row)
@@ -4970,7 +5038,7 @@ mod tests {
         let mut state = StateFile::new();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
             .with_attribute("vpc_id", json!("vpc-current"));
-        row.binding = Some("main".to_string());
+        row.binding = Some(absolute_binding("main"));
         row.deposed.push(deposed_instance(
             deposed_key("dep-a"),
             "vpc-old",
@@ -5735,7 +5803,7 @@ mod tests {
         row.directives = carina_core::resource::Directives::default()
             .with_force_delete(true)
             .with_create_before_destroy(true)
-            .with_depends_on(vec!["security_group".to_string()])
+            .with_depends_on(vec![absolute_binding("security_group")])
             .with_provider_instance("west")
             .with_prevent_destroy(true)
             .into();
@@ -5748,8 +5816,8 @@ mod tests {
                 original_value: Some("prod-original".to_string()),
             },
         );
-        row.binding = Some("subnet".to_string());
-        row.dependency_bindings = BTreeSet::from(["vpc".to_string()]);
+        row.binding = Some(absolute_binding("subnet"));
+        row.dependency_bindings = BTreeSet::from([absolute_binding("vpc")]);
         row.explicit = carina_core::explicit::ExplicitFields::Struct {
             children: HashMap::from([(
                 "cidr_block".to_string(),
@@ -5804,17 +5872,20 @@ mod tests {
         let refreshed = state
             .find_resource("awscc", "ec2.Subnet", "main")
             .expect("refreshed orphan row must remain");
-        assert_eq!(refreshed.binding.as_deref(), Some("subnet"));
+        assert_eq!(
+            refreshed.binding.as_ref().map(|binding| binding.as_str()),
+            Some("subnet")
+        );
         assert_eq!(
             refreshed.dependency_bindings,
-            BTreeSet::from(["vpc".to_string()])
+            BTreeSet::from([absolute_binding("vpc")])
         );
         assert_eq!(
             refreshed.directives,
             carina_core::resource::Directives::default()
                 .with_force_delete(true)
                 .with_create_before_destroy(true)
-                .with_depends_on(vec!["security_group".to_string()])
+                .with_depends_on(vec![absolute_binding("security_group")])
                 .with_provider_instance("west")
                 .with_prevent_destroy(true)
         );
@@ -7035,7 +7106,12 @@ mod tests {
         let plan = build_plan_from_state(&state);
 
         let vpc_effect = &plan.effects()[0];
-        assert_eq!(vpc_effect.binding_name(), Some("vpc".to_string()),);
+        assert_eq!(
+            vpc_effect
+                .binding_address()
+                .map(carina_core::resource::BindingAddress::as_str),
+            Some("vpc"),
+        );
     }
 
     #[test]
@@ -7064,21 +7140,21 @@ mod tests {
         let subnet_resource = plan.effects()[1].as_resource_ref().unwrap();
         assert_eq!(
             subnet_resource.dependency_bindings(),
-            &std::collections::BTreeSet::from(["vpc".to_string()])
+            &std::collections::BTreeSet::from([absolute_binding("vpc")])
         );
     }
 
     #[test]
     fn deferred_data_source_state_refresh_warning_names_read_and_missing_upstream() {
-        let resource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        let resource: DataSource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
         let warning = format_deferred_state_refresh_warning(
             &resource,
             &[UnresolvedDataSourceInput {
                 attribute: "name_regex".to_string(),
-                paths: vec![carina_core::resource::AccessPath::new(
-                    "target_role",
-                    "role_name",
-                )],
+                paths: vec![
+                    carina_core::resource::AccessPath::new("target_role", "role_name")
+                        .resolve_root_for_test(),
+                ],
                 bindings: Vec::new(),
                 unknowns: Vec::new(),
             }],
@@ -7091,10 +7167,11 @@ mod tests {
 
     #[test]
     fn deferred_data_source_state_refresh_warning_names_recorded_dependency() {
-        let mut resource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        let mut resource: DataSource =
+            DataSource::with_provider("mock", "iam.Roles", "roles", None);
         resource
             .dependency_bindings
-            .insert("registry_publish.target".to_string());
+            .insert(absolute_binding("registry_publish.target"));
 
         let warning = format_deferred_state_refresh_warning(&resource, &[]);
 
@@ -7191,7 +7268,7 @@ mod tests {
     fn lookup_resource_binding_named_exports() {
         let mut state = StateFile::new();
         let mut rs = ResourceState::new("ec2.Vpc", "exports-vpc", "awscc");
-        rs.binding = Some("exports".to_string());
+        rs.binding = Some(absolute_binding("exports"));
         rs.set_persisted_attribute("vpc_id".to_string(), serde_json::json!("vpc-from-resource"));
         state
             .upsert_resource(rs)

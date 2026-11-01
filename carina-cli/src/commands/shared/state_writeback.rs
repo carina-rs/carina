@@ -21,10 +21,10 @@ use carina_core::provider::{
 #[cfg(test)]
 use carina_core::resource::PersistedDirectiveField;
 use carina_core::resource::{
-    ConcreteValue, Current, ModuleSource, PersistedDirectiveFieldChange, PersistedDirectives,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, ModuleSource, PersistedDirectiveFieldChange,
+    PersistedDirectives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
-use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_core::schema::{CompiledResourceSchema as ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
@@ -39,6 +39,37 @@ use crate::commands::plan::MovedOrigins;
 use crate::commands::shared::incremental_state_saver::FinalStateBase;
 use crate::commands::shared::lock_heartbeat::StateLockRef;
 use crate::error::AppError;
+
+#[cfg(test)]
+fn absolute_binding(name: impl Into<String>) -> AbsoluteBindingAddress {
+    carina_core::resource::absolute_binding_address_for_test(name)
+}
+
+#[cfg(test)]
+fn root_resource_ref(
+    binding: impl Into<String>,
+    attribute: impl Into<String>,
+    fields: Vec<String>,
+) -> Value {
+    carina_core::resource::Value::<
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::RelativeBindingName,
+    >::resource_ref(binding.into(), attribute.into(), fields)
+    .resolve_root_for_test()
+}
+
+#[cfg(test)]
+trait WithTestBinding {
+    fn with_test_binding(self, binding: impl Into<String>) -> Self;
+}
+
+#[cfg(test)]
+impl<S, P: carina_core::resource::PlaceholderKind> WithTestBinding for Resource<S, P> {
+    fn with_test_binding(mut self, binding: impl Into<String>) -> Self {
+        self.binding = Some(absolute_binding(binding));
+        self
+    }
+}
 
 /// Apply permanent name overrides from state to desired resources.
 ///
@@ -1012,7 +1043,7 @@ struct ReplacementDeleteInput<'a> {
     identifier: &'a str,
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
-    fallback_dependency_bindings: BTreeSet<String>,
+    fallback_dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
 
@@ -2051,6 +2082,10 @@ mod post_apply_states_tests {
 
 #[cfg(test)]
 mod apply_state_save_tests {
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
+    };
+
     use super::*;
     use carina_core::differ::create_plan_for_test as create_plan;
     use carina_core::effect::{
@@ -2064,7 +2099,7 @@ mod apply_state_save_tests {
         ApplyTimeUnknown, ConcreteValue, DeferredValue, Directives, ResolvedResourceId, Resource,
         ResourceId, State, Value,
     };
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use carina_core::schema::SchemaRegistry;
     use carina_state::{CurrentInstance, DeposedInstance, DeposedKey, NameOverride};
 
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
@@ -2119,7 +2154,7 @@ mod apply_state_save_tests {
         changed(prevent_destroy, PersistedDirectiveField::PreventDestroy);
 
         let mut depends_on = Resource::with_provider("mock", "test.Resource", "main", None);
-        depends_on.directives.depends_on = vec!["dependency".to_string()];
+        depends_on.directives.depends_on = vec![absolute_binding("dependency")];
         changed(depends_on, PersistedDirectiveField::DependsOn);
 
         let mut provider_instance = Resource::with_provider("mock", "test.Resource", "main", None);
@@ -2131,12 +2166,13 @@ mod apply_state_save_tests {
     fn persisted_directive_changes_treat_depends_on_as_a_set() {
         let mut row = ResourceState::try_applied("test.Resource", "main", "mock", "provider-main")
             .expect("fixture identifier is valid");
-        row.directives.depends_on = vec!["first".to_string(), "second".to_string()];
+        row.directives.depends_on = vec![absolute_binding("first"), absolute_binding("second")];
         let mut state = StateFile::new();
         state.upsert_resource(row).expect("fixture row is unique");
 
         let mut resource = Resource::with_provider("mock", "test.Resource", "main", None);
-        resource.directives.depends_on = vec!["second".to_string(), "first".to_string()];
+        resource.directives.depends_on =
+            vec![absolute_binding("second"), absolute_binding("first")];
 
         assert_eq!(
             persisted_directive_changes(Some(&state), &[resolved(resource)], &Plan::new()),
@@ -2320,9 +2356,11 @@ mod apply_state_save_tests {
             Some("main.crn".to_string()),
             1,
             "for opt in cert.domain_validation_options".to_string(),
-            carina_core::parser::DeferredForTarget::bound("validation_records")
-                .expect("fixture binding is valid"),
-            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            carina_core::parser::DeferredForTarget::bound(
+                carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            )
+            .expect("fixture binding is valid"),
+            root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
             // Comparison pre-resolution keys the materialized template by
             // provider instance and type before any runtime child exists.
@@ -2469,7 +2507,7 @@ mod apply_state_save_tests {
     fn replacement_matrix_state(kind: ReplacementAppliedKind, delete_first: bool) -> StateFile {
         let resource =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("new.example.com".into())),
@@ -2772,7 +2810,7 @@ mod apply_state_save_tests {
         );
         let desired =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("changed.example.com".into())),
@@ -2870,15 +2908,21 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            (PatternResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::optional("replacement_key", AttributeType::string())
-                        .create_only()
+                    PatternAttributeSchema::optional("comment", PatternAttributeType::string())
                         .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional(
+                        "replacement_key",
+                        PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 ))
@@ -3000,11 +3044,17 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("ec2.InternetGateway")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            (PatternResourceSchema::new("ec2.InternetGateway")
                 .attribute(
-                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
                         .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "tags",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
                 ))
             .validate()
             .expect("schema fixture must be valid"),
@@ -3644,8 +3694,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("test.resource").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .create_only()
                     .build(),
@@ -3770,16 +3820,26 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            (PatternResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 )
-                .attribute(AttributeSchema::optional("api_key", AttributeType::string()).build())
                 .attribute(
-                    AttributeSchema::optional("unsent_secret", AttributeType::string()).build(),
+                    PatternAttributeSchema::optional("api_key", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "unsent_secret",
+                        PatternAttributeType::string(),
+                    )
+                    .build(),
                 ))
             .validate()
             .expect("schema fixture must be valid"),
@@ -3891,8 +3951,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("test.resource").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .create_only()
                     .build(),
@@ -3922,7 +3982,7 @@ mod apply_state_save_tests {
     #[test]
     fn missing_applied_entry_keeps_current_in_flight_row_byte_for_byte() {
         let resource = Resource::with_provider("mock", "test.resource", "pending", None)
-            .with_binding("pending")
+            .with_test_binding("pending")
             .with_attribute(
                 "name",
                 Value::Concrete(ConcreteValue::String("stable".into())),
@@ -3991,7 +4051,7 @@ mod apply_state_save_tests {
             ResourceId::with_provider_identity("mock", "test.resource", "new_address", None);
         let source_resource = resolved(
             Resource::from_id(source.clone())
-                .with_binding("old_address")
+                .with_test_binding("old_address")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("stable".into())),
@@ -4045,7 +4105,7 @@ mod apply_state_save_tests {
         };
         let destination_resource = resolved(
             Resource::from_id(destination.clone())
-                .with_binding("new_address")
+                .with_test_binding("new_address")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("stable".into())),
@@ -4099,8 +4159,9 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+            (PatternResourceSchema::new("test.resource").attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            ))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -4185,14 +4246,20 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            (PatternResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 )
-                .attribute(AttributeSchema::optional("api_key", AttributeType::string()).build()))
+                .attribute(
+                    PatternAttributeSchema::optional("api_key", PatternAttributeType::string())
+                        .build(),
+                ))
             .validate()
             .expect("schema fixture must be valid"),
         );
@@ -4442,7 +4509,7 @@ mod apply_state_save_tests {
     #[test]
     fn only_create_ended_clears_current_and_keeps_deposed() {
         let resource = Resource::with_provider("mock", "test.resource", "pending", None)
-            .with_binding("pending")
+            .with_test_binding("pending")
             .with_attribute(
                 "name",
                 Value::Concrete(ConcreteValue::String("stable".into())),
@@ -4938,8 +5005,8 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Deposed(deposed_key.clone()),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: HashSet::from([absolute_binding("cert")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         });
@@ -4947,12 +5014,14 @@ mod apply_state_save_tests {
             Some("main.crn".to_string()),
             1,
             "for opt in cert.domain_validation_options".to_string(),
-            carina_core::parser::DeferredForTarget::bound("validation_records")
-                .expect("fixture binding is valid"),
-            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            carina_core::parser::DeferredForTarget::bound(
+                carina_core::resource::absolute_binding_address_for_test("validation_records"),
+            )
+            .expect("fixture binding is valid"),
+            root_resource_ref("cert", "domain_validation_options", Vec::new()),
             ForBinding::Simple("opt".to_string()),
             Resource::with_provider("aws", "route53.Record", "validation_records", None)
-                .with_binding("validation_records"),
+                .with_test_binding("validation_records"),
         );
         plan.add(Effect::DeferredCreate(
             carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
@@ -4997,8 +5066,8 @@ mod apply_state_save_tests {
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
             identifier: crate::fixture_applied_identifier("old-record-id"),
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
-            dependencies: HashSet::from(["cert".to_string()]),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: HashSet::from([absolute_binding("cert")]),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         }
@@ -5011,7 +5080,7 @@ mod apply_state_save_tests {
             "validation_records",
             id.provider_instance.clone(),
         )
-        .with_binding("validation_records");
+        .with_test_binding("validation_records");
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
@@ -5019,9 +5088,11 @@ mod apply_state_save_tests {
                 Some("main.crn".to_string()),
                 1,
                 "for opt in cert.domain_validation_options".to_string(),
-                carina_core::parser::DeferredForTarget::bound("validation_records")
-                    .expect("fixture binding is valid"),
-                Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                carina_core::parser::DeferredForTarget::bound(
+                    carina_core::resource::absolute_binding_address_for_test("validation_records"),
+                )
+                .expect("fixture binding is valid"),
+                root_resource_ref("cert", "domain_validation_options", Vec::new()),
                 ForBinding::Simple("opt".to_string()),
                 template_resource,
             )),
@@ -5038,7 +5109,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]");
+                .with_test_binding("validation_records[0]");
         let applied_state =
             State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
         let mut plan = Plan::new();
@@ -5087,7 +5158,7 @@ mod apply_state_save_tests {
             "validation_records[0]",
             Some("west".to_string()),
         )
-        .with_binding("validation_records[0]");
+        .with_test_binding("validation_records[0]");
         let applied_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -5113,7 +5184,9 @@ mod apply_state_save_tests {
         .expect("fixture identifier is non-empty")
         .with_attribute("name", serde_json::json!("old.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
-        existing.dependency_bindings.insert("cert".to_string());
+        existing
+            .dependency_bindings
+            .insert(absolute_binding("cert"));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -5169,7 +5242,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]");
+                .with_test_binding("validation_records[0]");
         let applied_state =
             State::existing(id.clone(), HashMap::new()).with_identifier("old-record-id");
         let current_state =
@@ -5211,7 +5284,7 @@ mod apply_state_save_tests {
     #[test]
     fn update_only_applied_identifier_change_does_not_phantom_depose_old_identifier() {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main")
+            .with_test_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -5283,7 +5356,7 @@ mod apply_state_save_tests {
     #[test]
     fn applied_upsert_that_displaces_undeleted_current_identifier_deposes_old_identifier() {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main")
+            .with_test_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -5292,7 +5365,7 @@ mod apply_state_save_tests {
         let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
             .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
-        existing.dependency_bindings.insert("igw".to_string());
+        existing.dependency_bindings.insert(absolute_binding("igw"));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -5341,14 +5414,14 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             row.deposed[0].dependency_bindings,
-            BTreeSet::from(["igw".to_string()])
+            BTreeSet::from([absolute_binding("igw")])
         );
     }
 
     #[test]
     fn applied_recreate_after_confirmed_missing_current_does_not_depose_old_identifier() {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main")
+            .with_test_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -5408,7 +5481,7 @@ mod apply_state_save_tests {
     fn displaced_identifier_depose_records_existing_row_provider_instance() {
         let desired =
             Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
-                .with_binding("main")
+                .with_test_binding("main")
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -5472,7 +5545,7 @@ mod apply_state_save_tests {
      {
         let desired =
             Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
-                .with_binding("main")
+                .with_test_binding("main")
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -5506,7 +5579,7 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("vpc-old"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
-            binding: Some("main".to_string()),
+            binding: Some(absolute_binding("main")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -5570,7 +5643,7 @@ mod apply_state_save_tests {
     fn successful_delete_on_other_provider_instance_does_not_suppress_displaced_depose() {
         let desired =
             Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
-                .with_binding("main")
+                .with_test_binding("main")
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -5641,7 +5714,7 @@ mod apply_state_save_tests {
             "validation_records[0]",
             Some("west".to_string()),
         )
-        .with_binding("validation_records[0]")
+        .with_test_binding("validation_records[0]")
         .with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
@@ -5682,7 +5755,7 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
+            binding: Some(absolute_binding("validation_records[0]")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -5764,7 +5837,7 @@ mod apply_state_save_tests {
             "validation_records[0]",
             Some("west".to_string()),
         )
-        .with_binding("validation_records[0]")
+        .with_test_binding("validation_records[0]")
         .with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
@@ -5805,7 +5878,7 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("old-record-id"),
             generation: EffectGeneration::Current,
             directives: Directives::default(),
-            binding: Some("validation_records[0]".to_string()),
+            binding: Some(absolute_binding("validation_records[0]")),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
@@ -5883,7 +5956,7 @@ mod apply_state_save_tests {
     #[test]
     fn refresh_current_state_upsert_does_not_phantom_depose_displaced_identifier() {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main")
+            .with_test_binding("main")
             .with_attribute(
                 "cidr_block",
                 Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -6055,8 +6128,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("test.resource").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             ))
@@ -6117,8 +6190,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            (ResourceSchema::new("db.Instance").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("db.Instance").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             ))
@@ -6202,7 +6275,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("new.example.com".into())),
@@ -6241,10 +6314,13 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            (ResourceSchema::new("route53.Record")
-                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            (PatternResourceSchema::new("route53.Record")
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 ))
@@ -6310,14 +6386,17 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
-            (ResourceSchema::new("test.resource")
+            (PatternResourceSchema::new("test.resource")
                 .attribute(
-                    AttributeSchema::optional("replacement_key", AttributeType::string())
-                        .create_only()
-                        .build(),
+                    PatternAttributeSchema::optional(
+                        "replacement_key",
+                        PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
                 )
                 .attribute(
-                    AttributeSchema::optional("password", AttributeType::string())
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 )
@@ -6396,7 +6475,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "password",
                     Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -6419,7 +6498,8 @@ mod apply_state_save_tests {
                             "bootstrap",
                             "network",
                             vec!["unknown".into()],
-                        ),
+                        )
+                        .resolve_root_for_test(),
                     })),
                 ),
             ]),
@@ -6478,7 +6558,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "password",
                     Value::Concrete(ConcreteValue::String("plain-new".into())),
@@ -6558,7 +6638,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]")
+                .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "name",
                     Value::Concrete(ConcreteValue::String("new.example.com".into())),
@@ -6586,8 +6666,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
-            (ResourceSchema::new("route53.Record").attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+            (PatternResourceSchema::new("route53.Record").attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             ))
@@ -6748,7 +6828,7 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             deposed.dependency_bindings,
-            BTreeSet::from(["newer".to_string()])
+            BTreeSet::from([absolute_binding("newer")])
         );
     }
 
@@ -6762,7 +6842,7 @@ mod apply_state_save_tests {
         );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
-                .with_binding("validation_records[0]");
+                .with_test_binding("validation_records[0]");
         let applied_state =
             State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
         let current_state = State::existing(
@@ -6882,8 +6962,8 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "",
-            (ResourceSchema::new("ec2.Vpc").attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+            (PatternResourceSchema::new("ec2.Vpc").attribute(
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             ))
@@ -6965,13 +7045,16 @@ mod apply_state_save_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
-            (ResourceSchema::new("s3.Bucket")
+            (PatternResourceSchema::new("s3.Bucket")
                 .attribute(
-                    AttributeSchema::optional("bucket_name", AttributeType::string())
+                    PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
                         .create_only()
                         .build(),
                 )
-                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .attribute(
+                    PatternAttributeSchema::optional("comment", PatternAttributeType::string())
+                        .build(),
+                )
                 .with_coexisting_replacement())
             .validate()
             .expect("schema fixture must be valid"),
@@ -6996,7 +7079,7 @@ mod apply_state_save_tests {
             .next()
             .expect("create-only diff should produce replacement metadata");
         assert!(replacement.create_before_destroy);
-        let state_blocks: Vec<carina_core::parser::StateBlock> = Vec::new();
+        let state_blocks: Vec<carina_core::parser::ExpandedStateBlock> = Vec::new();
         let state_file_for_wiring = Some(StateFile::new());
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let unresolved_upstreams: HashSet<&str> = HashSet::new();
@@ -7042,7 +7125,9 @@ mod apply_state_save_tests {
                 .expect("fixture identifier is non-empty")
                 .with_attribute("bucket_name", serde_json::json!("old-name"))
                 .with_attribute("comment", persisted_secret.as_json().clone());
-        existing.dependency_bindings.insert("logs".to_string());
+        existing
+            .dependency_bindings
+            .insert(absolute_binding("logs"));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -7149,15 +7234,20 @@ mod apply_state_save_tests {
 #[cfg(test)]
 mod export_writeback_tests {
     use super::*;
-    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
+    use carina_core::parser::{
+        ExpandedInferredExportParam, InferredExportParam, ResolveExportBindingPhase,
+    };
     use carina_core::resource::{
-        AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart,
-        PartialReadMarker, PendingReRead, Value,
+        ApplyTimeUnknown, AuthoredAccessPath, ConcreteValue, DeferredValue, InterpolationPart,
+        NoPlaceholder, PartialReadMarker, PendingReRead, RelativeBindingName, Value,
     };
     use carina_state::{ResourceState, StateFile};
 
-    fn export_param(name: &str, value: Value) -> InferredExportParam {
-        InferredExportParam {
+    fn export_param(
+        name: &str,
+        value: Value<NoPlaceholder, RelativeBindingName>,
+    ) -> ExpandedInferredExportParam {
+        InferredExportParam::<NoPlaceholder, RelativeBindingName> {
             name: name.to_string(),
             static_type: carina_core::static_type::ExportStaticType::Inferred(
                 carina_core::static_type::StaticType::Unchecked(
@@ -7170,10 +7260,11 @@ mod export_writeback_tests {
             ),
             value: Some(value),
         }
+        .resolve_root_for_test()
     }
 
     fn resolve_export_parts(
-        export_params: &[InferredExportParam],
+        export_params: &[ExpandedInferredExportParam],
     ) -> (HashMap<String, PersistedExportValue>, Vec<SkippedExport>) {
         let state = StateFile::new();
         let post_apply_states = PostApplyStates::from_current_and_state(
@@ -7219,15 +7310,19 @@ mod export_writeback_tests {
                 BTreeSet::from(["computed".to_string()]),
             )),
         );
-        row.dependency_bindings = BTreeSet::from(["upstream".to_string()]);
+        row.dependency_bindings = BTreeSet::from([absolute_binding("upstream")]);
         let mut state = StateFile::new();
         state
             .upsert_resource(row)
             .expect("partial-read fixture must be valid");
 
-        let resource =
-            Resource::with_provider("mock", "test.Resource", "main", None).with_binding("instance");
-        let reference = Value::resource_ref("instance", "computed", vec![]);
+        let resource = Resource::with_provider("mock", "test.Resource", "main", None)
+            .with_test_binding("instance");
+        let reference = Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+            "instance",
+            "computed",
+            vec![],
+        );
         let export_params = [export_param("computed", reference.clone())];
         let checked = carina_core::validation::check_export_values_pre_apply(
             &export_params,
@@ -7253,7 +7348,7 @@ mod export_writeback_tests {
                 ));
                 assert_eq!(
                     present.state().dependency_bindings,
-                    BTreeSet::from(["upstream".to_string()])
+                    BTreeSet::from([absolute_binding("upstream")])
                 );
             }
             Current::MissingIdentifier(state) => {
@@ -7302,7 +7397,7 @@ mod export_writeback_tests {
             export_param(
                 "target_group_arn",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::with_fields(
+                    path: AuthoredAccessPath::with_fields(
                         "registry_publish",
                         "target_group",
                         vec!["arn".into()],
@@ -7346,7 +7441,7 @@ mod export_writeback_tests {
             export_param(
                 "first_missing",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new("first", "id"),
+                    path: AuthoredAccessPath::new("first", "id"),
                 }),
             ),
             export_param(
@@ -7356,7 +7451,7 @@ mod export_writeback_tests {
             export_param(
                 "second_missing",
                 Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new("second", "id"),
+                    path: AuthoredAccessPath::new("second", "id"),
                 }),
             ),
         ];
@@ -7380,7 +7475,7 @@ mod export_writeback_tests {
             Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("x".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new("missing", "value"),
+                    path: AuthoredAccessPath::new("missing", "value"),
                 })),
             ])),
         )];
@@ -7403,7 +7498,7 @@ mod export_writeback_tests {
                     Value::Concrete(ConcreteValue::String("-".into())).into(),
                     Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
                         DeferredValue::ResourceRef {
-                            path: AccessPath::new("missing", "value"),
+                            path: AuthoredAccessPath::new("missing", "value"),
                         },
                     )]))
                     .into(),
@@ -7477,16 +7572,29 @@ mod stage4_unknown_err_tests {
     /// silent fallback would re-introduce v1 corruption.
     #[test]
     fn unknown_returns_err_from_persisted_export_encode() {
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
+            .resolve_root_for_test();
         let v = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = PersistedExportValue::encode(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: ApplyTimeUnknown::UpstreamExport { path: p },
+                reason,
                 context: SerializationContext::StateWriteback,
-            } => assert_eq!(p, path),
+            } => match *reason {
+                ApplyTimeUnknown::UpstreamExport {
+                    path: persisted_path,
+                } => {
+                    assert_eq!(persisted_path, path)
+                }
+                ApplyTimeUnknown::UpstreamAllExports { binding } => {
+                    panic!("expected an upstream export path, got all exports for {binding}")
+                }
+                ApplyTimeUnknown::PendingReRead(pending) => {
+                    panic!("expected an upstream export path, got pending reread: {pending}")
+                }
+            },
             other => {
                 panic!("expected UnknownNotAllowed/UpstreamExport/StateWriteback, got: {other:?}")
             }
@@ -7499,7 +7607,8 @@ mod stage4_unknown_err_tests {
     #[test]
     fn resource_ref_returns_unresolved_err() {
         let v = Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
+            path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()])
+                .resolve_root_for_test(),
         });
         let err = PersistedExportValue::encode(&v).unwrap_err();
         assert!(
@@ -7517,7 +7626,7 @@ mod stage4_unknown_err_tests {
     #[test]
     fn coalesce_returns_unresolved_err() {
         let value = Value::Deferred(DeferredValue::Coalesce {
-            value: Box::new(Value::resource_ref("net", "optional", vec![])),
+            value: Box::new(root_resource_ref("net", "optional", vec![])),
             default: Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))),
         });
         let error = PersistedExportValue::encode(&value).unwrap_err();
@@ -7644,7 +7753,7 @@ mod stage4_unknown_err_tests {
 
     #[test]
     fn canonical_enum_serializes_as_typed_object() {
-        let attr_type = carina_core::schema::AttributeType::enum_(
+        let attr_type = carina_core::schema::CompiledAttributeType::enum_(
             carina_core::schema::TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
             Some(vec!["vpc".to_string()]),
             Vec::new(),

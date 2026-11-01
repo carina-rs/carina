@@ -1,0 +1,7 @@
+mock.budgets.Budget {
+  budget = {
+    budget_name = "shared-budget"
+    budget_type = "COST"
+    time_unit = "MONTHLY"
+  }
+}

@@ -1,4 +1,7 @@
 use super::*;
+use carina_core::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 use tower_lsp::lsp_types::{InsertTextFormat, TextEdit};
 
 #[test]
@@ -345,11 +348,14 @@ fn quoted_map_key_does_not_fall_back_to_resource_attributes() {
 
 #[test]
 fn unresolvable_struct_path_preserves_enclosing_resource_binding() {
-    let vpc = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build());
-    let resource = ResourceSchema::new("review.Resource")
-        .attribute(AttributeSchema::optional("policy", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("a", AttributeType::bool()).build());
+    let vpc = PatternResourceSchema::new("ec2.Vpc").attribute(
+        PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string()).build(),
+    );
+    let resource = PatternResourceSchema::new("review.Resource")
+        .attribute(
+            PatternAttributeSchema::optional("policy", PatternAttributeType::string()).build(),
+        )
+        .attribute(PatternAttributeSchema::optional("a", PatternAttributeType::bool()).build());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
@@ -431,9 +437,7 @@ outer {
 
 #[test]
 fn list_enum_completions() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let list_enum = AttributeType::list(AttributeType::enum_(
+    let list_enum = PatternAttributeType::list(PatternAttributeType::enum_(
         carina_core::schema::TypeIdentity::bare("Protocol"),
         Some(vec![
             "tcp".to_string(),
@@ -445,8 +449,8 @@ fn list_enum_completions() {
         None,
     ));
 
-    let schema = ResourceSchema::new("list.resource")
-        .attribute(AttributeSchema::optional("protocols", list_enum).build());
+    let schema = PatternResourceSchema::new("list.resource")
+        .attribute(PatternAttributeSchema::optional("protocols", list_enum).build());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -458,7 +462,7 @@ fn list_enum_completions() {
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
     let completions = provider.completions_for_type(
-        &AttributeType::list(AttributeType::enum_(
+        &PatternAttributeType::list(PatternAttributeType::enum_(
             carina_core::schema::TypeIdentity::bare("Protocol"),
             Some(vec![
                 "tcp".to_string(),
@@ -506,7 +510,7 @@ fn attribute_completions_include_block_name_snippet() {
 
 #[test]
 fn union_completions_include_member_types() {
-    use carina_core::schema::AttributeType;
+    use carina_core::schema::CompiledAttributeType as AttributeType;
 
     let provider = test_provider();
     let completions = provider.completions_for_type(
@@ -551,7 +555,7 @@ fn union_completions_include_member_types() {
 
 #[test]
 fn union_completions_dedup_labels() {
-    use carina_core::schema::AttributeType;
+    use carina_core::schema::CompiledAttributeType as AttributeType;
 
     let provider = test_provider();
     let completions = provider.completions_for_type(
@@ -570,7 +574,7 @@ fn union_completions_dedup_labels() {
 
 #[test]
 fn map_completions_delegate_to_inner_type() {
-    use carina_core::schema::AttributeType;
+    use carina_core::schema::CompiledAttributeType as AttributeType;
 
     let provider = test_provider();
     let completions =
@@ -608,13 +612,14 @@ fn attribute_completions_return_empty_when_resource_type_unknown() {
 fn no_completions_for_unknown_resource_type_in_block() {
     // End-to-end test: when inside a resource block whose type can't be detected,
     // the completion should return empty rather than all attributes from all schemas.
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     // Create a provider with two schemas
-    let schema_a = ResourceSchema::new("a.resource")
-        .attribute(AttributeSchema::optional("attr_a", AttributeType::string()).build());
-    let schema_b = ResourceSchema::new("b.resource")
-        .attribute(AttributeSchema::optional("attr_b", AttributeType::string()).build());
+    let schema_a = PatternResourceSchema::new("a.resource").attribute(
+        PatternAttributeSchema::optional("attr_a", PatternAttributeType::string()).build(),
+    );
+    let schema_b = PatternResourceSchema::new("b.resource").attribute(
+        PatternAttributeSchema::optional("attr_b", PatternAttributeType::string()).build(),
+    );
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -776,13 +781,15 @@ awscc.ec2.Subnet {
 
 #[test]
 fn type_based_completion_resolves_ref_typed_source_attribute() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let source_schema = ResourceSchema::new("source.Item")
+    let source_schema = PatternResourceSchema::new("source.Item")
         .attribute(
-            AttributeSchema::optional("value", AttributeType::ref_("Text".to_string())).build(),
+            PatternAttributeSchema::optional(
+                "value",
+                PatternAttributeType::ref_("Text".to_string()),
+            )
+            .build(),
         )
-        .with_def("Text", AttributeType::string());
+        .with_def("Text", PatternAttributeType::string());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
@@ -792,7 +799,7 @@ fn type_based_completion_resolves_ref_typed_source_attribute() {
     );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
-    let target = AttributeType::string();
+    let target = PatternAttributeType::string();
     let target_defs = std::collections::BTreeMap::new();
     let completions = provider.value_completions_for_attribute_type(
         &target,
@@ -1395,8 +1402,6 @@ outer =
 
 #[test]
 fn map_key_completions_from_enum_key_type() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
     use std::sync::Arc;
 
     // Create a schema with a Map attribute whose key is Enum
@@ -1405,18 +1410,18 @@ fn map_key_completions_from_enum_key_type() {
         "string_like".to_string(),
         "arn_like".to_string(),
     ];
-    let map_type = AttributeType::map_with_key(
-        AttributeType::enum_(
+    let map_type = PatternAttributeType::map_with_key(
+        PatternAttributeType::enum_(
             carina_core::schema::TypeIdentity::bare("ConditionOperator"),
             Some(condition_keys.clone()),
             vec![],
             None,
             None,
         ),
-        AttributeType::map(AttributeType::string()),
+        PatternAttributeType::map(PatternAttributeType::string()),
     );
-    let schema = ResourceSchema::new("resource")
-        .attribute(AttributeSchema::optional("condition", map_type).build());
+    let schema = PatternResourceSchema::new("resource")
+        .attribute(PatternAttributeSchema::optional("condition", map_type).build());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -1458,30 +1463,28 @@ fn map_key_completions_from_enum_key_type() {
 
 #[test]
 fn union_struct_field_completions() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-
     use std::sync::Arc;
 
     // principal: Union([Struct { fields: [service, aws, federated] }, String])
-    let principal_type = AttributeType::union(vec![
-        AttributeType::struct_(
+    let principal_type = PatternAttributeType::union(vec![
+        PatternAttributeType::struct_(
             "Principal".to_string(),
             vec![
-                StructField::optional("service", AttributeType::string()).build(),
-                StructField::optional("aws", AttributeType::string()).build(),
-                StructField::optional("federated", AttributeType::string()).build(),
+                PatternStructField::optional("service", PatternAttributeType::string()).build(),
+                PatternStructField::optional("aws", PatternAttributeType::string()).build(),
+                PatternStructField::optional("federated", PatternAttributeType::string()).build(),
             ],
         ),
-        AttributeType::string(),
+        PatternAttributeType::string(),
     ]);
 
-    let statement_type = AttributeType::struct_(
+    let statement_type = PatternAttributeType::struct_(
         "Statement".to_string(),
-        vec![StructField::optional("principal", principal_type).build()],
+        vec![PatternStructField::optional("principal", principal_type).build()],
     );
 
-    let schema = ResourceSchema::new("resource")
-        .attribute(AttributeSchema::optional("statement", statement_type).build());
+    let schema = PatternResourceSchema::new("resource")
+        .attribute(PatternAttributeSchema::optional("statement", statement_type).build());
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -2879,7 +2882,7 @@ fn enum_typed_completion_excludes_shadowing_structural_binding() {
 
 #[test]
 fn dynamic_enum_completion_offers_namespaced_prefix() {
-    let zone_name = AttributeType::enum_(
+    let zone_name = PatternAttributeType::enum_(
         carina_core::schema::TypeIdentity::new(
             Some("test"),
             vec!["network".to_string(), "Subnet".to_string()],
@@ -2890,8 +2893,8 @@ fn dynamic_enum_completion_offers_namespaced_prefix() {
         None,
         Some(carina_core::schema::DslTransform::HyphenToUnderscore),
     );
-    let schema = ResourceSchema::new("network.Subnet")
-        .attribute(AttributeSchema::optional("availability_zone", zone_name).build());
+    let schema = PatternResourceSchema::new("network.Subnet")
+        .attribute(PatternAttributeSchema::optional("availability_zone", zone_name).build());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
@@ -3204,20 +3207,20 @@ exports {
 /// the issue spec.
 #[test]
 fn exports_map_value_offers_matching_resource_refs() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+    use carina_core::schema::legacy_validator;
 
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::refined_string_with_validator(
+    let account_id = PatternAttributeType::refined_string_with_validator(
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
-    let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::optional("account_id", account_id).build());
+    let schema = PatternResourceSchema::new("organizations.account")
+        .attribute(PatternAttributeSchema::optional("account_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3290,20 +3293,20 @@ fn exports_list_value_position_filters_by_element_type() {
 /// expect matching resource-ref refs.
 #[test]
 fn exports_map_value_multiple_entries_returns_refs() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+    use carina_core::schema::legacy_validator;
 
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::refined_string_with_validator(
+    let account_id = PatternAttributeType::refined_string_with_validator(
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
-    let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::optional("account_id", account_id).build());
+    let schema = PatternResourceSchema::new("organizations.account")
+        .attribute(PatternAttributeSchema::optional("account_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3349,20 +3352,20 @@ exports {
 /// scanning sibling `.crn` files, not just the current buffer.
 #[test]
 fn exports_map_value_includes_bindings_from_sibling_files() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+    use carina_core::schema::legacy_validator;
 
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::refined_string_with_validator(
+    let account_id = PatternAttributeType::refined_string_with_validator(
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
-    let schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::optional("account_id", account_id).build());
+    let schema = PatternResourceSchema::new("organizations.account")
+        .attribute(PatternAttributeSchema::optional("account_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3408,22 +3411,22 @@ exports {
 /// `registry_prod.account_id`.
 #[test]
 fn custom_type_value_ref_includes_sibling_file_bindings() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+    use carina_core::schema::legacy_validator;
 
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::refined_string_with_validator(
+    let account_id = PatternAttributeType::refined_string_with_validator(
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
-    let account_schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::optional("account_id", account_id.clone()).build());
-    let consumer_schema = ResourceSchema::new("organizations.policy_target_attachment")
-        .attribute(AttributeSchema::optional("target_id", account_id).build());
+    let account_schema = PatternResourceSchema::new("organizations.account")
+        .attribute(PatternAttributeSchema::optional("account_id", account_id.clone()).build());
+    let consumer_schema = PatternResourceSchema::new("organizations.policy_target_attachment")
+        .attribute(PatternAttributeSchema::optional("target_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3474,10 +3477,9 @@ let attach = awscc.organizations.policy_target_attachment {
 /// still surface those parameters when the user is editing `main.crn`.
 #[test]
 fn argument_parameters_include_sibling_file_args() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::optional("name", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("s3.Bucket").attribute(
+        PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3520,22 +3522,22 @@ let b = awscc.s3.Bucket {
 /// `main.crn`.
 #[test]
 fn binding_dot_completion_resolves_sibling_file_binding() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+    use carina_core::schema::legacy_validator;
 
     fn validate_noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let account_id = AttributeType::refined_string_with_validator(
+    let account_id = PatternAttributeType::refined_string_with_validator(
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
         legacy_validator(validate_noop),
         None,
     );
-    let account_schema = ResourceSchema::new("organizations.account")
-        .attribute(AttributeSchema::optional("account_id", account_id.clone()).build());
-    let consumer_schema = ResourceSchema::new("organizations.policy_target_attachment")
-        .attribute(AttributeSchema::optional("target_id", account_id).build());
+    let account_schema = PatternResourceSchema::new("organizations.account")
+        .attribute(PatternAttributeSchema::optional("account_id", account_id.clone()).build());
+    let consumer_schema = PatternResourceSchema::new("organizations.policy_target_attachment")
+        .attribute(PatternAttributeSchema::optional("target_id", account_id).build());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3586,10 +3588,9 @@ let attach = awscc.organizations.policy_target_attachment {
 /// resource-binding Custom-type matching path.
 #[test]
 fn upstream_state_export_suggested_in_value_position() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::optional("attr", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("foo.bar").attribute(
+        PatternAttributeSchema::optional("attr", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
@@ -3638,10 +3639,9 @@ test.foo.bar {
 /// for resource bindings.
 #[test]
 fn upstream_state_export_filtered_by_attribute_type() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::optional("attr", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("foo.bar").attribute(
+        PatternAttributeSchema::optional("attr", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
@@ -3701,10 +3701,9 @@ test.foo.bar {
 /// green.
 #[test]
 fn upstream_state_export_multiple_bindings_and_sibling_exports_file() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
-    let schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::optional("attr", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("foo.bar").attribute(
+        PatternAttributeSchema::optional("attr", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
@@ -3773,20 +3772,20 @@ test.foo.bar {
 /// even if validation still catches the bad code at apply time.
 #[test]
 fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, legacy_validator};
+    use carina_core::schema::legacy_validator;
 
     fn noop(_v: &carina_core::resource::Value) -> Result<(), String> {
         Ok(())
     }
-    let vpc_id_type = AttributeType::refined_string_with_validator(
+    let vpc_id_type = PatternAttributeType::refined_string_with_validator(
         carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
         legacy_validator(noop),
         None,
     );
-    let schema = ResourceSchema::new("ec2.SecurityGroup")
-        .attribute(AttributeSchema::optional("vpc_id", vpc_id_type).build());
+    let schema = PatternResourceSchema::new("ec2.SecurityGroup")
+        .attribute(PatternAttributeSchema::optional("vpc_id", vpc_id_type).build());
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -4687,8 +4686,8 @@ fn value_position_filters_literal_union_by_lifted_string_type() {
         "literal-union argument must not satisfy an identified String sink: {identified_string:?}"
     );
 
-    let int_schema = ResourceSchema::new("foo.bar")
-        .attribute(AttributeSchema::optional("count", AttributeType::int()).build());
+    let int_schema = PatternResourceSchema::new("foo.bar")
+        .attribute(PatternAttributeSchema::optional("count", PatternAttributeType::int()).build());
     let mut int_schemas = SchemaRegistry::new();
     int_schemas.insert(
         "test",

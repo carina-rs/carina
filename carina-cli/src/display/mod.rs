@@ -516,7 +516,9 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
 }
 
 /// Format a single deferred for-expression for plan display.
-fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExpression) -> String {
+fn format_deferred_for_expression(
+    deferred: &carina_core::parser::ExpandedDeferredForExpression,
+) -> String {
     let mut out = String::new();
     let upstream = deferred_for_source(deferred);
     let sigil = Sigil::deferred_for_expression();
@@ -772,7 +774,10 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 binding,
                 ..
             } => {
-                let display_name = binding.as_deref().unwrap_or(id.identity_str());
+                let display_name = binding
+                    .as_ref()
+                    .map(|binding| binding.as_str())
+                    .unwrap_or(id.identity_str());
                 let deposed_note = if matches!(
                     generation,
                     carina_core::effect::EffectGeneration::Deposed(_)
@@ -1059,7 +1064,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
         // Extract current effect's binding name for children
         let current_binding = {
             if let Effect::Delete { binding, .. } = effect {
-                binding.clone()
+                binding.as_ref().map(ToString::to_string)
             } else {
                 effect
                     .as_resource_ref()
@@ -2274,7 +2279,10 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
             binding,
             ..
         } => {
-            let display_name = binding.as_deref().unwrap_or(id.identity_str());
+            let display_name = binding
+                .as_ref()
+                .map(|binding| binding.as_str())
+                .unwrap_or(id.identity_str());
             let deposed_note = if matches!(
                 generation,
                 carina_core::effect::EffectGeneration::Deposed(_)

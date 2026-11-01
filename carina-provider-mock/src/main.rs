@@ -117,6 +117,7 @@ impl MockProcessProvider {
     fn optional_string_attribute(name: &str) -> CoreAttributeSchema {
         CoreAttributeSchema::optional(name, CoreAttributeType::string())
             .with_description("Mock create/resume test control")
+            .create_only()
             .identity()
             .build()
     }
@@ -469,6 +470,20 @@ impl MockProcessProvider {
                 Value::Int(i64::from(polls_served)),
             );
         }
+        let id = &request.resource.id;
+        if id.resource_type == "route53.HostedZone"
+            && let Some((attribute, value)) = carina_provider_mock::generated_attribute(
+                &id.resource_type,
+                Some(&id.identity),
+                None,
+            )
+        {
+            request
+                .resource
+                .attributes
+                .entry(attribute.to_string())
+                .or_insert_with(|| Value::String(value));
+        }
         request.resource.attributes
     }
 
@@ -769,6 +784,17 @@ impl CarinaProvider for MockProcessProvider {
                 .validate()
                 .expect("normalization probe schema must be valid"),
         ]
+        .into_iter()
+        .chain(
+            carina_provider_mock::anonymous_identity_schemas()
+                .into_iter()
+                .map(|schema| {
+                    schema
+                        .validate()
+                        .expect("mock identity schema must be valid")
+                }),
+        )
+        .collect()
     }
 
     fn reference_forms(&self) -> carina_core::schema::ReferenceForms {

@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
-use carina_core::resource::{ConcreteValue, Value};
+use carina_core::resource::{AuthoredValue, ConcreteValue, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, RootlessType, SchemaKind, SchemaRegistry,
     ValidatedConfigSchema, ValidatedResourceSchema, legacy_validator,
@@ -36,7 +36,7 @@ fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
 
 fn render_first_error(
     schema: &ResourceSchema,
-    attrs: HashMap<String, Value>,
+    attrs: HashMap<String, AuthoredValue>,
     string_literal: bool,
 ) -> String {
     let schema = schema

@@ -121,3 +121,31 @@ fn applied_state_show_and_lookup_share_the_versioned_json_contract() {
     );
     assert_eq!(lookup_attribute, json!("r1"));
 }
+
+#[test]
+fn state_show_reports_empty_binding_with_file_path_and_recovery() {
+    let project = Project::new();
+    project.apply();
+    let state_path = project.root().join("carina.state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&state_path).expect("read state file"))
+        .expect("parse state file");
+    state["resources"][0]["binding"] = Value::String(String::new());
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("serialize corrupted state"),
+    )
+    .expect("write corrupted state");
+
+    let output = project.run(&["state", "show", "--json", "."]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "corrupted state must fail");
+    assert!(
+        stderr.contains("carina.state.json")
+            && stderr.contains("resources[0].binding")
+            && stderr.contains("an absolute binding address cannot be empty")
+            && stderr.contains("corrupted or hand-edited")
+            && stderr.contains("restore it from a backup"),
+        "state error must be located and actionable:\n{stderr}",
+    );
+}

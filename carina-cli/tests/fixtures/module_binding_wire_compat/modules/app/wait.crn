@@ -1,0 +1,5 @@
+let consumer_ready = wait consumer {
+  until      = consumer.identifier == "${label}-consumer-id"
+  depends_on = [seed]
+  timeout    = 1min
+}

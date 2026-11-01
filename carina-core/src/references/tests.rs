@@ -117,7 +117,14 @@ fn schema(create_only: bool, write_only: bool) -> ValidatedResourceSchema {
         crate::schema::AttributeType::reference(identity(), None, None),
     );
     if create_only {
-        attribute = attribute.create_only();
+        let mut attribute = attribute.create_only();
+        if write_only {
+            attribute = attribute.write_only();
+        }
+        return crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(attribute.build())
+            .validate()
+            .unwrap();
     }
     if write_only {
         attribute = attribute.write_only();
@@ -154,7 +161,7 @@ impl Fixture {
         let mut registry = SchemaRegistry::new();
         registry.insert("test", schema(create_only, false));
         let resource = Resource::with_provider("test", "keys.Resource", "example", None)
-            .with_binding("example")
+            .with_root_binding("example")
             .with_attribute("key", desired);
         let state = State {
             id: resource.id.clone(),
@@ -304,10 +311,10 @@ async fn unknown_and_deferred_reference_values_are_not_resolved() {
     for unknown in [
         Value::Deferred(DeferredValue::Unknown(
             ApplyTimeUnknown::UpstreamAllExports {
-                binding: "upstream".into(),
+                binding: crate::resource::absolute_binding_address_for_test("upstream"),
             },
         )),
-        Value::resource_ref("producer", "key", Vec::new()),
+        Value::root_resource_ref("producer", "key", Vec::new()),
     ] {
         for desired_unknown in [true, false] {
             let (desired, current) = if desired_unknown {
@@ -461,12 +468,8 @@ async fn missing_needed_witness_entry_is_typed_error_in_plan_and_binding_stabili
                 context,
             )
         })
-        .unwrap()
         .unwrap_err();
-    let crate::differ::PlanComparisonError::Reference(error) = error else {
-        panic!("typed reference error")
-    };
-    assert_eq!(error.path, "key");
+    assert!(matches!(error.source, ReferenceFailure::MissingWitness));
 
     assert!(
         crate::differ::managed_binding_stability(
@@ -776,7 +779,7 @@ async fn repeated_leaves_are_deduplicated_per_type_in_a_positional_batch() {
     first
         .attributes
         .insert("other".into(), string("alias/live"));
-    let mut second = first.clone().with_binding("second");
+    let mut second = first.clone().with_root_binding("second");
     second.id.set_identity("second".into());
     let resources = vec![first, second];
     let current = resources

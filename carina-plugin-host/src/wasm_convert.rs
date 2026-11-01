@@ -25,11 +25,12 @@ use carina_core::resource::{
 };
 #[cfg(test)]
 use carina_core::schema::{
-    AttributeSchema as CoreAttributeSchema, AttributeSchemaParts as CoreAttributeSchemaParts,
-    AttributeType as CoreAttributeType, InputMode as CoreInputMode,
-    ResourceSchema as CoreResourceSchema, ResourceSchemaParts as CoreResourceSchemaParts,
-    SchemaKind as CoreSchemaKind, SchemaRegistry as CoreSchemaRegistry,
-    StructField as CoreStructField, StructFieldParts as CoreStructFieldParts,
+    AttributeSchemaParts as CoreAttributeSchemaParts,
+    CompiledAttributeSchema as CoreAttributeSchema, CompiledAttributeType as CoreAttributeType,
+    CompiledResourceSchema as CoreResourceSchema, CompiledStructField as CoreStructField,
+    IdentityMode as CoreIdentityMode, InputMode as CoreInputMode,
+    ResourceSchemaParts as CoreResourceSchemaParts, SchemaKind as CoreSchemaKind,
+    SchemaRegistry as CoreSchemaRegistry, StructFieldParts as CoreStructFieldParts,
     UniqueNameSpec as CoreUniqueNameSpec,
 };
 use carina_core::schema::{
@@ -351,7 +352,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
         }
         CoreValue::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -363,7 +364,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
         }
         CoreValue::Deferred(DeferredValue::BindingRef { binding }) => {
             Err(SerializationError::UnresolvedResourceRef {
-                path: binding.clone(),
+                path: binding.as_str().to_owned(),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -719,7 +720,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         }
         CoreValue::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
-                reason: reason.clone(),
+                reason: Box::new(reason.clone()),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -731,7 +732,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         }
         CoreValue::Deferred(DeferredValue::BindingRef { binding }) => {
             Err(SerializationError::UnresolvedResourceRef {
-                path: binding.clone(),
+                path: binding.as_str().to_owned(),
                 context: SerializationContext::WasmBoundary,
             })
         }
@@ -2133,30 +2134,62 @@ fn proto_schema_to_core(
 fn proto_attr_schema_to_core(
     attribute: &proto::AttributeSchema,
 ) -> Result<CoreAttributeSchema, SchemaDecodeError> {
-    carina_core::protocol_convert::protocol_to_attribute_schema(attribute)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    let schema = proto::ResourceSchema {
+        resource_type: "test.Attribute".to_string(),
+        attributes: std::collections::BTreeMap::from([(attribute.name.clone(), attribute.clone())]),
+        description: None,
+        kind: proto::SchemaKind::Managed,
+        unique_name: proto::UniqueNameSpec::Conflicting,
+        operation_config: None,
+        validators: Vec::new(),
+        field_groups: Vec::new(),
+        default_prevent_destroy: false,
+        defs: std::collections::BTreeMap::new(),
+    };
+    let admitted = proto_schema_to_core(&schema)?;
+    Ok(admitted.as_schema().attributes()[&attribute.name].clone())
 }
 
 #[cfg(test)]
 fn proto_attr_type_to_core(
     attribute_type: &proto::AttributeType,
 ) -> Result<CoreAttributeType, SchemaDecodeError> {
-    carina_core::protocol_convert::protocol_to_attribute_type(attribute_type)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    let admitted = carina_core::protocol_convert::protocol_to_config_schema(
+        std::collections::BTreeMap::from([("value".to_string(), attribute_type.clone())]),
+    )
+    .map_err(SchemaDecodeError::protocol_conversion)?;
+    Ok(admitted.parts()["value"].clone())
 }
 
 #[cfg(test)]
 fn proto_struct_field_to_core(
     field: &proto::StructField,
 ) -> Result<CoreStructField, SchemaDecodeError> {
-    carina_core::protocol_convert::protocol_to_struct_field(field)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    let admitted = proto_attr_type_to_core(&proto::AttributeType::Struct {
+        name: "TestField".to_string(),
+        fields: vec![field.clone()],
+        field_groups: Vec::new(),
+    })?;
+    let carina_core::schema::RawShape::Struct { fields, .. } = admitted.raw_shape() else {
+        unreachable!("admitted field wrapper is a Struct")
+    };
+    Ok(fields[0].clone())
 }
 
 #[cfg(test)]
 mod tests {
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
-    use carina_core::resource::NoPlaceholder;
+
+    fn root_resource_ref(binding: &str, attribute: &str) -> CoreValue {
+        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+            .resolve_root_for_test()
+            .into_expanded()
+            .expect("root resource reference contains no placeholders")
+    }
 
     fn find_error_in_chain<'a, T: std::error::Error + 'static>(
         error: &'a (dyn std::error::Error + 'static),
@@ -2570,6 +2603,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn json_schema_rejects_uncompilable_pattern_with_typed_diagnostic() {
+        let wire = proto_resource(
+            "acm.Certificate",
+            vec![(
+                "domain_name".to_string(),
+                proto_attr(
+                    "domain_name",
+                    proto_custom("DomainName", proto_string(), Some("^(?!-).+$"), None),
+                ),
+            )],
+        );
+        let json = serde_json::to_string(&vec![wire]).unwrap();
+        let error = json_to_schemas(&json).expect_err("invalid regex must fail provider load");
+        let validation =
+            find_error_in_chain::<carina_core::schema::ResourceSchemaValidationError>(&error)
+                .expect("WASM conversion must preserve the typed validation error");
+        let (location, pattern_error) = validation
+            .pattern_errors()
+            .next()
+            .expect("typed regex diagnostic must remain accessible");
+        assert_eq!(
+            location,
+            &carina_core::schema::SchemaValidationIssueLocation::Attribute("domain_name".into())
+        );
+        assert_eq!(pattern_error.pattern, "^(?!-).+$");
+        assert!(matches!(
+            pattern_error.reason,
+            carina_core::schema::PatternCompileErrorSource::Parse(_)
+        ));
+        let diagnostic = pattern_error.reason.to_string();
+        let rendered = validation.to_string();
+        assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
+        let rendered = render_error_chain(&error);
+        assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
+        assert!(std::error::Error::source(validation).is_none());
+        assert!(std::error::Error::source(pattern_error).is_none());
+        let context =
+            find_error_in_chain::<carina_core::protocol_convert::SchemaDecodeError>(&error)
+                .expect("WASM conversion must preserve the schema context");
+        assert!(context.to_string().contains("acm.Certificate"));
+        assert!(context.to_string().contains("domain_name"));
+    }
+
     fn proto_attr(name: &str, attr_type: proto::AttributeType) -> proto::AttributeSchema {
         proto::AttributeSchema {
             name: name.to_string(),
@@ -2584,7 +2661,7 @@ mod tests {
             block_name: None,
             provider_name: None,
             removable: None,
-            identity: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         }
     }
@@ -2609,38 +2686,36 @@ mod tests {
 
     #[test]
     fn sdk_json_host_round_trip_property_covers_portable_defaults() {
-        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
         let cases = vec![
             (
-                AttributeType::bool(),
+                PatternAttributeType::bool(),
                 CoreValue::Concrete(ConcreteValue::Bool(true)),
             ),
             (
-                AttributeType::int(),
+                PatternAttributeType::int(),
                 CoreValue::Concrete(ConcreteValue::Int(-42)),
             ),
             (
-                AttributeType::float(),
+                PatternAttributeType::float(),
                 CoreValue::Concrete(ConcreteValue::Float(1.25)),
             ),
             (
-                AttributeType::string(),
+                PatternAttributeType::string(),
                 CoreValue::Concrete(ConcreteValue::String("portable".into())),
             ),
             (
-                AttributeType::list(AttributeType::string()),
+                PatternAttributeType::list(PatternAttributeType::string()),
                 CoreValue::Concrete(ConcreteValue::StringList(vec!["one".into(), "two".into()])),
             ),
             (
-                AttributeType::list(AttributeType::int()),
+                PatternAttributeType::list(PatternAttributeType::int()),
                 CoreValue::Concrete(ConcreteValue::List(vec![
                     CoreValue::Concrete(ConcreteValue::Int(1)),
                     CoreValue::Concrete(ConcreteValue::Int(2)),
                 ])),
             ),
             (
-                AttributeType::map(AttributeType::string()),
+                PatternAttributeType::map(PatternAttributeType::string()),
                 CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
                     "key".to_string(),
                     CoreValue::Concrete(ConcreteValue::String("value".into())),
@@ -2649,9 +2724,9 @@ mod tests {
         ];
 
         for (index, (attribute_type, default)) in cases.into_iter().enumerate() {
-            let schema = ResourceSchema::new(format!("test.Portable{index}"))
+            let schema = PatternResourceSchema::new(format!("test.Portable{index}"))
                 .attribute(
-                    AttributeSchema::optional("value", attribute_type)
+                    PatternAttributeSchema::optional("value", attribute_type)
                         .with_default(default)
                         .build(),
                 )
@@ -2684,16 +2759,16 @@ mod tests {
     #[test]
     fn host_provider_schema_decode_retains_reference_forms() {
         use carina_core::schema::{
-            AttributeSchema, AttributeType, ReferenceForm, ReferenceForms, ReferenceTemplate,
-            ResourceSchema, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+            ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
+            ValidatedProviderSchemaWitness,
         };
 
         let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "name",
-                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
                 )
                 .build(),
             )
@@ -2720,31 +2795,31 @@ mod tests {
     #[test]
     fn typed_sdk_resource_and_config_witnesses_load_in_host() {
         use carina_core::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
-            ValidatedConfigSchema, ValidatorType, legacy_validator,
+            TypeIdentity, ValidatedConfigSchema, ValidatorType, legacy_validator,
         };
 
-        let resource_record = AttributeType::struct_(
+        let resource_record = PatternAttributeType::struct_(
             "ResourceRecord",
-            vec![StructField::required("name", AttributeType::string()).build()],
+            vec![PatternStructField::required("name", PatternAttributeType::string()).build()],
         );
-        let output = AttributeType::list(AttributeType::struct_(
+        let output = PatternAttributeType::list(PatternAttributeType::struct_(
             "DomainValidation",
             vec![
-                StructField::required("domain_name", AttributeType::string()).build(),
-                StructField::optional("resource_record", resource_record)
+                PatternStructField::required("domain_name", PatternAttributeType::string()).build(),
+                PatternStructField::optional("resource_record", resource_record)
                     .deferred_populate()
                     .build(),
             ],
         ));
-        let schema = ResourceSchema::new("test.Certificate")
+        let schema = PatternResourceSchema::new("test.Certificate")
             .attribute(
-                AttributeSchema::provider_populated("domain_validation_options", output).build(),
+                PatternAttributeSchema::provider_populated("domain_validation_options", output)
+                    .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "count",
-                    AttributeType::refined_int_with_validator(
+                    PatternAttributeType::refined_int_with_validator(
                         TypeIdentity::new(Some("test"), ["Certificate"], "PositiveCount"),
                         None,
                         legacy_validator(|value| match value {
@@ -2756,17 +2831,22 @@ mod tests {
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::list(AttributeType::struct_(
+                    PatternAttributeType::list(PatternAttributeType::struct_(
                         "Setting",
                         vec![
-                            StructField::required("key", AttributeType::string()).build(),
-                            StructField::required("value", AttributeType::string()).build(),
+                            PatternStructField::required("key", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::required("value", PatternAttributeType::string())
+                                .build(),
                         ],
                     )),
                 )
@@ -2806,11 +2886,13 @@ mod tests {
 
         let config = ValidatedConfigSchema::validate(BTreeMap::from([(
             "assume_role".to_string(),
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "AssumeRole",
                 vec![
-                    StructField::required("role_arn", AttributeType::string()).build(),
-                    StructField::optional("session_name", AttributeType::string()).build(),
+                    PatternStructField::required("role_arn", PatternAttributeType::string())
+                        .build(),
+                    PatternStructField::optional("session_name", PatternAttributeType::string())
+                        .build(),
                 ],
             ),
         )]))
@@ -2850,10 +2932,13 @@ mod tests {
             provider_name: None,
             read_only: true,
             write_only: false,
+            create_only: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         };
 
-        let error = proto_struct_field_to_core(&field)
+        let error = carina_core::protocol_convert::protocol_to_struct_field(&field)
+            .map_err(SchemaDecodeError::protocol_conversion)
             .expect_err("required and read-only must not form a core StructField");
 
         let rendered = render_error_chain(&error);
@@ -2876,10 +2961,13 @@ mod tests {
             provider_name: None,
             read_only: true,
             write_only: true,
+            create_only: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         };
 
-        let error = proto_struct_field_to_core(&field)
+        let error = carina_core::protocol_convert::protocol_to_struct_field(&field)
+            .map_err(SchemaDecodeError::protocol_conversion)
             .expect_err("read-only and write-only must not form a core StructField");
 
         let rendered = render_error_chain(&error);
@@ -2938,6 +3026,8 @@ mod tests {
                     provider_name: Some("Key".to_string()),
                     read_only: false,
                     write_only: false,
+                    create_only: false,
+                    identity: proto::IdentityMode::None,
                     deferred_populate: false,
                 }],
             },
@@ -2981,6 +3071,8 @@ mod tests {
                     provider_name: None,
                     read_only: false,
                     write_only: true,
+                    create_only: false,
+                    identity: proto::IdentityMode::None,
                     deferred_populate: false,
                 }],
             },
@@ -3048,6 +3140,8 @@ mod tests {
             provider_name: None,
             read_only: true,
             write_only: false,
+            create_only: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         };
         let destination = proto::StructField {
@@ -3063,6 +3157,8 @@ mod tests {
             provider_name: None,
             read_only: false,
             write_only: false,
+            create_only: false,
+            identity: proto::IdentityMode::None,
             deferred_populate: false,
         };
         let metadata = proto_attr(
@@ -3104,6 +3200,8 @@ mod tests {
                     provider_name: None,
                     read_only: false,
                     write_only: true,
+                    create_only: false,
+                    identity: proto::IdentityMode::None,
                     deferred_populate: false,
                 }],
             },
@@ -3147,6 +3245,8 @@ mod tests {
                         provider_name: None,
                         read_only: false,
                         write_only: true,
+                        create_only: false,
+                        identity: proto::IdentityMode::None,
                         deferred_populate: false,
                     }],
                 },
@@ -3211,6 +3311,8 @@ mod tests {
                             provider_name: None,
                             read_only: false,
                             write_only: true,
+                            create_only: false,
+                            identity: proto::IdentityMode::None,
                             deferred_populate: false,
                         }],
                     },
@@ -3263,6 +3365,8 @@ mod tests {
             block_name,
             deferred_populate,
             write_only,
+            create_only,
+            identity_mode,
         } = round_tripped_field.parts();
         assert_eq!(name, "provider_id");
         assert!(matches!(
@@ -3277,6 +3381,8 @@ mod tests {
         assert_eq!(block_name, None);
         assert!(deferred_populate);
         assert!(!write_only);
+        assert!(!create_only);
+        assert_eq!(identity_mode, CoreIdentityMode::None);
 
         let write_only_field =
             CoreStructField::optional("client_secret", CoreAttributeType::string())
@@ -3296,6 +3402,20 @@ mod tests {
             proto_struct_field_to_core(&serde_json::from_str::<proto::StructField>(&json).unwrap())
                 .unwrap();
         assert!(round_tripped.parts().write_only);
+
+        let identity_field = CoreStructField::required("budget_name", CoreAttributeType::string())
+            .create_only()
+            .identity()
+            .build();
+        let wire = core_struct_field_to_proto_for_schema_round_trip(&identity_field);
+        assert!(wire.create_only);
+        assert_eq!(wire.identity, proto::IdentityMode::Required);
+        let round_tripped = proto_struct_field_to_core(&wire).unwrap();
+        assert!(round_tripped.parts().create_only);
+        assert_eq!(
+            round_tripped.parts().identity_mode,
+            CoreIdentityMode::Required
+        );
 
         let required_field = CoreStructField::required("name", CoreAttributeType::string()).build();
         let proto_required = core_struct_field_to_proto_for_schema_round_trip(&required_field);
@@ -3337,7 +3457,7 @@ mod tests {
             block_name,
             write_only,
             keyed_partial_update,
-            identity,
+            identity_mode,
             deferred_populate,
         } = round_tripped_attr.parts();
         assert_eq!(name, "status");
@@ -3361,7 +3481,7 @@ mod tests {
         assert_eq!(block_name, Some("status_block"));
         assert!(write_only);
         assert!(keyed_partial_update.is_none());
-        assert!(identity);
+        assert_eq!(identity_mode, CoreIdentityMode::Required);
         assert!(!deferred_populate);
 
         let provider_populated_attr =
@@ -3488,17 +3608,28 @@ mod tests {
     /// pin the contract by asserting the variant + context survives.
     #[test]
     fn unknown_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::{AccessPath, ApplyTimeUnknown};
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        use carina_core::resource::{ApplyTimeUnknown, AuthoredAccessPath as AccessPath};
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()])
+            .resolve_root_for_test();
         let v = CoreValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: ApplyTimeUnknown::UpstreamExport { path: p },
+                reason,
                 context: SerializationContext::WasmBoundary,
-            } => assert_eq!(p, path),
+            } => match *reason {
+                ApplyTimeUnknown::UpstreamExport {
+                    path: persisted_path,
+                } => assert_eq!(persisted_path, path),
+                ApplyTimeUnknown::UpstreamAllExports { binding } => {
+                    panic!("expected an upstream export path, got all exports for {binding}")
+                }
+                ApplyTimeUnknown::PendingReRead(pending) => {
+                    panic!("expected an upstream export path, got pending reread: {pending}")
+                }
+            },
             other => {
                 panic!("expected UnknownNotAllowed/UpstreamExport/WasmBoundary, got: {other:?}")
             }
@@ -3518,19 +3649,32 @@ mod tests {
 
     #[test]
     fn unknown_returns_err_in_core_value_to_json() {
-        use carina_core::resource::{AccessPath, ApplyTimeUnknown};
-        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
+        use carina_core::resource::{ApplyTimeUnknown, AuthoredAccessPath as AccessPath};
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()])
+            .resolve_root_for_test();
         let v = CoreValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_value_to_json(&v).unwrap_err();
-        assert!(matches!(
-            err,
+        match err {
             SerializationError::UnknownNotAllowed {
-                reason: ApplyTimeUnknown::UpstreamExport { .. },
+                reason,
                 context: SerializationContext::WasmBoundary,
+            } => match *reason {
+                ApplyTimeUnknown::UpstreamExport {
+                    path: persisted_path,
+                } => assert_eq!(persisted_path, path),
+                ApplyTimeUnknown::UpstreamAllExports { binding } => {
+                    panic!("expected an upstream export path, got all exports for {binding}")
+                }
+                ApplyTimeUnknown::PendingReRead(pending) => {
+                    panic!("expected an upstream export path, got pending reread: {pending}")
+                }
+            },
+            other => {
+                panic!("expected UnknownNotAllowed/UpstreamExport/WasmBoundary, got: {other:?}")
             }
-        ));
+        }
     }
 
     #[test]
@@ -3604,7 +3748,7 @@ mod tests {
 
     #[test]
     fn canonical_enum_uses_api_spelling_even_in_persisted_wit_json() {
-        let attr_type = carina_core::schema::AttributeType::enum_(
+        let attr_type = carina_core::schema::CompiledAttributeType::enum_(
             carina_core::schema::enum_identity("Mode", Some("aws.x")),
             Some(vec!["ALLOW".to_string()]),
             vec![("ALLOW".to_string(), "allow".to_string())],
@@ -3912,8 +4056,8 @@ mod tests {
     /// the provider.
     #[test]
     fn resource_ref_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::AccessPath;
-        let path = AccessPath::new("sso", "identity_store_id");
+        use carina_core::resource::AuthoredAccessPath as AccessPath;
+        let path = AccessPath::new("sso", "identity_store_id").resolve_root_for_test();
         let v = CoreValue::Deferred(DeferredValue::ResourceRef { path: path.clone() });
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
@@ -3928,7 +4072,7 @@ mod tests {
     #[test]
     fn coalesce_returns_err_in_core_to_wit_value() {
         let value = CoreValue::Deferred(DeferredValue::Coalesce {
-            value: Box::new(CoreValue::resource_ref("up", "optional", vec![])),
+            value: Box::new(root_resource_ref("up", "optional")),
             default: Box::new(CoreValue::Concrete(ConcreteValue::String(
                 "fallback".into(),
             ))),
@@ -3943,11 +4087,11 @@ mod tests {
 
     #[test]
     fn interpolation_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::{AccessPath, InterpolationPart};
+        use carina_core::resource::{AuthoredAccessPath as AccessPath, InterpolationPart};
         let v = CoreValue::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(CoreValue::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("vpc", "id"),
+                path: AccessPath::new("vpc", "id").resolve_root_for_test(),
             })),
         ]));
         let err = core_to_wit_value(&v).unwrap_err();
@@ -3961,13 +4105,13 @@ mod tests {
 
     #[test]
     fn function_call_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::AccessPath;
+        use carina_core::resource::AuthoredAccessPath as AccessPath;
         let v = CoreValue::Deferred(DeferredValue::FunctionCall {
             name: carina_core::builtins::BuiltinFunction::join,
             args: vec![
                 CoreValue::Concrete(ConcreteValue::String("-".into())).into(),
                 CoreValue::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new("vpc", "id"),
+                    path: AccessPath::new("vpc", "id").resolve_root_for_test(),
                 })
                 .into(),
             ],
@@ -4015,8 +4159,8 @@ mod tests {
 
     #[test]
     fn resource_ref_returns_err_in_core_value_to_json() {
-        use carina_core::resource::AccessPath;
-        let path = AccessPath::new("sso", "identity_store_id");
+        use carina_core::resource::AuthoredAccessPath as AccessPath;
+        let path = AccessPath::new("sso", "identity_store_id").resolve_root_for_test();
         let v = CoreValue::Deferred(DeferredValue::ResourceRef { path: path.clone() });
         let err = core_value_to_json(&v).unwrap_err();
         assert!(matches!(
@@ -4664,14 +4808,11 @@ mod tests {
         let mut schemas = carina_core::schema::SchemaRegistry::new();
         schemas.insert(
             "",
-            carina_core::schema::ResourceSchema::new("test")
+            PatternResourceSchema::new("test")
                 .attribute(
-                    carina_core::schema::AttributeSchema::optional(
-                        "token",
-                        carina_core::schema::AttributeType::string(),
-                    )
-                    .write_only()
-                    .build(),
+                    PatternAttributeSchema::optional("token", PatternAttributeType::string())
+                        .write_only()
+                        .build(),
                 )
                 .validate()
                 .expect("test schema must be valid"),
@@ -4763,18 +4904,17 @@ mod tests {
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_v14_provider() {
-        let error = check_protocol_version(
-            r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":14}"#,
+    fn test_check_protocol_version_rejects_pre_v17_provider() {
+        for version in [13, 14, 15, 16] {
+            let error = check_protocol_version(
+            &format!(r#"{{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":{version}}}"#),
         )
-        .expect_err("a v15 host must reject a v14 provider");
+        .expect_err("a v17 host must reject an older provider before schema decoding");
 
-        assert!(error.contains("provider 'old'"));
-        assert!(error.contains("protocol version 14"));
-        assert!(error.contains(&format!(
-            "requires at least version {}",
-            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
-        )));
+            assert!(error.contains("provider 'old'"));
+            assert!(error.contains(&format!("protocol version {version}")));
+            assert!(error.contains("requires at least version 17"));
+        }
     }
 
     #[test]
@@ -4833,7 +4973,7 @@ mod tests {
     }
 
     #[test]
-    fn released_protocol_v12_schema_fixtures_require_keyed_metadata_before_core_decode() {
+    fn released_protocol_v12_schema_fixtures_require_current_metadata_before_core_decode() {
         fn upgrade_v12_fixture_in_memory(value: &mut serde_json::Value) {
             match value {
                 serde_json::Value::Array(values) => {
@@ -4866,6 +5006,17 @@ mod tests {
                     }
                     if object.contains_key("attr_type") {
                         object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
+                        object.insert(
+                            "identity".to_string(),
+                            serde_json::Value::String("none".to_string()),
+                        );
+                    }
+                    if object.contains_key("field_type") {
+                        object.insert("create_only".to_string(), serde_json::Value::Bool(false));
+                        object.insert(
+                            "identity".to_string(),
+                            serde_json::Value::String("none".to_string()),
+                        );
                     }
                     if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
                         object.insert(
@@ -4904,16 +5055,20 @@ mod tests {
             let error = json_to_schemas(json)
                 .expect_err("released v12 bytes predate required protocol metadata");
             let rendered = render_error_chain(&error);
+            let rejected_legacy_identity_bool =
+                json.contains("\"identity\":false") && rendered.contains("expected value");
             assert!(
                 rendered.contains("missing field `keyed_partial_update`")
-                    || rendered.contains("missing field `field_groups`"),
+                    || rendered.contains("missing field `field_groups`")
+                    || rendered.contains("missing field `create_only`")
+                    || rendered.contains("missing field `identity`")
+                    || rejected_legacy_identity_bool,
                 "released fixture {expected_resource_type} crossed the required-field gate: {rendered}",
             );
 
-            // The protocol constant deliberately remains unchanged on this
-            // branch, while both new fields are deliberately required. Add
-            // them only in-memory so these immutable v12 bytes still exercise
-            // every older conversion rule after the required-field gate.
+            // Add newer metadata only in-memory so these immutable v12 bytes
+            // still exercise every older conversion rule after the required
+            // protocol-v16 field gate.
             let mut upgraded: serde_json::Value =
                 serde_json::from_str(json).expect("released fixture is valid JSON");
             upgrade_v12_fixture_in_memory(&mut upgraded);
@@ -4981,6 +5136,8 @@ mod tests {
                                     "required":true,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"DomainName"
                                 },{
@@ -4995,6 +5152,8 @@ mod tests {
                                             "required":false,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"RedirectFrom"
                                         },{
@@ -5003,6 +5162,8 @@ mod tests {
                                             "required":false,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"RedirectTo"
                                         }]
@@ -5010,6 +5171,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"HttpRedirect"
                                 },{
@@ -5024,6 +5187,8 @@ mod tests {
                                             "required":true,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"Name"
                                         },{
@@ -5038,6 +5203,8 @@ mod tests {
                                             "required":true,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"Type"
                                         },{
@@ -5046,6 +5213,8 @@ mod tests {
                                             "required":true,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":"none",
                                             "deferred_populate":false,
                                             "provider_name":"Value"
                                         }]
@@ -5053,6 +5222,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":"none",
                                     "deferred_populate":true,
                                     "provider_name":"ResourceRecord"
                                 },{
@@ -5061,6 +5232,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"ValidationDomain"
                                 },{
@@ -5073,6 +5246,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"ValidationEmails"
                                 },{
@@ -5091,6 +5266,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"ValidationMethod"
                                 },{
@@ -5109,6 +5286,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":"none",
                                     "deferred_populate":false,
                                     "provider_name":"ValidationStatus"
                                 }]
@@ -5119,6 +5298,7 @@ mod tests {
                         "keyed_partial_update":null,
                         "read_only":true,
                         "write_only":false,
+                        "identity":"none",
                         "provider_name":"DomainValidationOptions"
                     }
                 },
@@ -5126,7 +5306,7 @@ mod tests {
                 "default_prevent_destroy":false
             }]"#,
         )
-        .expect("the released ACM semantics must load with required v13 metadata");
+        .expect("the released ACM semantics must load with required v16 metadata");
 
         let validated_schema = &schemas[0];
         let schema = validated_schema.as_schema();
@@ -5221,7 +5401,7 @@ mod tests {
                 "default_prevent_destroy":false
             }]"#,
         )
-        .expect_err("protocol v13 schema JSON must declare nested write_only");
+        .expect_err("protocol v16 schema JSON must declare nested write_only");
 
         let rendered = render_error_chain(&err);
         assert!(rendered.contains("schema JSON parse error"));
@@ -5293,7 +5473,8 @@ mod tests {
                 "description": "Group name",
                 "create_only": true,
                 "read_only": false,
-                "write_only": false
+                "write_only": false,
+                "identity": "none"
               },
               "ingress": {
                 "name": "ingress",
@@ -5312,6 +5493,8 @@ mod tests {
                             "field_type": { "type": "Int" },
                             "required": true,
                             "write_only": false,
+                            "create_only": false,
+                            "identity": "none",
                             "description": "Start of port range",
                             "block_name": "from_port_block",
                             "provider_name": "FromPort"
@@ -5321,6 +5504,8 @@ mod tests {
                             "field_type": { "type": "String" },
                             "required": true,
                             "write_only": false,
+                            "create_only": false,
+                            "identity": "none",
                             "description": null,
                             "block_name": null,
                             "provider_name": null
@@ -5340,7 +5525,8 @@ mod tests {
                 "write_only": false,
                 "block_name": "ingress_block",
                 "provider_name": "IpPermissions",
-                "removable": false
+                "removable": false,
+                "identity": "none"
               },
               "description": {
                 "name": "description",
@@ -5350,7 +5536,8 @@ mod tests {
                 "description": "Group description",
                 "create_only": false,
                 "read_only": false,
-                "write_only": false
+                "write_only": false,
+                "identity": "none"
               },
               "enabled": {
                 "name": "enabled",
@@ -5360,7 +5547,8 @@ mod tests {
                 "description": null,
                 "create_only": false,
                 "read_only": false,
-                "write_only": false
+                "write_only": false,
+                "identity": "none"
               },
               "priority": {
                 "name": "priority",
@@ -5370,7 +5558,8 @@ mod tests {
                 "description": null,
                 "create_only": false,
                 "read_only": false,
-                "write_only": false
+                "write_only": false,
+                "identity": "none"
               }
             }
           }
@@ -5670,6 +5859,8 @@ mod tests {
                     provider_name: None,
                     read_only: false,
                     write_only: false,
+                    create_only: false,
+                    identity: proto::IdentityMode::None,
                     deferred_populate: false,
                 }],
             },
@@ -5835,7 +6026,7 @@ mod tests {
         let err = registry
             .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
             .expect("decoded fixture must be owner-bound")
-            .validate_with_resolver::<NoPlaceholder>(&HashMap::new(), &|_| false, &resolver)
+            .validate_with_resolver(&HashMap::<String, CoreValue>::new(), &|_| false, &resolver)
             .unwrap_err();
         assert!(
             err.iter().any(|e| e
@@ -6442,7 +6633,8 @@ mod tests {
                             }
                         },
                         "required":false,
-                        "keyed_partial_update":null
+                        "keyed_partial_update":null,
+                        "identity":"none"
                     }
                 }
             }

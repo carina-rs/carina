@@ -726,7 +726,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 let parent_binding = nodes[idx].parent.and_then(|p_idx| {
                     let p_effect = &plan.effects()[p_idx];
                     if let Effect::Delete { binding, .. } = p_effect {
-                        return binding.clone();
+                        return binding.as_ref().map(ToString::to_string);
                     }
                     p_effect
                         .as_resource_ref()

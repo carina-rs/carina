@@ -400,7 +400,10 @@ fn present_read_only_attribute_stays_present_while_producer_updates() {
     write_read_only_update_main(&project, true);
     let plan = plan_json(&project);
     match plan.plan.effects() {
-        [Effect::Update { to, .. }] => assert_eq!(to.binding.as_deref(), Some("producer")),
+        [Effect::Update { to, .. }] => assert_eq!(
+            to.binding.as_ref().map(|binding| binding.as_str()),
+            Some("producer")
+        ),
         effects => panic!(
             "only the authored producer update is expected; the present read-only value must not change the consumer: {effects:#?}"
         ),

@@ -1078,6 +1078,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "similar",
  "tempfile",
  "thiserror 2.0.18",
@@ -1107,6 +1108,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "regex",
+ "regex-syntax",
  "semver",
  "serde",
  "serde_json",
@@ -1158,6 +1160,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "carina-plugin-bindings-aws"
+version = "0.9.0"
+dependencies = [
+ "carina-plugin-bindings-aws-credentials",
+ "wasi 0.14.7+wasi-0.2.4",
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
+name = "carina-plugin-bindings-aws-credentials"
+version = "0.9.0"
+dependencies = [
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
+name = "carina-plugin-bindings-http"
+version = "0.9.0"
+dependencies = [
+ "wasi 0.14.7+wasi-0.2.4",
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
+name = "carina-plugin-bindings-provider"
+version = "0.9.0"
+dependencies = [
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
 name = "carina-plugin-host"
 version = "0.9.0"
 dependencies = [
@@ -1203,12 +1236,15 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "carina-core",
+ "carina-plugin-bindings-aws",
+ "carina-plugin-bindings-aws-credentials",
+ "carina-plugin-bindings-http",
+ "carina-plugin-bindings-provider",
  "carina-provider-protocol",
  "http 1.4.0",
  "serde",
  "serde_json",
  "wasi 0.14.7+wasi-0.2.4",
- "wit-bindgen 0.54.0",
 ]
 
 [[package]]
@@ -1224,7 +1260,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
- "wit-bindgen 0.54.0",
 ]
 
 [[package]]
@@ -1236,8 +1271,6 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "wasi 0.14.7+wasi-0.2.4",
- "wit-bindgen 0.54.0",
 ]
 
 [[package]]
@@ -1309,6 +1342,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

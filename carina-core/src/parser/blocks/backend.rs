@@ -129,7 +129,7 @@ pub(in crate::parser) fn parse_upstream_state_expr(
     })?;
 
     Ok(UpstreamState {
-        binding: binding_name.to_string(),
+        binding: crate::resource::RelativeBindingName::new(binding_name),
         source: std::path::PathBuf::from(source),
     })
 }

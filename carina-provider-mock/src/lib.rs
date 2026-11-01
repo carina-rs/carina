@@ -23,7 +23,8 @@ use carina_core::provider::{
     ResumeOutcomeKind,
 };
 use carina_core::resource::{
-    ConcreteValue, PlaceholderKind, Resource, ResourceId, State, Value, legacy_secret_migration,
+    BindingAddress, ConcreteValue, PlaceholderKind, Resource, ResourceId, State, Value,
+    legacy_secret_migration,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
@@ -93,8 +94,8 @@ impl std::error::Error for MockStateValueDecodeError {
 /// `provider mock {}` whose provider factory was not loaded. A sourced mock
 /// always belongs to the plugin path, including when that plugin failed to
 /// load.
-pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a>(
-    provider_configs: impl IntoIterator<Item = &'a ProviderConfig<P>>,
+pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
+    provider_configs: impl IntoIterator<Item = &'a ProviderConfig<P, B>>,
     provider_is_loaded: impl FnOnce(&str) -> bool,
 ) -> bool {
     let mut provider_configs = provider_configs.into_iter().peekable();
@@ -110,7 +111,6 @@ pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a>(
 /// Schemas exposed by Carina's built-in `provider mock {}` implementation.
 pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
     let schemas = vec![
-        references::resource_schema().as_schema().clone(),
         ResourceSchema::new("test.resource")
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
@@ -313,6 +313,18 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .build(),
             )
             .with_unique_name_attribute("name"),
+    ]
+    .into_iter()
+    .chain(anonymous_identity_schemas().into_iter().map(|schema| {
+        if schema.resource_type() == "budgets.Budget" {
+            schema.attribute(
+                AttributeSchema::optional("cost_filters", AttributeType::string()).build(),
+            )
+        } else {
+            schema
+        }
+    }))
+    .chain([
         ResourceSchema::new("compute.Instance")
             .attribute(
                 AttributeSchema::optional("name", AttributeType::string())
@@ -344,6 +356,7 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
             .attribute(
                 AttributeSchema::optional("role_name", AttributeType::string())
                     .create_only()
+                    .identity()
                     .build(),
             )
             .attribute(
@@ -356,7 +369,16 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                     .create_only()
                     .build(),
             )
-            .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .with_unique_name_attribute("role_name"),
+        ResourceSchema::new("logs.LogGroup")
+            .attribute(
+                AttributeSchema::optional("log_group_name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .with_unique_name_attribute("log_group_name"),
         ResourceSchema::new("iam.Roles").attribute(
             AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
                 .build(),
@@ -371,16 +393,135 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
         ResourceSchema::new("test.Thing")
             .attribute(AttributeSchema::required("name", AttributeType::string()).build())
             .with_unique_name_attribute("name"),
-    ];
+    ]);
 
     schemas
-        .into_iter()
         .map(|schema| {
             schema
                 .validate()
                 .expect("built-in mock resource schema must be valid")
         })
+        .chain(std::iter::once(references::resource_schema()))
         .collect()
+}
+
+/// Identity schemas shared by the built-in and process mock providers.
+pub fn anonymous_identity_schemas() -> Vec<ResourceSchema> {
+    vec![
+        ResourceSchema::new("test.nested_identity")
+            .attribute(
+                AttributeSchema::required(
+                    "identity",
+                    AttributeType::struct_(
+                        "NestedIdentity",
+                        vec![
+                            StructField::required("key", AttributeType::string())
+                                .create_only()
+                                .identity()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+        ResourceSchema::new("test.unique_identity")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("replacement_key", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build())
+            .with_unique_name_attribute("name"),
+        ResourceSchema::new("budgets.Budget")
+            .attribute(
+                AttributeSchema::required(
+                    "budget",
+                    AttributeType::struct_(
+                        "BudgetData",
+                        vec![
+                            StructField::optional("budget_name", AttributeType::string())
+                                .create_only()
+                                .identity()
+                                .build(),
+                            StructField::required("budget_type", AttributeType::string()).build(),
+                            StructField::required("time_unit", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "notifications_with_subscribers",
+                    AttributeType::list(AttributeType::struct_(
+                        "NotificationWithSubscribers",
+                        vec![
+                            StructField::required("notification_type", AttributeType::string())
+                                .build(),
+                            StructField::required("threshold", AttributeType::float()).build(),
+                        ],
+                    )),
+                )
+                .create_only()
+                .build(),
+            ),
+        ResourceSchema::new("route53.HostedZone")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::provider_populated("id", AttributeType::string()).build()),
+        ResourceSchema::new("route53.RecordSet")
+            .attribute(
+                AttributeSchema::required("hosted_zone_id", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("type", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "resource_records",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .create_only()
+                .build(),
+            ),
+    ]
+}
+
+/// Values generated by the mock provider after a resource is created.
+pub fn generated_attribute(
+    resource_type: &str,
+    identity: Option<&str>,
+    name: Option<&str>,
+) -> Option<(&'static str, String)> {
+    match resource_type {
+        "test.resource" => name
+            .or(identity)
+            .map(|identity| ("identifier", format!("{identity}-id"))),
+        "route53.HostedZone" => identity.map(|identity| ("id", format!("{identity}-id"))),
+        _ => None,
+    }
 }
 
 /// Aggregate schema witness exposed by Carina's built-in mock provider.
@@ -854,15 +995,7 @@ impl MockProvider {
         })
     }
 
-    fn test_resource_identifier(id: &ResourceId, name: Option<&str>) -> Option<String> {
-        if id.resource_type != "test.resource" {
-            return None;
-        }
-        name.or_else(|| id.identity_str())
-            .map(|identity| format!("{identity}-id"))
-    }
-
-    fn populate_test_resource_identifier_json(
+    fn populate_generated_attribute_json(
         id: &ResourceId,
         attrs: &mut HashMap<String, PersistedValue>,
     ) {
@@ -874,21 +1007,20 @@ impl MockProvider {
                     Value::Concrete(ConcreteValue::String(value)) => Some(value.into_plaintext()),
                     _ => None,
                 });
-        if let Some(identifier) = Self::test_resource_identifier(id, name.as_deref()) {
-            attrs.entry("identifier".to_string()).or_insert_with(|| {
+        if let Some((attribute, value)) =
+            generated_attribute(&id.resource_type, id.identity_str(), name.as_deref())
+        {
+            attrs.entry(attribute.to_string()).or_insert_with(|| {
                 PersistedValue::encode_provider_value(
-                    &Value::Concrete(ConcreteValue::String(identifier.into())),
+                    &Value::Concrete(ConcreteValue::String(value.into())),
                     None,
                 )
-                .expect("mock identifier is persistable")
+                .expect("mock generated attribute is persistable")
             });
         }
     }
 
-    fn populate_test_resource_identifier_value(
-        id: &ResourceId,
-        attrs: &mut HashMap<String, Value>,
-    ) {
+    fn populate_generated_attribute_value(id: &ResourceId, attrs: &mut HashMap<String, Value>) {
         let name = attrs
             .get("name")
             .and_then(|value| match value {
@@ -896,10 +1028,12 @@ impl MockProvider {
                 _ => None,
             })
             .map(str::to_string);
-        if let Some(identifier) = Self::test_resource_identifier(id, name.as_deref()) {
+        if let Some((attribute, value)) =
+            generated_attribute(&id.resource_type, id.identity_str(), name.as_deref())
+        {
             attrs
-                .entry("identifier".to_string())
-                .or_insert_with(|| Value::Concrete(ConcreteValue::String(identifier.into())));
+                .entry(attribute.to_string())
+                .or_insert_with(|| Value::Concrete(ConcreteValue::String(value.into())));
         }
     }
 
@@ -1172,7 +1306,7 @@ impl MockProvider {
             Ok(attrs) => attrs,
             Err(error) => return Err(attempt.untracked(error)),
         };
-        Self::populate_test_resource_identifier_json(&id, &mut attrs);
+        Self::populate_generated_attribute_json(&id, &mut attrs);
 
         let partial_create = self.partial_create_config_for(&id);
         if let Some(config) = partial_create {
@@ -1190,7 +1324,7 @@ impl MockProvider {
         }
 
         let mut state_attrs = persisted_values;
-        Self::populate_test_resource_identifier_value(&id, &mut state_attrs);
+        Self::populate_generated_attribute_value(&id, &mut state_attrs);
         Self::strip_unobservable_nested_write_only(&mut state_attrs);
         if let Some(config) = partial_create {
             for attr in &config.missing_attributes {
@@ -1247,7 +1381,7 @@ impl MockProvider {
                     error,
                 )
             })?;
-        Self::populate_test_resource_identifier_json(id, &mut persisted);
+        Self::populate_generated_attribute_json(id, &mut persisted);
         states.insert(key, persisted);
         self.save_states(&states).map_err(|error| {
             ProviderError::internal_caused_by(
@@ -1257,7 +1391,7 @@ impl MockProvider {
         })?;
 
         let mut attributes = persisted_values;
-        Self::populate_test_resource_identifier_value(id, &mut attributes);
+        Self::populate_generated_attribute_value(id, &mut attributes);
         Self::strip_unobservable_nested_write_only(&mut attributes);
         Ok(attributes)
     }
@@ -1863,6 +1997,46 @@ mod tests {
         assert!(witness.reference_forms().is_empty());
     }
 
+    #[test]
+    fn builtin_mock_identity_schemas_include_nested_budget_and_full_record_set_key() {
+        use carina_core::schema::IdentityPathSegment;
+
+        let schemas = builtin_schemas();
+        let identity_paths = |resource_type: &str| {
+            schemas
+                .iter()
+                .find(|schema| schema.as_schema().resource_type() == resource_type)
+                .unwrap_or_else(|| panic!("missing built-in mock schema {resource_type}"))
+                .identity_paths()
+                .iter()
+                .map(|path| path.segments().to_vec())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            identity_paths("test.nested_identity"),
+            vec![vec![
+                IdentityPathSegment::Attribute("identity".to_string()),
+                IdentityPathSegment::StructField("key".to_string()),
+            ]]
+        );
+        assert_eq!(
+            identity_paths("budgets.Budget"),
+            vec![vec![
+                IdentityPathSegment::Attribute("budget".to_string()),
+                IdentityPathSegment::StructField("budget_name".to_string()),
+            ]]
+        );
+        assert_eq!(
+            identity_paths("route53.RecordSet"),
+            vec![
+                vec![IdentityPathSegment::Attribute("hosted_zone_id".to_string())],
+                vec![IdentityPathSegment::Attribute("name".to_string())],
+                vec![IdentityPathSegment::Attribute("type".to_string())],
+            ]
+        );
+    }
+
     struct EnvGuard {
         name: &'static str,
         previous: Option<OsString>,
@@ -2189,7 +2363,7 @@ mod tests {
         )
     }
 
-    fn mock_provider_config() -> ProviderConfig {
+    fn mock_provider_config() -> carina_core::parser::ExpandedProviderConfig {
         carina_core::parser::parse_file(
             "provider mock {}\n",
             std::path::Path::new("mock_provider_config.crn"),
@@ -2206,7 +2380,10 @@ mod tests {
 
     #[test]
     fn builtin_provider_selection_is_shared_by_implicit_and_explicit_mock_paths() {
-        assert!(uses_builtin_provider::<NoPlaceholder>(&[], |_| {
+        assert!(uses_builtin_provider::<
+            NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >(&[], |_| {
             panic!("the implicit fallback does not depend on loaded factories")
         }));
 

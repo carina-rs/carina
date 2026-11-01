@@ -9,7 +9,9 @@ use tower_lsp::lsp_types::{
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::resource::EnumValueResolver;
-use carina_core::schema::{AttributeType, EffectiveType, Shape, TypeIdentity, TypeInSchema};
+use carina_core::schema::{
+    CompiledAttributeType as AttributeType, EffectiveType, Shape, TypeIdentity, TypeInSchema,
+};
 use carina_core::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, InferenceError, NotInferableReason,
     StaticType, UnnameableInConsumer,
@@ -1753,7 +1755,7 @@ impl CompletionProvider {
     /// (see #2043 follow-up).
     pub(super) fn resource_ref_completions_for_type(
         &self,
-        target: TypeInSchema<'_>,
+        target: TypeInSchema<'_, carina_core::schema::Compiled>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
@@ -2198,7 +2200,7 @@ fn resolve_upstream_export_keys(
 ) -> Option<carina_core::upstream_exports::UpstreamExportEntries> {
     let base = base_path?;
     let upstream = carina_core::parser::UpstreamState {
-        binding: binding.to_string(),
+        binding: carina_core::resource::RelativeBindingName::new(binding),
         source: std::path::PathBuf::from(source),
     };
     let (mut exports, _errors) =
@@ -2273,8 +2275,9 @@ fn infer_for_binding_type(
     let exports = exports_cache
         .entry(iterable.binding.clone())
         .or_insert_with(|| {
+            let binding = carina_core::resource::RelativeBindingName::new(iterable.binding.clone());
             let upstream = carina_core::parser::UpstreamState {
-                binding: iterable.binding.clone(),
+                binding: binding.clone(),
                 source: std::path::PathBuf::from(source),
             };
             let (mut resolved, _errors) =
@@ -2286,7 +2289,7 @@ fn infer_for_binding_type(
                 );
             // Move the entry out of `resolved` rather than cloning so we
             // don't pay a deep `Value` clone on the per-keystroke path.
-            resolved.remove(&iterable.binding).unwrap_or_default()
+            resolved.remove(&binding).unwrap_or_default()
         });
     let export_type =
         structural_type_for_completion(exports.get(&iterable.export)?).structural_type()?;

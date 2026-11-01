@@ -17,7 +17,7 @@ A provider is a [WebAssembly component](https://component-model.bytecodealliance
 | `carina-provider-with-http` | The provider calls an HTTP API through `wasi:http` and declares the hosts it may reach. |
 | `carina-provider-aws` | An AWS-kind provider needs `wasi:http` plus host-resolved AWS base credentials. |
 
-You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `CarinaProvider` trait, and its `export_provider!` macro generates the bindings and connects them to your implementation. The SDK re-exports the request and schema types from `carina-provider-protocol`.
+The `carina-plugin-sdk` crate defines a `CarinaProvider` trait and supplies bindings generated in Carina-owned crates from the SDK revision's WIT and binding generator. Its `export_provider!` macro connects those bindings to your implementation. Your provider needs no WIT submodule, `wit-bindgen` dependency, or direct dependency on the binding crates. The SDK re-exports the request and schema types from `carina-provider-protocol`.
 
 `export_provider!(MyProvider)` exports `carina-provider`. To export `carina-provider-with-http`, declare every hostname the provider may contact:
 
@@ -29,7 +29,7 @@ carina_plugin_sdk::export_provider!(
 );
 ```
 
-Add the `wasi` crate (version 0.14) to the provider's `wasm32` dependencies, because the generated bindings refer to it. The SDK's `carina_plugin_sdk::wasi_http::send_request` then sends an `http::Request` through the host.
+The SDK supplies the WASI imports. Its `carina_plugin_sdk::wasi_http::send_request` sends an `http::Request` through the host. Add a direct `wasi` dependency only if your own code calls WASI APIs.
 
 The HTTP form embeds a versioned `carina:egress` custom section in the component. The declaration is mandatory. The host reads it from the exact bytes being loaded and permits only consented patterns:
 
@@ -138,7 +138,7 @@ Cloud metadata addresses are withheld from every provider kind. The host may use
 
 ## Protocol version
 
-The provider protocol is versioned. The current development version is 15, and the host also requires at least 15. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release.
+The provider protocol is versioned. The current development version is 16, and the host also requires at least 16. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release. Protocol 16 changes the schema identity field to a required mode and uses declared identity hashing, so providers built for versions 14 or 15 must be rebuilt.
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 

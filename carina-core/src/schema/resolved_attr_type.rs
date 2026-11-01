@@ -5,23 +5,23 @@
 //! `ResolvedAttrType(...)` is **not callable** from anywhere outside
 //! this file. The only public path to construct a value is
 //! [`new_after_peel`], which is itself `pub(super)` and is invoked
-//! exclusively by [`super::AttributeType::resolve_refs`] after
+//! exclusively by [`super::PatternAttributeType::resolve_refs_with_defs`] after
 //! peeling every `Ref` hop. A future contributor adding code in
 //! `schema/mod.rs` (or any other carina-core file) cannot synthesise a
 //! `ResolvedAttrType(&AttributeType::ref_(...))` because the
 //! constructor is module-private to *this* file, not module-private to
 //! `schema/`.
 //!
-//! See [`super::AttributeType::resolve_refs`] and the
+//! See [`super::PatternAttributeType::resolve_refs_with_defs`] and the
 //! `ResolvedAttrType` doc-comment for the carina#3340 / carina#3349
 //! invariant being enforced.
 
-use super::{AttrTypeKind, AttributeType};
+use super::{AttrTypeKind, Draft, PatternAttributeType, PatternForm};
 
 /// A reference to an [`AttributeType`] that is **guaranteed not to be**
 /// [`AttributeType::Ref`].
 ///
-/// Constructed exclusively by [`super::AttributeType::resolve_refs`].
+/// Constructed exclusively by [`super::PatternAttributeType::resolve_refs_with_defs`].
 /// The tuple field is private to this submodule, so no code outside
 /// `resolved_attr_type.rs` can synthesise a `ResolvedAttrType` from a
 /// raw `&AttributeType` (including from a `Ref`). Callers `match` on
@@ -35,14 +35,14 @@ use super::{AttrTypeKind, AttributeType};
 /// `rule { }` block syntax. The carina#3340 chain documents the
 /// broader walk-site invariant.
 #[derive(Debug, Clone, Copy)]
-pub struct ResolvedAttrType<'a>(&'a AttributeType);
+pub struct ResolvedAttrType<'a, R: PatternForm = Draft>(&'a PatternAttributeType<R>);
 
-impl<'a> ResolvedAttrType<'a> {
+impl<'a, R: PatternForm> ResolvedAttrType<'a, R> {
     /// **Internal** — only invoke after every `Ref` hop has been
     /// peeled.  Calling this with `&AttributeType::ref_(_)` violates
     /// the type's invariant; the only legitimate caller is
-    /// [`super::AttributeType::resolve_refs`].
-    pub(super) fn new_after_peel(inner: &'a AttributeType) -> Self {
+    /// [`super::PatternAttributeType::resolve_refs_with_defs`].
+    pub(super) fn new_after_peel(inner: &'a PatternAttributeType<R>) -> Self {
         debug_assert!(
             !matches!(&inner.kind, AttrTypeKind::Ref(_)),
             "ResolvedAttrType constructor reached with an unpeeled Ref; \
@@ -55,7 +55,7 @@ impl<'a> ResolvedAttrType<'a> {
     /// the [`AttributeType::Ref`] variant; the wildcard arm in any
     /// `match self.as_attr() { ... }` is therefore safe.
     #[inline]
-    pub fn as_attr(self) -> &'a AttributeType {
+    pub fn as_attr(self) -> &'a PatternAttributeType<R> {
         self.0
     }
 }

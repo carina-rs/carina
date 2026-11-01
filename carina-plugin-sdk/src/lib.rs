@@ -8,11 +8,21 @@ pub use carina_provider_protocol::types;
 
 pub mod aws_credentials;
 
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub mod __private;
+
 /// The "Schemas" page of the provider guide on carina-rs.dev. Its Rust
 /// examples run as doctests of this crate so they cannot drift from the SDK.
 #[cfg(doctest)]
 #[doc = include_str!("../../site/src/content/providers/writing/schemas.md")]
 pub struct ProviderGuideSchemasPage;
+
+/// Type-checks the provider guide's provider implementation on the host.
+/// The wasm mock builds cover its target-gated `export_provider!` path.
+#[cfg(doctest)]
+#[doc = include_str!("../../site/src/content/providers/writing/getting-started.md")]
+pub struct ProviderGuideGettingStartedPage;
 
 #[cfg(any(target_arch = "wasm32", test))]
 pub mod wasm_guest;
@@ -70,7 +80,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-13 JSON.
+/// Failure while projecting validated SDK schemas onto version-16 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -173,7 +183,7 @@ impl ProviderSchemaCache {
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-13
+/// The validated provider schemas determine the scalar kind. The version-16
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
@@ -1854,9 +1864,9 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v13");
+            .expect_err("a validated schema must always be projectable to protocol v16");
 
-        assert!(error.to_string().contains("protocol v13"), "{error}");
+        assert!(error.to_string().contains("protocol v16"), "{error}");
     }
 
     #[test]

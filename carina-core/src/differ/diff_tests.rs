@@ -1,7 +1,18 @@
 use super::{create_plan_for_tests as create_plan, *};
+use crate::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 
-use crate::resource::ConcreteValue;
+use crate::resource::{
+    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDirectives as Directives, ExpandedResource as Resource, ExpandedValue as Value,
+    RelativeBindingName, RootScope,
+};
 use indexmap::IndexMap;
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn diff_test(
     desired: &Resource,
@@ -185,35 +196,39 @@ fn plan_for_reordered_iam_policy_value_lists(
     ordering: PolicyValueListOrdering,
     saved_policy_attrs: SavedPolicyAttrs,
 ) -> Plan {
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
     use crate::value::canonicalize_resources_with_schemas;
 
     let string_or_list = || {
         let list = match ordering {
-            PolicyValueListOrdering::Ordered => AttributeType::list(AttributeType::string()),
+            PolicyValueListOrdering::Ordered => {
+                PatternAttributeType::list(PatternAttributeType::string())
+            }
             PolicyValueListOrdering::Unordered => {
-                AttributeType::unordered_list(AttributeType::string())
+                PatternAttributeType::unordered_list(PatternAttributeType::string())
             }
         };
-        AttributeType::union(vec![AttributeType::string(), list])
+        PatternAttributeType::union(vec![PatternAttributeType::string(), list])
     };
-    let principal = AttributeType::struct_(
+    let principal = PatternAttributeType::struct_(
         "Principal",
-        vec![StructField::optional("aws", string_or_list()).build()],
+        vec![PatternStructField::optional("aws", string_or_list()).build()],
     );
-    let statement = AttributeType::struct_(
+    let statement = PatternAttributeType::struct_(
         "Statement",
         vec![
-            StructField::optional("action", string_or_list()).build(),
-            StructField::optional("principal", principal).build(),
+            PatternStructField::optional("action", string_or_list()).build(),
+            PatternStructField::optional("principal", principal).build(),
         ],
     );
-    let policy_document = AttributeType::struct_(
+    let policy_document = PatternAttributeType::struct_(
         "PolicyDocument",
-        vec![StructField::optional("statement", AttributeType::list(statement)).build()],
+        vec![
+            PatternStructField::optional("statement", PatternAttributeType::list(statement))
+                .build(),
+        ],
     );
-    let schema = ResourceSchema::new("iam.Policy")
-        .attribute(AttributeSchema::optional("policy_document", policy_document).build());
+    let schema = PatternResourceSchema::new("iam.Policy")
+        .attribute(PatternAttributeSchema::optional("policy_document", policy_document).build());
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "aws",
@@ -628,8 +643,6 @@ fn no_false_update_without_unique_name_attribute() {
 
 #[test]
 fn replace_when_create_only_attr_changed() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let resources = vec![Resource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -650,8 +663,8 @@ fn replace_when_create_only_attr_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("ec2.Vpc").attribute(
-            AttributeSchema::optional("cidr_block", AttributeType::string())
+        (PatternResourceSchema::new("ec2.Vpc").attribute(
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -684,20 +697,352 @@ fn replace_when_create_only_attr_changed() {
     );
 }
 
-fn create_only_nested_write_only_fixture(
-    password: &str,
-) -> (Resource, State, crate::schema::ResourceSchema) {
-    use crate::resource::DeferredValue;
+fn nested_create_only_plan(immutable: &str, mutable: &str) -> (Plan, ResourceId) {
     use crate::schema::{AttributeSchema, AttributeType, StructField};
 
-    let schema = crate::schema::ResourceSchema::new("test.Credential").attribute(
-        AttributeSchema::optional(
+    let id = ResourceId::with_identity("test.NestedReplacement", "example");
+    let nested_value = |immutable: &str, mutable: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "immutable".to_string(),
+                Value::Concrete(ConcreteValue::String(immutable.into())),
+            ),
+            (
+                "mutable".to_string(),
+                Value::Concrete(ConcreteValue::String(mutable.into())),
+            ),
+        ])))
+    };
+    let desired = Resource::new("test.NestedReplacement", "example")
+        .with_attribute("settings", nested_value(immutable, mutable));
+    let current = existing_state(
+        id.clone(),
+        HashMap::from([("settings".to_string(), nested_value("old-key", "old-value"))]),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        crate::schema::ResourceSchema::new("test.NestedReplacement")
+            .attribute(
+                AttributeSchema::required(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::required("immutable", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("mutable", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current_states = HashMap::from([(id.clone(), current)]);
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states,
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    (plan, id)
+}
+
+fn omitted_optional_nested_create_only_fixture() -> (Resource, State, SchemaRegistry) {
+    use crate::schema::ResourceSchema;
+
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let id = ResourceId::with_identity("budgets.Budget", "monthly");
+    let desired_budget = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "budget_type".to_string(),
+        Value::Concrete(ConcreteValue::String("FORECASTED".into())),
+    )])));
+    let current_budget = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "budget_name".to_string(),
+            Value::Concrete(ConcreteValue::String("provider-default".into())),
+        ),
+        (
+            "budget_type".to_string(),
+            Value::Concrete(ConcreteValue::String("ACTUAL".into())),
+        ),
+    ])));
+    let desired =
+        Resource::new("budgets.Budget", "monthly").with_attribute("budget", desired_budget);
+    let current = existing_state(id, HashMap::from([("budget".to_string(), current_budget)]));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("budgets.Budget")
+            .attribute(
+                AttributeSchema::required(
+                    "budget",
+                    AttributeType::struct_(
+                        "BudgetData",
+                        vec![
+                            StructField::optional("budget_name", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("budget_type", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    (desired, current, schemas)
+}
+
+#[test]
+fn replace_when_nested_create_only_field_changes() {
+    let (plan, id) = nested_create_only_plan("new-key", "old-value");
+
+    let metadata = replacement_metadata(&plan, &id);
+    assert_eq!(&metadata.changed_create_only[..], &["settings".to_string()]);
+}
+
+#[test]
+fn update_when_only_mutable_sibling_of_nested_create_only_field_changes() {
+    let (plan, id) = nested_create_only_plan("old-key", "new-value");
+
+    assert_eq!(plan.effects().len(), 1);
+    assert!(matches!(
+        &plan.effects()[0],
+        Effect::Update {
+            changed_attributes,
+            ..
+        } if changed_attributes == &["settings".to_string()]
+    ));
+    assert!(
+        plan.replace_display.is_empty(),
+        "unexpected replacement for {id}"
+    );
+}
+
+fn unordered_nested_create_only_plan(desired_items: Vec<Value>) -> (Plan, ResourceId) {
+    use crate::schema::ResourceSchema;
+
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let id = ResourceId::with_identity("test.UnorderedNestedReplacement", "example");
+    let desired = Resource::new("test.UnorderedNestedReplacement", "example")
+        .with_attribute("items", Value::Concrete(ConcreteValue::List(desired_items)));
+    let current = existing_state(
+        id.clone(),
+        HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                item("a", "old"),
+                item("b", "stable"),
+            ])),
+        )]),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.UnorderedNestedReplacement")
+            .attribute(
+                AttributeSchema::required(
+                    "items",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Item",
+                        vec![
+                            StructField::required("key", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("description", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            HashMap::from([(id.clone(), current)]),
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    (plan, id)
+}
+
+#[test]
+fn unordered_nested_create_only_reorder_with_mutable_change_is_update() {
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let (plan, id) = unordered_nested_create_only_plan(vec![item("b", "stable"), item("a", "new")]);
+
+    assert!(
+        plan.replace_display.is_empty(),
+        "unexpected replacement for {id}"
+    );
+    assert!(matches!(
+        plan.effects(),
+        [Effect::Update {
+            changed_attributes,
+            ..
+        }] if changed_attributes == &["items".to_string()]
+    ));
+}
+
+#[test]
+fn unordered_nested_create_only_addition_is_replace() {
+    let item = |key: &str, description: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".to_string(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.into())),
+            ),
+        ])))
+    };
+    let (plan, id) = unordered_nested_create_only_plan(vec![
+        item("b", "stable"),
+        item("a", "old"),
+        item("c", "new"),
+    ]);
+
+    let metadata = replacement_metadata(&plan, &id);
+    assert_eq!(&metadata.changed_create_only[..], &["items".to_string()]);
+}
+
+#[test]
+fn update_when_optional_nested_create_only_field_is_omitted_but_present_in_state() {
+    let (desired, current, schemas) = omitted_optional_nested_create_only_fixture();
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(id.clone(), current)]);
+
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states,
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(plan.replace_display.is_empty(), "unexpected replacement");
+    assert!(matches!(
+        plan.effects(),
+        [Effect::Update {
+            changed_attributes,
+            ..
+        }] if changed_attributes == &["budget".to_string()]
+    ));
+}
+
+#[test]
+fn managed_binding_stays_updating_when_omitted_nested_create_only_value_is_in_state() {
+    let (desired, current, schemas) = omitted_optional_nested_create_only_fixture();
+    let id = desired.id.clone();
+    let managed =
+        ResolvedResource::collect_resolved_with_schemas(std::iter::once(desired.clone()), &schemas)
+            .expect("budget fixture must resolve");
+    let (schemas, provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        managed.iter().map(|resource| &resource.id),
+    );
+    let current_states = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(id.clone(), current)]),
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let stability = managed_binding_stability(
+        &managed,
+        &current_states,
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &provider,
+        &crate::references::prepare_empty_for_tests(),
+    )
+    .expect("comparison fixture must resolve");
+
+    assert!(matches!(
+        stability.get(&id),
+        Some(ManagedBindingStability::Updating {
+            changed_attributes,
+            ..
+        }) if changed_attributes == &HashSet::from(["budget".to_string()])
+    ));
+}
+
+fn create_only_nested_write_only_fixture<R: crate::schema::PatternForm>(
+    password: &str,
+) -> (Resource, State, crate::schema::PatternResourceSchema<R>) {
+    use crate::resource::DeferredValue;
+
+    let schema = PatternResourceSchema::new("test.Credential").attribute(
+        PatternAttributeSchema::optional(
             "creds",
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Credentials",
                 vec![
-                    StructField::optional("username", AttributeType::string()).build(),
-                    StructField::optional("password", AttributeType::string())
+                    PatternStructField::optional("username", PatternAttributeType::string())
+                        .build(),
+                    PatternStructField::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 ],
@@ -778,14 +1123,20 @@ fn create_only_nested_write_only_changed_record_plans_replace() {
     let (previous_desired, _previous_current, schema) =
         create_only_nested_write_only_fixture("old-secret");
     let (desired, current, _equivalent_schema) =
-        create_only_nested_write_only_fixture("new-secret");
+        create_only_nested_write_only_fixture::<crate::schema::Draft>("new-secret");
     let id = desired.id.clone();
+    let schema = schema.validate().expect("schema fixture must be valid");
     let mut record = crate::provider::NestedWriteOnlyRecord::default();
     record
-        .record_sent(&schema, ["creds"], &previous_desired.attributes, None)
+        .record_sent(
+            schema.as_schema(),
+            ["creds"],
+            &previous_desired.attributes,
+            None,
+        )
         .expect("fixture credentials are persistable");
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("", schema.validate().expect("schema fixture must be valid"));
+    schemas.insert("", schema);
     let saved = crate::provider::RawSavedAttrs::from_persisted(
         HashMap::new(),
         HashMap::from([(id.clone(), record)]),
@@ -816,8 +1167,6 @@ fn create_only_nested_write_only_changed_record_plans_replace() {
 
 #[test]
 fn normal_update_when_non_create_only_attr_changed() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let resources = vec![Resource::new("ec2.Vpc", "my-vpc").with_attribute(
         "enable_dns_support",
         Value::Concrete(ConcreteValue::Bool(true)),
@@ -838,14 +1187,18 @@ fn normal_update_when_non_create_only_attr_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("enable_dns_support", AttributeType::bool()).build(),
+                PatternAttributeSchema::optional(
+                    "enable_dns_support",
+                    PatternAttributeType::bool(),
+                )
+                .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -878,8 +1231,6 @@ fn normal_update_when_non_create_only_attr_changed() {
 
 #[test]
 fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let resources = vec![
         Resource::new("ec2.Vpc", "my-vpc")
             .with_attribute(
@@ -910,14 +1261,18 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("enable_dns_support", AttributeType::bool()).build(),
+                PatternAttributeSchema::optional(
+                    "enable_dns_support",
+                    PatternAttributeType::bool(),
+                )
+                .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -950,8 +1305,6 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
 
 #[test]
 fn replace_carries_create_before_destroy_directives() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut resource = Resource::new("ec2.Vpc", "my-vpc")
         .with_attribute(
             "name",
@@ -983,14 +1336,14 @@ fn replace_carries_create_before_destroy_directives() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -1088,8 +1441,6 @@ fn diff_no_change_when_list_of_maps_reordered() {
 
 #[test]
 fn replace_with_provider_prefixed_schema_key() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     // In production, schemas are keyed by "awscc.ec2.Vpc" but resource_type is "ec2.Vpc"
     // The resource must have provider set so the generic lookup works
     let resources = vec![
@@ -1117,8 +1468,8 @@ fn replace_with_provider_prefixed_schema_key() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (crate::schema::ResourceSchema::new("ec2.Vpc").attribute(
-            AttributeSchema::optional("cidr_block", AttributeType::string())
+        (PatternResourceSchema::new("ec2.Vpc").attribute(
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -1400,10 +1751,10 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
 
     let orphan_id = ResourceId::with_identity("subnet", "my-subnet");
     let orphan_state = existing_state(orphan_id.clone(), HashMap::new())
-        .with_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
+        .with_root_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
     let orphans = crate::differ::Orphans::from([Orphan::from_state(
         orphan_state,
-        Some("my_subnet".to_string()),
+        Some(absolute_binding("my_subnet")),
         crate::resource::Directives::default(),
     )]);
 
@@ -1438,12 +1789,12 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
             ..
         } => {
             assert_eq!(
-                binding.as_deref(),
+                binding.as_ref().map(AbsoluteBindingAddress::as_str),
                 Some("my_subnet"),
                 "Orphan Delete should preserve the typed binding"
             );
             assert!(
-                dependencies.contains("my_vpc"),
+                dependencies.contains(&absolute_binding("my_vpc")),
                 "Orphan Delete should preserve typed dependency bindings"
             );
         }
@@ -1461,7 +1812,9 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
 /// The differ should see no changes when comparing merged-desired vs current.
 #[test]
 fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
-    use crate::schema::{ResourceSchema, StructField};
+    use crate::schema::{
+        CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+    };
 
     // Build a schema that matches ec2.security_group's security_group_egress attribute
     let egress_struct = AttributeType::struct_(
@@ -1491,7 +1844,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
         ],
     );
     let schema = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::optional(
+        crate::schema::CompiledAttributeSchema::optional(
             "security_group_egress",
             AttributeType::unordered_list(egress_struct),
         )
@@ -1676,7 +2029,9 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
 /// comparison fails and falsely detects changes.
 #[test]
 fn diff_false_positive_when_ordered_true_for_struct_list() {
-    use crate::schema::{ResourceSchema, StructField};
+    use crate::schema::{
+        CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+    };
 
     let egress_struct = AttributeType::struct_(
         "Egress".to_string(),
@@ -1691,7 +2046,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 
     // Bug: ordered: true causes positional comparison of struct list items
     let schema_ordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::optional(
+        crate::schema::CompiledAttributeSchema::optional(
             "security_group_egress",
             AttributeType::list(egress_struct.clone()),
         )
@@ -1768,7 +2123,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 
     // With ordered: false (unordered_list), differ correctly sees no change
     let schema_unordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::optional(
+        crate::schema::CompiledAttributeSchema::optional(
             "security_group_egress",
             AttributeType::unordered_list(egress_struct),
         )
@@ -1792,7 +2147,9 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 /// two name the same enum value, so the differ must see NoChange.
 #[test]
 fn diff_no_change_for_compound_word_dsl_alias() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let schema = ResourceSchema::new("aws.s3.BucketOwnershipControls").attribute(
         AttributeSchema::optional(
