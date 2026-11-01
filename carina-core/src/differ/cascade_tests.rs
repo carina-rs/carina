@@ -147,7 +147,14 @@ fn plan_for(
         crate::resource::into_plan_input_current_map_from_states(current_states, &schemas, &[]);
     create_plan_with_cascades(
         &resolved,
-        CascadeDependents::new(&unresolved, std::iter::empty()),
+        CascadeDependents::new(
+            &unresolved,
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
         &[],
         &provider,
         crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
@@ -702,7 +709,6 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
     use crate::effect::deps::{
         ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
     };
-    use crate::effect::{DeferredReplaceDelete, DeferredReplacePayload, NonEmptyDeletes};
     use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
     use crate::resource::{LoopSlot, ModuleSource, ResolvedResource};
 
@@ -754,9 +760,18 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         &schemas,
         &[],
     );
-    let mut plan = create_plan_with_cascades(
+    let plan = create_plan_with_cascades(
         &managed,
-        CascadeDependents::new(&unresolved, std::iter::once(&deferred)),
+        CascadeDependents::new(
+            &unresolved,
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    deferred.clone(),
+                ]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
         &[],
         &provider,
         PlanPriorStates::new(&current, &orphans),
@@ -769,36 +784,21 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
     )
     .expect("test provider hints should succeed");
 
-    let absorbed = plan
+    let deferred_replace = plan
         .effects()
         .iter()
         .find_map(|effect| match effect {
-            Effect::Delete {
-                id,
-                identifier,
-                generation: crate::effect::EffectGeneration::Current,
-                directives,
-                binding,
-                dependencies,
-                explicit_dependencies,
-                blocked_by_updates,
-            } if id.as_inner() == &child_id => Some(DeferredReplaceDelete {
-                id: id.clone(),
-                identifier: identifier.clone(),
-                directives: directives.clone(),
-                binding: binding.clone(),
-                dependencies: dependencies.clone(),
-                explicit_dependencies: explicit_dependencies.clone(),
-                blocked_by_updates: blocked_by_updates.clone(),
-            }),
+            Effect::DeferredReplace(payload) => Some(payload),
             _ => None,
         })
-        .expect("orphan child delete must be planned");
-    plan.retain(|effect| effect.resource_id() != &child_id);
-    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-        deletes: NonEmptyDeletes::try_new(vec![absorbed]).expect("fixture has one delete"),
-        template: Box::new(deferred),
-    })));
+        .expect("the planner must emit the deferred target it used for CBD promotion");
+    assert_eq!(deferred_replace.template.as_ref(), &deferred);
+    assert_eq!(deferred_replace.deletes.len(), 1);
+    assert_eq!(deferred_replace.deletes[0].id.as_inner(), &child_id);
+    assert!(plan.effects().iter().all(|effect| !matches!(
+        effect,
+        Effect::Delete { id, .. } if id.as_inner() == &child_id
+    )));
 
     assert!(
         replacement_metadata(&plan, &vpc_id).create_before_destroy,
@@ -880,7 +880,16 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
         );
         let plan = create_plan_with_cascades(
             &managed,
-            CascadeDependents::new(&unresolved, [&deferred]),
+            CascadeDependents::new(
+                &unresolved,
+                DeferredCreateTargets::partition_for_expansion(
+                    crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                        deferred,
+                    ]),
+                    |_| DeferredForExpansionChoice::Retain,
+                )
+                .1,
+            ),
             &[],
             &provider,
             PlanPriorStates::new(&current, &Orphans::new()),
@@ -932,9 +941,18 @@ fn deferred_create_cbd_plan(
         &schemas,
         &[],
     );
-    let mut plan = create_plan_with_cascades(
+    let plan = create_plan_with_cascades(
         &managed,
-        CascadeDependents::new(&unresolved, [&deferred]),
+        CascadeDependents::new(
+            &unresolved,
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    deferred,
+                ]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
         &[],
         &provider,
         PlanPriorStates::new(&current, &Orphans::new()),
@@ -946,12 +964,36 @@ fn deferred_create_cbd_plan(
         &HashSet::new(),
     )
     .unwrap();
-    plan.add(Effect::DeferredCreate(
-        crate::effect::DeferredCreatePayload {
-            template: Box::new(deferred),
-        },
-    ));
     (plan, id)
+}
+
+#[test]
+fn planning_uses_retained_targets_for_both_cbd_and_deferred_effects() {
+    let (plan, producer) = deferred_create_cbd_plan(
+        "vpc",
+        crate::parser::DeferredForTarget::bound("same_retained_target").unwrap(),
+        &base_schemas(false),
+    );
+    assert!(replacement_metadata(&plan, &producer).create_before_destroy);
+    let templates = plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::DeferredCreate(payload) => Some(payload.template.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        templates.len(),
+        1,
+        "the cascade input must also emit its target"
+    );
+    assert_eq!(
+        templates[0].target().bound_binding(),
+        Some("same_retained_target")
+    );
+    assert_eq!(templates[0].root_bindings(), ["vpc".to_string()].into());
+    assert_deferred_create_cbd_is_acyclic(&plan, &producer);
 }
 
 fn assert_deferred_create_cbd_is_acyclic(plan: &Plan, producer: &ResourceId) {

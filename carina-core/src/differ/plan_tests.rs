@@ -484,7 +484,14 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
 
     let plan = create_plan_with_cascades(
         &managed,
-        CascadeDependents::new(&managed, std::iter::empty()),
+        CascadeDependents::new(
+            &managed,
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
         &[],
         &ProviderRouter::new(),
         PlanPriorStates::new(&current, &orphans),

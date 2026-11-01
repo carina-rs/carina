@@ -6,6 +6,7 @@ use carina_core::binding_index::{LivePreApplyInputs, ManagedBindingStability, Re
 use carina_core::config_loader::UnresolvedConfigSnapshot;
 use carina_core::data_source_value::DataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
+use carina_core::differ::{DeferredCreateTargets, DeferredForExpansionChoice};
 use carina_core::effect::deps::UnresolvedResource;
 use carina_core::name_override::{
     ApplyDecision, NameOverride, NameOverrideSource, should_apply_override,
@@ -110,17 +111,6 @@ impl<E: carina_core::parser::IntoExpandedExportParam> ParserCanonicalResourcePai
             prefix_fallbacks,
         })
     }
-}
-
-/// Selects how a deferred-for expression owned by a
-/// [`CanonicalResourcePair`] crosses the expansion boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeferredForExpansionChoice {
-    /// Materialize the expression now (or preserve it as a parser residual if
-    /// expansion reports that it is still unresolved).
-    Expand,
-    /// Keep the expression as an apply-time deferred template.
-    Retain,
 }
 
 /// Failure while canonicalizing resource values and assigning anonymous
@@ -309,21 +299,25 @@ impl<E> CanonicalResourcePair<E> {
     pub fn expand_deferred_for_expressions<F>(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
-        mut classify: F,
+        classify: F,
     ) -> Result<
-        carina_core::parser::ResolvedDeferredForExpressions,
+        (
+            carina_core::parser::ResolvedDeferredForExpressions,
+            DeferredCreateTargets,
+        ),
         carina_core::parser::DeferredForExpansionError,
     >
     where
         F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
     {
-        let (selected, retained) = self
-            .parsed
-            .take_deferred_for_expressions()
-            .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
+        let (selected, retained) = DeferredCreateTargets::partition_for_expansion(
+            self.parsed.take_deferred_for_expressions(),
+            classify,
+        );
         self.parsed.warnings.retain(|warning| {
             warning.kind != carina_core::parser::WarningKind::DeferredFor
                 || !retained
+                    .templates()
                     .iter()
                     .any(|deferred| deferred.location().matches_deferred_warning(warning))
         });
@@ -332,8 +326,8 @@ impl<E> CanonicalResourcePair<E> {
         let residual = self.parsed.deferred_for_expressions().clone();
         self.parsed
             .deferred_for_expressions_mut()
-            .append_finalized(retained);
-        Ok(residual)
+            .append_finalized(retained.templates().clone());
+        Ok((residual, retained))
     }
 
     /// Run the provider-bound desired normalization pipeline on the owned

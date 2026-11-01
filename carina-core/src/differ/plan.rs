@@ -4,9 +4,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
 
-use crate::effect::{ChangedCreateOnly, Effect, OutcomeUnknownImportReplacement, TemporaryName};
+use crate::effect::{
+    ChangedCreateOnly, DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload,
+    Effect, EffectGeneration, NonEmptyDeletes, OutcomeUnknownImportReplacement, TemporaryName,
+};
 use crate::identifier::generate_random_suffix;
-use crate::parser::WaitBinding;
+use crate::parser::{DeferredForExpression, ResolvedDeferredForExpressions, WaitBinding};
 use crate::plan::{
     CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
@@ -17,29 +20,6 @@ use crate::resource::{
     ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
     ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
 };
-
-/// Resource-shaped dependents consulted while cascading replacement changes.
-///
-/// Deferred-for targets are retained outside the ordinary managed-resource
-/// slice until apply time. Keeping both sets in this required planner input
-/// ensures their references participate in create-before-destroy promotion
-/// before replacement effects are decomposed.
-pub struct CascadeDependents<'a> {
-    managed: &'a [ResolvedResource],
-    deferred: Vec<&'a crate::parser::DeferredForExpression>,
-}
-
-impl<'a> CascadeDependents<'a> {
-    pub fn new(
-        managed: &'a [ResolvedResource],
-        deferred: impl IntoIterator<Item = &'a crate::parser::DeferredForExpression>,
-    ) -> Self {
-        Self {
-            managed,
-            deferred: deferred.into_iter().collect(),
-        }
-    }
-}
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
     WAIT_DEFAULT_TIMEOUT,
@@ -49,6 +29,96 @@ use crate::wait::predicate::resolve_wait_predicate;
 use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
 use super::{PlanPriorStates, PlannedListKeyRelease, PresentDiff, diff_present_with_releases};
+
+#[cfg(test)]
+#[path = "deferred_tests.rs"]
+mod deferred_tests;
+
+/// Select how a finalized deferred loop crosses the plan-time expansion seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredForExpansionChoice {
+    /// Expand now, preserving a parser residual if expansion is still unresolved.
+    Expand,
+    /// Retain the template for apply-time expansion and planning dependencies.
+    Retain,
+}
+
+/// The complete apply-time target set retained by deferred-loop expansion.
+///
+/// Partition the configuration's finalized loops with [`Self::partition_for_expansion`],
+/// including configurations without deferred loops. There is deliberately no
+/// empty/default constructor, mutable access, or clone: the planner consumes
+/// this owner and uses the same templates for cascading and effect emission.
+///
+/// ```compile_fail,E0423
+/// use carina_core::differ::DeferredCreateTargets;
+/// let targets = DeferredCreateTargets(Vec::new());
+/// ```
+///
+/// ```compile_fail,E0599
+/// use carina_core::differ::DeferredCreateTargets;
+/// let targets = DeferredCreateTargets::default();
+/// ```
+///
+/// The retained owner cannot be reused for another planning call.
+///
+/// ```compile_fail,E0382
+/// use carina_core::differ::{CascadeDependents, DeferredCreateTargets};
+/// fn reuse(targets: DeferredCreateTargets) {
+///     let first = CascadeDependents::new(&[], targets);
+///     let second = CascadeDependents::new(&[], targets);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct DeferredCreateTargets(ResolvedDeferredForExpressions);
+
+impl DeferredCreateTargets {
+    /// Select plan-time expansion candidates and retain the complementary
+    /// target set as one owner. This is also how a no-deferred configuration
+    /// produces its (empty) target set; callers cannot substitute an iterator.
+    pub fn partition_for_expansion(
+        expressions: ResolvedDeferredForExpressions,
+        mut classify: impl FnMut(&DeferredForExpression) -> DeferredForExpansionChoice,
+    ) -> (ResolvedDeferredForExpressions, Self) {
+        let (selected, retained) = expressions
+            .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
+        (selected, Self(retained))
+    }
+
+    /// Read-only templates, also retained in the expanded parser view for
+    /// diagnostics and validation. Only planning may emit their effects.
+    pub fn templates(&self) -> &ResolvedDeferredForExpressions {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Dependents and the owned deferred targets used by replacement planning.
+///
+/// The same target owner is consulted before replacement decomposition and
+/// consumed afterward to emit DeferredCreate/DeferredReplace effects.
+///
+/// ```compile_fail,E0308
+/// use carina_core::differ::CascadeDependents;
+/// let dependents = CascadeDependents::new(&[], std::iter::empty());
+/// ```
+pub struct CascadeDependents<'a> {
+    managed: &'a [ResolvedResource],
+    deferred: DeferredCreateTargets,
+}
+
+impl<'a> CascadeDependents<'a> {
+    pub fn new(managed: &'a [ResolvedResource], deferred: DeferredCreateTargets) -> Self {
+        Self { managed, deferred }
+    }
+}
 
 fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {
     for release in releases {
@@ -421,6 +491,12 @@ pub(crate) fn create_plan_with_provider(
     Ok(build.plan)
 }
 
+/// Build replacements and deferred effects together from the retained target owner.
+/// Deferred effects cannot be added through a separate public planning pass.
+///
+/// ```compile_fail,E0432
+/// use carina_core::differ::add_deferred_create_effects;
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan_with_cascades(
     managed: &[ResolvedResource],
@@ -459,7 +535,101 @@ pub fn create_plan_with_cascades(
     );
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
+    add_deferred_create_effects(&mut build.plan, dependents.deferred);
     Ok(build.plan)
+}
+
+/// Add apply-time deferred-for re-expansion effects to the plan.
+///
+/// Matching orphan `Delete` effects are absorbed into `DeferredReplace`; targets
+/// with no matching deletes remain plain `DeferredCreate` effects.
+fn add_deferred_create_effects(plan: &mut Plan, targets: DeferredCreateTargets) {
+    let mut deletes_to_absorb: HashSet<ResourceId> = HashSet::new();
+    let mut deferred_effects = Vec::new();
+
+    for template in targets.0 {
+        let deletes: Vec<DeferredReplaceDelete> = plan
+            .effects()
+            .iter()
+            .filter_map(|effect| {
+                let Effect::Delete {
+                    id,
+                    identifier,
+                    generation: EffectGeneration::Current,
+                    directives,
+                    binding,
+                    dependencies,
+                    explicit_dependencies,
+                    blocked_by_updates,
+                } = effect
+                else {
+                    return None;
+                };
+
+                if deletes_to_absorb.contains(id.as_inner())
+                    || id.provider != template.template_resource_id().provider
+                    || id.resource_type != template.template_resource_id().resource_type
+                    || id.provider_instance != template.template_resource_id().provider_instance
+                {
+                    return None;
+                }
+                let matches = binding.as_deref().is_some_and(|binding| {
+                    super::binding_matches_deferred_template(binding, template.target())
+                });
+                matches.then(|| DeferredReplaceDelete {
+                    id: id.clone(),
+                    identifier: identifier.clone(),
+                    directives: directives.clone(),
+                    binding: binding.clone(),
+                    dependencies: dependencies.clone(),
+                    explicit_dependencies: explicit_dependencies.clone(),
+                    blocked_by_updates: blocked_by_updates.clone(),
+                })
+            })
+            .collect();
+
+        if deletes.is_empty() {
+            deferred_effects.push(Effect::DeferredCreate(DeferredCreatePayload::new(
+                Box::new(template),
+            )));
+        } else {
+            deletes_to_absorb.extend(deletes.iter().map(|delete| delete.id.clone().into_inner()));
+            deferred_effects.push(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+                deletes: NonEmptyDeletes::try_new(deletes)
+                    .expect("planner checked non-empty deletes"),
+                template: Box::new(template),
+            })));
+        }
+    }
+
+    if !deletes_to_absorb.is_empty() {
+        plan.retain(|effect| match effect {
+            Effect::Delete {
+                id,
+                generation: EffectGeneration::Current,
+                ..
+            } => !deletes_to_absorb.contains(id),
+            Effect::Delete {
+                generation: EffectGeneration::Deposed(_),
+                ..
+            }
+            | Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate(_)
+            | Effect::DeferredReplace(_) => true,
+        });
+    }
+
+    for effect in deferred_effects {
+        plan.add(effect);
+    }
 }
 
 struct PlanBuild {
@@ -1116,7 +1286,7 @@ fn cascade_dependent_updates(
             pending_replaces,
             // Deferred children have no concrete desired identities here.
             // Their prior rows are orphan deletes grouped into DeferredReplace
-            // by the caller, which replaces them at materialization, including
+            // by this planner, which replaces them at materialization, including
             // template attributes with create-only producer references.
             dependents.managed,
             current_states,
@@ -1149,7 +1319,7 @@ fn promote_referenced_replaces_to_cbd(
             get_resource_dependencies(resource),
         )
     });
-    let deferred_dependencies = dependents.deferred.iter().map(|deferred| {
+    let deferred_dependencies = dependents.deferred.templates().iter().map(|deferred| {
         let mut dependencies =
             get_resource_dependencies(deferred.template_resource().as_resource());
         // Header bindings shadow top-level names only inside the body. The

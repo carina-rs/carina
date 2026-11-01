@@ -25,8 +25,8 @@ use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
 #[doc(hidden)]
 pub use plan::create_plan_for_test;
 pub use plan::{
-    CascadeDependents, block_deletes_on_prior_consumer_updates, create_plan,
-    create_plan_with_cascades,
+    CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice,
+    block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades,
 };
 
 /// Project the differ's managed-resource decision into the attribute

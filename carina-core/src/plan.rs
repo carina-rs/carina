@@ -9,7 +9,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, SavedEffect, TemporaryName,
+    ChangedCreateOnly, DeferredCreatePayload, DeferredReplacePayload, Effect, EffectGeneration,
+    EffectWithSource, MoveAuthority, NonEmptyDeletes, SavedEffect, TemporaryName,
     UnresolvedSavedEffect,
 };
 use crate::hint::ProjectCommand;
@@ -1093,6 +1094,45 @@ impl<S> Plan<S> {
                 metadata.create_idx = create_idx;
                 metadata.delete_idx = delete_idx;
                 Some(metadata)
+            })
+            .collect();
+    }
+
+    /// Suppress current-instance deletes managed by state-only operations.
+    ///
+    /// Deferred planning already groups prior children into DeferredReplace.
+    /// A later `removed`/`moved` block must suppress those absorbed deletes too,
+    /// without dropping the template or any deposed-generation cleanup.
+    pub fn suppress_current_deletes(&mut self, ids: &HashSet<ResourceId>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.retain(|effect| {
+            !matches!(effect,
+                Effect::Delete { id, generation: EffectGeneration::Current, .. }
+                    if ids.contains(id.as_inner())
+            )
+        });
+        // Mapping keeps the remaining effect indices (and replacement display
+        // metadata) unchanged. Moving payloads avoids cloning source locations.
+        self.effects = std::mem::take(&mut self.effects)
+            .into_iter()
+            .map(|effect| {
+                let Effect::DeferredReplace(payload) = effect else {
+                    return effect;
+                };
+                let DeferredReplacePayload { deletes, template } = *payload;
+                let deletes = Vec::from(deletes)
+                    .into_iter()
+                    .filter(|delete| !ids.contains(delete.id.as_inner()))
+                    .collect();
+                match NonEmptyDeletes::try_new(deletes) {
+                    Ok(deletes) => Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+                        deletes,
+                        template,
+                    })),
+                    Err(_) => Effect::DeferredCreate(DeferredCreatePayload::new(template)),
+                }
             })
             .collect();
     }

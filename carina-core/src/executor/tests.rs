@@ -8844,7 +8844,10 @@ impl Provider for CascadeReplaceProvider {
 #[tokio::test]
 async fn cascading_replacement_child_create_uses_new_parent_binding() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
-    use crate::differ::{CascadeDependents, create_plan_with_cascades};
+    use crate::differ::{
+        CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice,
+        create_plan_with_cascades,
+    };
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
     fn string(value: &str) -> Value {
@@ -8973,7 +8976,14 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     );
     let plan = create_plan_with_cascades(
         &managed,
-        CascadeDependents::new(&unresolved, std::iter::empty()),
+        CascadeDependents::new(
+            &unresolved,
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
         &[],
         &comparison_provider,
         crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
