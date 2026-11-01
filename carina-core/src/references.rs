@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::provider::{LiftedSavedAttrs, ProviderError, ProviderInstanceKey, ProviderRouter};
 use crate::resource::{
-    ConcreteValue, Current, PlanInputCurrent, ResolvedResource, ResourceId, Value, ValueString,
+    CanonicalComparisonAttributes, ConcreteValue, Current, PlanInputCurrent, ResolvedIgnoreChanges,
+    ResolvedResource, ResourceId, Value, ValueString,
 };
 use crate::schema::{SchemaRegistry, Shape, TypeIdentity};
 
@@ -566,20 +567,27 @@ impl ReferencePreparation {
             provider,
             || {
                 let mut values = Vec::new();
+                let mut ignores = HashMap::new();
+                let no_ignores = ResolvedIgnoreChanges::default();
                 for effect in plan.effects() {
-                    match effect {
+                    let resource = match effect {
                         crate::effect::Effect::Create(resource)
-                        | crate::effect::Effect::Update { to: resource, .. } => {
-                            if let Some(schema) = registry.get_for(resource) {
-                                collect_attributes(
-                                    &resource.id,
-                                    resource.resolved_attributes().iter(),
-                                    schema.schema(),
-                                    &mut values,
-                                )?;
-                            }
-                        }
-                        _ => {}
+                        | crate::effect::Effect::Update { to: resource, .. } => resource,
+                        _ => continue,
+                    };
+                    ignores.insert(&resource.id, &resource.resolved_ignore_changes);
+                    if let Some(schema) = registry.get_for(resource) {
+                        let attributes = CanonicalComparisonAttributes::canonicalize(
+                            resource.resolved_attributes(),
+                            schema.schema().as_schema(),
+                        );
+                        collect_masked_attributes(
+                            &resource.id,
+                            &attributes,
+                            &resource.resolved_ignore_changes,
+                            schema.schema(),
+                            &mut values,
+                        )?;
                     }
                 }
                 for (id, attributes) in historical.reference_values() {
@@ -588,7 +596,17 @@ impl ReferencePreparation {
                         &id.resource_type,
                         crate::schema::SchemaKind::Resource,
                     ) {
-                        collect_attributes(id, attributes.iter(), schema.schema(), &mut values)?;
+                        let attributes = CanonicalComparisonAttributes::canonicalize(
+                            attributes.clone(),
+                            schema.schema().as_schema(),
+                        );
+                        collect_masked_attributes(
+                            id,
+                            &attributes,
+                            ignores.get(id).copied().unwrap_or(&no_ignores),
+                            schema.schema(),
+                            &mut values,
+                        )?;
                     }
                 }
                 for (id, record) in historical.reference_records() {
@@ -743,12 +761,7 @@ impl ReferencePreparation {
                 .into_iter()
                 .flatten()
                 {
-                    collect_attributes(
-                        &resource.id,
-                        attributes.iter(),
-                        schema.schema(),
-                        &mut values,
-                    )?;
+                    collect_attributes(&resource.id, attributes, schema.schema(), &mut values)?;
                 }
                 Ok(values)
             },
@@ -887,11 +900,21 @@ fn collect_inputs(
     saved: &LiftedSavedAttrs,
 ) -> Result<Vec<Occurrence>, Box<ReferencePlanError>> {
     let mut values = Vec::new();
+    let ignores = desired
+        .iter()
+        .map(|resource| (&resource.id, resource.ignore_changes()))
+        .collect::<HashMap<_, _>>();
+    let no_ignores = ResolvedIgnoreChanges::default();
     for resource in desired {
         if let Some(schema) = registry.get_for(resource.as_resource()) {
-            collect_attributes(
+            let attributes = CanonicalComparisonAttributes::canonicalize(
+                resource.resolved_attributes(),
+                schema.schema().as_schema(),
+            );
+            collect_masked_attributes(
                 &resource.id,
-                resource.resolved_attributes().iter(),
+                &attributes,
+                resource.ignore_changes(),
                 schema.schema(),
                 &mut values,
             )?;
@@ -903,9 +926,10 @@ fn collect_inputs(
             &id.resource_type,
             crate::schema::SchemaKind::Resource,
         ) {
-            collect_attributes(
+            collect_masked_attributes(
                 id,
-                current.comparison_attributes().iter(),
+                current.comparison_attributes(),
+                ignores.get(id).copied().unwrap_or(&no_ignores),
                 schema.schema(),
                 &mut values,
             )?;
@@ -917,9 +941,14 @@ fn collect_inputs(
             &id.resource_type,
             crate::schema::SchemaKind::Resource,
         ) {
-            collect_attributes(
+            let attributes = CanonicalComparisonAttributes::canonicalize(
+                saved.get(id).expect("saved resource").clone(),
+                schema.schema().as_schema(),
+            );
+            collect_masked_attributes(
                 id,
-                saved.get(id).expect("saved resource").iter(),
+                &attributes,
+                ignores.get(id).copied().unwrap_or(&no_ignores),
                 schema.schema(),
                 &mut values,
             )?;
@@ -948,9 +977,27 @@ fn collect_inputs(
     Ok(values)
 }
 
-fn collect_attributes<'a>(
+/// Mask each canonical operand with the comparator's constructor. Masking is
+/// independent per side and can itself change a union's canonical shape.
+fn collect_masked_attributes(
     resource: &ResourceId,
-    attributes: impl Iterator<Item = (&'a String, &'a Value)>,
+    attributes: &CanonicalComparisonAttributes,
+    ignores: &ResolvedIgnoreChanges,
+    schema: &crate::schema::ValidatedResourceSchema,
+    values: &mut Vec<Occurrence>,
+) -> Result<(), Box<ReferencePlanError>> {
+    let masked = ignores.mask_comparison_attributes(
+        attributes,
+        &CanonicalComparisonAttributes::default(),
+        None,
+        Some(schema.as_schema()),
+    );
+    collect_attributes(resource, masked.desired(), schema, values)
+}
+
+fn collect_attributes(
+    resource: &ResourceId,
+    attributes: &CanonicalComparisonAttributes,
     schema: &crate::schema::ValidatedResourceSchema,
     values: &mut Vec<Occurrence>,
 ) -> Result<(), Box<ReferencePlanError>> {

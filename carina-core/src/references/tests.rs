@@ -721,6 +721,158 @@ async fn round8_clean_first_pass_never_enumerates_or_replays() {
 }
 
 #[tokio::test]
+async fn round9_scalar_to_list_union_enumerates_planning_and_display_operands() {
+    use crate::schema::AttributeType;
+    let mut fixture = Fixture::new(
+        string("unused"),
+        string("unused"),
+        HashMap::from([
+            ("alias/desired".into(), resolved("key/b")),
+            ("alias/saved".into(), resolved("key/a")),
+        ]),
+        false,
+    );
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::union(vec![
+                        AttributeType::union(vec![
+                            AttributeType::string(),
+                            AttributeType::list(AttributeType::string()),
+                        ]),
+                        AttributeType::list(AttributeType::reference(identity(), None, None)),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    reset_values(
+        &mut fixture,
+        string("alias/desired"),
+        string("key/a"),
+        string("alias/saved"),
+    );
+    let id = &fixture.desired[0].id;
+    assert_eq!(
+        fixture.desired[0].attributes["key"],
+        string("alias/desired")
+    );
+    let saved_before = fixture.saved.get(id).unwrap().clone();
+    assert!(matches!(
+        fixture.current[id].comparison_attributes().get("key"),
+        Some(Value::Concrete(ConcreteValue::StringList(_)))
+    ));
+
+    let references = fixture
+        .prepare()
+        .await
+        .expect("the canonical list operands must all be prepared in one replay");
+    let plan = fixture.plan(&references).unwrap();
+    assert_eq!(plan.effects().len(), 1);
+    let check_batch = || {
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]
+                .iter()
+                .map(|request| request.value.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["alias/desired", "alias/saved", "key/a"])
+        );
+    };
+    check_batch();
+    fixture.calls.lock().unwrap().clear();
+    ReferencePreparation::default()
+        .display(
+            plan.clone(),
+            &prepare_empty_for_tests(),
+            crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
+            crate::detail_rows::DetailLevel::Full,
+            &fixture.registry,
+            &HashMap::new(),
+            &fixture.router,
+        )
+        .await
+        .expect("fresh display preparation must enumerate canonical historical operands too");
+    check_batch();
+    assert_eq!(
+        fixture.desired[0].attributes["key"],
+        string("alias/desired")
+    );
+    assert_eq!(fixture.saved.get(id).unwrap(), &saved_before);
+}
+
+#[tokio::test]
+async fn round9_used_whole_batch_error_is_typed_through_the_planner_and_not_retried() {
+    let mut fixture = Fixture::new(
+        string("alias/desired"),
+        string("key/a"),
+        HashMap::new(),
+        false,
+    );
+    fixture.router.add_provider(
+        "test".into(),
+        InitializedProvider::unavailable(Box::new(TableProvider {
+            table: HashMap::new(),
+            calls: fixture.calls.clone(),
+            barrier: None,
+            result_count: None,
+            fail_batch: true,
+            updates: fixture.updates.clone(),
+        })),
+    );
+    let mut preparation = ReferencePreparation::default();
+    for _ in 0..2 {
+        let error = preparation
+            .plan(
+                &fixture.desired,
+                &[],
+                &fixture.router,
+                crate::differ::PlanPriorStates::new(
+                    &fixture.current,
+                    &crate::differ::Orphans::new(),
+                ),
+                &HashMap::new(),
+                &fixture.registry,
+                &fixture.saved,
+                &HashMap::new(),
+                &[],
+            )
+            .await
+            .expect_err("a used batch failure must prevent a plan from escaping");
+        let crate::differ::PlanComparisonError::Reference(error) = error else {
+            panic!("expected typed reference plan error, got {error:?}");
+        };
+        assert!(matches!(error.source, ReferenceFailure::Call(_)));
+        assert_eq!(error.resource, fixture.desired[0].id);
+        assert_eq!(error.instance, ProviderInstanceKey::new("test", None));
+        assert_eq!(error.path, "key");
+        assert_eq!(error.raw.expose_plaintext(), "key/a");
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
+        let mut chain = String::new();
+        while let Some(error) = source {
+            chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        for required in [
+            "example",
+            "key/a",
+            "DeniedCode",
+            "request-123",
+            "transport diagnostic",
+        ] {
+            assert!(chain.contains(required), "missing {required}: {chain}");
+        }
+        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn round8_whole_batch_errors_are_cached_for_each_value_and_judged_on_use() {
     let mut fixture = Fixture::new(
         string("alias/live"),
@@ -1840,14 +1992,7 @@ async fn round3_unordered_list_index_ignore_precedes_projection_pairing_and_save
             .iter()
             .map(|r| r.value.as_str())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "alias/ignored-desired",
-            "alias/ignored-read",
-            "alias/ignored-saved",
-            "alias/live",
-            "alias/saved",
-            "key/b"
-        ])
+        BTreeSet::from(["alias/live", "alias/saved", "key/b"])
     );
 }
 

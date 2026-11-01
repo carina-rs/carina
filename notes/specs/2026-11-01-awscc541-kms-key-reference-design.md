@@ -109,16 +109,20 @@ at their resource paths and provisionally returns unequal.
 There is no separate walker enumerating pairs.
 
 If pass 1 records any miss, discard its provisional result and enumerate every
-concrete reference value in the invocation: desired, current/read and saved
-leaves, including lists, binding-stability and cascade inputs, historical display
-operands and write-only fallbacks. This is a schema walk over values, not pairs.
+concrete reference value in that computation's inputs: desired, current/read
+and saved leaves, including lists, binding-stability and cascade inputs,
+historical display operands and write-only fallbacks. Walk the masked, canonical
+comparison and display values by schema, not pairs.
 Resolve uncached values in one concurrent batch per initialized provider instance,
-checking positional lengths and nonempty successes. Replay exactly once.
+checking positional lengths and nonempty successes. Replay that computation once.
+The limit is per computation: binding-stability, plan-with-cascades, display and
+apply augmentation each run at most one replay.
 
 Cache `Resolved`, `NotFound` or `Failed` by `(provider instance, reference type
 identity, raw value)`, including a failure for every value of a failed batch.
-Only comparisons judge these outcomes under D6; unused outcomes produce no error
-or note. A miss after the replay is a typed internal `UnpreparedAfterReplay`
+Reuse cached outcomes, including `Failed`, for the rest of the invocation
+without retry. Only comparisons judge these outcomes under D6; unused outcomes
+produce no error or note. A miss after the replay is a typed internal `UnpreparedAfterReplay`
 error naming the resource, attribute path and redacted-safe raw value.
 
 The recording session returns only an opaque provisional result. Only a pass
@@ -129,9 +133,9 @@ are never requested; a comparison that uses one returns the typed secret error.
 The typed traversal-depth check finishes before any guest call.
 
 Unknown/deferred leaves retain existing dependency and scheduling behavior.
-Apply-time augmentation uses the same single replay with a fresh cache for
-keys that become concrete or change after planning. Unchanged planned leaves
-keep their recorded decision.
+Apply-time augmentation uses the same rule in its own invocation, with a fresh
+cache for keys that become concrete or change after planning. Unchanged planned
+leaves keep their recorded decision.
 
 ### D6. Resolution failures are typed; only a dangling current value is a diff
 
@@ -139,13 +143,16 @@ The resolver's per-request outcome is a closed enum, and the comparison
 side decides what each case means:
 
 ```rust
-enum ReferenceOutcome { Resolved(KmsKeyArn), NotFound(ProviderError) }
+enum ReferenceOutcome { Resolved(CanonicalReference), NotFound(ProviderError) }
 enum ReferenceError {
     AccessDenied(ProviderError),   // AccessDeniedException, key policy denial
     Transient(ProviderError),      // throttling after retries, transport, 5xx, credentials
     InvalidReference(ProviderError), // malformed value, unreachable partition, non-ARN success
 }
 ```
+
+Core holds a provider-agnostic `CanonicalReference`; the guest validates `KmsKeyArn`.
+Cached states are `Resolved`, `NotFound` and `Failed`.
 
 | Case | Desired side | Current (read/state) side |
 |---|---|---|
@@ -210,8 +217,8 @@ Results are positional; the host retains resource/path fan-out and never
 sends unknown/deferred leaves. Core rejects length mismatches and empty
 `resolved` values (as `invalid-reference`). The shared guest resolver
 validates the canonical key ARN shape through its `KmsKeyArn` output type;
-core remains provider-agnostic. The outer
-error covers whole-call failure and aborts planning. The variants map
+core remains provider-agnostic. The outer error covers whole-call failure,
+cached per request as `Failed` and judged on use under D6. The variants map
 one-to-one onto D6's Rust enums; the guest classifies AWS error codes, so
 the host never parses error strings. The SDK default fails every request
 with `invalid-reference` naming the unsupported type identity.
