@@ -12,7 +12,7 @@ fn snapshot_module_list_with_imports() {
     let fixture_dir = PathBuf::from(format!("{}/tests/fixtures/module_list", manifest_dir));
 
     let config = config_loader::load_configuration(
-        &fixture_dir,
+        &carina_core::paths::ResolvedPath::new(&fixture_dir).unwrap(),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
@@ -27,7 +27,7 @@ fn snapshot_module_list_empty() {
     let fixture_dir = PathBuf::from(format!("{}/tests/fixtures/module_info", manifest_dir));
 
     let config = config_loader::load_configuration(
-        &fixture_dir,
+        &carina_core::paths::ResolvedPath::new(&fixture_dir).unwrap(),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();

@@ -1,7 +1,5 @@
 //! Top-level, module, and input parameter completions.
 
-use std::path::Path;
-
 use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
 };
@@ -15,7 +13,7 @@ impl CompletionProvider {
         &self,
         position: Position,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &parser::ProviderContext,
     ) -> Vec<CompletionItem> {
         // Calculate the range for resource type replacements
@@ -365,12 +363,12 @@ impl CompletionProvider {
         &self,
         module_name: &str,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::parser::ParsedFile> {
         let import_path = self.find_module_import_path(module_name, text, base_path)?;
         let base = base_path?;
-        let module_path = base.join(&import_path);
+        let module_path = base.join(&import_path).ok()?;
         let provider_context = carina_core::parser::ProviderContext {
             environment: provider_ctx.catalog().environment.clone(),
             decryptor: None,
@@ -390,7 +388,7 @@ impl CompletionProvider {
         &self,
         module_name: &str,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
@@ -448,7 +446,7 @@ impl CompletionProvider {
         module_name: &str,
         arg_name: &str,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let Some(parsed) = self.load_called_module(module_name, text, base_path, provider_ctx)
@@ -550,7 +548,7 @@ impl CompletionProvider {
         &self,
         module_name: &str,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Option<String> {
         // Fast path: when the `let X = use {...}` lives in the open
         // buffer itself, skip the disk walk over sibling `.crn` files.
@@ -577,7 +575,7 @@ impl CompletionProvider {
         binding: &str,
         after_eq: &str,
         merged: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &parser::ProviderContext,
     ) -> String {
         // Try the same-line shape first (`use { source = '...' }` on the
@@ -589,8 +587,9 @@ impl CompletionProvider {
 
         if let Some(path) = import_path.as_deref()
             && let Some(base) = base_path
+            && let Ok(module_path) = base.join(path)
             && let Some(parsed) =
-                carina_core::module_resolver::load_module(&base.join(path), provider_ctx)
+                carina_core::module_resolver::load_module(&module_path, provider_ctx)
             && !parsed.arguments.is_empty()
         {
             let mut snippet = format!("{} {{\n", binding);
@@ -747,7 +746,7 @@ impl CompletionProvider {
     pub(super) fn import_path_completions(
         &self,
         partial_path: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let base = match base_path {
             Some(b) => b,
@@ -781,14 +780,16 @@ impl CompletionProvider {
             ("", partial_path)
         };
 
-        let search_dir = base.join(dir_part);
-        let entries = match std::fs::read_dir(&search_dir) {
+        let Ok(search_dir) = base.join(dir_part) else {
+            return vec![];
+        };
+        let entries = match search_dir.entries() {
             Ok(entries) => entries,
             Err(_) => return completions,
         };
 
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
+        for entry in entries {
+            let file_name = entry.display().file_name().unwrap_or_default();
             let name = file_name.to_string_lossy();
 
             // Skip hidden files/dirs
@@ -796,7 +797,7 @@ impl CompletionProvider {
                 continue;
             }
 
-            let path = entry.path();
+            let path = &entry;
             // Modules are directory-scoped, so only directories are valid
             // import targets; .crn files on their own are rejected by the
             // resolver (ModuleError::NotADirectory).

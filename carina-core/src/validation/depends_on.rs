@@ -430,7 +430,7 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
         )
         .unwrap();
         let parsed = crate::config_loader::parse_directory(
-            directory.path(),
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("multi-file wait fixture must parse");
@@ -603,7 +603,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             )
             .unwrap();
             let error = crate::config_loader::parse_directory(
-                directory.path(),
+                &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .expect_err("upstream_state and wait handles must remain parser errors");

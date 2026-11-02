@@ -111,11 +111,17 @@ fn parse_root_and_resolve(source: &str) -> carina_core::parser::ExpandedParsedFi
     TypeCheckSession::run(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            let parsed =
-                carina_core::config_loader::parse_directory(root.path(), session.catalog())
-                    .expect("parse should succeed");
-            carina_core::module_resolver::resolve_modules_providerless(parsed, root.path(), session)
-                .expect("module-resolution boundary should succeed")
+            let parsed = carina_core::config_loader::parse_directory(
+                &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
+                session.catalog(),
+            )
+            .expect("parse should succeed");
+            carina_core::module_resolver::resolve_modules_providerless(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
+                session,
+            )
+            .expect("module-resolution boundary should succeed")
         },
     )
     .publish(&mut TestTypeCheckSink)

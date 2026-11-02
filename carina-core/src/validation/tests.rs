@@ -311,7 +311,7 @@ fn module_call_findings_for_test(
         check_module_calls(ModuleCallCheckInput {
             authored: parsed,
             semantic: Some(parsed),
-            base_dir: Some(std::path::Path::new(".")),
+            base_dir: Some(&crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap()),
             imported_signatures: signatures,
             provider_context: session,
             schemas: &schemas,
@@ -1881,6 +1881,91 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     );
 }
 
+#[cfg(unix)]
+fn symlink_parent_source(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let private = temp.path().join("private");
+    std::fs::create_dir_all(project.join("bad")).unwrap();
+    std::fs::create_dir_all(private.join("nested")).unwrap();
+    std::fs::create_dir(private.join("bad")).unwrap();
+    std::fs::write(project.join("bad/main.crn"), "wrong file").unwrap();
+    std::fs::write(private.join("bad/main.crn"), contents).unwrap();
+    std::os::unix::fs::symlink(private.join("nested"), project.join("jump")).unwrap();
+    let source = project.join("jump/../bad/main.crn");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), contents);
+    (temp, source)
+}
+
+#[cfg(unix)]
+#[test]
+fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
+    let (_temp, path) = symlink_parent_source(
+        "arguments { value: Int }\nlet item = mock.test.resource { name = value }\n",
+    );
+    let provider = LoadedProviderContext::empty_for_test();
+    let parsed =
+        crate::parser::parse_file(&std::fs::read_to_string(&path).unwrap(), &path, &provider)
+            .unwrap();
+    let schemas = function_ref_schema();
+    let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &provider, &signatures),
+    );
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    let finding = &report.findings()[0];
+    assert_eq!(finding.use_site.source_file.path(), path);
+    assert_eq!(finding.to_string(), format!("{} at line 2", path.display()));
+    assert_eq!(
+        report.to_string(),
+        format!("{}: {} at line 2", path.display(), finding.error)
+    );
+    let nested = ModuleCallFindingMessage::NestedResourceBindingUse(Box::new(finding.clone()));
+    assert_eq!(nested.to_string(), report.to_string());
+}
+
+#[cfg(unix)]
+#[test]
+fn module_call_diagnostics_preserve_symlink_parent_source_spelling() {
+    let (_temp, path) = symlink_parent_source(
+        "let child = use { source = './child' }\nchild { surprise = true }\n",
+    );
+    let provider = LoadedProviderContext::empty_for_test();
+    let parsed =
+        crate::parser::parse_file(&std::fs::read_to_string(&path).unwrap(), &path, &provider)
+            .unwrap();
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: Vec::new(),
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let findings = module_call_findings_for_test(&parsed, &signatures, &provider);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].anchor().source_file.path(), path);
+    assert_eq!(
+        findings[0].to_string(),
+        format!("{} at line 2", path.display())
+    );
+    assert_eq!(module_use_anchor(&parsed.uses[0]).source_file.path(), path);
+    let diagnostic = TypeResolutionDiagnostic::description(
+        "module declaration".to_string(),
+        crate::static_type::StaticTypeResolutionError::UnknownCustomType {
+            name: "Missing".to_string(),
+        }
+        .into(),
+        Some(TypeResolutionSource::new(
+            SourceFileId::new(path.clone()),
+            SourceSpan::dummy(),
+        )),
+    );
+    let finding = ModuleCallFinding::try_from_type_resolution(diagnostic).unwrap();
+    assert_eq!(finding.anchor().source_file.path(), path);
+}
+
 #[test]
 fn parser_side_deferred_resource_keeps_bare_binding_sink_type() {
     let parsed = crate::parser::parse(
@@ -2235,12 +2320,15 @@ mock.test.Consumer { name = shared }
 
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let schemas = SchemaRegistry::new();
-    let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
-        .expect("load module fixture");
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        &config,
+    )
+    .expect("load module fixture");
     let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
             parsed,
-            fixture.path(),
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
             session,
             &schemas,
         )
@@ -4987,7 +5075,7 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
     let schemas = SchemaRegistry::new();
     let signatures = crate::module_resolver::load_resolved_module_signatures(
         &parsed,
-        fixture.path(),
+        &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &provider_context,
     );
     let binding_use_report = check_bare_binding_uses(
@@ -5006,7 +5094,7 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
             check_module_calls(ModuleCallCheckInput {
                 authored: &parsed,
                 semantic: Some(&parsed),
-                base_dir: Some(fixture.path()),
+                base_dir: Some(&crate::paths::ResolvedPath::new(fixture.path()).unwrap()),
                 imported_signatures: &signatures,
                 provider_context: session,
                 schemas: &schemas,
@@ -6023,6 +6111,58 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         declaration_errors[0].contains("module 'bad_module'"),
         "the declaration diagnostic must identify its module: {declaration_errors:?}",
     );
+}
+
+#[test]
+fn module_attribute_errors_deduplicate_directory_spellings_with_both_call_paths() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("modules/m")).unwrap();
+    std::fs::create_dir(root.path().join("a")).unwrap();
+    let mut parsed = empty_parsed();
+    let mut source = make_composition("source", &[]);
+    source.signature.attributes.insert(
+        "value".to_string(),
+        LiveCompositionAttribute::from_value(
+            Value::Concrete(ConcreteValue::String("text".into())),
+            Some(consumer_type(TypeExpr::String)),
+        ),
+    );
+    parsed.compositions.push(source);
+    for (instance, directory) in [
+        ("one", root.path().join("modules/m")),
+        ("two", root.path().join("a/../modules/m")),
+    ] {
+        let mut consumer = make_composition(instance, &[]);
+        let mut call = consumer.call_path.immediate().clone();
+        call.module_directory = Some(crate::paths::ResolvedPath::new(directory).unwrap());
+        consumer.call_path = CompositionCallPath::direct(call);
+        consumer.signature.attributes.insert(
+            "bad".to_string(),
+            LiveCompositionAttribute::from_value(
+                Value::resource_ref("source".to_string(), "value".to_string(), vec![]),
+                Some(consumer_type(TypeExpr::Bool)),
+            ),
+        );
+        parsed.compositions.push(consumer);
+    }
+    let parsed = parsed.resolve_root(&RootScope::new());
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    let CompositionRefError::Attribute(error) = &errors[0] else {
+        panic!("expected a module declaration error: {errors:#?}");
+    };
+    let instances: Vec<_> = error
+        .call_paths
+        .iter()
+        .map(|path| path.immediate().instance.as_str())
+        .collect();
+    assert_eq!(instances, ["one", "two"]);
 }
 
 #[test]
@@ -9501,7 +9641,7 @@ fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAtt
         },
         module_name: "shared".to_string(),
         module_source: Some("../shared".to_string()),
-        module_directory: Some(std::path::PathBuf::from(module_directory)),
+        module_directory: Some(crate::paths::ResolvedPath::new(module_directory).unwrap()),
         call_paths: Vec::new(),
         reference_position: 0,
     }
@@ -9646,6 +9786,23 @@ fn module_type_resolution_dedup_uses_typed_identity_not_display_text() {
         first, second,
         "deduplication must retain distinct typed type-resolution failures",
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn composition_error_identity_survives_symlink_retarget() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original");
+    let replacement = temp.path().join("replacement");
+    let alias = temp.path().join("alias");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    std::os::unix::fs::symlink(&original, &alias).unwrap();
+    let error = attribute_reference_message_fixture(alias.to_str().unwrap());
+    let identity = error.module_identity();
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+    assert_eq!(error.module_identity(), identity);
 }
 
 #[test]

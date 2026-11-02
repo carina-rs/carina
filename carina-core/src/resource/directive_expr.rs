@@ -253,8 +253,6 @@ impl DirectiveArgumentSources {
             if let Some((file, range)) = source.authored_location()
                 && file.is_absolute()
             {
-                let file = crate::utils::normalize_source_path(file);
-                let root = crate::utils::normalize_source_path(root);
                 let file_parts = file.components().collect::<Vec<_>>();
                 let root_parts = root.components().collect::<Vec<_>>();
                 let shared = file_parts

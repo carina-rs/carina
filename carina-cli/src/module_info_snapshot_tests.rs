@@ -24,11 +24,13 @@ fn module_info_output(fixture_name: &str) -> String {
     ));
 
     let parsed = module_resolver::load_module_from_directory(
-        &module_dir,
+        &carina_core::paths::ResolvedPath::new(&module_dir).unwrap(),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("failed to load fixture module");
-    let module_name = module_resolver::derive_module_name(&module_dir);
+    let module_name = module_resolver::derive_module_name(
+        &carina_core::paths::ResolvedPath::new(&module_dir).unwrap(),
+    );
     let signature = FileSignature::from_parsed_file_with_name(
         &parsed,
         &module_name,
@@ -46,11 +48,13 @@ fn module_info_dir_output(fixture_name: &str) -> String {
     ));
 
     let parsed = module_resolver::load_module_from_directory(
-        &dir_path,
+        &carina_core::paths::ResolvedPath::new(&dir_path).unwrap(),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("failed to load fixture dir");
-    let module_name = module_resolver::derive_module_name(&dir_path);
+    let module_name = module_resolver::derive_module_name(
+        &carina_core::paths::ResolvedPath::new(&dir_path).unwrap(),
+    );
     let signature = FileSignature::from_parsed_file_with_name(
         &parsed,
         &module_name,

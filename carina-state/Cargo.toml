@@ -15,7 +15,7 @@ doctest = false
 test-utils = ["carina-core/test-support"]
 
 [dependencies]
-carina-core = { path = "../carina-core" }
+carina-core = { path = "../carina-core", features = ["async-io"] }
 aws-config = "1"
 aws-sdk-s3 = "1"
 tokio = { version = "1", features = ["full"] }

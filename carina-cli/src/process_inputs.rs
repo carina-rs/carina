@@ -121,17 +121,21 @@ impl ProcessInputs {
             };
             let scope = MockScope::file(state_file.clone()).map_err(|error| {
                 CommandInputError::MockStorage {
-                    path: state_file,
+                    path: carina_core::paths::DisplayPath::new(&state_file)
+                        .expect("mock storage input is absolute"),
                     error,
                 }
             })?;
             Ok(ConfiguredBuiltinMock::new(behavior, scope))
         });
         let accepted_egress = if let Some((project, accepted)) = consent {
+            let project = carina_core::paths::ResolvedPath::new(project)
+                .map_err(|error| carina_cli::commands::init::InitError::Other(error.to_string()))
+                .map_err(AppError::from)?;
             carina_provider_resolver::AcceptedEgressSources::parse_os(
                 accepted,
                 self.environment.get("CARINA_ACCEPT_EGRESS"),
-                project,
+                &project,
             )
             .map_err(carina_cli::commands::init::InitError::AcceptedEgress)
             .map_err(AppError::from)?

@@ -79,6 +79,7 @@ enum ResolvedFileTheme {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPlanImageTarget {
     path: PathBuf,
+    destination: carina_core::paths::ResolvedPath,
     theme: ResolvedFileTheme,
 }
 
@@ -129,6 +130,11 @@ impl TryFrom<PathBuf> for PlanImageTarget {
 pub enum PlanImageError {
     #[error("plan image path must end in .svg or .png: {path}", path = .path.display())]
     UnsupportedExtension { path: PathBuf },
+    #[error("failed to locate plan image destination {path}: {error}", path = .path.display())]
+    Resolve {
+        path: PathBuf,
+        error: std::io::Error,
+    },
     #[error("failed to write plan image {path}: {error}")]
     Write {
         path: PathBuf,
@@ -248,10 +254,21 @@ where
     let themes = resolve_image_themes(target, inline, requested, inline::query_terminal_theme)?;
     let file = target
         .zip(themes.file)
-        .map(|(target, theme)| ResolvedPlanImageTarget {
-            path: target.path.clone(),
-            theme,
-        });
+        .map(|(target, theme)| {
+            let destination =
+                carina_core::paths::ResolvedPath::new(&target.path).map_err(|error| {
+                    PlanImageError::Resolve {
+                        path: target.path.clone(),
+                        error,
+                    }
+                })?;
+            Ok(ResolvedPlanImageTarget {
+                path: target.path.clone(),
+                destination,
+                theme,
+            })
+        })
+        .transpose()?;
     let inline = protocol
         .zip(themes.inline)
         .map(|(protocol, theme)| InlineImageRequest {
@@ -345,15 +362,52 @@ pub fn render_plan_image(
 
 /// Write bytes that have already been rendered and validated.
 pub fn write_plan_image(image: RenderedPlanImage) -> Result<(), PlanImageError> {
-    std::fs::write(&image.target.path, image.bytes).map_err(|error| PlanImageError::Write {
-        path: image.target.path,
-        error,
-    })
+    image
+        .target
+        .destination
+        .atomic_replace(&image.bytes)
+        .map_err(|error| PlanImageError::Write {
+            path: image.target.path,
+            error,
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_image_symlink_retarget_keeps_output_in_pinned_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("replacement");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let target = PlanImageTarget::try_from(alias.join("plan.svg")).unwrap();
+        let options = resolve_plan_image_options(
+            Some(&target),
+            false,
+            Some(ImageTheme::Light),
+            |_| None,
+            false,
+        )
+        .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        write_plan_image(RenderedPlanImage {
+            target: options.file().unwrap().clone(),
+            bytes: b"rendered image".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(original.join("plan.svg")).unwrap(),
+            b"rendered image"
+        );
+        assert!(!replacement.join("plan.svg").exists());
+    }
 
     #[test]
     fn output_extension_is_case_insensitive() {

@@ -70,6 +70,7 @@
 //! ```
 
 use carina_core::effect::{AddressedMoves, ResolvedExplicitMove, ResolvedMovePairs};
+use carina_core::paths::ResolvedPath;
 use carina_core::provider::{MetadataComparisonResolver, ResourceComparisonResolver};
 use carina_core::resource::{PersistedDirectives, ResolvedDependencies};
 use legacy_migration::DeferredForExpansionWitness;
@@ -81,7 +82,9 @@ mod legacy_migration;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use indexmap::IndexMap;
 use std::sync::{Arc, OnceLock};
@@ -868,7 +871,7 @@ struct CliTypeCheckSink {
 /// Keep the parse failure and check declarations in every readable valid file
 /// under that same explicitly unloaded authority.
 pub(crate) fn failed_configuration_report<T>(
-    path: &Path,
+    path: &ResolvedPath,
     error: AppError,
     environment: carina_core::EnvironmentSnapshot,
 ) -> carina_core::validation::deferred_types::ProviderTypeCheckResult<Result<T, AppError>> {
@@ -877,14 +880,17 @@ pub(crate) fn failed_configuration_report<T>(
         |session| {
             let mut errors = vec![error.to_string()];
             let files = if path.is_file() {
-                vec![path.to_path_buf()]
+                vec![path.clone()]
             } else {
                 carina_core::config_loader::find_crn_files_in_dir(path).unwrap_or_default()
             };
             for file in files {
-                if let Ok(source) = std::fs::read_to_string(&file)
-                    && let Ok(mut parsed) =
-                        carina_core::parser::parse_file(&source, &file, session.catalog())
+                if let Ok(source) = file.read_to_string()
+                    && let Ok(mut parsed) = carina_core::parser::parse_file(
+                        &source,
+                        &file.source_label(),
+                        session.catalog(),
+                    )
                 {
                     errors.extend(
                         validation::resolve_file_type_exprs(&mut parsed, session)
@@ -1028,7 +1034,7 @@ fn validation_report_from<'a>(
     context: &'a WiringContext,
     load_errors: &HashMap<String, String>,
     parsed: &carina_core::config_loader::InferredRootDirectory,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> ValidationReport<'a> {
@@ -1047,7 +1053,7 @@ fn validation_report_with<'a, T>(
     context: &'a WiringContext,
     load_errors: &HashMap<String, String>,
     parsed: &carina_core::config_loader::InferredRootDirectory,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     finish: impl FnOnce(
@@ -1156,7 +1162,7 @@ fn resolve_config_pair_errors_with_context(
     load_errors: &HashMap<String, String>,
     parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<ReadyConfigPair, NonEmptyValidationErrors> {
@@ -1196,7 +1202,7 @@ fn resolve_config_pair_errors_with_catalog(
     providers: ProviderValidationInputs<'_>,
     parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<ReadyConfigPair, NonEmptyValidationErrors> {
@@ -1247,7 +1253,7 @@ fn resolve_config_pair_with_context(
     load_errors: &HashMap<String, String>,
     parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Result<ReadyConfigPair, AppError> {
@@ -1278,18 +1284,18 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
 
 fn require_expanded_config<E>(
     file: &carina_core::parser::ModuleResolvedFile<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
 ) -> Result<(), AppError>
 where
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress>,
 {
     module_resolver::ensure_expanded_root_graph(file)
-        .map_err(|error| AppError::Config(error.display_relative_to(base_dir)))
+        .map_err(|error| AppError::Config(error.display_relative_to(&base_dir.source_label())))
 }
 
 fn resolve_file_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>(
     file: carina_core::parser::ModuleResolvedFile<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     context: &WiringContext,
     catalog: &ValidationProviderCatalog<'_>,
 ) -> Result<carina_core::validation::ResolvedFile<E::Expanded>, AppError> {
@@ -1306,7 +1312,7 @@ fn resolve_file_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
 
 fn resolve_pair_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>(
     pair: ParserCanonicalResourcePair<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     context: &WiringContext,
     catalog: &ValidationProviderCatalog<'_>,
 ) -> Result<
@@ -1331,7 +1337,7 @@ impl ProviderLoad {
     pub(crate) fn load<P: PlaceholderKind, B: BindingAddress>(
         runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
     ) -> Result<Self, AppError> {
         let (factories, load_errors) =
             build_factories_from_providers(runtime, providers, base_dir)?;
@@ -1349,7 +1355,7 @@ impl ProviderLoad {
     pub(crate) fn load_reporting<P: PlaceholderKind, B: BindingAddress>(
         runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
     ) -> Result<(ReportingProviderLoad, Option<AppError>), AppError> {
         Ok(
             match build_schema_factories_from_providers(runtime, providers, base_dir) {
@@ -1392,7 +1398,7 @@ impl ProviderLoad {
     pub(crate) fn validation_report<'a>(
         &'a self,
         parsed: &carina_core::config_loader::InferredRootDirectory,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> ValidationReport<'a> {
@@ -1411,7 +1417,7 @@ impl ProviderLoad {
     pub fn validate_evaluated_config(
         self,
         parsed: carina_core::config_loader::InferredRootDirectory,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig<ExpandedInferredFile>, AppError> {
@@ -1452,7 +1458,7 @@ impl ProviderLoad {
         self,
         parsed: carina_core::config_loader::InferredRootDirectory,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
@@ -1546,7 +1552,7 @@ impl MigrationCheckProviderLoad {
             ParserPlaceholder,
             carina_core::resource::RelativeBindingName,
         >],
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         schema_overrides: &HashMap<String, PathBuf>,
     ) -> Result<Self, AppError> {
         let effective = schema_check_provider_configs(providers, schema_overrides)?;
@@ -1561,7 +1567,7 @@ impl MigrationCheckProviderLoad {
     pub(crate) fn validate_evaluated_config(
         self,
         parsed: carina_core::config_loader::InferredRootDirectory,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<MigrationCheckConfig, AppError> {
         let Self {
@@ -1596,7 +1602,7 @@ impl CompleteProviderLoad {
         self,
         parsed: carina_core::config_loader::InferredRootDirectory,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<CheckedSavedPlanInputs, AppError> {
@@ -1675,7 +1681,7 @@ impl ReportingProviderLoad {
     pub(crate) fn validation_report<'a>(
         &'a self,
         parsed: &carina_core::config_loader::InferredRootDirectory,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> ValidationReport<'a> {
@@ -1786,8 +1792,13 @@ impl ValidatedWiring {
         let (parsed, unresolved) = carina_core::validation::deferred_types::with_session_for_test(
             self.context().provider_context(),
             |session| {
-                resolve_pair_binding_uses(resources, Path::new("."), self.context(), session)
-                    .expect("test parser placeholders must be fully expanded")
+                resolve_pair_binding_uses(
+                    resources,
+                    &ResolvedPath::new(".").unwrap(),
+                    self.context(),
+                    session,
+                )
+                .expect("test parser placeholders must be fully expanded")
             },
         );
         ValidatedConfig {
@@ -2028,7 +2039,7 @@ impl ValidatedConfig<CanonicalResourcePair<ExpandedInferredExportParam>> {
         self,
         parsed: carina_core::config_loader::InferredRootDirectory,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     ) -> Result<ValidatedConfig, AppError> {
@@ -2436,7 +2447,7 @@ impl FormattingProviderLoad {
     pub(crate) fn load<P: PlaceholderKind, B: BindingAddress>(
         runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
     ) -> Result<Self, AppError> {
         let (factories, load_errors) =
             build_factories_from_providers_for_formatting(runtime, providers, base_dir)?;
@@ -2709,7 +2720,7 @@ pub(crate) fn provider_loading_configs<P: PlaceholderKind, B: BindingAddress>(
 fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
 ) -> Result<ProviderFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
     carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
@@ -2726,7 +2737,7 @@ fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
 fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
 ) -> Result<ProviderFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
     carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
@@ -2750,7 +2761,7 @@ fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
 fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingAddress>(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
 ) -> Result<FormattingFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
     if let Err(error) = carina_provider_resolver::validate_lock_constraints(base_dir, &providers) {
@@ -2782,7 +2793,7 @@ fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingA
 fn build_factories_from_providers_impl<B: BindingAddress>(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<carina_core::resource::NoPlaceholder, B>],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     report_errors: bool,
     network: ProviderFactoryNetwork,
 ) -> Result<ProviderFactoryLoad, AppError> {
@@ -2791,7 +2802,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
 
     let grant_inputs = runtime.grants();
     let loader_user_dirs = runtime.user_dirs().clone();
-    let loader_project_dir = base_dir.to_path_buf();
+    let loader_project_dir = base_dir.clone();
     let aws = Arc::new(CliAwsCredentialProvisioner::new());
     build_factories_from_providers_impl_using(
         runtime,
@@ -2829,7 +2840,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
 fn build_factories_from_providers_impl_using<B: BindingAddress, L, Fut>(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<carina_core::resource::NoPlaceholder, B>],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     report_errors: bool,
     grant_inputs: &TrustedLocalGrantInputs,
     mut loader: L,
@@ -2934,7 +2945,10 @@ where
                     error.loader_error(),
                     Some(carina_plugin_host::WasmProviderLoadError::EgressConsent(_))
                 ) {
-                    format!("{error}\nRun `{}`.", ProjectCommand::new("init", base_dir))
+                    format!(
+                        "{error}\nRun `{}`.",
+                        ProjectCommand::for_display_path("init", base_dir.display())
+                    )
                 } else {
                     error.to_string()
                 };
@@ -4454,7 +4468,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
         for finding in validation::resolve_file_type_exprs(&mut parsed, config) {
             errors.push(AppError::Validation(format!(
                 "{}: {finding}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
         let signatures = carina_core::module_resolver::ResolvedModuleSignatures::default();
@@ -4467,7 +4481,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
         ) {
             errors.extend(prefixed_validation_messages(
                 &joined,
-                module.diagnostic_path().display(),
+                module.diagnostic_label(),
             ));
         }
     }
@@ -4486,7 +4500,7 @@ pub(crate) fn validate_module_internal_ref_types(
     let mut errors = Vec::new();
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
-        let prefix = module.diagnostic_path().display();
+        let prefix = module.diagnostic_label();
         // Module expansion retains the established diagnostic for malformed
         // declarations. This pass only needs successful resolution so valid
         // dotted argument types can act as sources before expansion.
@@ -4542,7 +4556,7 @@ pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<A
         if let Err(message) = validation::validate_no_provider_in_module(&module.loaded().parsed) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -4562,7 +4576,7 @@ pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> V
         {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -4579,7 +4593,7 @@ pub(crate) fn validate_no_backend_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
         if let Err(message) = validation::validate_no_backend_in_module(&module.loaded().parsed) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -4598,7 +4612,7 @@ pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -
         {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -4615,7 +4629,7 @@ pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
         if let Err(message) = validation::validate_no_exports_in_module(&module.loaded().parsed) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -10492,7 +10506,9 @@ fn schema_check_provider_configs(
                 "provider schema override names undeclared default provider '{name}'"
             )));
         };
-        let source = format!("file://{}", path.display())
+        let path = carina_core::paths::DisplayPath::new(path)
+            .map_err(|error| AppError::Validation(error.to_string()))?;
+        let source = format!("file://{path}")
             .parse::<ProviderSource>()
             .map_err(|error| AppError::Validation(error.to_string()))?;
         config.source = Some(source);
@@ -10507,7 +10523,7 @@ fn schema_check_provider_configs(
 fn build_schema_only_factories_from_providers(
     runtime: &CommandRuntime,
     providers: &[ProviderConfig<ParserPlaceholder, carina_core::resource::RelativeBindingName>],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
 ) -> Result<ProviderFactoryLoad, AppError> {
     #[cfg(any(test, feature = "test-utils"))]
     runtime.record_provider_load();

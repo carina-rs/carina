@@ -24,7 +24,7 @@ fn share_provider_attrs_resolves_default_tags() {
     .collect();
 
     let config = load_configuration(
-        &fixture,
+        &carina_core::paths::ResolvedPath::new(&fixture).unwrap(),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("load_configuration");
@@ -37,7 +37,7 @@ fn share_provider_attrs_resolves_default_tags() {
     let parsed = carina_cli::commands::validate_and_resolve_with_provider_load_for_test(
         &runtime,
         &config.parsed,
-        &fixture,
+        &carina_core::paths::ResolvedPath::new(&fixture).unwrap(),
         true,
         &config.duplicate_declarations,
     )

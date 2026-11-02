@@ -120,7 +120,7 @@ fn module_parameter_completion_uses_environment_snapshot() {
     let snippets = test_provider().top_level_completions(
         Position::new(0, 0),
         &doc.text(),
-        Some(directory.path()),
+        Some(&carina_core::paths::ResolvedPath::new(directory.path()).unwrap()),
         doc.provider_context(),
     );
     let service = snippets
@@ -1886,6 +1886,27 @@ fn upstream_state_source_outside_block_produces_nothing() {
         "Outside upstream_state block, source = '...' should not trigger this completion. Got: {:?}",
         labels
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn upstream_state_source_symlink_suggestions_resolve_from_the_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    let link = temp.path().join("link");
+    std::fs::create_dir_all(real.join("current")).unwrap();
+    std::fs::create_dir(real.join("neighbor")).unwrap();
+    std::fs::write(real.join("current/main.crn"), "").unwrap();
+    std::fs::write(real.join("neighbor/main.crn"), "").unwrap();
+    std::os::unix::fs::symlink(real.join("current"), &link).unwrap();
+    let provider = test_provider();
+    let doc = create_document("let orgs = upstream_state {\n    source = '");
+    let completions = provider.complete_for_test(&doc, Position::new(1, 14), Some(&link));
+    assert!(completions.iter().any(|item| item.label == "'../neighbor'"));
+    for item in completions {
+        let source = item.label.trim_matches('\'');
+        assert!(link.join(source).is_dir(), "invalid suggestion: {source}");
+    }
 }
 
 #[test]

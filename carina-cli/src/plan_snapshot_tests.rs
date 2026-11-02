@@ -2075,7 +2075,7 @@ fn collect_unused_let_bindings_in_fixtures(
         }
         let fixture_name = entry.file_name().to_string_lossy().to_string();
         let loaded = load_configuration(
-            &fixture_dir,
+            &carina_core::paths::ResolvedPath::new(&fixture_dir).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -2640,17 +2640,21 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
         env!("CARGO_MANIFEST_DIR")
     ));
     let loaded = load_configuration(
-        &fixture_path,
+        &carina_core::paths::ResolvedPath::new(&fixture_path).unwrap(),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
-    let providers =
-        crate::wiring::ProviderLoad::load(&user_dirs, &parsed.providers, &fixture_path).unwrap();
+    let providers = crate::wiring::ProviderLoad::load(
+        &user_dirs,
+        &parsed.providers,
+        &carina_core::paths::ResolvedPath::new(&fixture_path).unwrap(),
+    )
+    .unwrap();
     let errors = crate::commands::validate_and_resolve_errors(
         &parsed,
-        &fixture_path,
+        &carina_core::paths::ResolvedPath::new(&fixture_path).unwrap(),
         &providers,
         true,
         &duplicate_declarations,

@@ -144,8 +144,7 @@ impl LoopSource {
         source_text: impl Into<Arc<str>>,
         kind: LoopKind,
     ) -> Self {
-        let normalized = crate::utils::normalize_source_path(source_file);
-        let display_file = normalized.display().to_string();
+        let display_file = source_file.display().to_string();
         let system_identity = loop_system_identity(
             &display_file,
             span.start_byte(),

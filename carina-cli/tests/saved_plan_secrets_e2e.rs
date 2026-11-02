@@ -59,6 +59,7 @@ impl Scenario {
         let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
         command
             .current_dir(&self.project)
+            .env("PWD", &self.project)
             .env("NO_COLOR", "1")
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
             .env_remove("CLICOLOR_FORCE")
@@ -1521,8 +1522,10 @@ let alpha = tokens {{
         "moved call must invalidate the saved plan"
     );
     let rendered = output_text(&apply);
+    let call_source = carina_core::paths::DisplayPath::new(scenario.project.join("main.crn"))
+        .expect("display source path");
     assert!(
-        rendered.contains("composition call id chain main.crn:")
+        rendered.contains(&format!("composition call id chain {call_source}:"))
             && rendered.contains("disagreed with the saved plan")
             && rendered.contains("re-run `carina plan --out plan.json "),
         "stale composition error must name the call location and replan command:\n{rendered}",
@@ -3249,8 +3252,8 @@ fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
     };
-    assert_eq!(PlanFile::CURRENT_VERSION, 39);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v39.plan.json");
+    assert_eq!(PlanFile::CURRENT_VERSION, 40);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v40.plan.json");
     let plan: PlanFile = serde_json::from_str(fixture).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline(&plan).unwrap(),

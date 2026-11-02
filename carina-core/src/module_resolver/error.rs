@@ -608,9 +608,7 @@ fn display_parse_error_relative_to(error: &ParseError, root: &Path) -> String {
 
 fn display_source_path_relative_to(path: &Path, root: &Path) -> String {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    crate::utils::normalize_source_path(relative)
-        .display()
-        .to_string()
+    relative.display().to_string()
 }
 
 #[cfg(test)]

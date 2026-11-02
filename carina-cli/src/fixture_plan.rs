@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::config_loader::load_configuration_with_config;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::UnresolvedResource;
@@ -372,8 +372,9 @@ where
     let fixture_pathbuf = fixture_path.to_path_buf();
     let state_path = fixture_path.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
 
+    let project = carina_core::paths::ResolvedPath::new(&fixture_pathbuf).unwrap();
     let loaded = load_configuration_with_config(
-        &fixture_pathbuf,
+        &project,
         &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
         &SchemaRegistry::new(),
     )
@@ -381,7 +382,7 @@ where
     let duplicate_declarations = loaded.duplicate_declarations;
     let unresolved_parsed = loaded.unresolved_parsed;
     let parsed = loaded.parsed;
-    let base_dir = get_base_dir(&fixture_pathbuf);
+    let base_dir = &project;
     // Fixture planning deliberately skips loading provider artifacts. Supply
     // only the enum metadata validation needs here: the full fixture schema
     // catalog would assign anonymous identities earlier than the real plan
@@ -475,13 +476,12 @@ where
     // instead of leaving the raw dot-form (#2366).
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for us in &parsed.upstream_states {
-        let dir = if us.source.is_absolute() {
-            us.source.clone()
-        } else {
-            base_dir.join(&us.source)
-        };
-        let state_path = dir.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
-        let bindings = std::fs::read(&state_path)
+        let dir = base_dir.join(&us.source).unwrap();
+        let state_path = dir
+            .join(carina_state::LocalBackend::DEFAULT_STATE_FILE)
+            .unwrap();
+        let bindings = state_path
+            .read()
             .ok()
             .and_then(|bytes| PublishedExports::from_state_bytes(&bytes).ok())
             .map(|exports| exports.build_remote_bindings())
@@ -1584,8 +1584,12 @@ mod tests {
                 environment: carina_core::EnvironmentSnapshot::empty(),
                 builtin_mock: BuiltinMockInputs::deferred(|| {
                     let path = PathBuf::from("/");
-                    let scope = MockScope::file(path.clone())
-                        .map_err(|error| CommandInputError::MockStorage { path, error })?;
+                    let scope = MockScope::file(path.clone()).map_err(|error| {
+                        CommandInputError::MockStorage {
+                            path: carina_core::paths::DisplayPath::new(&path).unwrap(),
+                            error,
+                        }
+                    })?;
                     Ok(ConfiguredBuiltinMock::new(MockBehavior::default(), scope))
                 }),
                 trusted_local_grants: TrustedLocalGrantInputs::new(Vec::new(), None),
@@ -1620,7 +1624,7 @@ mod tests {
             else {
                 panic!("expected a typed mock storage error, got {error:?}");
             };
-            assert_eq!(path, Path::new("/"));
+            assert_eq!(path, &carina_core::paths::DisplayPath::new("/").unwrap());
             assert_eq!(io_error.kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(io_error.to_string(), "mock state path has no file name");
         }

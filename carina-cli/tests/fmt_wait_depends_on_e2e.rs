@@ -17,7 +17,7 @@ fn fmt_check_accepts_wait_dotted_dependencies_in_a_multifile_directory() {
     let producer = carina_core::formatter::format("let record = mock.test.resource { name = 'validation' }\nattributes { validation_record: mock.test.resource = record }\n", &Default::default()).unwrap();
     fs::write(fixture.path().join("producer/main.crn"), producer).unwrap();
     carina_core::config_loader::parse_directory(
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("multi-file fixture parses with its module binding");

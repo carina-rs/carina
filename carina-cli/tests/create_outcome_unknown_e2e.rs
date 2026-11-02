@@ -46,6 +46,7 @@ impl OutcomeUnknownProject {
         Command::new(env!("CARGO_BIN_EXE_carina"))
             .args(args)
             .current_dir(&self.root)
+            .env("PWD", &self.root)
             .env("NO_COLOR", "1")
             .env_remove("CLICOLOR_FORCE")
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
@@ -251,14 +252,111 @@ fn unknown_row_forget_allows_the_next_plan_to_propose_create() {
 fn apply_locked_reload_keeps_project_path_in_unknown_outcome_hint() {
     let identity = "outcome-unknown-locked-reload";
     let project = OutcomeUnknownProject::new(identity);
+    assert_locked_reload_hint(&project, identity);
+}
+
+#[test]
+fn relative_plan_source_ignores_invalid_or_stale_pwd() {
+    let project = OutcomeUnknownProject::new("logical-pwd-fallback");
+    project.initialize();
+    let unrelated = tempfile::tempdir().unwrap();
+    for pwd in [
+        None,
+        Some(PathBuf::from("relative")),
+        Some(unrelated.path().to_path_buf()),
+        Some(unrelated.path().join("missing")),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
+        command
+            .current_dir(&project.root)
+            .env("NO_COLOR", "1")
+            .env("CARINA_MOCK_STATE_FILE", &project.mock_state)
+            .args(["plan", "--out", "plan.json"]);
+        if let Some(pwd) = pwd {
+            command.env("PWD", pwd);
+        } else {
+            command.env_remove("PWD");
+        }
+        let output = command.output().unwrap();
+        assert_success("plan with invalid or absent PWD", &output);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(project.root.join("plan.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved["source_path"],
+            serde_json::to_value(carina_core::paths::CanonicalPath::new(&project.root).unwrap())
+                .unwrap(),
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_locked_reload_keeps_symlink_project_path_in_unknown_outcome_hint() {
+    let identity = "outcome-unknown-symlink-locked-reload";
+    let mut project = OutcomeUnknownProject::new(identity);
+    let real = project.root.join("real");
+    fs::create_dir(&real).unwrap();
+    for name in ["main.crn", "providers.crn", "backend.crn", "exports.crn"] {
+        fs::rename(project.root.join(name), real.join(name)).unwrap();
+    }
+    let link = project.root.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    project.root = link;
+    project.mock_state = project.root.join("mock-provider-state.json");
+
+    for source in [None, Some(".")] {
+        let stderr = assert_locked_reload_hint_with_source(&project, identity, source);
+        assert!(
+            stderr.contains(&project.root.display().to_string()),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(&real.display().to_string()), "{stderr}");
+        fs::remove_file(project.state_path()).unwrap();
+    }
+
+    let stderr = assert_locked_reload_hint(&project, identity);
+    assert!(
+        !stderr.contains(&real.display().to_string()),
+        "locked-reload hint resolved the project symlink\n{stderr}",
+    );
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(project.root.join("reviewed-plan.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["source_path"], project.root.to_str().unwrap());
+    // Version rejection uses the header's source locator for a replan hint.
+    let plan_path = project.root.join("reviewed-plan.json");
+    saved["version"] = serde_json::json!(0);
+    fs::write(&plan_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let apply = project.run(&["apply", plan_path.to_str().unwrap(), "--auto-approve"]);
+    assert!(!apply.status.success());
+    let stderr = stderr_text(&apply);
+    let replan = carina_core::hint::ProjectCommand::new("plan --out", &project.root)
+        .with_path_argument(&plan_path)
+        .to_string();
+    assert!(stderr.contains(&replan), "{stderr}");
+    assert!(!stderr.contains(&real.display().to_string()), "{stderr}");
+}
+
+fn assert_locked_reload_hint(project: &OutcomeUnknownProject, identity: &str) -> String {
+    let source = project.root.to_string_lossy();
+    assert_locked_reload_hint_with_source(project, identity, Some(&source))
+}
+
+fn assert_locked_reload_hint_with_source(
+    project: &OutcomeUnknownProject,
+    identity: &str,
+    source: Option<&str>,
+) -> String {
     project.initialize();
     let plan_path = project.root.join("reviewed-plan.json");
-    let project_path = project.root.to_string_lossy().into_owned();
     let plan_path_arg = plan_path.to_string_lossy().into_owned();
 
-    let plan = project.run(&["plan", &project_path, "--out", &plan_path_arg]);
+    let mut args = vec!["plan"];
+    args.extend(source);
+    args.extend(["--out", &plan_path_arg]);
+    let plan = project.run(&args);
     assert_success("saved plan", &plan);
-    seed_unknown_state(&project, identity);
+    seed_unknown_state(project, identity);
 
     let apply = project.run(&["apply", &plan_path_arg, "--auto-approve"]);
     assert!(
@@ -275,6 +373,7 @@ fn apply_locked_reload_keeps_project_path_in_unknown_outcome_hint() {
         stderr.contains(&expected),
         "locked-reload hint lost the project path\nexpected: {expected}\n{stderr}",
     );
+    stderr
 }
 
 #[test]

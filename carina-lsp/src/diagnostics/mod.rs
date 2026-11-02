@@ -367,7 +367,7 @@ impl std::ops::Deref for DiagnosticRun<'_> {
 impl DiagnosticRun<'_> {
     fn resolve_diagnostic_upstream_exports<B: BindingAddress>(
         &self,
-        base: &Path,
+        base: &carina_core::paths::ResolvedPath,
         upstream_states: &[carina_core::parser::UpstreamState<B>],
     ) -> (
         carina_core::upstream_exports::UpstreamExports<B>,
@@ -444,10 +444,10 @@ impl DiagnosticRun<'_> {
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let source = DiagnosticSource::new(doc, &text);
-        let base_path = current_file_path.map(|path| {
-            path.parent()
-                .expect("a current file path must have a parent directory")
-        });
+        let pinned_base = current_file_path
+            .and_then(|path| path.parent())
+            .and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
+        let base_path = pinned_base.as_ref();
         let current_file_name = current_file_path.map(|path| {
             path.file_name()
                 .expect("a current file path must name a file")
@@ -613,7 +613,7 @@ impl DiagnosticRun<'_> {
                 &current_file,
                 &directory,
                 expanded_identity_graph,
-                base_path,
+                base_path.map(|base| base.source_label()).as_deref(),
             ));
         }
         let upstream_resolution = match (base_path, merged) {
@@ -2200,11 +2200,14 @@ impl DiagnosticEngine {
         current_file_path: Option<&Path>,
     ) -> carina_core::parser::ProviderContext {
         let mut context = match current_file_path.and_then(Path::parent) {
-            Some(directory) => self.directory_catalog(doc, directory).unwrap_or_else(|| {
-                carina_core::parser::ProviderContext::new(
-                    doc.provider_context().environment.clone(),
-                )
-            }),
+            Some(directory) => carina_core::paths::ResolvedPath::new(directory)
+                .ok()
+                .and_then(|directory| self.directory_catalog(doc, &directory))
+                .unwrap_or_else(|| {
+                    carina_core::parser::ProviderContext::new(
+                        doc.provider_context().environment.clone(),
+                    )
+                }),
             None => (*self.provider_context).clone(),
         };
         context.environment = doc.provider_context().environment.clone();
@@ -2229,22 +2232,25 @@ impl DiagnosticEngine {
     fn directory_catalog(
         &self,
         doc: &Document,
-        directory: &Path,
+        directory: &carina_core::paths::ResolvedPath,
     ) -> Option<carina_core::parser::ProviderContext> {
         let files = carina_core::config_loader::find_crn_files_in_dir(directory).ok()?;
         let mut providers = Vec::new();
         let mut has_buffer = false;
+        let buffer_identity = carina_core::paths::ResolvedPath::new(doc.source_file())
+            .ok()
+            .map(|path| path.identity());
         for file in files {
-            let source = if file == doc.source_file() {
+            let source = if Some(file.identity()) == buffer_identity {
                 has_buffer = true;
                 doc.text()
             } else {
-                std::fs::read_to_string(&file).ok()?
+                file.read_to_string().ok()?
             };
             providers.extend(
                 carina_core::parser::parse_provider_factory_declarations(
                     &source,
-                    &file,
+                    &file.source_label(),
                     doc.provider_context(),
                 )
                 .ok()?,

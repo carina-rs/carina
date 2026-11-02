@@ -335,7 +335,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
     let parsed = parse_directory(
-        &caller,
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed for the caller fixture");
@@ -343,7 +343,12 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let parsed = with_type_check_session(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
+            resolve_modules(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+                session,
+            )
+            .expect("module resolution should succeed")
         },
     );
     let parsed = parsed
@@ -559,7 +564,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     root.push("tests/fixtures/wait/module_wait_nested/root");
 
     let parsed = parse_directory(
-        &root,
+        &carina_core::paths::ResolvedPath::new(&root).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed for the nested root fixture");
@@ -567,8 +572,12 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let parsed = with_type_check_session(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            resolve_modules(parsed, &root, session)
-                .expect("nested module resolution should succeed")
+            resolve_modules(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(&root).unwrap(),
+                session,
+            )
+            .expect("nested module resolution should succeed")
         },
     );
     let parsed = parsed
@@ -766,14 +775,19 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
     let parsed = parse_directory(
-        &caller,
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed");
     let parsed = with_type_check_session(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
+            resolve_modules(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+                session,
+            )
+            .expect("module resolution should succeed")
         },
     );
     let parsed = parsed

@@ -20,8 +20,6 @@
 //!   same `src` then shares the same `&str`, so the disk read is
 //!   single-shot even though multiple helpers scan the source.
 
-use std::path::Path;
-
 /// Explicit contract for what a text-scanning helper is allowed to see.
 ///
 /// `Copy` so helpers can take it by value without ceremony. Both
@@ -56,7 +54,7 @@ impl<'a> DslSource<'a> {
     /// ```
     pub(crate) fn resolve_directory(
         buffer: &'a str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         storage: &'a mut String,
     ) -> Self {
         storage.clear();
@@ -86,7 +84,7 @@ impl<'a> DslSource<'a> {
 /// canonical loader's ordering contract (#2449, #2855). Iterating
 /// `std::fs::read_dir` directly would yield filesystem-dependent order,
 /// which makes downstream merged-text scanning non-deterministic.
-pub(crate) fn read_sibling_crn(base_path: Option<&Path>) -> String {
+pub(crate) fn read_sibling_crn(base_path: Option<&carina_core::paths::ResolvedPath>) -> String {
     let Some(base) = base_path else {
         return String::new();
     };
@@ -95,7 +93,7 @@ pub(crate) fn read_sibling_crn(base_path: Option<&Path>) -> String {
     };
     let mut out = String::new();
     for path in files {
-        if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(content) = path.read_to_string() {
             out.push_str(&content);
             out.push('\n');
         }
@@ -133,7 +131,7 @@ mod tests {
         std::fs::write(base.join("a.crn"), "let a = 1\n").unwrap();
         std::fs::write(base.join("m.crn"), "let m = 13\n").unwrap();
 
-        let merged = read_sibling_crn(Some(base));
+        let merged = read_sibling_crn(Some(&carina_core::paths::ResolvedPath::new(base).unwrap()));
         let pos_a = merged.find("let a = 1").expect("a.crn missing");
         let pos_m = merged.find("let m = 13").expect("m.crn missing");
         let pos_z = merged.find("let z = 26").expect("z.crn missing");
@@ -152,7 +150,11 @@ mod tests {
         std::fs::write(base.join("exports.crn"), "let b = 2\n").unwrap();
         let buffer = "let c = 3\n"; // unsaved buffer, not on disk
         let mut storage = String::new();
-        let src = DslSource::resolve_directory(buffer, Some(base), &mut storage);
+        let src = DslSource::resolve_directory(
+            buffer,
+            Some(&carina_core::paths::ResolvedPath::new(base).unwrap()),
+            &mut storage,
+        );
         let merged = src.merged_text();
         assert!(
             merged.contains("let a = 1")

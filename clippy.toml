@@ -3,6 +3,8 @@ disallowed-types = [
 ]
 
 disallowed-methods = [
+  { path = "std::fs::canonicalize", reason = "resolve filesystem identities only through carina_core::paths; keep DisplayPath for diagnostics" },
+  { path = "std::path::Path::canonicalize", reason = "resolve filesystem identities only through carina_core::paths; keep DisplayPath for diagnostics" },
   { path = "dirs::home_dir", reason = "resolve all user-owned paths through carina_core::UserDirs" },
   { path = "dirs::cache_dir", reason = "resolve all user-owned paths through carina_core::UserDirs" },
   { path = "dirs::config_dir", reason = "resolve all user-owned paths through carina_core::UserDirs" },

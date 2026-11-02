@@ -18,7 +18,7 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
     dir.push("tests/fixtures/wait/cert_issued");
 
     let parsed = parse_directory(
-        &dir,
+        &carina_core::paths::ResolvedPath::new(&dir).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed for valid fixture");

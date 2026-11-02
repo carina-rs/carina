@@ -3,10 +3,11 @@ use crate::cursor::CursorState;
 use crate::error::{AppError, CommandInputError};
 use crate::output_style::ColorMode;
 use crate::wiring::TrustedLocalGrantInputs;
+use carina_core::paths::{CanonicalPath, ResolvedPath};
 use carina_core::{EnvironmentSnapshot, UserDirs};
 use carina_provider_mock::ConfiguredBuiltinMock;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -59,7 +60,7 @@ pub struct CommandInputs {
 
 struct InvocationState {
     inputs: CommandInputs,
-    warned_upstream: Mutex<HashSet<PathBuf>>,
+    warned_upstream: Mutex<HashSet<CanonicalPath>>,
     #[cfg(any(test, feature = "test-utils"))]
     provider_loads: AtomicUsize,
 }
@@ -110,12 +111,12 @@ impl CommandRuntime {
     pub(crate) fn hooks(&self) -> &InvocationHooks {
         &self.state.inputs.hooks
     }
-    pub(crate) fn first_upstream_warning(&self, path: &Path) -> bool {
+    pub(crate) fn first_upstream_warning(&self, path: &ResolvedPath) -> bool {
         self.state
             .warned_upstream
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(path.to_owned())
+            .insert(path.identity())
     }
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn record_provider_load(&self) {
@@ -165,8 +166,8 @@ mod tests {
         let mut fixture = crate::test_support::TestCommandRuntime::new();
         let shared = CommandRuntime::clone(&fixture);
         shared.record_provider_load();
-        let source = Path::new("/same/canonical/upstream");
-        assert!(shared.first_upstream_warning(source));
+        let source = ResolvedPath::new("/same/canonical/upstream").unwrap();
+        assert!(shared.first_upstream_warning(&source));
 
         fixture.set_mock(
             carina_provider_mock::MockBehavior::default(),
@@ -175,8 +176,8 @@ mod tests {
 
         assert_eq!(fixture.provider_load_count(), 0);
         assert_eq!(shared.provider_load_count(), 1);
-        assert!(fixture.first_upstream_warning(source));
-        assert!(!shared.first_upstream_warning(source));
+        assert!(fixture.first_upstream_warning(&source));
+        assert!(!shared.first_upstream_warning(&source));
         assert_eq!(fixture.user_dirs(), shared.user_dirs());
     }
 
@@ -310,18 +311,18 @@ mod tests {
     fn upstream_warning_deduplication_is_per_invocation_across_threads() {
         let a = crate::test_support::TestCommandRuntime::new();
         let b = crate::test_support::TestCommandRuntime::new();
-        let source = Path::new("/same/canonical/upstream");
-        assert!(a.first_upstream_warning(source));
-        assert!(!a.first_upstream_warning(source));
+        let source = ResolvedPath::new("/same/canonical/upstream").unwrap();
+        assert!(a.first_upstream_warning(&source));
+        assert!(!a.first_upstream_warning(&source));
         std::thread::scope(|threads| {
             threads
                 .spawn(|| {
-                    assert!(!a.first_upstream_warning(source));
-                    assert!(b.first_upstream_warning(source));
+                    assert!(!a.first_upstream_warning(&source));
+                    assert!(b.first_upstream_warning(&source));
                 })
                 .join()
                 .unwrap();
         });
-        assert!(!b.first_upstream_warning(source));
+        assert!(!b.first_upstream_warning(&source));
     }
 }

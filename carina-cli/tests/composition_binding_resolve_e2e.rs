@@ -275,7 +275,10 @@ fn validate_passes_for_virtual_rooted_ref() {
     let fixture = write_fixture();
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags.is_empty(),
@@ -301,10 +304,12 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
 
     let fixture = write_fixture();
     let caller = fixture.path().join("caller");
+    let project = carina_core::paths::ResolvedPath::new(&caller).unwrap();
 
     let provider_context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = load_configuration_with_config(&caller, &provider_context, &SchemaRegistry::new())
-        .expect("load should succeed");
+    let loaded =
+        load_configuration_with_config(&project, &provider_context, &SchemaRegistry::new())
+            .expect("load should succeed");
     let parsed = loaded.parsed;
 
     // `load_configuration_with_config` does not run nested module
@@ -317,7 +322,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
                 parsed,
-                &caller,
+                &project,
                 session,
                 &SchemaRegistry::new(),
             )

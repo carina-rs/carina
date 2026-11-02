@@ -2,32 +2,10 @@
 
 use crate::resource::{BindingAddress, ConcreteValue, Value};
 use crate::schema::CompiledAttributeType as AttributeType;
-use std::path::{Component, Path, PathBuf};
 
-/// Lexically normalize a diagnostic source path without consulting the
-/// filesystem. Parent components cancel an immediately preceding normal
-/// component, while leading parents remain intact.
-pub fn normalize_source_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir
-                if matches!(
-                    normalized.components().next_back(),
-                    Some(Component::Normal(_))
-                ) =>
-            {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        normalized
-    }
+/// Normalize a parser source label with the shared diagnostic display rule.
+pub fn normalize_source_path(path: &std::path::Path) -> std::path::PathBuf {
+    crate::paths::DisplayPath::for_diagnostics(path).into_source_path()
 }
 
 pub(crate) fn truncate_chars_for_display(value: &str, max_chars: usize) -> (String, &'static str) {
@@ -1034,14 +1012,18 @@ mod tests {
     use crate::schema::{TypeIdentity, enum_identity};
 
     #[test]
-    fn normalize_source_path_collapses_parent_components_lexically() {
+    fn diagnostic_source_paths_preserve_parent_components() {
         assert_eq!(
-            normalize_source_path(Path::new("mod/../inner/main.crn")),
-            PathBuf::from("inner/main.crn")
+            crate::paths::DisplayPath::new("mod/../inner/main.crn")
+                .unwrap()
+                .to_string(),
+            "mod/../inner/main.crn"
         );
         assert_eq!(
-            normalize_source_path(Path::new("../mod/../inner/main.crn")),
-            PathBuf::from("../inner/main.crn")
+            crate::paths::DisplayPath::new("../mod/../inner/main.crn")
+                .unwrap()
+                .to_string(),
+            "../mod/../inner/main.crn"
         );
     }
 

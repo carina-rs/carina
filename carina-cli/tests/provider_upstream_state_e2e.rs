@@ -93,7 +93,7 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     write_downstream(&downstream, "../mgmt");
 
     let config = load_configuration(
-        &downstream,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("load_configuration");

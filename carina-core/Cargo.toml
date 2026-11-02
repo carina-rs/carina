@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+async-io = ["tokio/fs", "tokio/rt"]
 test-shutdown = []
 test-support = []
 test-utils = ["dep:tempfile", "test-support"]
@@ -38,6 +39,9 @@ tracing = "0.1"
 chrono = "0.4"
 dirs = "6"
 tempfile = { version = "3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Integration fixtures use the same gated helpers as the crate's unit tests.
