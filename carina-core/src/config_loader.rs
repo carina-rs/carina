@@ -774,7 +774,7 @@ pub struct DirectoryParseResult {
     pub authored_bindings: AuthoredBindingView,
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     /// Exact source inputs used for the parse, including in-memory overrides.
-    pub source_files: Vec<(PathBuf, String)>,
+    pub source_files: Vec<(ResolvedPath, String)>,
     /// Source file that owns the backend when the directory has exactly one.
     /// `None` means the directory has either zero or multiple backend blocks.
     pub sole_backend_file: Option<PathBuf>,
@@ -1007,7 +1007,11 @@ fn parse_directory_with_overrides_impl(
         parsed: RootDirectoryParse::new(merged),
         authored_bindings,
         duplicate_declarations,
-        source_files: file_inputs,
+        source_files: paths
+            .into_iter()
+            .zip(file_inputs)
+            .map(|((file, _), (_, source))| (file, source))
+            .collect(),
         sole_backend_file,
         semantic_files,
     })
@@ -1548,14 +1552,21 @@ fn collect_resolved_crn_files_recursive(
                 .unwrap_or_default()
                 .to_string_lossy();
             if !name.starts_with('.') && name != "target" && name != "node_modules" {
-                collect_resolved_crn_files_recursive(&entry, files, visited)?;
+                let path = entry
+                    .resolve()
+                    .map_err(|error| format!("Failed to resolve {}: {error}", entry.display()))?;
+                collect_resolved_crn_files_recursive(&path, files, visited)?;
             }
         } else if entry
             .display()
             .extension()
             .is_some_and(|extension| extension == "crn")
         {
-            files.push(entry);
+            files.push(
+                entry
+                    .resolve()
+                    .map_err(|error| format!("Failed to resolve {}: {error}", entry.display()))?,
+            );
         }
     }
     Ok(())
@@ -1573,6 +1584,24 @@ mod tests {
     use crate::parser::ModuleCall;
     use crate::resource::{DeferredValue, Value};
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_discovery_skips_unrelated_looping_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::write(directory.path().join("nested/main.crn"), "exports {}\n").unwrap();
+        std::os::unix::fs::symlink("notes.txt", directory.path().join("notes.txt")).unwrap();
+        let root = ResolvedPath::new(directory.path()).unwrap();
+
+        let files = find_crn_files_recursive(&root).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].display(),
+            root.join("nested/main.crn").unwrap().display()
+        );
+    }
 
     #[test]
     fn directory_load_preserves_resource_handle_export_type_for_boundary_validation() {

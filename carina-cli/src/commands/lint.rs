@@ -39,7 +39,7 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
 }
 
 fn mixed_tag_key_style_warnings_for_population<E, D, B: carina_core::resource::BindingAddress>(
-    root_inputs: &[(PathBuf, String)],
+    root_inputs: &[(carina_core::paths::ResolvedPath, String)],
     parsed: &carina_core::parser::File<
         E,
         carina_core::resource::ParserPlaceholder,
@@ -109,7 +109,7 @@ impl LintFile {
 
     fn mixed_tag_key_style_warnings(
         &self,
-        root_inputs: &[(PathBuf, String)],
+        root_inputs: &[(carina_core::paths::ResolvedPath, String)],
         base_dir: &carina_core::paths::ResolvedPath,
     ) -> Vec<LintWarning> {
         match self {
@@ -375,14 +375,14 @@ fn lint_result(
             let export_handle_errors = parsed.export_handle_errors();
 
             // Collect source texts for each .crn file
-            let source_texts: Vec<(PathBuf, String)> = {
+            let source_texts: Vec<(carina_core::paths::ResolvedPath, String)> = {
                 let files = find_crn_files_in_dir(base_dir)?;
                 let mut texts = Vec::new();
                 for file in files {
                     let content = file
                         .read_to_string()
                         .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-                    texts.push((PathBuf::from(file.display().to_string()), content));
+                    texts.push((file, content));
                 }
                 texts
             };
@@ -467,7 +467,8 @@ fn lint_result(
                     });
                 }
             }
-            for (file_path, source) in &source_texts {
+            for (file, source) in &source_texts {
+                let file_path = PathBuf::from(file.display().to_string());
                 // Check for list literal syntax on List<Struct> attributes
                 let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
                 for (attr_name, line) in hits {
@@ -752,7 +753,10 @@ attributes {
             vec![("first", "./shared"), ("second", "./shared")],
             vec!["first", "second"],
         );
-        let root_inputs = vec![(root_file, root_source.to_string())];
+        let root_inputs = vec![(
+            carina_core::paths::ResolvedPath::new(root_file).unwrap(),
+            root_source.to_string(),
+        )];
 
         let warnings = mixed_tag_key_style_warnings_for_population(
             &root_inputs,
@@ -781,8 +785,14 @@ attributes {
 
         let parsed = parsed_with_uses(vec![("self_module", ".")], vec!["self_module"]);
         let root_inputs = vec![
-            (main_file, main_source.to_string()),
-            (db_file.clone(), db_source.to_string()),
+            (
+                carina_core::paths::ResolvedPath::new(main_file).unwrap(),
+                main_source.to_string(),
+            ),
+            (
+                carina_core::paths::ResolvedPath::new(&db_file).unwrap(),
+                db_source.to_string(),
+            ),
         ];
 
         let warnings = mixed_tag_key_style_warnings_for_population(

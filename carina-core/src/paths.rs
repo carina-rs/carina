@@ -186,6 +186,9 @@ impl ResolvedPath {
         )
     }
 
+    /// Change the locator's extension, as used when looking up module sources.
+    /// For lock or recovery siblings of a file identity, use
+    /// [`Self::sibling_with_extension`].
     pub fn with_extension(&self, extension: impl AsRef<std::ffi::OsStr>) -> io::Result<Self> {
         let name = self
             .display
@@ -195,6 +198,22 @@ impl ResolvedPath {
         self.parent()
             .ok_or_else(|| io::Error::other("path has no parent"))?
             .join(Path::new(name).with_extension(extension))
+    }
+
+    /// Derive a sibling of the pinned file's identity, including its real name.
+    /// Lock and recovery files must use this rather than the locator's parent.
+    /// The diagnostic and persisted spellings still follow the user's locator.
+    pub fn sibling_with_extension(
+        &self,
+        extension: impl AsRef<std::ffi::OsStr>,
+    ) -> io::Result<Self> {
+        let extension = extension.as_ref();
+        Self::from_address(
+            &self.resolved.with_extension(extension),
+            self.display.with_extension(extension),
+            self.display_address.with_extension(extension),
+            PersistedPath(DisplayPath(self.persisted.0.0.with_extension(extension))),
+        )
     }
 
     pub fn create_dir(&self) -> io::Result<()> {
@@ -331,14 +350,22 @@ impl ResolvedPath {
             .map_err(io::Error::other)?
     }
 
-    /// Sorted entries, each pinned under this directory and retaining its
-    /// diagnostic spelling. No `DirEntry` or resolved path escapes.
-    pub fn entries(&self) -> io::Result<Vec<Self>> {
-        let mut names = std::fs::read_dir(&self.resolved)?
-            .map(|entry| entry.map(|entry| entry.file_name()))
+    /// Sorted entries under this pinned directory. Callers can filter names and
+    /// kinds before resolving a child, so unrelated broken symlinks are harmless.
+    pub fn entries(&self) -> io::Result<Vec<DirectoryEntry>> {
+        let mut entries = std::fs::read_dir(&self.resolved)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok(DirectoryEntry {
+                    directory: self.clone(),
+                    display: self.display.join(entry.file_name()),
+                    name: entry.file_name(),
+                    kind: entry.file_type()?,
+                })
+            })
             .collect::<io::Result<Vec<_>>>()?;
-        names.sort();
-        names.into_iter().map(|name| self.join(name)).collect()
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
     }
 
     pub fn crn_files(&self) -> io::Result<Vec<Self>> {
@@ -352,6 +379,32 @@ impl ResolvedPath {
         });
         names.sort();
         names.into_iter().map(|name| self.join(name)).collect()
+    }
+}
+
+/// A child name anchored to a pinned directory, with resolution deferred until
+/// the caller selects it for IO. No raw filesystem address escapes this type.
+pub struct DirectoryEntry {
+    directory: ResolvedPath,
+    display: DisplayPath,
+    name: std::ffi::OsString,
+    kind: std::fs::FileType,
+}
+
+impl DirectoryEntry {
+    pub fn display(&self) -> &DisplayPath {
+        &self.display
+    }
+
+    /// Match `Path::is_dir`: follow directory symlinks and treat inaccessible or
+    /// looping symlinks as non-directories without resolving unrelated files.
+    pub fn is_dir(&self) -> bool {
+        self.kind.is_dir()
+            || (self.kind.is_symlink() && self.directory.resolved.join(&self.name).is_dir())
+    }
+
+    pub fn resolve(&self) -> io::Result<ResolvedPath> {
+        self.directory.join(&self.name)
     }
 }
 
@@ -1306,6 +1359,56 @@ mod tests {
         lock.create_lock(b"owner").unwrap();
         assert!(project.join("carina.state.lock").exists());
         assert!(!data.join("real.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_siblings_and_staging_keep_pinned_target_after_leaf_retarget() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("shared");
+        std::fs::create_dir(&data).unwrap();
+        let alias = temp.path().join("alias.json");
+        std::fs::write(data.join("state.json"), b"original").unwrap();
+        std::fs::write(temp.path().join("replacement.json"), b"replacement").unwrap();
+        std::os::unix::fs::symlink("shared/state.json", &alias).unwrap();
+        let state = ResolvedPath::new(&alias).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("replacement.json", &alias).unwrap();
+
+        let lock = state.sibling_with_extension("lock").unwrap();
+        let recovery = lock.sibling_with_extension("lock.recover").unwrap();
+        lock.create_lock(b"owner").unwrap();
+        recovery.create_lock(b"recovering").unwrap();
+        assert_eq!(
+            lock.display().to_string(),
+            alias.with_extension("lock").display().to_string()
+        );
+        assert!(data.join("state.lock").exists());
+        assert!(data.join("state.lock.recover").exists());
+        assert!(!temp.path().join("alias.lock").exists());
+        assert!(!temp.path().join("replacement.lock").exists());
+        let mut stage = state.stage().unwrap();
+        assert_eq!(
+            stage.temporary.parent().unwrap(),
+            std::fs::canonicalize(&data).unwrap()
+        );
+        assert!(
+            stage
+                .temporary
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(".state.json.tmp.")
+        );
+        stage.write_all(b"updated").unwrap();
+        stage.publish().unwrap();
+        assert_eq!(std::fs::read(data.join("state.json")).unwrap(), b"updated");
+        assert_eq!(
+            std::fs::read(temp.path().join("replacement.json")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(std::fs::read_dir(data).unwrap().count(), 3);
     }
 
     #[cfg(unix)]

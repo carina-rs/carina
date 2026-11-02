@@ -16170,7 +16170,11 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
     let (_, parsed_source) = merged_result
         .source_files
         .iter_mut()
-        .find(|(path, _)| path.ends_with("main.crn"))
+        .find(|(path, _)| {
+            path.display()
+                .file_name()
+                .is_some_and(|name| name == "main.crn")
+        })
         .expect("parsed directory retains main.crn source");
     *parsed_source = current_source.to_string();
 

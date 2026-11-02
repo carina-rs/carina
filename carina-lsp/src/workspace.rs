@@ -95,9 +95,13 @@ fn discover_by_dir_recursive(
         Ok(entries) => entries,
         Err(_) => return,
     };
-    let paths = entries;
-
-    for path in paths {
+    for entry in entries {
+        if !entry.is_dir() && entry.display().extension().is_none_or(|ext| ext != "crn") {
+            continue;
+        }
+        let Ok(path) = entry.resolve() else {
+            continue;
+        };
         if path.is_dir() {
             discover_by_dir_recursive(&path, result, visited, environment);
         } else if path.display().extension().is_some_and(|ext| ext == "crn")
@@ -162,9 +166,13 @@ fn discover_imports_recursive(
         Ok(entries) => entries,
         Err(_) => return,
     };
-    let paths = entries;
-
-    for path in paths {
+    for entry in entries {
+        if !entry.is_dir() && entry.display().extension().is_none_or(|ext| ext != "crn") {
+            continue;
+        }
+        let Ok(path) = entry.resolve() else {
+            continue;
+        };
         if path.is_dir() {
             discover_imports_recursive(&path, result, visited, environment);
         } else if path.display().extension().is_some_and(|ext| ext == "crn")
@@ -211,6 +219,31 @@ fn discover_imports_recursive(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_discovery_skips_unrelated_looping_symlink() {
+        let dir = TempDir::new().unwrap();
+        let module = dir.path().join("module");
+        fs::create_dir(&module).unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            "provider mock {}\nlet module = use { source = './module' }\n",
+        )
+        .unwrap();
+        fs::write(module.join("main.crn"), "provider aws {}\n").unwrap();
+        for directory in [dir.path(), module.as_path()] {
+            std::os::unix::fs::symlink("notes.txt", directory.join("notes.txt")).unwrap();
+        }
+        let environment = carina_core::EnvironmentSnapshot::empty();
+
+        let providers = discover_providers_by_dir(dir.path(), &environment);
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[dir.path()][0].name, "mock");
+        assert_eq!(providers[&module][0].name, "aws");
+        let imports = discover_import_map(dir.path(), &environment);
+        assert!(imports[&PathIdentity::new(&module)].contains(&PathIdentity::new(dir.path())));
+    }
 
     #[test]
     fn discovery_uses_environment_snapshot() {

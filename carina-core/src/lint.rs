@@ -402,12 +402,12 @@ pub fn collect_tag_keys_for_file(source: &str, file: &Path) -> Vec<TagKeyEntry> 
 /// semantics. Root inputs are collected first; called module directories are
 /// then scanned from disk.
 ///
-/// Every file has one vote. Canonical paths deduplicate root/module overlap,
-/// symlink aliases, repeated imports, and multiple aliases to one module. When
-/// canonicalization fails, the original path is the identity, matching the
-/// module walk's cycle-guard convention.
+/// Every file has one vote. Pinned identities deduplicate root/module overlap,
+/// symlink aliases, repeated imports, and multiple aliases to one module.
+/// Root inputs retain the pins used to read their source text; resolution
+/// failures are reported by the caller when collecting these inputs.
 pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddress>(
-    root_inputs: &[(PathBuf, S)],
+    root_inputs: &[(crate::paths::ResolvedPath, S)],
     parsed: &crate::parser::File<
         E,
         crate::resource::ParserPlaceholder,
@@ -420,11 +420,11 @@ pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddr
     let mut seen_files = HashSet::new();
     let mut entries = Vec::new();
     for (file, source) in root_inputs {
-        if base_dir
-            .join(file)
-            .is_ok_and(|file| seen_files.insert(file.identity()))
-        {
-            entries.extend(collect_tag_keys_for_file(source.as_ref(), file));
+        if seen_files.insert(file.identity()) {
+            entries.extend(collect_tag_keys_for_file(
+                source.as_ref(),
+                &PathBuf::from(file.display().to_string()),
+            ));
         }
     }
 
@@ -1893,7 +1893,10 @@ tags = {
             vec![("first", "./shared"), ("second", "./shared")],
             vec!["first", "second"],
         );
-        let root_inputs = vec![(root_file, root_source.to_string())];
+        let root_inputs = vec![(
+            crate::paths::ResolvedPath::new(root_file).unwrap(),
+            root_source.to_string(),
+        )];
 
         let entries = collect_all_tag_keys(
             &root_inputs,
@@ -1927,8 +1930,14 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("self_module", ".")], vec!["self_module"]);
         let root_inputs = vec![
-            (main_file, main_source.to_string()),
-            (db_file.clone(), db_source.to_string()),
+            (
+                crate::paths::ResolvedPath::new(main_file).unwrap(),
+                main_source.to_string(),
+            ),
+            (
+                crate::paths::ResolvedPath::new(&db_file).unwrap(),
+                db_source.to_string(),
+            ),
         ];
 
         let entries = collect_all_tag_keys(

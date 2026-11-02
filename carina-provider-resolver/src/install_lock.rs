@@ -124,6 +124,11 @@ impl DerefMut for GuardedLockFile<'_> {
 }
 
 impl ProviderInstallLock {
+    #[cfg(test)]
+    pub(crate) fn on_blocking_acquire_for_test(hook: impl FnOnce() + 'static) {
+        BLOCKING_ACQUIRE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
     /// Acquires the exclusive provider-install lock for `project_dir`.
     ///
     /// This lock is not re-entrant. Acquiring it a second time for the same

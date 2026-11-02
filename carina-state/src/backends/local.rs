@@ -93,11 +93,13 @@ impl LocalBackend {
 
     pub(crate) fn with_resolved_path(state_path: ResolvedPath) -> BackendResult<Self> {
         let lock_path = state_path
-            .with_extension("lock")
+            .sibling_with_extension("lock")
             .map_err(|error| BackendError::Io(format!("Failed to locate lock file: {error}")))?;
-        let recovery_path = lock_path.with_extension("lock.recover").map_err(|error| {
-            BackendError::Io(format!("Failed to locate recovery claim: {error}"))
-        })?;
+        let recovery_path = lock_path
+            .sibling_with_extension("lock.recover")
+            .map_err(|error| {
+                BackendError::Io(format!("Failed to locate recovery claim: {error}"))
+            })?;
         Ok(Self {
             recovery_path,
             state_path,
@@ -706,6 +708,51 @@ mod tests {
                     .is_some_and(|name| name.to_string_lossy().starts_with(prefix.as_ref()))
             })
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn state_file_aliases_contend_on_the_pinned_files_lock_and_recovery_claim() {
+        for existing_state in [false, true] {
+            let dir = tempdir().unwrap();
+            let shared = dir.path().join("shared");
+            std::fs::create_dir(&shared).unwrap();
+            let target = shared.join("state.json");
+            let alias = dir.path().join("alias.json");
+            if existing_state {
+                std::fs::write(&target, serde_json::to_vec(&StateFile::new()).unwrap()).unwrap();
+            }
+            std::os::unix::fs::symlink("shared/state.json", &alias).unwrap();
+            let aliased = LocalBackend::with_path(alias.clone());
+            let direct = LocalBackend::with_path(target.clone());
+            assert_eq!(
+                aliased.state_path().to_string(),
+                alias.display().to_string()
+            );
+
+            let lock = aliased.acquire_lock("apply").await.unwrap();
+            let competing = direct.acquire_lock("destroy").await;
+            assert!(
+                matches!(competing, Err(BackendError::Locked { .. })),
+                "the same state file must have one lock: {competing:?}"
+            );
+            assert!(shared.join("state.lock").exists());
+            assert!(!dir.path().join("alias.lock").exists());
+            direct.release_lock(&lock).await.unwrap();
+
+            let claim = aliased.acquire_recovery_claim().await.unwrap().unwrap();
+            assert!(direct.acquire_recovery_claim().await.unwrap().is_none());
+            assert!(shared.join("state.lock.recover").exists());
+            assert!(!dir.path().join("alias.lock.recover").exists());
+            drop(claim);
+
+            let lock = direct.acquire_lock("destroy").await.unwrap();
+            assert!(matches!(
+                aliased.acquire_lock("apply").await,
+                Err(BackendError::Locked { .. })
+            ));
+            aliased.release_lock(&lock).await.unwrap();
+        }
     }
 
     #[tokio::test]

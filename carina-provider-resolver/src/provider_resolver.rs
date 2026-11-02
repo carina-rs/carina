@@ -5007,11 +5007,21 @@ impl InstalledProvider {
         source: FileSource,
         project_dir: &ResolvedPath,
     ) -> Result<Self, String> {
-        let project_dir = project_dir.clone();
         let io_path = path
-            .resolve(&project_dir)
+            .resolve(project_dir)
             .map_err(|error| error.to_string())?;
-        let bytes = ProviderArtifactBytes::read(&io_path).map_err(|error| {
+        Self::file_source_at(path, provider_name, source, project_dir, &io_path)
+    }
+
+    fn file_source_at(
+        path: WasmArtifactPath,
+        provider_name: String,
+        source: FileSource,
+        project_dir: &ResolvedPath,
+        io_path: &ResolvedPath,
+    ) -> Result<Self, String> {
+        let project_dir = project_dir.clone();
+        let bytes = ProviderArtifactBytes::read(io_path).map_err(|error| {
             format!(
                 "Failed to read provider artifact {}: {error}",
                 path.as_path().display()
@@ -9221,6 +9231,20 @@ fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
     remote_source: &RemoteSource,
     lock_file: &'lock LockFile,
 ) -> Result<Option<LockArtifactSelection<'lock>>, FindInstalledProviderError> {
+    select_locked_entry(base_dir, config, remote_source, lock_file)?
+        .map(|lock_entry| {
+            lock_artifact_selection(base_dir, lock_entry, &config.name)
+                .map_err(FindInstalledProviderError::from)
+        })
+        .transpose()
+}
+
+fn select_locked_entry<'lock, P: PlaceholderKind, B: BindingAddress>(
+    base_dir: &ResolvedPath,
+    config: &ProviderConfig<P, B>,
+    remote_source: &RemoteSource,
+    lock_file: &'lock LockFile,
+) -> Result<Option<&'lock LockEntry<RegistryLock>>, FindInstalledProviderError> {
     let source_key = remote_source.source_key();
     if let Some(legacy) = lock_file
         .legacy
@@ -9231,14 +9255,7 @@ fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
             legacy.error(base_dir),
         ));
     }
-    let selected = lock_file.find_by_remote_config(config, remote_source);
-
-    selected
-        .map(|lock_entry| {
-            lock_artifact_selection(base_dir, lock_entry, &config.name)
-                .map_err(FindInstalledProviderError::from)
-        })
-        .transpose()
+    Ok(lock_file.find_by_remote_config(config, remote_source))
 }
 
 fn installed_provider_from_lock(
@@ -10269,7 +10286,7 @@ where
             ResolveEgress::Skip => {}
             ResolveEgress::Initialize(accepted_sources) => {
                 let installed = installed_provider_from_resolved(
-                    base_dir,
+                    install_lock,
                     config,
                     source,
                     &artifact_path,
@@ -10498,22 +10515,26 @@ fn explicit_consent_given(
 }
 
 fn installed_provider_from_resolved(
-    base_dir: &ResolvedPath,
+    install_lock: &ProviderInstallLock,
     config: &ProviderConfig,
     source: &ProviderSource,
     artifact_path: &WasmArtifactPath,
     lock_file: &LockFile,
 ) -> Result<InstalledProvider, ResolveAllError> {
+    let base_dir = install_lock.project_dir();
     match source {
-        ProviderSource::File(file_source) => InstalledProvider::file_source(
+        ProviderSource::File(file_source) => InstalledProvider::file_source_at(
             artifact_path.clone(),
             config.name.clone(),
             file_source.clone(),
             base_dir,
+            &install_lock
+                .project_artifact(artifact_path)
+                .map_err(|error| ResolveAllError::Other(error.to_string()))?,
         )
         .map_err(ResolveAllError::Other),
         ProviderSource::Remote(remote_source) => {
-            let selection = select_locked_artifact(base_dir, config, remote_source, lock_file)
+            let entry = select_locked_entry(base_dir, config, remote_source, lock_file)
                 .map_err(EgressInitializationError::Installed)?
                 .ok_or_else(|| {
                     ResolveAllError::Other(format!(
@@ -10521,8 +10542,12 @@ fn installed_provider_from_resolved(
                         remote_source.source_key()
                     ))
                 })?;
-            installed_provider_from_lock(&config.name, selection, base_dir)
-                .map_err(ResolveAllError::Other)
+            let verified = VerifiedArtifact::from_existing(entry, &config.name, install_lock)
+                .map_err(|error| ResolveAllError::Other(error.to_string()))?;
+            Ok(InstalledProvider::from_verified(
+                verified,
+                config.name.clone(),
+            ))
         }
     }
 }
@@ -26123,6 +26148,97 @@ future_protection_field = "retain-me"
 
     fn no_local_grants() -> TrustedLocalGrants {
         TrustedLocalGrants::parse(&[], None).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_egress_read_keeps_waiting_install_directory_pin() {
+        for remote in [false, true] {
+            for populated_replacement in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let project = temp.path().join("project");
+                let original = temp.path().join("original");
+                let replacement = temp.path().join("replacement");
+                for directory in [&project, &original, &replacement] {
+                    fs::create_dir(directory).unwrap();
+                }
+                let alias = project.join(".carina");
+                std::os::unix::fs::symlink(&original, &alias).unwrap();
+                let root = ResolvedPath::new(&project).unwrap();
+                let first = ProviderInstallLock::acquire(&root).unwrap();
+                let changed_alias = alias.clone();
+                let changed_target = replacement.clone();
+                ProviderInstallLock::on_blocking_acquire_for_test(move || {
+                    fs::remove_file(&changed_alias).unwrap();
+                    std::os::unix::fs::symlink(&changed_target, &changed_alias).unwrap();
+                    drop(first);
+                });
+                let guard = ProviderInstallLock::acquire(&root).unwrap();
+                // This lock protects the replacement throughout the old pin's read.
+                let other_guard = ProviderInstallLock::acquire(&root).unwrap();
+                let bytes = b"provider installed through original directory pin";
+                let source_file = project.join("source.wasm");
+                fs::write(&source_file, bytes).unwrap();
+                let config = if remote {
+                    provider_config("github.com/carina-rs/carina-provider-awscc", None)
+                } else {
+                    provider_config(&format!("file://{}", source_file.display()), None)
+                };
+                let source = config.source.as_ref().unwrap();
+                let mut lock = LockFile::default();
+                let artifact = if let ProviderSource::Remote(remote_source) = source {
+                    let version = "0.1.0";
+                    lock.upsert(LockEntry {
+                        name: config.name.clone(),
+                        source: remote_source.source_key().to_string(),
+                        kind: LockEntryKind::GithubRelease {
+                            version: Version::parse(version).unwrap(),
+                            tag: ReleaseTag::from_lock(format!("v{version}")),
+                            asset_id: release_asset_id(42),
+                            constraint: None,
+                        },
+                        sha256: sha256_bytes(bytes),
+                        registry: None,
+                    });
+                    WasmArtifactPath::new(
+                        cache_path_wasm(&root, &remote_source.source_key(), version),
+                        &config.name,
+                    )
+                    .unwrap()
+                } else {
+                    let source = WasmArtifactPath::new(source_file.clone(), &config.name).unwrap();
+                    file_provider_cache_path(&root, &source, &config.name).unwrap()
+                };
+                install_project_artifact_atomically(
+                    &guard,
+                    &root.join("source.wasm").unwrap(),
+                    &artifact,
+                )
+                .unwrap();
+                if populated_replacement {
+                    let replacement_artifact = other_guard.project_artifact(&artifact).unwrap();
+                    replacement_artifact
+                        .parent()
+                        .unwrap()
+                        .create_dir_all()
+                        .unwrap();
+                    replacement_artifact
+                        .atomic_replace(b"unprotected replacement provider")
+                        .unwrap();
+                }
+
+                let installed =
+                    installed_provider_from_resolved(&guard, &config, source, &artifact, &lock)
+                        .unwrap();
+
+                assert_eq!(
+                    installed.artifact_bytes().as_bytes(),
+                    bytes,
+                    "init must inspect the artifact protected by its install guard"
+                );
+                assert_eq!(installed.path(), &artifact);
+            }
+        }
     }
 
     #[cfg(unix)]

@@ -6,6 +6,69 @@ fn command() -> Command {
     command
 }
 
+#[cfg(unix)]
+#[test]
+fn recursive_fmt_skips_unrelated_looping_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let nested = temp.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(
+        nested.join("main.crn"),
+        "exports{ marker:String=\"hello\"}\n",
+    )
+    .unwrap();
+    for directory in [temp.path(), nested.as_path()] {
+        std::os::unix::fs::symlink("notes.txt", directory.join("notes.txt")).unwrap();
+    }
+
+    let output = command()
+        .current_dir(temp.path())
+        .args(["fmt", "--recursive", "."])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Formatted: ./nested/main.crn"),
+        "{output:?}"
+    );
+    let output = command()
+        .current_dir(temp.path())
+        .args(["fmt", "--recursive", ".", "--check"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn lint_parent_components_keep_root_tag_style_warnings() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("scratch")).unwrap();
+    std::fs::create_dir(temp.path().join("infra")).unwrap();
+    std::fs::write(temp.path().join("infra/main.crn"),
+        "attributes {\n  tags = {\n    Name = \"application\"\n    Environment = \"production\"\n    managed_by = \"carina\"\n  }\n}\n").unwrap();
+    assert!(!temp.path().join("infra/scratch").exists());
+
+    let output = command()
+        .current_dir(temp.path())
+        .args(["lint", "scratch/../infra"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "mixed tag styles must fail lint: {output:?}"
+    );
+    assert!(
+        stderr.contains("Tag key 'managed_by' doesn't match the dominant style (PascalCase)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: scratch/../infra/main.crn:5"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Found 1 lint warning(s)."), "{stderr}");
+}
+
 #[test]
 fn fmt_preserves_relative_argument_spelling_in_output_and_diffs() {
     let temp = tempfile::tempdir().unwrap();

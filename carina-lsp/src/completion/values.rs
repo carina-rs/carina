@@ -2634,8 +2634,11 @@ fn find_carina_projects_under(
     let Ok(entries) = ancestor.entries() else {
         return;
     };
-    for child in entries {
-        let Some(child_name) = visible_dir_name(&child) else {
+    for entry in entries {
+        let Some(child_name) = visible_dir_name(&entry) else {
+            continue;
+        };
+        let Ok(child) = entry.resolve() else {
             continue;
         };
         let child_abs = child.identity();
@@ -2651,8 +2654,11 @@ fn find_carina_projects_under(
         let Ok(grandchildren) = child.entries() else {
             continue;
         };
-        for grand_path in grandchildren {
-            let Some(grand_name) = visible_dir_name(&grand_path) else {
+        for entry in grandchildren {
+            let Some(grand_name) = visible_dir_name(&entry) else {
+                continue;
+            };
+            let Ok(grand_path) = entry.resolve() else {
                 continue;
             };
             let grand_abs = grand_path.identity();
@@ -2664,7 +2670,7 @@ fn find_carina_projects_under(
 }
 
 /// `Some(name)` if `path` is a directory with a non-hidden name, else `None`.
-fn visible_dir_name(path: &ResolvedPath) -> Option<String> {
+fn visible_dir_name(path: &carina_core::paths::DirectoryEntry) -> Option<String> {
     let name = path.display().file_name()?.to_str()?;
     if name.starts_with('.') || !path.is_dir() {
         return None;
