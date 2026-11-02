@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use carina_core::differ::{Diff, diff};
+use carina_core::differ::{Diff, diff_for_test as diff};
 use carina_core::provider::{InitializedProvider, ProviderRouter};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
@@ -33,6 +33,20 @@ use carina_core::schema::{
     ValidatedProviderSchemaWitness,
 };
 use carina_core::value::CanonicalState;
+
+fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedResource {
+    let parsed = carina_core::parser::ExpandedParsedFile::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (std::slice::from_ref(&resource)).to_vec();
+        configuration.data_sources = Vec::new();
+        configuration.into()
+    })
+    .expect("cyclic-schema fixture graph must resolve");
+    graph
+        .resolve_resource(resource, registry)
+        .expect("cyclic-schema fixture resource must resolve")
+}
 
 /// Build a minimal WAFv2-WebACL-shaped cyclic schema.
 ///
@@ -207,14 +221,17 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
         )
         .expect("comparison provider route is initialized");
 
+    let desired = resolve_resource(desired, &schemas);
     let d = diff(
-        &ResolvedResource::new(desired),
+        &desired,
         &current,
         &saved,
         None,
         Some(witness.resources()[0].as_schema()),
         &comparison,
-    );
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
     assert!(
         matches!(d, Diff::NoChange(_)),
         "equal cyclic values must produce NoChange, got: {d:?}"
@@ -270,14 +287,17 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         )
         .expect("comparison provider route is initialized");
 
+    let desired = resolve_resource(desired, &schemas);
     let d = diff(
-        &ResolvedResource::new(desired),
+        &desired,
         &current,
         &saved,
         None,
         Some(witness.resources()[0].as_schema()),
         &comparison,
-    );
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
     match d {
         Diff::Update {
             changed_attributes, ..

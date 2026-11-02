@@ -7,19 +7,41 @@ use crate::parser::ParsedValue as Value;
 use crate::parser::ParserValidationBlock as ValidationBlock;
 use crate::parser::ProviderContext;
 use crate::parser::Rule;
-use crate::parser::ast::{ArgumentParameter, AttributeParameter, ExportParameter, SourceSpan};
+use crate::parser::ast::{
+    ArgumentParameter, AttributeParameter, BoundaryExpression, ExportParameter, SourceSpan,
+};
 use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::{ParseError, ParseWarning};
 use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::grammar::PreprocessedFile;
-use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
+use crate::parser::{parse_expression, parse_expression_eval};
 use crate::resource::{ConcreteValue, DeferredValue};
 
 pub(in crate::parser) struct ParsedArgumentsBlock {
     pub parameters: Vec<ArgumentParameter>,
     pub type_sources: Vec<(String, SourceSpan)>,
+}
+
+fn parse_boundary_expression(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<BoundaryExpression, ParseError> {
+    let line = pair.line_col().0;
+    let eval = parse_expression_eval(pair, ctx)?;
+    if let Some(handle) = eval.structural_handle_ref() {
+        let Some(handle) = handle.resource_handle() else {
+            return Err(ParseError::from_eval_value(
+                crate::eval_value::EvalValueError::BareStructuralHandle(handle.bare_error()),
+                line,
+            ));
+        };
+        return Ok(BoundaryExpression::Handle(handle));
+    }
+    eval.into_value()
+        .map(BoundaryExpression::Value)
+        .map_err(|error| ParseError::from_eval_value(error, line))
 }
 
 /// Parse arguments block. See `register_argument_binding` for the
@@ -168,6 +190,53 @@ fn register_argument_binding(
     name: &str,
     type_expr: &crate::parser::TypeExpr,
 ) {
+    let resource_type = match type_expr {
+        crate::parser::TypeExpr::Ref(resource_type) => Some(resource_type),
+        crate::parser::TypeExpr::DottedUnresolved(resource_type)
+            if ctx.config.resource_types.contains(&(
+                resource_type.provider.clone(),
+                resource_type.resource_type.clone(),
+            )) =>
+        {
+            Some(resource_type)
+        }
+        crate::parser::TypeExpr::String
+        | crate::parser::TypeExpr::Bool
+        | crate::parser::TypeExpr::Int
+        | crate::parser::TypeExpr::Float
+        | crate::parser::TypeExpr::Duration
+        | crate::parser::TypeExpr::Simple(_)
+        | crate::parser::TypeExpr::UnloadedSchemaType(_)
+        | crate::parser::TypeExpr::List(_)
+        | crate::parser::TypeExpr::Map(_)
+        | crate::parser::TypeExpr::DottedUnresolved(_)
+        | crate::parser::TypeExpr::SchemaType { .. }
+        | crate::parser::TypeExpr::Struct { .. }
+        | crate::parser::TypeExpr::StringLiteral(_)
+        | crate::parser::TypeExpr::Union(_) => None,
+    };
+    if let Some(resource_type) = resource_type {
+        ctx.set_structural_binding(
+            name.to_string(),
+            crate::eval_value::UnexpandedStructuralHandle::module_parameter(
+                name,
+                resource_type.clone(),
+            ),
+        );
+        ctx.unmark_seeded(name);
+        return;
+    }
+    if let crate::parser::TypeExpr::Ref(resource_type) = type_expr {
+        ctx.set_structural_binding(
+            name.to_owned(),
+            crate::eval_value::UnexpandedStructuralHandle::module_parameter(
+                name,
+                resource_type.clone(),
+            ),
+        );
+        ctx.unmark_seeded(name);
+        return;
+    }
     ctx.set_argument_variable(
         name.to_string(),
         Value::Deferred(DeferredValue::Placeholder(
@@ -217,11 +286,11 @@ pub(in crate::parser) fn parse_attributes_block(
                     Some(preprocessed_file),
                 )?);
                 let expr = next_pair(&mut param_inner, "value expression", "attributes parameter")?;
-                let value = Some(parse_expression(expr, ctx)?);
+                let value = Some(parse_boundary_expression(expr, ctx)?);
                 (type_expr, value)
             } else {
                 // No type annotation: name = expr
-                let value = Some(parse_expression(next, ctx)?);
+                let value = Some(parse_boundary_expression(next, ctx)?);
                 (None, value)
             };
 
@@ -264,10 +333,10 @@ pub(in crate::parser) fn parse_exports_block(
                     Some(preprocessed_file),
                 )?);
                 let expr = next_pair(&mut param_inner, "value expression", "exports parameter")?;
-                let value = Some(parse_expression(expr, ctx)?);
+                let value = Some(parse_boundary_expression(expr, ctx)?);
                 (type_expr, value)
             } else {
-                let value = Some(parse_expression(next, ctx)?);
+                let value = Some(parse_boundary_expression(next, ctx)?);
                 (None, value)
             };
 

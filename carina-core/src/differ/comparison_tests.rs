@@ -1,5 +1,7 @@
 use super::comparison::SavedAttr;
+use super::diff_for_test as diff;
 use super::{create_plan_for_tests as create_plan, *};
+type State = crate::resource::State;
 use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
@@ -22,36 +24,59 @@ use std::sync::LazyLock;
 static EXACT_SCOPE: ReferenceScope = ReferenceScope::Unavailable;
 static NO_REFERENCE_FORMS: LazyLock<ReferenceForms> = LazyLock::new(ReferenceForms::new);
 
-fn exact_comparison_context() -> ComparisonContext<'static> {
-    ComparisonContext::for_test(&EXACT_SCOPE, &NO_REFERENCE_FORMS)
+fn exact_comparison_context() -> ObservationComparison<'static> {
+    ObservationComparison::for_test(&EXACT_SCOPE, &NO_REFERENCE_FORMS)
 }
 
-fn type_aware_equal(
-    a: &Value,
-    b: &Value,
+fn type_aware_equal<P: crate::resource::StateValueLeaf, Q: crate::resource::StateValueLeaf>(
+    a: &crate::resource::Value<P>,
+    b: &crate::resource::Value<Q>,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
     super::type_aware_equal(a, b, attr_type, defs, &exact_comparison_context())
 }
 
-fn find_changed_attributes(
+fn find_changed_attributes<P: crate::resource::StateValueLeaf>(
     desired: &HashMap<String, Value>,
-    current: &HashMap<String, Value>,
+    current: &HashMap<String, crate::resource::Value<P>>,
     saved: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Vec<String> {
-    super::comparison::find_changed_attributes(
-        desired,
-        current,
-        saved,
-        nested_write_only,
-        prev_explicit,
-        schema,
-        &exact_comparison_context(),
-    )
+    let desired = desired
+        .iter()
+        .map(|(key, value)| (key.clone(), value.to_snapshot()))
+        .collect();
+    let current = current
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
+    let saved = saved.map(|values| {
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), value.to_snapshot()))
+            .collect()
+    });
+    super::exact_comparison_schema_for_tests()
+        .with_references(
+            &crate::references::prepare_empty_for_tests(),
+            &ResourceId::with_identity("test.Resource", "example"),
+            |context| {
+                super::comparison::find_changed_attributes(
+                    &desired,
+                    &current,
+                    saved.as_ref(),
+                    nested_write_only,
+                    prev_explicit,
+                    schema,
+                    context,
+                    &exact_comparison_context(),
+                )
+            },
+        )
+        .unwrap()
 }
 
 fn key_should_enter_patch(
@@ -69,10 +94,10 @@ fn key_should_enter_patch(
     )
 }
 
-fn diff_test(
+fn diff_test<P: crate::resource::StateValueLeaf>(
     desired: &Resource,
-    current: &State,
-    saved: Option<&HashMap<String, Value>>,
+    current: &crate::resource::State<P>,
+    saved: Option<&HashMap<String, crate::resource::SnapshotValue>>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
@@ -82,7 +107,7 @@ fn diff_test(
         saved,
         prev_explicit,
         schema,
-        &exact_comparison_context(),
+        &super::exact_comparison_schema_for_tests(),
     )
 }
 
@@ -101,8 +126,9 @@ fn resolved_ignored_resource(
         resource.id.provider.clone(),
         schema.validate().expect("ignore_changes schema is valid"),
     );
-    let resource = ResolvedResource::resolve_with_schemas(resource, &registry)
-        .expect("ignore_changes path resolves");
+    let resource =
+        ResolvedResource::resolve_with_schemas(resource.with_dependency_phase(()), &registry)
+            .expect("ignore_changes path resolves");
     (resource, registry)
 }
 
@@ -154,8 +180,10 @@ fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
             &saved,
             None,
             Some(schema),
-            &exact_comparison_context(),
-        ),
+            &super::exact_comparison_schema_for_tests(),
+            &crate::references::prepare_empty_for_tests(),
+        )
+        .unwrap(),
         Diff::NoChange(_)
     ));
 }
@@ -187,8 +215,10 @@ fn resolved_ignore_changes_without_comparison_schema_does_not_panic() {
             &saved,
             None,
             None,
-            &exact_comparison_context(),
-        ),
+            &super::exact_comparison_schema_for_tests(),
+            &crate::references::prepare_empty_for_tests(),
+        )
+        .unwrap(),
         Diff::NoChange(_)
     ));
 }
@@ -247,15 +277,17 @@ fn ignored_readable_struct_leaf_does_not_hide_changed_sibling() {
         &saved,
         None,
         Some(schema),
-        &exact_comparison_context(),
+        &super::exact_comparison_schema_for_tests(),
+        &crate::references::prepare_empty_for_tests(),
     )
+    .unwrap()
     else {
         panic!("memory change must still produce an update")
     };
     assert_eq!(changed_attributes, ["config"]);
 }
 
-fn persisted_secret(encoded: &serde_json::Value) -> Value {
+fn persisted_secret(encoded: &serde_json::Value) -> crate::resource::SnapshotValue {
     crate::value::PersistedValue::from_serialized_json(encoded.clone())
         .expect("valid persisted secret")
         .decode()
@@ -290,7 +322,7 @@ fn string_value(value: &str) -> Value {
 #[test]
 fn refined_string_reference_form_equates_bare_name_and_local_arn() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(super::type_aware_equal(
         &string_value("processor"),
@@ -311,7 +343,7 @@ fn refined_string_applies_to_dsl_before_reference_form_canonicalization() {
         None,
         Some(crate::schema::DslTransform::StripSuffix("_api".to_string())),
     );
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(super::type_aware_equal(
         &string_value("processor_api"),
@@ -335,7 +367,7 @@ fn reference_scope_rejects_placeholder_text() {
 #[test]
 fn refined_string_reference_form_rejects_cross_account_arn_for_local_name() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(!super::type_aware_equal(
         &string_value("processor"),
@@ -349,7 +381,7 @@ fn refined_string_reference_form_rejects_cross_account_arn_for_local_name() {
 #[test]
 fn refined_string_reference_form_rejects_qualified_arn_for_bare_name() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(!super::type_aware_equal(
         &string_value("processor"),
@@ -363,7 +395,7 @@ fn refined_string_reference_form_rejects_qualified_arn_for_bare_name() {
 #[test]
 fn refined_string_reference_form_keeps_different_names_and_arns_distinct() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(!super::type_aware_equal(
         &string_value("processor"),
@@ -384,7 +416,7 @@ fn refined_string_reference_form_keeps_different_names_and_arns_distinct() {
 #[test]
 fn refined_string_reference_form_is_exact_when_scope_is_unavailable() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(ReferenceScope::Unavailable);
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(!super::type_aware_equal(
         &string_value("processor"),
@@ -399,7 +431,7 @@ fn refined_string_reference_form_is_exact_when_scope_is_unavailable() {
 fn union_uses_refined_string_reference_form_member() {
     let (scope, forms, string_type) =
         lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
     let union = AttributeType::union(vec![AttributeType::int(), string_type]);
 
     assert!(super::type_aware_equal(
@@ -414,7 +446,6 @@ fn union_uses_refined_string_reference_form_member() {
 #[test]
 fn create_only_reference_form_equivalence_suppresses_replace() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
     let schema = ResourceSchema::new("lambda.Permission").attribute(
         crate::schema::CompiledAttributeSchema::optional("function_name", attr_type)
             .create_only()
@@ -431,7 +462,14 @@ fn create_only_reference_form_equivalence_suppresses_replace() {
     )
     .with_identifier("permission-id");
 
-    let result = super::diff_test(&desired, &current, None, None, Some(&schema), &context);
+    let result = super::diff_test(
+        &desired,
+        &current,
+        None,
+        None,
+        Some(&schema),
+        &ComparisonSchema::for_test(&scope, &forms),
+    );
 
     assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
 }
@@ -439,7 +477,7 @@ fn create_only_reference_form_equivalence_suppresses_replace() {
 #[test]
 fn apply_time_patch_omits_reference_form_equivalent_key() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
     let current = string_value("arn:aws:lambda:us-east-1:123456789012:function:processor");
     let desired = string_value("processor");
 
@@ -448,8 +486,8 @@ fn apply_time_patch_omits_reference_form_equivalent_key() {
         None,
         LeafProvenance::DecidedByPlan { key_changed: false },
         AttrComparison {
-            from: Some(&current),
-            to: &desired,
+            from: Some(&current.to_snapshot()),
+            to: &desired.to_snapshot(),
             saved: None,
             type_info: Some(TypedAttr {
                 attr_type: &attr_type,
@@ -1529,8 +1567,8 @@ fn key_should_enter_patch_uses_matching_recorded_nested_write_only_provenance() 
             Some(&schema),
             LeafProvenance::Recorded(Some(recorded)),
             AttrComparison {
-                from: Some(current_value),
-                to: desired_value,
+                from: Some(&current_value.to_snapshot()),
+                to: &desired_value.to_snapshot(),
                 saved: None,
                 type_info: Some(TypedAttr {
                     attr_type,
@@ -1610,7 +1648,7 @@ fn secret_wrapped_oidc_listener_fixture(
 ) -> (
     ResourceSchema,
     HashMap<String, Value>,
-    HashMap<String, Value>,
+    HashMap<String, crate::resource::SnapshotValue>,
 ) {
     use crate::schema::{
         CompiledAttributeSchema as AttributeSchema, CompiledStructField as StructField,
@@ -1652,14 +1690,15 @@ fn secret_wrapped_oidc_listener_fixture(
         "issuer".to_string(),
         issuer(),
     )])));
-    let action = |config| {
-        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::Map(IndexMap::from([(
-                "authenticate_oidc_config".to_string(),
-                config,
-            )])),
-        )]))
-    };
+    fn action<P: crate::resource::ValueKind>(
+        config: crate::resource::Value<P>,
+    ) -> crate::resource::Value<P> {
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(IndexMap::from(
+                [("authenticate_oidc_config".to_string(), config)],
+            ))),
+        ]))
+    }
     let secret = |value| Value::Deferred(DeferredValue::Secret(Box::new(value)));
 
     let (desired_actions, current_actions) = if wrap_default_actions {
@@ -1764,7 +1803,7 @@ fn entirely_write_only_struct_absent_from_read_converges_with_matching_record() 
             )))),
         )]))),
     )]);
-    let current = HashMap::new();
+    let current: HashMap<String, Value> = HashMap::new();
     let mut nested_write_only = NestedWriteOnlyRecord::default();
     let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
     nested_write_only
@@ -1824,7 +1863,7 @@ fn omitted_read_with_empty_observable_string_list_converges() {
             ),
         ]))),
     )]);
-    let current = HashMap::new();
+    let current: HashMap<String, Value> = HashMap::new();
     let mut nested_write_only = NestedWriteOnlyRecord::new();
     let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
     nested_write_only
@@ -1876,7 +1915,7 @@ fn entirely_write_only_secret_wrapped_struct_absent_from_read_converges() {
             )])),
         )))),
     )]);
-    let current = HashMap::new();
+    let current: HashMap<String, Value> = HashMap::new();
     let mut nested_write_only = NestedWriteOnlyRecord::new();
     let desired_for_record = desired.clone().into_iter().collect::<IndexMap<_, _>>();
     nested_write_only
@@ -2286,10 +2325,11 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
         None,
         LeafProvenance::DecidedByPlan { key_changed: false },
         AttrComparison {
-            from: Some(&current),
-            to: &desired,
+            from: Some(&current.to_snapshot()),
+            to: &desired.to_snapshot(),
             saved: Some(SavedAttr {
-                views: crate::resource::SavedValueViews::same(&saved),
+                origins: None,
+                views: crate::resource::SavedValueViews::same(&saved.to_snapshot()),
                 authoring: &ExplicitFields::Unrecorded,
             }),
             type_info: Some(TypedAttr {
@@ -2325,8 +2365,8 @@ fn nested_post_create_read_unknown_cannot_enter_a_patch() {
             None,
             LeafProvenance::DecidedByPlan { key_changed: false },
             AttrComparison {
-                from: Some(&current),
-                to: &desired,
+                from: Some(&current.to_snapshot()),
+                to: &desired.to_snapshot(),
                 saved: None,
                 type_info: None,
             },
@@ -2385,13 +2425,17 @@ fn secret_in_map_no_change_when_hash_matches() {
 
     // State: tags map with the secret hash (as stored by from_provider_state)
     let hash_json = value_to_json(&secret_value).unwrap();
-    let state_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
-        (
-            "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".into())),
-        ),
-        ("SecretTag".to_string(), persisted_secret(&hash_json)),
-    ])));
+    let state_tags = crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+        IndexMap::from([
+            (
+                "Name".to_string(),
+                crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::String(
+                    "test".into(),
+                )),
+            ),
+            ("SecretTag".to_string(), persisted_secret(&hash_json)),
+        ]),
+    ));
 
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
     let current = HashMap::from([("tags".to_string(), state_tags)]);
@@ -3038,8 +3082,6 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
 /// through the same structural canonicalization as desired and current state.
 #[test]
 fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
-    use crate::provider::RawSavedAttrs;
-
     use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
 
     let statement = PatternAttributeType::struct_(
@@ -3103,7 +3145,7 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     )]);
     canonicalize_states_with_schemas(&mut states, &registry);
 
-    let saved_attrs = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+    let saved_attrs = crate::test_support::raw_saved_attrs(HashMap::from([(
         id.clone(),
         HashMap::from([(
             "statement".to_string(),
@@ -3149,8 +3191,6 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
 /// carries the unauthored nested field into the effective desired value.
 #[test]
 fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
-    use crate::provider::RawSavedAttrs;
-
     let config = PatternAttributeType::struct_(
         "Config".to_string(),
         vec![
@@ -3195,23 +3235,29 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
         IndexMap::from([
             (
                 "enabled".to_string(),
-                Value::Concrete(ConcreteValue::Bool(true)),
+                crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Bool(
+                    true,
+                )),
             ),
             ("password".to_string(), secret_hash.clone()),
         ])
     };
-    let current = State::existing(
+    let current = crate::resource::SnapshotState::existing(
         desired.id.clone(),
         HashMap::from([(
             "config".to_string(),
-            Value::Concrete(ConcreteValue::Map(persisted_config())),
+            crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+                persisted_config(),
+            )),
         )]),
     );
-    let saved_attrs = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+    let saved_attrs = crate::test_support::raw_saved_attrs(HashMap::from([(
         desired.id.clone(),
         HashMap::from([(
             "config".to_string(),
-            Value::Concrete(ConcreteValue::Map(persisted_config())),
+            crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+                persisted_config(),
+            )),
         )]),
     )]))
     .lift(&registry);
@@ -3504,7 +3550,9 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let result = diff_test(
         &resources[0],
         current,
-        Some(&saved_attrs),
+        Some(&crate::test_support::snapshot_attributes(
+            (saved_attrs).clone(),
+        )),
         Some(&prev_explicit),
         Some(
             registry

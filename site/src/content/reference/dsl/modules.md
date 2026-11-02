@@ -3,7 +3,10 @@ title: Modules
 description: Module definition, arguments, attributes, use syntax, directory modules, and module resolution in the Carina DSL.
 ---
 
-Modules are reusable units of Carina configuration. A module defines a set of resources along with input parameters (`arguments`) and output values (`attributes`).
+Modules are reusable units of Carina configuration. A module defines a set of
+resources along with input parameters (`arguments`) and same-stack outputs
+(`attributes`). An output may be an ordinary value or a typed managed-resource
+handle.
 
 ## Block Roles at a Glance
 
@@ -12,7 +15,7 @@ A directory of `.crn` files may contain three interface-like blocks. They share 
 | Block | Role | `=` expr means | Who consumes it |
 |---|---|---|---|
 | `arguments` | declare inputs | **optional default** for the parameter | callers of the module (`module { name = value }`) |
-| `attributes` | define module outputs | **required value** for the output | callers who bind the module (`let m = module { ... }; m.foo`) |
+| `attributes` | define module outputs | **required value or resource handle** for the output | callers who bind the module (`let m = module { ... }; m.foo`) |
 | `exports` | define upstream-state outputs | **required value** for the export | other projects referencing this directory via `upstream_state` |
 
 The blocks fall into two groups by role:
@@ -24,11 +27,20 @@ When an export has no annotation and Carina cannot infer its type from the value
 
 Because `description` and `validation` are input-side concerns (documenting what callers should pass, and checking what they did pass), they are available on `arguments` entries through the block form but are deliberately absent from `attributes` and `exports`. Outputs are values produced internally from bindings the module already controls, so there is nothing to validate and no caller-facing documentation to attach beyond the type.
 
-`attributes` and `exports` share their body grammar but are intentionally kept separate because their consumers are different: `attributes` is the interface a module presents to its direct caller, while `exports` is the interface a directory presents to other projects through `upstream_state`.
+`attributes` and `exports` share their body grammar but are intentionally kept
+separate because their consumers are different: `attributes` is the interface
+a module presents to its direct caller and may carry a same-stack resource
+handle, while `exports` is the value-only interface a directory persists for
+other projects through `upstream_state`.
 
 `exports` belongs to a root configuration only; a module directory that declares `exports` is rejected.
 
 Exports cannot hold secret values, including values derived from `secret()` or `decrypt()`; `carina validate` and `carina plan` report `export '<name>' cannot hold a secret value`.
+
+Exports also cannot hold resource handles, whether their type is annotated or
+inferred. Handles identify resources in the current expanded graph and never
+cross a state boundary. Export an identity value such as
+`aws.ec2.Vpc.Id` instead.
 
 ## Module Structure
 
@@ -62,8 +74,9 @@ let subnet = awscc.ec2.Subnet {
 }
 
 attributes {
-  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
+  vpc      = vpc
+  vpc_id   : aws.ec2.Vpc.Id = vpc.vpc_id
+  subnet_id: aws.ec2.Subnet.Id = subnet.subnet_id
 }
 ```
 
@@ -199,23 +212,26 @@ let subnet = awscc.ec2.Subnet {
 ```
 
 Passing a bare resource handle to a value parameter such as `String` is an
-error at the module call. Passing an attribute such as `vpc.vpc_id` instead
-binds a value, even when the parameter has a resource type (resource-typed
-parameters accept identifier strings for provider configurations that model
-references as IDs). Using a handle-backed parameter bare inside the module is
-also an error.
+error at the module call. Conversely, a resource-typed parameter accepts only
+a matching handle: neither a plain string nor an identity value such as
+`vpc.vpc_id` satisfies `awscc.ec2.Vpc`. Use the identity type
+`aws.ec2.Vpc.Id` when the module should receive the ID value instead. Using a
+handle-backed parameter bare in an ordinary value position inside the module
+is also an error.
 
 ## Attributes Block
 
-The `attributes` block defines the output values that a module exposes to its caller.
+The `attributes` block defines the values and managed-resource handles that a
+module exposes to its caller.
 
 Each attribute has a name, an optional type, and a value expression:
 
 ```crn
 attributes {
-  vpc_id        : awscc.ec2.Vpc = vpc.vpc_id
-  subnet_id     : awscc.ec2.Subnet = subnet.subnet_id
-  route_table_id: awscc.ec2.RouteTable = rt.route_table_id
+  vpc           : awscc.ec2.Vpc = vpc
+  vpc_id        : aws.ec2.Vpc.Id = vpc.vpc_id
+  subnet_id     : aws.ec2.Subnet.Id = subnet.subnet_id
+  route_table_id: aws.ec2.RouteTable.Id = rt.route_table_id
 }
 ```
 
@@ -223,12 +239,19 @@ The type annotation is optional; you can also use the simpler form:
 
 ```crn
 attributes {
-  vpc_id = vpc.vpc_id
+  vpc = vpc
 }
 ```
 
-An output must likewise be a value. `vpc_id = vpc` is invalid because `vpc`
-is a resource handle; expose `vpc.vpc_id` (or another attribute) instead.
+For an unannotated output, Carina infers whether the right-hand side is a
+value or a handle. Both a local resource (`vpc = vpc`) and a received handle
+argument (`vpc = network`) preserve their known resource type and can be
+forwarded through another module. An optional annotation checks that inferred
+type; it does not convert a value into a handle or a handle into a value.
+
+Select an attribute when a caller needs a value (`net.vpc.vpc_id`). Use the
+bare output only in a structural context that accepts a handle, such as a
+resource-typed module argument or `depends_on`.
 
 ## Loading Modules
 
@@ -258,9 +281,14 @@ let net = network {
 }
 
 awscc.ec2.SecurityGroup {
-  vpc_id = net.vpc_id
+  vpc_id = net.vpc.vpc_id
 }
 ```
+
+Here `net.vpc` is a resource handle and `net.vpc.vpc_id` is an ordinary
+deferred value reference to the underlying VPC. Attribute access is checked
+against the VPC schema. A bare `net.vpc` cannot be sent to a provider as a
+value.
 
 ## Directory Modules
 
@@ -328,8 +356,9 @@ let rt = awscc.ec2.RouteTable {
 }
 
 attributes {
-  vpc_id        : awscc.ec2.Vpc = net.vpc_id
-  route_table_id: awscc.ec2.RouteTable = rt.route_table_id
+  vpc           = net.vpc
+  vpc_id        : aws.ec2.Vpc.Id = net.vpc.vpc_id
+  route_table_id: aws.ec2.RouteTable.Id = rt.route_table_id
 }
 ```
 

@@ -4,25 +4,24 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
-#[cfg(test)]
-use carina_core::provider::ProviderDirectiveSchema;
 use carina_core::provider::{
-    AppliedState as CoreAppliedState, CreateRequest as CoreCreateRequest,
-    DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
-    PartialReadDiagnostic as CorePartialReadDiagnostic, PatchOp as CorePatchOp,
-    PendingCreate as CorePendingCreate, ProviderDirectives as CoreProviderDirectives,
-    ProviderError as CoreProviderError, ReadOutcome as CoreReadOutcome,
-    ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
-    UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
-    UpdateRequest as CoreUpdateRequest,
+    AppliedIdentifier as CoreAppliedIdentifier, AppliedState as CoreAppliedState,
+    CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
+    PartialReadDiagnostic as CorePartialReadDiagnostic, PendingCreate as CorePendingCreate,
+    ProviderDirectives as CoreProviderDirectives, ProviderError as CoreProviderError,
+    ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
+    UpdateOutcome as CoreUpdateOutcome, UpdateRequest as CoreUpdateRequest, WireAttributes,
+    WirePatchOp, WireValue,
 };
 #[cfg(test)]
-use carina_core::resource::Directives;
+use carina_core::provider::{PatchOp as CorePatchOp, ProviderDirectiveSchema};
 use carina_core::resource::{
-    ConcreteValue, DataSource as CoreDataSource, DeferredValue, RedactedSecretHash,
-    Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentityState,
-    State as CoreState, Value as CoreValue,
+    ConcreteValue, DeferredValue, RedactedSecretHash, ResourceId as CoreResourceId,
+    ResourceIdentityState, SnapshotLeaf, SnapshotState as CoreSnapshotState,
+    SnapshotValue as CoreSnapshotValue, State as CoreState, Value as CoreValue,
 };
+#[cfg(test)]
+use carina_core::resource::{Directives, Resource as CoreResource};
 #[cfg(test)]
 use carina_core::schema::{
     AttributeSchemaParts as CoreAttributeSchemaParts,
@@ -274,14 +273,11 @@ impl std::error::Error for WasmAppliedStateDecodeError {}
 /// Returns `Err(SerializationError)` for an unresolved `EnumIdentifier` and
 /// for `Value::Deferred(DeferredValue::Unknown)`,
 /// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
-/// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. The scoped transport wrapper in
-/// `WasmProviderNormalizer::normalize_desired` strips ref/Unknown-bearing
-/// attributes before conversion, reports their top-level names through the
-/// WIT `desired-resource.deferred` field, and restores their values after the
-/// guest call. Reaching any of these arms is therefore a producer-side bug —
-/// the diagnostic identifies which variant leaked. See RFC #2371 stage 2
-/// (#2378) for `Unknown` and #2387 for `ResourceRef` / `Interpolation` /
-/// `FunctionCall`.
+/// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. Desired
+/// normalization uses a separate structural `desired-value` codec,
+/// projecting deferred leaves to opaque slots before the guest call. These
+/// ordinary-value encoders are used by CRUD/configuration and do not interpret
+/// normalization markers.
 ///
 /// `Value::Deferred(DeferredValue::Secret(inner))` is encoded as the `secret-val` WIT variant
 /// (#2390): the inner is JSON-encoded the same way `list-val` / `map-val`
@@ -407,11 +403,6 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
                 serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::SecretVal(json_str))
         }
-        CoreValue::Deferred(DeferredValue::RedactedSecret { .. }) => {
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary,
-            })
-        }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
@@ -447,8 +438,10 @@ fn ordinary_wit_value_into_persisted(
 /// type. Canonical enums still cross as API strings because WIT has no enum
 /// identity variant.
 fn core_to_wit_persisted_value(
-    value: &CoreValue,
+    value: &CoreSnapshotValue,
 ) -> Result<wit::PersistedValue, SerializationError> {
+    use carina_core::resource::SnapshotValue as CoreValue;
+
     match value {
         CoreValue::Concrete(ConcreteValue::List(items)) => {
             let json = items
@@ -476,10 +469,13 @@ fn core_to_wit_persisted_value(
                 context: SerializationContext::WasmBoundary,
             })
         }
-        CoreValue::Deferred(DeferredValue::RedactedSecret { hash }) => Ok(
-            wit::PersistedValue::RedactedSecretVal(hash.encoded_digest()),
-        ),
-        _ => core_to_wit_value(value).and_then(ordinary_wit_value_into_persisted),
+        CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })) => {
+            Ok(wit::PersistedValue::RedactedSecretVal(
+                hash.encoded_digest(),
+            ))
+        }
+        _ => core_to_wit_value(&value.to_value_at("persisted state")?)
+            .and_then(ordinary_wit_value_into_persisted),
     }
 }
 
@@ -565,11 +561,17 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
 
 fn wit_to_core_persisted_value(
     value: &wit::PersistedValue,
-) -> Result<CoreValue, WasmValueDecodeError> {
+) -> Result<CoreSnapshotValue, WasmValueDecodeError> {
+    use carina_core::resource::SnapshotValue as CoreValue;
+
     match value {
         wit::PersistedValue::RedactedSecretVal(digest) => {
             RedactedSecretHash::from_encoded_digest(digest)
-                .map(|hash| CoreValue::Deferred(DeferredValue::RedactedSecret { hash }))
+                .map(|hash| {
+                    CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret {
+                        hash,
+                    }))
+                })
                 .ok_or_else(|| {
                     WasmValueDecodeError::new(
                         WitValueVariant::RedactedSecret,
@@ -617,7 +619,7 @@ fn wit_to_core_persisted_value(
         ))),
         wit::PersistedValue::StringListVal(json) => {
             let ordinary = wit::Value::StringListVal(json.clone());
-            wit_to_core_value(&ordinary)
+            wit_to_core_value(&ordinary).map(|value| value.to_snapshot())
         }
     }
 }
@@ -780,18 +782,15 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
             core_value_to_json(inner).map_err(SerializationError::masked_for_secret)
         }
-        CoreValue::Deferred(DeferredValue::RedactedSecret { .. }) => {
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary,
-            })
-        }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
 fn core_persisted_value_to_json(
-    value: &CoreValue,
+    value: &CoreSnapshotValue,
 ) -> Result<serde_json::Value, SerializationError> {
+    use carina_core::resource::SnapshotValue as CoreValue;
+
     match value {
         CoreValue::Concrete(ConcreteValue::List(items)) => items
             .iter()
@@ -810,10 +809,10 @@ fn core_persisted_value_to_json(
                 context: SerializationContext::WasmBoundary,
             })
         }
-        CoreValue::Deferred(DeferredValue::RedactedSecret { hash }) => {
+        CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })) => {
             Ok(serde_json::json!({ PERSISTED_SECRET_KEY: hash.encoded_digest() }))
         }
-        _ => core_value_to_json(value),
+        _ => core_value_to_json(&value.to_value_at("persisted state")?),
     }
 }
 
@@ -867,7 +866,9 @@ fn json_to_core_value(
 fn persisted_json_to_core_value(
     value: &serde_json::Value,
     wit_variant: WitValueVariant,
-) -> Result<CoreValue, WasmValueDecodeError> {
+) -> Result<CoreSnapshotValue, WasmValueDecodeError> {
+    use carina_core::resource::SnapshotValue as CoreValue;
+
     match value {
         serde_json::Value::Array(values) => values
             .iter()
@@ -891,7 +892,11 @@ fn persisted_json_to_core_value(
                     ));
                 };
                 return RedactedSecretHash::from_encoded_digest(digest)
-                    .map(|hash| CoreValue::Deferred(DeferredValue::RedactedSecret { hash }))
+                    .map(|hash| {
+                        CoreValue::Deferred(DeferredValue::Placeholder(
+                            SnapshotLeaf::RedactedSecret { hash },
+                        ))
+                    })
                     .ok_or_else(|| {
                         WasmValueDecodeError::new(
                             wit_variant,
@@ -921,28 +926,17 @@ fn persisted_json_to_core_value(
                 .map(ConcreteValue::Map)
                 .map(CoreValue::Concrete)
         }
-        _ => json_to_core_value(value, wit_variant),
+        _ => json_to_core_value(value, wit_variant).map(|value| value.to_snapshot()),
     }
 }
 
 // -- Value map helpers --
 
-pub(crate) fn core_to_wit_value_map<'a, M>(
-    map: M,
-) -> Result<Vec<(String, wit::Value)>, SerializationError>
-where
-    M: IntoIterator<Item = (&'a String, &'a CoreValue)>,
-{
-    map.into_iter()
-        .map(|(k, v)| core_to_wit_value(v).map(|wv| (k.clone(), wv)))
-        .collect()
-}
-
 fn core_to_wit_persisted_value_map<'a, M>(
     map: M,
 ) -> Result<Vec<(String, wit::PersistedValue)>, SerializationError>
 where
-    M: IntoIterator<Item = (&'a String, &'a CoreValue)>,
+    M: IntoIterator<Item = (&'a String, &'a CoreSnapshotValue)>,
 {
     map.into_iter()
         .map(|(key, value)| core_to_wit_persisted_value(value).map(|value| (key.clone(), value)))
@@ -984,7 +978,7 @@ pub(crate) fn wit_to_core_value_map(
 /// [`wit_to_core_value_map`].
 pub(crate) fn wit_to_core_persisted_value_map(
     entries: &[(String, wit::PersistedValue)],
-) -> Result<HashMap<String, CoreValue>, WasmValueDecodeError> {
+) -> Result<HashMap<String, CoreSnapshotValue>, WasmValueDecodeError> {
     entries
         .iter()
         .map(|(key, value)| {
@@ -1037,7 +1031,7 @@ fn wit_to_wire_resource_id(id: wit::ResourceId) -> proto::ResourceId {
 // -- State --
 
 pub(crate) fn core_to_wit_persisted_state(
-    state: &CoreState,
+    state: &CoreSnapshotState,
 ) -> Result<wit::PersistedState, SerializationError> {
     Ok(wit::PersistedState {
         identifier: state.identifier.clone(),
@@ -1087,8 +1081,13 @@ fn wit_to_core_applied_persisted_state(
     let operation = AppliedStateOperation::Update;
     let attributes = wit_to_core_persisted_value_map(&attributes)
         .map_err(|source| WasmAppliedStateDecodeError::attributes(operation, id, source))?;
-    CoreAppliedState::new(id.clone(), identifier, attributes)
-        .map_err(|source| WasmAppliedStateDecodeError::identifier(operation, id, source))
+    let identifier = CoreAppliedIdentifier::new(identifier)
+        .map_err(|source| WasmAppliedStateDecodeError::identifier(operation, id, source))?;
+    Ok(CoreAppliedState::from_snapshot_parts(
+        id.clone(),
+        identifier,
+        attributes,
+    ))
 }
 
 pub(crate) fn wit_to_core_read_outcome(
@@ -1750,28 +1749,64 @@ pub(crate) fn wit_to_core_delete_outcome(outcome: wit::DeleteOutcome) -> WasmDel
 
 // -- Resource --
 
-pub(crate) fn core_to_wit_resource<S>(
-    resource: &CoreResource<S>,
-) -> Result<wit::ResourceDef, SerializationError> {
-    Ok(wit::ResourceDef {
-        id: core_to_wit_resource_id(&resource.id),
-        attributes: core_to_wit_value_map(&resource.resolved_attributes())?,
-    })
-}
-
-/// Convert a [`CoreDataSource`] to the WIT `ResourceDef` carried over the
+/// Convert a checked data source to the WIT `ResourceDef` carried over the
 /// plugin boundary. The WIT contract has a single `ResourceDef` record,
 /// so a data source maps to the same `{ id, attributes }` shape as a
 /// managed resource (carina#3181).
-pub(crate) fn core_data_source_to_wit_resource<S>(
-    data_source: &CoreDataSource<S>,
-) -> Result<wit::ResourceDef, SerializationError> {
-    Ok(wit::ResourceDef {
+pub(crate) fn core_data_source_to_wit_resource(
+    data_source: &carina_core::provider::ProviderReadyDataSource,
+) -> wit::ResourceDef {
+    wit::ResourceDef {
         id: core_to_wit_resource_id(&data_source.id),
-        attributes: core_to_wit_value_map(&carina_core::resource::attrs_to_hashmap(
-            &data_source.attributes,
-        ))?,
-    })
+        attributes: checked_attributes_to_wit(data_source.wire_attributes()),
+    }
+}
+
+/// Adapt already checked protocol values; this layer has no rejection policy.
+pub(crate) fn checked_attributes_to_wit(attributes: &WireAttributes) -> Vec<(String, wit::Value)> {
+    attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), checked_value_to_wit(value)))
+        .collect()
+}
+
+fn checked_value_to_wit(value: &WireValue) -> wit::Value {
+    let json =
+        || serde_json::to_string(value.value()).expect("checked protocol values serialize to JSON");
+    if value.is_secret() {
+        return wit::Value::SecretVal(json());
+    }
+    match value.value() {
+        proto::Value::String(value) => wit::Value::StrVal(value.clone()),
+        proto::Value::Int(value) => wit::Value::IntVal(*value),
+        proto::Value::Float(value) => wit::Value::FloatVal(*value),
+        proto::Value::Bool(value) => wit::Value::BoolVal(*value),
+        proto::Value::List(_) => wit::Value::ListVal(json()),
+        proto::Value::StringList(_) => wit::Value::StringListVal(json()),
+        proto::Value::Map(_) => wit::Value::MapVal(json()),
+    }
+}
+
+fn checked_patch_to_wit(operations: &[WirePatchOp]) -> wit::UpdatePatch {
+    let patch_value = |key: &String, value: &WireValue| wit::PatchValue {
+        key: key.clone(),
+        value: checked_value_to_wit(value),
+    };
+    wit::UpdatePatch {
+        ops: operations
+            .iter()
+            .map(|op| match op {
+                WirePatchOp::Add { key, value } => wit::PatchOp::Add(patch_value(key, value)),
+                WirePatchOp::Replace { key, value } => {
+                    wit::PatchOp::Replace(patch_value(key, value))
+                }
+                WirePatchOp::Reassert { key, value } => {
+                    wit::PatchOp::Reassert(patch_value(key, value))
+                }
+                WirePatchOp::Remove { key } => wit::PatchOp::Remove(key.clone()),
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1845,6 +1880,70 @@ pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProvide
     CoreProviderError::from_wire(wit_to_wire_provider_error(err))
 }
 
+pub(crate) fn decode_reference_results(
+    results: Vec<Result<wit::ReferenceOutcome, wit::ReferenceError>>,
+) -> Vec<Result<carina_core::references::ReferenceOutcome, carina_core::references::ReferenceError>>
+{
+    use carina_core::references::{ReferenceError, ReferenceOutcome};
+    // Core preparation validates the positional contract for every provider.
+    results
+        .into_iter()
+        .map(|result| match result {
+            Ok(wit::ReferenceOutcome::Resolved(value)) => {
+                ReferenceOutcome::from_guest(proto::ReferenceOutcome::Resolved(value))
+            }
+            Ok(wit::ReferenceOutcome::NotFound(error)) => Ok(ReferenceOutcome::NotFound(
+                wit_to_core_provider_error(error),
+            )),
+            Err(wit::ReferenceError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
+                wit_to_core_provider_error(error).into(),
+            )),
+            Err(wit::ReferenceError::Transient(error)) => Err(ReferenceError::Transient(
+                wit_to_core_provider_error(error).into(),
+            )),
+            Err(wit::ReferenceError::InvalidReference(error)) => Err(
+                ReferenceError::InvalidReference(wit_to_core_provider_error(error).into()),
+            ),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    use carina_core::references::{ReferenceError, ReferenceOutcome};
+
+    #[test]
+    fn reference_decode_preserves_positional_results_for_core_validation() {
+        for actual in [0, 1, 3] {
+            let mut results = Vec::with_capacity(actual);
+            for _ in 0..actual {
+                results.push(Ok(wit::ReferenceOutcome::Resolved("key/one".into())));
+            }
+            assert_eq!(decode_reference_results(results).len(), actual);
+        }
+    }
+
+    #[test]
+    fn reference_success_is_nonempty_and_format_is_guest_owned() {
+        let results = decode_reference_results(vec![
+            Ok(wit::ReferenceOutcome::Resolved(String::new())),
+            Ok(wit::ReferenceOutcome::Resolved(
+                "generic-provider-key".into(),
+            )),
+        ]);
+        let mut results = results.into_iter();
+        assert!(matches!(
+            results.next().unwrap(),
+            Err(ReferenceError::InvalidReference(_))
+        ));
+        assert!(matches!(
+            results.next().unwrap(),
+            Ok(ReferenceOutcome::Resolved(_))
+        ));
+    }
+}
+
 /// Decode a guest initialization error and attach its boundary phase when the
 /// guest did not provide a more specific operation.
 ///
@@ -1869,18 +1968,19 @@ pub(crate) fn core_to_wit_update_request(
 ) -> Result<wit::UpdateRequest, SerializationError> {
     Ok(wit::UpdateRequest {
         current: core_to_wit_persisted_state(request.from())?,
-        patch: core_to_wit_update_patch(request.patch())?,
+        patch: checked_patch_to_wit(request.wire_patch()),
     })
 }
 
 /// Build a [`wit::CreateRequest`] from the host-side core
 /// [`CoreCreateRequest`].
-pub(crate) fn core_to_wit_create_request(
-    request: &CoreCreateRequest,
-) -> Result<wit::CreateRequest, SerializationError> {
-    Ok(wit::CreateRequest {
-        res: core_to_wit_resource(request.resource().as_resource())?,
-    })
+pub(crate) fn core_to_wit_create_request(request: &CoreCreateRequest) -> wit::CreateRequest {
+    wit::CreateRequest {
+        res: wit::ResourceDef {
+            id: core_to_wit_resource_id(&request.resource().id),
+            attributes: checked_attributes_to_wit(request.resource().wire_attributes()),
+        },
+    }
 }
 
 /// Build a [`wit::ReadRequest`].
@@ -1909,38 +2009,6 @@ pub(crate) fn core_to_wit_directives(directives: &CoreProviderDirectives) -> wit
         create_before_destroy: directives.create_before_destroy(),
         prevent_destroy: directives.prevent_destroy(),
     }
-}
-
-/// Convert a host-side [`CoreUpdatePatch`] to a [`wit::UpdatePatch`].
-/// Op order is preserved.
-pub(crate) fn core_to_wit_update_patch(
-    patch: &CoreUpdatePatch,
-) -> Result<wit::UpdatePatch, SerializationError> {
-    let ops = patch
-        .ops
-        .iter()
-        .map(core_to_wit_patch_op)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(wit::UpdatePatch { ops })
-}
-
-/// Convert a host-side [`CorePatchOp`] to a [`wit::PatchOp`].
-pub(crate) fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, SerializationError> {
-    Ok(match op {
-        CorePatchOp::Add { key, value } => wit::PatchOp::Add(wit::PatchValue {
-            key: key.clone(),
-            value: core_to_wit_value(value)?,
-        }),
-        CorePatchOp::Replace { key, value } => wit::PatchOp::Replace(wit::PatchValue {
-            key: key.clone(),
-            value: core_to_wit_value(value)?,
-        }),
-        CorePatchOp::Reassert { key, value } => wit::PatchOp::Reassert(wit::PatchValue {
-            key: key.clone(),
-            value: core_to_wit_value(value)?,
-        }),
-        CorePatchOp::Remove { key } => wit::PatchOp::Remove(key.clone()),
-    })
 }
 
 /// Convert a [`wit::PatchOp`] to a host-side [`CorePatchOp`].
@@ -2013,6 +2081,32 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Admit the metadata-only surface used by legacy state migration checks.
+///
+/// Protocol v13 changed provider initialization and create-operation WIT
+/// shapes, but retained the v12 `info`, schema, config-schema, completion, and
+/// identity-attribute function signatures. The schema JSON itself gained
+/// required fields and is upgraded by the dedicated decoders below. The
+/// migration checker invokes only those stable exports through Wasmtime's
+/// dynamic component API; it never constructs runtime bindings or calls
+/// `initialize`. Keep this compatibility window explicit rather than
+/// weakening the ordinary provider runtime gate above.
+pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), String> {
+    const LEGACY_SCHEMA_PROTOCOL_VERSION: u32 = 12;
+
+    if schema_only_protocol_version(info_json)? == LEGACY_SCHEMA_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    check_protocol_version(info_json)
+}
+
+/// Read the protocol stamp after the schema-only compatibility gate admits it.
+pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, String> {
+    let envelope: proto::ProviderInfoEnvelope =
+        serde_json::from_str(info_json).map_err(|e| format!("invalid provider info: {e}"))?;
+    Ok(envelope.protocol_version)
+}
+
 /// Deserialize JSON to validated core resource schemas.
 pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, SchemaDecodeError> {
     let proto_schemas: Vec<proto::ResourceSchema> =
@@ -2040,6 +2134,135 @@ pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, 
         serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
     carina_core::protocol_convert::protocol_to_config_schema(proto_types)
         .map_err(SchemaDecodeError::protocol_conversion)
+}
+
+/// Decode the schema metadata surface admitted for a migration-only provider.
+///
+/// Protocol v12 used the same metadata exports as the current protocol, but
+/// its JSON omitted keyed-update and nested-field lifecycle metadata and used
+/// a boolean identity flag. Upgrade those released bytes in memory; ordinary
+/// provider runtime loading continues to use [`json_to_attribute_types`] and
+/// remains strict.
+pub(crate) fn json_to_schema_only_attribute_types(
+    json: &str,
+    protocol_version: u32,
+) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
+    if protocol_version != 12 {
+        return json_to_attribute_types(json);
+    }
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+    upgrade_v12_schema_json_in_memory(&mut value);
+    let value = serde_json::to_string(&value).map_err(SchemaDecodeError::schema_json_parse)?;
+    let proto_types: BTreeMap<String, proto::AttributeType> =
+        serde_json::from_str(&value).map_err(SchemaDecodeError::schema_json_parse)?;
+    carina_core::protocol_convert::protocol_to_config_schema(proto_types)
+        .map_err(SchemaDecodeError::protocol_conversion)
+}
+
+/// Decode v12 resource-schema JSON into the current aggregate witness used only
+/// by the read-only migration checker. V12 had no reference-form declarations,
+/// so the compatibility envelope supplies an empty collection.
+pub(crate) fn json_to_schema_only_provider_schema(
+    json: &str,
+    config: CoreValidatedConfigSchema,
+    protocol_version: u32,
+) -> Result<CoreValidatedProviderSchemaWitness, SchemaDecodeError> {
+    if protocol_version != 12 {
+        return json_to_provider_schema(json, config);
+    }
+
+    let mut resources: serde_json::Value =
+        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+    upgrade_v12_schema_json_in_memory(&mut resources);
+    let envelope = serde_json::json!({
+        "resources": resources,
+        "reference_forms": [],
+    });
+    let envelope =
+        serde_json::to_string(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
+    let envelope: proto::ProviderSchemaEnvelope =
+        serde_json::from_str(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
+    carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
+        .map_err(SchemaDecodeError::protocol_conversion)
+}
+
+fn upgrade_v12_schema_json_in_memory(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                upgrade_v12_schema_json_in_memory(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if object
+                .get("resource_type")
+                .is_some_and(serde_json::Value::is_string)
+                && object
+                    .get("attributes")
+                    .is_some_and(serde_json::Value::is_object)
+            {
+                let field_groups = object
+                    .remove("exclusive_required")
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|fields| {
+                        serde_json::json!({
+                            "kind": "exactly_one",
+                            "fields": fields,
+                        })
+                    })
+                    .collect();
+                object.insert(
+                    "field_groups".to_string(),
+                    serde_json::Value::Array(field_groups),
+                );
+                object.insert(
+                    "default_prevent_destroy".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+            if object
+                .get("attr_type")
+                .is_some_and(serde_json::Value::is_object)
+                && object.get("name").is_some_and(serde_json::Value::is_string)
+                && object.contains_key("required")
+            {
+                object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
+                object.insert(
+                    "identity".to_string(),
+                    serde_json::Value::String("none".to_string()),
+                );
+            }
+            if object
+                .get("field_type")
+                .is_some_and(serde_json::Value::is_object)
+                && object.get("name").is_some_and(serde_json::Value::is_string)
+                && object.contains_key("required")
+            {
+                object.insert("create_only".to_string(), serde_json::Value::Bool(false));
+                object.insert(
+                    "identity".to_string(),
+                    serde_json::Value::String("none".to_string()),
+                );
+            }
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("list") {
+                object.insert("elements".to_owned(), serde_json::json!("allow_duplicates"));
+            }
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
+                object.insert(
+                    "field_groups".to_string(),
+                    serde_json::Value::Array(Vec::new()),
+                );
+            }
+            for child in object.values_mut() {
+                upgrade_v12_schema_json_in_memory(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -2103,6 +2326,30 @@ mod tests {
     };
 
     use super::*;
+
+    async fn prepare_conversion_request(
+        resource: CoreResource,
+    ) -> Result<CoreCreateRequest, carina_core::executor::ProviderPreparationError> {
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let bindings = carina_core::binding_index::ResolvedBindings::default();
+                let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+                let schemas = CoreSchemaRegistry::new();
+                let context = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                carina_core::executor::prepare_create_request(resource, &context).await
+            },
+        )
+        .await
+    }
 
     fn root_resource_ref(binding: &str, attribute: &str) -> CoreValue {
         carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
@@ -2477,10 +2724,10 @@ mod tests {
 
     impl std::error::Error for TestOperationError {}
 
-    fn redacted_secret_and_digest(plaintext: &str) -> (CoreValue, String) {
-        let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String(plaintext.into()),
-        ))));
+    fn redacted_secret_and_digest(plaintext: &str) -> (CoreSnapshotValue, String) {
+        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(Box::new(
+            CoreValue::Concrete(ConcreteValue::String(plaintext.into())),
+        )));
         let persisted = carina_core::value::PersistedValue::encode_provider_value(&secret, None)
             .expect("serialize test secret")
             .as_json()
@@ -2491,10 +2738,7 @@ mod tests {
             .to_string();
         let hash = RedactedSecretHash::from_encoded_digest(&digest)
             .expect("parse generated redacted-secret digest");
-        (
-            CoreValue::Deferred(DeferredValue::RedactedSecret { hash }),
-            digest,
-        )
+        (CoreSnapshotValue::redacted(hash), digest)
     }
 
     fn proto_string() -> proto::AttributeType {
@@ -2677,18 +2921,35 @@ mod tests {
     }
 
     #[test]
-    fn host_provider_schema_decode_retains_reference_forms() {
+    fn host_provider_schema_decode_retains_reference_forms_and_unique_reference_lists() {
         use carina_core::schema::{
-            ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
-            ValidatedProviderSchemaWitness,
+            ListElements, ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity,
+            ValidatedConfigSchema, ValidatedProviderSchemaWitness,
         };
 
         let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+        let reference_identity = TypeIdentity::new(Some("test"), ["Widget"], "Reference");
         let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
                 PatternAttributeSchema::optional(
                     "name",
                     PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "keys",
+                    PatternAttributeType::refined_list(
+                        PatternAttributeType::reference(
+                            reference_identity.clone(),
+                            Some("^alias/[a-z]+$".into()),
+                            Some((Some(8), Some(12))),
+                        ),
+                        false,
+                        Some((Some(1), Some(3))),
+                        ListElements::Unique,
+                    ),
                 )
                 .build(),
             )
@@ -2702,14 +2963,26 @@ mod tests {
         };
         let witness = ValidatedProviderSchemaWitness::new(
             vec![schema],
-            ValidatedConfigSchema::default(),
-            ReferenceForms::from([(identity.clone(), form.clone())]),
+            CoreValidatedConfigSchema::default(),
+            ReferenceForms::from([
+                (identity.clone(), form.clone()),
+                (reference_identity.clone(), form.clone()),
+            ]),
         )
         .unwrap();
         let json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
 
         let decoded = json_to_provider_schema(&json, ValidatedConfigSchema::default()).unwrap();
         assert_eq!(decoded.reference_forms().get(&identity), Some(&form));
+        assert_eq!(
+            decoded.reference_forms().get(&reference_identity),
+            Some(&form)
+        );
+        let reencoded = carina_plugin_sdk::provider_schema_to_json(&decoded).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&reencoded).unwrap(),
+        );
     }
 
     #[test]
@@ -3561,12 +3834,10 @@ mod tests {
     #[test]
     fn redacted_saved_plan_secret_is_rejected_at_wasm_boundary() {
         let (value, _) = redacted_secret_and_digest("saved-plan-secret");
-        assert!(matches!(
-            core_to_wit_value(&value),
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary
-            })
-        ));
+        let error = value
+            .to_value_at("desired.token")
+            .expect_err("historical hashes cannot become ordinary WASM inputs");
+        assert_eq!(error.path(), "desired.token");
     }
 
     #[test]
@@ -3692,7 +3963,8 @@ mod tests {
         let nested = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
             "mode".to_string() => value,
         }));
-        let wit = core_to_wit_persisted_value(&nested).expect("encode persisted WIT JSON");
+        let wit =
+            core_to_wit_persisted_value(&nested.to_snapshot()).expect("encode persisted WIT JSON");
         let wit::PersistedValue::MapVal(json) = wit else {
             panic!("nested canonical enum must use map-val")
         };
@@ -3712,15 +3984,15 @@ mod tests {
     #[test]
     fn persisted_state_rejects_live_secret_without_exposing_plaintext() {
         let plaintext = "persisted-boundary-secret-must-not-leak";
-        let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String(plaintext.into()),
-        ))));
+        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(Box::new(
+            CoreValue::Concrete(ConcreteValue::String(plaintext.into())),
+        )));
         let nested = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
             "token".to_string() => secret.clone(),
         }));
 
         for value in [secret, nested] {
-            let error = core_to_wit_persisted_value(&value)
+            let error = core_to_wit_persisted_value(&value.to_snapshot())
                 .expect_err("persisted state must contain only redacted secret identity");
             assert!(matches!(
                 error,
@@ -4251,8 +4523,8 @@ mod tests {
 
     // -- State roundtrip --
 
-    #[test]
-    fn test_state_roundtrip() {
+    #[tokio::test]
+    async fn test_state_roundtrip() {
         let id = CoreResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
         let mut attrs: HashMap<String, CoreValue> = HashMap::new();
         attrs.insert(
@@ -4263,11 +4535,14 @@ mod tests {
             "region".into(),
             CoreValue::Concrete(ConcreteValue::String("us-east-1".into())),
         );
-        let core = CoreState::existing(id.clone(), attrs);
+        let core = CoreState::<carina_core::resource::NoPlaceholder>::existing(id.clone(), attrs);
 
+        let mut resource = CoreResource::from_id(id.clone());
+        resource.attributes = core.attributes.clone().into_iter().collect();
+        let request = prepare_conversion_request(resource).await.unwrap();
         let wit = wit::State {
             identifier: core.identifier.clone(),
-            attributes: core_to_wit_value_map(&core.attributes).unwrap(),
+            attributes: checked_attributes_to_wit(request.resource().wire_attributes()),
             exists: core.exists,
         };
         let back = wit_to_core_state(&wit, &id).unwrap();
@@ -4290,18 +4565,22 @@ mod tests {
         assert!(wire.directives.prevent_destroy);
     }
 
-    #[test]
-    fn test_state_with_identifier_roundtrip() {
+    #[tokio::test]
+    async fn test_state_with_identifier_roundtrip() {
         let id = CoreResourceId::with_provider_identity("aws", "ec2.Vpc", "main", None);
         let attrs = HashMap::from([(
             "cidr".into(),
             CoreValue::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
-        let core = CoreState::existing(id.clone(), attrs).with_identifier("vpc-12345");
+        let core = CoreState::<carina_core::resource::NoPlaceholder>::existing(id.clone(), attrs)
+            .with_identifier("vpc-12345");
 
+        let mut resource = CoreResource::from_id(id.clone());
+        resource.attributes = core.attributes.clone().into_iter().collect();
+        let request = prepare_conversion_request(resource).await.unwrap();
         let wit = wit::State {
             identifier: core.identifier.clone(),
-            attributes: core_to_wit_value_map(&core.attributes).unwrap(),
+            attributes: checked_attributes_to_wit(request.resource().wire_attributes()),
             exists: core.exists,
         };
         assert_eq!(wit.identifier, Some("vpc-12345".into()));
@@ -4313,7 +4592,7 @@ mod tests {
     fn persisted_state_and_saved_attrs_use_redacted_secret_variants() {
         let (redacted, digest) = redacted_secret_and_digest("wire-secret");
         let id = CoreResourceId::with_provider_identity("aws", "test.Resource", "example", None);
-        let state = CoreState::existing(
+        let state = CoreSnapshotState::existing(
             id.clone(),
             HashMap::from([("token".to_string(), redacted.clone())]),
         );
@@ -4339,18 +4618,17 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn desired_resource_rejects_redacted_secret_placeholder() {
+    #[tokio::test]
+    async fn desired_resource_rejects_redacted_secret_placeholder() {
         let (redacted, _) = redacted_secret_and_digest("desired-secret");
-        let resource = CoreResource::with_provider("aws", "test.Resource", "example", None)
-            .with_attribute("token", redacted);
-
-        assert!(matches!(
-            core_to_wit_resource(&resource),
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary
-            })
-        ));
+        let saved: CoreResource<carina_core::resource::ModuleSource, SnapshotLeaf> =
+            CoreResource::with_provider("aws", "test.Resource", "example", None)
+                .to_snapshot()
+                .with_attribute("token", redacted);
+        let error = saved
+            .to_value_resource()
+            .expect_err("a saved hash cannot be restored as a desired resource");
+        assert_eq!(error.path(), format!("{}.token", saved.id));
     }
 
     #[test]
@@ -4370,10 +4648,10 @@ mod tests {
         .expect("persisted state value");
         assert!(matches!(
             state.get("token"),
-            Some(CoreValue::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-                if CoreValue::Deferred(DeferredValue::RedactedSecret {
+            Some(CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash: loaded })))
+                if CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret {
                     hash: loaded.clone()
-                }) == expected
+                })) == expected
         ));
     }
 
@@ -4438,7 +4716,9 @@ mod tests {
         );
         assert!(matches!(
             values.get("typed"),
-            Some(CoreValue::Deferred(DeferredValue::RedactedSecret { .. }))
+            Some(CoreValue::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { .. }
+            )))
         ));
         assert_eq!(
             values.get("$secret"),
@@ -4471,7 +4751,8 @@ mod tests {
     fn persisted_core_redacted_secrets_use_the_dedicated_wit_variant() {
         let (redacted, digest) = redacted_secret_and_digest("core-to-wit-secret");
         let id = CoreResourceId::with_provider_identity("mock", "test.Resource", "main", None);
-        let state = CoreState::existing(id, HashMap::from([("token".to_string(), redacted)]));
+        let state =
+            CoreSnapshotState::existing(id, HashMap::from([("token".to_string(), redacted)]));
         let wit = core_to_wit_persisted_state(&state).expect("encode persisted state");
 
         assert!(matches!(
@@ -4479,12 +4760,10 @@ mod tests {
             [(key, wit::PersistedValue::RedactedSecretVal(value))]
                 if key == "token" && value == &digest
         ));
-        assert!(matches!(
-            core_to_wit_value(state.attributes.get("token").unwrap()),
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary
-            })
-        ));
+        let error = state.attributes["token"]
+            .to_value_at("current.token")
+            .expect_err("persisted hashes cannot become ordinary WASM inputs");
+        assert_eq!(error.path(), "current.token");
     }
 
     #[test]
@@ -4519,8 +4798,8 @@ mod tests {
 
     // -- Value map helpers --
 
-    #[test]
-    fn test_value_map_roundtrip() {
+    #[tokio::test]
+    async fn test_value_map_roundtrip() {
         let map: HashMap<String, CoreValue> = vec![
             (
                 "a".into(),
@@ -4531,15 +4810,18 @@ mod tests {
         .into_iter()
         .collect();
 
-        let wit = core_to_wit_value_map(&map).unwrap();
+        let mut resource = CoreResource::new("test", "value-map");
+        resource.attributes = map.clone().into_iter().collect();
+        let request = prepare_conversion_request(resource).await.unwrap();
+        let wit = checked_attributes_to_wit(request.resource().wire_attributes());
         let back = wit_to_core_value_map(&wit).unwrap();
         assert_eq!(map, back);
     }
 
     // -- Resource roundtrip --
 
-    #[test]
-    fn test_resource_roundtrip() {
+    #[tokio::test]
+    async fn test_resource_roundtrip() {
         let mut resource = CoreResource::with_provider("aws", "s3.Bucket", "my-bucket", None);
         resource.attributes = indexmap::IndexMap::from([
             (
@@ -4552,7 +4834,8 @@ mod tests {
             ),
         ]);
 
-        let wit = core_to_wit_resource(&resource).unwrap();
+        let request = prepare_conversion_request(resource.clone()).await.unwrap();
+        let wit = core_to_wit_create_request(&request).res;
         assert_eq!(wit.id.provider, "aws");
         assert_eq!(wit.id.resource_type, "s3.Bucket");
         assert_eq!(wit.id.identity, "my-bucket");
@@ -4700,6 +4983,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_and_update_wire_values_keep_plaintext_secrets() {
+        carina_core::validation::deferred_types::with_session_for_test_async(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+
+        struct LateSecrets;
+        impl carina_core::provider::ProviderNormalizer for LateSecrets {
+            fn normalize_desired<'a>(
+                &'a self,
+                resources: &'a mut [carina_core::resource::ProviderResource],
+            ) -> carina_core::provider::BoxFuture<'a, carina_core::provider::ProviderResult<()>>
+            {
+                Box::pin(async move {
+                    let secret = |text: &str| {
+                        CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+                            ConcreteValue::String(text.into()),
+                        ))))
+                    };
+                    for resource in resources {
+                        resource.set_attr("top", secret("top-plaintext"));
+                        resource.set_attr("reasserted", secret("top-plaintext"));
+                        resource.set_attr(
+                            "nested",
+                            CoreValue::Concrete(ConcreteValue::Map(
+                                [(
+                                    "items".into(),
+                                    CoreValue::Concrete(ConcreteValue::List(vec![secret(
+                                        "nested-plaintext",
+                                    )])),
+                                )]
+                                .into_iter()
+                                .collect(),
+                            )),
+                        );
+                    }
+                    Ok(())
+                })
+            }
+            fn normalize_state<'a>(
+                &'a self,
+                _: &'a mut carina_core::provider::StateTransformMap,
+            ) -> carina_core::provider::BoxFuture<'a, carina_core::provider::ProviderResult<()>>
+            {
+                carina_core::provider::ready_noop()
+            }
+            fn hydrate_read_state<'a>(
+                &'a self,
+                _: &'a mut carina_core::provider::StateTransformMap,
+                _: &'a carina_core::provider::SavedAttrs,
+            ) -> carina_core::provider::BoxFuture<'a, carina_core::provider::ProviderResult<()>>
+            {
+                carina_core::provider::ready_noop()
+            }
+        }
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let mut schemas = CoreSchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test")
+                .attribute(
+                    PatternAttributeSchema::optional("top", PatternAttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("reasserted", PatternAttributeType::string())
+                        .write_only()
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &LateSecrets,
+            &[],
+            &schemas,
+ type_checks,
+);
+        let resource = CoreResource::new("test", "secret-boundaries");
+        let create = carina_core::executor::prepare_create_request(resource.clone(), &context)
+            .await
+            .unwrap();
+        let create = core_to_wit_create_request(&create).res;
+        let from = CoreState::<carina_core::resource::NoPlaceholder>::existing(
+            resource.id.clone(),
+            HashMap::from([
+                (
+                    "nested".into(),
+                    CoreValue::Concrete(ConcreteValue::Map(Default::default())),
+                ),
+                (
+                    "reasserted".into(),
+                    CoreValue::Concrete(ConcreteValue::String("old".into())),
+                ),
+            ]),
+        );
+        let update = carina_core::executor::prepare_update_request(
+            resource,
+            from.to_snapshot(),
+            &["top".into(), "nested".into()],
+            &context,
+        )
+        .await
+        .unwrap();
+        let update = core_to_wit_update_request(&update).unwrap().patch;
+        assert!(matches!(&update.ops[0], wit::PatchOp::Add(value) if value.key == "top"));
+        assert!(matches!(&update.ops[1], wit::PatchOp::Replace(value) if value.key == "nested"));
+        assert!(
+            matches!(&update.ops[2], wit::PatchOp::Reassert(value) if value.key == "reasserted")
+        );
+        let update_values: Vec<_> = update
+            .ops
+            .iter()
+            .map(|op| match op {
+                wit::PatchOp::Add(value)
+                | wit::PatchOp::Replace(value)
+                | wit::PatchOp::Reassert(value) => (value.key.clone(), value.value.clone()),
+                wit::PatchOp::Remove(_) => panic!("the secret patch contains only values"),
+            })
+            .collect();
+        assert_eq!(create.attributes.len(), 3);
+        assert_eq!(update_values.len(), 3);
+        for attributes in [&create.attributes, &update_values] {
+            for (name, value) in attributes {
+                match (name.as_str(), value) {
+                    ("top" | "reasserted", wit::Value::SecretVal(json)) => {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                            serde_json::json!("top-plaintext")
+                        );
+                    }
+                    ("nested", wit::Value::MapVal(json)) => {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                            serde_json::json!({"items": ["nested-plaintext"]})
+                        );
+                    }
+                    _ => panic!("CRUD must preserve real secret wire values"),
+                }
+            }
+        }
+
+        },
+    ).await
+    }
+
+    #[tokio::test]
     async fn test_update_patch_round_trip_preserves_op_order_and_kinds() {
         use carina_core::resource::Value as CV;
         let (persisted_secret, digest) = redacted_secret_and_digest("patch-secret");
@@ -4710,7 +5144,7 @@ mod tests {
                 "token",
                 CV::Concrete(ConcreteValue::String("unchanged".into())),
             );
-        let from = CoreState::existing(
+        let from = CoreSnapshotState::existing(
             resource.id.clone(),
             HashMap::from([
                 ("b".to_string(), CV::Concrete(ConcreteValue::Int(1))),
@@ -4739,6 +5173,12 @@ mod tests {
                 .validate()
                 .expect("test schema must be valid"),
         );
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            std::sync::Arc::new(Vec::new()),
+            schemas.clone(),
+            carina_core::EnvironmentSnapshot::empty(),
+        );
+        carina_core::validation::deferred_types::with_session_for_test_async(provider_types.provider_context(), async |type_checks| {
         let preparation = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
             &module_gate,
@@ -4746,6 +5186,7 @@ mod tests {
             &carina_core::provider::NoopNormalizer,
             &[],
             &schemas,
+            type_checks,
         );
         let request = carina_core::executor::prepare_update_request(
             resource,
@@ -4753,8 +5194,9 @@ mod tests {
             &["a".to_string(), "b".to_string(), "c".to_string()],
             &preparation,
         )
-        .await
-        .expect("checked request should be prepared");
+        .await;
+        let request =
+            request.expect("checked request should be prepared");
         let wit_request = core_to_wit_update_request(&request).unwrap();
         assert!(wit_request.current.attributes.iter().any(|(key, value)| {
             key == "persisted_token"
@@ -4785,6 +5227,7 @@ mod tests {
             back[3].sent_value(),
             Some(&CV::Concrete(ConcreteValue::String("unchanged".into())))
         );
+    }).await
     }
 
     #[test]
@@ -4818,22 +5261,27 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v17_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 17);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 17);
+    fn test_protocol_version_range_accepts_only_the_current_version() {
+        assert_eq!(
+            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION,
+            carina_provider_protocol::PROTOCOL_VERSION
+        );
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_pre_v17_provider() {
-        for version in [13, 14, 15, 16] {
+    fn test_check_protocol_version_rejects_older_providers() {
+        for version in 13..carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION {
             let error = check_protocol_version(
             &format!(r#"{{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":{version}}}"#),
         )
-        .expect_err("a v17 host must reject an older provider before schema decoding");
+        .expect_err("the host must reject an older provider before schema decoding");
 
             assert!(error.contains("provider 'old'"));
             assert!(error.contains(&format!("protocol version {version}")));
-            assert!(error.contains("requires at least version 17"));
+            assert!(error.contains(&format!(
+                "requires at least version {}",
+                carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+            )));
         }
     }
 
@@ -4894,70 +5342,6 @@ mod tests {
 
     #[test]
     fn released_protocol_v12_schema_fixtures_require_current_metadata_before_core_decode() {
-        fn upgrade_v12_fixture_in_memory(value: &mut serde_json::Value) {
-            match value {
-                serde_json::Value::Array(values) => {
-                    for value in values {
-                        upgrade_v12_fixture_in_memory(value);
-                    }
-                }
-                serde_json::Value::Object(object) => {
-                    if object.contains_key("resource_type") {
-                        let field_groups = object
-                            .remove("exclusive_required")
-                            .and_then(|value| value.as_array().cloned())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|fields| {
-                                serde_json::json!({
-                                    "kind": "exactly_one",
-                                    "fields": fields,
-                                })
-                            })
-                            .collect();
-                        object.insert(
-                            "field_groups".to_string(),
-                            serde_json::Value::Array(field_groups),
-                        );
-                        object.insert(
-                            "default_prevent_destroy".to_string(),
-                            serde_json::Value::Bool(false),
-                        );
-                    }
-                    if object.contains_key("attr_type") {
-                        object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
-                        object.insert(
-                            "identity".to_string(),
-                            serde_json::Value::String("none".to_string()),
-                        );
-                    }
-                    if object.contains_key("field_type") {
-                        object.insert("create_only".to_string(), serde_json::Value::Bool(false));
-                        object.insert(
-                            "identity".to_string(),
-                            serde_json::Value::String("none".to_string()),
-                        );
-                    }
-                    if object.get("type").and_then(serde_json::Value::as_str) == Some("list") {
-                        object.insert(
-                            "elements".to_string(),
-                            serde_json::json!("allow_duplicates"),
-                        );
-                    }
-                    if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
-                        object.insert(
-                            "field_groups".to_string(),
-                            serde_json::Value::Array(Vec::new()),
-                        );
-                    }
-                    for child in object.values_mut() {
-                        upgrade_v12_fixture_in_memory(child);
-                    }
-                }
-                _ => {}
-            }
-        }
-
         let fixtures = [
             (
                 "acm.Certificate",
@@ -4998,7 +5382,7 @@ mod tests {
             // protocol-v16 field gate.
             let mut upgraded: serde_json::Value =
                 serde_json::from_str(json).expect("released fixture is valid JSON");
-            upgrade_v12_fixture_in_memory(&mut upgraded);
+            upgrade_v12_schema_json_in_memory(&mut upgraded);
             let upgraded = serde_json::to_string(&upgraded).expect("upgraded fixture serializes");
             let schemas = json_to_schemas(&upgraded).unwrap_or_else(|error| {
                 panic!(
@@ -5656,6 +6040,82 @@ mod tests {
     }
 
     #[test]
+    fn schema_only_loads_released_protocol_v12_schema_fixtures() {
+        for (resource_type, json) in [
+            (
+                "acm.Certificate",
+                include_str!(
+                    "../tests/fixtures/protocol-v12/aws-acm-domain-validation-options.json"
+                ),
+            ),
+            (
+                "ec2.EgressOnlyInternetGateway",
+                include_str!(
+                    "../tests/fixtures/protocol-v12/released-aws-egress-only-internet-gateway.json"
+                ),
+            ),
+            (
+                "ec2.Vpc",
+                include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
+            ),
+        ] {
+            let witness =
+                json_to_schema_only_provider_schema(json, CoreValidatedConfigSchema::default(), 12)
+                    .expect(
+                        "released v12 schema metadata must load through the migration-only decoder",
+                    );
+            assert_eq!(witness.resources()[0].parts().resource_type, resource_type);
+        }
+    }
+
+    #[test]
+    fn schema_only_v12_upgrade_distinguishes_fields_from_attribute_names() {
+        let config = json_to_schema_only_attribute_types(
+            r#"{
+                "attr_type":{"type":"String"},
+                "nested":{
+                    "type":"struct",
+                    "name":"Nested",
+                    "fields":[{
+                        "name":"value",
+                        "field_type":{"type":"String"},
+                        "required":false,
+                        "write_only":false
+                    }]
+                }
+            }"#,
+            12,
+        )
+        .expect("v12 config metadata must be upgraded in memory");
+        assert!(config.parts().contains_key("attr_type"));
+        assert!(config.parts().contains_key("nested"));
+
+        let witness = json_to_schema_only_provider_schema(
+            r#"[{
+                "resource_type":"test.FlowLog",
+                "attributes":{
+                    "resource_type":{
+                        "name":"resource_type",
+                        "attr_type":{"type":"String"},
+                        "required":true
+                    }
+                },
+                "exclusive_required":[]
+            }]"#,
+            CoreValidatedConfigSchema::default(),
+            12,
+        )
+        .expect("an attribute named resource_type must not be mistaken for a resource schema");
+        assert_eq!(witness.resources().len(), 1);
+        assert!(
+            witness.resources()[0]
+                .parts()
+                .attributes
+                .contains_key("resource_type")
+        );
+    }
+
+    #[test]
     fn json_to_attribute_types_rejects_malformed_json() {
         let error = json_to_attribute_types("not json").unwrap_err();
         let rendered = render_error_chain(&error);
@@ -6060,7 +6520,7 @@ mod tests {
             dsl_transform: Some(proto::DslTransform::HyphenToUnderscore),
         };
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
-        let state = carina_core::resource::Value::Concrete(
+        let state: CoreSnapshotValue = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("ap-northeast-1a".into()),
         );
 
@@ -6097,7 +6557,7 @@ mod tests {
         };
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
 
-        let garbage = carina_core::resource::Value::Concrete(
+        let garbage: CoreSnapshotValue = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("garbage-not-an-az".into()),
         );
         assert_eq!(
@@ -6106,7 +6566,7 @@ mod tests {
             "unknown dynamic enum strings must remain String for strict validation"
         );
 
-        let az_shaped_garbage = carina_core::resource::Value::Concrete(
+        let az_shaped_garbage: CoreSnapshotValue = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("foo_bar_42".into()),
         );
         assert_eq!(
@@ -6115,7 +6575,7 @@ mod tests {
             "already-DSL-looking unknown strings must stay String without data-form membership"
         );
 
-        let already_dsl = carina_core::resource::Value::Concrete(
+        let already_dsl: CoreSnapshotValue = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::enum_identifier("ap_northeast_1a".to_string()),
         );
         match carina_core::utils::lift_enum_leaves(&already_dsl, &core_attr) {
@@ -6131,7 +6591,7 @@ mod tests {
         }
 
         for raw in ["   ", "", "AP-NORTHEAST-1A"] {
-            let value = carina_core::resource::Value::Concrete(
+            let value: carina_core::resource::Value = carina_core::resource::Value::Concrete(
                 carina_core::resource::ConcreteValue::String(raw.to_string().into()),
             );
             assert_eq!(
@@ -6141,7 +6601,7 @@ mod tests {
             );
         }
 
-        let valid = carina_core::resource::Value::Concrete(
+        let valid: carina_core::resource::Value = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("ap-northeast-1a".into()),
         );
         match carina_core::utils::lift_enum_leaves(&valid, &core_attr) {
@@ -6801,5 +7261,13 @@ mod tests {
                 .validate_with_resolver(&attrs, &|_| false, &resolver)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn schema_only_protocol_check_admits_v12_without_weakening_runtime_check() {
+        let info = r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#;
+
+        assert!(check_schema_only_protocol_version(info).is_ok());
+        assert!(check_protocol_version(info).is_err());
     }
 }

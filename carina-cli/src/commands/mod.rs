@@ -16,11 +16,11 @@ pub mod state;
 pub(crate) mod state_output;
 pub mod validate;
 
-use carina_core::paths::{CanonicalPath, ResolvedPath};
+use carina_core::paths::ResolvedPath;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
+use crate::output_style::Colorize;
 use carina_core::config_loader::{DuplicateDeclaration, UnresolvedConfigSnapshot};
 use carina_core::module_resolver;
 use carina_core::parser::BackendConfig;
@@ -34,7 +34,6 @@ use carina_state::{
 };
 #[cfg(test)]
 use carina_state::{BackendError, StateBackend};
-use colored::Colorize;
 
 pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
 
@@ -43,7 +42,8 @@ use crate::module_walk::ModuleWalk;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::wiring::ProviderLoad;
 use crate::wiring::{
-    NonEmptyValidationErrors, ParserCanonicalResourcePair, WiringContext,
+    NonEmptyValidationErrors, ParserCanonicalResourcePair, ValidationProviderCatalog,
+    ValidationProviderCatalogExt, WiringContext,
     compute_anonymous_identifiers_with_policy_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
@@ -90,7 +90,10 @@ pub(crate) enum ReadBackendWarningPolicy<'a> {
     /// A top-level command reading the current project's state.
     CommandBoundary { project_dir: &'a Path },
     /// An `upstream_state` read, deduplicated by canonical source directory.
-    UpstreamSource { source_dir: &'a ResolvedPath },
+    UpstreamSource {
+        source_dir: &'a ResolvedPath,
+        runtime: &'a crate::runtime::CommandRuntime,
+    },
 }
 
 /// Resolve the backend for a read-only state operation.
@@ -100,6 +103,7 @@ pub(crate) enum ReadBackendWarningPolicy<'a> {
 /// [`ResolvedReadBackend`] points at the locked old backend. A warning policy
 /// is mandatory and is applied before the readable backend is returned.
 pub(crate) async fn resolve_backend_for_read<P: PlaceholderKind, B: BindingAddress>(
+    color_mode: crate::output_style::ColorMode,
     base_dir: &ResolvedPath,
     command_path: &Path,
     backend_config: Option<&BackendConfig<P, B>>,
@@ -115,7 +119,7 @@ pub(crate) async fn resolve_backend_for_read<P: PlaceholderKind, B: BindingAddre
     }
     let backend = selection
         .resolve_with_drift_warning(|drift| {
-            emit_read_backend_drift_warning(drift, warning_policy);
+            emit_read_backend_drift_warning(color_mode, drift, warning_policy);
         })
         .await?;
     Ok(backend)
@@ -143,22 +147,22 @@ pub fn verify_for_mutation<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-static WARNED_UPSTREAM_BACKEND_DRIFT: OnceLock<Mutex<HashSet<CanonicalPath>>> = OnceLock::new();
-
-fn emit_read_backend_drift_warning(drift: &BackendDrift, policy: ReadBackendWarningPolicy<'_>) {
+fn emit_read_backend_drift_warning(
+    color_mode: crate::output_style::ColorMode,
+    drift: &BackendDrift,
+    policy: ReadBackendWarningPolicy<'_>,
+) {
     let warning = match policy {
         ReadBackendWarningPolicy::CommandBoundary { project_dir } => {
             drift_warning(drift.existing(), drift.configured(), project_dir)
         }
-        ReadBackendWarningPolicy::UpstreamSource { source_dir } => {
-            let warned = WARNED_UPSTREAM_BACKEND_DRIFT.get_or_init(|| Mutex::new(HashSet::new()));
-            let mut warned = warned
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !warned.insert(source_dir.identity()) {
+        ReadBackendWarningPolicy::UpstreamSource {
+            source_dir,
+            runtime,
+        } => {
+            if !runtime.first_upstream_warning(source_dir) {
                 return;
             }
-            drop(warned);
 
             upstream_backend_drift_warning(
                 drift,
@@ -167,7 +171,7 @@ fn emit_read_backend_drift_warning(drift: &BackendDrift, policy: ReadBackendWarn
         }
     };
 
-    eprintln!("{}", warning.yellow());
+    eprintln!("{}", warning.yellow(color_mode));
 }
 
 fn upstream_backend_drift_warning(drift: &BackendDrift, source: &Path) -> String {
@@ -320,14 +324,14 @@ pub fn validate_and_resolve_with_config(
 /// Test-support entry point that exercises the real command-scoped provider loader.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_with_provider_load_for_test(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
     let (providers, load_error) =
-        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+        ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
     if let Some(error) = load_error {
         return Err(error);
     }
@@ -474,6 +478,18 @@ fn extend_module_resolution_errors(
     }
 }
 
+/// Backend checks depend on authored values, even when provider loading fails.
+pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
+    if !carina_core::validation::is_module_definition(parsed)
+        && let Some(backend) = &parsed.backend
+        && let Err(error) = StateBackendConfig::try_from(backend)
+    {
+        vec![AppError::Backend(error.into())]
+    } else {
+        Vec::new()
+    }
+}
+
 fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>(
     errors: &mut Vec<AppError>,
     report: &carina_core::validation::BindingUseReport,
@@ -481,6 +497,7 @@ fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>
         P,
         carina_core::resource::AbsoluteBindingAddress,
     >],
+    provider_context: &carina_core::parser::ProviderContext,
 ) {
     extend_module_call_errors(
         errors,
@@ -489,6 +506,7 @@ fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>
                 binding_use_report: report,
                 compositions,
             },
+            provider_context,
         ),
     );
 }
@@ -499,7 +517,8 @@ pub(crate) fn validate_and_resolve_errors_inner(
     mut parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
     ctx: &WiringContext,
-    load_errors: &HashMap<String, String>,
+    enriched_context: &ValidationProviderCatalog,
+    _load_errors: &HashMap<String, String>,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
@@ -510,7 +529,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
-    let module_walk = ModuleWalk::load(parsed.parsed(), base_dir);
+    let module_walk = ModuleWalk::load(
+        parsed.parsed(),
+        base_dir,
+        &enriched_context.catalog().environment,
+    );
 
     let mut errors: Vec<AppError> = Vec::new();
     if !skip_resource_validation {
@@ -532,8 +555,10 @@ pub(crate) fn validate_and_resolve_errors_inner(
     }
 
     if !skip_resource_validation {
-        let schema_checked_exports =
-            parsed.retry_unchecked_export_inference(ctx.loaded_provider_schemas());
+        let schema_checked_exports = parsed.retry_unchecked_export_inference(
+            ctx.loaded_provider_schemas(),
+            enriched_context.catalog(),
+        );
         errors.extend(
             carina_core::validation::inference::attached_inference_failures(schema_checked_exports)
                 .map(|failure| {
@@ -558,50 +583,13 @@ pub(crate) fn validate_and_resolve_errors_inner(
         errors.push(AppError::Validation(msg));
     }
 
-    // Check for declared providers whose plugins failed to load.
-    // Named instances (`binding.is_some()`) deliberately omit `source` —
-    // the parser enforces that `source` is a kind-level property
-    // (carina#3023). They inherit the kind default's plugin, so
-    // they only matter to this check when the *kind default* could
-    // not be loaded, which is already reported via the
-    // `factories().iter().any(...)` lookup on the kind's name.
-    if !skip_resource_validation {
-        for provider in &parsed.providers {
-            let loaded = ctx.factories().iter().any(|f| f.name() == provider.name);
-            let uses_builtin_provider = carina_provider_mock::uses_builtin_provider(
-                std::iter::once(provider),
-                |provider_name| {
-                    ctx.factories()
-                        .iter()
-                        .any(|factory| factory.name() == provider_name)
-                },
-            );
-            if loaded {
-                continue;
-            }
-            if let Some(reason) = load_errors.get(&provider.name) {
-                errors.push(AppError::Validation(reason.clone()));
-            } else if provider.is_default() && provider.source.is_none() && !uses_builtin_provider {
-                errors.push(AppError::Validation(missing_provider_source_message(
-                    &provider.name,
-                )));
-            }
-        }
-    }
-
     // Validate provider region
     errors.extend(validate_provider_region_with_ctx(ctx, parsed.parsed()));
 
-    if !carina_core::validation::is_module_definition(&parsed)
-        && let Some(backend) = &parsed.backend
-        && let Err(error) = StateBackendConfig::try_from(backend)
-    {
-        errors.push(AppError::Backend(error.into()));
-    }
+    errors.extend(validate_root_backend(parsed.parsed()));
 
-    // Provider validation minted this loaded context from the exact factories
-    // and schemas retained by `ctx`.
-    let enriched_context = ctx.provider_context();
+    // The catalog retains the schemas available in `ctx`, including explicit
+    // unavailable owners when provider loading is skipped.
 
     // carina#3239: reject `arguments { foo: TotallyMadeUpType }`-shaped
     // unknown bare custom-type names in the root parse. The root
@@ -615,6 +603,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // below runs this same typed resolver over every imported module.
     let mut root_type_resolution_findings = Vec::new();
     let type_resolution = parsed.resolve_type_exprs_report(enriched_context);
+    let resolved_argument_types = type_resolution.resolved_argument_types().clone();
     for diagnostic in type_resolution.into_diagnostics() {
         match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
             Ok(finding) => root_type_resolution_findings.push(finding),
@@ -622,7 +611,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         }
     }
     extend_module_call_errors(&mut errors, root_type_resolution_findings);
-    if let Err(error) = parsed.resolve_resource_refs_with_config(enriched_context) {
+    if let Err(error) = parsed.resolve_resource_refs_in_session(enriched_context) {
         errors.push(AppError::Config(error.to_string()));
     }
     if !skip_resource_validation {
@@ -639,7 +628,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     let imported_module_signatures = module_resolver::load_resolved_module_signatures(
         parsed.parsed(),
         base_dir,
-        enriched_context,
+        enriched_context.catalog(),
     );
 
     // Consume caller-authored uses before the shared module-call checker or
@@ -649,12 +638,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // resource checks, but it cannot mint validation readiness.
     let binding_use_report = carina_core::validation::check_bare_binding_uses(
         parsed.parsed(),
-        &carina_core::validation::ValidationTypeContext::new(
-            parsed.parsed(),
-            ctx.schemas(),
-            enriched_context,
-            &imported_module_signatures,
-        ),
+        &enriched_context.type_context(parsed.parsed(), ctx.schemas(), &imported_module_signatures),
     );
     extend_binding_use_errors(&mut errors, &binding_use_report);
     for module in module_walk.iter() {
@@ -662,26 +646,19 @@ pub(crate) fn validate_and_resolve_errors_inner(
         let module_signatures = module_resolver::load_resolved_module_signatures(
             module_parsed,
             module.module_path(),
-            enriched_context,
+            enriched_context.catalog(),
         );
         let report = carina_core::validation::check_bare_binding_uses(
             module_parsed,
-            &carina_core::validation::ValidationTypeContext::new(
-                module_parsed,
-                ctx.schemas(),
-                enriched_context,
-                &module_signatures,
-            ),
+            &enriched_context.type_context(module_parsed, ctx.schemas(), &module_signatures),
         );
         extend_binding_use_errors(&mut errors, &report);
     }
 
     let authored_module_call_findings = {
         let module_call_bindings =
-            carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
-                parsed.parsed(),
-                ctx.schemas(),
-                &imported_module_signatures,
+            carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                parsed.parsed(), ctx.schemas(), None, &imported_module_signatures, enriched_context,
             );
         let reference_checks = if skip_resource_validation {
             carina_core::validation::ModuleCallReferenceChecks::Skipped
@@ -724,6 +701,15 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // collect concrete constraint outcomes before all typed findings are
     // merged below.
     if !errors.is_empty() {
+        // Dependency diagnostics are independent of unrelated argument-type
+        // failures. The per-argument report preserves every sound result even
+        // when expansion cannot proceed to the final graph check.
+        if !skip_resource_validation {
+            errors.extend(validate_depends_on_with_ctx(
+                parsed.parsed(),
+                &resolved_argument_types,
+            ));
+        }
         extend_module_call_errors(&mut errors, authored_module_call_findings);
         return Err(non_empty_validation_failure(errors));
     }
@@ -786,7 +772,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // are promoted into the typed `default_tags` field. See #2717.
     if let Err(e) = carina_core::parser::resolve_expanded_provider_unresolved_attributes(
         &mut parsed,
-        enriched_context,
+        enriched_context.catalog(),
     ) {
         errors.push(AppError::Config(format!(
             "Provider attribute resolution error: {}",
@@ -806,15 +792,15 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // use the same mandatory provider context.
     let binding_use_report = carina_core::validation::check_expanded_bare_binding_uses(
         &parsed,
-        &carina_core::validation::ValidationTypeContext::new(
-            &parsed,
-            ctx.schemas(),
-            enriched_context,
-            &imported_module_signatures,
-        ),
+        &enriched_context.type_context(&parsed, ctx.schemas(), &imported_module_signatures),
     );
     extend_binding_use_errors(&mut errors, &binding_use_report);
-    extend_expanded_binding_use_errors(&mut errors, &binding_use_report, &parsed.compositions);
+    extend_expanded_binding_use_errors(
+        &mut errors,
+        &binding_use_report,
+        &parsed.compositions,
+        enriched_context.catalog(),
+    );
     if !binding_use_report.is_ready() {
         return Err(non_empty_validation_failure(errors));
     }
@@ -855,7 +841,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
     };
-    for error in parsed.directive_resolution_errors(placeholder_boundary, ctx.schemas()) {
+    for error in parsed.directive_resolution_errors(
+        placeholder_boundary,
+        ctx.schemas(),
+        enriched_context.catalog(),
+    ) {
         errors.push(AppError::from(carina_core::resource::ExpansionError::from(
             error,
         )));
@@ -865,20 +855,41 @@ pub(crate) fn validate_and_resolve_errors_inner(
         return Err(non_empty_validation_failure(errors));
     }
 
-    let (upstream_exports, upstream_resolve_errors) = if skip_resource_validation {
-        (Default::default(), Vec::new())
-    } else {
+    let (upstream_exports, upstream_resolve_errors) = if !skip_resource_validation {
         carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
             base_dir,
             &parsed.upstream_states,
             enriched_context,
             Some(ctx.schemas()),
         )
+    } else {
+        (Default::default(), Vec::new())
     };
 
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+        parsed,
+        ctx.schemas(),
+        Some(&upstream_exports),
+        &imported_module_signatures,
+        enriched_context,
+    );
+    if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
+        &parsed.export_params,
+        &bindings,
+    ) {
+        errors.extend(ref_errors.into_iter().map(AppError::from));
+    }
+
     if !skip_resource_validation {
-        errors.extend(validate_resources_with_ctx(ctx, parsed, enriched_context));
-        errors.extend(validate_depends_on_with_ctx(parsed));
+        errors.extend(validate_resources_with_ctx(
+            ctx,
+            parsed,
+            enriched_context.catalog(),
+        ));
+        errors.extend(validate_depends_on_with_ctx(
+            parsed,
+            &resolved_argument_types,
+        ));
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
         errors.extend(
@@ -894,12 +905,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
             &export_value_bindings,
             enriched_context,
         );
-        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(
-            parsed,
-            ctx.schemas(),
-            &upstream_exports,
-            &imported_module_signatures,
-        );
         // Expansion-only boundary checks consume the final composition graph
         // without reloading the authored module walk.
         extend_module_call_errors(
@@ -909,6 +914,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
                     compositions: &parsed.compositions,
                     bindings: &bindings,
                 },
+                enriched_context.catalog(),
             ),
         );
         if let Err(message) = carina_core::validation::validate_resource_ref_types(
@@ -927,19 +933,13 @@ pub(crate) fn validate_and_resolve_errors_inner(
         {
             errors.extend(split_validation_message(&message));
         }
-        if let Err(message) = carina_core::validation::validate_attribute_params(
+        if let Err(message) = carina_core::validation::validate_attribute_params_with_context(
             &parsed.attribute_params,
             enriched_context,
         ) {
             errors.extend(split_validation_message(&message));
         }
         if let Err(msg) = checked_export_values {
-            errors.extend(split_validation_message(&msg));
-        }
-        if let Err(msg) = carina_core::validation::validate_export_param_ref_types_with_bindings(
-            &parsed.export_params,
-            &bindings,
-        ) {
             errors.extend(split_validation_message(&msg));
         }
         if !errors.is_empty() {
@@ -1070,6 +1070,7 @@ mod tests {
             carina_core::config_loader::InferredRootDirectory,
             &ResolvedPath,
             &WiringContext,
+            &ValidationProviderCatalog,
             &HashMap<String, String>,
             bool,
             &[DuplicateDeclaration],
@@ -1290,7 +1291,7 @@ mod tests {
 
     #[test]
     fn backend_validation_keeps_the_typed_error() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let raw = carina_core::parser::parse_file(
             r#"backend s3 {
                 bucket = "state"
@@ -1298,14 +1299,14 @@ mod tests {
                 region = true
             }"#,
             std::path::Path::new("backend.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
         let mut parsed = empty_parsed_file();
         parsed.backend = raw.backend;
         let base = tempfile::tempdir().unwrap();
         let providers = ProviderLoad::load(
-            &user_dirs,
+            &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
         )
@@ -1337,7 +1338,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_provider_load_error_shows_actual_reason() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let base = tempfile::tempdir().unwrap();
         let source_path = base.path().join("local-provider.wasm");
         let installed_path = base
@@ -1360,7 +1361,7 @@ mod tests {
         });
 
         let providers = ProviderLoad::load(
-            &user_dirs,
+            &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
         )
@@ -1394,7 +1395,7 @@ mod tests {
 
     #[test]
     fn test_provider_without_source_shows_source_hint() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         // A provider without source should tell the user to add source config.
         let mut parsed = empty_parsed_file();
         parsed.providers.push(ProviderConfig {
@@ -1409,7 +1410,7 @@ mod tests {
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
         let providers = ProviderLoad::load(
-            &user_dirs,
+            &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
         )
@@ -1435,7 +1436,7 @@ mod tests {
 
     #[test]
     fn upstream_field_check_honors_skip_resource_validation() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         // `destroy` and `state` subcommands pass `skip_resource_validation =
         // true` so they can run on projects whose upstream has drifted.
         // The static upstream-exports check must respect that gate;
@@ -1464,14 +1465,14 @@ exports {
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
             &carina_core::paths::ResolvedPath::new(&base).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
         let duplicate_declarations = loaded.duplicate_declarations;
         let parsed = loaded.parsed;
         let providers = ProviderLoad::load(
-            &user_dirs,
+            &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(&base).unwrap(),
         )
@@ -1506,7 +1507,7 @@ exports {
 
     #[test]
     fn recovery_validation_skips_export_reference_diagnostics() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let base = tempfile::tempdir().unwrap();
         std::fs::write(
             base.path().join("main.crn"),
@@ -1516,13 +1517,13 @@ exports {
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
         let parsed = loaded.parsed;
         let providers = ProviderLoad::load(
-            &user_dirs,
+            &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
         )
@@ -1545,7 +1546,7 @@ exports {
 
     #[test]
     fn module_call_reference_checks_honor_skip_resource_validation() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let fixture = tempfile::tempdir().unwrap();
         let outer = fixture.path().join("outer");
         let inner = fixture.path().join("inner");
@@ -1573,12 +1574,12 @@ attributes { loaded: Bool = true }
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load fixture");
         let providers = ProviderLoad::load(
-            &user_dirs,
+            &runtime,
             &loaded.parsed.providers,
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         )
@@ -1623,7 +1624,7 @@ let child = use { source = "./child" }
 child { values = [source] }
 "#,
             std::path::Path::new("recovery-binding.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
         let signatures = HashMap::from([(
@@ -1634,7 +1635,7 @@ child { values = [source] }
                     static_type:
                         carina_core::validation::resolve_consumer_static_type_for_signature(
                             &TypeExpr::List(Box::new(TypeExpr::String)),
-                            &ProviderContext::default(),
+                            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
                         ),
                     default: None,
                     description: None,
@@ -1650,7 +1651,7 @@ child { values = [source] }
             &carina_core::validation::ValidationTypeContext::new_providerless(
                 &parsed,
                 &schemas,
-                &ProviderContext::default(),
+                &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
                 &signatures,
             ),
         );
@@ -1663,6 +1664,7 @@ child { values = [source] }
             &[] as &[carina_core::resource::LiveComposition<
                 carina_core::resource::ParserPlaceholder,
             >],
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         );
         assert!(
             errors.iter().any(|error| {
@@ -1676,7 +1678,7 @@ child { values = [source] }
 
     #[test]
     fn duplicate_declaration_check_honors_skip_resource_validation() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let base = tempfile::tempdir().unwrap();
         std::fs::write(
             base.path().join("a.crn"),
@@ -1691,14 +1693,14 @@ child { values = [source] }
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
         let duplicate_declarations = loaded.duplicate_declarations;
         let parsed = loaded.parsed;
         let providers = ProviderLoad::load(
-            &user_dirs,
+            &runtime,
             &parsed.providers,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
         )
@@ -1752,10 +1754,6 @@ child { values = [source] }
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "ap-northeast-1".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -1766,8 +1764,17 @@ child { values = [source] }
             carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
         > {
             Box::pin(async {
-                Ok(carina_core::provider::InitializeOutcome::unavailable()
-                    .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
+                Ok(
+                    carina_core::provider::InitializeOutcome::unavailable().with_provider(
+                        Box::new(
+                            carina_provider_mock::ConfiguredBuiltinMock::new(
+                                carina_provider_mock::MockBehavior::default(),
+                                carina_provider_mock::MockScope::memory(),
+                            )
+                            .create_provider(),
+                        ),
+                    ),
+                )
             })
         }
 
@@ -1850,6 +1857,7 @@ child { values = [source] }
         let aws = resource_create_only_enum_file("aws.Region.ap_northeast_1");
 
         let providers = ProviderLoad::for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
                 ResourceCreateOnlyEnumFactory {
                     enum_provider: "awscc",
@@ -1868,6 +1876,7 @@ child { values = [source] }
         .expect("awscc spelling must validate");
 
         let providers = ProviderLoad::for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
                 ResourceCreateOnlyEnumFactory {
                     enum_provider: "aws",

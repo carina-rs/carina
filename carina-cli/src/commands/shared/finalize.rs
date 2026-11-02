@@ -1,7 +1,7 @@
 use crate::error::AppError;
+use crate::output_style::Colorize;
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_state::StateBackend;
-use colored::Colorize;
 use std::future::Future;
 
 use super::lock_heartbeat::{StateLock, StateLockRef};
@@ -71,6 +71,7 @@ pub(crate) async fn release_lock_after_execute(
 
 /// Finish a lock-owning command, releasing only when ownership survived.
 pub(crate) async fn finish_lock_command<T>(
+    color_mode: crate::output_style::ColorMode,
     backend: &dyn StateBackend,
     outcome: LockCommandOutcome<Result<T, AppError>>,
     shutdown: &ShutdownToken,
@@ -85,7 +86,7 @@ pub(crate) async fn finish_lock_command<T>(
         && release_result.is_ok()
         && (result.is_ok() || matches!(result, Err(AppError::Interrupted)))
     {
-        println!("  {} Lock released", "✓".green());
+        println!("  {} Lock released", "✓".green(color_mode));
     }
 
     let value = result?;

@@ -14,11 +14,9 @@
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::Value;
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
 };
-use indexmap::IndexMap;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -51,9 +49,6 @@ impl ProviderFactory for WaitTestFactory {
         _value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
     fn create_provider(
         &self,
@@ -157,7 +152,11 @@ impl Provider for NoopProvider {
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
         let id = resource.id.clone();
-        Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })
+        Box::pin(async move {
+            Ok(carina_core::resource::State::<
+                carina_core::resource::NoPlaceholder,
+            >::existing(id, HashMap::new()))
+        })
     }
     fn create(
         &self,
@@ -278,6 +277,140 @@ fn validate_accepts_well_formed_wait_multi_file_fixture() {
         !diags.iter().any(|d| d.contains("wait")),
         "well-formed wait fixture must not produce wait-related errors; got: {:?}",
         diags
+    );
+}
+
+fn wait_depends_on_fixture(dependency: &str, sibling: &str) -> TempDir {
+    write_fixture(&[
+        ("providers.crn", "provider aws {}\n"),
+        (
+            "resources.crn",
+            &format!(
+                "let cert = aws.acm.Certificate {{ domain_name = \"example.com\" }}\n{sibling}\n"
+            ),
+        ),
+        (
+            "wait.crn",
+            &format!(
+                "let ready = wait cert {{\n    until = cert.status == \"ISSUED\"\n    depends_on = [{dependency}]\n}}\n"
+            ),
+        ),
+    ])
+}
+
+#[test]
+fn validate_rejects_wait_unknown_depends_on_in_multi_file_directory() {
+    let fixture = wait_depends_on_fixture("nope", "");
+    let diagnostics = cli_validate(&fixture);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("binding 'nope' is not declared in this scope")),
+        "validate must reject the unknown wait dependency: {diagnostics:?}"
+    );
+}
+
+fn assert_wait_depends_on_rejections(cases: &[(&str, &str, &str)]) {
+    let mut failures = Vec::new();
+    for &(dependency, declaration, expected_message) in cases {
+        let fixture = wait_depends_on_fixture(dependency, declaration);
+        let diagnostics = cli_validate(&fixture);
+        if !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains(expected_message))
+        {
+            failures.push((dependency, expected_message, diagnostics));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "validate must reject each wait dependency with the expected diagnostic: {failures:#?}"
+    );
+}
+
+#[test]
+fn validate_rejects_wait_non_resource_depends_on_in_multi_file_directory() {
+    assert_wait_depends_on_rejections(&[
+        (
+            "helper",
+            "fn helper() { 1 }",
+            "wait.depends_on on 'ready': binding 'helper' is not declared in this scope",
+        ),
+        (
+            "rec",
+            "arguments { rec: String }",
+            "wait.depends_on: expected a managed resource handle; got String",
+        ),
+    ]);
+}
+
+#[test]
+fn validate_keeps_parser_rejections_for_wait_depends_on_in_multi_file_directory() {
+    assert_wait_depends_on_rejections(&[
+        (
+            "upstream",
+            "let upstream = upstream_state { source = './upstream' }",
+            "wait.depends_on: expected a managed resource handle; got an upstream state",
+        ),
+        (
+            "secondary",
+            "let secondary = provider aws {}",
+            "wait.depends_on: expected a managed resource handle; got a provider instance",
+        ),
+        (
+            "imported",
+            "let imported = use { source = './module' }",
+            "wait.depends_on: expected a managed resource handle; got a module import",
+        ),
+        (
+            "other",
+            "let other = wait cert { until = cert.status == 'ISSUED' }",
+            "wait.depends_on: expected a managed resource handle; got a wait binding",
+        ),
+    ]);
+}
+
+#[test]
+fn validate_accepts_wait_depends_on_resource_and_data_source_in_sibling_file() {
+    for (dependency, sibling) in [
+        (
+            "dependency",
+            r#"let dependency = aws.acm.Certificate { domain_name = "dependency.example.com" }"#,
+        ),
+        (
+            "lookup",
+            r#"let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }"#,
+        ),
+    ] {
+        let fixture = wait_depends_on_fixture(dependency, sibling);
+        let diagnostics = cli_validate(&fixture);
+        assert!(diagnostics.is_empty(), "{dependency}: {diagnostics:?}");
+    }
+}
+
+#[test]
+fn validate_rejects_wait_unknown_depends_on_in_standalone_module_directory() {
+    let fixture = write_fixture(&[
+        ("arguments.crn", "arguments { domain: String }\n"),
+        (
+            "resources.crn",
+            "let cert = aws.acm.Certificate { domain_name = domain }\n",
+        ),
+        (
+            "wait.crn",
+            r#"let ready = wait cert {
+    until = cert.status == "ISSUED"
+    depends_on = [nope]
+}
+"#,
+        ),
+    ]);
+    let diagnostics = cli_validate(&fixture);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("binding 'nope' is not declared in this scope")),
+        "standalone module validation must reject the unknown wait dependency: {diagnostics:?}"
     );
 }
 

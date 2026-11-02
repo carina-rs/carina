@@ -19,7 +19,7 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
 
     let parsed = parse_directory(
         &carina_core::paths::ResolvedPath::new(&dir).unwrap(),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed for valid fixture");
 
@@ -39,7 +39,18 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
         "cert.status == aws.acm.Certificate.Status.Issued"
     );
     assert_eq!(wait.timeout_secs, Some(75 * 60));
-    assert_eq!(wait.depends_on, vec!["validation_record"]);
+    assert_eq!(
+        wait.depends_on
+            .iter()
+            .map(|operand| operand.binding_reference().to_string())
+            .collect::<Vec<_>>(),
+        ["validation_record"]
+    );
+    assert!(matches!(
+        wait.depends_on.as_slice(),
+        [carina_core::parser::UnexpandedDependencyOperand::Handle(handle)]
+            if handle.resource_type() == &carina_core::parser::ResourceTypePath::new("aws", "route53.RecordSet")
+    ));
     assert_eq!(wait.until_predicate.root, "cert");
     assert_eq!(wait.until_predicate.attribute_segments, vec!["status"]);
     assert_eq!(

@@ -77,11 +77,49 @@ fn write_multifile_root(project: &Project, body: &str) {
     project.write("providers.crn", "provider mock {}\n");
 }
 
-fn resource<'a>(plan: &'a PlanFile, binding: &str) -> &'a carina_core::resource::SavedResource {
+fn resource<'a>(
+    plan: &'a PlanFile,
+    binding: &str,
+) -> &'a carina_core::resource::Resource<
+    carina_core::resource::SavedModuleSource,
+    carina_core::resource::SnapshotLeaf,
+    carina_core::resource::AbsoluteBindingAddress,
+    (),
+> {
     plan.unresolved_resources
         .iter()
         .find(|resource| resource.binding.as_ref().map(|binding| binding.as_str()) == Some(binding))
         .unwrap_or_else(|| panic!("missing expanded resource {binding:?}"))
+}
+
+fn graph_resource<'a>(
+    plan: &'a PlanFile,
+    binding: &str,
+) -> &'a carina_core::resource::SchemaUnresolvedResource<
+    carina_core::resource::SavedModuleSource,
+    carina_core::resource::SnapshotLeaf,
+> {
+    plan.plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            UnresolvedSavedEffect::Create(resource)
+            | UnresolvedSavedEffect::ResumeCreate { resource, .. }
+            | UnresolvedSavedEffect::Update { to: resource, .. }
+                if resource
+                    .as_resource()
+                    .binding
+                    .as_ref()
+                    .is_some_and(|value| value.as_str() == binding) =>
+            {
+                Some(resource)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing resolved graph resource {binding}"))
+}
+fn row_id(plan: &PlanFile, binding: &str) -> carina_core::resource::ResolvedResourceId {
+    carina_core::resource::ResolvedResourceId::new(resource(plan, binding).id.clone())
 }
 
 #[test]
@@ -123,17 +161,15 @@ let consumer = mock.test.resource {
     assert!(
         matches!(
             secret,
-            Value::Deferred(DeferredValue::RedactedSecret { .. })
+            Value::Deferred(DeferredValue::Placeholder(
+                carina_core::resource::SnapshotLeaf::RedactedSecret { .. }
+            ))
         ),
         "saved plans must redact the resolved secret expression: {secret:?}",
     );
     assert_eq!(
-        consumer
-            .dependency_bindings
-            .iter()
-            .map(|binding| binding.as_str())
-            .collect::<Vec<_>>(),
-        ["app.role"],
+        graph_resource(&plan, "app.consumer").value_dependencies(),
+        &std::iter::once(row_id(&plan, "app.role")).collect(),
     );
 }
 
@@ -198,13 +234,8 @@ let inner = app_module {}
         ("looped[1].consumer", "looped[1].role"),
     ] {
         assert_eq!(
-            resource(&plan, consumer)
-                .directives
-                .depends_on
-                .iter()
-                .map(|binding| binding.as_str())
-                .collect::<Vec<_>>(),
-            [dependency],
+            graph_resource(&plan, consumer).explicit_dependencies(),
+            &std::iter::once(row_id(&plan, dependency)).collect(),
             "wrong qualified dependency for {consumer}",
         );
     }
@@ -262,8 +293,8 @@ let app = app_module {}
     let consumer = resource(&plan, "app.consumer");
 
     assert_eq!(
-        consumer.dependency_bindings.iter().collect::<Vec<_>>(),
-        vec![module_role],
+        graph_resource(&plan, "app.consumer").value_dependencies(),
+        &std::iter::once(row_id(&plan, "app.role")).collect(),
         "the module-local reference must create an app.role dependency",
     );
     match consumer.attributes.get("comment") {
@@ -396,7 +427,7 @@ m { label = "consumer-a2" }
         })
         .expect("expanded seed resource");
     let consumer_binding = consumer.binding.as_ref().expect("consumer binding");
-    let seed_binding = seed.binding.as_ref().expect("seed binding");
+    let _seed_binding = seed.binding.as_ref().expect("seed binding");
 
     let create_dependencies = plan
         .plan
@@ -404,9 +435,9 @@ m { label = "consumer-a2" }
         .iter()
         .find_map(|effect| match effect {
             UnresolvedSavedEffect::Create(resource)
-                if resource.binding.as_ref() == Some(consumer_binding) =>
+                if resource.as_resource().binding.as_ref() == Some(consumer_binding) =>
             {
-                Some(&resource.directives.depends_on)
+                Some(resource.explicit_dependencies())
             }
             UnresolvedSavedEffect::Read { .. }
             | UnresolvedSavedEffect::Create(_)
@@ -424,7 +455,10 @@ m { label = "consumer-a2" }
         .expect("replacement create for consumer");
     assert_eq!(
         create_dependencies,
-        &vec![seed_binding.clone()],
+        &std::iter::once(carina_core::resource::ResolvedResourceId::new(
+            seed.id.clone()
+        ))
+        .collect(),
         "Create.directives.depends_on must follow the state-prefix remap",
     );
 
@@ -454,7 +488,10 @@ m { label = "consumer-a2" }
         .expect("replacement delete for consumer");
     assert_eq!(
         delete_dependencies,
-        &std::collections::HashSet::from([seed_binding.clone()]),
+        &std::iter::once(carina_core::resource::ResolvedResourceId::new(
+            seed.id.clone()
+        ))
+        .collect(),
         "Delete.explicit_dependencies must follow the state-prefix remap",
     );
 }

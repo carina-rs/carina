@@ -67,7 +67,12 @@ mod backend_selection;
 pub mod backends;
 mod heartbeat;
 pub mod lock;
+mod refresh;
 pub mod state;
+pub use refresh::{
+    PreparedRows, RefreshRows, RefreshTarget, RefreshableCurrent, RefreshableDeposed,
+    RefreshableOrphan, RefreshableOrphans, RemovedRows, ResolvedRemovedClaims,
+};
 
 // Re-export main types for convenience
 pub use backend::{
@@ -87,16 +92,19 @@ pub use backend_selection::{
 #[cfg(any(test, feature = "test-utils"))]
 pub use backends::local_backend_for_test;
 pub use backends::{
-    LocalBackend, StateUrl, anchored_local_path, load_published_exports_from_url,
-    load_state_from_url,
+    LocalBackend, LocalStateFile, StateUrl, anchored_local_path, load_local_state_file,
+    load_published_exports_from_url, load_state_from_url,
 };
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, CurrentInstance, DeposedAttributes, DeposedInstance, DeposedKey,
-    ImportTargetDisposition, LoadedOrphans, LoadedState, MigratedStateFile, MigrationInfo,
-    NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind, OutcomeUnknownRow,
+    ImportTargetDisposition, LegacyClassificationOutcome, LegacyDependencyClassification,
+    LegacyDependencyMigrationError, LegacyDependencyNames, LegacyDestroyOrderingWarning,
+    LegacyReadRequiredRow, LegacyReadRequiredRows, LoadedOrphans, LoadedState, MigratedStateFile,
+    MigrationInfo, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind, OutcomeUnknownRow,
     PreviousSecretHashAuthority, PublishedExports, ResourceState, ResourceStateEncodingError,
-    RowBasis, StateFile, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
+    RowBasis, StateFile, UnreportedMigratedState, UnvalidatedLegacyMigration,
+    ValidatedLegacyMigration, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
     should_apply_override,
 };

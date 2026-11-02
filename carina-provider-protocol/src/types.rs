@@ -38,9 +38,28 @@ pub struct TypeIdentity {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceRequest {
+    pub ty: TypeIdentity,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReferenceOutcome {
+    Resolved(String),
+    NotFound(Box<ProviderError>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReferenceError {
+    AccessDenied(Box<ProviderError>),
+    Transient(Box<ProviderError>),
+    InvalidReference(Box<ProviderError>),
+}
+
 /// A validated long-form reference template.
 ///
-/// The only placeholders accepted by protocol v17 are `{partition}`,
+/// The only placeholders accepted by the protocol are `{partition}`,
 /// `{region}`, `{account}`, and `{name}`. The `{name}` placeholder appears
 /// exactly once and denotes the short form of the reference.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1764,6 +1783,15 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AttributeType {
+    /// String-valued reference whose equality is resolved by the initialized guest.
+    #[serde(rename = "reference")]
+    Reference {
+        identity: TypeIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<(Option<u64>, Option<u64>)>,
+    },
     String {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
@@ -2295,8 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v17_state_json_bytes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 17);
+    fn ordered_maps_preserve_state_json_bytes() {
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),
@@ -2321,6 +2348,18 @@ mod tests {
             serde_json::to_vec(&state).expect("state must serialize"),
             br#"{"id":{"provider":"mock","resource_type":"test.Widget","identity":"example"},"identifier":"widget-123","attributes":{"a_settings":{"a_count":2,"z_enabled":true},"z_name":"example"},"exists":true}"#
         );
+    }
+
+    #[test]
+    fn reference_schema_json_round_trip_preserves_identity_and_constraints() {
+        let json = serde_json::json!({
+            "type": "reference",
+            "identity": {"provider": "test", "segments": ["keys", "Key"], "kind": "Reference"},
+            "pattern": "^(alias/|key/).+$",
+            "length": [1, 256]
+        });
+        let ty: AttributeType = serde_json::from_value(json.clone()).expect("reference schema");
+        assert_eq!(serde_json::to_value(ty).unwrap(), json);
     }
 
     #[test]

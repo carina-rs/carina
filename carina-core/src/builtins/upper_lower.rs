@@ -66,7 +66,7 @@ pub(crate) fn builtin_lower<B: BindingAddress>(
 
 #[cfg(test)]
 mod tests {
-    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value_for_tests as evaluate_builtin;
     use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]

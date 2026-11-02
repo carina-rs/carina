@@ -11,24 +11,6 @@ use crate::resource::{
 
 use super::value_type_name;
 
-/// `decrypt(ciphertext)` or `decrypt(ciphertext, key)` - Decrypt an encrypted value.
-///
-/// This is the fallback entry point used by `evaluate_builtin` (no config).
-/// It always returns an error since the decryptor is only available via `ProviderContext`.
-/// Use `builtin_decrypt_with_config` for the config-aware version.
-pub(crate) fn builtin_decrypt<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
-) -> Result<Value<NoPlaceholder, B>, String> {
-    // Validate arguments for better error messages
-    let (_ciphertext, _key) = parse_decrypt_args(args)?;
-
-    Err(
-        "decrypt() requires a configured provider with encryption support. \
-         Ensure a provider (e.g., awscc) is configured and credentials are available."
-            .to_string(),
-    )
-}
-
 /// `decrypt()` implementation that uses the decryptor from [`ProviderContext`].
 pub(crate) fn builtin_decrypt_with_config<B: BindingAddress>(
     args: &[Value<NoPlaceholder, B>],
@@ -108,19 +90,17 @@ mod tests {
         ExpandedValue as Value,
     };
 
-    use super::builtin_decrypt;
-
     fn mock_config(decrypt_fn: crate::parser::DecryptorFn) -> ProviderContext {
         ProviderContext {
             decryptor: Some(decrypt_fn),
             resource_types: Default::default(),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         }
     }
 
     #[test]
     fn decrypt_with_mock_decryptor() {
-        let config = mock_config(Box::new(|ciphertext, _key| {
+        let config = mock_config(std::sync::Arc::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         }));
 
@@ -136,7 +116,7 @@ mod tests {
 
     #[test]
     fn decrypt_with_key_argument() {
-        let config = mock_config(Box::new(|ciphertext, key| {
+        let config = mock_config(std::sync::Arc::new(|ciphertext, key| {
             let key_str = key.unwrap_or("none");
             Ok(format!("decrypted:{ciphertext}:key={key_str}"))
         }));
@@ -156,7 +136,7 @@ mod tests {
 
     #[test]
     fn decrypt_without_decryptor_returns_error() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
         let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
@@ -169,9 +149,13 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_fallback_without_config_returns_error() {
+    fn decrypt_dispatch_without_decryptor_returns_error() {
         let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
-        let result = builtin_decrypt(&args);
+        let result = crate::builtins::evaluate_builtin_to_value(
+            "decrypt",
+            &args,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -182,7 +166,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_no_args() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let args: Vec<Value> = vec![];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
@@ -191,7 +175,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_too_many_args() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let args = vec![
             Value::Concrete(ConcreteValue::String("a".into())),
             Value::Concrete(ConcreteValue::String("b".into())),
@@ -204,7 +188,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_non_string_ciphertext() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let args = vec![Value::Concrete(ConcreteValue::Int(42))];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
@@ -217,7 +201,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_non_string_key() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let args = vec![
             Value::Concrete(ConcreteValue::String("cipher".into())),
             Value::Concrete(ConcreteValue::Int(42)),
@@ -233,7 +217,7 @@ mod tests {
 
     #[test]
     fn secret_decrypt_composition() {
-        let config = mock_config(Box::new(|_ciphertext, _key| {
+        let config = mock_config(std::sync::Arc::new(|_ciphertext, _key| {
             Ok("my-secret-password".to_string())
         }));
 

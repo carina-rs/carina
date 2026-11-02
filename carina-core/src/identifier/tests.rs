@@ -42,7 +42,7 @@ fn canonical_create_only_value_string_for_test(value: &Value) -> Option<String> 
     )
 }
 
-fn anonymous_state_entry<I, K>(
+fn anonymous_state_entry<I, K, P: crate::resource::StateValueLeaf>(
     registry: &SchemaRegistry,
     provider: &str,
     resource_type: &str,
@@ -52,7 +52,7 @@ fn anonymous_state_entry<I, K>(
     attributes: I,
 ) -> AnonymousIdStateInfo
 where
-    I: IntoIterator<Item = (K, Value)>,
+    I: IntoIterator<Item = (K, crate::resource::Value<P>)>,
     K: Into<String>,
 {
     let attributes = attributes
@@ -132,15 +132,24 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
     let parsed = crate::parser::parse_file(
         source,
         Path::new(file),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("valid loop fixture");
-    crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        &crate::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                &crate::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+                session,
+            )
+            .expect("loop fixture crosses the module-resolution seam")
+        },
     )
-    .expect("loop fixture crosses the module-resolution seam")
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("loop fixture contains no parser placeholders")
     .resources
 }
@@ -225,7 +234,12 @@ fn detect_legacy_loop_moves_for_test(
     };
     super::detect_legacy_loop_address_moves(
         resources,
-        registry,
+        IdentityEvaluationContext {
+            schemas: registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &find_state_by_type,
         &|_binding| Vec::new(),
@@ -240,7 +254,10 @@ fn redacted_secret_identifier_material_bytes_are_legacy_compatible() {
     let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
     let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
         .expect("valid explicit legacy digest");
-    let value = Value::Deferred(DeferredValue::RedactedSecret { hash });
+    let value: crate::resource::SnapshotValue =
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::SnapshotLeaf::RedactedSecret { hash },
+        ));
 
     assert_eq!(
         deterministic_value_string(&value).as_bytes(),
@@ -345,7 +362,12 @@ fn try_reconcile_anonymous_identifiers(
     super::reconcile_anonymous_identifiers(
         resources,
         &[],
-        registry,
+        IdentityEvaluationContext {
+            schemas: registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &find_screened_state_by_type,
         find_state_by_binding,
@@ -1458,23 +1480,88 @@ fn longer_reference_chain_resolves_from_state_for_legacy_identity_migration() {
         Value::root_resource_ref("source", "details", vec!["generated_name".to_string()]);
     let source = AnonymousIdBindingStateInfo {
         name: "source".to_string(),
-        attribute_values: HashMap::from([(
-            "details".to_string(),
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                "generated_name".to_string(),
-                concrete_string("resolved-name"),
-            )]))),
-        )]),
+        attribute_values: {
+            let attributes: HashMap<String, Value> = HashMap::from([(
+                "details".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "generated_name".to_string(),
+                    concrete_string("resolved-name"),
+                )]))),
+            )]);
+            attributes
+                .into_iter()
+                .map(|(key, value)| (key, value.to_snapshot()))
+                .collect()
+        },
     };
 
-    let resolved = resolve_deferred_create_only_value(&reference, &|binding| {
-        (binding == "source")
-            .then(|| source.clone())
-            .into_iter()
-            .collect()
-    });
+    let resolved = resolve_deferred_create_only_value(
+        &reference,
+        &|binding| {
+            (binding == "source")
+                .then(|| source.clone())
+                .into_iter()
+                .collect()
+        },
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("historical identity fixture remains available");
 
     assert_eq!(resolved, Some(concrete_string("resolved-name")));
+}
+
+#[test]
+fn historical_identity_binding_selects_siblings_and_rejects_hashes_with_typed_paths() {
+    let hash = serde_json::json!({
+        "RedactedSecret": {
+            "hash": format!("argon2-legacy:73616c74:{}", "ab".repeat(32)),
+        },
+    });
+    let attributes: HashMap<String, crate::resource::SnapshotValue> =
+        serde_json::from_value(serde_json::json!({
+            "password": hash,
+            "details": {"Map": {
+                "name": {"String": "ordinary"},
+                "password": hash,
+            }},
+        }))
+        .expect("historical binding fixture");
+    let find_state = |binding: &str| {
+        (binding == "source")
+            .then(|| AnonymousIdBindingStateInfo {
+                name: "source".to_string(),
+                attribute_values: attributes.clone(),
+            })
+            .into_iter()
+            .collect()
+    };
+    let ordinary = Value::root_resource_ref("source", "details", vec!["name".to_string()]);
+    assert_eq!(
+        resolve_deferred_create_only_value(
+            &ordinary,
+            &find_state,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+        )
+        .expect("a sibling hash does not make an ordinary selection unavailable"),
+        Some(concrete_string("ordinary")),
+    );
+    for (attribute, segments, path) in [
+        ("password", vec![], "source.password"),
+        (
+            "details",
+            vec!["password".to_string()],
+            "source.details.password",
+        ),
+    ] {
+        let reference = Value::root_resource_ref("source", attribute, segments);
+        let error = resolve_deferred_create_only_value(
+            &reference,
+            &find_state,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a selected hash cannot supply a desired identity");
+        assert_eq!(error.path(), path);
+    }
 }
 
 #[test]
@@ -1666,14 +1753,20 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
             let vpc = mock.test.resource { name = "network" }
             mock.test.Consumer { parent = vpc }
         "#,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the parser must preserve the authored use for typed validation");
-    let parsed = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-    )
-    .expect("the fixture crosses module resolution before readiness validation");
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+                session,
+            )
+            .expect("the fixture crosses module resolution before readiness validation")
+        },
+    );
     let error = crate::validation::resolve_bare_binding_uses(
         parsed,
         &SchemaRegistry::new(),
@@ -1687,6 +1780,46 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
             .to_string()
             .contains("'vpc' is a resource, not a value"),
         "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn module_handle_dependency_does_not_change_anonymous_identity_hash() {
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("name", PatternAttributeType::string())
+            .create_only()
+            .build(),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+
+    let resource = || {
+        let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+        resource.set_attr("name".to_string(), concrete_string("anonymous-dependent"));
+        resource
+    };
+    let mut without_dependency = vec![resource()];
+    let mut with_dependency = vec![resource()];
+    with_dependency[0].dependencies.depends_on = crate::parser::UnexpandedDependencies::new(vec![
+        crate::parser::UnexpandedDependencyOperand::AttributeSelection {
+            binding: absolute_binding("producer"),
+            attribute: "validation_record".to_string(),
+        },
+    ]);
+
+    compute_anonymous_identifiers_for_test(&mut without_dependency, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("identity without a handle dependency");
+    compute_anonymous_identifiers_for_test(&mut with_dependency, &[], &registry, &|_| Vec::new())
+        .expect("identity with a module handle dependency");
+
+    assert_eq!(
+        with_dependency[0].id, without_dependency[0].id,
+        "dependency capabilities are graph metadata, never identity-hash input",
     );
 }
 
@@ -2272,9 +2405,11 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
         );
         resource.set_attr(
             "domain_by_name".to_string(),
-            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-                "primary".to_string() => enum_value,
-            })),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::indexmap! {
+                    "primary".to_string() => enum_value,
+                },
+            )),
         );
         resource
     };
@@ -2870,12 +3005,10 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
             prefixes: vec![("bucket_name".to_string(), "my-app-".to_string())]
                 .into_iter()
                 .collect(),
-            attribute_values: vec![(
+            attribute_values: HashMap::from([(
                 "bucket_name".to_string(),
                 PrefixStateValue::Known("my-app-existing1".to_string()),
-            )]
-            .into_iter()
-            .collect(),
+            )]),
         })
     });
 
@@ -2905,12 +3038,10 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
             prefixes: vec![("bucket_name".to_string(), "old-prefix-".to_string())]
                 .into_iter()
                 .collect(),
-            attribute_values: vec![(
+            attribute_values: HashMap::from([(
                 "bucket_name".to_string(),
                 PrefixStateValue::Known("old-prefix-existing1".to_string()),
-            )]
-            .into_iter()
-            .collect(),
+            )]),
         })
     });
 
@@ -3066,7 +3197,13 @@ fn state_row_identity_values_use_the_original_permanent_name_override() {
         .expect("schema fixture must be valid");
     let mut desired = Resource::pending_with_provider("mock", "test.unique_identity", None);
     desired.set_attr("name", concrete_string("role"));
-    let desired_values = DesiredIdentityValues::from_resource(&desired, &schema, &|_| Vec::new());
+    let desired_values = DesiredIdentityValues::from_resource(
+        &desired,
+        &schema,
+        &|_| Vec::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("historical identity fixture remains available");
     let attributes = HashMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]);
     let without_override =
         StateRowIdentityValues::from_state_row(&schema, &attributes, &HashMap::new());
@@ -3939,11 +4076,13 @@ fn reconcile_when_present_absence_matches_only_a_state_row_with_the_attribute_ab
     );
 }
 
-fn redacted_identity_value() -> Value {
+fn redacted_identity_value() -> crate::resource::SnapshotValue {
     let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
     let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
         .expect("valid persisted secret digest");
-    Value::Deferred(DeferredValue::RedactedSecret { hash })
+    crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+        crate::resource::SnapshotLeaf::RedactedSecret { hash },
+    ))
 }
 
 #[test]
@@ -3967,7 +4106,13 @@ fn reconcile_when_present_absence_does_not_match_a_redacted_secret() {
     );
     let schema = registry.get_for(&desired[0]).unwrap();
     let schema = schema.schema();
-    let desired_values = DesiredIdentityValues::from_resource(&desired[0], schema, &|_| Vec::new());
+    let desired_values = DesiredIdentityValues::from_resource(
+        &desired[0],
+        schema,
+        &|_| Vec::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("historical identity fixture remains available");
 
     assert_eq!(
         desired_values.compare_row(
@@ -4061,11 +4206,17 @@ fn nested_when_present_absence_does_not_match_redacted_state() {
             "settings",
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
         );
-    let desired_values = DesiredIdentityValues::from_resource(&desired, &schema, &|_| Vec::new());
-    let redacted_leaf = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-        "name".to_string(),
-        redacted_identity_value(),
-    )])));
+    let desired_values = DesiredIdentityValues::from_resource(
+        &desired,
+        &schema,
+        &|_| Vec::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("historical identity fixture remains available");
+    let redacted_leaf =
+        crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+            IndexMap::from([("name".to_string(), redacted_identity_value())]),
+        ));
 
     for settings in [redacted_leaf, redacted_identity_value()] {
         let state = StateRowIdentityValues::from_state_row(
@@ -4096,8 +4247,13 @@ fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted
     for desired in [resolved, prefix] {
         let schema = registry.get_for(&desired).unwrap();
         let schema = schema.schema();
-        let desired_values =
-            DesiredIdentityValues::from_resource(&desired, schema, &|_| Vec::new());
+        let desired_values = DesiredIdentityValues::from_resource(
+            &desired,
+            schema,
+            &|_| Vec::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("historical identity fixture remains available");
         let state = StateRowIdentityValues::from_state_row(
             schema,
             &HashMap::from([("name".to_string(), redacted_identity_value())]),
@@ -4109,8 +4265,11 @@ fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted
             desired_values.compare_row(&state, schema, &context),
             DeclaredIdentityRowOutcome::Undecidable(_),
         ));
-        let absent =
-            StateRowIdentityValues::from_state_row(schema, &HashMap::new(), &HashMap::new());
+        let absent = StateRowIdentityValues::from_state_row(
+            schema,
+            &HashMap::<String, crate::resource::ExpandedValue>::new(),
+            &HashMap::new(),
+        );
         assert_eq!(
             desired_values.compare_row(&absent, schema, &context),
             DeclaredIdentityRowOutcome::Mismatch,
@@ -4290,7 +4449,12 @@ fn reconcile_complete_declared_identity_rejects_multiple_legacy_state_matches() 
     let error = super::reconcile_anonymous_identifiers(
         &desired,
         &[],
-        &registry,
+        IdentityEvaluationContext {
+            schemas: &registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &find_state_by_type,
         &|_binding| Vec::new(),
@@ -4598,15 +4762,21 @@ fn binding_state_entry(
         binding.to_string(),
         AnonymousIdBindingStateInfo {
             name: name.to_string(),
-            attribute_values: attrs
-                .iter()
-                .map(|(attr, value)| {
-                    (
-                        (*attr).to_string(),
-                        Value::Concrete(ConcreteValue::String((*value).to_string().into())),
-                    )
-                })
-                .collect(),
+            attribute_values: {
+                let attributes: HashMap<String, Value> = attrs
+                    .iter()
+                    .map(|(attr, value)| {
+                        (
+                            (*attr).to_string(),
+                            Value::Concrete(ConcreteValue::String((*value).to_string().into())),
+                        )
+                    })
+                    .collect();
+                attributes
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_snapshot()))
+                    .collect()
+            },
         },
     )
 }
@@ -4620,6 +4790,58 @@ fn binding_state_entries_for(
         .filter(|(entry_binding, _)| entry_binding == binding)
         .map(|(_, entry)| entry.clone())
         .collect()
+}
+
+#[test]
+fn create_only_snapshot_container_verifies_secret_leaves() {
+    let schema = PatternResourceSchema::new("test.SecretIdentity")
+        .attribute(
+            PatternAttributeSchema::optional(
+                "settings",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .create_only()
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let settings = |token: &str, name: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "token".into(),
+                Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(token)))),
+            ),
+            ("name".into(), concrete_string(name)),
+        ])))
+    };
+    let snapshot = crate::value::redact_secrets_in_value(&settings("original", "legacy")).unwrap();
+    let state = StateCreateOnlyValues::from_state_attributes(
+        &schema,
+        &HashMap::from([("settings".into(), snapshot)]),
+    );
+    let context = crate::differ::exact_comparison_context_for_tests();
+    for (token, name, matches) in [
+        ("original", "legacy", true),
+        ("changed", "legacy", false),
+        ("original", "changed", false),
+    ] {
+        let desired = Resource::new("test.SecretIdentity", "desired")
+            .with_attribute("settings", settings(token, name));
+        let values =
+            DesiredCreateOnlyValues::without_binding_resolution(&desired, schema.as_schema());
+        assert_eq!(
+            values.all_match(&state, schema.as_schema(), &context),
+            matches
+        );
+        assert_eq!(
+            values.resolved_subset_match(&state, schema.as_schema(), &context),
+            (1, matches)
+        );
+        assert_eq!(
+            values.match_counts(&state, schema.as_schema(), &context),
+            if matches { (1, 0) } else { (0, 1) }
+        );
+    }
 }
 
 #[test]
@@ -4653,7 +4875,14 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
         (binding == "source")
             .then(|| AnonymousIdBindingStateInfo {
                 name: "source".to_string(),
-                attribute_values: HashMap::from([("config".to_string(), empty.clone())]),
+                attribute_values: {
+                    let attributes: HashMap<String, Value> =
+                        HashMap::from([("config".to_string(), empty.clone())]);
+                    attributes
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_snapshot()))
+                        .collect()
+                },
             })
             .into_iter()
             .collect()
@@ -4664,8 +4893,13 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
     );
 
     for desired in [&inline, &deferred] {
-        let desired =
-            DesiredCreateOnlyValues::from_resource(desired, schema.as_schema(), &find_state);
+        let desired = DesiredCreateOnlyValues::from_resource(
+            desired,
+            schema.as_schema(),
+            &find_state,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("historical identity fixture remains available");
         assert!(
             !desired.has_configured_values(),
             "an empty struct must be identical to an unconfigured identity input"
@@ -4957,7 +5191,12 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     let simhash_renames = super::reconcile_anonymous_identifiers(
         &simhash_resources,
         &[],
-        &simhash_schemas,
+        IdentityEvaluationContext {
+            schemas: &simhash_schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &simhash_comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -5015,7 +5254,12 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     let create_only_renames = super::reconcile_anonymous_identifiers(
         &create_only_resources,
         &[],
-        &create_only_schemas,
+        IdentityEvaluationContext {
+            schemas: &create_only_schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &create_only_comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -5081,7 +5325,12 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
     super::reconcile_anonymous_identifiers(
         &resources,
         &[],
-        &schemas,
+        IdentityEvaluationContext {
+            schemas: &schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -5574,7 +5823,9 @@ fn test_canonical_create_only_string_matches_state_round_trip() {
             .expect("persisted state value should decode");
         assert_eq!(
             canonical_create_only_value_string_for_test(&value),
-            canonical_create_only_value_string_for_test(&persisted),
+            canonical_create_only_value_string_for_test(&crate::test_support::available_value(
+                &persisted
+            )),
             "round-trip canonical mismatch for {value:?}",
         );
     }
@@ -7181,7 +7432,12 @@ fn detect_reference_form_rename(
     );
     let detection = super::detect_anonymous_to_named_renames(
         AnonymousToNamedCandidates::new(&resources, &candidates, &claimed_origins),
-        registry,
+        IdentityEvaluationContext {
+            schemas: registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         AnonymousToNamedStateLookup::new(
             &|provider, resource_type| {
@@ -7480,26 +7736,34 @@ fn test_detect_rename_matches_mixed_canonical_and_identifier_enums_in_list_and_m
     );
     resource.set_attr(
         "domain_by_name".to_string(),
-        Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-            "canonical".to_string() => canonical,
-            "identifier".to_string() => identifier,
-        })),
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+            indexmap::indexmap! {
+                "canonical".to_string() => canonical,
+                "identifier".to_string() => identifier,
+            },
+        )),
     );
 
     let persisted_attributes = HashMap::from([
         (
             "domains".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("vpc".into())),
-                Value::Concrete(ConcreteValue::String("standard".into())),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "vpc".into(),
+                )),
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "standard".into(),
+                )),
             ])),
         ),
         (
             "domain_by_name".to_string(),
-            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-                "canonical".to_string() => Value::Concrete(ConcreteValue::String("vpc".into())),
-                "identifier".to_string() => Value::Concrete(ConcreteValue::String("standard".into())),
-            })),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::indexmap! {
+                    "canonical".to_string() => Value::Concrete(ConcreteValue::String("vpc".into())),
+                    "identifier".to_string() => Value::Concrete(ConcreteValue::String("standard".into())),
+                },
+            )),
         ),
     ]);
     let state_entries = vec![anonymous_state_entry(
@@ -7831,13 +8095,13 @@ fn test_detect_rename_invalid_enum_is_typed_unresolved_and_does_not_rename() {
         .get_for(&resource)
         .expect("resource schema exists")
         .schema();
-    let resolution = canonical_or_resolved_create_only_value(
+    let resolution = canonical_create_only_value(
         resource
             .get_attr("domain")
-            .expect("domain is configured on the test resource"),
+            .expect("domain is configured on the test resource")
+            .clone(),
         schema.as_schema(),
         "domain",
-        &|_binding| Vec::new(),
     );
     let Err(UnresolvedReason::Type(error)) = resolution else {
         panic!("invalid enum must return its typed canonicalization error")
@@ -8009,7 +8273,12 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
     super::reconcile_anonymous_identifiers(
         &resources,
         &[],
-        &schemas,
+        IdentityEvaluationContext {
+            schemas: &schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -8085,7 +8354,12 @@ fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
     let renames = super::reconcile_anonymous_identifiers(
         &resources,
         &[],
-        &schemas,
+        IdentityEvaluationContext {
+            schemas: &schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
@@ -9084,11 +9358,11 @@ fn nested_loop_rewrite_uses_current_module_prefix_and_is_a_valid_move_target() {
         &format!(
             "moved {{\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc '{expected_target}'\n}}\n"
         ),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("rendered move target must parse");
     assert!(
-        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[] as &[Resource],)
+        check_legacy_loop_move_targets::<ModuleSource, _>(&parsed.state_blocks, &[] as &[Resource],)
             .is_empty(),
         "the suggested current-prefix target must not be classified as legacy",
     );
@@ -9109,15 +9383,24 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
     .expect("write loop fixture");
     let parsed = crate::config_loader::parse_directory(
         &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("directory parses");
-    let mut parsed = crate::module_resolver::resolve_modules_providerless(
-        parsed,
-        &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+    let mut parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                parsed,
+                &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+                session,
+            )
+            .expect("directory fixture crosses the module-resolution seam")
+        },
     )
-    .expect("directory fixture crosses the module-resolution seam")
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
@@ -9442,7 +9725,7 @@ fn moved_to_rejects_a_legacy_segment_below_a_module_prefix() {
         ResourceId::with_provider_identity("mock", "ec2.Vpc", "net.mock_ec2_vpc_current", None);
     let parsed = crate::parser::parse(
         "moved {\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc 'net._for0[0]'\n}\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("moved block parses");
 
@@ -9462,7 +9745,7 @@ fn import_to_rejects_a_legacy_loop_address_with_the_current_replacement() {
         .to_string();
     let parsed = crate::parser::parse(
         "import {\n  to = mock.ec2.Vpc '_for0[0]'\n  id = 'vpc-existing'\n}\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("import block parses");
 
@@ -9493,7 +9776,7 @@ import {
   id = 'vpc-existing'
 }
 "#,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("bound discard loop and state blocks parse");
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
@@ -9505,7 +9788,7 @@ import {
     );
 
     let errors =
-        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &parsed.resources);
+        check_legacy_loop_move_targets::<ModuleSource, _>(&parsed.state_blocks, &parsed.resources);
 
     assert!(
         errors.is_empty(),
@@ -9522,7 +9805,7 @@ fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
             "moved {\n  from = mock.ec2.Vpc 'old-two'\n",
             "  to = mock.ec2.Vpc \"items['a._b']\"\n}\n",
         ),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("bound map-key move destinations parse");
 
@@ -9542,12 +9825,12 @@ fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
 fn moved_to_rejects_an_orphaned_legacy_segment_below_a_regular_prefix() {
     let parsed = crate::parser::parse(
         "moved {\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc 'net._for0[0]'\n}\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("moved block parses");
 
     let errors =
-        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[] as &[Resource]);
+        check_legacy_loop_move_targets::<ModuleSource, _>(&parsed.state_blocks, &[] as &[Resource]);
 
     assert_eq!(errors.len(), 1);
     assert!(errors[0].to_string().contains("net._for0[0]"));
@@ -9796,5 +10079,100 @@ fn legacy_loop_detector_skips_ambiguous_owner_without_one_exact_input_match() {
             moves.is_empty(),
             "zero or multiple exact stable-input owners must not be guessed: {persisted_value:?}"
         );
+    }
+}
+
+#[test]
+fn historical_identity_inspection_preserves_hashes_and_propagates_selection_errors() {
+    let hash = redacted_identity_value();
+    let snapshot = crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+        IndexMap::from([("token".into(), hash)]),
+    ));
+    let path = IdentityPath::attribute("name");
+    let selected = StateIdentityValue::at_path(Some(&snapshot), &path);
+    let StateIdentityValue::Comparable(value) = selected else {
+        panic!("a historical container must retain its hash evidence");
+    };
+    assert_eq!(
+        serde_json::to_value(&value.value).unwrap(),
+        serde_json::to_value(&snapshot).unwrap()
+    );
+    let registry = scalar_identity_registry();
+    let desired = Resource::pending_with_provider("mock", "test.resource", None).with_attribute(
+        "name",
+        Value::root_resource_ref("history", "settings", vec![]),
+    );
+    let schema = registry.get_for(&desired).unwrap();
+    let result = DesiredIdentityValues::from_resource(
+        &desired,
+        schema.schema(),
+        &|_| {
+            vec![AnonymousIdBindingStateInfo {
+                name: "history".into(),
+                attribute_values: HashMap::from([("settings".into(), snapshot.clone())]),
+            }]
+        },
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    let error = match result {
+        Ok(_) => panic!("a selected historical secret needs a typed unavailable error"),
+        Err(error) => error,
+    };
+    assert_eq!(error.path(), "history.settings.token");
+}
+
+#[test]
+fn identity_projection_evaluates_env_from_the_caller_snapshot() {
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::required("name", PatternAttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .validate()
+        .expect("identity schema");
+    let mut desired = Resource::with_provider("mock", "test.resource", "desired", None);
+    desired.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![Value::root_resource_ref("source", "variable", Vec::new()).into()],
+            source_line: 1.into(),
+        }),
+    );
+    let find_state = |binding: &str| {
+        assert_eq!(binding, "source");
+        vec![AnonymousIdBindingStateInfo {
+            name: binding.to_string(),
+            attribute_values: HashMap::from([(
+                "variable".to_string(),
+                concrete_string("IDENTITY_VARIABLE").to_snapshot(),
+            )]),
+        }]
+    };
+    for expected in ["first", "second"] {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "IDENTITY_VARIABLE".to_string(),
+            expected.into(),
+        )]));
+        let create_only = DesiredCreateOnlyValues::from_resource(
+            &desired,
+            schema.as_schema(),
+            &find_state,
+            &context,
+        )
+        .expect("environment-backed create-only material is available");
+        let Some(DesiredCreateOnlyValue::Resolved(actual)) = create_only.values.get("name") else {
+            panic!("the state-backed env call must resolve for create-only comparison");
+        };
+        assert_eq!(actual.value, concrete_string(expected));
+        let identity =
+            DesiredIdentityValues::from_resource(&desired, &schema, &find_state, &context)
+                .expect("environment-backed identity material is available");
+        let Some(DesiredIdentityValue::Resolved(actual)) = identity.values.values().next() else {
+            panic!("the state-backed env call must resolve for declared-identity comparison");
+        };
+        assert_eq!(actual.value, concrete_string(expected));
     }
 }

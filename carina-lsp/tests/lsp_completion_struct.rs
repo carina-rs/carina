@@ -1,16 +1,51 @@
 mod support;
 
-use std::time::Duration;
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+};
+use support::fixture::write_fixture;
 
 use support::TestClient;
 
-#[ignore = "requires provider schemas"]
+fn completion_schemas() -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
+    let ingress = AttributeType::list(AttributeType::struct_(
+        "Ingress".to_string(),
+        vec![
+            StructField::optional("ip_protocol", AttributeType::string()).build(),
+            StructField::optional("from_port", AttributeType::int()).build(),
+            StructField::optional("to_port", AttributeType::int()).build(),
+        ],
+    ));
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("ec2.SecurityGroup")
+            .attribute(
+                AttributeSchema::optional("group_description", AttributeType::string()).build(),
+            )
+            .attribute(
+                AttributeSchema::optional("security_group_ingress", ingress)
+                    .with_block_name("security_group_ingress")
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::optional("bucket", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("versioning_status", AttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas
+}
+
 #[tokio::test]
 async fn test_struct_field_completion() {
-    let mut client = TestClient::new().await;
-    client.initialize().await;
-
-    let uri = "file:///tmp/test_struct.crn";
     let text = r#"awscc.ec2.SecurityGroup {
     group_description = "test"
     security_group_ingress {
@@ -18,10 +53,15 @@ async fn test_struct_field_completion() {
     }
 }"#;
 
+    let fixture = write_fixture(&[
+        ("main.crn", text),
+        ("providers.crn", "provider awscc {}\nprovider aws {}\n"),
+    ]);
+    let mut client = TestClient::with_schemas(fixture.path(), completion_schemas()).await;
+    let uri = tower_lsp::lsp_types::Url::from_file_path(fixture.path().join("main.crn")).unwrap();
+    let uri = uri.as_str();
     client.open_document(uri, text).await;
-
-    // Small delay to let the server process didOpen
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.wait_for_diagnostics(uri).await;
 
     // Request completion inside the security_group_ingress block (line 3)
     let response = client._request_completion(uri, 3, 8).await;
@@ -68,19 +108,19 @@ async fn test_struct_field_completion() {
     client.shutdown().await;
 }
 
-#[ignore = "requires provider schemas"]
 #[tokio::test]
 async fn test_resource_attribute_completion() {
-    let mut client = TestClient::new().await;
-    client.initialize().await;
-
-    let uri = "file:///tmp/test_attr.crn";
     let text = "aws.s3.Bucket {\n    \n}";
 
+    let fixture = write_fixture(&[
+        ("main.crn", text),
+        ("providers.crn", "provider awscc {}\nprovider aws {}\n"),
+    ]);
+    let mut client = TestClient::with_schemas(fixture.path(), completion_schemas()).await;
+    let uri = tower_lsp::lsp_types::Url::from_file_path(fixture.path().join("main.crn")).unwrap();
+    let uri = uri.as_str();
     client.open_document(uri, text).await;
-
-    // Small delay to let the server process didOpen
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.wait_for_diagnostics(uri).await;
 
     // Request completion inside the block (line 1, after indentation)
     let response = client._request_completion(uri, 1, 4).await;

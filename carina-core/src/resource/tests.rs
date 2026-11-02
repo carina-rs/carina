@@ -1,8 +1,36 @@
 use super::*;
 use crate::explicit::ExplicitFields;
-use crate::parser::SourceSpan;
+use crate::parser::{RelativeBindingName, SourceSpan};
 use crate::schema::PatternResourceSchema;
 
+#[test]
+fn resolved_dependency_reads_use_typed_json_entries_and_round_trip() {
+    let id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "producer.record",
+        Some("secondary".to_string()),
+    );
+    let mut reads = ResolvedDependencyReads::default();
+    reads.insert_known(id.clone(), "comment");
+
+    let encoded = serde_json::to_value(&reads).expect("serialize typed dependency reads");
+    assert!(
+        encoded.is_array(),
+        "dependency reads must not use object keys"
+    );
+    assert_eq!(encoded[0]["id"]["identity"], "producer.record");
+    assert_eq!(encoded[0]["id"]["provider_instance"], "secondary");
+    let decoded: ResolvedDependencyReads =
+        serde_json::from_value(encoded).expect("deserialize typed dependency reads");
+    assert_eq!(decoded, reads);
+    assert_eq!(
+        decoded.known_attributes(&id),
+        Some(&BTreeSet::from(["comment".to_string()]))
+    );
+}
+
+type State = super::State;
 type Value = ExpandedValue;
 type ConcreteValue = ExpandedConcreteValue;
 type DeferredValue = ExpandedDeferredValue;
@@ -20,6 +48,36 @@ type LoopDeferredValue = super::DeferredValue<LoopSlot, AbsoluteBindingAddress>;
 
 fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
     RootScope::new().resolve(RelativeBindingName::new(binding))
+}
+
+#[test]
+fn desired_leaf_deferral_keeps_containers_structural() {
+    let reference = Value::root_resource_ref("peer", "id", vec![]);
+    let unknown = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: absolute_binding("peer"),
+        },
+    ));
+    let known = Value::Concrete(ConcreteValue::String("known".into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(known.clone())));
+    for value in [reference, unknown, secret] {
+        assert!(is_deferred_desired_leaf(&value));
+        let list = Value::Concrete(ConcreteValue::List(vec![known.clone(), value]));
+        assert!(!is_deferred_desired_leaf(&list));
+        let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("known".into(), known.clone()),
+            ("nested".into(), list),
+        ])));
+        assert!(!is_deferred_desired_leaf(&map));
+    }
+    for value in [
+        known.clone(),
+        Value::Concrete(ConcreteValue::List(vec![known.clone()])),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([("key".into(), known)]))),
+        Value::Concrete(ConcreteValue::StringList(vec!["known".into()])),
+    ] {
+        assert!(!is_deferred_desired_leaf(&value));
+    }
 }
 
 fn module_argument_diagnostic_at(
@@ -155,7 +213,9 @@ fn loop_placeholder_uses_the_existing_unknown_wire_shape() {
         serde_json::from_value(encoded).expect("deserialize loop placeholder in a template");
     assert!(matches!(
         decoded,
-        LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value))
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            LoopSlot::Value
+        ))
     ));
 }
 
@@ -177,14 +237,14 @@ fn merge_with_saved(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Value {
-    super::merge_with_saved(
-        desired,
+    crate::test_support::available_value(&super::merge_with_saved(
+        &desired.to_snapshot(),
         saved,
         prior_explicit,
         attr_type,
         defs,
         &crate::differ::exact_comparison_context_for_tests(),
-    )
+    ))
 }
 
 fn pair_list_elements<D, S>(
@@ -194,8 +254,8 @@ fn pair_list_elements<D, S>(
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Vec<Option<usize>>
 where
-    D: std::borrow::Borrow<Value>,
-    S: std::borrow::Borrow<Value>,
+    D: super::ComparisonItem,
+    S: super::ComparisonItem,
 {
     super::pair_list_elements(
         desired,
@@ -213,8 +273,8 @@ fn pair_list_elements_with_uniqueness<D, S>(
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Vec<ListElementPairing>
 where
-    D: std::borrow::Borrow<Value>,
-    S: std::borrow::Borrow<Value>,
+    D: super::ComparisonItem,
+    S: super::ComparisonItem,
 {
     super::pair_list_elements_with_uniqueness(
         desired,
@@ -231,9 +291,9 @@ fn similarity_score(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> usize {
-    super::similarity_score(
-        a,
-        b,
+    super::snapshot_comparison::similarity_score(
+        &a.to_snapshot(),
+        &b.to_snapshot(),
         attr_type,
         defs,
         &crate::differ::exact_comparison_context_for_tests(),
@@ -248,15 +308,21 @@ fn merge_lists(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Vec<Value> {
-    super::merge_lists(
-        desired,
-        projected_saved,
-        raw_saved,
+    super::snapshot_comparison::merge_lists(
+        &desired.iter().map(Value::to_snapshot).collect::<Vec<_>>(),
+        &projected_saved
+            .iter()
+            .map(Value::to_snapshot)
+            .collect::<Vec<_>>(),
+        &raw_saved.iter().map(Value::to_snapshot).collect::<Vec<_>>(),
         prior_explicit,
         attr_type,
         defs,
         &crate::differ::exact_comparison_context_for_tests(),
     )
+    .iter()
+    .map(crate::test_support::available_value)
+    .collect()
 }
 
 #[test]
@@ -729,7 +795,7 @@ fn pending_resource_id_and_resource_reject_serialization() {
     let resource = Resource::pending_with_provider("aws", "ec2.Subnet", None);
 
     assert!(serde_json::to_string(&id).is_err());
-    assert!(serde_json::to_string(&resource).is_err());
+    assert!(serde_json::to_string(&resource.into_value_snapshot()).is_err());
 }
 
 #[test]
@@ -812,18 +878,22 @@ fn resolved_resource_id_serde_round_trips_as_resource_id() {
 #[test]
 #[should_panic(expected = "ResolvedResource requires identity")]
 fn resolved_resource_new_panics_without_identity() {
-    ResolvedResource::new(Resource::pending("s3.Bucket"));
+    ResolvedResource::new(Resource::pending("s3.Bucket").with_dependency_phase(()));
 }
 
 #[test]
 fn resolved_resource_try_new_returns_none_without_identity() {
-    assert!(ResolvedResource::try_new(Resource::pending("s3.Bucket")).is_none());
+    assert!(
+        ResolvedResource::try_new(Resource::pending("s3.Bucket").with_dependency_phase(()))
+            .is_none()
+    );
 }
 
 #[test]
 fn resolved_resource_try_new_returns_some_with_identity() {
     let resolved =
-        ResolvedResource::try_new(Resource::new("s3.Bucket", "logs")).expect("identity is present");
+        ResolvedResource::try_new(Resource::new("s3.Bucket", "logs").with_dependency_phase(()))
+            .expect("identity is present");
     assert_eq!(resolved.id.identity_str(), Some("logs"));
     assert_eq!(resolved.as_inner().id.identity_str(), Some("logs"));
     assert_eq!(
@@ -846,8 +916,9 @@ fn resolved_resource_error_preserves_typed_ignore_errors() {
             .expect("valid test schema"),
     );
 
-    let error = ResolvedResource::resolve_with_schemas(resource, &registry)
-        .expect_err("the authored path is not in the schema");
+    let error =
+        ResolvedResource::resolve_with_schemas(resource.with_dependency_phase(()), &registry)
+            .expect_err("the authored path is not in the schema");
     let rendered = error.to_string();
     let ResolvedResourceError::InvalidIgnoreChanges { errors, .. } = error else {
         panic!("expected typed ignore_changes errors");
@@ -863,12 +934,10 @@ fn resolved_resource_error_preserves_typed_ignore_errors() {
 
 #[test]
 fn resolved_resource_serde_round_trips_as_resource() {
-    let resolved = ResolvedResource::new(Resource::with_provider(
-        "aws",
-        "s3.Bucket",
-        "logs",
-        Some("primary".to_string()),
-    ));
+    let resolved = ResolvedResource::new(
+        Resource::with_provider("aws", "s3.Bucket", "logs", Some("primary".to_string()))
+            .with_dependency_phase(()),
+    );
     let json = serde_json::to_string(&resolved).unwrap();
     let decoded = serde_json::from_str::<SavedResolvedResource>(&json).unwrap();
     assert_eq!(decoded, SavedResolvedResource::from(resolved));
@@ -877,7 +946,8 @@ fn resolved_resource_serde_round_trips_as_resource() {
 
 #[test]
 fn resolved_resource_deserialize_rejects_absent_identity() {
-    let mut value = serde_json::to_value(Resource::new("s3.Bucket", "logs")).unwrap();
+    let mut value =
+        serde_json::to_value(Resource::new("s3.Bucket", "logs").into_value_snapshot()).unwrap();
     value["id"].as_object_mut().unwrap().remove("identity");
     let err = serde_json::from_value::<SavedResolvedResource>(value).unwrap_err();
     assert!(err.to_string().contains("identity is required"));
@@ -885,7 +955,9 @@ fn resolved_resource_deserialize_rejects_absent_identity() {
 
 #[test]
 fn resource_deserialization_cannot_restore_resolved_ignore_changes() {
-    let resource: SavedResource = Resource::new("Widget", "example").into();
+    let resource: SavedResource = Resource::new("Widget", "example")
+        .into_value_snapshot()
+        .into();
     let mut value = serde_json::to_value(resource).expect("serialize saved resource");
     value["resolved_ignore_changes"] = serde_json::json!([{
         "attribute": "secret",
@@ -905,18 +977,22 @@ fn resource_deserialization_cannot_restore_resolved_ignore_changes() {
 #[test]
 #[should_panic(expected = "ResolvedDataSource requires identity")]
 fn resolved_data_source_new_panics_without_identity() {
-    ResolvedDataSource::new(DataSource::pending("aws_ami"));
+    ResolvedDataSource::new(DataSource::pending("aws_ami").with_dependency_phase(()));
 }
 
 #[test]
 fn resolved_data_source_try_new_returns_none_without_identity() {
-    assert!(ResolvedDataSource::try_new(DataSource::pending("aws_ami")).is_none());
+    assert!(
+        ResolvedDataSource::try_new(DataSource::pending("aws_ami").with_dependency_phase(()),)
+            .is_none()
+    );
 }
 
 #[test]
 fn resolved_data_source_try_new_returns_some_with_identity() {
     let resolved =
-        ResolvedDataSource::try_new(DataSource::new("aws_ami", "ubuntu")).expect("identity");
+        ResolvedDataSource::try_new(DataSource::new("aws_ami", "ubuntu").with_dependency_phase(()))
+            .expect("identity");
     assert_eq!(resolved.id.identity_str(), Some("ubuntu"));
     assert_eq!(resolved.as_inner().id.identity_str(), Some("ubuntu"));
     assert_eq!(
@@ -927,12 +1003,10 @@ fn resolved_data_source_try_new_returns_some_with_identity() {
 
 #[test]
 fn resolved_data_source_serde_round_trips_as_data_source() {
-    let resolved = ResolvedDataSource::new(DataSource::with_provider(
-        "aws",
-        "ami",
-        "ubuntu",
-        Some("primary".to_string()),
-    ));
+    let resolved = ResolvedDataSource::new(
+        DataSource::with_provider("aws", "ami", "ubuntu", Some("primary".to_string()))
+            .with_dependency_phase(()),
+    );
     let json = serde_json::to_string(&resolved).unwrap();
     let decoded = serde_json::from_str::<SavedResolvedDataSource>(&json).unwrap();
     assert_eq!(decoded, SavedResolvedDataSource::from(resolved));
@@ -941,7 +1015,8 @@ fn resolved_data_source_serde_round_trips_as_data_source() {
 
 #[test]
 fn resolved_data_source_deserialize_rejects_absent_identity() {
-    let mut value = serde_json::to_value(DataSource::new("aws_ami", "ubuntu")).unwrap();
+    let mut value =
+        serde_json::to_value(DataSource::new("aws_ami", "ubuntu").into_value_snapshot()).unwrap();
     value["id"].as_object_mut().unwrap().remove("identity");
     let err = serde_json::from_value::<SavedResolvedDataSource>(value).unwrap_err();
     assert!(err.to_string().contains("identity is required"));
@@ -1105,18 +1180,21 @@ fn prevent_destroy_resolution_reports_source_and_fails_safe_for_expressions() {
 
 #[test]
 fn directives_depends_on_defaults_to_empty() {
-    let d = Directives::default();
+    let d = PersistedDirectives::default();
     assert!(d.depends_on.is_empty());
 }
 
 #[test]
 fn directives_depends_on_round_trips_serde() {
-    let d = Directives {
-        depends_on: vec![absolute_binding("role"), absolute_binding("key")],
-        ..Directives::default()
+    let d = PersistedDirectives {
+        depends_on: crate::test_support::persisted([
+            ResolvedResourceId::with_provider_identity("mock", "test.Role", "role", None),
+            ResolvedResourceId::with_provider_identity("mock", "test.Key", "key", None),
+        ]),
+        ..Default::default()
     };
     let json = serde_json::to_string(&d).unwrap();
-    let back: Directives = serde_json::from_str(&json).unwrap();
+    let back: PersistedDirectives = serde_json::from_str(&json).unwrap();
     assert_eq!(back.depends_on, d.depends_on);
 }
 
@@ -1125,7 +1203,7 @@ fn directives_serialises_without_depends_on_when_empty() {
     // Avoid state-file noise: an empty depends_on must not appear as
     // `"depends_on": []` in serialised JSON, otherwise every legacy
     // state file will gain a meaningless key on first re-write.
-    let d = Directives::default();
+    let d = PersistedDirectives::default();
     let json = serde_json::to_string(&d).unwrap();
     assert!(
         !json.contains("depends_on"),
@@ -1141,7 +1219,7 @@ fn directives_depends_on_deserialises_from_legacy_json_without_field() {
         "create_before_destroy": false,
         "prevent_destroy": {"kind": "unspecified"}
     }"#;
-    let d: Directives = serde_json::from_str(without_depends_on).unwrap();
+    let d: PersistedDirectives = serde_json::from_str(without_depends_on).unwrap();
     assert!(d.depends_on.is_empty());
 }
 
@@ -1398,7 +1476,7 @@ fn merge_with_saved_map_fills_extra_keys() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1433,7 +1511,7 @@ fn merge_with_saved_desired_wins() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1465,7 +1543,7 @@ fn merge_with_saved_list_of_maps() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1488,7 +1566,7 @@ fn merge_with_saved_non_map() {
     let saved = Value::Concrete(ConcreteValue::String("world".into()));
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1502,7 +1580,7 @@ fn merge_with_saved_non_map() {
     let saved = Value::Concrete(ConcreteValue::Int(99));
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1523,7 +1601,7 @@ fn merge_with_saved_does_not_reinject_authored_removed_key() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1545,7 +1623,7 @@ fn merge_with_saved_reinjects_unauthored_saved_key() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1567,7 +1645,7 @@ fn merge_with_saved_reinjects_saved_key_with_unrecorded_child() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1586,7 +1664,7 @@ fn merge_with_saved_unrecorded_reinjects_all_saved_keys() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1688,7 +1766,7 @@ fn merge_with_saved_applies_authoring_recursively_to_maps_and_lists() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1772,7 +1850,7 @@ fn merge_with_saved_does_not_apply_union_authoring_to_individual_list_elements()
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1821,7 +1899,7 @@ fn merge_with_saved_list_elements_drops_only_paired_authored_field_in_both_paths
 
         let merged = merge_with_saved(
             &Value::Concrete(ConcreteValue::List(desired.clone())),
-            SavedValueViews::same(&Value::Concrete(ConcreteValue::List(saved))),
+            SavedValueViews::same(&(Value::Concrete(ConcreteValue::List(saved))).to_snapshot()),
             &prior,
             None,
             crate::schema::empty_defs_for_schema_walks(),
@@ -1911,15 +1989,18 @@ fn merge_with_saved_requires_raw_projected_corroboration_in_both_pairing_paths()
         let raw_saved = Value::Concrete(ConcreteValue::List(raw_saved));
         let merged = merge_with_saved(
             &desired,
-            SavedValueViews::new(&projected_saved, &raw_saved),
+            SavedValueViews::new(&projected_saved.to_snapshot(), &raw_saved.to_snapshot()),
             &ExplicitFields::ListElements { elements },
             None,
             crate::schema::empty_defs_for_schema_walks(),
         );
-        let Value::Concrete(ConcreteValue::List(merged)) = merged else {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(merged)) = merged
+        else {
             panic!("expected merged list");
         };
-        let Value::Concrete(ConcreteValue::Map(first)) = &merged[0] else {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(first)) =
+            &merged[0]
+        else {
             panic!("expected first merged map");
         };
         assert_eq!(
@@ -2168,6 +2249,7 @@ fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
 
 #[test]
 fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
+    use crate::resource::{ConcreteValue, DeferredValue, SnapshotValue as Value};
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
@@ -2201,6 +2283,7 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
 
 #[test]
 fn list_element_with_persisted_secret_hash_pairs_uniquely() {
+    use crate::resource::{ConcreteValue, DeferredValue, SnapshotValue as Value};
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let desired_secret = Value::Deferred(DeferredValue::Secret(Box::new(string("p"))));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
@@ -2436,7 +2519,7 @@ fn reference_form_pairing_is_identical_on_both_sides_of_hash_threshold() {
     )]);
     let scope = ReferenceScope::available("aws", "us-east-1", "123456789012")
         .expect("fixture scope is valid");
-    let context = crate::differ::ComparisonContext::for_test(&scope, &forms);
+    let context = crate::differ::ObservationComparison::for_test(&scope, &forms);
 
     for len in [HASH_THRESHOLD - 1, HASH_THRESHOLD] {
         let desired = (0..len)
@@ -2482,8 +2565,18 @@ fn enum_pairing_hashes_keep_dotted_strings_literal() {
     let api = Value::Concrete(ConcreteValue::String("json".into()));
     let defs = crate::schema::empty_defs_for_schema_walks();
     let context = crate::differ::exact_comparison_context_for_tests();
-    let dotted_hashes = pairing_hashes(&dotted, Some(&attr_type), defs, &context);
-    let api_hashes = pairing_hashes(&api, Some(&attr_type), defs, &context);
+    let dotted_hashes = super::snapshot_comparison::pairing_hashes(
+        &dotted.to_snapshot(),
+        Some(&attr_type),
+        defs,
+        &context,
+    );
+    let api_hashes = super::snapshot_comparison::pairing_hashes(
+        &api.to_snapshot(),
+        Some(&attr_type),
+        defs,
+        &context,
+    );
 
     assert!(
         dotted_hashes.iter().all(|hash| !api_hashes.contains(hash)),
@@ -2565,7 +2658,7 @@ fn merge_with_saved_malformed_list_elements_length_uses_conservative_full_merge(
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &malformed,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -2647,33 +2740,27 @@ fn lists_equal_large_list_of_maps() {
 }
 
 #[test]
-fn lists_equal_performance_large_list() {
-    // Benchmark: 1000-element list comparison should complete quickly
-    // With O(n^2), 1000 elements = 1M comparisons; with hashing, ~1000.
-    let n = 1000;
-    let a: Vec<Value> = (0..n)
-        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
-        .collect();
-    let b: Vec<Value> = (0..n)
-        .rev()
-        .map(|i| Value::Concrete(ConcreteValue::Int(i)))
-        .collect();
-
-    let start = std::time::Instant::now();
-    for _ in 0..100 {
-        assert!(lists_equal(&a, &b));
-    }
-    let elapsed = start.elapsed();
-    // Should complete well under 1 second for 100 iterations
+fn lists_equal_work_grows_linearly() {
+    let measure = |n: i64| {
+        let a: Vec<Value> = (0..n)
+            .map(|i| Value::Concrete(ConcreteValue::Int(i)))
+            .collect();
+        let b: Vec<Value> = a.iter().rev().cloned().collect();
+        let (equal, units) = super::comparison_work::measure(|| lists_equal(&a, &b));
+        assert!(equal);
+        assert!(units > 0, "the algorithm must report its work");
+        units
+    };
+    let small = measure(500);
+    let large = measure(1500);
     assert!(
-        elapsed.as_secs() < 5,
-        "lists_equal with 1000 elements took {:?} for 100 iterations, expected < 5s",
-        elapsed
+        large <= small * 4,
+        "list comparison work: 500={small}, 1500={large}"
     );
 }
 
 #[test]
-fn pair_list_elements_performance_large_list() {
+fn pair_list_elements_work_grows_at_most_n_log_n() {
     #[derive(Clone, Copy)]
     enum Fixture {
         AllDistinct,
@@ -2683,31 +2770,41 @@ fn pair_list_elements_performance_large_list() {
     let build = |n: usize, fixture: Fixture| {
         (0..n)
             .map(|index| {
-                Value::Concrete(ConcreteValue::Map(IndexMap::from([
-                    (
-                        "sid".to_string(),
-                        Value::Concrete(ConcreteValue::String(format!("Statement{index}").into())),
-                    ),
-                    (
-                        "effect".to_string(),
-                        Value::Concrete(ConcreteValue::String(match fixture {
-                            Fixture::AllDistinct => format!("Effect{index}").into(),
-                            Fixture::SharedEffect => "Allow".into(),
-                        })),
-                    ),
-                    (
-                        "action".to_string(),
-                        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                            ConcreteValue::String(format!("service:Action{index}").into()),
-                        )])),
-                    ),
-                    (
-                        "resource".to_string(),
-                        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                            ConcreteValue::String(format!("arn:carina:resource/{index}").into()),
-                        )])),
-                    ),
-                ])))
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                    IndexMap::from([
+                        (
+                            "sid".to_string(),
+                            crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::String(
+                                    format!("Statement{index}").into(),
+                                ),
+                            ),
+                        ),
+                        (
+                            "effect".to_string(),
+                            crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::String(match fixture {
+                                    Fixture::AllDistinct => format!("Effect{index}").into(),
+                                    Fixture::SharedEffect => "Allow".into(),
+                                }),
+                            ),
+                        ),
+                        (
+                            "action".to_string(),
+                            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                                ConcreteValue::String(format!("service:Action{index}").into()),
+                            )])),
+                        ),
+                        (
+                            "resource".to_string(),
+                            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                                ConcreteValue::String(
+                                    format!("arn:carina:resource/{index}").into(),
+                                ),
+                            )])),
+                        ),
+                    ]),
+                ))
             })
             .collect::<Vec<_>>()
     };
@@ -2715,40 +2812,27 @@ fn pair_list_elements_performance_large_list() {
         let desired = build(n, fixture);
         let mut saved = desired.clone();
         saved.reverse();
-        let start = std::time::Instant::now();
-        let pairs = pair_list_elements(
-            &desired,
-            &saved,
-            None,
-            crate::schema::empty_defs_for_schema_walks(),
-        );
-        let elapsed = start.elapsed();
-        assert_eq!(pairs[0], Some(n - 1));
-        assert_eq!(pairs[n - 1], Some(0));
-        elapsed
+        let (pairs, units) = super::comparison_work::measure(|| {
+            pair_list_elements(
+                &desired,
+                &saved,
+                None,
+                crate::schema::empty_defs_for_schema_walks(),
+            )
+        });
+        assert_eq!(pairs, (0..n).rev().map(Some).collect::<Vec<_>>());
+        assert!(units > 0, "the algorithm must report its work");
+        units
     };
 
     for fixture in [Fixture::AllDistinct, Fixture::SharedEffect] {
-        let name = match fixture {
-            Fixture::AllDistinct => "all-distinct",
-            Fixture::SharedEffect => "shared-effect",
-        };
-        for n in [100, 400, 800] {
-            eprintln!("pair_list_elements {name} n={n}: {:?}", measure(n, fixture));
-        }
-    }
-
-    // The known quadratic implementation takes about one second at n=800,
-    // projecting to well over 30 seconds at n=5000. Two seconds leaves ample
-    // headroom for slow debug CI while still reliably catching that regression.
-    for (name, fixture) in [
-        ("all-distinct", Fixture::AllDistinct),
-        ("shared-effect", Fixture::SharedEffect),
-    ] {
-        let large_elapsed = measure(5_000, fixture);
+        let small = measure(500, fixture);
+        let large = measure(1500, fixture);
+        // n*log2(n) grows by < 3.6x here. Allow 4.5x for bookkeeping,
+        // still below the 9x growth of all-pairs scoring.
         assert!(
-            large_elapsed < std::time::Duration::from_secs(2),
-            "pair_list_elements with 5000 {name} maps took {large_elapsed:?}, expected < 2s"
+            large * 2 <= small * 9,
+            "pairing work: 500={small}, 1500={large}"
         );
     }
 }
@@ -2869,7 +2953,10 @@ fn unavailable_canonical_hash_matches_function_call_and_ignores_diagnostics() {
 fn resource_typed_binding_field() {
     let resource: AuthoredResource =
         AuthoredResource::new("s3.Bucket", "my-bucket").with_binding("my_bucket");
-    assert_eq!(resource.binding.as_deref(), Some("my_bucket"));
+    assert_eq!(
+        resource.binding.as_ref().map(|binding| binding.as_str()),
+        Some("my_bucket")
+    );
     // binding should NOT be in attributes
     assert!(!resource.attributes.contains_key("_binding"));
 }
@@ -2878,8 +2965,8 @@ fn resource_typed_binding_field() {
 fn resource_typed_dependency_bindings_field() {
     let resource: AuthoredResource = AuthoredResource::new("ec2.Subnet", "my-subnet")
         .with_dependency_bindings(["vpc".to_string()].into_iter().collect());
-    assert!(resource.dependency_bindings.contains("vpc"));
-    assert_eq!(resource.dependency_bindings.len(), 1);
+    assert!(resource.dependencies.value_bindings.contains("vpc"));
+    assert_eq!(resource.dependencies.value_bindings.len(), 1);
     // dependency_bindings should NOT be in attributes
     assert!(!resource.attributes.contains_key("_dependency_bindings"));
 }
@@ -2889,10 +2976,10 @@ fn resource_typed_dependency_bindings_field() {
 #[test]
 fn resource_dependency_bindings_dedup_on_duplicate_insert() {
     let mut resource: AuthoredResource = AuthoredResource::new("ec2.Subnet", "my-subnet");
-    resource.dependency_bindings.insert("vpc".into());
-    resource.dependency_bindings.insert("vpc".into());
-    assert_eq!(resource.dependency_bindings.len(), 1);
-    assert!(resource.dependency_bindings.contains("vpc"));
+    resource.dependencies.value_bindings.insert("vpc".into());
+    resource.dependencies.value_bindings.insert("vpc".into());
+    assert_eq!(resource.dependencies.value_bindings.len(), 1);
+    assert!(resource.dependencies.value_bindings.contains("vpc"));
 }
 
 /// Iteration order is deterministic (sorted) regardless of insertion
@@ -2900,13 +2987,17 @@ fn resource_dependency_bindings_dedup_on_duplicate_insert() {
 #[test]
 fn resource_dependency_bindings_iteration_is_sorted() {
     let mut resource: AuthoredResource = AuthoredResource::new("ec2.Route", "my-route");
-    resource.dependency_bindings.insert("rt".into());
-    resource.dependency_bindings.insert("tgw_attach".into());
-    resource.dependency_bindings.insert("vpc".into());
+    resource.dependencies.value_bindings.insert("rt".into());
+    resource
+        .dependencies
+        .value_bindings
+        .insert("tgw_attach".into());
+    resource.dependencies.value_bindings.insert("vpc".into());
     let order: Vec<&str> = resource
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .iter()
-        .map(AsRef::as_ref)
+        .map(|binding| binding.as_str())
         .collect();
     assert_eq!(order, vec!["rt", "tgw_attach", "vpc"]);
 }
@@ -2915,9 +3006,28 @@ fn resource_dependency_bindings_iteration_is_sorted() {
 /// that delete-ordering metadata is also dedup'd and stable (#2228).
 #[test]
 fn state_dependency_bindings_dedup_on_duplicate_insert() {
-    let mut state = State::not_found(ResourceId::with_identity("ec2.Subnet", "my-subnet"));
-    state.dependency_bindings.insert(absolute_binding("vpc"));
-    state.dependency_bindings.insert(absolute_binding("vpc"));
+    let mut state: crate::resource::State =
+        State::not_found(ResourceId::with_identity("ec2.Subnet", "my-subnet"));
+    state
+        .dependency_bindings
+        .extend_projected(&crate::test_support::persisted([
+            ResolvedResourceId::with_provider_identity(
+                "aws",
+                "ec2.Vpc",
+                ResourceIdentity::new("vpc"),
+                None,
+            ),
+        ]));
+    state
+        .dependency_bindings
+        .extend_projected(&crate::test_support::persisted([
+            ResolvedResourceId::with_provider_identity(
+                "aws",
+                "ec2.Vpc",
+                ResourceIdentity::new("vpc"),
+                None,
+            ),
+        ]));
     assert_eq!(state.dependency_bindings.len(), 1);
 }
 
@@ -2925,7 +3035,7 @@ fn state_dependency_bindings_dedup_on_duplicate_insert() {
 fn resource_default_metadata_fields() {
     let resource = Resource::new("s3.Bucket", "my-bucket");
     assert_eq!(resource.binding, None);
-    assert!(resource.dependency_bindings.is_empty());
+    assert!(resource.dependencies.value_bindings.is_empty());
 }
 
 #[test]
@@ -3065,7 +3175,7 @@ fn loop_scheduler_identity_uses_the_persisted_stable_hash_contract() {
     let parsed = crate::parser::parse_file(
         source,
         std::path::Path::new("stable.crn"),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("loop parses");
     let origin = parsed.resources[0]
@@ -3091,14 +3201,20 @@ fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span()
     let parsed = crate::parser::parse(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for value in upstream.values { mock.test.Leaf { value = value } }\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("deferred loop parses");
-    let parsed = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-    )
-    .expect("deferred fixture crosses the module-resolution seam");
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+                session,
+            )
+            .expect("deferred fixture crosses the module-resolution seam")
+        },
+    );
     let crate::parser::DeferredForTarget::Unbound { template } =
         parsed.deferred_for_expressions()[0].target()
     else {
@@ -3206,7 +3322,8 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
     );
     let resource =
         Resource::new("fixture.Resource", "instance.resource").with_module_source(live.clone());
-    let encoded = serde_json::to_value(&resource).expect("serialize live resource metadata");
+    let encoded = serde_json::to_value(resource.into_value_snapshot())
+        .expect("serialize live resource metadata");
     assert_eq!(
         encoded["module_source"],
         serde_json::json!({
@@ -3229,7 +3346,8 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
 
     let mut data_source = DataSource::new("fixture.Lookup", "instance.lookup");
     data_source.module_source = Some(live);
-    let encoded = serde_json::to_value(&data_source).expect("serialize live data-source metadata");
+    let encoded = serde_json::to_value(data_source.into_value_snapshot())
+        .expect("serialize live data-source metadata");
     assert_eq!(
         encoded["module_source"],
         serde_json::json!({
@@ -3250,7 +3368,8 @@ fn live_and_saved_module_sources_have_the_same_wire_shape_but_distinct_resource_
     );
 
     let root = Resource::new("fixture.Resource", "root").with_module_source(ModuleSource::Root);
-    let encoded = serde_json::to_value(&root).expect("serialize live root metadata");
+    let encoded =
+        serde_json::to_value(root.into_value_snapshot()).expect("serialize live root metadata");
     assert_eq!(
         encoded["module_source"],
         serde_json::json!("Root"),
@@ -3943,9 +4062,9 @@ fn upstream_unknown_wire_tags_remain_stable() {
         r#"{"Unknown":{"UpstreamRef":{"path":{"binding":"network","attribute":"vpc_id"}}}}"#;
     assert_eq!(serde_json::to_string(&export).unwrap(), export_json);
     match serde_json::from_str::<Value>(export_json).unwrap() {
-        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-            path: decoded_path,
-        })) => assert_eq!(decoded_path, path),
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamExport { path: decoded_path },
+        )) => assert_eq!(decoded_path, path),
         other => panic!("expected UpstreamExport, got {other:?}"),
     }
 
@@ -3960,9 +4079,9 @@ fn upstream_unknown_wire_tags_remain_stable() {
         all_exports_json
     );
     match serde_json::from_str::<Value>(all_exports_json).unwrap() {
-        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
-            binding,
-        })) => {
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports { binding },
+        )) => {
             assert_eq!(binding.as_str(), "network")
         }
         other => panic!("expected UpstreamAllExports, got {other:?}"),
@@ -4144,7 +4263,7 @@ fn directives_provider_instance_round_trips_serde() {
         ..Directives::default()
     };
     let json = serde_json::to_string(&d).unwrap();
-    let back: Directives = serde_json::from_str(&json).unwrap();
+    let back: PersistedDirectives = serde_json::from_str(&json).unwrap();
     assert_eq!(back.provider_instance, d.provider_instance);
 }
 
@@ -4305,4 +4424,66 @@ mod navigate_value_path_tests {
             Some(Value::Deferred(DeferredValue::Secret(Box::new(s("n")))))
         );
     }
+}
+
+#[test]
+fn unexpanded_dependency_fields_default_to_empty() {
+    let dependencies = UnexpandedDependencyFields::<RelativeBindingName>::default();
+    assert!(dependencies.depends_on.is_empty());
+    assert!(dependencies.value_bindings.is_empty());
+}
+#[test]
+fn unexpanded_dependencies_are_parser_only_and_do_not_serialize() {
+    let mut resource = Resource::with_provider("mock", "test.resource", "example", None);
+    resource.dependencies.depends_on =
+        vec![absolute_binding("role"), absolute_binding("key")].into();
+    let saved: SavedResource = resource.into_value_snapshot().into();
+    let json = serde_json::to_string(&saved).unwrap();
+    let back: SavedResource = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.dependencies, ());
+    assert!(!json.contains("role") && !json.contains("key"));
+}
+#[test]
+fn provider_normalization_boundary_strips_then_restores_host_dependencies() {
+    let mut resource = Resource::new("test.resource", "consumer");
+    resource
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("value_source"));
+    resource.dependencies.depends_on = vec![absolute_binding("explicit_source")].into();
+    let mut provider = resource.clone().into_provider_resource();
+    assert_eq!(provider.dependencies, ());
+    provider.attributes.insert(
+        "normalized".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    resource.apply_provider_resource(provider);
+    assert_eq!(
+        resource.dependencies.value_bindings,
+        BTreeSet::from([absolute_binding("value_source")])
+    );
+    assert_eq!(
+        resource.dependencies.depends_on.diagnostic_references(),
+        ["explicit_source"]
+    );
+    assert_eq!(
+        resource.attributes.get("normalized"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
+}
+
+#[test]
+fn exact_pairing_preserves_hash_container_evidence() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("private".into()),
+    ))));
+    let hash = crate::value::redact_secrets_in_value(&secret).unwrap();
+    let item = SnapshotValue::Concrete(super::ConcreteValue::Map(IndexMap::from([(
+        "token".into(),
+        hash,
+    )])));
+    let (pairs, matched) =
+        super::match_equal_concrete_items(std::slice::from_ref(&item), std::slice::from_ref(&item));
+    assert_eq!(pairs, vec![Some(0)]);
+    assert_eq!(matched, vec![true]);
 }

@@ -92,8 +92,11 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     write_upstream(&upstream);
     write_downstream(&downstream, "../mgmt");
 
-    let config = load_configuration(&carina_core::paths::ResolvedPath::new(&downstream).unwrap())
-        .expect("load_configuration");
+    let config = load_configuration(
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("load_configuration");
 
     // Sanity: pre-resolve, the ref survives nested inside `assume_role`.
     let pc_pre = config
@@ -130,11 +133,16 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
         .parsed
         .clone()
         .into_parsed()
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("provider fixture has no parser placeholders");
-    let resolved =
-        resolve_provider_attributes_with_remote(&expanded, &remote, &ProviderContext::default())
-            .expect("resolve must succeed");
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| resolve_provider_attributes_with_remote(&expanded, &remote, session),
+    )
+    .expect("resolve must succeed");
 
     let pc = resolved
         .iter()

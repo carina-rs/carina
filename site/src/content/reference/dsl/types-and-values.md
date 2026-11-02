@@ -265,8 +265,10 @@ let label = "network-${vpc}"
 ```
 
 Use an attribute such as `vpc.vpc_id`. The same rule applies to bindings
-created by `for`, `if`, `use`, module calls, and `wait`. For a module call,
-select an output such as `network.vpc_id`.
+created by `for`, `if`, `use`, module calls, and `wait`. A module output may
+itself be a handle: if a module declares `attributes { vpc = vpc }`, then
+`network.vpc` is the handle and `network.vpc.vpc_id` is a value selected from
+the underlying resource.
 
 A handle may be given another name with `let`. The alias is itself a handle,
 so attribute access works through it, but using the alias bare in a value
@@ -283,12 +285,13 @@ let subnet = awscc.ec2.Subnet {
 ```
 
 Only syntax that explicitly transports a handle accepts one directly. Examples
-are `directives.depends_on`, `directives.provider`, and function or module
-arguments. The argument itself decides what is transported: passing `vpc`
-binds the parameter as a handle, while passing `vpc.vpc_id` binds it as a
-value. A resource type annotation checks that a passed handle has the expected
-resource type; it does not turn values into handles. An untyped function
-parameter can also receive a handle:
+are a module `attributes` entry, `directives.depends_on`,
+`wait.depends_on`, `directives.provider`, and function or module arguments.
+The argument itself decides what is transported: passing `vpc` binds the
+parameter as a handle, while passing `vpc.vpc_id` binds it as a value. A
+resource type annotation accepts only a matching handle; it does not turn a
+string or identity value into a handle. An untyped function parameter can also
+receive a handle:
 
 ```crn
 fn id_of(resource) {
@@ -344,7 +347,31 @@ arguments {
 }
 ```
 
-Primitive type names are PascalCase (`String`, not `string`). Besides the primitives, built-in types such as `Ipv4Cidr`, `Ipv4Address`, `Ipv6Cidr`, and `Ipv6Address` are always available, and providers register their own dotted types (for example `aws.Arn` or `aws.ec2.Vpc.Id`). An unknown type name is an error.
+Primitive type names are PascalCase (`String`, not `string`). The built-in refinements below are always available. Providers also register their own dotted types (for example `aws.Arn` or `aws.ec2.Vpc.Id`). An unknown type name is an error.
+
+### Built-in Types
+
+| Type | Base | Accepted values |
+| --- | --- | --- |
+| `DomainName` | String | DNS names with at least two labels; at most 253 characters excluding one trailing dot. |
+| `Email` | String | Email addresses with a non-empty local part and a dotted domain. |
+| `HttpResponseStatusCode` | String | Three-digit HTTP status codes in 2XX, 4XX, or 5XX. |
+| `HttpsUrl` | String | Absolute URLs starting with lowercase `https://`, without userinfo. |
+| `Ipv4Address` | String | IPv4 addresses such as `192.0.2.1`. |
+| `Ipv4Cidr` | String | IPv4 CIDR blocks such as `192.0.2.0/24`. |
+| `Ipv6Address` | String | IPv6 addresses such as `2001:db8::1`. |
+| `Ipv6Cidr` | String | IPv6 CIDR blocks such as `2001:db8::/32`. |
+| `PositiveInt` | Int | Integers greater than zero. |
+| `RedirectHost` | String | Redirect hosts of 1–128 characters, allowing `#{host}`. |
+| `RedirectPath` | String | Redirect paths of 1–128 characters starting with `/`, allowing host, port, and path placeholders. |
+| `RedirectPort` | String | Decimal ports in 1–65535, or `#{port}`. |
+| `RedirectProtocol` | String | `HTTP`, `HTTPS`, or `#{protocol}`. |
+| `RedirectQuery` | String | Redirect queries of at most 128 characters, allowing protocol, host, port, path, and query placeholders. |
+| `WildcardDomainName` | String | DomainName values with an optional leftmost `*.`; the full name is at most 253 characters excluding one trailing dot. |
+
+`DomainName` and `WildcardDomainName` accept uppercase letters, punycode, and numeric labels, including a numeric last label and dotted-IPv4-looking strings. Numeric labels deliberately match ACM's domain-name regex. Underscores are rejected, so these types are unsuitable for Route53 record names such as `_acme-challenge` or `_dmarc`.
+
+`HttpsUrl` accepts single-label hosts such as `localhost`, trailing-dot FQDNs such as `https://example.com.`, IPv4 addresses, and bracketed IPv6 addresses. A host whose last label is decimal digits or `0x`/`0X` followed by zero or more hex digits must be a canonical dotted-quad IPv4 address; forms such as `https://123` and `https://0x7f.1` are rejected. DNS labels have a 63-character limit, but the host has no 253-character cap. RFC 6570 templates such as `{proxy}` are rejected, so use another type for API Gateway HTTP integration URIs that contain templates. Attribute schemas may impose additional length or URL restrictions.
 
 ### Generic Types
 
@@ -382,14 +409,32 @@ arguments {
 
 ### Resource Type References
 
-Resource types can be used as type expressions to indicate a reference:
+Resource types used as type expressions mean resource handles. They are not
+aliases for the resource's ID or another string attribute:
+
+```crn
+arguments {
+  network: awscc.ec2.Vpc
+}
+
+attributes {
+  network = network
+}
+```
+
+A matching bare resource or module handle can satisfy `awscc.ec2.Vpc`. A
+`String`, `vpc.vpc_id`, or even the typed identity value
+`aws.ec2.Vpc.Id` cannot. When the boundary should carry the ID value, annotate
+it with the identity type instead:
 
 ```crn
 attributes {
-  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
+  vpc_id: aws.ec2.Vpc.Id = vpc.vpc_id
 }
 ```
+
+Resource handles may cross module boundaries in the same expanded graph, but
+they cannot be stored in `exports` or read through `upstream_state`.
 
 ## Null
 

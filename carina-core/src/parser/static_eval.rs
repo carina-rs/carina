@@ -145,7 +145,6 @@ fn classify_non_static_if_condition(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => IfConditionDependency::Runtime,
@@ -253,7 +252,6 @@ pub(crate) fn is_static_value<B: BindingAddress>(
         | GenericValue::Deferred(GenericDeferredValue::BindingRef { .. })
         | GenericValue::Deferred(GenericDeferredValue::Coalesce { .. })
         | GenericValue::Deferred(GenericDeferredValue::Unavailable { .. })
-        | GenericValue::Deferred(GenericDeferredValue::RedactedSecret { .. })
         | GenericValue::Deferred(GenericDeferredValue::Unknown(_))
         | GenericValue::Deferred(GenericDeferredValue::Placeholder(_)) => false,
         GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => is_static_value(inner),
@@ -267,10 +265,10 @@ pub(crate) fn is_static_value<B: BindingAddress>(
 pub(crate) fn is_static_eval(value: &EvalValue) -> bool {
     match value {
         EvalValue::User(v) => is_static_value(v),
-        EvalValue::StructuralHandle(_) => true,
+        EvalValue::UnexpandedStructuralHandle(_) => true,
         EvalValue::PendingValue(_) => false,
         EvalValue::ProvisionalReference { .. } => false,
-        EvalValue::ComputedWithStructuralHandles { value, .. } => is_static_value(value),
+        EvalValue::ComputedWithUnexpandedStructuralHandles { value, .. } => is_static_value(value),
         EvalValue::DeferredForValue { .. } => false,
         EvalValue::Closure { captured_args, .. } => captured_args.iter().all(is_static_eval),
     }
@@ -371,6 +369,7 @@ pub(crate) fn evaluate_static_value(
                 functions,
                 &evaluated_args,
                 config,
+                None,
                 line,
             )
         }
@@ -415,7 +414,6 @@ pub(crate) fn evaluate_static_value(
             | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value),

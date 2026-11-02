@@ -1,6 +1,8 @@
 use super::*;
+use carina_core::resource::Directives;
 use carina_core::resource::{
-    DeferredValue, PendingReRead, ReReadReason, absolute_binding_address_for_test,
+    DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies, SavedModuleSource,
+    SnapshotLeaf, absolute_binding_address_for_test,
 };
 use carina_core::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
@@ -20,13 +22,128 @@ fn persisted_prevent_destroy_json(directives: &PersistedDirectives) -> serde_jso
         .clone()
 }
 
-fn exact_comparison_context() -> carina_core::differ::ComparisonContext<'static> {
+fn exact_comparison_context() -> carina_core::differ::ObservationComparison<'static> {
     carina_core::differ::exact_comparison_context_for_tests()
 }
 
-fn resource_state_from_provider_state_for_resource_and_schema_for_test<S: Clone>(
+#[test]
+fn round3_carried_reference_list_keeps_removal_provenance_across_alias_and_arn() {
+    use carina_core::explicit::ExplicitFields;
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+    };
+    let schema = ResourceSchema::new("keys.Resource")
+        .attribute(
+            AttributeSchema::optional(
+                "rules",
+                AttributeType::unordered_list(AttributeType::struct_(
+                    "Rule",
+                    vec![
+                        StructField::optional(
+                            "key",
+                            AttributeType::reference(
+                                TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
+                                None,
+                                None,
+                            ),
+                        )
+                        .build(),
+                        StructField::optional("removed", AttributeType::string()).build(),
+                    ],
+                )),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let rules = |key: &str, removed: bool| {
+        let mut fields = IndexMap::from([(
+            "key".into(),
+            Value::Concrete(ConcreteValue::String(key.into())),
+        )]);
+        if removed {
+            fields.insert(
+                "removed".into(),
+                Value::Concrete(ConcreteValue::String("keep retrying".into())),
+            );
+        }
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(fields),
+        )]))
+    };
+    let old = Resource::with_provider("test", "keys.Resource", "example", None)
+        .with_attribute("rules", rules("alias/old", true));
+    let before =
+        State::existing(old.id.clone(), old.resolved_attributes()).with_identifier("id-123");
+    let prior = resource_state_from_provider_state_for_resource_and_schema_for_test(
+        &resolved(&old),
+        &before,
+        None,
+        Some(schema.as_schema()),
+        RowBasis::Imported,
+        None,
+    )
+    .unwrap();
+    for (desired_key, drifted) in [
+        ("alias/old", false),
+        ("alias/new", false),
+        ("alias/old", true),
+        ("alias/new", true),
+    ] {
+        let desired = Resource::with_provider("test", "keys.Resource", "example", None)
+            .with_attribute("rules", rules(desired_key, false));
+        let mut fresh = State::existing(
+            old.id.clone(),
+            HashMap::from([("rules".into(), rules("key/a", true))]),
+        )
+        .with_identifier("id-123");
+        if drifted {
+            let Value::Concrete(ConcreteValue::List(items)) =
+                fresh.attributes.get_mut("rules").unwrap()
+            else {
+                unreachable!()
+            };
+            let Value::Concrete(ConcreteValue::Map(fields)) = &mut items[0] else {
+                unreachable!()
+            };
+            fields.insert(
+                "removed".into(),
+                Value::Concrete(ConcreteValue::String("changed outside the plan".into())),
+            );
+        }
+        let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
+            &resolved(&desired),
+            &fresh,
+            Some(&prior),
+            Some(schema.as_schema()),
+            RowBasis::Carried,
+            None,
+        )
+        .unwrap();
+        let ExplicitFields::Struct { children } = &row.explicit else {
+            panic!("resource authoring")
+        };
+        match &children["rules"] {
+            ExplicitFields::WholeValue { pending } => assert_eq!(
+                serde_json::to_value(pending).unwrap(),
+                serde_json::json!([["removed"]])
+            ),
+            ExplicitFields::ListElements { elements } => assert!(
+                matches!(&elements[0],
+                ExplicitFields::Struct { children } if children.contains_key("removed")),
+                "{elements:?}"
+            ),
+            other => panic!("removal evidence lost for {desired_key}: {other:?}"),
+        }
+    }
+}
+
+fn resource_state_from_provider_state_for_resource_and_schema_for_test<
+    S: Clone,
+    P: StateValueLeaf,
+>(
     resource: &carina_core::resource::ResolvedResource<S>,
-    state: &State,
+    state: &State<P>,
     existing: Option<&ResourceState>,
     schema: Option<&carina_core::schema::CompiledResourceSchema>,
     row_basis: RowBasis<'_>,
@@ -60,25 +177,96 @@ fn resource_state_from_observation_for_test<S: Clone>(
     )
 }
 
-fn diff(
+fn diff<P: StateValueLeaf>(
     desired: &carina_core::resource::ResolvedResource,
-    current: &State,
+    current: &State<P>,
     saved_attrs: &carina_core::provider::LiftedSavedAttrs,
     prev_explicit: Option<&carina_core::explicit::ExplicitFields>,
     schema: Option<&carina_core::schema::CompiledResourceSchema>,
 ) -> carina_core::differ::Diff {
-    carina_core::differ::diff(
+    carina_core::differ::diff_for_test(
         desired,
         current,
         saved_attrs,
         prev_explicit,
         schema,
-        &exact_comparison_context(),
+        &carina_core::differ::exact_comparison_schema_for_tests(),
+        &carina_core::references::prepare_empty_for_tests(),
     )
+    .unwrap()
+}
+
+fn migrate_legacy_with_config(
+    state: StateFile,
+    resources: &[Resource],
+) -> Result<(StateFile, ReportedLegacyMigration), LegacyDependencyMigrationError> {
+    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = parsed;
+        configuration.resources = resources.to_vec();
+        configuration.into()
+    })
+    .expect("legacy migration fixture graph must resolve");
+    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
+    let moved_pairs =
+        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
+    let migration =
+        expect_classified(state.classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())?);
+    let migrated_rows = migration.migrated_rows();
+    let mut warnings = Vec::new();
+    let state = migration
+        .report_and_validate(|warning| warnings.push(warning.clone()))?
+        .state;
+    Ok((
+        state,
+        ReportedLegacyMigration {
+            migrated_rows,
+            warnings,
+        },
+    ))
+}
+
+#[derive(Debug)]
+struct ReportedLegacyMigration {
+    migrated_rows: usize,
+    warnings: Vec<LegacyDestroyOrderingWarning>,
+}
+
+fn expect_classified<T>(outcome: LegacyClassificationOutcome<T>) -> T {
+    match outcome {
+        LegacyClassificationOutcome::Classified(classified) => classified,
+        LegacyClassificationOutcome::RequiresReads(rows) => {
+            panic!("fixture requires reads: {rows}")
+        }
+    }
+}
+
+impl ReportedLegacyMigration {
+    fn migrated_rows(&self) -> usize {
+        self.migrated_rows
+    }
+
+    fn warnings(&self) -> &[LegacyDestroyOrderingWarning] {
+        &self.warnings
+    }
+}
+
+fn finish_legacy_dependency_migration(state: StateFile) -> StateFile {
+    if !state.requires_legacy_dependency_migration() {
+        return state;
+    }
+    let (state, report) = migrate_legacy_with_config(state, &[])
+        .expect("source-independent migration fixture must cross the v20 dependency seam");
+    assert!(
+        report.warnings().is_empty(),
+        "migration fixture contains an unresolved legacy dependency: {:?}",
+        report.warnings()
+    );
+    state
 }
 
 #[test]
-fn v19_migrates_to_v20_without_rewriting_resource_data() {
+fn v19_migrates_to_unwritable_v20_then_graph_aware_v21_without_losing_row_data() {
     let json = serde_json::json!({
         "version": 19,
         "exports_version": PublishedExports::CURRENT_VERSION,
@@ -105,10 +293,16 @@ fn v19_migrates_to_v20_without_rewriting_resource_data() {
     let migrated = check_and_migrate(&json.to_string()).expect("v19 state must migrate");
     assert_eq!(
         migrated.migration(),
-        Some(MigrationInfo { from: 19, to: 20 })
+        Some(MigrationInfo { from: 19, to: 21 })
     );
     let state = migrated.into_state();
     assert_eq!(state.version, 20);
+    assert!(state.requires_legacy_dependency_migration());
+    assert!(serde_json::to_value(&state).is_err());
+    let (state, report) = migrate_legacy_with_config(state, &[])
+        .expect("an empty legacy dependency snapshot is graph-migratable");
+    assert_eq!(report.migrated_rows(), 0);
+    assert_eq!(state.version, 21);
     assert_eq!(state.serial, 7);
     assert_eq!(state.lineage, "v19-lineage");
     assert_eq!(state.resources().len(), 1);
@@ -192,30 +386,67 @@ fn v19_migration_preserves_true_and_makes_false_or_missing_unspecified() {
 }
 
 #[test]
-fn v20_state_round_trip_preserves_explicit_prevent_destroy_false() {
-    let mut row =
-        ResourceState::try_applied("test.Resource", "explicit-false", "mock", "provider-id")
-            .expect("fixture identifier is non-empty");
-    row.directives = PersistedDirectives::default().with_prevent_destroy(false);
-    let mut state = StateFile::new();
-    state
-        .upsert_resource(row)
-        .expect("test state setup must be valid");
+fn v20_to_v21_preserves_all_three_prevent_destroy_states() {
+    let row = |identity: &str, prevent_destroy: serde_json::Value| {
+        serde_json::json!({
+            "resource_type": "test.Resource",
+            "identity": identity,
+            "provider": "mock",
+            "current": {
+                "kind": "applied",
+                "identifier": format!("provider-{identity}"),
+                "attributes": {},
+                "nested_write_only": {}
+            },
+            "directives": {"prevent_destroy": prevent_destroy}
+        })
+    };
+    let json = serde_json::json!({
+        "version": 20,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "tri-state-v20-to-v21",
+        "carina_version": "test",
+        "resources": [
+            row("unspecified", serde_json::json!({"kind": "unspecified"})),
+            row("explicit-false", serde_json::json!({"kind": "explicit", "value": false})),
+            row("explicit-true", serde_json::json!({"kind": "explicit", "value": true}))
+        ],
+        "exports": {}
+    });
 
-    let encoded = serde_json::to_string(&state).expect("v20 state must serialize");
-    let decoded = check_and_migrate(&encoded)
-        .expect("v20 state must decode")
+    let state = check_and_migrate(&json.to_string())
+        .expect("v20 tri-state directives must decode")
         .into_state();
+    assert_eq!(state.version, 20);
+    let (state, report) = migrate_legacy_with_config(state, &[])
+        .expect("empty dependency sets must cross the v20 to v21 graph seam");
+    assert_eq!(report.migrated_rows(), 0);
+    assert_eq!(state.version, 21);
 
+    let settings = state
+        .resources()
+        .iter()
+        .map(|row| {
+            (
+                row.identity.as_str(),
+                persisted_prevent_destroy_json(&row.directives),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     assert_eq!(
-        persisted_prevent_destroy_json(&decoded.resources()[0].directives),
+        settings["unspecified"],
+        serde_json::json!({"kind": "unspecified"})
+    );
+    assert_eq!(
+        settings["explicit-false"],
         serde_json::json!({"kind": "explicit", "value": false})
     );
-    let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
     assert_eq!(
-        json["resources"][0]["directives"]["prevent_destroy"],
-        serde_json::json!({"kind": "explicit", "value": false})
+        settings["explicit-true"],
+        serde_json::json!({"kind": "explicit", "value": true})
     );
+    serde_json::to_value(&state).expect("the migrated v21 state must be writable");
 }
 
 #[test]
@@ -251,6 +482,10 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
     let state = check_and_migrate(&json.to_string())
         .expect("v20 outcome-unknown state must load")
         .into_state();
+    assert_eq!(state.version, 20);
+    let (state, _report) = migrate_legacy_with_config(state, &[])
+        .expect("token-less outcome rows must survive graph-aware migration");
+    assert_eq!(state.version, 21);
     let id = ResourceId::with_provider_identity(
         "mock",
         "test.Resource",
@@ -274,7 +509,8 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
     );
     assert_eq!(row.deposed.len(), 1);
 
-    let encoded = serde_json::to_value(&state).expect("v20 state must serialize");
+    let encoded = serde_json::to_value(&state).expect("v21 state must serialize");
+    assert_eq!(encoded["version"], serde_json::json!(21));
     assert_eq!(
         encoded["resources"][0]["current"],
         serde_json::json!({
@@ -372,23 +608,38 @@ fn outcome_unknown_forget_keeps_deposed_generations_in_a_shell() {
         "serial": 1,
         "lineage": "forget-unknown-create-with-deposed",
         "carina_version": "test",
-        "resources": [{
-            "resource_type": "test.Resource",
-            "identity": "unknown",
-            "provider": "mock",
-            "current": {
-                "kind": "create_outcome_unknown",
-                "started_at": "2026-10-23T08:00:00Z"
+        "resources": [
+            {
+                "resource_type": "test.Resource",
+                "identity": "unknown",
+                "provider": "mock",
+                "current": {
+                    "kind": "create_outcome_unknown",
+                    "started_at": "2026-10-23T08:00:00Z"
+                },
+                "directives": { "provider_instance": "issuing" },
+                "deposed": [{
+                    "key": "00000000-0000-4000-8000-000000000001",
+                    "identifier": "old-id",
+                    "provider_instance": "old-route",
+                    "attributes": {},
+                    "dependency_bindings": ["network"]
+                }]
             },
-            "directives": { "provider_instance": "issuing" },
-            "deposed": [{
-                "key": "00000000-0000-4000-8000-000000000001",
-                "identifier": "old-id",
-                "provider_instance": "old-route",
-                "attributes": {},
-                "dependency_bindings": ["network"]
-            }]
-        }],
+            {
+                "resource_type": "test.Network",
+                "identity": "network",
+                "provider": "mock",
+                "binding": "network",
+                "current": {
+                    "kind": "applied",
+                    "identifier": "network-id",
+                    "attributes": {},
+                    "write_only_attributes": [],
+                    "nested_write_only": {}
+                }
+            }
+        ],
         "exports": {}
     });
     let mut state = check_and_migrate(&json.to_string()).unwrap().into_state();
@@ -536,7 +787,7 @@ fn v15_migrates_to_current_and_round_trips_all_current_instance_variants() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = migrated.into_state();
+    let state = finish_legacy_dependency_migration(migrated.into_state());
     assert!(matches!(
         state.resources()[0].current(),
         CurrentInstance::None
@@ -604,7 +855,7 @@ fn v17_migrates_nested_write_only_records_to_empty() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = migrated.into_state();
+    let state = finish_legacy_dependency_migration(migrated.into_state());
     assert!(state.resources()[0].nested_write_only().is_empty());
     assert!(state.resources()[1].nested_write_only().is_empty());
     let encoded = serde_json::to_value(&state).expect("migrated state serializes");
@@ -652,7 +903,7 @@ fn v18_migrates_partial_read_detail_to_incomplete_reread_reason() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = migrated.into_state();
+    let state = finish_legacy_dependency_migration(migrated.into_state());
     let marker = state.resources()[0]
         .partial_read()
         .expect("legacy marker survives migration");
@@ -751,7 +1002,7 @@ fn v18_empty_partial_read_marker_migrates_to_no_marker() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = migrated.into_state();
+    let state = finish_legacy_dependency_migration(migrated.into_state());
     assert!(
         state.resources()[0].partial_read().is_none(),
         "an empty legacy marker must not survive migration"
@@ -796,7 +1047,7 @@ fn restore_partial_read_markers_shrinks_and_clears_resolved_attributes() {
         .upsert_resource(clearing_row)
         .expect("clearing fixture row is unique");
 
-    let resolved_value = Value::Concrete(ConcreteValue::String("now-known".into()));
+    let resolved_value: Value = Value::Concrete(ConcreteValue::String("now-known".into()));
     let mut refreshed = HashMap::from([
         (
             shrinking_id.clone(),
@@ -937,6 +1188,10 @@ fn v14_to_current_preserves_write_only_partial_and_deposed_fields() {
         })
     );
     let state = migrated.into_state();
+    let upstream = Resource::with_provider("mock", "test.Dependency", "upstream", None)
+        .with_absolute_binding(absolute_binding("upstream"));
+    let (state, _reported) = migrate_legacy_with_config(state, &[upstream])
+        .expect("v14 directive dependency resolves with configuration");
     let CurrentInstance::Applied {
         identifier,
         attributes,
@@ -955,7 +1210,7 @@ fn v14_to_current_preserves_write_only_partial_and_deposed_fields() {
     assert_eq!(state.resources()[0].deposed.len(), 1);
     assert_eq!(
         state.resources()[0].directives.depends_on,
-        [absolute_binding("upstream")],
+        fixture_persisted_dependencies(["upstream"]),
         "legacy directive dependencies must cross migration through checked absolute addresses"
     );
 }
@@ -1006,7 +1261,7 @@ fn structural_secret_digest(value: &serde_json::Value) -> &str {
 }
 
 fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String(plaintext.into()),
     ))));
     let encoded = PersistedValue::encode_provider_value(&secret, None)
@@ -1023,15 +1278,17 @@ fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
 }
 
 fn resolved(resource: &carina_core::resource::Resource) -> carina_core::resource::ResolvedResource {
-    carina_core::resource::ResolvedResource::new(resource.clone())
+    carina_core::resource::ResolvedResource::collect_resolved([resource.clone()])
+        .expect("fixture graph resolves")
+        .remove(0)
 }
 
 fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
     absolute_binding_address_for_test(name)
 }
 
-fn absolute_bindings<const N: usize>(names: [&str; N]) -> BTreeSet<AbsoluteBindingAddress> {
-    names.into_iter().map(absolute_binding).collect()
+fn absolute_bindings<const N: usize>(names: [&str; N]) -> PersistedDestroyDependencies {
+    fixture_persisted_dependencies(names)
 }
 
 fn list_rule(port: i64, description: Option<&str>) -> Value {
@@ -1148,7 +1405,7 @@ fn whole_value(paths: &[&[&str]]) -> ExplicitFields {
 fn test_state_file_new() {
     let state = StateFile::new();
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
-    assert_eq!(StateFile::CURRENT_VERSION, 20);
+    assert_eq!(StateFile::CURRENT_VERSION, 21);
     assert_eq!(state.serial, 0);
     assert!(!state.lineage.is_empty());
     assert!(state.resources.is_empty());
@@ -1158,7 +1415,7 @@ fn test_state_file_new() {
 fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
     use carina_core::resource::{Resource, State as ProviderState};
 
-    assert_eq!(StateFile::CURRENT_VERSION, 20);
+    assert_eq!(StateFile::CURRENT_VERSION, 21);
     let marker = valid_legacy_marker_shaped_string("state-marker-collision");
     let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
@@ -1199,8 +1456,14 @@ fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
         }
     };
 
-    assert_eq!(loaded.attributes.get("authored"), Some(&plain));
-    assert_eq!(loaded.attributes.get("provider_only"), Some(&plain));
+    assert_eq!(
+        loaded.attributes.get("authored"),
+        Some(&plain.to_snapshot())
+    );
+    assert_eq!(
+        loaded.attributes.get("provider_only"),
+        Some(&plain.to_snapshot())
+    );
     let raw: serde_json::Value = serde_json::from_str(&json).expect("state JSON");
     assert_eq!(
         raw["resources"][0]["current"]["attributes"]["authored"],
@@ -1298,7 +1561,9 @@ fn release_list_keys_only_demotes_matching_authoring_entries() {
         key_field: key_field.clone(),
         keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
             "b",
-            Value::Concrete(ConcreteValue::String("2".into())),
+            Value::<carina_core::resource::NoPlaceholder>::Concrete(ConcreteValue::String(
+                "2".into(),
+            )),
         )])
         .expect("release fixture has one key"),
     };
@@ -1375,14 +1640,14 @@ fn upsert_resource_returns_error_for_duplicate_deposed_key() {
             identifier: "vpc-old-a".to_string(),
             provider_instance: Some("west".to_string()),
             attributes: PersistedAttributes::default(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
         },
         DeposedInstance {
             key: duplicate_key,
             identifier: "vpc-old-b".to_string(),
             provider_instance: Some("east".to_string()),
             attributes: PersistedAttributes::default(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
         },
     ];
 
@@ -1408,14 +1673,14 @@ fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generatio
             identifier: "vpc-old-a".to_string(),
             provider_instance: Some("west".to_string()),
             attributes: PersistedAttributes::default(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
         },
         DeposedInstance {
             key: second_key,
             identifier: "vpc-old-b".to_string(),
             provider_instance: Some("east".to_string()),
             attributes: PersistedAttributes::default(),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
         },
     ];
     state
@@ -1434,7 +1699,7 @@ fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generatio
                 identifier: "vpc-old-b".to_string(),
                 provider_instance: Some("east".to_string()),
                 attributes: PersistedAttributes::default(),
-                dependency_bindings: BTreeSet::new(),
+                dependency_bindings: Default::default(),
             },
         )
         .expect_err("key and identity cannot select different generations");
@@ -1512,7 +1777,7 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
             "cidr_block".to_string(),
             serde_json::json!("10.2.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
     });
     existing.deposed.push(DeposedInstance {
         key: retained_key.clone(),
@@ -1563,7 +1828,7 @@ fn upsert_resource_keeps_deposed_generation_with_same_identifier_on_other_provid
             "cidr_block".to_string(),
             serde_json::json!("10.2.0.0/16"),
         )])),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
     });
     state
         .upsert_resource(existing)
@@ -1635,7 +1900,7 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
     resource.binding = Some(absolute_binding("vpc"));
     resource
         .dependency_bindings
-        .insert(absolute_binding("internet"));
+        .extend_projected(&fixture_persisted_dependencies(["internet"]));
     resource.set_write_only_attributes_for_test(vec!["token".to_string()]);
     resource.set_partial_read_for_test(PartialReadMarker::new(
         PendingReRead::incomplete("partial"),
@@ -1673,7 +1938,10 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
         Some("west")
     );
     assert!(!retained.protected);
-    let expected_directives = Directives::default().with_provider_instance("west");
+    let expected_directives = PersistedDirectives::from_resolved(
+        &carina_core::resource::Directives::default().with_provider_instance("west"),
+        PersistedDestroyDependencies::default(),
+    );
     assert_eq!(retained.directives, expected_directives);
     assert_eq!(
         StateFile::id_for_resource_state(retained),
@@ -2034,7 +2302,7 @@ fn test_resource_state_serialization_with_binding_and_deps() {
         "name_overrides": {},
         "desired_keys": [],
         "binding": "my_bucket",
-        "dependency_bindings": ["vpc", "subnet"]
+        "dependency_bindings": [{"provider":"mock","resource_type":"test.Dependency","identity":"vpc"},{"provider":"mock","resource_type":"test.Dependency","identity":"subnet"}]
     }"#;
 
     let deserialized: ResourceState = serde_json::from_str(json).unwrap();
@@ -2112,7 +2380,7 @@ fn test_from_provider_state() {
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("my-bucket-abcd1234".to_string()),
         attributes: [(
@@ -2122,7 +2390,7 @@ fn test_from_provider_state() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -2161,7 +2429,7 @@ fn test_from_provider_state_without_existing() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("aws", "s3.Bucket", "test", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("test-id".to_string()),
         attributes: [(
@@ -2171,7 +2439,7 @@ fn test_from_provider_state_without_existing() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -2393,7 +2661,7 @@ fn test_from_provider_state_repairs_unrecorded_from_desired_resource() {
 
     let resource = Resource::with_provider("awscc", "sso.Assignment", "x", None);
     // The desired resource intentionally has no authored attributes.
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("identifier".to_string()),
         attributes: [
@@ -2409,7 +2677,7 @@ fn test_from_provider_state_repairs_unrecorded_from_desired_resource() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -2445,7 +2713,7 @@ fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_pr
 
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
         .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into())));
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([
             (
@@ -2527,7 +2795,7 @@ fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_pr
 fn test_from_provider_state_carry_prior_without_prior_seeds_from_desired() {
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
         .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into())));
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([
             (
@@ -2604,7 +2872,7 @@ fn test_from_provider_state_carry_prior_preserves_partially_removed_authored_key
         "name",
         Value::Concrete(ConcreteValue::String("kept".into())),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([
             (
@@ -2654,7 +2922,7 @@ fn test_from_provider_state_carry_prior_demotes_retained_list_alignment() {
         "name",
         Value::Concrete(ConcreteValue::String("kept".into())),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([
             (
@@ -2712,7 +2980,7 @@ fn test_from_provider_state_carry_prior_drops_removed_key_absent_from_fresh_stat
         "name",
         Value::Concrete(ConcreteValue::String("kept".into())),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([(
             "name".to_string(),
@@ -2755,7 +3023,7 @@ fn carried_top_level_unrecorded_child_still_plans_its_removal() {
         "legacy",
         Value::Concrete(ConcreteValue::String("provider-value".into())),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         authored.id.clone(),
         HashMap::from([(
             "legacy".to_string(),
@@ -3451,7 +3719,7 @@ fn test_from_provider_state_records_empty_struct_for_fresh_empty_body_resource()
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("aws", "sts.CallerIdentity", "caller", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("identifier".to_string()),
         attributes: [(
@@ -3461,7 +3729,7 @@ fn test_from_provider_state_records_empty_struct_for_fresh_empty_body_resource()
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -3496,7 +3764,7 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
     };
 
     let resource = Resource::with_provider("awscc", "ec2.InternetGateway", "igw", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("id".to_string()),
         attributes: [(
@@ -3506,7 +3774,7 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -3587,7 +3855,7 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
 #[test]
 fn test_from_provider_state_replaces_prior_top_level_list_when_resource_attrs_empty() {
     let resource = Resource::with_provider("mock", "test.Resource", "empty", None);
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([(
             "provider_value".to_string(),
@@ -3731,12 +3999,12 @@ fn test_from_provider_state_replaces_unrecorded_when_desired_and_state_attrs_are
     use carina_core::resource::{Resource, State as ProviderState};
 
     let resource = Resource::with_provider("awscc", "sso.Assignment", "x", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("id".to_string()),
         attributes: HashMap::new(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -3791,9 +4059,11 @@ fn test_migrate_v6_empty_struct_to_unrecorded() {
             }
         ]
     }"#;
-    let state = check_and_migrate(v6)
-        .expect("migration should succeed")
-        .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(v6)
+            .expect("migration should succeed")
+            .into_state(),
+    );
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
     let rs = state
         .resources
@@ -4185,7 +4455,9 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
             .and_then(|attributes| attributes.get("comment")),
     ] {
         match loaded {
-            Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })) => {
+            Some(Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret {
+                hash: loaded,
+            }))) => {
                 assert!(
                     loaded.encoded_digest().starts_with("argon2-legacy:"),
                     "state load must retain the typed explicit legacy digest",
@@ -4212,7 +4484,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
             "token".to_string(),
             tag,
         )])),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
     };
 
     for decoded in [
@@ -4223,7 +4495,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
     ] {
         assert!(matches!(
             decoded.get("token"),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
+            Some(Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash: loaded })))
                 if loaded.encoded_digest().starts_with("argon2-legacy:")
         ));
     }
@@ -4244,7 +4516,7 @@ fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
             "token".to_string(),
             tag,
         )])),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
     });
 
     let mut state = StateFile::new();
@@ -4263,11 +4535,15 @@ fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
     let deposed: &PersistedAttributes = &reloaded.resources()[0].deposed[0].attributes;
     assert!(matches!(
         current.get("token"),
-        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        Some(Value::Deferred(DeferredValue::Placeholder(
+            SnapshotLeaf::RedactedSecret { .. }
+        )))
     ));
     assert!(matches!(
         deposed.get("token"),
-        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        Some(Value::Deferred(DeferredValue::Placeholder(
+            SnapshotLeaf::RedactedSecret { .. }
+        )))
     ));
     assert_eq!(
         serde_json::to_vec(&reloaded).expect("serialize reloaded state"),
@@ -4600,7 +4876,7 @@ fn build_state_for_resource_does_not_hide_current_content_behind_deposed_generat
         "old-id".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state = StateFile::new();
     state
@@ -4626,7 +4902,7 @@ fn removing_last_deposed_generation_retains_malformed_current_instance() {
         "old-id".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state = StateFile::new();
     state
@@ -4656,7 +4932,7 @@ fn removing_last_deposed_generation_prunes_explicit_false_shell() {
         "old-id".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state = StateFile::new();
     state
@@ -4684,7 +4960,7 @@ fn removing_last_deposed_generation_retains_explicit_true_shell() {
         "old-id".to_string(),
         None,
         HashMap::new(),
-        BTreeSet::new(),
+        Default::default(),
     ));
     let mut state = StateFile::new();
     state
@@ -4716,7 +4992,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
             .expect("resource reference contains no parser placeholder"),
     );
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("subnet-123".to_string()),
         attributes: [(
@@ -4726,13 +5002,21 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
 
     let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
-        &resolved(&resource),
+        &carina_core::resource::ResolvedResource::from_resolved_parts(
+            resource.clone().into_resolved_dependency_phase_for_test(),
+            fixture_dependencies(["my_vpc"]),
+            Default::default(),
+        )
+        .with_saved_destroy_dependencies(
+            fixture_persisted_dependencies(["my_vpc"]),
+            Default::default(),
+        ),
         &provider_state,
         None,
         None,
@@ -4756,7 +5040,7 @@ fn state_json_cannot_persist_ignore_changes_paths() {
     assert_eq!(runtime.ignore_changes.len(), 1);
 
     let mut row = ResourceState::new("test.Widget", "example", "mock");
-    row.directives = (&runtime).into();
+    row.directives = PersistedDirectives::from_resolved(&runtime, Default::default());
     let encoded = serde_json::to_string(&row).expect("state row serializes");
 
     assert!(row.directives.explicitly_prevents_destroy());
@@ -4774,7 +5058,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     rs.binding = Some(absolute_binding("my_subnet"));
     rs.dependency_bindings = absolute_bindings(["my_vpc"]);
     rs.directives.set_prevent_destroy(true);
-    rs.directives.depends_on = vec![absolute_binding("security_group")];
+    rs.directives.depends_on = fixture_persisted_dependencies(["security_group"]);
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -4813,7 +5097,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     assert!(orphan.directives().explicitly_prevents_destroy());
     assert_eq!(
         orphan.directives().depends_on,
-        vec![absolute_binding("security_group")]
+        fixture_persisted_dependencies(["security_group"])
     );
     assert_eq!(
         orphan_state.dependency_bindings,
@@ -4845,7 +5129,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     assert!(refreshed.directives().explicitly_prevents_destroy());
     assert_eq!(
         refreshed.directives().depends_on,
-        vec![absolute_binding("security_group")]
+        fixture_persisted_dependencies(["security_group"])
     );
     assert_eq!(
         refreshed_state.dependency_bindings,
@@ -4870,7 +5154,7 @@ fn refreshing_loaded_orphan_to_absent_cannot_retain_an_identifier() {
         .next()
         .expect("orphan remains visible");
 
-    let refreshed = loaded.with_refreshed_state(State::not_found(id));
+    let refreshed = loaded.with_refreshed_state(SnapshotState::not_found(id));
     match refreshed.current() {
         Current::Absent(state) => assert!(state.state().identifier.is_none()),
         Current::Present(present) => panic!(
@@ -4942,7 +5226,7 @@ fn orphan_provider_refresh_demotes_aligned_list_explicit_tree() {
             children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)]),
         }],
     };
-    let fresh = State::existing(
+    let fresh: carina_core::resource::State = State::existing(
         id,
         HashMap::from([(
             "name".to_string(),
@@ -4970,7 +5254,7 @@ fn orphan_provider_refresh_demotes_aligned_list_explicit_tree() {
 #[test]
 fn orphan_provider_refresh_never_promotes_provider_keys_into_authoring_metadata() {
     let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
-    let fresh = State::existing(
+    let fresh: carina_core::resource::State = State::existing(
         id,
         HashMap::from([(
             "tags".to_string(),
@@ -5078,8 +5362,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
             .validate()
             .expect("legacy fixture schema is valid"),
     );
-    let resolved = ResolvedResource::resolve_with_schemas(desired, &schemas)
-        .expect("legacy desired resource resolves against its schema");
+    let resolved = resolved(&desired);
     let id = resolved.id.clone();
     let current = match state.build_state_for_resource(&id) {
         Current::Absent(state) => carina_core::resource::Current::Absent(state),
@@ -5094,6 +5377,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     };
     let plan_input_states = carina_core::resource::into_plan_input_current_map::<
         carina_core::resource::ModuleSource,
+        carina_core::resource::UnexpandedDependencyFields,
     >(HashMap::from([(id.clone(), current)]), &schemas, &[]);
     let plan = carina_core::differ::create_plan_for_test(
         &[resolved],
@@ -5147,9 +5431,9 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         generation: generation.clone(),
         directives: Directives::default(),
         binding: None,
-        dependencies: std::collections::HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: std::collections::HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     };
     let mut delete_plan = carina_core::plan::Plan::new();
     delete_plan.add(delete.clone());
@@ -5174,6 +5458,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         &historical,
         None,
         &provider,
+        carina_core::detail_rows::DetailComparisons::RecordedEffects,
     )
     .expect("delete display must use the production detail-row builder");
     assert_eq!(
@@ -5193,11 +5478,13 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
 
 #[test]
 fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
-    let state = check_and_migrate(include_str!(
-        "../../tests/fixtures/state-v12-tagged-enum-json.json"
-    ))
-    .expect("v12 fixture should migrate")
-    .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(include_str!(
+            "../../tests/fixtures/state-v12-tagged-enum-json.json"
+        ))
+        .expect("v12 fixture should migrate")
+        .into_state(),
+    );
 
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
     let row = state
@@ -5261,7 +5548,7 @@ fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_liter
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = outcome.into_state();
+    let state = finish_legacy_dependency_migration(outcome.into_state());
     let row = state
         .find_resource("mock", "test.Resource", "main")
         .expect("fixture resource exists");
@@ -5272,11 +5559,15 @@ fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_liter
     ] {
         assert!(matches!(
             attributes.get("self_contained"),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+            Some(Value::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { .. }
+            )))
         ));
         assert!(matches!(
             attributes.get("raw_legacy"),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+            Some(Value::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { .. }
+            )))
         ));
     }
     assert!(matches!(
@@ -5368,9 +5659,11 @@ fn v13_raw_row_salted_secret_still_verifies_after_structural_migration() {
         }],
         "exports": {},
     });
-    let state = check_and_migrate(&json.to_string())
-        .expect("v13 raw legacy state migrates")
-        .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(&json.to_string())
+            .expect("v13 raw legacy state migrates")
+            .into_state(),
+    );
     let hash = state.resources()[0]
         .persisted_attributes()
         .expect("migrated row has persisted attributes")
@@ -5546,7 +5839,7 @@ fn v8_state_migrates_to_current_with_empty_deposed() {
 fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
     use super::check_and_migrate;
 
-    assert_eq!(StateFile::CURRENT_VERSION, 20);
+    assert_eq!(StateFile::CURRENT_VERSION, 21);
     let json = format!(
         r#"{{
         "version": 11,
@@ -5576,9 +5869,9 @@ fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
-    let row = outcome
-        .state()
+    assert_eq!(outcome.state().version, 20);
+    let state = finish_legacy_dependency_migration(outcome.into_state());
+    let row = state
         .find_resource("mock", "test.resource", "legacy")
         .expect("legacy row should survive migration");
     let encoded = row
@@ -5615,7 +5908,9 @@ fn v11_fixture_migrates_nested_tagged_values_and_dollar_keys() {
 
     assert!(matches!(
         settings.get("$k"),
-        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        Some(Value::Deferred(DeferredValue::Placeholder(
+            SnapshotLeaf::RedactedSecret { .. }
+        )))
     ));
     assert!(matches!(
         settings.get("legacy_enum"),
@@ -5704,13 +5999,23 @@ fn v9_deposed_entries_round_trip() {
                         "dependency_bindings": ["igw"]
                     }
                 ]
+            },
+            {
+                "resource_type": "ec2.InternetGateway",
+                "identity": "igw",
+                "provider": "awscc",
+                "identifier": "igw-1",
+                "attributes": {},
+                "binding": "igw"
             }
         ]
     }"#;
 
-    let state = check_and_migrate(json)
-        .expect("v9 state with deposed entries should load")
-        .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(json)
+            .expect("v9 state with deposed entries should load")
+            .into_state(),
+    );
     let serialized = serde_json::to_value(&state).expect("state should serialize");
     let reloaded = StateFile::from_json_str(&serialized.to_string())
         .expect("serialized v9 state should reload");
@@ -5724,7 +6029,10 @@ fn v9_deposed_entries_round_trip() {
     let row_json = serde_json::to_value(row).expect("resource state should serialize");
     assert_eq!(row_json["deposed"][0]["identifier"], "vpc-old");
     assert_eq!(row_json["deposed"][0]["provider_instance"], "west");
-    assert_eq!(row_json["deposed"][0]["dependency_bindings"][0], "igw");
+    assert_eq!(
+        row_json["deposed"][0]["dependency_bindings"][0]["identity"],
+        "igw"
+    );
 }
 
 #[test]
@@ -5921,6 +6229,7 @@ fn state_json_wrapper_renders_serde_detail_without_rewording_it() {
 fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
     match result.expect_err("invalid state must be rejected") {
         BackendError::InvalidState(message) => message,
+        BackendError::InvalidStateJson(error) => error.to_string(),
         other => panic!("expected InvalidState, got {other}"),
     }
 }
@@ -6022,6 +6331,33 @@ fn check_and_migrate_accepts_resource_identities_differing_on_each_axis() {
         .into_state();
 
     assert_eq!(state.resources.len(), 4);
+}
+
+#[test]
+fn v21_state_rejects_destroy_dependencies_that_are_not_managed_rows() {
+    let invalid_dependencies = [
+        (
+            "synthetic wait",
+            resolved_dependency("", "__wait", "ready", None),
+        ),
+        (
+            "empty provider",
+            resolved_dependency("", "test.Thing", "x", None),
+        ),
+    ];
+
+    for (kind, dependency) in invalid_dependencies {
+        let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+        consumer["dependency_bindings"] =
+            serde_json::json!([serde_json::to_value(&dependency).expect("encode dependency")]);
+        let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![consumer]);
+
+        let message = invalid_state_message(check_and_migrate(&json));
+        assert!(
+            message.contains("dependency_bindings") && message.contains("not a managed state row"),
+            "{kind} dependency must be rejected with row context: {message}",
+        );
+    }
 }
 
 fn deposed_generation(
@@ -6523,7 +6859,7 @@ fn test_check_and_migrate_older_version_migrates() {
         "resources": []
     }"#;
 
-    let result = check_and_migrate(json).unwrap().into_state();
+    let result = finish_legacy_dependency_migration(check_and_migrate(json).unwrap().into_state());
     assert_eq!(
         result.version,
         StateFile::CURRENT_VERSION,
@@ -6594,7 +6930,11 @@ fn test_check_and_migrate_returns_migration_info_for_older_version() {
         .expect("migration info should be present for v6 → v7");
     assert_eq!(migration.from, 6);
     assert_eq!(migration.to, StateFile::CURRENT_VERSION);
-    assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
+    assert_eq!(outcome.state().version, 20);
+    assert_eq!(
+        finish_legacy_dependency_migration(outcome.into_state()).version,
+        StateFile::CURRENT_VERSION
+    );
 }
 
 #[test]
@@ -6712,7 +7052,7 @@ fn accepted_create_records_write_only_attributes() {
     );
 
     // Provider returns state without write-only attributes (API doesn't return them)
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("vpc-123".to_string()),
         attributes: [(
@@ -6722,7 +7062,7 @@ fn accepted_create_records_write_only_attributes() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -6769,8 +7109,7 @@ fn accepted_create_records_write_only_attributes() {
 
 #[test]
 fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribute() {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
-    use carina_core::value::SerializationError;
+    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 
     let historical = persisted_attributes_from_state_json(&HashMap::from([(
         "placeholder".to_string(),
@@ -6788,43 +7127,19 @@ fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribut
         ),
         ("b".to_string(), redacted),
     ])));
-    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
-        .with_attribute("settings", desired);
-
-    for provider_attributes in [
-        HashMap::new(),
-        HashMap::from([(
-            "settings".to_string(),
-            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-        )]),
-    ] {
-        let provider_state = State::existing(resource.id.clone(), provider_attributes);
-        let error = resource_state_from_provider_state_for_resource_and_schema_for_test(
-            &resolved(&resource),
-            &provider_state,
-            None,
-            None,
-            RowBasis::Applied(&AcceptedRequest::create_for_test()),
-            None,
-        )
-        .expect_err("desired redacted secrets must never be written as new state");
-
-        assert!(matches!(
-            error,
-            ResourceStateEncodingError::Serialization(
-                SerializationError::RedactedSecretNotAllowed { .. }
-            )
-        ));
-    }
+    let error = desired
+        .to_value_at("mock.test.Resource.main.settings")
+        .expect_err("a historical hash cannot become an authored desired value");
+    assert!(matches!(
+        error,
+        carina_core::resource::UnavailableSecretError { .. }
+    ));
+    assert_eq!(error.path(), "mock.test.Resource.main.settings.b");
 }
 
 #[test]
 fn accepted_write_only_rejects_desired_redacted_secret() {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
-    use carina_core::schema::{
-        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
-    };
-    use carina_core::value::SerializationError;
+    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 
     let historical = persisted_attributes_from_state_json(&HashMap::from([(
         "placeholder".to_string(),
@@ -6842,29 +7157,14 @@ fn accepted_write_only_rejects_desired_redacted_secret() {
         ),
         ("b".to_string(), redacted),
     ])));
-    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
-        .with_attribute("settings", desired);
-    let schema = ResourceSchema::new("test.Resource").attribute(
-        AttributeSchema::optional("settings", AttributeType::map(AttributeType::string()))
-            .write_only()
-            .build(),
-    );
-    let error = resource_state_from_provider_state_for_resource_and_schema_for_test(
-        &resolved(&resource),
-        &State::existing(resource.id.clone(), HashMap::new()).with_identifier("main-id"),
-        None,
-        Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
-        None,
-    )
-    .expect_err("accepted redacted values cannot be encoded as new state");
-
+    let error = desired
+        .to_value_at("mock.test.Resource.main.settings")
+        .expect_err("a historical hash cannot become an authored desired value");
     assert!(matches!(
         error,
-        ResourceStateEncodingError::Serialization(
-            SerializationError::RedactedSecretNotAllowed { .. }
-        )
+        carina_core::resource::UnavailableSecretError { .. }
     ));
+    assert_eq!(error.path(), "mock.test.Resource.main.settings.b");
 }
 
 #[test]
@@ -6881,7 +7181,7 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("vpc-123".to_string()),
         attributes: [(
@@ -6891,7 +7191,7 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -6937,7 +7237,7 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
     );
 
     // Provider happens to return this attribute (unusual for write-only but possible)
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("vpc-123".to_string()),
         attributes: [(
@@ -6947,7 +7247,7 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7034,7 +7334,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         )))),
     );
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("my-db-id".to_string()),
         // Provider returns the actual password (since secret was unwrapped before sending)
@@ -7045,7 +7345,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7082,7 +7382,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
     let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
         .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
         attributes: [(
@@ -7092,7 +7392,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -7119,11 +7419,56 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
 }
 
 #[test]
+fn deposed_encoders_return_unavailable_secret_errors() {
+    use carina_core::resource::{ConcreteValue, Resource, SnapshotValue};
+    let resource = resolved(&Resource::with_provider(
+        "mock",
+        "test.Resource",
+        "old",
+        None,
+    ));
+    let previous_json = HashMap::from([(
+        "password".into(),
+        structural_legacy_secret(&"ab".repeat(32)),
+    )]);
+    let previous = persisted_attributes_from_state_json(&previous_json);
+    let opaque = previous.get("password").unwrap();
+    let attributes = HashMap::from([(
+        "password".into(),
+        SnapshotValue::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "nested".into(),
+            opaque,
+        )]))),
+    )]);
+    let deposed = DeposedInstance::from_persisted_json(
+        DeposedKey::new_unique(),
+        "old-id".into(),
+        None,
+        previous_json,
+        PersistedDestroyDependencies::default(),
+    );
+    for result in [
+        deposed.refreshed_attributes_for_resource_and_schema(&resource, None, &attributes),
+        ResourceState::deposed_attributes_without_previous(
+            &resource,
+            None,
+            &attributes,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+        ),
+    ] {
+        let error = result.expect_err("unavailable material must be returned, not panic");
+        assert!(matches!(error, ResourceStateEncodingError::Serialization(
+            SerializationError::UnavailableSecret(ref error)
+        ) if error.path().ends_with(".nested")));
+    }
+}
+
+#[test]
 fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
-    let attrs = HashMap::from([(
+    let attrs: HashMap<String, Value> = HashMap::from([(
         "password".to_string(),
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     )]);
@@ -7137,7 +7482,8 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let password =
         structural_secret_digest(stored.get("password").expect("password remains stored"));
@@ -7151,7 +7497,7 @@ fn with_attributes_from_state_reuses_matching_secret_digest() {
     use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, State, Value};
 
     let id = ResourceId::with_provider_identity("mock", "test.resource", "stable", None);
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("stable-secret".into()),
     ))));
     let provider_state = State::existing(id, HashMap::from([("comment".to_string(), secret)]));
@@ -7191,7 +7537,7 @@ fn with_attributes_from_state_keeps_raw_legacy_shaped_text_plain() {
 
     let id = ResourceId::with_provider_identity("mock", "test.resource", "plain", None);
     let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         id,
         HashMap::from([(
             "comment".to_string(),
@@ -7230,7 +7576,11 @@ fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
     );
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
-        &State::existing(resource.id.clone(), HashMap::new()).with_identifier("plain-id"),
+        &State::<carina_core::resource::NoPlaceholder>::existing(
+            resource.id.clone(),
+            HashMap::new(),
+        )
+        .with_identifier("plain-id"),
         None,
         Some(&schema),
         RowBasis::Applied(&AcceptedRequest::create_for_test()),
@@ -7292,19 +7642,20 @@ fn nested_write_only_state_fixture(
 fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove() {
     use carina_core::resource::State as ProviderState;
 
-    let provider_state = |resource: &carina_core::resource::Resource| {
-        ProviderState::existing(
-            resource.id.clone(),
-            HashMap::from([(
-                "config".to_string(),
-                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                    "issuer".to_string(),
-                    Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
-                )]))),
-            )]),
-        )
-        .with_identifier("resource-id")
-    };
+    let provider_state =
+        |resource: &carina_core::resource::Resource| -> carina_core::resource::State {
+            ProviderState::existing(
+                resource.id.clone(),
+                HashMap::from([(
+                    "config".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "issuer".to_string(),
+                        Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+                    )]))),
+                )]),
+            )
+            .with_identifier("resource-id")
+        };
 
     // Add: a sent attribute without prior leaf provenance establishes it.
     let (added_resource, schema) = nested_write_only_state_fixture("add-secret");
@@ -7375,8 +7726,11 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
     let remove = AcceptedRequest::update_for_test(&[], &["config"]);
     let removed = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&removed_resource),
-        &ProviderState::existing(removed_resource.id.clone(), HashMap::new())
-            .with_identifier("resource-id"),
+        &ProviderState::<carina_core::resource::NoPlaceholder>::existing(
+            removed_resource.id.clone(),
+            HashMap::new(),
+        )
+        .with_identifier("resource-id"),
         Some(&reasserted),
         Some(&schema),
         RowBasis::Applied(&remove),
@@ -7423,7 +7777,7 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
         )
         .build(),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([(
             "config".to_string(),
@@ -7948,7 +8302,8 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
 
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     assert_eq!(stored.get("password"), Some(upgraded.as_json()));
@@ -7965,7 +8320,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
     let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
         .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
         attributes: [(
@@ -7975,7 +8330,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -8015,12 +8370,12 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
     existing.set_write_only_attributes_for_test(vec!["password".to_string()]);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
         attributes: HashMap::new(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -8076,8 +8431,11 @@ fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resourc
 
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
-        &ProviderState::existing(resource.id.clone(), HashMap::new())
-            .with_identifier("resource-id"),
+        &ProviderState::<carina_core::resource::NoPlaceholder>::existing(
+            resource.id.clone(),
+            HashMap::new(),
+        )
+        .with_identifier("resource-id"),
         Some(&existing),
         Some(&schema),
         RowBasis::Applied(&request),
@@ -8104,7 +8462,8 @@ fn orphan_refresh_without_schema_carries_recorded_write_only_value() {
         .expect("fixture identifier is non-empty")
         .with_attribute("password", serde_json::json!("old"));
     existing.set_write_only_attributes_for_test(vec!["password".to_string()]);
-    let fresh = ProviderState::existing(id, HashMap::new()).with_identifier("resource-id");
+    let fresh: carina_core::resource::State =
+        ProviderState::existing(id, HashMap::new()).with_identifier("resource-id");
 
     let refreshed = existing
         .refreshable()
@@ -8140,7 +8499,7 @@ fn orphan_refresh_drops_provider_echoed_write_only_value_absent_from_previous() 
             .write_only()
             .build(),
     );
-    let fresh = ProviderState::existing(
+    let fresh: carina_core::resource::State = ProviderState::existing(
         id,
         HashMap::from([(
             "password".to_string(),
@@ -8194,14 +8553,16 @@ fn managed_refresh_infers_legacy_unlisted_write_only_values_from_schema() {
             .expect("test schema must be valid"),
     );
 
-    let mut omitted = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+    let mut omitted =
+        SnapshotState::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
     state_file.restore_recorded_write_only_attributes_in_state(&mut omitted, &schemas);
     assert_eq!(
         omitted.attributes.get("password"),
         Some(&Value::Concrete(ConcreteValue::String("last-sent".into())))
     );
 
-    let provider_value = Value::Concrete(ConcreteValue::String("provider-value".into()));
+    let provider_value: SnapshotValue =
+        Value::Concrete(ConcreteValue::String("provider-value".into()));
     let mut returned = State::existing(
         id,
         HashMap::from([("password".to_string(), provider_value.clone())]),
@@ -8221,7 +8582,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         "Name": "old-name",
         "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
     });
-    let mut provider_tags = IndexMap::new();
+    let mut provider_tags: IndexMap<String, Value> = IndexMap::new();
     provider_tags.insert(
         "Name".to_string(),
         Value::Concrete(ConcreteValue::String("new-name".into())),
@@ -8244,7 +8605,8 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored_json = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_tags = stored_json
         .get("tags")
@@ -8272,7 +8634,8 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&second_existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     assert_eq!(
         stored_again.as_persisted().get("tags"),
         stored.as_persisted().get("tags")
@@ -8289,7 +8652,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         "Name": "old-name",
         "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
     });
-    let attrs = HashMap::from([(
+    let attrs: HashMap<String, Value> = HashMap::from([(
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::new())),
     )]);
@@ -8301,7 +8664,8 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_tags = stored
         .get("tags")
@@ -8333,7 +8697,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
             "Public": "kept",
         }
     ]);
-    let mut first_provider_item = IndexMap::new();
+    let mut first_provider_item: IndexMap<String, Value> = IndexMap::new();
     first_provider_item.insert(
         "Name".to_string(),
         Value::Concrete(ConcreteValue::String("two".into())),
@@ -8368,7 +8732,8 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_items = structural_secret_digest(
         stored
@@ -8403,7 +8768,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         Value::Concrete(ConcreteValue::Map(tags_map)),
     );
 
-    let mut state_tags = IndexMap::new();
+    let mut state_tags: IndexMap<String, Value> = IndexMap::new();
     state_tags.insert(
         "Name".to_string(),
         Value::Concrete(ConcreteValue::String("test".into())),
@@ -8423,7 +8788,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -8479,7 +8844,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     );
 
     // Provider returns extra keys (e.g., CloudControl adds Name automatically)
-    let mut state_tags = IndexMap::new();
+    let mut state_tags: IndexMap<String, Value> = IndexMap::new();
     state_tags.insert(
         "Name".to_string(),
         Value::Concrete(ConcreteValue::String("test".into())),
@@ -8503,7 +8868,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -8558,7 +8923,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         ])),
     );
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("res-123".to_string()),
         attributes: [(
@@ -8571,7 +8936,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -8680,7 +9045,14 @@ fn published_null_export_is_absent_for_coalesce_resolution() {
     });
 
     assert_eq!(
-        carina_core::resolver::resolve_ref_value_status(&expression, &bindings),
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| carina_core::resolver::resolve_ref_value_status(
+                &expression,
+                &bindings,
+                session
+            ),
+        ),
         Ok(carina_core::resolver::ValueResolution::Present(default)),
     );
 }
@@ -8719,6 +9091,22 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
             "carina_version": "test",
             "resources": [
                 {{
+                    "resource_type": "test.Dependency",
+                    "name": "other[\"a\"]",
+                    "provider": "mock",
+                    "identifier": "other-a",
+                    "attributes": {{}},
+                    "binding": "other[\"a\"]"
+                }},
+                {{
+                    "resource_type": "test.Dependency",
+                    "name": "_envs[\"prod-east\"]",
+                    "provider": "mock",
+                    "identifier": "prod-east",
+                    "attributes": {{}},
+                    "binding": "_envs[\"prod-east\"]"
+                }},
+                {{
                     "resource_type": "sso.Assignment",
                     "name": "_accounts[\"registry_prod\"]",
                     "provider": "awscc",
@@ -8731,8 +9119,14 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
         }}"#,
         ver = 14,
     );
-    let state = check_and_migrate(&json).expect("load state").into_state();
-    let r = &state.resources[0];
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(&json).expect("load state").into_state(),
+    );
+    let r = state
+        .resources
+        .iter()
+        .find(|row| row.resource_type == "sso.Assignment")
+        .expect("assignment row");
     assert_eq!(r.identity.as_str(), "_accounts.registry_prod");
     assert_eq!(
         r.binding.as_ref().map(AbsoluteBindingAddress::as_str),
@@ -8741,7 +9135,7 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
     let deps: Vec<&str> = r
         .dependency_bindings
         .iter()
-        .map(AbsoluteBindingAddress::as_str)
+        .map(ResolvedResourceId::identity_str)
         .collect();
     assert!(deps.contains(&"other.a"));
     assert!(deps.contains(&"_envs['prod-east']"));
@@ -8757,7 +9151,7 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
     use carina_core::resource::{DeferredValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("my-bucket".to_string()),
         attributes: [(
@@ -8774,7 +9168,7 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         .into_iter()
         .collect(),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
 
         partial_read: None,
     };
@@ -8826,9 +9220,11 @@ fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
         }]
     }"#;
 
-    let state = check_and_migrate(v5)
-        .expect("migration must succeed")
-        .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(v5)
+            .expect("migration must succeed")
+            .into_state(),
+    );
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
     assert_eq!(state.resources.len(), 1);
 
@@ -8948,8 +9344,8 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
     }"#;
     let outcome = check_and_migrate(json).expect("v9 state must lift without a custom migration");
     assert_eq!(outcome.migration.unwrap().from, 9);
-    assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
-    let state = outcome.state;
+    assert_eq!(outcome.state.version, 20);
+    let state = finish_legacy_dependency_migration(outcome.state);
     let row = state
         .find_resource("mock", "listener.Listener", "listener")
         .expect("legacy row");
@@ -8981,7 +9377,7 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
     let current = State::existing(desired.id.clone(), current_attributes.clone())
         .with_identifier("listener-id");
     let persisted =
-        PersistedAttributes::from_typed_persisted_wire_values(current_attributes.clone())
+        PersistedAttributes::from_typed_persisted_wire_values(current.to_snapshot().attributes)
             .expect("fixture attributes are persistable");
     let saved = RawSavedAttrs::from_persisted(
         HashMap::from([(desired.id.clone(), persisted)]),
@@ -9283,4 +9679,556 @@ fn missing_partial_read_field_defaults_to_none() {
 
     assert_eq!(state.resources.len(), 1);
     assert_eq!(state.resources[0].partial_read(), None);
+}
+
+fn resolved_dependency(
+    provider: &str,
+    resource_type: &str,
+    identity: &str,
+    provider_instance: Option<&str>,
+) -> ResolvedResourceId {
+    ResolvedResourceId::new(ResourceId::with_provider_identity(
+        provider.to_string(),
+        resource_type.to_string(),
+        ResourceIdentity::try_from(identity.to_string()).expect("fixture identity is non-empty"),
+        provider_instance.map(str::to_string),
+    ))
+}
+
+fn fixture_dependencies<const N: usize>(identities: [&str; N]) -> ResolvedDependencies {
+    identities
+        .into_iter()
+        .map(|identity| resolved_dependency("mock", "test.Dependency", identity, None))
+        .collect()
+}
+
+fn fixture_persisted_dependencies<const N: usize>(
+    identities: [&str; N],
+) -> PersistedDestroyDependencies {
+    PersistedDestroyDependencies::from_test_dependencies(
+        identities
+            .into_iter()
+            .map(|identity| resolved_dependency("mock", "test.Dependency", identity, None)),
+    )
+}
+
+#[test]
+fn legacy_dependency_spellings_do_not_double_an_existing_scope_prefix() {
+    assert_eq!(
+        legacy_dependency_spellings(&["module_instance"], "module_instance.target"),
+        vec!["module_instance.target"],
+    );
+    assert_eq!(
+        legacy_dependency_spellings(&["module_instance"], "target"),
+        vec!["module_instance.target", "target"],
+    );
+    assert_eq!(legacy_dependency_spellings(&[], "target"), vec!["target"],);
+}
+
+#[test]
+fn v20_without_dependency_names_can_complete_before_a_mutating_command_early_write() {
+    let json = state_json_with_resources(
+        20,
+        vec![persisted_resource("mock", "test.Resource", "independent")],
+    );
+    let state = check_and_migrate(&json)
+        .expect("v20 state without dependency names must load")
+        .into_state();
+
+    assert!(state.requires_legacy_dependency_migration());
+    assert!(serde_json::to_value(&state).is_err());
+    let (state, report) = migrate_legacy_with_config(state, &[])
+        .expect("even empty legacy state crosses graph validation before the early write");
+    assert!(report.warnings().is_empty());
+    assert!(!state.requires_legacy_dependency_migration());
+    assert!(serde_json::to_value(&state).is_ok());
+    assert!(!state.has_legacy_dependency_names());
+}
+
+#[test]
+fn v20_dependency_migration_resolves_root_module_loop_origin_and_deposed_edges() {
+    let mut root = persisted_resource("mock", "test.Root", "root_target");
+    root["binding"] = serde_json::json!("root_target");
+
+    let mut module = persisted_resource("mock", "test.Module", "module_instance.target");
+    module["binding"] = serde_json::json!("module_instance.target");
+    module["directives"] = serde_json::json!({ "provider_instance": "west" });
+
+    let mut loop_target = persisted_resource("mock", "test.Loop", "module_instance.items[0]");
+    loop_target["binding"] = serde_json::json!("module_instance.items[0]");
+
+    let origin = persisted_resource("mock", "test.Origin", "moved_origin");
+
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["dependency_bindings"] = serde_json::json!([
+        "root_target",
+        "module_instance.target",
+        "module_instance.items[0]",
+        "moved_origin"
+    ]);
+    consumer["directives"] = serde_json::json!({
+        "depends_on": ["module_instance.target"]
+    });
+    consumer["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "consumer-old",
+        "attributes": {},
+        "dependency_bindings": ["module_instance.items[0]"]
+    }]);
+
+    let json = state_json_with_resources(20, vec![root, module, loop_target, origin, consumer]);
+    let loaded = check_and_migrate(&json)
+        .expect("legacy dependency names must load into the unwritable typestate")
+        .into_state();
+    assert!(loaded.requires_legacy_dependency_migration());
+    assert!(serde_json::to_value(&loaded).is_err());
+    let configured_consumer = Resource::with_provider("mock", "test.Consumer", "consumer", None)
+        .with_absolute_binding(absolute_binding("consumer"));
+    let (migrated, report) = migrate_legacy_with_config(loaded, &[configured_consumer])
+        .expect("every legacy address has one exact persisted origin");
+    assert!(report.warnings().is_empty());
+    let consumer = &migrated.resources()[4];
+    let expected = PersistedDestroyDependencies::from_test_dependencies([
+        resolved_dependency("mock", "test.Root", "root_target", None),
+        resolved_dependency(
+            "mock",
+            "test.Module",
+            "module_instance.target",
+            Some("west"),
+        ),
+        resolved_dependency("mock", "test.Loop", "module_instance.items[0]", None),
+        resolved_dependency("mock", "test.Origin", "moved_origin", None),
+    ]);
+    assert_eq!(consumer.dependency_bindings, expected);
+    assert_eq!(
+        consumer.directives.depends_on,
+        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
+            "mock",
+            "test.Module",
+            "module_instance.target",
+            Some("west"),
+        )])
+    );
+    assert_eq!(
+        consumer.deposed[0].dependency_bindings,
+        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
+            "mock",
+            "test.Loop",
+            "module_instance.items[0]",
+            None,
+        )])
+    );
+
+    let encoded = serde_json::to_value(&migrated).expect("migrated state serializes");
+    assert!(encoded["resources"][4]["dependency_bindings"][0].is_object());
+    assert!(encoded["resources"][4]["directives"]["depends_on"][0].is_object());
+    assert!(encoded["resources"][4]["deposed"][0]["dependency_bindings"][0].is_object());
+}
+
+#[test]
+fn v20_dependency_migration_rejects_missing_target_with_row_and_text() {
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["dependency_bindings"] = serde_json::json!(["gone_target"]);
+    let json = state_json_with_resources(20, vec![consumer]);
+
+    let state = check_and_migrate(&json)
+        .expect("legacy strings load before configuration-aware classification")
+        .into_state();
+    let configured = Resource::with_provider("mock", "test.Consumer", "consumer", None)
+        .with_absolute_binding(absolute_binding("consumer"));
+    let error = migrate_legacy_with_config(state, &[configured])
+        .expect_err("missing edges on configured rows must never be dropped");
+    assert!(matches!(
+        error,
+        LegacyDependencyMigrationError::Missing {
+            row_index: 0,
+            ref row,
+            ref location,
+            ref dependency,
+        } if row.contains("test.Consumer")
+            && location == "resources[0].dependency_bindings"
+            && dependency == "gone_target"
+    ));
+}
+
+#[test]
+fn v20_dependency_migration_preserves_matchable_resolution_cause() {
+    let mut target = persisted_resource("mock", "__wait", "invalid_target");
+    target["binding"] = serde_json::json!("invalid_target");
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["dependency_bindings"] = serde_json::json!(["invalid_target"]);
+    let state = check_and_migrate(&state_json_with_resources(20, vec![target, consumer]))
+        .expect("legacy rows load before dependency projection")
+        .into_state();
+    let configured = Resource::with_provider("mock", "test.Consumer", "consumer", None)
+        .with_absolute_binding(absolute_binding("consumer"));
+    let error = migrate_legacy_with_config(state, &[configured])
+        .expect_err("a synthetic address cannot become a persisted destroy edge");
+    assert!(std::error::Error::source(&error).is_none());
+    let LegacyDependencyMigrationError::InvalidStateDependency { reason, .. } = &error else {
+        panic!("migration must retain the typed decode error: {error:?}");
+    };
+    let carina_core::resource::NotAManagedRow(cause) = reason.as_ref();
+    assert_eq!(
+        cause,
+        &resolved_dependency("mock", "__wait", "invalid_target", None),
+        "the typed decode error must survive migration context: {error:?}",
+    );
+    assert_eq!(error.to_string().matches(&reason.to_string()).count(), 1);
+}
+
+#[test]
+fn legacy_dependency_resolution_error_retains_typed_cause_without_duplicate_source() {
+    let error = LegacyDependencyMigrationError::Resolution {
+        row_index: 0,
+        row: "consumer".to_string(),
+        location: "resources[0].dependency_bindings".to_string(),
+        dependency: "target".to_string(),
+        reason: Box::new(ExpandedGraphResolutionError::DataSourceHandle {
+            owner: "consumer".to_string(),
+            reference: "target".to_string(),
+        }),
+    };
+    assert_eq!(
+        error.to_string(),
+        "resources[0].dependency_bindings on consumer could not classify legacy dependency \
+         \"target\": consumer: expected a managed resource handle; 'target' is a data source"
+    );
+    assert!(std::error::Error::source(&error).is_none());
+    let LegacyDependencyMigrationError::Resolution { reason, .. } = error else {
+        panic!("migration must retain the typed graph resolution error");
+    };
+    assert!(matches!(
+        reason.as_ref(),
+        ExpandedGraphResolutionError::DataSourceHandle { owner, reference }
+            if owner == "consumer" && reference == "target"
+    ));
+}
+
+#[test]
+fn legacy_dependency_graph_validation_error_retains_typed_cause_without_duplicate_source() {
+    let cause = ExpandedGraphResolutionError::MissingDependency {
+        owner: "consumer".to_string(),
+        reference: "target".to_string(),
+    };
+    let error = LegacyDependencyMigrationError::from(cause.clone());
+    assert_eq!(error.to_string(), cause.to_string());
+    assert!(std::error::Error::source(&error).is_none());
+    let LegacyDependencyMigrationError::GraphValidation(reason) = error else {
+        panic!("migration must retain the typed graph validation error");
+    };
+    assert!(matches!(
+        reason.as_ref(),
+        ExpandedGraphResolutionError::MissingDependency { owner, reference }
+            if owner == "consumer" && reference == "target"
+    ));
+}
+
+#[test]
+fn v20_dependency_migration_classifies_moved_row_as_configured() {
+    assert_moved_legacy_row_scope("other_instance.consumer", "other_instance.target", true);
+}
+
+#[test]
+fn v20_dependency_migration_uses_destination_scope_for_moved_orphan_and_deposed_rows() {
+    assert_moved_legacy_row_scope("other_instance.consumer", "other_instance.target", false);
+}
+
+#[test]
+fn v20_dependency_migration_uses_root_scope_for_row_moved_out_of_module() {
+    assert_moved_legacy_row_scope("consumer", "target", true);
+}
+
+#[test]
+fn v20_dependency_migration_uses_destination_ancestors_without_splitting_quoted_map_keys() {
+    assert_moved_legacy_row_scope(
+        "other_instance[\"west.example\"].inner.consumer",
+        "other_instance[\"west.example\"].target",
+        true,
+    );
+}
+
+#[test]
+fn with_legacy_classification_rejects_stale_sources() {
+    let mut target = persisted_resource("mock", "test.Target", "target");
+    target["binding"] = serde_json::json!("target");
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["dependency_bindings"] = serde_json::json!(["target"]);
+    let original = check_and_migrate(&state_json_with_resources(
+        20,
+        vec![target.clone(), consumer.clone()],
+    ))
+    .expect("original v20 state loads")
+    .into_state();
+
+    let configured = [
+        Resource::with_provider("mock", "test.Target", "target", None)
+            .with_absolute_binding(absolute_binding("target")),
+        Resource::with_provider("mock", "test.Consumer", "consumer", None)
+            .with_absolute_binding(absolute_binding("consumer")),
+    ];
+    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = parsed;
+        configuration.resources = configured.to_vec();
+        configuration.data_sources = [].to_vec();
+        configuration.into()
+    })
+    .expect("stale-classification graph resolves");
+    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
+    let moved_pairs =
+        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
+    let classification = expect_classified(
+        original
+            .clone()
+            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
+            .expect("original source classifies"),
+    )
+    .report_and_validate(|_| panic!("fixture has no warnings"))
+    .expect("the graph must validate")
+    .classification;
+
+    consumer["dependency_bindings"] = serde_json::json!(["different_target"]);
+    let changed = check_and_migrate(&state_json_with_resources(20, vec![target, consumer]))
+        .expect("changed v20 state loads")
+        .into_state();
+    let error = changed
+        .clone()
+        .replay_legacy_graph(classification)
+        .report_and_validate(|_| {})
+        .err()
+        .expect("changed source names must reject the saved classification");
+
+    assert_eq!(error, LegacyDependencyMigrationError::StaleClassification);
+    assert_eq!(changed.version, 20);
+    assert!(changed.requires_legacy_dependency_migration());
+}
+
+#[test]
+fn v20_dependency_migration_rejects_ambiguous_binding_with_row_and_text() {
+    let mut first = persisted_resource("mock", "test.First", "first");
+    first["binding"] = serde_json::json!("shared");
+    let mut second = persisted_resource("mock", "test.Second", "second");
+    second["binding"] = serde_json::json!("shared");
+    let mut consumer = persisted_resource("mock", "test.Consumer", "consumer");
+    consumer["binding"] = serde_json::json!("consumer");
+    consumer["directives"] = serde_json::json!({ "depends_on": ["shared"] });
+    let json = state_json_with_resources(20, vec![first, second, consumer]);
+
+    let state = check_and_migrate(&json)
+        .expect("legacy strings load before configuration-aware classification")
+        .into_state();
+    let configured = Resource::with_provider("mock", "test.Consumer", "consumer", None)
+        .with_absolute_binding(absolute_binding("consumer"));
+    let error = migrate_legacy_with_config(state, &[configured])
+        .expect_err("ambiguous edges on configured rows must never be guessed");
+    assert!(matches!(
+        error,
+        LegacyDependencyMigrationError::Ambiguous {
+            row_index: 2,
+            ref row,
+            ref location,
+            ref dependency,
+            ref candidates,
+        } if row.contains("test.Consumer")
+            && location == "resources[2].directives.depends_on"
+            && dependency == "shared"
+            && candidates.len() == 2
+    ));
+}
+
+#[test]
+fn v20_dependency_migration_keeps_known_orphan_edges_and_reports_each_unknown_generation() {
+    let mut target = persisted_resource("mock", "test.Target", "remaining");
+    target["binding"] = serde_json::json!("remaining");
+    let mut orphan = persisted_resource("mock", "test.Orphan", "removed_module.consumer");
+    orphan["binding"] = serde_json::json!("removed_module.consumer");
+    orphan["dependency_bindings"] = serde_json::json!(["remaining", "removed_module.gone"]);
+    orphan["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "orphan-old",
+        "attributes": {},
+        "dependency_bindings": ["removed_module.old_gone"]
+    }]);
+    let json = state_json_with_resources(20, vec![target, orphan]);
+    let state = check_and_migrate(&json)
+        .expect("orphan legacy names load into the migration typestate")
+        .into_state();
+    let configured_target = Resource::with_provider("mock", "test.Target", "remaining", None)
+        .with_absolute_binding(absolute_binding("remaining"));
+
+    let (migrated, report) = migrate_legacy_with_config(state, &[configured_target])
+        .expect("unresolved orphan names are warnings rather than migration failures");
+    assert_eq!(report.warnings().len(), 2);
+    assert!(report.warnings().iter().any(|warning| {
+        warning.generation.is_none()
+            && warning.legacy_names == BTreeSet::from(["removed_module.gone".to_string()])
+    }));
+    assert!(report.warnings().iter().any(|warning| {
+        warning
+            .generation
+            .as_ref()
+            .is_some_and(|key| key.as_str() == "old-generation")
+            && warning.legacy_names == BTreeSet::from(["removed_module.old_gone".to_string()])
+    }));
+
+    let orphan = &migrated.resources()[1];
+    assert_eq!(
+        orphan.dependency_bindings,
+        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
+            "mock",
+            "test.Target",
+            "remaining",
+            None,
+        )])
+    );
+    assert!(orphan.deposed[0].dependency_bindings.is_empty());
+    let encoded = serde_json::to_string(&migrated).expect("v21 state must be writable");
+    assert!(!encoded.contains("removed_module.gone"));
+    assert!(!encoded.contains("removed_module.old_gone"));
+}
+
+#[test]
+fn report_invokes_sink_for_every_current_and_deposed_warning_before_returning_state() {
+    let mut orphan = persisted_resource("mock", "test.Orphan", "removed.consumer");
+    orphan["binding"] = serde_json::json!("removed.consumer");
+    orphan["dependency_bindings"] = serde_json::json!(["gone-current"]);
+    orphan["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "orphan-old",
+        "attributes": {},
+        "dependency_bindings": ["gone-deposed"]
+    }]);
+    let state = check_and_migrate(&state_json_with_resources(20, vec![orphan]))
+        .expect("warning fixture loads into the migration typestate")
+        .into_state();
+    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = parsed;
+        configuration.resources = [].to_vec();
+        configuration.data_sources = [].to_vec();
+        configuration.into()
+    })
+    .expect("empty warning graph resolves");
+    let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
+    let moved_pairs =
+        carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
+    let migration = expect_classified(
+        state
+            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
+            .expect("orphan unknown names classify as warnings"),
+    );
+
+    let mut reported = Vec::new();
+    let state = migration
+        .report_and_validate(|warning| {
+            reported.push((
+                warning
+                    .generation
+                    .as_ref()
+                    .map(|key| key.as_str().to_string()),
+                warning.legacy_names.clone(),
+            ));
+        })
+        .expect("the warning graph must validate")
+        .state;
+
+    assert_eq!(reported.len(), 2);
+    assert!(reported.iter().any(|(generation, names)| {
+        generation.is_none() && names == &BTreeSet::from(["gone-current".to_string()])
+    }));
+    assert!(reported.iter().any(|(generation, names)| {
+        generation.as_deref() == Some("old-generation")
+            && names == &BTreeSet::from(["gone-deposed".to_string()])
+    }));
+    assert_eq!(state.version, StateFile::CURRENT_VERSION);
+}
+
+fn assert_moved_legacy_row_scope(
+    destination: &'static str,
+    expected_target: &'static str,
+    configured: bool,
+) {
+    let mut target = persisted_resource("mock", "test.Target", "module_instance.target");
+    target["binding"] = serde_json::json!("module_instance.target");
+    let mut root_target = persisted_resource("mock", "test.Target", "target");
+    root_target["binding"] = serde_json::json!("target");
+    let mut consumer = persisted_resource("mock", "test.Consumer", "module_instance.old_consumer");
+    consumer["binding"] = serde_json::json!("module_instance.old_consumer");
+    consumer["dependency_bindings"] = serde_json::json!(["target"]);
+    consumer["directives"] = serde_json::json!({"depends_on": ["target"]});
+    consumer["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "consumer-old",
+        "attributes": {},
+        "dependency_bindings": ["target"]
+    }]);
+    let json = state_json_with_resources(20, vec![target, root_target, consumer]);
+    let state = check_and_migrate(&json)
+        .expect("moved-row fixture must load as pending migration")
+        .into_state();
+
+    let mut graph_resources: Vec<Resource> = vec![
+        Resource::with_provider("mock", "test.Target", "module_instance.target", None)
+            .with_absolute_binding(absolute_binding("module_instance.target")),
+        Resource::with_provider("mock", "test.Target", expected_target, None)
+            .with_absolute_binding(absolute_binding(expected_target)),
+    ];
+    if configured {
+        graph_resources.push(
+            Resource::with_provider("mock", "test.Consumer", destination, None)
+                .with_absolute_binding(absolute_binding(destination)),
+        );
+    }
+    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = parsed;
+        configuration.resources = graph_resources.to_vec();
+        configuration.data_sources = [].to_vec();
+        configuration.into()
+    })
+    .expect("moved-row graph resolves");
+    let from = resolved_dependency(
+        "mock",
+        "test.Consumer",
+        "module_instance.old_consumer",
+        None,
+    );
+    let to = resolved_dependency("mock", "test.Consumer", destination, None);
+
+    let mut move_plan: carina_core::plan::Plan<SavedModuleSource> =
+        carina_core::plan::Plan::default();
+    move_plan.add(carina_core::effect::Effect::Move {
+        from,
+        to,
+        origin: None,
+    });
+    let moved_pairs =
+        carina_core::effect::ResolvedMovePairs::from_saved_plan(move_plan.move_effects());
+    let migration = expect_classified(
+        state
+            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
+            .expect("the moved row must classify with its resolved destination scope"),
+    );
+    assert!(migration.warnings().is_empty());
+    let state = migration
+        .report_and_validate(|_| panic!("fixture must not report warnings"))
+        .expect("the graph must validate")
+        .state;
+    let row = state
+        .find_resource("mock", "test.Consumer", "module_instance.old_consumer")
+        .expect("migration classifies but does not itself move the row");
+    let expected = PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
+        "mock",
+        "test.Target",
+        expected_target,
+        None,
+    )]);
+    assert_eq!(row.dependency_bindings, expected);
+    assert_eq!(row.directives.depends_on, expected);
+    assert_eq!(row.deposed[0].dependency_bindings, expected);
 }

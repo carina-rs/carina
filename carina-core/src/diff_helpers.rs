@@ -9,13 +9,12 @@ use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
-use crate::differ::ComparisonContext;
+use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::resource::{CanonicalComparisonAttributes, Value};
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
     ValidatedResourceSchema, empty_defs_for_schema_walks,
 };
-use crate::value::CanonicalState;
 
 /// Schema-aware value equality shared by the plan renderer
 /// (`detail_rows`) and the unchanged-count helper below (carina#3073).
@@ -30,16 +29,21 @@ use crate::value::CanonicalState;
 /// `type_aware_equal`'s secret arm and compare unequal, which only ever
 /// *over*-reports a diff (safe-by-default) — it never hides a real
 /// change.
-pub(crate) fn schema_aware_equal(
-    old: &Value,
-    new: &Value,
+pub(crate) fn schema_aware_equal<
+    R: ReferenceEquality,
+    P: crate::resource::StateValueLeaf,
+    Q: crate::resource::StateValueLeaf,
+>(
+    old: &Value<P>,
+    new: &Value<Q>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> bool {
     match attr_type {
         Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs, context),
-        None => old.semantically_equal(new),
+        None => crate::resource::state_value_snapshot(old)
+            .semantically_equal(&crate::resource::state_value_snapshot(new)),
     }
 }
 
@@ -51,33 +55,44 @@ pub(crate) fn schema_aware_equal(
 /// callers from accidentally pairing an attribute with definitions from another
 /// resource. Both operands are canonicalized through the state pipeline before
 /// comparison. When the schema or named attribute is unavailable, comparison
-/// falls back to schema-blind semantic equality without cloning either value.
-pub fn resource_attribute_values_equal(
-    old: &Value,
-    new: &Value,
+/// falls back to schema-blind semantic equality. Historical hashes remain snapshot
+/// leaves throughout canonicalization and comparison.
+pub fn resource_attribute_values_equal<
+    P: crate::resource::StateValueLeaf,
+    Q: crate::resource::StateValueLeaf,
+>(
+    old: &Value<P>,
+    new: &Value<Q>,
     schema: Option<&ValidatedResourceSchema>,
     attribute_name: &str,
-    context: &ComparisonContext<'_>,
+    context: &crate::differ::ObservationComparison<'_>,
 ) -> bool {
+    let old = crate::resource::state_value_snapshot(old);
+    let new = crate::resource::state_value_snapshot(new);
     let Some(attribute) = schema.and_then(|schema| schema.effective_attribute(attribute_name))
     else {
-        return old.semantically_equal(new);
+        return old.semantically_equal(&new);
     };
 
     let effective_type = attribute.value_type();
-    let old = attribute.canonicalize_state(old.clone());
-    let new = attribute.canonicalize_state(new.clone());
-    match (old, new) {
-        (CanonicalState::Absent, CanonicalState::Absent) => true,
-        (CanonicalState::Present(old), CanonicalState::Present(new)) => schema_aware_equal(
+    let canonicalize = |value| {
+        crate::value::canonicalize_snapshot_with_type(
+            value,
+            effective_type.as_type(),
+            effective_type.defs(),
+            effective_type.ancestry(),
+        )
+    };
+    match (canonicalize(old), canonicalize(new)) {
+        (None, None) => true,
+        (Some(old), Some(new)) => schema_aware_equal(
             &old,
             &new,
             Some(effective_type.as_type()),
             effective_type.defs(),
             context,
         ),
-        (CanonicalState::Present(_), CanonicalState::Absent)
-        | (CanonicalState::Absent, CanonicalState::Present(_)) => false,
+        (Some(_), None) | (None, Some(_)) => false,
     }
 }
 
@@ -101,30 +116,41 @@ pub(crate) fn map_entry_subtype<'a>(
     key: &str,
     defs: &'a BTreeMap<String, AttributeType>,
 ) -> Option<&'a AttributeType> {
-    let mut t = attr_type?;
+    let t = map_entry_type(attr_type?, defs)?;
+    match t.shape_ref_free().ok()? {
+        crate::schema::Shape::Map { value, .. } => Some(value),
+        crate::schema::Shape::Struct { .. } => crate::schema::struct_fields_with_defs(t, defs)?
+            .iter()
+            .find(|field| field.name() == key)
+            .map(|field| &field.field_type),
+        _ => None,
+    }
+}
+
+pub(crate) fn map_entry_is_map(
+    ty: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> bool {
+    ty.and_then(|ty| map_entry_type(ty, defs))
+        .is_some_and(|ty| matches!(ty.shape_ref_free(), Ok(crate::schema::Shape::Map { .. })))
+}
+
+fn map_entry_type<'a>(
+    mut t: &'a AttributeType,
+    defs: &'a BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
     let mut visited_refs = Vec::new();
     loop {
-        let resolved = t.resolve_refs_for_union_walk_on_path(defs, &mut visited_refs)?;
-        t = resolved.as_attr();
-        match t
-            .shape_ref_free()
-            .expect("resolve_refs_for_union_walk_on_path must peel every top-level Ref")
-        {
-            crate::schema::Shape::List {
-                element_type: inner,
-                ..
-            } => t = inner,
-            crate::schema::Shape::Map { value, .. } => return Some(value),
-            crate::schema::Shape::Struct { .. } => {
-                let fields = crate::schema::struct_fields_with_defs(t, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                return fields
-                    .iter()
-                    .find(|field| field.name() == key)
-                    .map(|field| &field.field_type);
+        t = t
+            .resolve_refs_for_union_walk_on_path(defs, &mut visited_refs)?
+            .as_attr();
+        match t.shape_ref_free().ok()? {
+            crate::schema::Shape::List { element_type, .. } => t = element_type,
+            crate::schema::Shape::Map { .. } | crate::schema::Shape::Struct { .. } => {
+                return Some(t);
             }
             crate::schema::Shape::Union => {
-                t = union_member_for_walk(t, defs, UnionWalkTarget::MapEntry, &mut visited_refs)?;
+                t = union_member_for_walk(t, defs, UnionWalkTarget::MapEntry, &mut visited_refs)?
             }
             _ => return None,
         }
@@ -242,12 +268,12 @@ pub(crate) fn list_element_type<'a>(
 /// `# (n unchanged attributes hidden)` tally would not add up. With
 /// `schema = None`, behavior is the schema-blind `semantically_equal`
 /// path (unchanged for embedded / test callers).
-pub fn compute_unchanged_count(
+pub fn compute_unchanged_count<R: ReferenceEquality>(
     from_attrs: &CanonicalComparisonAttributes,
     to_attrs: &CanonicalComparisonAttributes,
     exclude: Option<&std::collections::HashSet<&str>>,
     schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> usize {
     let defs: &BTreeMap<String, AttributeType> = schema
         .map(|s| &s.defs)
@@ -262,7 +288,7 @@ pub fn compute_unchanged_count(
                         let attr_type = schema
                             .and_then(|s| s.attributes.get(k.as_str()))
                             .map(|a| &a.attr_type);
-                        schema_aware_equal(nv, v, attr_type, defs, context)
+                        schema_aware_equal(v, nv, attr_type, defs, &context.at_path(k))
                     })
                     .unwrap_or(false)
         })
@@ -284,15 +310,15 @@ pub struct MapDiff {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapDiffEntry {
     pub key: String,
-    pub value: Value,
+    pub value: crate::resource::SnapshotValue,
 }
 
 /// A changed map entry with old and new values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapDiffChanged {
     pub key: String,
-    pub old_value: Value,
-    pub new_value: Value,
+    pub old_value: crate::resource::SnapshotValue,
+    pub new_value: crate::resource::SnapshotValue,
 }
 
 /// A reference to a single diff entry, used when iterating in key order.
@@ -328,10 +354,19 @@ impl MapDiff {
 ///
 /// All result vectors are sorted by key for deterministic output, so the
 /// caller's input order does not affect the result.
-pub fn compute_map_diff(
-    old_map: &IndexMap<String, Value>,
-    new_map: &IndexMap<String, Value>,
+pub fn compute_map_diff<P: crate::resource::StateValueLeaf, Q: crate::resource::StateValueLeaf>(
+    old_map: &IndexMap<String, Value<P>>,
+    new_map: &IndexMap<String, Value<Q>>,
 ) -> MapDiff {
+    let old_map: IndexMap<_, _> = old_map
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
+    let new_map: IndexMap<_, _> = new_map
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
+
     let mut all_keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
     all_keys.sort();
     all_keys.dedup();
@@ -447,6 +482,66 @@ mod tests {
             attribute_name,
             &crate::differ::exact_comparison_context_for_tests(),
         )
+    }
+
+    #[test]
+    fn historical_attribute_comparison_verifies_root_and_nested_secret_hashes() {
+        let secret = |text: &str| -> Value {
+            Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String(text.into())),
+            )))
+        };
+        for nested in [false, true] {
+            let schema_type = if nested {
+                PatternAttributeType::struct_(
+                    "Config",
+                    vec![
+                        PatternStructField::required("password", PatternAttributeType::string())
+                            .build(),
+                    ],
+                )
+            } else {
+                PatternAttributeType::string()
+            };
+            let schema = PatternResourceSchema::new("test.Widget")
+                .attribute(PatternAttributeSchema::optional("config", schema_type).build())
+                .validate()
+                .expect("schema fixture");
+            let config = |text: &str| -> Value {
+                if nested {
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "password".to_string(),
+                        secret(text),
+                    )])))
+                } else {
+                    secret(text)
+                }
+            };
+            let historical = crate::value::redact_secrets_in_value(&config("original"))
+                .expect("capture historical secret evidence");
+            let context = crate::differ::exact_comparison_context_for_tests();
+            assert!(super::resource_attribute_values_equal(
+                &historical,
+                &config("original"),
+                Some(&schema),
+                "config",
+                &context,
+            ));
+            assert!(!super::resource_attribute_values_equal(
+                &historical,
+                &config("changed"),
+                Some(&schema),
+                "config",
+                &context,
+            ));
+            assert!(super::resource_attribute_values_equal(
+                &historical,
+                &historical,
+                Some(&schema),
+                "config",
+                &context,
+            ));
+        }
     }
 
     fn compute_unchanged_count(

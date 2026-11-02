@@ -142,3 +142,73 @@ fn fixture_attributes_round_trip_through_value_codec() {
         failures.join("\n"),
     );
 }
+
+#[test]
+fn current_state_root_and_nested_hashes_round_trip_byte_for_byte() {
+    use carina_core::resource::{ConcreteValue, DeferredValue, SnapshotLeaf, Value};
+    use carina_state::StateFile;
+    assert_eq!(StateFile::CURRENT_VERSION, 21);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v21.state.json");
+    let mut wire: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    let attributes = wire["resources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|row| {
+            let attrs = row["current"]["attributes"].as_object_mut()?;
+            attrs.get("comment")?.get("$secret")?;
+            Some(attrs)
+        })
+        .expect("current fixture contains a root hash");
+    let root = attributes["comment"].clone();
+    attributes.insert(
+        "nested_secret".into(),
+        serde_json::json!({
+            "plain": "still selectable", "list": [{ "token": root }]
+        }),
+    );
+    let state = check_and_migrate(&serde_json::to_string(&wire).unwrap())
+        .expect("current state fixture passes the production version gate")
+        .into_state();
+    let bytes = carina_core::utils::pretty_with_newline_bytes(&state).unwrap();
+    let reloaded = check_and_migrate(std::str::from_utf8(&bytes).unwrap())
+        .unwrap()
+        .into_state();
+    assert_eq!(
+        carina_core::utils::pretty_with_newline_bytes(&reloaded).unwrap(),
+        bytes
+    );
+    let row = reloaded
+        .resources()
+        .iter()
+        .find(|row| {
+            row.persisted_attributes()
+                .is_some_and(|attrs| attrs.contains_key("nested_secret"))
+        })
+        .unwrap();
+    let attrs = row.persisted_attributes().unwrap();
+    assert!(matches!(
+        attrs.get("comment"),
+        Some(Value::Deferred(DeferredValue::Placeholder(
+            SnapshotLeaf::RedactedSecret { .. }
+        )))
+    ));
+    let nested = attrs.get("nested_secret").unwrap();
+    assert!(matches!(nested, Value::Concrete(ConcreteValue::Map(_))));
+    assert_eq!(
+        nested
+            .to_value_at("state.nested_secret")
+            .unwrap_err()
+            .path(),
+        "state.nested_secret.list[0].token"
+    );
+    let Value::Concrete(ConcreteValue::Map(fields)) = nested else {
+        unreachable!()
+    };
+    assert_eq!(
+        fields["plain"]
+            .to_value_at("state.nested_secret.plain")
+            .unwrap(),
+        Value::Concrete(ConcreteValue::String("still selectable".into()))
+    );
+}

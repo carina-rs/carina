@@ -303,22 +303,44 @@ fn plan_json_after_init(project: &Path) -> serde_json::Value {
     })
 }
 
-fn resource_dependency_bindings<'a>(
-    resources: &'a serde_json::Value,
+fn dependency_identities(dependencies: Option<&serde_json::Value>) -> Vec<String> {
+    dependencies
+        .map(|dependencies| {
+            dependencies
+                .as_array()
+                .expect("resolved dependency collection")
+                .iter()
+                .map(|dependency| {
+                    dependency["identity"]
+                        .as_str()
+                        .expect("resolved dependency identity")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn resource_dependency_identities(
+    resources: &serde_json::Value,
     binding: &str,
-) -> &'a serde_json::Value {
-    resources
+    field: &str,
+) -> Vec<String> {
+    let resource = resources
         .as_array()
         .expect("resource collection")
         .iter()
         .find(|resource| {
             resource.get("binding").and_then(serde_json::Value::as_str) == Some(binding)
         })
-        .and_then(|resource| resource.get("dependency_bindings"))
-        .unwrap_or_else(|| panic!("missing dependency metadata for {binding}: {resources:#}"))
+        .unwrap_or_else(|| panic!("missing resource {binding}: {resources:#}"));
+    dependency_identities(resource.get(field))
 }
 
-fn dependency_bindings_by_binding(resources: &serde_json::Value) -> BTreeMap<String, Vec<String>> {
+fn dependencies_by_binding(
+    resources: &serde_json::Value,
+    field: &str,
+) -> BTreeMap<String, Vec<String>> {
     resources
         .as_array()
         .expect("resource collection")
@@ -328,13 +350,36 @@ fn dependency_bindings_by_binding(resources: &serde_json::Value) -> BTreeMap<Str
                 .as_str()
                 .expect("resource binding")
                 .to_string();
-            let dependencies = resource["dependency_bindings"]
-                .as_array()
-                .expect("dependency bindings")
-                .iter()
-                .map(|dependency| dependency.as_str().expect("dependency binding").to_string())
-                .collect();
+            let dependencies = dependency_identities(resource.get(field));
             (binding, dependencies)
+        })
+        .collect()
+}
+
+fn sorted_destroy_dependencies_by_binding(
+    plan: &serde_json::Value,
+    field: &str,
+) -> BTreeMap<String, Vec<String>> {
+    let resources = plan["sorted_resources"]
+        .as_array()
+        .expect("sorted resources");
+    let dependencies = plan[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing {field} sidecar"));
+    assert_eq!(
+        resources.len(),
+        dependencies.len(),
+        "{field} must stay index-aligned with sorted_resources",
+    );
+    resources
+        .iter()
+        .zip(dependencies)
+        .map(|(resource, dependencies)| {
+            let binding = resource["binding"]
+                .as_str()
+                .expect("sorted resource binding")
+                .to_string();
+            (binding, dependency_identities(Some(dependencies)))
         })
         .collect()
 }
@@ -547,12 +592,16 @@ fn conditional_binding_references_validate_after_selection_and_report_dropped_br
 fn plan_json_dependencies_are_derived_from_the_selected_value_branch() {
     let fixture = ConditionalDependencyFixture::new();
     for (project, expected) in [
-        (&fixture.selected_argument, serde_json::json!([])),
-        (&fixture.selected_reference, serde_json::json!(["on.a"])),
+        (&fixture.selected_argument, Vec::<String>::new()),
+        (&fixture.selected_reference, vec!["on.a".to_string()]),
     ] {
         let plan = plan_json(project);
-        let sorted = resource_dependency_bindings(&plan["sorted_resources"], "on.consumer");
-        assert_eq!(sorted, &expected, "stale dependency in sorted resources");
+        let sorted =
+            sorted_destroy_dependencies_by_binding(&plan, "sorted_value_destroy_dependencies");
+        assert_eq!(
+            sorted["on.consumer"], expected,
+            "stale graph-projected dependency in sorted resources",
+        );
 
         let creates = plan["plan"]["effects"]
             .as_array()
@@ -561,8 +610,9 @@ fn plan_json_dependencies_are_derived_from_the_selected_value_branch() {
             .filter_map(|effect| effect.get("Create"))
             .collect::<Vec<_>>();
         let create_resources = serde_json::Value::Array(creates.into_iter().cloned().collect());
-        let effect = resource_dependency_bindings(&create_resources, "on.consumer");
-        assert_eq!(effect, &expected, "stale dependency in create effect");
+        let effect =
+            resource_dependency_identities(&create_resources, "on.consumer", "value_dependencies");
+        assert_eq!(effect, expected, "stale dependency in create effect");
     }
 }
 
@@ -571,7 +621,7 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
     let fixture = OrdinaryModuleDependencyFixture::new();
     let plan = plan_json(&fixture.caller);
 
-    let expected = BTreeMap::from([
+    let expected_runtime = BTreeMap::from([
         ("source".to_string(), vec![]),
         ("stack.base".to_string(), vec![]),
         ("stack.cross".to_string(), vec!["stack.base".to_string()]),
@@ -587,9 +637,26 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
         ("stack.gated".to_string(), vec!["stack.ready".to_string()]),
     ]);
     assert_eq!(
-        dependency_bindings_by_binding(&plan["sorted_resources"]),
-        expected,
-        "ordinary module dependencies drifted in sorted_resources",
+        sorted_destroy_dependencies_by_binding(&plan, "sorted_value_destroy_dependencies"),
+        BTreeMap::from([
+            ("source".to_string(), vec![]),
+            ("stack.base".to_string(), vec![]),
+            ("stack.cross".to_string(), vec!["stack.base".to_string()],),
+            (
+                "stack.nested_call.nested".to_string(),
+                vec!["source".to_string()],
+            ),
+            ("stack.generated[0]".to_string(), vec!["source".to_string()],),
+            (
+                "stack.data_consumer".to_string(),
+                vec!["stack.base".to_string()],
+            ),
+            (
+                "stack.gated".to_string(),
+                vec!["stack.cross".to_string(), "stack.data_consumer".to_string(),],
+            ),
+        ]),
+        "ordinary module dependencies drifted in the persisted destroy graph",
     );
 
     let create_resources = plan["plan"]["effects"]
@@ -600,8 +667,11 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(
-        dependency_bindings_by_binding(&serde_json::Value::Array(create_resources)),
-        expected,
+        dependencies_by_binding(
+            &serde_json::Value::Array(create_resources),
+            "value_dependencies",
+        ),
+        expected_runtime,
         "ordinary module dependencies drifted in Create effects",
     );
 
@@ -614,8 +684,8 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
         .expect("module data-source Read effect");
     assert_eq!(roles["binding"], "stack.roles");
     assert_eq!(
-        roles["dependency_bindings"],
-        serde_json::json!(["stack.base"])
+        dependency_identities(roles.get("value_dependencies")),
+        vec!["stack.base".to_string()],
     );
 
     let wait = plan["plan"]["effects"]
@@ -624,10 +694,10 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
         .iter()
         .find_map(|effect| effect.get("Wait"))
         .expect("module wait effect");
-    assert_eq!(wait["identity"], "stack.ready");
+    assert_eq!(wait["id"]["identity"], "stack.ready");
     assert_eq!(
-        wait["explicit_dependencies"],
-        serde_json::json!(["stack.data_consumer"]),
+        dependency_identities(wait.get("explicit_dependencies")),
+        vec!["stack.data_consumer".to_string()],
     );
 }
 

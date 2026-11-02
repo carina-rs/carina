@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use carina_core::detail_rows::{
-    DetailLevel, DetailRow, HistoricalDisplayAttributes, build_detail_rows_by_instance,
-    build_replace_detail_rows_from_display, delete_identifier_fallback_row,
+    DetailLevel, DetailRow, HistoricalDisplayAttributes, PlanDisplay,
+    delete_identifier_fallback_row,
 };
 use carina_core::effect::Effect;
 use carina_core::explicit::ExplicitFields;
@@ -107,8 +107,17 @@ impl App {
             schemas,
             plan.effects().iter().map(Effect::resource_id),
         );
-        Self::new(plan, &schemas, &historical_display, None, &provider)
-            .expect("test plan display must resolve every comparison")
+        Self::new(
+            plan,
+            &schemas,
+            &historical_display,
+            None,
+            &provider,
+            carina_core::detail_rows::DetailComparisons::Planning(
+                &carina_core::references::prepare_empty_for_tests(),
+            ),
+        )
+        .expect("test plan display must resolve every comparison")
     }
 
     pub fn new(
@@ -117,7 +126,23 @@ impl App {
         historical_display: &HistoricalDisplayAttributes,
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
         provider: &ProviderRouter,
+        comparisons: carina_core::detail_rows::DetailComparisons<'_>,
     ) -> ProviderResult<Self> {
+        Self::from_display(
+            PlanDisplay::unprepared(plan, historical_display, comparisons),
+            schemas,
+            prev_explicit,
+            provider,
+        )
+    }
+
+    pub fn from_display<S, V: carina_core::resource::PlanValueKind>(
+        display: PlanDisplay<'_, S, V>,
+        schemas: &SchemaRegistry,
+        prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
+        provider: &ProviderRouter,
+    ) -> ProviderResult<Self> {
+        let plan = display.plan();
         let replacement_display: Vec<_> = plan.replace_display_info().collect();
         let replacement_create_info: HashMap<_, _> = replacement_display
             .iter()
@@ -127,12 +152,11 @@ impl App {
             .effects()
             .iter()
             .enumerate()
-            .map(|(idx, effect)| {
+            .map(|(idx, _effect)| {
                 effect_to_node(
-                    plan,
-                    effect,
+                    &display,
+                    idx,
                     schemas,
-                    historical_display,
                     replacement_create_info.get(&idx).copied(),
                     prev_explicit,
                     provider,
@@ -142,8 +166,8 @@ impl App {
         Ok(Self::from_nodes(plan, nodes, replacement_display))
     }
 
-    fn from_nodes(
-        plan: &Plan,
+    fn from_nodes<S, V: carina_core::resource::PlanValueKind>(
+        plan: &Plan<S, V>,
         mut nodes: Vec<TreeNode>,
         replacement_display: Vec<ReplaceDisplayInfo<'_>>,
     ) -> Self {
@@ -660,7 +684,10 @@ impl App {
 /// - Builds forward/reverse dependency maps from `ResourceRef` attributes
 /// - Assigns each resource a single parent (shallowest dependency)
 /// - Sorts siblings by `(resource_type, binding_name)`
-fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
+fn build_tree_structure<S, V: carina_core::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+    nodes: &mut [TreeNode],
+) {
     if nodes.is_empty() {
         return;
     }
@@ -695,7 +722,10 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
 }
 
 /// Shorten effect labels: strip provider prefix and use binding name or compact hint.
-fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
+fn shorten_effect_labels<S, V: carina_core::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+    nodes: &mut [TreeNode],
+) {
     for (idx, effect) in plan.effects().iter().enumerate() {
         // carina#3181 PR D: `Effect` payloads are typestate structs;
         // reach them through the shared `ResourceLike` view.
@@ -770,51 +800,25 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     }
 }
 
-fn effect_to_node(
-    plan: &Plan,
-    effect: &Effect,
+fn effect_to_node<S, V: carina_core::resource::PlanValueKind>(
+    display: &PlanDisplay<'_, S, V>,
+    index: usize,
     schemas: &SchemaRegistry,
-    historical_display: &HistoricalDisplayAttributes,
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
 ) -> ProviderResult<TreeNode> {
-    let detail_rows =
-        if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
-            build_replace_detail_rows_from_display(
-                plan,
-                resource,
-                replacement,
-                historical_display,
-                Some(schemas),
-                DetailLevel::Full,
-                prev_explicit.and_then(|map| map.get(&resource.id)),
-                provider,
-            )
-        } else {
-            build_detail_rows_by_instance(
-                effect,
-                Some(schemas),
-                DetailLevel::Full,
-                historical_display,
-                prev_explicit,
-                provider,
-            )
-        }?;
-    Ok(effect_to_node_with_rows(
-        plan,
-        effect,
-        replacement_info,
-        detail_rows,
-    ))
-}
-
-fn effect_to_node_with_rows(
-    plan: &Plan,
-    effect: &Effect,
-    replacement_info: Option<ReplaceDisplayInfo<'_>>,
-    mut detail_rows: Vec<DetailRow>,
-) -> TreeNode {
+    let mut detail_rows = display
+        .detail_rows(
+            index,
+            DetailLevel::Full,
+            Some(schemas),
+            prev_explicit,
+            provider,
+        )?
+        .into_owned();
+    let plan = display.plan();
+    let effect = &plan.effects()[index];
     if let Effect::Remove { id } = effect {
         detail_rows.extend(
             plan.abandoned_deposed_generations()
@@ -825,7 +829,7 @@ fn effect_to_node_with_rows(
         );
     }
 
-    match effect {
+    Ok(match effect {
         Effect::Read { resource } => TreeNode {
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
@@ -971,11 +975,9 @@ fn effect_to_node_with_rows(
             parent: None,
         },
         Effect::Wait {
-            identity,
-            until_surface,
-            ..
+            id, until_surface, ..
         } => {
-            let binding = identity.to_string();
+            let binding = id.identity_str().to_string();
             TreeNode {
                 effect_label: format!("{} (until {})", binding, until_surface),
                 resource_type: "wait".to_string(),
@@ -1029,7 +1031,7 @@ fn effect_to_node_with_rows(
                 parent: None,
             }
         }
-    }
+    })
 }
 
 #[cfg(test)]

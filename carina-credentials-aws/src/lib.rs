@@ -749,6 +749,7 @@ mod tests {
         write_aws_files(home.path(), "");
         let _environment = EnvironmentGuard::isolated(home.path(), None);
 
+        // wall-clock-ok: hang guard for the real SDK credential chain with IMDS disabled.
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             AwsSdkCredentialSource::new()
                 .await
@@ -801,6 +802,7 @@ mod tests {
         }
         let _environment = EnvironmentGuard::isolated(home.path(), Some("expired-sso"));
 
+        // wall-clock-ok: hang guard for the real SDK chain reading an expired on-disk SSO token.
         let error = tokio::time::timeout(Duration::from_secs(10), async {
             AwsSdkCredentialSource::new()
                 .await

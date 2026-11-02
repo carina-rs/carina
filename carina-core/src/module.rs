@@ -233,9 +233,7 @@ fn format_value(value: &Value) -> String {
                 }
             }
         }
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
-            "(secret)".to_string()
-        }
+        Value::Deferred(DeferredValue::Secret(_)) => "(secret)".to_string(),
         Value::Deferred(DeferredValue::Unknown(reason)) => crate::value::render_unknown(reason),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
     }
@@ -605,9 +603,7 @@ impl RootConfigSignature {
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 // Unknown is upstream-deferred and carries no resource-binding edge.
             }
-            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-                // Saved-plan placeholders never carry dependency expressions.
-            }
+
             Value::Deferred(DeferredValue::Placeholder(_)) => {}
         }
     }
@@ -899,6 +895,7 @@ impl ModuleSignature {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -917,6 +914,7 @@ impl ModuleSignature {
             | TypeExpr::List(_)
             | TypeExpr::Map(_)
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::Struct { .. }
             | TypeExpr::StringLiteral(_)
@@ -1011,12 +1009,21 @@ impl ModuleSignature {
             .attribute_params
             .iter()
             .map(|attr_param| {
-                let source_binding = attr_param.value.as_ref().and_then(|v| match v {
-                    Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                        Some(path.binding().to_string())
-                    }
-                    _ => None,
-                });
+                let source_binding =
+                    attr_param
+                        .value
+                        .as_ref()
+                        .and_then(|expression| match expression {
+                            crate::parser::BoundaryExpression::Value(Value::Deferred(
+                                DeferredValue::ResourceRef { path },
+                            )) => Some(path.binding().to_string()),
+                            crate::parser::BoundaryExpression::Handle(handle) => {
+                                Some(handle.canonical_binding_name().to_string())
+                            }
+                            crate::parser::BoundaryExpression::Value(
+                                Value::Concrete(_) | Value::Deferred(_),
+                            ) => None,
+                        });
 
                 TypedAttributeParam {
                     name: attr_param.name.clone(),
@@ -1248,9 +1255,6 @@ impl ModuleSignature {
                 // Other unknowns are upstream-deferred and carry no
                 // resource-binding edge.
             }
-            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-                // Saved-plan placeholders never carry dependency expressions.
-            }
         }
     }
 
@@ -1405,6 +1409,7 @@ impl ModuleSignature {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::StringLiteral(_)
             | TypeExpr::Union(_) => format!("{}{}{}", c.green, type_expr, c.reset),
@@ -1697,11 +1702,15 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let signature = ModuleSignature::from_directory_module(
             &parsed,
             "web_tier",
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let display = signature.display_with_color(false);
 
@@ -1727,13 +1736,13 @@ mod tests {
         let parsed = parse(
             "arguments {\n  input: missing.types.Identifier\n}\n\
              attributes {\n  output: missing.types.Identifier = input\n}\n",
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("module fixture must parse");
         let signature = ModuleSignature::from_directory_module(
             &parsed,
             "unnameable",
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let display = signature.display_with_color(false);
 
@@ -1775,11 +1784,15 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let signature = ModuleSignature::from_directory_module(
             &parsed,
             "web_tier",
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let display = signature.display_with_color(false);
 
@@ -1919,9 +1932,13 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
 
-        let mut config = ProviderContext::default();
+        let mut config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         config
             .resource_types
             .insert(("aws".to_string(), "vpc".to_string()));
@@ -1972,9 +1989,16 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
-        let signature =
-            FileSignature::from_parsed_file(&parsed, "web_tier", &ProviderContext::default());
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let signature = FileSignature::from_parsed_file(
+            &parsed,
+            "web_tier",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         // Should be detected as a Module, not a RootConfig
         assert!(matches!(signature, FileSignature::Module(_)));
@@ -2002,9 +2026,16 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
-        let signature =
-            FileSignature::from_parsed_file(&parsed, "main", &ProviderContext::default());
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let signature = FileSignature::from_parsed_file(
+            &parsed,
+            "main",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         // Should be detected as a RootConfig
         assert!(matches!(signature, FileSignature::RootConfig(_)));

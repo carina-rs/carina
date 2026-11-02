@@ -1,5 +1,8 @@
 #[cfg(test)]
 use carina_core::config_loader::get_base_dir;
+use carina_core::effect::deps::KeptDestroyTargets;
+use carina_core::resource::{ResolvedDependencies, ResolvedResource};
+use carina_core::wait::ResolvedWaitBinding;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -12,28 +15,24 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::time::Instant;
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::load_configuration_with_config;
-use carina_core::deps::get_resource_dependencies;
 use carina_core::effect::deps::{
-    DependencyAnalysis, DestroyWaitAlias, ScheduleInputs, UnresolvedResource,
-    build_effect_dependency_analysis,
+    DependencyAnalysis, DestroyWaitAlias, ScheduleInputs, build_effect_dependency_analysis,
 };
 use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::executor::{
     EffectFailure, EffectFailureKind, ExecutionEvent, ExecutionObserver, FailureEventContext,
     FailureReport, FailureSink, ProgressInfo, classify_stalled_effects as classify_destroy_stall,
 };
-use carina_core::parser::WaitBinding;
 use carina_core::plan::{Plan, PlanError};
 use carina_core::provider::{Provider, ProviderError};
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Current, PreventDestroySource, ResolvedResourceId,
-    Resource, ResourceId, ResourceIdentity, Value,
+    ConcreteValue, Current, PreventDestroySource, ResolvedResourceId, Resource, ResourceId, Value,
 };
 use carina_core::schema::SchemaKind;
 #[cfg(test)]
@@ -123,7 +122,7 @@ impl<'a, F: Future> Future for DestroyInFlight<'a, F> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_destroy(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -136,6 +135,7 @@ pub async fn run_destroy(
     let project = carina_core::paths::ResolvedPath::new(path)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         base_dir,
         provider_context,
@@ -145,7 +145,7 @@ pub async fn run_destroy(
     let parsed = loaded.parsed;
 
     super::apply::symlink_retarget_test_barrier("CARINA_TEST_DESTROY_CONFIG_HANDSHAKE_DIR").await;
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
@@ -173,19 +173,19 @@ pub async fn run_destroy(
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
-        println!("{}", "Acquiring state lock...".cyan());
+        println!("{}", "Acquiring state lock...".cyan(color_mode));
         let li = backend
             .acquire_lock("destroy")
             .await
             .map_err(|error| map_lock_error(error, path))?;
-        println!("  {} Lock acquired", "✓".green());
+        println!("  {} Lock acquired", "✓".green(color_mode));
         StateLock::held(li)
     } else {
         println!(
             "{}",
             "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
-                .yellow()
-                .bold()
+                .yellow(color_mode)
+                .bold(color_mode)
         );
         StateLock::disabled_by_cli_flag()
     };
@@ -204,7 +204,7 @@ pub async fn run_destroy(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
+    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await?;
 
     Ok(())
 }
@@ -355,6 +355,8 @@ async fn run_destroy_locked_owned(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> LockCommandOutcome<Result<(), AppError>> {
+    let color_mode = validated_config.context().runtime().color_mode();
+    let runtime = validated_config.context().runtime().clone();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
@@ -391,10 +393,11 @@ async fn run_destroy_locked_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-    let state_block_claims = validated_config.reconcile_for_destroy(&state_file);
+    let state_blocks = validated_config.reconcile_for_destroy(&state_file);
+    let state_block_claims = &state_blocks.claims;
     let (ctx, parsed) = validated_config.context_and_resources();
 
-    let provider_inputs = load_and_resolve_provider_configs(
+    let provider_inputs = load_and_resolve_provider_configs(&runtime,
         parsed,
         base_dir,
         provider_context,
@@ -414,8 +417,9 @@ async fn run_destroy_locked_owned(
 
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
-    let mut all_resources = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
+    let detected_resources = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
         parsed,
+        &state_blocks.targets.removed_from,
         &state_file,
         ctx.schemas(),
     )?
@@ -424,22 +428,32 @@ async fn run_destroy_locked_owned(
         &provider,
         &parsed.data_sources,
         provider_inputs.configs().as_provider_configs(),
-        &state_block_claims,
-    )?
-    .into_destroy_resources();
+        state_block_claims,
+    )?;
+    let moved_pairs = crate::wiring::resolve_moved_pairs(
+        ctx,
+        parsed,
+        detected_resources.sorted_resources(),
+        &parsed.data_sources,
+        &state_file,
+    )?;
+    let expansion_prelude = detected_resources.into_destroy_prelude(&moved_pairs);
+    let prepared_rows = expansion_prelude.prepared_rows().clone();
+    let mut all_resources = expansion_prelude.sorted_resources().to_vec();
 
     if !refresh {
         eprintln!(
             "{}",
-            "Warning: using cached managed-resource state (--refresh=false). The plan may not reflect actual managed infrastructure.".yellow()
+            "Warning: using cached managed-resource state (--refresh=false). The plan may not reflect actual managed infrastructure.".yellow(color_mode)
         );
     }
 
     // Build managed current state -- either from the provider or the state file.
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
+    let mut orphans = carina_core::differ::Orphans::new();
 
-    if refresh {
-        let progress_backend = ProgressBackend::new(ProgressSink::Human);
+    let validated_config = if refresh {
+        let progress_backend = ProgressBackend::new(color_mode, ProgressSink::Human);
         let refresh_phase = RefreshPhase::start(&progress_backend);
 
         // Read states for managed resources concurrently using identifier
@@ -471,10 +485,11 @@ async fn run_destroy_locked_owned(
                 let Some(resource) = resource_iter.next() else {
                     break;
                 };
+                let Some(loaded) = prepared_rows.refreshable.current(&resource.id) else {
+                    managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
+                    continue;
+                };
                 let progress = refresh_phase.begin(&resource.id);
-                let loaded = persisted_state
-                    .map(|sf| sf.build_state_for_resource(&resource.id))
-                    .unwrap_or_else(|| Current::absent(resource.id.clone()));
                 refresh_in_flight.push(async move {
                     let current = refresh_loaded_resource_with_retry(
                         provider_ref,
@@ -498,6 +513,7 @@ async fn run_destroy_locked_owned(
             let next_in_flight = async {
                 if draining {
                     crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
+                        &runtime,
                         &cancel,
                     )
                     .await;
@@ -548,7 +564,7 @@ async fn run_destroy_locked_owned(
         if let Some(sf) = persisted_state {
             let desired_ids: HashSet<ResourceId> =
                 all_resources.iter().map(|r| r.id.clone()).collect();
-            let loaded_orphans = sf.build_orphans(&desired_ids);
+            let loaded_orphans = prepared_rows.refreshable.build_orphans(&desired_ids);
             let orphan_entries: Vec<_> = loaded_orphans.into_iter().collect();
             let mut refresh_cancelled = false;
             let mut orphan_iter = orphan_entries.into_iter();
@@ -595,6 +611,7 @@ async fn run_destroy_locked_owned(
                 let next_in_flight = async {
                     if draining {
                         crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
+                        &runtime,
                             &cancel,
                         )
                         .await;
@@ -632,6 +649,7 @@ async fn run_destroy_locked_owned(
                     continue;
                 }
                 let (id, loaded) = result?;
+                orphans.insert(loaded.clone());
                 let current = loaded.into_current();
                 let exists = match &current {
                     Current::Absent(_state) => false,
@@ -652,28 +670,127 @@ async fn run_destroy_locked_owned(
                 return Err(AppError::Interrupted);
             }
         }
-    } else if let Some(sf) = state_file.as_ref() {
-        // --refresh=false: build states from state file without AWS calls.
-        // carina#3181: `all_resources` is managed-only.
-        for resource in &all_resources {
-            let current = sf.build_state_for_resource(&resource.id);
-            managed_current.insert(resource.id.clone(), current);
-        }
 
-        // Include orphaned resources (in state but not in .crn)
-        let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
-        for (id, loaded) in sf.build_orphans(&desired_ids) {
-            let current = loaded.into_current();
-            if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
-                let orphan_resource = build_orphan_resource(sf, &resolved_id);
-                all_resources.push(orphan_resource);
+        let already_refreshed = managed_current.keys().cloned().collect();
+        for id in orphans.keys() {
+            managed_current.remove(id);
+        }
+        let crate::wiring::MaterializedLegacyConfiguration {
+            config,
+            sorted_resources,
+            parts,
+        } = validated_config.materialize_legacy_configuration(
+            crate::wiring::LegacyConfigurationReadInputs {
+                prelude: expansion_prelude,
+                state: crate::wiring::PreserveDeferredForExpansionInputs {
+                    managed_current,
+                    orphans,
+                    already_refreshed,
+                },
+                provider: &provider,
+                state_file: &state_file,
+                refresh_phase: &refresh_phase,
+                remote_bindings: &HashMap::new(),
+                cancel: &cancel,
+            },
+        ).await?;
+        all_resources = crate::wiring::resources_at_destroy_addresses(sorted_resources, &moved_pairs);
+        let crate::wiring::AddressedStateParts { managed_current: expanded_current, orphans, .. } = parts.addressed.into_parts();
+        if let Some(state) = state_file.as_ref() {
+            all_resources.extend(orphans.keys().map(|id| build_orphan_resource(state, &ResolvedResourceId::new(id.clone()))));
+        }
+        managed_current = carina_core::differ::into_all_prior_states(orphans, expanded_current);
+        config
+    } else {
+        if let Some(sf) = state_file.as_ref() {
+            // --refresh=false: build states from state file without AWS calls.
+            // carina#3181: `all_resources` is managed-only.
+            for resource in &all_resources {
+                let current = prepared_rows.refreshable.current(&resource.id).map(|row| row.into_current()).unwrap_or_else(|| Current::absent(resource.id.clone()));
+                managed_current.insert(resource.id.clone(), current);
             }
-            managed_current.insert(id, current);
+
+            // Include orphaned resources (in state but not in .crn)
+            let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
+            for (id, loaded) in prepared_rows.refreshable.build_orphans(&desired_ids) {
+                let current = loaded.into_orphan().into_current();
+                if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
+                    let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                    all_resources.push(orphan_resource);
+                }
+                managed_current.insert(id, current);
+            }
+        }
+        validated_config.into_offline_legacy_configuration()
+    };
+
+    let validated = match validated_config.resolve_legacy_graph(
+        &moved_pairs, state_file.as_ref(),
+    )? {
+        carina_state::LegacyClassificationOutcome::Classified(validated) => validated,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            let advice = if refresh {
+                "run plan/apply (which reads upstream_state) to migrate"
+            } else {
+                "rerun destroy with --refresh=true"
+            };
+            return Err(AppError::Validation(format!("{rows}: legacy dependency migration requires reads; {advice}")));
+        }
+    };
+    let (ctx, destroy_graph) = validated.config.context_and_resources();
+    let parsed = destroy_graph.configuration();
+    let resolved_wait_bindings = destroy_graph.configuration().wait_bindings.iter()
+        .map(|wait| destroy_graph.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(migrated) = validated.migrated_state {
+        state_file = Some(migrated);
+        if let Some(state) = state_file.as_ref() {
+            for (id, current) in &mut managed_current {
+                if let Some(row) = state.find_resource_for_id(id) {
+                    current.set_dependency_bindings(row.dependency_bindings.clone());
+                }
+            }
+        }
+        mid_run_writer.write_schema_migration(state_file.as_mut().expect("validated migration retains state")).await?;
+    }
+
+    // Backend protection covers every persisted generation, including rows
+    // whose removed current instance no longer has any attributes.
+    let mut protected_row_keys: HashSet<StateRowKey> = HashSet::new();
+    if let (Some(state), Some(backend_rt), Some(bucket_name)) = (
+        state_file.as_ref(),
+        backend.resource_type(),
+        protected_bucket.as_deref(),
+    ) {
+        for row in state.resources() {
+            if row.resource_type == backend_rt
+                && (row
+                    .persisted_attributes()
+                    .into_iter()
+                    .chain(
+                        row.deposed
+                            .iter()
+                            .map(|generation| generation.persisted_attributes()),
+                    )
+                    .any(|attributes| {
+                        matches!(attributes.get("bucket"), Some(Value::Concrete(ConcreteValue::String(name)))
+                            if name.expose_plaintext() == bucket_name)
+                    })
+                    || row
+                        .deposed
+                        .iter()
+                        .any(|generation| generation.identifier == bucket_name))
+            {
+                protected_row_keys.insert(state_row_key_from_parts(
+                    &row.provider,
+                    &row.resource_type,
+                    row.identity.as_str(),
+                ));
+            }
         }
     }
 
-    // Collect resources that exist and will be destroyed
-    // Skip the state bucket if it matches the backend bucket
+    // Collect resources that exist and will be destroyed.
     let mut protected_resources: Vec<&Resource> = Vec::new();
     let mut prevent_destroy_resources: Vec<(&Resource, PreventDestroySource)> = Vec::new();
     let mut resources_to_destroy: Vec<&Resource> = all_resources
@@ -706,12 +823,21 @@ async fn run_destroy_locked_owned(
                 }
             }
 
-            // Check if this is the protected state bucket
-            if let Some(backend_rt) = backend.resource_type()
-                && r.id.resource_type == backend_rt
-                && let Some(ref bucket_name) = protected_bucket
-                && let Some(Value::Concrete(ConcreteValue::String(name))) = r.get_attr("bucket")
-                && name == bucket_name
+            // Protect the persisted backend bucket even if its configured name changed.
+            let configured_backend_bucket = backend.resource_type()
+                == Some(r.id.resource_type.as_str())
+                && protected_bucket.as_deref().is_some_and(|bucket_name| {
+                    matches!(r.get_attr("bucket"), Some(Value::Concrete(ConcreteValue::String(name)))
+                        if name.expose_plaintext() == bucket_name)
+                });
+            if configured_backend_bucket
+                || r.id.identity_str().is_some_and(|identity| {
+                    protected_row_keys.contains(&state_row_key_from_parts(
+                        &r.id.provider,
+                        &r.id.resource_type,
+                        identity,
+                    ))
+                })
             {
                 protected_resources.push(r);
                 return false;
@@ -739,13 +865,33 @@ async fn run_destroy_locked_owned(
     // bucket itself. `prevent_destroy` is intentionally not included here: it
     // guards the current instance, while a deposed generation already came from
     // a replacement path that approved deleting the old instance.
-    let protected_row_keys: HashSet<StateRowKey> = protected_resources
+    protected_row_keys.extend(
+        protected_resources
+            .iter()
+            .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
+            .map(|id| state_row_key_from_id(&id)),
+    );
+    let resolved_resources_to_destroy = resources_to_destroy
         .iter()
-        .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
-        .map(|id| state_row_key_from_id(&id))
+        .map(|resource| destroy_graph.resolve_resource((*resource).clone(), ctx.schemas()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let destroyed_ids: HashSet<_> = resolved_resources_to_destroy
+        .iter()
+        .map(ResolvedResource::resolved_id)
+        .collect();
+    let kept_targets: KeptDestroyTargets = parsed
+        .data_sources
+        .iter()
+        .filter_map(|data_source| ResolvedResourceId::try_new(data_source.id.clone()))
+        .chain(
+            all_resources
+                .iter()
+                .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone())),
+        )
+        .filter(|id| !destroyed_ids.contains(id))
         .collect();
     let (delete_effects, identifier_errors) = build_destroy_delete_effects(
-        &resources_to_destroy,
+        &resolved_resources_to_destroy,
         &managed_current,
         state_file.as_ref(),
         &protected_row_keys,
@@ -755,16 +901,16 @@ async fn run_destroy_locked_owned(
         for error in identifier_errors {
             error_plan.add_error(error);
         }
-        render_plan_errors_and_abort(&error_plan, &std::path::PathBuf::from(base_dir.display().to_string()))?;
+        render_plan_errors_and_abort(color_mode,&error_plan, &std::path::PathBuf::from( base_dir.display().to_string()))?;
     }
 
-    let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &delete_effects);
+    let wait_aliases = build_destroy_wait_aliases(&resolved_wait_bindings, &delete_effects);
     let dependency_analysis = build_effect_dependency_analysis(
         &delete_effects,
-        &HashMap::<ResourceId, UnresolvedResource>::new(),
-        &[],
+        std::iter::empty(),
         ScheduleInputs::Destroy {
             aliases: &wait_aliases,
+            kept_targets: &kept_targets,
         },
     )
     .map_err(DestroyDependencyAnalysisError::new)?;
@@ -776,7 +922,7 @@ async fn run_destroy_locked_owned(
         .map(|effect| {
             effect
                 .binding_address()
-                .map(ToString::to_string)
+                .map(|binding| binding.to_string())
                 .unwrap_or_else(|| effect.resource_id().identity_display().to_string())
         })
         .collect();
@@ -789,26 +935,30 @@ async fn run_destroy_locked_owned(
     .map_err(AppError::Config)?;
 
     if delete_effects.is_empty()
+        && prepared_rows.removed.is_empty()
         && protected_resources.is_empty()
         && prevent_destroy_resources.is_empty()
     {
-        println!("{}", "No resources to destroy.".green());
+        println!("{}", "No resources to destroy.".green(color_mode));
         return Ok(DestroyAfterHeartbeat::Done);
     }
 
     // Build a Plan from the delete effects for tree display
     let mut destroy_plan = Plan::new();
+    for id in prepared_rows.removed.ids() {
+        destroy_plan.add(Effect::Remove { id: id.clone() });
+    }
     for idx in &display_order {
         destroy_plan.add(delete_effects[*idx].clone());
     }
-
+    destroy_plan.record_unresolved_delete_ordering_analysis(&dependency_analysis);
     let historical_display =
         collect_historical_display_attributes(&destroy_plan, &managed_current, state_file.as_ref());
 
     // Display destroy plan as a dependency tree
     print!(
         "{}",
-        format_destroy_plan_with_delete_instances(
+        format_destroy_plan_with_delete_instances(color_mode,
             &destroy_plan,
             DetailLevel::Full,
             &historical_display,
@@ -820,9 +970,9 @@ async fn run_destroy_locked_owned(
     for resource in &protected_resources {
         println!(
             "  {} {} {}",
-            "⚠".yellow().bold(),
+            "⚠".yellow(color_mode).bold(color_mode),
             resource.id,
-            "(protected - will be skipped)".yellow()
+            "(protected - will be skipped)".yellow(color_mode)
         );
     }
 
@@ -832,10 +982,10 @@ async fn run_destroy_locked_owned(
         println!(
             "{}",
             "Error: the following resources are protected from destruction:"
-                .red()
-                .bold()
+                .red(color_mode)
+                .bold(color_mode)
         );
-        let failure_progress = ProgressBackend::<()>::new(ProgressSink::Human);
+        let failure_progress = ProgressBackend::<()>::new(color_mode, ProgressSink::Human);
         for (resource, _source) in &prevent_destroy_resources {
             failure_progress.failed_line(FailedOutcome::summary(resource.id.to_string()));
         }
@@ -846,7 +996,7 @@ async fn run_destroy_locked_owned(
         {
             println!(
                 "{}",
-                "At least one resource has `prevent_destroy = true`.".yellow()
+                "At least one resource has `prevent_destroy = true`.".yellow(color_mode)
             );
         }
         if prevent_destroy_resources
@@ -856,10 +1006,10 @@ async fn run_destroy_locked_owned(
             println!(
                 "{}",
                 "A resource type is protected from destruction by default; to allow it, write `directives { prevent_destroy = false }`."
-                    .yellow()
+                    .yellow(color_mode)
             );
         }
-        println!("{}", "Use --force to override destruction protection.".yellow());
+        println!("{}", "Use --force to override destruction protection.".yellow(color_mode));
     }
 
     println!();
@@ -871,11 +1021,11 @@ async fn run_destroy_locked_owned(
     if counts.guarded > 0 {
         println!(
             "Plan: {} to destroy, {} protected.",
-            counts.to_destroy.to_string().red(),
-            counts.guarded.to_string().yellow()
+            counts.to_destroy.to_string().red(color_mode),
+            counts.guarded.to_string().yellow(color_mode)
         );
     } else {
-        println!("Plan: {} to destroy.", counts.to_destroy.to_string().red());
+        println!("Plan: {} to destroy.", counts.to_destroy.to_string().red(color_mode));
     }
     println!();
 
@@ -887,10 +1037,10 @@ async fn run_destroy_locked_owned(
         )));
     }
 
-    if should_skip_destroy_execution(delete_effects.len()) {
+    if should_skip_destroy_execution(delete_effects.len() + prepared_rows.removed.ids().count()) {
         println!(
             "{}",
-            "All resources are protected. Nothing to destroy.".yellow()
+            "All resources are protected. Nothing to destroy.".yellow(color_mode)
         );
         return Ok(DestroyAfterHeartbeat::Done);
     }
@@ -900,19 +1050,19 @@ async fn run_destroy_locked_owned(
         println!(
             "{}",
             "Do you really want to destroy all resources?"
-                .yellow()
-                .bold()
+                .yellow(color_mode)
+                .bold(color_mode)
         );
         println!(
             "  {}",
-            "This action cannot be undone. Type 'yes' to confirm.".yellow()
+            "This action cannot be undone. Type 'yes' to confirm.".yellow(color_mode)
         );
         // The cursor is hidden command-wide (#3158); reveal it for this
         // irreversible-destroy confirmation so the user does not type
         // blind, and re-hide on scope exit.
         let mut input = String::new();
         {
-            let _reveal = CursorReveal::new();
+            let _reveal = CursorReveal::new(ctx.runtime().cursor());
             print!("\n  Enter a value: ");
             std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
@@ -923,16 +1073,32 @@ async fn run_destroy_locked_owned(
 
         if input.trim() != "yes" {
             println!();
-            println!("{}", "Destroy cancelled.".yellow());
+            println!("{}", "Destroy cancelled.".yellow(color_mode));
             return Ok(DestroyAfterHeartbeat::Done);
         }
         println!();
     }
 
-    println!("{}", "Destroying resources...".red().bold());
-    println!();
+    match cancel.phase() {
+        carina_core::shutdown::ShutdownPhase::Running => {}
+        _ => return Err(AppError::Interrupted),
+    }
+    if !prepared_rows.removed.is_empty() {
+        mid_run_writer.write_removals(
+            state_file.as_mut().expect("removed rows came from persisted state"),
+            &prepared_rows.removed,
+        ).await?;
+        if delete_effects.is_empty() {
+            println!("Removed {} resource(s) from state.", prepared_rows.removed.ids().count());
+        }
+    }
 
-    let progress = ProgressBackend::new(ProgressSink::Human);
+    if !delete_effects.is_empty() {
+        println!("{}", "Destroying resources...".red(color_mode).bold(color_mode));
+        println!();
+    }
+
+    let progress = ProgressBackend::new(color_mode, ProgressSink::Human);
 
     let mut success_count = 0;
     let mut failures = FailureSink::default();
@@ -963,7 +1129,7 @@ async fn run_destroy_locked_owned(
         .map(|effect| {
             let binding = effect
                 .binding_address()
-                .map(ToString::to_string)
+                .map(|binding| binding.to_string())
                 .unwrap_or_else(|| {
                     let id = effect.resource_id();
                     format!("{}:{}", id.resource_type, id.identity_display())
@@ -1045,7 +1211,7 @@ async fn run_destroy_locked_owned(
                     &failed_indices,
                 ) {
                     let failed_dep = &resource_info[failed_dep_idx].0;
-                    let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(
+                    let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(color_mode,
                         &completed_counter,
                         destroy_total,
                         effect,
@@ -1087,6 +1253,7 @@ async fn run_destroy_locked_owned(
                 );
 
                 let provider_ref = &provider;
+                let result_runtime = &runtime;
                 let result_shutdown = &cancel;
                 let delete = async move {
                     let started = Instant::now();
@@ -1097,7 +1264,7 @@ async fn run_destroy_locked_owned(
                             delete_request,
                         )
                         .await;
-                    observe_destroy_result_ready_for_tests(result_shutdown).await;
+                    observe_destroy_result_ready_for_tests(result_runtime, result_shutdown).await;
                     (resource_id, generation, started, delete_result)
                 };
                 in_flight.push(DestroyInFlight::new(idx, active_progress, delete));
@@ -1131,7 +1298,7 @@ async fn run_destroy_locked_owned(
                         effect,
                         retry.stopped(DeleteRetryStop::NoProgress),
                         |failure| {
-                            let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
+                            let outcome = FailedOutcome::summary(format_destroy_outcome_summary(color_mode,
                                 &completed_counter,
                                 destroy_total,
                                 effect,
@@ -1156,7 +1323,7 @@ async fn run_destroy_locked_owned(
             for (idx, kind) in classify_destroy_stall(&effects, &deletion_deps, &remaining.into_iter().collect(), &completed_indices) {
                 let (_, effect) = &resource_info[idx];
                 record_destroy_failure(&mut failures, effect, kind, |failure| {
-                    let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
+                    let outcome = FailedOutcome::summary(format_destroy_outcome_summary(color_mode,
                         &completed_counter,
                         destroy_total,
                         effect,
@@ -1212,8 +1379,8 @@ async fn run_destroy_locked_owned(
         match delete_result {
             Ok(()) => {
                 retry_failures.remove(&finished_idx);
-                let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
-                let outcome = NonFailureOutcome::success(format_destroy_outcome_summary(
+                let timing = format!("took {}", format_duration(started.elapsed())).dimmed(color_mode);
+                let outcome = NonFailureOutcome::success(format_destroy_outcome_summary(color_mode,
                     &completed_counter,
                     destroy_total,
                     effect,
@@ -1221,7 +1388,7 @@ async fn run_destroy_locked_owned(
                 ));
                 active_progress.finish(outcome);
                 success_count += 1;
-                observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
+                observe_destroy_success_for_tests(&runtime, success_count, &resource_id, &cancel);
                 let destroyed = DestroyedInstance {
                     id: resource_id,
                     generation,
@@ -1265,14 +1432,14 @@ async fn run_destroy_locked_owned(
                     } else {
                         EffectFailureKind::provider(e)
                     };
-                    let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
+                    let timing = format!("took {}", format_duration(started.elapsed())).dimmed(color_mode);
                     record_destroy_failure(
                         &mut failures,
                         effect,
                         kind,
                         |failure| {
                             let outcome = FailedOutcome::new(
-                                format_destroy_outcome_summary(
+                                format_destroy_outcome_summary(color_mode,
                                     &completed_counter,
                                     destroy_total,
                                     effect,
@@ -1305,7 +1472,7 @@ async fn run_destroy_locked_owned(
                     retry.stopped(DeleteRetryStop::Cancelled),
                     |failure| {
                         progress.failed_line(FailedOutcome::new(
-                            format_destroy_outcome_summary(
+                            format_destroy_outcome_summary(color_mode,
                                 &completed_counter,
                                 destroy_total,
                                 effect,
@@ -1344,7 +1511,7 @@ async fn run_destroy_locked_owned(
                 let effect = &resource_info[idx].1;
                 match outcome {
                     InterruptedDestroyOutcome::Skipped => NonFailureOutcome::skipped(
-                        format_destroy_outcome_summary(
+                        format_destroy_outcome_summary(color_mode,
                             &completed_counter,
                             destroy_total,
                             effect,
@@ -1352,7 +1519,7 @@ async fn run_destroy_locked_owned(
                         ),
                     ),
                     InterruptedDestroyOutcome::Unknown => NonFailureOutcome::unknown(
-                        format_destroy_outcome_summary(
+                        format_destroy_outcome_summary(color_mode,
                             &completed_counter,
                             destroy_total,
                             effect,
@@ -1418,18 +1585,19 @@ async fn run_destroy_locked_owned(
                             skip_count,
                             unknown_count,
                         )
-                        .yellow()
-                        .bold()
+                        .yellow(color_mode)
+                        .bold(color_mode)
                     );
                     return Err(AppError::Interrupted);
                 }
 
                 println!();
-                println!("{}", "Saving state...".cyan());
+                println!("{}", "Saving state...".cyan(color_mode));
 
                 let finalize_result = finalize_after_execute(
                     |persistence| {
                         finalize_destroy(
+                            color_mode,
                             FinalizeDestroyInput {
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
@@ -1455,8 +1623,8 @@ async fn run_destroy_locked_owned(
                                 skip_count,
                                 unknown_count,
                             )
-                            .yellow()
-                            .bold()
+                            .yellow(color_mode)
+                            .bold(color_mode)
                         );
                     }
                     return Err(error);
@@ -1467,8 +1635,8 @@ async fn run_destroy_locked_owned(
                     println!(
                         "{}",
                         format!("Destroy complete! {} resources destroyed.", success_count)
-                            .green()
-                            .bold()
+                            .green(color_mode)
+                            .bold(color_mode)
                     );
                     Ok(())
                 } else {
@@ -1493,6 +1661,8 @@ async fn run_destroy_locked_owned(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked(
+    runtime: &crate::runtime::CommandRuntime,
+    color_mode: crate::output_style::ColorMode,
     parsed: carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -1505,11 +1675,11 @@ async fn run_destroy_locked(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let providers = match ProviderLoad::load(&user_dirs, &parsed.providers, base_dir) {
+    let providers = match ProviderLoad::load(runtime, &parsed.providers, base_dir) {
         Ok(providers) => providers,
         Err(error) => {
             return finish_lock_command(
+                color_mode,
                 backend.as_ref(),
                 LockCommandOutcome::Kept {
                     result: Err(error),
@@ -1525,6 +1695,7 @@ async fn run_destroy_locked(
         Ok(validated_config) => validated_config,
         Err(error) => {
             return finish_lock_command(
+                color_mode,
                 backend.as_ref(),
                 LockCommandOutcome::Kept {
                     result: Err(error),
@@ -1549,7 +1720,7 @@ async fn run_destroy_locked(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
 }
 
 #[cfg(test)]
@@ -1567,6 +1738,7 @@ async fn run_destroy_locked_with_ctx(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = validated_config.context().runtime().color_mode();
     let outcome = run_destroy_locked_owned(
         validated_config,
         auto_approve,
@@ -1581,16 +1753,8 @@ async fn run_destroy_locked_with_ctx(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
 }
-
-#[cfg(test)]
-static DESTROY_SUCCESS_CANCEL_AFTER: std::sync::Mutex<Option<DestroySuccessCancelHook>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-static DESTROY_READY_RESULT_BARRIER: std::sync::Mutex<Option<DestroyReadyResultBarrier>> =
-    std::sync::Mutex::new(None);
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -1620,7 +1784,7 @@ impl DestroyReadyResultBarrier {
 }
 
 #[cfg(test)]
-struct DestroySuccessCancelHook {
+pub(crate) struct DestroySuccessCancelHook {
     threshold: usize,
     trigger: TestShutdownTrigger,
     shutdown: ShutdownToken,
@@ -1628,11 +1792,14 @@ struct DestroySuccessCancelHook {
 
 #[cfg(test)]
 pub(crate) fn set_destroy_success_cancel_after(
+    runtime: &crate::runtime::CommandRuntime,
     threshold: usize,
     trigger: TestShutdownTrigger,
     shutdown: ShutdownToken,
 ) {
-    *DESTROY_SUCCESS_CANCEL_AFTER
+    *runtime
+        .test_hooks()
+        .destroy_success
         .lock()
         .expect("destroy success cancel hook lock") = Some(DestroySuccessCancelHook {
         threshold,
@@ -1642,34 +1809,28 @@ pub(crate) fn set_destroy_success_cancel_after(
 }
 
 #[cfg(test)]
-pub(crate) fn clear_destroy_success_cancel_after() {
-    *DESTROY_SUCCESS_CANCEL_AFTER
-        .lock()
-        .expect("destroy success cancel hook lock") = None;
-}
-
-#[cfg(test)]
 pub(crate) fn install_destroy_ready_result_barrier(
+    runtime: &crate::runtime::CommandRuntime,
     shutdown: ShutdownToken,
 ) -> DestroyReadyResultBarrier {
     let barrier = DestroyReadyResultBarrier::new(shutdown);
-    *DESTROY_READY_RESULT_BARRIER
+    *runtime
+        .test_hooks()
+        .destroy_ready
         .lock()
         .expect("destroy ready result barrier lock") = Some(barrier.clone());
     barrier
 }
 
 #[cfg(test)]
-pub(crate) fn clear_destroy_ready_result_barrier() {
-    *DESTROY_READY_RESULT_BARRIER
-        .lock()
-        .expect("destroy ready result barrier lock") = None;
-}
-
-#[cfg(test)]
-async fn observe_destroy_result_ready_for_tests(shutdown: &ShutdownToken) {
+pub(crate) async fn observe_destroy_result_ready_for_tests(
+    runtime: &crate::runtime::CommandRuntime,
+    shutdown: &ShutdownToken,
+) {
     let barrier = {
-        let mut barrier = DESTROY_READY_RESULT_BARRIER
+        let mut barrier = runtime
+            .test_hooks()
+            .destroy_ready
             .lock()
             .expect("destroy ready result barrier lock");
         if barrier.as_ref().is_some_and(|barrier| {
@@ -1687,15 +1848,22 @@ async fn observe_destroy_result_ready_for_tests(shutdown: &ShutdownToken) {
 }
 
 #[cfg(not(test))]
-async fn observe_destroy_result_ready_for_tests(_shutdown: &ShutdownToken) {}
+async fn observe_destroy_result_ready_for_tests(
+    _runtime: &crate::runtime::CommandRuntime,
+    _shutdown: &ShutdownToken,
+) {
+}
 
 #[cfg(test)]
-fn observe_destroy_success_for_tests(
+pub(crate) fn observe_destroy_success_for_tests(
+    runtime: &crate::runtime::CommandRuntime,
     success_count: usize,
     _resource_id: &ResourceId,
     cancel: &ShutdownToken,
 ) {
-    if let Some(hook) = DESTROY_SUCCESS_CANCEL_AFTER
+    if let Some(hook) = runtime
+        .test_hooks()
+        .destroy_success
         .lock()
         .expect("destroy success cancel hook lock")
         .as_ref()
@@ -1708,6 +1876,7 @@ fn observe_destroy_success_for_tests(
 
 #[cfg(not(test))]
 fn observe_destroy_success_for_tests(
+    _runtime: &crate::runtime::CommandRuntime,
     _success_count: usize,
     _resource_id: &ResourceId,
     _cancel: &ShutdownToken,
@@ -1715,22 +1884,15 @@ fn observe_destroy_success_for_tests(
 }
 
 fn build_destroy_wait_aliases(
-    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
+    wait_bindings: &[ResolvedWaitBinding],
     delete_effects: &[Effect],
 ) -> Vec<DestroyWaitAlias> {
-    let delete_dependencies: Vec<(
-        ResourceIdentity,
-        Option<AbsoluteBindingAddress>,
-        HashSet<AbsoluteBindingAddress>,
-    )> = delete_effects
+    let delete_dependencies: Vec<(ResolvedResourceId, ResolvedDependencies)> = delete_effects
         .iter()
         .filter_map(|effect| match effect {
             Effect::Delete {
-                id,
-                binding,
-                dependencies,
-                ..
-            } => Some((id.identity().clone(), binding.clone(), dependencies.clone())),
+                id, dependencies, ..
+            } => Some((id.clone(), dependencies.to_resolved_dependencies())),
             Effect::Read { .. }
             | Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -1740,38 +1902,36 @@ fn build_destroy_wait_aliases(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate(_)
+            | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace(_) => None,
         })
         .collect();
-    let destroy_targets: HashSet<&str> = delete_dependencies
+    let destroy_targets: HashSet<&ResolvedResourceId> =
+        delete_dependencies.iter().map(|(id, _)| id).collect();
+    let referenced_bindings: HashSet<&ResolvedResourceId> = delete_dependencies
         .iter()
-        .filter_map(|(_, binding, _)| binding.as_ref().map(AbsoluteBindingAddress::as_str))
-        .collect();
-    let referenced_bindings: HashSet<&str> = delete_dependencies
-        .iter()
-        .flat_map(|(_, _, dependencies)| dependencies.iter().map(AbsoluteBindingAddress::as_str))
+        .flat_map(|(_, dependencies)| dependencies.iter())
         .collect();
 
     wait_bindings
         .iter()
-        .filter(|wait| referenced_bindings.contains(wait.binding.as_str()))
+        .filter(|wait| referenced_bindings.contains(&wait.id))
         .filter_map(|wait| {
-            if !destroy_targets.contains(wait.target.as_str()) {
+            if !destroy_targets.contains(wait.target_id.id()) {
                 return None;
             }
             let mut consumers = delete_dependencies
                 .iter()
-                .filter(|(_, _, dependencies)| dependencies.contains(&wait.binding))
-                .map(|(identity, _, _)| identity.clone())
+                .filter(|(_, dependencies)| dependencies.contains(&wait.id))
+                .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
-            consumers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            consumers.sort();
             consumers.dedup();
 
             DestroyWaitAlias::new(
-                wait.binding.clone(),
-                wait.target.clone(),
-                wait.depends_on.iter().cloned().collect(),
+                wait.id.clone(),
+                wait.target_id.id().clone(),
+                wait.explicit_dependencies.clone(),
                 consumers,
             )
         })
@@ -1779,7 +1939,7 @@ fn build_destroy_wait_aliases(
 }
 
 fn build_destroy_delete_effects(
-    resources_to_destroy: &[&Resource],
+    resources_to_destroy: &[ResolvedResource],
     managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
     protected_row_keys: &HashSet<StateRowKey>,
@@ -1822,17 +1982,29 @@ fn build_destroy_delete_effects(
                 continue;
             }
         };
-        let dependencies = get_resource_dependencies(resource);
-        let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
+        let mut dependencies = resource.persisted_value_destroy_dependencies().clone();
+        dependencies.extend_projected(resource.persisted_explicit_destroy_dependencies());
+        let mut explicit_dependencies = resource.explicit_dependencies().clone();
+        if let Some(row) = state_file.and_then(|state| {
+            state.find_resource(
+                resource.id.provider.as_str(),
+                resource.id.resource_type.as_str(),
+                resource.identity_str(),
+            )
+        }) {
+            dependencies.extend_projected(&row.dependency_bindings);
+            dependencies.extend_projected(&row.directives.depends_on);
+            explicit_dependencies.extend(row.directives.depends_on.iter().cloned());
+        }
         delete_effects.push(Effect::Delete {
-            id: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
+            id: resource.resolved_id(),
             identifier,
             generation: EffectGeneration::Current,
             directives: resource.directives.clone(),
             binding: resource.binding.clone(),
             dependencies,
             explicit_dependencies,
-            blocked_by_updates: HashSet::new(),
+            blocked_by_updates: ResolvedDependencies::default(),
         });
     }
     if let Some(sf) = state_file {
@@ -1908,13 +2080,14 @@ fn format_destroy_failure_summary(
 }
 
 fn format_destroy_outcome_summary(
+    color_mode: crate::output_style::ColorMode,
     completed_counter: &AtomicUsize,
     total: usize,
     effect: &Effect,
     detail: impl std::fmt::Display,
 ) -> String {
     let completed = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let counter = format!("{completed}/{total}").dimmed();
+    let counter = format!("{completed}/{total}").dimmed(color_mode);
     format!("{} {} {}", format_effect(effect), detail, counter)
 }
 
@@ -2184,6 +2357,7 @@ pub(crate) struct FinalizeDestroyInput<'a> {
 }
 
 pub(crate) async fn finalize_destroy(
+    color_mode: crate::output_style::ColorMode,
     input: FinalizeDestroyInput<'_>,
     persistence: StatePersistence,
 ) -> Result<(), AppError> {
@@ -2215,20 +2389,26 @@ pub(crate) async fn finalize_destroy(
             .await?;
         }
     }
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!(
+        "  {} State saved (serial: {})",
+        "✓".green(color_mode),
+        state.serial
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::provider_upstream_test_support::{
         ProviderConfigCaptureFactory, provider_default_tags_local_resource_fixture,
         provider_default_tags_missing_upstream_fixture, provider_upstream_fixture,
     };
+    use crate::test_support::resolved;
     use std::sync::{Arc, Mutex};
 
-    fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
+    fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
         crate::absolute_binding_for_test(name)
     }
 
@@ -2241,7 +2421,7 @@ mod tests {
     fn destroy_stall_matches_apply_scc_and_no_progress_classification() {
         let effects = ["first", "second", "blocked", "external"].map(|name| {
             Effect::Create(carina_core::resource::ResolvedResource::new(
-                carina_core::resource::Resource::new("test.resource", name),
+                (carina_core::resource::Resource::new("test.resource", name)).into_value_snapshot(),
             ))
         });
         for (dependencies, remaining) in [
@@ -2277,7 +2457,7 @@ mod tests {
     fn delete_retry_no_progress_does_not_claim_unattempted_retries_were_exhausted() {
         for attempts in [1, 2] {
             let effect: Effect = Effect::Create(carina_core::resource::ResolvedResource::new(
-                Resource::new("test.resource", "blocked"),
+                (Resource::new("test.resource", "blocked")).into_value_snapshot(),
             ));
             let failure = EffectFailure::new(
                 &effect,
@@ -2355,7 +2535,7 @@ mod tests {
     #[test]
     fn destroy_final_error_retains_failed_endpoint_and_source() {
         let effect: Effect = Effect::Create(carina_core::resource::ResolvedResource::new(
-            carina_core::resource::Resource::new("test.resource", "failed"),
+            (carina_core::resource::Resource::new("test.resource", "failed")).into_value_snapshot(),
         ));
         let failure = EffectFailure::new(
             &effect,
@@ -2395,7 +2575,8 @@ mod tests {
     #[test]
     fn interrupted_destroy_finishes_in_flight_and_undispatched_outcomes() {
         let output = SharedProgressWriter::default();
-        let progress = ProgressBackend::plain(output.clone());
+        let progress =
+            ProgressBackend::plain(crate::output_style::ColorMode::Plain, output.clone());
         let mut active_progress =
             HashMap::from([(0, progress.start_indexed(0, "Delete in-flight"))]);
         let completed = HashSet::from([2]);
@@ -2437,7 +2618,7 @@ mod tests {
     #[should_panic(expected = "dispatched destroy effect must own progress")]
     fn interrupted_destroy_requires_progress_for_dispatched_effect() {
         let output = SharedProgressWriter::default();
-        let progress = ProgressBackend::plain(output);
+        let progress = ProgressBackend::plain(crate::output_style::ColorMode::Plain, output);
         let mut active_progress = HashMap::new();
 
         finish_interrupted_destroy_outcomes(
@@ -2512,18 +2693,27 @@ mod tests {
     #[tokio::test]
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-            &ProviderContext::default(),
-            &carina_core::schema::SchemaRegistry::new(),
+        let parsed = carina_core::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |session| {
+                carina_core::module_resolver::resolve_modules_with_providerless_config(
+                    carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                    &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+                    session,
+                    &carina_core::schema::SchemaRegistry::new(),
+                )
+                .expect("test fixture crosses module resolution")
+            },
         )
-        .expect("test fixture crosses module resolution")
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2554,7 +2744,7 @@ mod tests {
             false,
             true,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2571,6 +2761,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_provider_resolution_ignores_unrelated_missing_upstream_state() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, downstream, mut parsed) = provider_upstream_fixture();
         let unrelated = downstream.parent().unwrap().join("unrelated");
         std::fs::create_dir_all(&unrelated).unwrap();
@@ -2589,6 +2780,8 @@ mod tests {
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             std::sync::Arc::from(backend),
@@ -2597,7 +2790,7 @@ mod tests {
             false,
             true,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2607,6 +2800,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn destroy_helper_releases_passed_lock_when_provider_load_hard_fails() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let project = tempfile::tempdir().unwrap();
         let source = format!(
             "file://{}",
@@ -2634,6 +2828,8 @@ mod tests {
         assert!(lock_path.exists(), "fixture must hold the lock");
 
         let error = run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             Arc::clone(&backend),
@@ -2642,7 +2838,7 @@ mod tests {
             false,
             true,
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2658,6 +2854,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_provider_resolution_reports_referenced_missing_upstream_state() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
@@ -2671,6 +2868,8 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
 
         let error = match run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             std::sync::Arc::from(backend),
@@ -2679,7 +2878,7 @@ mod tests {
             false,
             true,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2699,10 +2898,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_allows_default_tags_referencing_local_computed_attributes() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             std::sync::Arc::from(backend),
@@ -2711,7 +2913,7 @@ mod tests {
             false,
             true,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2721,10 +2923,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_ignores_missing_upstream_referenced_only_by_default_tags() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             std::sync::Arc::from(backend),
@@ -2733,7 +2938,7 @@ mod tests {
             false,
             true,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2802,16 +3007,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removed_backend_bucket_with_deposed_generation_is_protected_in_both_refresh_modes() {
+        use carina_provider_mock::{MockBehavior, MockObservations, MockScope};
+        use carina_state::{BackendResult, DeposedInstance, DeposedKey, LoadedState, RawState};
+
+        // Exercise S3 bucket protection while keeping state I/O local.
+        struct StateBucketBackend(Box<dyn StateBackend>);
+
+        #[async_trait::async_trait]
+        impl StateBackend for StateBucketBackend {
+            async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+                self.0.read_state().await
+            }
+
+            async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
+                self.0.read_state_bytes().await
+            }
+
+            async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
+                self.0.write_state(state).await
+            }
+
+            async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
+                self.0.acquire_lock(operation).await
+            }
+
+            async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
+                self.0.release_lock(lock).await
+            }
+
+            async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
+                self.0.renew_lock(lock).await
+            }
+
+            async fn write_state_locked(
+                &self,
+                state: &StateFile,
+                lock: &LockInfo,
+            ) -> BackendResult<()> {
+                self.0.write_state_locked(state, lock).await
+            }
+
+            async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
+                self.0.force_unlock(lock_id).await
+            }
+
+            async fn bucket_exists(&self) -> BackendResult<bool> {
+                self.0.bucket_exists().await
+            }
+
+            async fn create_bucket(&self) -> BackendResult<()> {
+                self.0.create_bucket().await
+            }
+
+            fn resource_type(&self) -> Option<&str> {
+                Some("s3.Bucket")
+            }
+        }
+
+        for (deposed_identifier, deposed_bucket) in [
+            ("backend-state-bucket", None),
+            ("aliased-state-bucket", Some("backend-state-bucket")),
+            ("backend-state-bucket", Some("backend-state-bucket")),
+        ] {
+            for refresh in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let delete_log = dir.path().join("deletes.log");
+                let runtime = crate::test_support::TestCommandRuntime::with_mock(
+                    MockBehavior {
+                        observations: MockObservations {
+                            delete_log: Some(delete_log.clone()),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    MockScope::memory(),
+                );
+                let config_path = dir.path();
+                std::fs::write(
+                    config_path.join("main.crn"),
+                    concat!(
+                        "provider mock {}\n",
+                        "let alias = provider mock {}\n",
+                        "removed { from = mock.s3.Bucket 'state' }\n",
+                    ),
+                )
+                .unwrap();
+                let project = carina_core::paths::ResolvedPath::new(config_path).unwrap();
+                let backend: Arc<dyn StateBackend> = Arc::new(StateBucketBackend(
+                    crate::commands::local_backend_for_test(dir.path().join("state.json")),
+                ));
+                let mut row = carina_state::ResourceState::try_applied(
+                    "s3.Bucket",
+                    "state",
+                    "mock",
+                    "backend-state-bucket",
+                )
+                .unwrap();
+                row.set_persisted_attribute("bucket", serde_json::json!("backend-state-bucket"));
+                row.deposed.push(DeposedInstance::from_persisted_json(
+                    DeposedKey::new_unique(),
+                    "old-state-bucket".to_owned(),
+                    None,
+                    HashMap::new(),
+                    Default::default(),
+                ));
+                row.deposed.push(DeposedInstance::from_persisted_json(
+                    DeposedKey::new_unique(),
+                    deposed_identifier.to_owned(),
+                    Some("alias".to_owned()),
+                    deposed_bucket
+                        .map(|bucket| {
+                            HashMap::from([("bucket".to_owned(), serde_json::json!(bucket))])
+                        })
+                        .unwrap_or_default(),
+                    Default::default(),
+                ));
+                let expected_deposed = serde_json::to_value(&row.deposed).unwrap();
+                let mut state = StateFile::new();
+                state.upsert_resource(row).unwrap();
+                backend.write_state(&state).await.unwrap();
+
+                for run in 1..=2 {
+                    let parsed = load_configuration_with_config(
+                        &project,
+                        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+                        &carina_core::schema::SchemaRegistry::new(),
+                    )
+                    .unwrap()
+                    .parsed
+                    .into_parsed();
+                    let lock = backend.acquire_lock("destroy").await.unwrap();
+
+                    run_destroy_locked(
+                        &runtime,
+                        crate::output_style::ColorMode::Plain,
+                        parsed,
+                        true,
+                        Arc::clone(&backend),
+                        Some("backend-state-bucket".to_owned()),
+                        StateLock::held(lock),
+                        refresh,
+                        false,
+                        &project,
+                        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+                        NonZeroUsize::new(1).unwrap(),
+                        ShutdownToken::running(),
+                    )
+                    .await
+                    .unwrap();
+
+                    assert!(
+                        !delete_log.exists(),
+                        "removed backend bucket generations must never be deleted (refresh={refresh}, run={run}, identifier={deposed_identifier}, bucket={deposed_bucket:?})"
+                    );
+                    let state = backend.read_state().await.unwrap().unwrap().into_state();
+                    let row = state
+                        .find_resource("mock", "s3.Bucket", "state")
+                        .expect("row with protected deposed generation must be retained");
+                    assert!(
+                        !row.has_current_instance(),
+                        "the removed claim must forget the current instance (refresh={refresh}, run={run})"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&row.deposed).unwrap(),
+                        expected_deposed,
+                        "all protected deposed generations must be retained unchanged (refresh={refresh}, run={run})"
+                    );
+                    assert!(
+                        !dir.path().join("state.lock").exists(),
+                        "destroy must release the lock (refresh={refresh}, run={run})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_only_destroy_clears_exports_and_releases_lock() {
+        let fixture = DestroyCancellationFixture::new().with_orphaned_resources(["retired"]);
+        std::fs::write(
+            fixture.config_path().join("removed.crn"),
+            "removed { from = mock.test.resource 'retired' }\n",
+        )
+        .unwrap();
+        assert!(!fixture.read_state().await.exports.is_empty());
+
+        run_destroy(
+            fixture.runtime(),
+            fixture.config_path(),
+            true,
+            true,
+            true,
+            false,
+            NonZeroUsize::new(1).unwrap(),
+            fixture.provider_context(),
+            fixture.cancel_token(),
+        )
+        .await
+        .expect("removal-only destroy must complete");
+
+        let state = fixture.read_state().await;
+        assert!(state.resources().is_empty(), "removed row must leave state");
+        assert!(state.exports.is_empty(), "destroy must clear stale exports");
+        assert!(!fixture.lock_path().exists(), "lock must be released");
+    }
+
+    #[tokio::test]
     async fn run_destroy_cancelled_after_partial_execution_persists_deletions_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["first", "second"])
             .cancel_after_successes(1);
         let token = fixture.cancel_token();
-        let load_count = crate::wiring::track_provider_loads_for_test();
+        let loads_before = fixture.runtime().provider_load_count();
 
         let err = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -2828,7 +3239,11 @@ mod tests {
             matches!(err, AppError::Interrupted),
             "expected Interrupted, got {err:?}"
         );
-        assert_eq!(load_count.count(), 1, "destroy must load providers once");
+        assert_eq!(
+            fixture.runtime().provider_load_count() - loads_before,
+            1,
+            "destroy must load providers once"
+        );
         let state = fixture.read_state().await;
         assert!(fixture.state_path().exists());
         assert!(
@@ -2854,13 +3269,9 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
-            .lock()
-            .await;
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["slow"])
-            .with_delayed_delete("slow", Duration::from_millis(75));
+            .with_blocked_delete("slow");
         let loaded = load_configuration_with_config(
             &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
             fixture.provider_context(),
@@ -2868,25 +3279,17 @@ mod tests {
         )
         .expect("fixture must load");
         let parsed = loaded.parsed;
-        let base_dir = get_base_dir(fixture.config_path());
-        let providers = ProviderLoad::load(
-            &user_dirs,
-            &parsed.providers,
-            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
-        )
-        .expect("mock provider must load");
+        let base_dir =
+            carina_core::paths::ResolvedPath::new(get_base_dir(fixture.config_path())).unwrap();
+        let providers = ProviderLoad::load(fixture.runtime(), &parsed.providers, &base_dir)
+            .expect("mock provider must load");
         let validated_config = providers
-            .validate_evaluated_config(
-                parsed,
-                &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
-                true,
-                &loaded.duplicate_declarations,
-            )
+            .validate_evaluated_config(parsed, &base_dir, true, &loaded.duplicate_declarations)
             .expect("fixture must validate");
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();
 
-        let error = run_destroy_locked_with_ctx(
+        let destroy = run_destroy_locked_with_ctx(
             validated_config,
             true,
             backend.clone(),
@@ -2894,13 +3297,22 @@ mod tests {
             StateLock::held(lock),
             false,
             false,
-            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+            &base_dir,
             fixture.provider_context(),
             NonZeroUsize::new(1).unwrap(),
             fixture.cancel_token(),
-        )
-        .await
-        .expect_err("heartbeat lock loss must fail destroy");
+        );
+        tokio::pin!(destroy);
+        tokio::select! {
+            () = fixture.wait_for_blocked_delete() => {},
+            outcome = &mut destroy => panic!("destroy returned before the mock delete blocked: {outcome:?}"),
+        }
+        backend.provider_is_blocked();
+        backend.wait_for_renewal_failure().await;
+        fixture.release_blocked_delete();
+        let error = destroy
+            .await
+            .expect_err("heartbeat lock loss must fail destroy");
 
         assert!(matches!(error, AppError::StateLockLost { .. }));
         assert!(error.to_string().contains("state may be behind the cloud"));
@@ -2910,10 +3322,6 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_managed_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
-            .lock()
-            .await;
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["managed"])
             .with_blocked_read("managed")
@@ -2921,7 +3329,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -2947,9 +3355,10 @@ mod tests {
             }
         }
         fixture.prioritize_cleanup_and_release_refresh_drain();
+        // wall-clock-ok: bounds cleanup-priority abandonment of a mock read held for 60s.
         let err = tokio::time::timeout(std::time::Duration::from_secs(1), destroy)
             .await
-            .expect("destroy did not abandon the in-flight managed refresh after cleanup priority")
+            .expect("cleanup priority must abandon the in-flight read")
             .unwrap_err();
 
         assert!(matches!(err, AppError::Interrupted));
@@ -2971,10 +3380,6 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_orphan_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
-            .lock()
-            .await;
         let fixture = DestroyCancellationFixture::new()
             .with_orphaned_resources(["orphan"])
             .with_blocked_read("orphan")
@@ -2982,7 +3387,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -3008,9 +3413,10 @@ mod tests {
             }
         }
         fixture.prioritize_cleanup_and_release_refresh_drain();
+        // wall-clock-ok: bounds cleanup-priority abandonment of a mock read held for 60s.
         let err = tokio::time::timeout(std::time::Duration::from_secs(1), destroy)
             .await
-            .expect("destroy did not abandon the in-flight orphan refresh after cleanup priority")
+            .expect("cleanup priority must abandon the in-flight read")
             .unwrap_err();
 
         assert!(matches!(err, AppError::Interrupted));
@@ -3032,17 +3438,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_cleanup_priority_persists_completed_deletion_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
-            .lock()
-            .await;
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["z_blocked", "a_completed"])
             .with_blocked_delete("z_blocked");
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -3082,14 +3484,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_harvests_ready_deletion_before_cleanup_priority() {
-        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["ready"])
             .with_delete_result_barrier();
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -3151,7 +3552,7 @@ mod tests {
     #[test]
     fn build_destroy_delete_effects_includes_current_and_deposed_instances() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut resource =
             Resource::with_provider("awscc", "ec2.Vpc", "main", Some("current".to_string()));
@@ -3159,7 +3560,11 @@ mod tests {
         let current_states = HashMap::from([(
             resource.id.clone(),
             Current::from_state(
-                State::existing(resource.id.clone(), HashMap::new()).with_identifier("vpc-new"),
+                State::<carina_core::resource::NoPlaceholder>::existing(
+                    resource.id.clone(),
+                    HashMap::new(),
+                )
+                .with_identifier("vpc-new"),
             ),
         )]);
         let deposed_key = DeposedKey::new_unique();
@@ -3170,15 +3575,18 @@ mod tests {
             "vpc-old".to_string(),
             Some("deposed".to_string()),
             HashMap::new(),
-            BTreeSet::from(["subnet".to_string()]),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("awscc", "ec2.Subnet", "subnet", None),
+            ]),
         ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
+        let resolved_resource = resolved(resource.clone());
         let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
-            &[&resource],
+            &[resolved_resource],
             &current_states,
             Some(&state_file),
             &HashSet::new(),
@@ -3204,22 +3612,26 @@ mod tests {
             } if id.as_inner().provider_instance.as_deref() == Some("deposed")
                 && identifier.as_str() == "vpc-old"
                 && key == &deposed_key
-                && dependencies == &HashSet::from([absolute_binding("subnet")])
+                && dependencies == &crate::test_support::persisted([ResolvedResourceId::with_provider_identity("awscc", "ec2.Subnet", "subnet", None)])
         ));
     }
 
     #[test]
     fn destroy_delete_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Widget", "current", None);
-        let state = State::existing(resource.id.clone(), HashMap::new());
+        let state = State::<carina_core::resource::NoPlaceholder>::existing(
+            resource.id.clone(),
+            HashMap::new(),
+        );
         let identifier = crate::fixture_applied_identifier("typed-provider-id");
         let current_states = HashMap::from([(
             resource.id.clone(),
             carina_core::resource::fixture_present_current(state, identifier),
         )]);
 
+        let resolved_resource = resolved(resource.clone());
         let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
-            &[&resource],
+            &[resolved_resource],
             &current_states,
             None,
             &HashSet::new(),
@@ -3280,8 +3692,13 @@ mod tests {
         assert!(matches!(&loaded, Current::MissingIdentifier(_state)));
         let current_states = HashMap::from([(resource.id.clone(), loaded)]);
 
-        let (effects, errors) =
-            build_destroy_delete_effects(&[&resource], &current_states, None, &HashSet::new());
+        let resolved_resource = resolved(resource.clone());
+        let (effects, errors) = build_destroy_delete_effects(
+            &[resolved_resource],
+            &current_states,
+            None,
+            &HashSet::new(),
+        );
         assert!(effects.is_empty());
         let error = errors
             .first()
@@ -3322,8 +3739,9 @@ mod tests {
             (second.id.clone(), Current::create_in_flight(second_pending)),
         ]);
 
+        let resolved_resources = [resolved(first.clone()), resolved(second.clone())];
         let (effects, errors) = build_destroy_delete_effects(
-            &[&first, &second],
+            &resolved_resources,
             &current_states,
             None,
             &HashSet::new(),
@@ -3347,7 +3765,12 @@ mod tests {
 
     #[test]
     fn destroy_rejects_create_outcome_unknown_with_resolution_hint() {
-        let resource = Resource::with_provider("mock", "test.Widget", "unknown", None);
+        let resource = resolved(Resource::with_provider(
+            "mock",
+            "test.Widget",
+            "unknown",
+            None,
+        ));
         let failure = carina_core::provider::CreateAttempt::for_test(resource.id.clone())
             .outcome_unknown(
                 carina_core::provider::EgressSent::for_test(),
@@ -3364,7 +3787,7 @@ mod tests {
         )]);
 
         let (effects, errors) =
-            build_destroy_delete_effects(&[&resource], &current_states, None, &HashSet::new());
+            build_destroy_delete_effects(&[resource], &current_states, None, &HashSet::new());
 
         assert!(effects.is_empty());
         assert!(matches!(
@@ -3384,7 +3807,6 @@ mod tests {
     #[test]
     fn orphan_destroy_uses_row_binding_and_depends_on_for_delete_ordering() {
         use carina_state::ResourceState;
-        use std::collections::{BTreeSet, HashMap};
 
         let mut parent = ResourceState::try_applied("test.Parent", "parent", "mock", "parent-123")
             .expect("fixture identifier is non-empty");
@@ -3392,8 +3814,12 @@ mod tests {
         let mut child = ResourceState::try_applied("test.Child", "child", "mock", "child-123")
             .expect("fixture identifier is non-empty");
         child.binding = Some(absolute_binding("child"));
-        child.directives.depends_on = vec![absolute_binding("parent")];
-        child.dependency_bindings = BTreeSet::from([absolute_binding("network")]);
+        let parent_id =
+            ResolvedResourceId::with_provider_identity("mock", "test.Parent", "parent", None);
+        let network_id =
+            ResolvedResourceId::with_provider_identity("mock", "test.Network", "network", None);
+        child.directives.depends_on = crate::test_support::persisted([parent_id.clone()]);
+        child.dependency_bindings = crate::test_support::persisted([network_id.clone()]);
 
         let mut state_file = StateFile::new();
         state_file.upsert_resource(parent).unwrap();
@@ -3402,11 +3828,11 @@ mod tests {
         let mut resources = orphan_entries
             .iter()
             .map(|(id, _loaded)| {
-                build_orphan_resource(
+                resolved(build_orphan_resource(
                     &state_file,
                     &ResolvedResourceId::try_new(id.clone())
                         .expect("test orphan id must be resolved"),
-                )
+                ))
             })
             .collect::<Vec<_>>();
         resources.sort_by_key(|resource| resource.binding.clone());
@@ -3414,10 +3840,8 @@ mod tests {
             .into_iter()
             .map(|(id, loaded)| (id, loaded.current().clone()))
             .collect();
-        let resource_refs = resources.iter().collect::<Vec<_>>();
-
         let effects = expect_valid_destroy_effects(build_destroy_delete_effects(
-            &resource_refs,
+            &resources,
             &current_states,
             Some(&state_file),
             &HashSet::new(),
@@ -3425,7 +3849,7 @@ mod tests {
         let child_binding = absolute_binding("child");
         let child_delete = effects
             .iter()
-            .find(|effect| effect.binding_address() == Some(&child_binding))
+            .find(|effect| effect.binding_address().as_deref() == Some(&child_binding))
             .expect("child orphan must produce a Delete");
         assert!(matches!(
             child_delete,
@@ -3433,17 +3857,16 @@ mod tests {
                 dependencies,
                 explicit_dependencies,
                 ..
-            } if dependencies == &HashSet::from([
-                absolute_binding("network"),
-                absolute_binding("parent"),
-            ]) && explicit_dependencies == &HashSet::from([absolute_binding("parent")])
+            } if dependencies == &crate::test_support::persisted([network_id, parent_id.clone()]) && explicit_dependencies == &std::iter::once(parent_id).collect()
         ));
 
         let analysis = build_effect_dependency_analysis(
             &effects,
-            &HashMap::<ResourceId, UnresolvedResource>::new(),
-            &[],
-            ScheduleInputs::Destroy { aliases: &[] },
+            std::iter::empty(),
+            ScheduleInputs::Destroy {
+                aliases: &[],
+                kept_targets: &Default::default(),
+            },
         )
         .expect("destroy dependency analysis must resolve");
         let deletion_deps = transitive_delete_deps(&analysis, effects.len());
@@ -3466,7 +3889,7 @@ mod tests {
     #[test]
     fn build_destroy_delete_effects_skips_deposed_generations_for_protected_rows() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut resource: Resource = Resource::with_provider("awscc", "s3.Bucket", "state", None);
         resource.binding = Some(absolute_binding("state"));
@@ -3477,7 +3900,7 @@ mod tests {
             "old-state-bucket".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -3503,7 +3926,7 @@ mod tests {
     #[test]
     fn build_destroy_delete_effects_keeps_deposed_generations_for_prevent_destroy_rows() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.binding = Some(absolute_binding("main"));
@@ -3514,7 +3937,7 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -3542,7 +3965,7 @@ mod tests {
     #[test]
     fn deposed_only_destroy_work_prevents_all_protected_short_circuit() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.deposed.push(DeposedInstance::from_persisted_json(
@@ -3550,7 +3973,7 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -3645,7 +4068,7 @@ mod tests {
     #[test]
     fn apply_destroy_to_state_preserves_deposed_generations() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let mut state = carina_state::StateFile::new();
         let mut resource = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-new")
@@ -3656,7 +4079,12 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            BTreeSet::from(["network".to_string()]),
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Network",
+                "network",
+                None,
+            )]),
         ));
         state
             .upsert_resource(resource)
@@ -3682,7 +4110,7 @@ mod tests {
     #[test]
     fn apply_destroy_to_state_removes_only_successful_deposed_generation() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let removed_key = DeposedKey::new_unique();
         let retained_key = DeposedKey::new_unique();
@@ -3695,14 +4123,18 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            BTreeSet::from(["network".to_string()]),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "network", None),
+            ]),
         ));
         resource.deposed.push(DeposedInstance::from_persisted_json(
             retained_key.clone(),
             "vpc-older".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
-            BTreeSet::from(["network".to_string()]),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "network", None),
+            ]),
         ));
         state
             .upsert_resource(resource)
@@ -3729,7 +4161,7 @@ mod tests {
     #[test]
     fn apply_destroy_to_state_removes_row_after_current_and_deposed_successes() {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
 
         let deposed_key = DeposedKey::new_unique();
         let mut state = carina_state::StateFile::new();
@@ -3741,7 +4173,12 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            BTreeSet::from(["network".to_string()]),
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Network",
+                "network",
+                None,
+            )]),
         ));
         state
             .upsert_resource(resource)

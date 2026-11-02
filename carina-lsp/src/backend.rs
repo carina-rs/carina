@@ -66,10 +66,11 @@ struct ProviderState {
 impl ProviderState {
     fn new(
         factories: Vec<Box<dyn ProviderFactory>>,
-        provider_errors: HashMap<String, String>,
+        mut provider_errors: HashMap<String, String>,
         configs: Vec<(PathBuf, workspace::DiscoveredProviderConfig)>,
         prober: Option<ProviderInstallProber>,
         install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
+        environment: carina_core::EnvironmentSnapshot,
     ) -> Self {
         let use_builtin_mock = carina_provider_mock::uses_builtin_provider(
             configs.iter().map(|(_, config)| config.factory_config()),
@@ -98,24 +99,17 @@ impl ProviderState {
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
             .collect();
         let factories = Arc::new(factories);
-        let (schemas, diagnostic_engine) = if provider_names.is_empty() {
-            (
-                Arc::new(SchemaRegistry::new()),
-                DiagnosticEngine::without_loaded_provider_schemas(),
-            )
-        } else {
-            let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
-                Arc::clone(&factories),
-                supplemental_schemas,
-            ));
-            let schemas = loaded_providers.schemas().schemas_arc();
-            let engine = DiagnosticEngine::new_with_known_providers(
-                loaded_providers,
-                provider_names.clone(),
-                known_provider_names,
-            );
-            (schemas, engine)
-        };
+        let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
+            Arc::clone(&factories),
+            supplemental_schemas,
+            environment,
+        ));
+        let schemas = loaded_providers.schemas().schemas_arc();
+        let diagnostic_engine = DiagnosticEngine::new_with_known_providers(
+            loaded_providers,
+            provider_names.clone(),
+            known_provider_names,
+        );
         // Extract custom type names from provider schemas for completion.
         // The structured identities render to their dotted display form
         // (`aws.iam.Role.Arn`, `Ipv4Cidr`), which is also the spelling a
@@ -124,6 +118,14 @@ impl ProviderState {
             .iter()
             .map(|id| id.to_string())
             .collect();
+        for (_, config) in &configs {
+            let provider = &config.factory_config().name;
+            if config.factory_config().is_default() && !provider_names.contains(provider) {
+                provider_errors
+                    .entry(provider.clone())
+                    .or_insert_with(|| format!("Provider '{provider}' schemas are unavailable"));
+            }
+        }
         let diagnostic_engine = diagnostic_engine.with_provider_errors(provider_errors);
         Self {
             schemas: Arc::clone(&schemas),
@@ -188,6 +190,7 @@ const PROVIDER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_se
 
 /// Per-directory provider states keyed by configuration directory.
 struct ProviderStates {
+    environment: carina_core::EnvironmentSnapshot,
     /// Directory → ProviderState. Each directory with provider declarations
     /// gets its own state with its own schemas.
     by_dir: HashMap<PathIdentity, ProviderState>,
@@ -199,11 +202,19 @@ struct ProviderStates {
 }
 
 impl ProviderStates {
-    fn new() -> Self {
+    fn new(environment: carina_core::EnvironmentSnapshot) -> Self {
         Self {
             by_dir: HashMap::new(),
             import_map: HashMap::new(),
-            empty: ProviderState::new(vec![], HashMap::new(), vec![], None, vec![]),
+            empty: ProviderState::new(
+                vec![],
+                HashMap::new(),
+                vec![],
+                None,
+                vec![],
+                environment.clone(),
+            ),
+            environment,
         }
     }
 
@@ -295,7 +306,9 @@ impl Backend {
         Self {
             client,
             documents: Arc::new(DashMap::new()),
-            providers: Arc::new(tokio::sync::RwLock::new(ProviderStates::new())),
+            providers: Arc::new(tokio::sync::RwLock::new(ProviderStates::new(
+                provider_context.environment.clone(),
+            ))),
             provider_context,
             workspace_root: Arc::new(tokio::sync::OnceCell::new()),
             factory_builder,
@@ -552,10 +565,14 @@ impl LanguageServer for Backend {
                 .as_ref()
                 .map(|p| providers.state_for_path(p))
                 .unwrap_or(&providers.empty);
-            let completions =
-                state
-                    .completion_provider
-                    .complete(&doc, position, base_path.as_deref());
+            let completions = state.completion_provider.complete(
+                &doc,
+                position,
+                base_path.as_deref(),
+                &state
+                    .diagnostic_engine
+                    .catalog_for_document(&doc, uri.to_file_path().ok().as_deref()),
+            );
             return Ok(Some(CompletionResponse::Array(completions)));
         }
         Ok(None)
@@ -737,8 +754,9 @@ async fn load_schemas_impl(
         return;
     };
 
+    let environment = providers.read().await.environment.clone();
     let mut dir_providers = HashMap::new();
-    for (dir, configs) in workspace::discover_providers_by_dir(&workspace_root) {
+    for (dir, configs) in workspace::discover_providers_by_dir(&workspace_root, &environment) {
         let entry = dir_providers
             .entry(PathIdentity::new(&dir))
             .or_insert_with(|| (dir.clone(), configs.clone()));
@@ -747,7 +765,7 @@ async fn load_schemas_impl(
             *entry = (dir, configs);
         }
     }
-    let import_map = workspace::discover_import_map(&workspace_root);
+    let import_map = workspace::discover_import_map(&workspace_root, &environment);
 
     // Drain the current states up-front so matching per-dir entries can
     // be reused without re-running the factory builder. Anything left in
@@ -766,7 +784,7 @@ async fn load_schemas_impl(
 
     if dir_providers.is_empty() {
         let dropped_any = !old_states.is_empty();
-        let mut states = ProviderStates::new();
+        let mut states = ProviderStates::new(environment);
         states.import_map = import_map.clone();
         *providers.write().await = states;
         if dropped_any || old_import_map != import_map {
@@ -778,7 +796,7 @@ async fn load_schemas_impl(
         return;
     }
 
-    let mut states = ProviderStates::new();
+    let mut states = ProviderStates::new(environment.clone());
     let mut total_schemas = 0;
     // Track whether any dir was freshly rebuilt (or whether the set of
     // known dirs changed). When every dir was reused and the import map
@@ -834,6 +852,7 @@ async fn load_schemas_impl(
             dir_configs,
             install_prober.cloned(),
             dir_fingerprint,
+            environment.clone(),
         );
         total_schemas += state.schema_count();
         states.by_dir.insert(identity, state);
@@ -915,7 +934,6 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, ProviderResult};
-    use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
 
@@ -941,10 +959,6 @@ mod tests {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
         }
 
         fn create_provider(
@@ -987,7 +1001,7 @@ mod tests {
         let config = carina_core::parser::parse_file(
             "provider mock {}\n",
             std::path::Path::new("providers.crn"),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap()
         .providers
@@ -1001,11 +1015,15 @@ mod tests {
             vec![(PathBuf::new(), config)],
             None,
             vec![],
+            carina_core::EnvironmentSnapshot::empty(),
         )
     }
 
     fn builtin_mock_provider_state(directory: &std::path::Path) -> ProviderState {
-        let discovered = workspace::discover_providers_by_dir(directory);
+        let discovered = workspace::discover_providers_by_dir(
+            directory,
+            &carina_core::EnvironmentSnapshot::empty(),
+        );
         let configs = discovered[directory]
             .iter()
             .cloned()
@@ -1020,6 +1038,7 @@ mod tests {
                 "mock".to_string(),
                 Ok(ProviderArtifactFingerprint::default()),
             )],
+            carina_core::EnvironmentSnapshot::empty(),
         )
     }
 
@@ -1058,7 +1077,10 @@ mock.test.Thing {
         std::fs::write(temp.path().join("providers.crn"), providers).unwrap();
         std::fs::write(temp.path().join("main.crn"), main).unwrap();
 
-        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let discovered = workspace::discover_providers_by_dir(
+            temp.path(),
+            &carina_core::EnvironmentSnapshot::empty(),
+        );
         let configs = discovered[temp.path()]
             .iter()
             .cloned()
@@ -1073,11 +1095,14 @@ mock.test.Thing {
                 "mock".to_string(),
                 Ok(ProviderArtifactFingerprint::default()),
             )],
+            carina_core::EnvironmentSnapshot::empty(),
         );
         let document = Document::new_with_path(
             main.to_string(),
             temp.path().join("main.crn"),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
 
         let diagnostics = state
@@ -1123,7 +1148,10 @@ mock.test.Thing {
         std::fs::write(temp.path().join("a.crn"), budget).unwrap();
         std::fs::write(temp.path().join("b.crn"), budget).unwrap();
 
-        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let discovered = workspace::discover_providers_by_dir(
+            temp.path(),
+            &carina_core::EnvironmentSnapshot::empty(),
+        );
         let configs = discovered[temp.path()]
             .iter()
             .cloned()
@@ -1138,12 +1166,15 @@ mock.test.Thing {
                 "mock".to_string(),
                 Ok(ProviderArtifactFingerprint::default()),
             )],
+            carina_core::EnvironmentSnapshot::empty(),
         );
         let path = temp.path().join("a.crn");
         let document = Document::new_with_path(
             budget.to_string(),
             path.clone(),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
 
         let diagnostics = state.diagnostic_engine.analyze(&document, Some(&path));
@@ -1189,7 +1220,9 @@ mock.test.Thing {
         let document = Document::new_with_path(
             budget.to_string(),
             path.clone(),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
         state.diagnostic_engine.analyze(&document, Some(&path))
     }
@@ -1253,7 +1286,9 @@ mock.test.Thing {
         let document = Document::new_with_path(
             records,
             path.clone(),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
 
         let diagnostics = state.diagnostic_engine.analyze(&document, Some(&path));
@@ -1306,7 +1341,9 @@ budget_module {
         let document = Document::new_with_path(
             modules.to_string(),
             path.clone(),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
 
         let diagnostics = state.diagnostic_engine.analyze(&document, Some(&path));
@@ -1361,7 +1398,10 @@ let duplicate = mock.test.resource {
         std::fs::write(temp.path().join("backend.crn"), backend).unwrap();
         std::fs::write(temp.path().join("main.crn"), main).unwrap();
 
-        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let discovered = workspace::discover_providers_by_dir(
+            temp.path(),
+            &carina_core::EnvironmentSnapshot::empty(),
+        );
         let configs = discovered[temp.path()]
             .iter()
             .cloned()
@@ -1376,12 +1416,15 @@ let duplicate = mock.test.resource {
                 "mock".to_string(),
                 Ok(ProviderArtifactFingerprint::default()),
             )],
+            carina_core::EnvironmentSnapshot::empty(),
         );
         let main_path = temp.path().join("main.crn");
         let document = Document::new_with_path(
             main.to_string(),
             main_path.clone(),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
         let messages = state
             .diagnostic_engine
@@ -1416,7 +1459,10 @@ let duplicate = mock.test.resource {
         std::fs::write(temp.path().join("providers.crn"), providers).unwrap();
         std::fs::write(temp.path().join("main.crn"), main).unwrap();
 
-        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let discovered = workspace::discover_providers_by_dir(
+            temp.path(),
+            &carina_core::EnvironmentSnapshot::empty(),
+        );
         let configs = discovered[temp.path()]
             .iter()
             .cloned()
@@ -1434,11 +1480,14 @@ let duplicate = mock.test.resource {
                 "mock".to_string(),
                 Ok(ProviderArtifactFingerprint::default()),
             )],
+            carina_core::EnvironmentSnapshot::empty(),
         );
         let document = Document::new_with_path(
             main.to_string(),
             temp.path().join("main.crn"),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
 
         let diagnostics = state
@@ -1478,7 +1527,7 @@ let duplicate = mock.test.resource {
         std::fs::create_dir_all(&last_caller).unwrap();
         std::fs::create_dir_all(&module).unwrap();
 
-        let mut states = ProviderStates::new();
+        let mut states = ProviderStates::new(carina_core::EnvironmentSnapshot::empty());
         states.by_dir.insert(
             PathIdentity::new(&first_caller),
             provider_state("first_rule"),
@@ -1745,7 +1794,11 @@ mod reload_skip_tests {
             }
         });
         let (service, socket) = tower_lsp::LspService::new(|client| {
-            Backend::new(client, ProviderContext::default(), Some(builder))
+            Backend::new(
+                client,
+                ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+                Some(builder),
+            )
         });
         drop(socket);
         let backend = service.inner();
@@ -1861,24 +1914,30 @@ mod reload_skip_tests {
         let fixture = tempfile::tempdir().unwrap();
         let provider_file = fixture.path().join("provider.crn");
         std::fs::write(&provider_file, "provider awscc { region = 'us-east-1' }\n").unwrap();
-        let first = workspace::discover_providers_by_dir(fixture.path())
-            .remove(fixture.path())
-            .unwrap()
-            .into_iter()
-            .map(|config| (fixture.path().to_path_buf(), config))
-            .collect::<Vec<_>>();
+        let first = workspace::discover_providers_by_dir(
+            fixture.path(),
+            &carina_core::EnvironmentSnapshot::empty(),
+        )
+        .remove(fixture.path())
+        .unwrap()
+        .into_iter()
+        .map(|config| (fixture.path().to_path_buf(), config))
+        .collect::<Vec<_>>();
 
         std::fs::write(
             &provider_file,
             "provider awscc { region = 'ap-northeast-1' }\n",
         )
         .unwrap();
-        let second = workspace::discover_providers_by_dir(fixture.path())
-            .remove(fixture.path())
-            .unwrap()
-            .into_iter()
-            .map(|config| (fixture.path().to_path_buf(), config))
-            .collect::<Vec<_>>();
+        let second = workspace::discover_providers_by_dir(
+            fixture.path(),
+            &carina_core::EnvironmentSnapshot::empty(),
+        )
+        .remove(fixture.path())
+        .unwrap()
+        .into_iter()
+        .map(|config| (fixture.path().to_path_buf(), config))
+        .collect::<Vec<_>>();
 
         assert!(!configs_match(&first, &second));
     }
@@ -1888,12 +1947,15 @@ mod reload_skip_tests {
         let fixture = tempfile::tempdir().unwrap();
         let provider_file = fixture.path().join("provider.crn");
         let discover = || {
-            workspace::discover_providers_by_dir(fixture.path())
-                .remove(fixture.path())
-                .unwrap()
-                .into_iter()
-                .map(|config| (fixture.path().to_path_buf(), config))
-                .collect::<Vec<_>>()
+            workspace::discover_providers_by_dir(
+                fixture.path(),
+                &carina_core::EnvironmentSnapshot::empty(),
+            )
+            .remove(fixture.path())
+            .unwrap()
+            .into_iter()
+            .map(|config| (fixture.path().to_path_buf(), config))
+            .collect::<Vec<_>>()
         };
 
         std::fs::write(&provider_file, "provider awscc {}\n").unwrap();

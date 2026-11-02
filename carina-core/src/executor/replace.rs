@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::resource::{DataSource, State};
+use crate::resource::{DataSource, SnapshotState};
 
 use super::basic::StartedBasicEffectResult;
 use super::wait::{StartedEffect, WaitOutcome};
@@ -18,8 +18,15 @@ pub(super) enum SingleEffectResult<'a, S> {
     /// downstream effects are scheduled.
     Read {
         started: StartedEffect<'a, S>,
-        resource: Box<DataSource<S>>,
-        outcome: Result<(SecretPreservingAttributes, State), super::EffectFailureKind>,
+        resource: Box<
+            DataSource<
+                S,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                (),
+            >,
+        >,
+        outcome: Result<(SecretPreservingAttributes, SnapshotState), super::EffectFailureKind>,
         duration: Duration,
     },
     /// `Effect::Wait` execution outcome. On success carries the

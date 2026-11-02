@@ -45,12 +45,33 @@ use carina_core::provider::{
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
-    ConcreteValue, Current, PlanInputCurrent, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, Current, PlanInputCurrent, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, ValidatedConfigSchema,
     ValidatedProviderSchemaWitness,
 };
+use carina_core::validation::deferred_types::{
+    ProviderTypeCheckDiagnostic, ProviderTypeCheckSink, TypeCheckSession,
+};
+
+fn with_type_check_session<T>(
+    catalog: &ProviderContext,
+    operation: impl FnOnce(&dyn carina_core::validation::deferred_types::ProviderTypeCheckContext) -> T,
+) -> T {
+    TypeCheckSession::run(catalog, |session| operation(session)).publish(&mut TestTypeCheckSink)
+}
+
+struct TestTypeCheckSink;
+impl ProviderTypeCheckSink for TestTypeCheckSink {
+    fn record(&mut self, diagnostic: ProviderTypeCheckDiagnostic) {
+        match diagnostic {
+            ProviderTypeCheckDiagnostic::Deferred(warning) => eprintln!("{}", warning.message),
+            ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => panic!("{}", error.message),
+        }
+    }
+}
 
 fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
     carina_core::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
@@ -81,6 +102,37 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
             result.skip_count
         ),
     }
+}
+
+fn resolve_plan_graph(
+    parsed: carina_core::parser::ExpandedParsedFile,
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+) -> (
+    Vec<ResolvedResource>,
+    Vec<carina_core::wait::ResolvedWaitBinding>,
+) {
+    let index = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (resources).to_vec();
+        configuration.data_sources = Vec::new();
+        configuration.into()
+    })
+    .expect("expanded test graph must resolve");
+    let managed = resources
+        .iter()
+        .cloned()
+        .map(|resource| index.resolve_resource(resource, registry))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("managed test dependencies must resolve");
+    let waits = index
+        .configuration()
+        .wait_bindings
+        .iter()
+        .map(|wait| index.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("wait test dependencies must resolve");
+    (managed, waits)
 }
 
 /// cert read returns ISSUED (+ certificate_arn) immediately; other
@@ -284,17 +336,26 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
 
     let parsed = parse_directory(
         &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed for the caller fixture");
 
-    let parsed = resolve_modules(
-        parsed,
-        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
-    )
-    .expect("module resolution should succeed");
+    let parsed = with_type_check_session(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            resolve_modules(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+                session,
+            )
+            .expect("module resolution should succeed")
+        },
+    );
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded module fixture contains no parser placeholders");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
@@ -330,7 +391,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     assert!(
         wb.depends_on
             .iter()
-            .any(|dependency| dependency.as_str() == "r.validation_record"),
+            .any(|dependency| dependency.binding_reference().as_str() == "r.validation_record"),
         "depends_on entries must be instance-prefixed; got {:?}",
         wb.depends_on
     );
@@ -367,6 +428,12 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let mut resources_for_plan = sorted_resources.clone();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(Vec::new()),
+        registry.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
@@ -387,14 +454,15 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
                 wait_aliases: &wait_aliases,
             },
         );
-        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+        with_type_check_session(provider_types.provider_context(), |session| {
+            resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings, session)
+        })
     }
     .expect("resolve_refs should succeed");
 
-    let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(parsed.clone(), &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -411,23 +479,24 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
 
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "r.cert_issued"
         )),
         "create_plan must emit Effect::Wait for the prefixed wait binding"
     );
 
-    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+    let unresolved_resources: HashMap<ResolvedResourceId, _> = sorted_resources
         .iter()
         .map(|r| {
             (
-                r.id.clone(),
+                ResolvedResourceId::new(r.id.clone()),
                 UnresolvedResource::from_pre_resolve(r.clone()),
             )
         })
@@ -437,6 +506,9 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         failures: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
+        provider_context: carina_core::parser::ProviderContext::clone(
+            provider_types.provider_context(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -493,17 +565,26 @@ async fn nested_module_wait_binding_survives_two_expansions() {
 
     let parsed = parse_directory(
         &carina_core::paths::ResolvedPath::new(&root).unwrap(),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed for the nested root fixture");
 
-    let parsed = resolve_modules(
-        parsed,
-        &carina_core::paths::ResolvedPath::new(&root).unwrap(),
-    )
-    .expect("nested module resolution should succeed");
+    let parsed = with_type_check_session(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            resolve_modules(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(&root).unwrap(),
+                session,
+            )
+            .expect("nested module resolution should succeed")
+        },
+    );
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded nested module fixture contains no parser placeholders");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
@@ -556,6 +637,12 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let mut resources_for_plan = sorted_resources.clone();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(Vec::new()),
+        registry.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
@@ -576,14 +663,15 @@ async fn nested_module_wait_binding_survives_two_expansions() {
                 wait_aliases: &wait_aliases,
             },
         );
-        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+        with_type_check_session(provider_types.provider_context(), |session| {
+            resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings, session)
+        })
     }
     .expect("resolve_refs should succeed");
 
-    let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(parsed.clone(), &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -600,22 +688,23 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "o.c.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "o.c.cert_issued"
         )),
         "create_plan must emit Effect::Wait for the doubly-prefixed binding"
     );
 
-    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+    let unresolved_resources: HashMap<ResolvedResourceId, _> = sorted_resources
         .iter()
         .map(|r| {
             (
-                r.id.clone(),
+                ResolvedResourceId::new(r.id.clone()),
                 UnresolvedResource::from_pre_resolve(r.clone()),
             )
         })
@@ -625,6 +714,9 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         failures: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
+        provider_context: carina_core::parser::ProviderContext::clone(
+            provider_types.provider_context(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -684,16 +776,25 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     let parsed = parse_directory(
         &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed");
-    let parsed = resolve_modules(
-        parsed,
-        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
-    )
-    .expect("module resolution should succeed");
+    let parsed = with_type_check_session(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            resolve_modules(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+                session,
+            )
+            .expect("module resolution should succeed")
+        },
+    );
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded module fixture contains no parser placeholders");
 
     let sorted_resources =
@@ -725,6 +826,12 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         .collect();
 
     let mut resources_for_plan = sorted_resources.clone();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+        std::sync::Arc::new(Vec::new()),
+        registry.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
     {
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
             carina_core::binding_index::LivePreApplyInputs {
@@ -740,7 +847,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
                 wait_aliases: &wait_aliases,
             },
         );
-        resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
+        with_type_check_session(provider_types.provider_context(), |session| {
+            resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings, session)
+        })
     }
     .expect("resolve_refs should succeed");
 
@@ -774,10 +883,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     );
 
     // ---- The dependency edge is intact: Effect::Wait still emitted.
-    let registry = fixture_schemas(&resources_for_plan);
     let provider = fixture_provider(&resources_for_plan);
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -794,13 +902,14 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "r.cert_issued"
         )),
         "the value-layer alias fix must NOT remove the Effect::Wait \
          dependency edge — both halves of the wait binding must hold"

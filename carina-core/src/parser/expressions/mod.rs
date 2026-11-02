@@ -6,6 +6,7 @@
 //! `ParseContext`, `parse_expression`, and the AST types — those move in
 //! part 2.
 
+pub(in crate::parser) mod dependency;
 pub(super) mod for_expr;
 pub(super) mod if_expr;
 pub(super) mod integer_arithmetic;

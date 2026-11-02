@@ -336,6 +336,11 @@ mod tests {
             .clone()
     }
 
+    fn renewal_stamp(sequence: usize) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap()
+            + chrono::Duration::milliseconds(i64::try_from(sequence).unwrap())
+    }
+
     struct RecordingBackend {
         renewals: AtomicUsize,
         renewing: AtomicBool,
@@ -431,9 +436,9 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             tokio::time::sleep(self.renewal_delay).await;
-            let renewed = lock.renewed_for_test();
+            let sequence = self.renewals.fetch_add(1, Ordering::SeqCst) + 1;
+            let renewed = lock.renewed_at_for_test(renewal_stamp(sequence));
             *self.latest_renewed_at.lock().expect("latest renewed lock") = Some(renewed.created());
-            self.renewals.fetch_add(1, Ordering::SeqCst);
             self.renewal_completed.add_permits(1);
             self.renewing.store(false, Ordering::SeqCst);
             Ok(renewed)
@@ -472,11 +477,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn heartbeat_renews_and_stop_returns_the_latest_lock() {
         let backend = Arc::new(RecordingBackend::new(Duration::ZERO));
         let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(60));
-        let original_expiry = lock.expires();
+        let original_id = lock.id().to_owned();
         let guard =
             LockHeartbeat::start(backend.clone(), lock, || panic!("lock should not be lost"));
 
@@ -491,10 +496,18 @@ mod tests {
         let renewed = guard.stop().await.expect("lock should remain held");
 
         assert!(backend.renewals.load(Ordering::SeqCst) >= 2);
-        assert!(renewed.expires() > original_expiry);
+        assert_eq!(renewed.id(), original_id);
+        let last_sequence = backend.renewals.load(Ordering::SeqCst);
+        assert_eq!(renewed.created(), renewal_stamp(last_sequence));
+        assert_ne!(renewed.created(), renewal_stamp(1));
+        assert_eq!(
+            Some(renewed.created()),
+            *backend.latest_renewed_at.lock().unwrap(),
+            "stop must return the last completed renewal's capability"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stop_joins_an_in_progress_renewal_before_save() {
         let backend = Arc::new(RecordingBackend::new(Duration::from_millis(50)));
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(30));
@@ -512,7 +525,7 @@ mod tests {
         assert!(!backend.save_overlapped_renewal.load(Ordering::SeqCst));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn writer_serializes_with_renewal_uses_latest_lock_and_heartbeat_continues() {
         let backend = Arc::new(RecordingBackend::new(Duration::from_millis(50)));
         let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(30));
@@ -558,7 +571,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cleanup_stop_aborts_an_in_progress_renewal_and_returns_the_last_lock() {
         let backend = Arc::new(RecordingBackend::with_never_completing_renewal());
         let renewal_started = backend.renewal_started.notified();
@@ -577,7 +590,7 @@ mod tests {
         assert_eq!(returned.id(), lock_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn transient_renewal_failure_warns_once_per_failure_streak() {
         clear_captured_warnings();
         let backend = Arc::new(RecordingBackend::with_transient_failure_script([

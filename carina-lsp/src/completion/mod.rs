@@ -18,6 +18,7 @@ use crate::document::Document;
 use crate::enclosing_block::{
     EnclosingBlock, ResourceTypePatterns, StructPath, cursor_line_segment, enclosing_block,
 };
+use carina_core::paths::ResolvedPath;
 use carina_core::schema::{
     CompiledAttributeType as AttributeType, CompletionValue, SchemaKind, SchemaRegistry, Shape,
     ValidatedResourceSchema,
@@ -32,6 +33,24 @@ pub struct CompletionProvider {
     resource_type_patterns: ResourceTypePatterns,
     /// Custom type names from provider validators (e.g., "arn", "vpc_id")
     custom_type_names: Vec<String>,
+}
+
+struct CompletionTypeCheckSink {
+    authoritative: bool,
+}
+impl carina_core::validation::deferred_types::ProviderTypeCheckSink for CompletionTypeCheckSink {
+    fn record(
+        &mut self,
+        diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
+    ) {
+        match diagnostic {
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => eprintln!("completion type check: {}", warning.message),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => {
+                eprintln!("completion type check: {}", error.message);
+                self.authoritative = false;
+            }
+        }
+    }
 }
 
 impl CompletionProvider {
@@ -77,18 +96,52 @@ impl CompletionProvider {
         doc: &Document,
         position: Position,
         base_path: Option<&Path>,
+        catalog: &carina_core::parser::ProviderContext,
     ) -> Vec<CompletionItem> {
-        let root = base_path.and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
-        let base_path = root.as_ref();
+        let root = base_path.and_then(|path| ResolvedPath::new(path).ok());
+        let terminal =
+            carina_core::validation::deferred_types::TypeCheckSession::run(catalog, |session| {
+                self.complete_in_session(doc, position, root.as_ref(), session)
+            });
+        let mut sink = CompletionTypeCheckSink {
+            authoritative: true,
+        };
+        let items = terminal.publish(&mut sink);
+        if sink.authoritative {
+            items
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn complete_in_session(
+        &self,
+        doc: &Document,
+        position: Position,
+        base_path: Option<&ResolvedPath>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Vec<CompletionItem> {
         let text = doc.text();
-        let provider_ctx = doc.provider_context();
+
+        // A module resource-handle output preserves the underlying resource
+        // schema for postfix access. Detect the depth-2 shape before the
+        // generic value-position dispatcher, which otherwise sees only the
+        // module-call binding and falls back to in-scope names.
+        if let Some(completions) =
+            self.module_handle_dot_completions(&text, position, base_path, provider_ctx)
+        {
+            return completions;
+        }
 
         // `<binding>.<key>.<partial>` (depth-2) is checked first because
         // its prefix shape also matches the depth-1 walker's tail (which
         // would treat `<key>` as the binding and decline). #2041.
         if let Some(m) = detect_upstream_state_depth2_dot(&text, position, base_path) {
             return self.upstream_state_depth2_dot_completions(
-                &m.binding, &m.key, &m.partial, &m.source, position, base_path,
+                &m,
+                position,
+                base_path,
+                provider_ctx,
             );
         }
 
@@ -100,8 +153,14 @@ impl CompletionProvider {
         if let Some((binding, partial, source)) =
             detect_upstream_state_dot(&text, position, base_path)
         {
-            return self
-                .upstream_state_dot_completions(&binding, &partial, &source, position, base_path);
+            return self.upstream_state_dot_completions(
+                &binding,
+                &partial,
+                &source,
+                position,
+                base_path,
+                provider_ctx,
+            );
         }
 
         // Without this branch the surrounding string-literal context
@@ -120,14 +179,16 @@ impl CompletionProvider {
         let context = self.get_completion_context(&text, position);
 
         match context {
-            CompletionContext::TopLevel => self.top_level_completions(position, &text, base_path),
+            CompletionContext::TopLevel => {
+                self.top_level_completions(position, &text, base_path, provider_ctx.catalog())
+            }
             CompletionContext::InsideResourceBlock { resource_type } => {
                 self.attribute_completions_for_type(&resource_type)
             }
             CompletionContext::InsideUpstreamStateBlock => self.upstream_state_block_completions(),
             CompletionContext::InsideUseBlock => self.use_block_completions(),
             CompletionContext::InsideModuleCall { module_name } => {
-                self.module_parameter_completions(&module_name, &text, base_path)
+                self.module_parameter_completions(&module_name, &text, base_path, provider_ctx)
             }
             CompletionContext::AfterEquals {
                 target,
@@ -143,7 +204,13 @@ impl CompletionProvider {
             CompletionContext::AfterEqualsInExports {
                 type_expr_text,
                 in_nested,
-            } => self.exports_value_completions(&type_expr_text, in_nested, &text, base_path),
+            } => self.exports_value_completions(
+                provider_ctx,
+                &type_expr_text,
+                in_nested,
+                &text,
+                base_path,
+            ),
             CompletionContext::AfterEqualsInModuleCall {
                 module_name,
                 arg_name,
@@ -729,6 +796,18 @@ impl CompletionProvider {
                 .is_some();
                 completions
                     .extend(self.completions_for_type(field.field_type(), Some(resource_type)));
+                completions.extend(
+                    self.resource_ref_completions_for_type(
+                        field.field_type().in_schema(schema.as_schema().defs()),
+                        text,
+                        base_path,
+                    )
+                    .into_iter()
+                    .filter(|item| {
+                        !current_binding
+                            .is_some_and(|binding| item.label.starts_with(&format!("{binding}.")))
+                    }),
+                );
             }
         }
         let mut in_scope = self.in_scope_binding_completions(

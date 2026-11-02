@@ -1,38 +1,37 @@
 //! Plan generation from diffs and cascading update logic.
 
+use crate::resource::{PersistedDirectives, ResolvedDependencies};
 use std::collections::{HashMap, HashSet};
-
-use crate::deps::get_resource_dependencies;
 
 use crate::effect::{
     ChangedCreateOnly, DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload,
     Effect, EffectGeneration, NonEmptyDeletes, OutcomeUnknownImportReplacement, TemporaryName,
 };
 use crate::identifier::generate_random_suffix;
-use crate::parser::{DeferredForExpression, ResolvedDeferredForExpressions, WaitBinding};
+use crate::parser::{DeferredForExpression, ResolvedDeferredForExpressions};
 use crate::plan::{
     CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
+use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
 use crate::resource::{
-    AbsoluteBindingAddress, CanonicalComparisonAttributes, ConcreteValue, Current, DataSource,
-    Directives, PlanInputCurrent, PlanInputDesired, PlanInputDesiredResources, ResolvedDataSource,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
-    plan_input_desired_resources,
+    AbsoluteBindingAddress, ConcreteValue, Current, Directives, PlanInputCurrent, PlanInputDesired,
+    PlanInputDesiredResources, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, SnapshotState as State, Value, plan_input_desired_resources,
 };
 use crate::schema::{
     AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
     SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
+use crate::wait::ResolvedWaitBinding;
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
-use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
 use super::{
-    ComparisonContext, ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates,
-    PlannedListKeyRelease, PresentDiff, comparison::AuthoredRemovalEvidence,
+    ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates, PlannedListKeyRelease,
+    PlanningComparison, PresentDiff,
+    comparison::{AuthoredAttributeViews, AuthoredRemovalEvidence},
     diff_present_with_releases, type_aware_equal,
 };
 
@@ -70,8 +69,8 @@ pub enum DeferredForExpansionChoice {
 /// The retained owner cannot be reused for another planning call.
 ///
 /// ```compile_fail,E0382
-/// use carina_core::differ::{CascadeDependents, DeferredCreateTargets};
-/// fn reuse(targets: DeferredCreateTargets) {
+/// use carina_core::differ::{CascadeDependents, ResolvedDeferredCreateTargets};
+/// fn reuse(targets: ResolvedDeferredCreateTargets) {
 ///     let first = CascadeDependents::new(&[], targets);
 ///     let second = CascadeDependents::new(&[], targets);
 /// }
@@ -107,6 +106,35 @@ impl DeferredCreateTargets {
     }
 }
 
+/// The retained target owner after binding-to-row graph resolution.
+#[derive(Debug, Default, Clone)]
+pub struct ResolvedDeferredCreateTargets(Vec<CompiledDeferredCreate>);
+#[derive(Debug, Clone)]
+struct CompiledDeferredCreate {
+    template: crate::parser::CompiledDeferredForExpression,
+    dependencies: crate::resource::DeferredDependencyTemplate,
+}
+impl DeferredCreateTargets {
+    pub fn resolve_graph(
+        self,
+        index: &crate::resolved_graph::ExpandedBindingIndex,
+    ) -> Result<ResolvedDeferredCreateTargets, crate::resolved_graph::ExpandedGraphResolutionError>
+    {
+        self.0
+            .into_iter()
+            .map(|template| {
+                index
+                    .compile_deferred_for(template)
+                    .map(|(template, dependencies)| CompiledDeferredCreate {
+                        template,
+                        dependencies,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(ResolvedDeferredCreateTargets)
+    }
+}
+
 /// Dependents and the owned deferred targets used by replacement planning.
 ///
 /// The same target owner is consulted before replacement decomposition and
@@ -118,12 +146,25 @@ impl DeferredCreateTargets {
 /// ```
 pub struct CascadeDependents<'a> {
     managed: &'a [ResolvedResource],
-    deferred: DeferredCreateTargets,
+    deferred: ResolvedDeferredCreateTargets,
 }
 
 impl<'a> CascadeDependents<'a> {
-    pub fn new(managed: &'a [ResolvedResource], deferred: DeferredCreateTargets) -> Self {
+    pub fn new(managed: &'a [ResolvedResource], deferred: ResolvedDeferredCreateTargets) -> Self {
         Self { managed, deferred }
+    }
+
+    pub(crate) fn managed(&self) -> &'a [ResolvedResource] {
+        self.managed
+    }
+
+    // Replaying a provisional computation must not consume the caller's
+    // deferred target owner. Only the clean plan is released by preparation.
+    pub(crate) fn for_recording_run(&self) -> Self {
+        Self {
+            managed: self.managed,
+            deferred: self.deferred.clone(),
+        }
     }
 }
 
@@ -149,7 +190,7 @@ impl<'a> CascadeDependents<'a> {
 #[must_use = "finish planning to emit the retained deferred targets"]
 pub struct PendingCascadePlan {
     plan: Plan,
-    deferred: DeferredCreateTargets,
+    deferred: ResolvedDeferredCreateTargets,
 }
 
 impl PendingCascadePlan {
@@ -182,8 +223,8 @@ pub(crate) struct PendingReplace {
     pub changed_create_only: ChangedCreateOnly,
     pub cascade_ref_hints: Vec<(String, String)>,
     pub temporary_name: Option<TemporaryName>,
-    pub consumer_updates: HashSet<ResourceIdentity>,
-    pub previous_attributes: HashMap<String, Value>,
+    pub consumer_updates: ResolvedDependencies,
+    pub previous_attributes: HashMap<String, crate::resource::SnapshotValue>,
 }
 
 struct RefAttr {
@@ -191,21 +232,22 @@ struct RefAttr {
     hint: String,
 }
 
-fn contains_authored_create_only_value(
+fn contains_authored_create_only_value<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    value: &Value,
+    value: &Value<P>,
     schema: &ResourceSchema,
 ) -> bool {
     contains_authored_create_only_value_on_path(attr_type, value, schema, &mut Vec::new())
 }
 
-fn contains_authored_create_only_value_on_path<'schema>(
+fn contains_authored_create_only_value_on_path<'schema, P: crate::resource::StateValueLeaf>(
     attr_type: &'schema AttributeType,
-    value: &Value,
+    value: &Value<P>,
     schema: &'schema ResourceSchema,
     ref_chain: &mut Vec<&'schema str>,
 ) -> bool {
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => false,
         AttrTypeKind::Ref(name) => {
             if ref_chain.contains(&name.as_str()) {
                 return false;
@@ -253,7 +295,8 @@ fn contains_authored_create_only_value_on_path<'schema>(
                 })
             })
         }
-        AttrTypeKind::Union(_)
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::Union(_)
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -265,26 +308,36 @@ fn contains_authored_create_only_value_on_path<'schema>(
     }
 }
 
-struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
-    desired_items: &'items [&'items Value],
-    current_items: &'items [Value],
+struct UnorderedCreateOnlyMatcher<
+    'items,
+    'schema,
+    'context,
+    'comparison,
+    P: crate::resource::StateValueLeaf,
+> {
+    desired_items: &'items [(usize, &'items Value<P>)],
+    current_items: &'items [Value<P>],
     element_type: &'schema AttributeType,
     schema: &'schema ResourceSchema,
-    context: &'context ComparisonContext<'comparison>,
+    context: &'context PlanningComparison<'comparison>,
     removal_evidence: AuthoredRemovalEvidence,
     current_matches: &'items mut [Option<usize>],
 }
 
-impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
+impl<P: crate::resource::StateValueLeaf> UnorderedCreateOnlyMatcher<'_, '_, '_, '_, P> {
     fn matches(&mut self, desired_index: usize, seen_current: &mut [bool]) -> bool {
         for current_index in 0..self.current_items.len() {
             if seen_current[current_index]
                 || !create_only_values_compatible(
                     self.element_type,
                     &self.current_items[current_index],
-                    self.desired_items[desired_index],
+                    self.desired_items[desired_index].1,
                     self.schema,
-                    self.context,
+                    &self.context.at_paths(
+                        &self
+                            .context
+                            .index_paths(current_index, self.desired_items[desired_index].0),
+                    ),
                     self.removal_evidence,
                 )
             {
@@ -302,12 +355,12 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
     }
 }
 
-fn create_only_values_compatible(
+fn create_only_values_compatible<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    current: &Value,
-    desired: &Value,
+    current: &Value<P>,
+    desired: &Value<P>,
     schema: &ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
 ) -> bool {
     create_only_values_compatible_on_path(
@@ -321,12 +374,12 @@ fn create_only_values_compatible(
     )
 }
 
-fn authored_create_only_value_is_compatible(
+fn authored_create_only_value_is_compatible<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    current: Option<&Value>,
-    desired: &Value,
+    current: Option<&Value<P>>,
+    desired: &Value<P>,
     schema: &ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
 ) -> bool {
     !contains_authored_create_only_value(attr_type, desired, schema)
@@ -342,16 +395,17 @@ fn authored_create_only_value_is_compatible(
         })
 }
 
-fn create_only_values_compatible_on_path<'schema>(
+fn create_only_values_compatible_on_path<'schema, P: crate::resource::StateValueLeaf>(
     attr_type: &'schema AttributeType,
-    current: &Value,
-    desired: &Value,
+    current: &Value<P>,
+    desired: &Value<P>,
     schema: &'schema ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
     ref_chain: &mut Vec<&'schema str>,
 ) -> bool {
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => true,
         AttrTypeKind::Ref(name) => {
             if ref_chain.contains(&name.as_str()) {
                 return true;
@@ -392,14 +446,17 @@ fn create_only_values_compatible_on_path<'schema>(
                         current_items.get(index),
                         desired,
                         schema,
-                        context,
+                        &context.at_paths(&context.index_paths(index, index)),
                         removal_evidence,
                     )
                 })
             } else {
                 let desired_items = desired_items
                     .iter()
-                    .filter(|item| contains_authored_create_only_value(element_type, item, schema))
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        contains_authored_create_only_value(element_type, item, schema)
+                    })
                     .collect::<Vec<_>>();
                 let mut current_matches = vec![None; current_items.len()];
                 let mut matcher = UnorderedCreateOnlyMatcher {
@@ -433,7 +490,7 @@ fn create_only_values_compatible_on_path<'schema>(
                     current_entries.get(key),
                     desired,
                     schema,
-                    context,
+                    &context.at_paths(&context.map_key_paths(key)),
                     removal_evidence,
                 )
             })
@@ -468,7 +525,7 @@ fn create_only_values_compatible_on_path<'schema>(
                             desired,
                             Some(&field.field_type),
                             &schema.defs,
-                            context,
+                            &context.at_paths(&context.field_paths(&field.name)),
                         )
                     });
                 }
@@ -477,12 +534,13 @@ fn create_only_values_compatible_on_path<'schema>(
                     current_fields.get(&field.name),
                     desired,
                     schema,
-                    context,
+                    &context.at_paths(&context.field_paths(&field.name)),
                     removal_evidence,
                 )
             })
         }
-        AttrTypeKind::Union(_)
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::Union(_)
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -494,14 +552,33 @@ fn create_only_values_compatible_on_path<'schema>(
     }
 }
 
-pub(super) fn find_changed_create_only(
+pub(super) fn find_changed_create_only<S>(
     changed_attributes: &[String],
-    current_attributes: &CanonicalComparisonAttributes,
-    removal_evidence: AuthoredRemovalEvidence,
-    desired: &PlanInputDesired<'_>,
+    desired: &ResolvedResource<S>,
+    views: &AuthoredAttributeViews<'_>,
     schema: &ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
 ) -> Vec<String> {
+    find_changed_create_only_for_resource(
+        changed_attributes,
+        desired.as_resource(),
+        views,
+        schema,
+        context,
+    )
+}
+
+pub(super) fn find_changed_create_only_for_resource<S, D>(
+    changed_attributes: &[String],
+    desired: &Resource<S, crate::resource::NoPlaceholder, AbsoluteBindingAddress, D>,
+    views: &AuthoredAttributeViews<'_>,
+    schema: &ResourceSchema,
+    context: &PlanningComparison<'_>,
+) -> Vec<String> {
+    let context = context.with_left_origins(&views.current_origins);
+    let context = &context;
+    let current_attributes = views.current();
+    let removal_evidence = views.removal_evidence();
     let top_level = schema.create_only_attributes();
     changed_attributes
         .iter()
@@ -513,17 +590,13 @@ pub(super) fn find_changed_create_only(
             let Some(attribute_schema) = schema.attributes().get(attribute.as_str()) else {
                 return false;
             };
-            let Some(desired_value) = desired.comparison_attributes().get(attribute.as_str())
-            else {
+            let Some(desired_value) = views.desired().get(attribute.as_str()) else {
                 // An authored empty struct canonicalizes to absence, but it
                 // still removes any previously authored create-only leaves.
                 // Keep comparison absence from inventing additions of empty
                 // nested create-only structs during unrelated updates.
                 return removal_evidence == AuthoredRemovalEvidence::Recorded
-                    && desired
-                        .authored()
-                        .attributes
-                        .contains_key(attribute.as_str())
+                    && desired.attributes.contains_key(attribute.as_str())
                     && current_attributes
                         .get(attribute.as_str())
                         .is_some_and(|current| {
@@ -546,7 +619,7 @@ pub(super) fn find_changed_create_only(
                 current,
                 desired_value,
                 schema,
-                context,
+                &context.at_path(attribute),
                 removal_evidence,
             )
         })
@@ -596,10 +669,10 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
 /// A "removal" is an attribute that appears in `changed_attributes` but not in `to`.
 /// Only attributes marked as `removable` in the schema should be kept as removals.
 /// Non-removal changes (attribute present in `to`) are always kept.
-pub(super) fn filter_non_removable_removals(
+pub(super) fn filter_non_removable_removals<S, D>(
     provider: &str,
     resource_type: &str,
-    to: &Resource,
+    to: &Resource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, D>,
     changed_attributes: Vec<String>,
     registry: &SchemaRegistry,
 ) -> Vec<String> {
@@ -631,8 +704,13 @@ pub(super) fn filter_non_removable_removals(
 /// resource has no server-side create-first conflict, a `name_prefix` already
 /// produces a non-conflicting cloud name, and a direct change to the
 /// unique-name value is already distinct from the old resource.
-pub fn generate_temporary_name(
-    resource: &Resource,
+pub fn generate_temporary_name<S, D>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     from: &State,
     schema: &ResourceSchema,
 ) -> Result<Option<TemporaryName>, CreateBeforeDestroyError> {
@@ -728,6 +806,10 @@ pub fn generate_temporary_name(
 /// let states = HashMap::<ResourceId, Current>::new();
 /// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let orphans = Orphans::new();
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &compositions,
 ///     &[],
@@ -738,6 +820,7 @@ pub fn generate_temporary_name(
 ///     &saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 ///
@@ -756,6 +839,10 @@ pub fn generate_temporary_name(
 /// let states: HashMap<ResourceId, State> = HashMap::new();
 /// let registry = SchemaRegistry::default();
 /// let saved_attrs = RawSavedAttrs::default().lift(&registry);
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
@@ -766,6 +853,7 @@ pub fn generate_temporary_name(
 ///     &saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 ///
@@ -785,6 +873,10 @@ pub fn generate_temporary_name(
 /// let registry = SchemaRegistry::default();
 /// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let raw_saved_attrs = RawSavedAttrs::default();
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
@@ -795,20 +887,35 @@ pub fn generate_temporary_name(
 ///     &raw_saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 #[allow(clippy::too_many_arguments)]
+/// Reference preparation is a required input, even for a caller with all
+/// other planning inputs available:
+///
+/// ```compile_fail,E0061
+/// use std::collections::HashMap;
+/// use carina_core::{differ::{create_plan, PlanPriorStates}, provider::{ProviderRouter, LiftedSavedAttrs},
+///     resource::{ResolvedResource, ResourceId, Directives}, schema::SchemaRegistry};
+/// fn without_preparation(resources: &[ResolvedResource], provider: &ProviderRouter,
+///     prior: PlanPriorStates<'_>, registry: &SchemaRegistry, saved: &LiftedSavedAttrs) {
+///     let _ = create_plan(resources, &[], provider, prior, &HashMap::new(), registry,
+///         saved, &HashMap::new(), &[]);
+/// }
+/// ```
 pub fn create_plan(
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
-    directives_map: &HashMap<ResourceId, Directives>,
+    directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
-) -> ProviderResult<Plan> {
+    wait_bindings: &[ResolvedWaitBinding],
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<Plan> {
     create_plan_with_provider(
         managed,
         data_sources,
@@ -820,6 +927,7 @@ pub fn create_plan(
         saved_attrs,
         prev_explicit,
         wait_bindings,
+        references,
     )
 }
 
@@ -830,19 +938,28 @@ pub fn create_plan(
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan_for_test(
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &dyn crate::provider::Provider,
     prior_states: PlanPriorStates<'_>,
-    directives_map: &HashMap<ResourceId, Directives>,
+    directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
-) -> ProviderResult<Plan> {
+    wait_bindings: &[ResolvedWaitBinding],
+) -> super::PlanComparisonResult<Plan> {
     let (registry, comparison_provider) = crate::provider::comparison_fixture_for_test(
         registry,
         managed.iter().map(|resource| &resource.id),
     );
+    let current = prior_states.materialize_current_states(managed, &registry);
+    let references =
+        futures::executor::block_on(crate::references::ReferencePreparation::default().prepare(
+            managed,
+            &current,
+            &registry,
+            saved_attrs,
+            &comparison_provider,
+        ))?;
     create_plan_with_provider(
         managed,
         data_sources,
@@ -854,22 +971,24 @@ pub fn create_plan_for_test(
         saved_attrs,
         prev_explicit,
         wait_bindings,
+        &references,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_plan_with_provider(
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &dyn Provider,
     comparison_provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
-    directives_map: &HashMap<ResourceId, Directives>,
+    directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
-) -> ProviderResult<Plan> {
+    wait_bindings: &[ResolvedWaitBinding],
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<Plan> {
     let desired = plan_input_desired_resources(managed, registry);
     let managed_current = prior_states.materialize_current_states(desired.authored(), registry);
     let mut build = create_plan_parts(
@@ -884,8 +1003,9 @@ pub(crate) fn create_plan_with_provider(
         prior_states.orphans(),
         wait_bindings,
         &HashSet::new(),
+        references,
     )?;
-    decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
+    decompose_replace_into_effects(&mut build.plan, build.pending_replaces, directives_map);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
     Ok(build.plan)
 }
@@ -901,16 +1021,17 @@ pub(crate) fn create_plan_with_provider(
 pub fn create_plan_with_cascades(
     managed: &PlanInputDesiredResources<'_>,
     dependents: CascadeDependents<'_>,
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
-    directives_map: &HashMap<ResourceId, Directives>,
+    directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
+    wait_bindings: &[ResolvedWaitBinding],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<PendingCascadePlan> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<PendingCascadePlan> {
     let managed_current = prior_states.materialize_current_states(managed.authored(), registry);
     let mut build = create_plan_parts(
         managed,
@@ -924,6 +1045,7 @@ pub fn create_plan_with_cascades(
         prior_states.orphans(),
         wait_bindings,
         outcome_unknown_import_replacements,
+        references,
     )?;
     cascade_dependent_updates(
         &mut build.plan,
@@ -933,8 +1055,9 @@ pub fn create_plan_with_cascades(
         registry,
         provider,
         outcome_unknown_import_replacements,
+        references,
     )?;
-    decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
+    decompose_replace_into_effects(&mut build.plan, build.pending_replaces, directives_map);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
     Ok(PendingCascadePlan {
         plan: build.plan,
@@ -946,11 +1069,15 @@ pub fn create_plan_with_cascades(
 ///
 /// Matching orphan `Delete` effects are absorbed into `DeferredReplace`; targets
 /// with no matching deletes remain plain `DeferredCreate` effects.
-fn add_deferred_create_effects(plan: &mut Plan, targets: DeferredCreateTargets) {
+fn add_deferred_create_effects(plan: &mut Plan, targets: ResolvedDeferredCreateTargets) {
     let mut deletes_to_absorb: HashSet<ResourceId> = HashSet::new();
     let mut deferred_effects = Vec::new();
 
-    for template in targets.0 {
+    for CompiledDeferredCreate {
+        template,
+        dependencies,
+    } in targets.0
+    {
         let deletes: Vec<DeferredReplaceDelete> = plan
             .effects()
             .iter()
@@ -994,6 +1121,7 @@ fn add_deferred_create_effects(plan: &mut Plan, targets: DeferredCreateTargets) 
         if deletes.is_empty() {
             deferred_effects.push(Effect::DeferredCreate(DeferredCreatePayload::new(
                 Box::new(template),
+                dependencies,
             )));
         } else {
             deletes_to_absorb.extend(deletes.iter().map(|delete| delete.id.clone().into_inner()));
@@ -1001,6 +1129,7 @@ fn add_deferred_create_effects(plan: &mut Plan, targets: DeferredCreateTargets) 
                 deletes: NonEmptyDeletes::try_new(deletes)
                     .expect("planner checked non-empty deletes"),
                 template: Box::new(template),
+                dependency_template: dependencies,
             })));
         }
     }
@@ -1037,13 +1166,13 @@ fn add_deferred_create_effects(plan: &mut Plan, targets: DeferredCreateTargets) 
 
 struct PlanBuild {
     plan: Plan,
-    pending_replaces: HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: HashMap<ResolvedResourceId, PendingReplace>,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn create_plan_parts(
     managed: &PlanInputDesiredResources<'_>,
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &dyn Provider,
     comparison_provider: &ProviderRouter,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
@@ -1051,9 +1180,10 @@ fn create_plan_parts(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &super::Orphans,
-    wait_bindings: &[WaitBinding<AbsoluteBindingAddress>],
+    wait_bindings: &[ResolvedWaitBinding],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<PlanBuild> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
     let authored_managed = managed.authored();
@@ -1066,7 +1196,7 @@ fn create_plan_parts(
     // longer reachable from this loop (carina#3179).
     for ds in data_sources {
         plan.add(Effect::Read {
-            resource: ResolvedDataSource::new(ds.clone()),
+            resource: ds.clone(),
         });
     }
 
@@ -1113,19 +1243,25 @@ fn create_plan_parts(
                 let context = resolved_comparison.context();
                 let validated_schema = owner_schema.schema();
                 let schema = validated_schema.as_schema();
-                let result = diff_present_with_releases(
-                    comparison_desired,
-                    present,
-                    ExistingComparisonInputs {
-                        current_attributes,
-                        saved,
-                        nested_write_only: saved_attrs.nested_write_only(&resource.id),
-                        prev_explicit: prev_explicit_for_resource,
-                        schema: Some(schema),
-                        context,
-                    },
-                    validated_schema,
-                );
+                let masked =
+                    comparison_desired.masked_comparison(current_attributes, saved, Some(schema));
+                let result = context.with_references(references, &resource.id, |context| {
+                    diff_present_with_releases(
+                        comparison_desired,
+                        present,
+                        ExistingComparisonInputs {
+                            masked: &masked,
+                            current_attributes,
+                            saved,
+                            nested_write_only: saved_attrs.nested_write_only(&resource.id),
+                            prev_explicit: prev_explicit_for_resource,
+                            schema: Some(schema),
+                            context,
+                            observations: &context.observation(),
+                        },
+                        validated_schema,
+                    )
+                })?;
                 match result.diff {
                     PresentDiff::Update {
                         id,
@@ -1168,22 +1304,23 @@ fn create_plan_parts(
                         }
 
                         let identifier = present.identifier().clone();
-                        let authored_views = super::comparison::project_authored_attribute_views(
-                            comparison_desired.comparison_attributes(),
-                            current_attributes,
-                            saved,
-                            prev_explicit_for_resource,
-                            Some(schema),
-                            context,
-                        );
-                        let changed_create_only = find_changed_create_only(
-                            &changed_attributes,
-                            authored_views.current(),
-                            authored_views.removal_evidence(),
-                            comparison_desired,
-                            schema,
-                            context,
-                        );
+                        let changed_create_only =
+                            context.with_references(references, &resource.id, |context| {
+                                let authored_views =
+                                    super::comparison::project_authored_attribute_views(
+                                        &masked,
+                                        prev_explicit_for_resource,
+                                        Some(schema),
+                                        context,
+                                    );
+                                find_changed_create_only(
+                                    &changed_attributes,
+                                    comparison_desired.authored(),
+                                    &authored_views,
+                                    schema,
+                                    context,
+                                )
+                            })?;
 
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
@@ -1199,6 +1336,7 @@ fn create_plan_parts(
                                 ));
                                 continue;
                             }
+                            let to = resource.replace_inner(to);
                             match pending_replace_from_parts(
                                 from,
                                 identifier,
@@ -1209,8 +1347,7 @@ fn create_plan_parts(
                                 registry,
                             ) {
                                 Ok(pending) => {
-                                    pending_replaces
-                                        .insert(resource_identity(&pending.create), pending);
+                                    pending_replaces.insert(pending.create.resolved_id(), pending);
                                 }
                                 Err(err) => plan.add_error(PlanError::new(id, err.into())),
                             }
@@ -1218,7 +1355,7 @@ fn create_plan_parts(
                             plan.add(Effect::Update {
                                 from,
                                 identifier,
-                                to: ResolvedResource::new(to),
+                                to: resource.replace_inner(to),
                                 changed_attributes,
                             });
                             add_key_releases(&mut plan, &resource.id, result.releases);
@@ -1276,7 +1413,8 @@ fn create_plan_parts(
                 continue;
             }
         };
-        let directives = orphan.directives().clone();
+        let persisted_directives = orphan.directives().clone();
+        let directives: Directives = (&persisted_directives).into();
         let resolved_directives =
             registry.resolve_directives(id, SchemaKind::Resource, &directives);
         let prevent_destroy_source = resolved_directives.prevent_destroy_source();
@@ -1289,8 +1427,9 @@ fn create_plan_parts(
             continue;
         }
         let binding = orphan.binding_address().cloned();
-        let dependencies = dependencies_from_prior_state(state, directives.clone());
-        let explicit_dependencies = directives.depends_on.iter().cloned().collect();
+        let explicit_dependencies = persisted_directives.depends_on.to_resolved_dependencies();
+        let mut dependencies = state.dependency_bindings.clone();
+        dependencies.extend_projected(&persisted_directives.depends_on);
         plan.add(Effect::Delete {
             id: ResolvedResourceId::new(id.clone()),
             identifier,
@@ -1299,50 +1438,19 @@ fn create_plan_parts(
             binding,
             dependencies,
             explicit_dependencies,
-            blocked_by_updates: HashSet::new(),
+            blocked_by_updates: ResolvedDependencies::default(),
         });
     }
 
     // Lower each `wait` declaration into an `Effect::Wait`.
     //
-    // Target resolution: the parser has already pinned the target name;
-    // here we look it up in `desired` (the live resource set after
-    // `resolve_resource_refs`) to recover the resolved `ResourceId`. If
-    // the target is missing — typo, scoped-out binding, etc. — the
-    // wait is skipped with a plan-level error so downstream resources
-    // referencing the wait binding still fail loudly.
+    // Target and explicit dependencies crossed the fallible address
+    // resolution boundary before the differ.
     for wb in wait_bindings {
-        let target = match resolve_wait_target(wb.target.as_str(), authored_managed, data_sources) {
-            WaitTargetLookup::Managed(target) => target,
-            WaitTargetLookup::DataSource => {
-                plan.add_error(PlanError::new(
-                    ResourceId::with_identity(
-                        "__wait",
-                        ResourceIdentity::new(wb.binding.to_string()),
-                    ),
-                    PlanErrorKind::WaitTargetIsDataSource {
-                        wait_binding: wb.binding.to_string(),
-                        target: wb.target.to_string(),
-                    },
-                ));
-                continue;
-            }
-            WaitTargetLookup::Missing => {
-                plan.add_error(PlanError::new(
-                    ResourceId::with_identity(
-                        "__wait",
-                        ResourceIdentity::new(wb.binding.to_string()),
-                    ),
-                    PlanErrorKind::WaitTargetMissing {
-                        wait_binding: wb.binding.to_string(),
-                        target: wb.target.to_string(),
-                    },
-                ));
-                continue;
-            }
-        };
+        let target = wb.target_id.clone();
         let target_id = target.id();
         let diagnostic_id = target_id.as_inner().clone();
+        let wait_binding = wb.id.identity_str();
 
         // Once the managed target is known, resolve the full nested attribute
         // path. The same function drives validation (and therefore LSP
@@ -1364,7 +1472,7 @@ fn create_plan_parts(
                 plan.add_error(PlanError::new(
                     diagnostic_id,
                     PlanErrorKind::WaitPredicateInvalid {
-                        wait_binding: wb.binding.to_string(),
+                        wait_binding: wait_binding.to_string(),
                         reason: error.to_string(),
                     },
                 ));
@@ -1390,18 +1498,22 @@ fn create_plan_parts(
         // (carina#3101). A genuinely pending consumer change still
         // produces the wait + its dependency edge (carina#3085 /
         // carina#3061 behavior preserved).
-        let gates_a_pending_change = authored_managed.iter().any(|m| {
-            get_resource_dependencies(m).contains(&wb.binding)
+        let gates_a_pending_change = authored_managed.iter().any(|resource| {
+            resource
+                .all_dependencies()
+                .any(|dependency| dependency == &wb.id)
                 && plan
                     .effects()
                     .iter()
-                    .any(|e| e.resource_id() == &m.id && e.is_mutating())
-        }) || data_sources.iter().any(|d| {
-            crate::deps::get_data_source_dependencies(d).contains(&wb.binding)
+                    .any(|effect| effect.resource_id() == &resource.id && effect.is_mutating())
+        }) || data_sources.iter().any(|resource| {
+            resource
+                .all_dependencies()
+                .any(|dependency| dependency == &wb.id)
                 && plan
                     .effects()
                     .iter()
-                    .any(|e| e.resource_id() == &d.id && e.is_mutating())
+                    .any(|effect| effect.resource_id() == &resource.id && effect.is_mutating())
         });
         if !gates_a_pending_change {
             continue;
@@ -1439,13 +1551,27 @@ fn create_plan_parts(
                     Current::CreateOutcomeUnknown(_unknown) => None,
                     Current::MissingIdentifier(unidentified) => Some(unidentified.state()),
                 });
-        let wait_has_work = cached_state
-            .map(|state| {
+        let cached_inputs = match cached_state
+            .map(|state| crate::wait::evaluation_inputs(&until, &state.attributes))
+            .transpose()
+        {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                plan.add_error(PlanError::new(
+                    diagnostic_id,
+                    PlanErrorKind::UnavailableSecret(error),
+                ));
+                continue;
+            }
+        };
+        let wait_has_work = cached_inputs
+            .as_ref()
+            .map(|inputs| {
                 let target_is_mutating = plan
                     .effects()
                     .iter()
                     .any(|e| e.resource_id() == target_id.as_inner() && e.is_mutating());
-                let target_needs_wait = !until.evaluate(&state.attributes);
+                let target_needs_wait = !until.evaluate(inputs);
 
                 target_is_mutating || target_needs_wait
             })
@@ -1453,8 +1579,7 @@ fn create_plan_parts(
         if !wait_has_work {
             continue;
         }
-        let mut explicit_dependencies: HashSet<AbsoluteBindingAddress> =
-            wb.depends_on.iter().cloned().collect();
+        let mut explicit_dependencies = wb.explicit_dependencies.clone();
         // Provider hints supplement user-authored ordering. They are additive
         // because `depends_on` is the user's source of truth and must never be
         // weakened by provider-derived knowledge.
@@ -1466,7 +1591,7 @@ fn create_plan_parts(
         )?);
 
         plan.add(Effect::Wait {
-            identity: wb.binding.clone(),
+            id: wb.id.clone(),
             target_id: target,
             until,
             until_surface: wb.until_raw.clone(),
@@ -1504,24 +1629,27 @@ fn create_plan_parts(
 /// Existing `blocked_by_updates` entries are preserved; this pass only adds missing inverse edges.
 pub fn block_deletes_on_prior_consumer_updates(
     plan: &mut Plan,
-    prior_directives: &HashMap<ResourceId, Directives>,
+    prior_directives: &HashMap<ResourceId, PersistedDirectives>,
 ) {
     let consumers: Vec<(
-        ResourceIdentity,
-        HashSet<AbsoluteBindingAddress>,
-        HashSet<AbsoluteBindingAddress>,
+        ResolvedResourceId,
+        ResolvedDependencies,
+        ResolvedDependencies,
     )> = plan
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Update { from, to, .. } => Some((
-                resource_identity(to),
-                dependencies_from_prior_state(
-                    from,
-                    prior_directives.get(&from.id).cloned().unwrap_or_default(),
-                ),
-                get_resource_dependencies(to.as_resource()),
-            )),
+            Effect::Update { from, to, .. } => {
+                let mut prior_dependencies = from.dependency_bindings.to_resolved_dependencies();
+                if let Some(directives) = prior_directives.get(&from.id) {
+                    prior_dependencies.extend(directives.depends_on.iter().cloned());
+                }
+                Some((
+                    to.resolved_id(),
+                    prior_dependencies,
+                    to.all_dependencies().cloned().collect(),
+                ))
+            }
             Effect::Read { .. }
             | Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -1539,48 +1667,30 @@ pub fn block_deletes_on_prior_consumer_updates(
     for effect in plan.effects_mut() {
         let Effect::Delete {
             id,
-            binding,
+            binding: _,
             blocked_by_updates,
             ..
         } = effect
         else {
             continue;
         };
-        let delete_identity = id.identity();
-        for (consumer_identity, prior_dependencies, desired_dependencies) in &consumers {
-            if consumer_identity == delete_identity {
+        for (consumer_id, prior_dependencies, desired_dependencies) in &consumers {
+            if consumer_id == id {
                 continue;
             }
-            let should_add_inverse_edge = binding.as_ref().is_some_and(|binding| {
-                prior_dependencies.contains(binding) && !desired_dependencies.contains(binding)
-            });
+            let should_add_inverse_edge =
+                prior_dependencies.contains(id) && !desired_dependencies.contains(id);
             if should_add_inverse_edge {
-                blocked_by_updates.insert(consumer_identity.clone());
+                blocked_by_updates.insert(consumer_id.clone());
             }
         }
     }
 }
 
-fn dependencies_from_prior_state(
-    state: &State,
-    directives: Directives,
-) -> HashSet<AbsoluteBindingAddress> {
-    state
-        .dependency_bindings
-        .iter()
-        .chain(&directives.depends_on)
-        .cloned()
-        .collect()
-}
-
-fn resource_identity(resource: &ResolvedResource) -> ResourceIdentity {
-    resource.identity().clone()
-}
-
 fn pending_replace_from_parts(
     from: Box<State>,
     identifier: crate::provider::AppliedIdentifier,
-    to: Resource,
+    to: ResolvedResource,
     directives: Directives,
     changed_create_only: ChangedCreateOnly,
     cascade_ref_hints: Vec<(String, String)>,
@@ -1589,36 +1699,57 @@ fn pending_replace_from_parts(
     let create_before_destroy = directives.create_before_destroy;
     let previous_attributes = from.attributes.clone();
     let temporary_name = if create_before_destroy {
-        temporary_name_for_cbd(&to, &from, registry)?
+        temporary_name_for_cbd(to.as_resource(), &from, registry)?
     } else {
         None
     };
+    let (
+        to,
+        value_dependencies,
+        explicit_dependencies,
+        persisted_value_destroy_dependencies,
+        persisted_explicit_destroy_dependencies,
+        value_dependency_reads,
+    ) = to.into_parts();
     let create = apply_temporary_name(to, temporary_name.as_ref());
-    let dependencies = from.dependency_bindings.iter().cloned().collect();
-    let explicit_dependencies = directives.depends_on.iter().cloned().collect();
+    let dependencies = from.dependency_bindings.clone();
     let delete = ReplacementDelete {
         id: ResolvedResourceId::new(from.id.clone()),
         identifier,
         directives,
         binding: create.binding.clone(),
         dependencies,
-        explicit_dependencies,
+        explicit_dependencies: explicit_dependencies.clone(),
     };
 
     Ok(PendingReplace {
-        create: ResolvedResource::new(create),
+        create: ResolvedResource::from_resolved_parts_with_reads(
+            create,
+            value_dependencies,
+            explicit_dependencies.clone(),
+            value_dependency_reads,
+        )
+        .with_persisted_destroy_dependencies(
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+        ),
         delete,
         create_before_destroy,
         changed_create_only,
         cascade_ref_hints,
         temporary_name,
-        consumer_updates: HashSet::new(),
+        consumer_updates: ResolvedDependencies::default(),
         previous_attributes,
     })
 }
 
-pub(super) fn temporary_name_for_cbd(
-    resource: &Resource,
+pub(super) fn temporary_name_for_cbd<S, D>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     from: &State,
     registry: &SchemaRegistry,
 ) -> Result<Option<TemporaryName>, CreateBeforeDestroyError> {
@@ -1639,10 +1770,15 @@ pub(super) fn temporary_name_for_cbd(
     generate_temporary_name(resource, from, schema.as_schema())
 }
 
-fn apply_temporary_name(
-    mut resource: Resource,
+fn apply_temporary_name<S, D>(
+    mut resource: Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     temporary_name: Option<&TemporaryName>,
-) -> Resource {
+) -> Resource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, D> {
     if let Some(temp) = temporary_name {
         resource.set_attr(
             temp.attribute.clone(),
@@ -1654,12 +1790,22 @@ fn apply_temporary_name(
 
 fn decompose_replace_into_effects(
     plan: &mut Plan,
-    pending_replaces: HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: HashMap<ResolvedResourceId, PendingReplace>,
+    prior_directives: &HashMap<ResourceId, PersistedDirectives>,
 ) {
     let mut pending_replaces: Vec<_> = pending_replaces.into_values().collect();
     pending_replaces.sort_by_key(|pending| pending.create.id.to_string());
 
-    for pending in pending_replaces {
+    for mut pending in pending_replaces {
+        let prior_explicit = prior_directives
+            .get(pending.delete.id.as_inner())
+            .map(|directives| directives.depends_on.clone())
+            .unwrap_or_default();
+        pending
+            .delete
+            .dependencies
+            .extend_projected(&prior_explicit);
+        pending.delete.explicit_dependencies = prior_explicit.to_resolved_dependencies();
         let permanent_name_override =
             pending
                 .temporary_name
@@ -1687,28 +1833,36 @@ fn decompose_replace_into_effects(
 
 fn known_binding_names(
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
-) -> HashSet<AbsoluteBindingAddress> {
+    data_sources: &[ResolvedDataSource],
+) -> HashMap<AbsoluteBindingAddress, ResolvedResourceId> {
     managed
         .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .chain(
-            data_sources
-                .iter()
-                .filter_map(|resource| resource.binding.clone()),
-        )
+        .filter_map(|resource| {
+            resource
+                .binding
+                .clone()
+                .map(|binding| (binding, resource.resolved_id()))
+        })
+        .chain(data_sources.iter().filter_map(|resource| {
+            resource
+                .binding
+                .clone()
+                .map(|binding| (binding, ResolvedResourceId::new(resource.id.clone())))
+        }))
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cascade_dependent_updates(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
     dependents: &CascadeDependents<'_>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<()> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<()> {
     loop {
         promote_referenced_replaces_to_cbd(plan, pending_replaces, dependents, registry);
 
@@ -1728,6 +1882,7 @@ fn cascade_dependent_updates(
             registry,
             comparison_provider,
             outcome_unknown_import_replacements,
+            references,
         )?;
 
         if !promoted {
@@ -1739,11 +1894,10 @@ fn cascade_dependent_updates(
 
 fn promote_referenced_replaces_to_cbd(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
     dependents: &CascadeDependents<'_>,
     registry: &SchemaRegistry,
 ) {
-    let ref_targets = pending_reference_targets(pending_replaces, false);
     let mut promote = Vec::new();
 
     let managed_dependencies = dependents.managed.iter().map(|resource| {
@@ -1753,28 +1907,25 @@ fn promote_referenced_replaces_to_cbd(
                 .binding
                 .as_ref()
                 .map(ToString::to_string)
-                .unwrap_or_else(|| resource.id.identity_display().to_string()),
-            get_resource_dependencies(resource),
+                .unwrap_or_else(|| resource.id.to_string()),
+            resource
+                .all_dependencies()
+                .cloned()
+                .collect::<ResolvedDependencies>(),
         )
     });
-    let deferred_dependencies = dependents.deferred.templates().iter().map(|deferred| {
-        let mut dependencies =
-            get_resource_dependencies(deferred.template_resource().as_resource());
-        // Header bindings shadow top-level names only inside the body. The
-        // iterable still resolves in the enclosing scope.
-        for local in deferred.binding.names() {
-            dependencies.retain(|binding| binding.as_str() != local);
-        }
-        dependencies.extend(deferred.root_bindings());
-        (None, deferred.target().display_name(), dependencies)
+    let deferred_dependencies = dependents.deferred.0.iter().map(|compiled| {
+        (
+            None,
+            compiled.template.target().display_name(),
+            compiled.dependencies.dependencies(),
+        )
     });
-
-    for (dependent_id, dependent_name, deps) in managed_dependencies.chain(deferred_dependencies) {
-        for dep in &deps {
-            let Some(replaced_identity) = ref_targets.get(dep) else {
-                continue;
-            };
-            let Some(pending) = pending_replaces.get(replaced_identity) else {
+    for (dependent_id, dependent_name, dependencies) in
+        managed_dependencies.chain(deferred_dependencies)
+    {
+        for dependency in dependencies.iter() {
+            let Some(pending) = pending_replaces.get(dependency) else {
                 continue;
             };
             if pending.create_before_destroy
@@ -1782,14 +1933,12 @@ fn promote_referenced_replaces_to_cbd(
             {
                 continue;
             }
-            promote.push((replaced_identity.clone(), dependent_name.clone()));
+            promote.push((dependency.clone(), dependent_name.clone()));
         }
     }
-
     promote.sort_by(|(left_id, left_name), (right_id, right_name)| {
         left_id
-            .as_str()
-            .cmp(right_id.as_str())
+            .cmp(right_id)
             .then_with(|| left_name.cmp(right_name))
     });
     promote.dedup_by(|(left, _), (right, _)| left == right);
@@ -1820,7 +1969,14 @@ fn mark_pending_create_before_destroy(
         return Ok(());
     }
 
-    let mut create = pending.create.clone().into_inner();
+    let (
+        mut create,
+        value_dependencies,
+        explicit_dependencies,
+        persisted_value_destroy_dependencies,
+        persisted_explicit_destroy_dependencies,
+        value_dependency_reads,
+    ) = pending.create.clone().into_parts();
     create.directives.create_before_destroy = true;
     let from = State::existing(
         pending.delete.id.as_inner().clone(),
@@ -1829,38 +1985,53 @@ fn mark_pending_create_before_destroy(
     let temporary_name = temporary_name_for_cbd(&create, &from, registry)?;
     let create = apply_temporary_name(create, temporary_name.as_ref());
 
-    pending.create = ResolvedResource::new(create);
+    pending.create = ResolvedResource::from_resolved_parts_with_reads(
+        create,
+        value_dependencies,
+        explicit_dependencies,
+        value_dependency_reads,
+    )
+    .with_persisted_destroy_dependencies(
+        persisted_value_destroy_dependencies,
+        persisted_explicit_destroy_dependencies,
+    );
     pending.create_before_destroy = true;
     pending.delete.directives.create_before_destroy = true;
     pending.temporary_name = temporary_name;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn promote_pending_replaces_for_dependents(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<bool> {
-    let ref_targets = pending_reference_targets(pending_replaces, true);
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<bool> {
     let mut promoted = false;
 
     for resource in unresolved_managed {
-        let consumer_identity = resource_identity(resource);
-        let deps = get_resource_dependencies(resource);
-
-        for dep in &deps {
-            let Some(replaced_identity) = ref_targets.get(dep).cloned() else {
+        let consumer_identity = resource.resolved_id();
+        for dependency in resource.value_dependencies().iter() {
+            let Some(pending) = pending_replaces.get(dependency) else {
                 continue;
             };
+            let replaced_identity = dependency.clone();
             if consumer_identity == replaced_identity {
                 continue;
             }
 
-            let ref_attrs = cascade_ref_attrs(&resource.attributes, dep.as_str());
+            let dependency_binding = pending
+                .create
+                .binding
+                .as_ref()
+                .map(AbsoluteBindingAddress::as_str)
+                .unwrap_or_else(|| dependency.identity_str());
+            let ref_attrs = cascade_ref_attrs(&resource.attributes, dependency_binding);
             if ref_attrs.is_empty() {
                 continue;
             }
@@ -1879,14 +2050,27 @@ fn promote_pending_replaces_for_dependents(
             let owner_schema = resolved_comparison.owner_schema();
             let schema = owner_schema.schema().as_schema();
             let desired = PlanInputDesired::with_resource_schema(resource, Some(schema));
-            let create_only_refs = find_changed_create_only(
-                &ref_attr_names,
-                current.comparison_attributes(),
-                AuthoredRemovalEvidence::Unrecorded,
-                &desired,
-                schema,
-                resolved_comparison.context(),
-            );
+            let masked =
+                desired.masked_comparison(current.comparison_attributes(), None, Some(schema));
+            let create_only_refs = resolved_comparison.context().with_references(
+                references,
+                &resource.id,
+                |context| {
+                    let views = super::comparison::project_authored_attribute_views(
+                        &masked,
+                        None,
+                        Some(schema),
+                        context,
+                    );
+                    find_changed_create_only(
+                        &ref_attr_names,
+                        desired.authored(),
+                        &views,
+                        schema,
+                        context,
+                    )
+                },
+            )?;
 
             if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
                 let ref_hints: Vec<(String, String)> = ref_attrs
@@ -1950,22 +2134,6 @@ fn promote_pending_replaces_for_dependents(
     Ok(promoted)
 }
 
-fn pending_reference_targets(
-    pending_replaces: &HashMap<ResourceIdentity, PendingReplace>,
-    create_before_destroy_only: bool,
-) -> HashMap<AbsoluteBindingAddress, ResourceIdentity> {
-    let mut targets = HashMap::new();
-    for (identity, pending) in pending_replaces {
-        if create_before_destroy_only && !pending.create_before_destroy {
-            continue;
-        }
-        if let Some(binding) = &pending.create.binding {
-            targets.insert(binding.clone(), identity.clone());
-        }
-    }
-    targets
-}
-
 fn merge_pending_create_only(
     pending: &mut PendingReplace,
     attrs: ChangedCreateOnly,
@@ -1985,7 +2153,7 @@ fn merge_pending_create_only(
 
 fn promote_resource_to_pending_replace(
     plan: &mut Plan,
-    resource: &Resource,
+    resource: &ResolvedResource,
     changed_create_only: ChangedCreateOnly,
     ref_hints: Vec<(String, String)>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
@@ -2054,7 +2222,7 @@ fn take_update_from_plan(
 
 fn ensure_consumer_update(
     plan: &mut Plan,
-    resource: &Resource,
+    resource: &ResolvedResource,
     changed_attributes: &[String],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
@@ -2070,7 +2238,7 @@ fn ensure_consumer_update(
             ..
         } = effect
         {
-            *to = ResolvedResource::new(resource.clone());
+            *to = resource.clone();
             for attr in changed_attributes {
                 if !existing.contains(attr) {
                     existing.push(attr.clone());
@@ -2111,7 +2279,7 @@ fn ensure_consumer_update(
     plan.add(Effect::Update {
         from: Box::new(from),
         identifier,
-        to: ResolvedResource::new(resource.clone()),
+        to: resource.clone(),
         changed_attributes: changed_attributes.to_vec(),
     });
     true
@@ -2152,12 +2320,13 @@ mod typed_current_identifier_tests {
     #[test]
     fn ensure_consumer_update_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Resource", "consumer", None);
+        let resolved = ResolvedResource::new(resource.clone().with_dependency_phase(()));
         let current = current_with_authoritative_identifier(&resource);
         let mut plan = Plan::new();
 
         assert!(ensure_consumer_update(
             &mut plan,
-            &resource,
+            &resolved,
             &["input".to_string()],
             &current,
             &HashSet::new(),
@@ -2182,12 +2351,13 @@ mod typed_current_identifier_tests {
     #[test]
     fn pending_replace_promotion_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Resource", "consumer", None);
+        let resolved = ResolvedResource::new(resource.clone().with_dependency_phase(()));
         let current = current_with_authoritative_identifier(&resource);
         let mut plan = Plan::new();
 
         let pending = promote_resource_to_pending_replace(
             &mut plan,
-            &resource,
+            &resolved,
             ChangedCreateOnly::new(vec!["input".to_string()]).expect("non-empty change set"),
             Vec::new(),
             &current,

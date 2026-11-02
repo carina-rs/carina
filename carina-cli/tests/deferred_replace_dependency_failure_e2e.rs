@@ -485,6 +485,7 @@ let c_never_ran = mock.test.resource { name = "never-ran" }
     );
     assert_success("initial apply", &scenario.apply_config());
     let ready = scenario.project.join("delete-ready");
+    let release = scenario.project.join("delete-release");
     let stdout_path = scenario.project.join("destroy.stdout");
     let stderr_path = scenario.project.join("destroy.stderr");
     let mut child = KillOnDrop(
@@ -515,6 +516,7 @@ let c_never_ran = mock.test.resource { name = "never-ran" }
                 if cleanup_priority { "60000" } else { "1500" },
             )
             .env("CARINA_MOCK_DELETE_READY_PATH", &ready)
+            .env("CARINA_MOCK_DELETE_RELEASE_PATH", &release)
             .stdout(fs::File::create(&stdout_path).unwrap())
             .stderr(fs::File::create(&stderr_path).unwrap())
             .spawn()
@@ -522,6 +524,7 @@ let c_never_ran = mock.test.resource { name = "never-ran" }
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ready.exists() {
+        // wall-clock-ok: hang guard for a real CLI process and its retry-readiness handshake.
         assert!(
             Instant::now() < deadline,
             "delete did not reach readiness handshake"
@@ -538,26 +541,31 @@ let c_never_ran = mock.test.resource { name = "never-ran" }
         unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGINT) },
         0
     );
+    while !fs::read_to_string(&stderr_path)
+        .unwrap()
+        .contains("Received shutdown signal: Interrupt.")
+    {
+        // wall-clock-ok: hang guard waiting for the real CLI to acknowledge SIGINT.
+        assert!(
+            Instant::now() < deadline,
+            "graceful shutdown was not observed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     if cleanup_priority {
-        while !fs::read_to_string(&stderr_path)
-            .unwrap()
-            .contains("Received shutdown signal: Interrupt.")
-        {
-            assert!(
-                Instant::now() < deadline,
-                "graceful shutdown was not observed"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert_eq!(
             unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
             0
         );
+    } else {
+        // Graceful draining can finish only after the CLI has observed SIGINT.
+        fs::write(&release, b"").unwrap();
     }
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             break status;
         }
+        // wall-clock-ok: hang guard for a real CLI process and its retry-readiness handshake.
         assert!(
             Instant::now() < deadline,
             "destroy did not finish cancellation"

@@ -31,7 +31,7 @@ wait_expr = { "wait" ~ identifier ~ "{" ~ wait_attr* ~ "}" }
 wait_attr = { wait_until_attr | wait_timeout_attr | wait_depends_on_attr }
 wait_until_attr = { "until" ~ "=" ~ validate_expr }
 wait_timeout_attr = { "timeout" ~ "=" ~ duration_literal }
-wait_depends_on_attr = { "depends_on" ~ "=" ~ "[" ~ (identifier ~ ("," ~ identifier)*)? ~ ","? ~ "]" }
+wait_depends_on_attr = { "depends_on" ~ "=" ~ list }
 
 // User-defined function: fn name(params) { body }
 fn_def = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ (":" ~ type_expr)? ~ "{" ~ fn_body ~ "}" }

@@ -67,7 +67,11 @@ mod tests {
 
     #[test]
     fn png_is_valid_and_exactly_twice_the_svg_dimensions() {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name("mixed_operations");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+
+        let fixture =
+            crate::fixture_plan::build_plan_from_fixture_name(&runtime, "mixed_operations")
+                .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
             plan: &fixture.plan,

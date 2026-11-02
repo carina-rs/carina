@@ -196,6 +196,82 @@ fn assert_resume_count(plan: &PlanFile, expected: usize) {
     assert_eq!(create_count, 0, "in-flight state must never plan a create");
 }
 
+fn exercise_saved_plan_removal_of_create(outcome_unknown: bool) {
+    for refresh in [true, false] {
+        let scenario = Scenario::new_with_provider(
+            r#"let retired = mock.test.resource {
+  name = "retired"
+  directives { provider = east }
+}"#,
+            "provider mock {}\nlet east = provider mock {}".to_string(),
+        );
+        scenario.init();
+        let current_kind = if outcome_unknown {
+            assert_success(
+                "initial successful apply",
+                &scenario.apply_with_modes("success", "resumed"),
+            );
+            let mut state = scenario.state_json();
+            state["resources"][0]["current"] = serde_json::json!({
+                "kind": "create_outcome_unknown",
+                "started_at": "2026-10-30T03:00:00Z"
+            });
+            scenario.write_state_json(&state);
+            "create_outcome_unknown"
+        } else {
+            assert_failed(
+                "initial pending apply",
+                &scenario.apply_with_modes("pending", "resumed"),
+            );
+            "create_in_flight"
+        };
+        assert_eq!(only_current(&scenario.state_json())["kind"], current_kind);
+        scenario.write_config("removed { from = mock.test.resource 'retired' }");
+
+        let provider_before = fs::read(&scenario.mock_state).ok();
+        let (output, plan, _) = scenario.save_plan(refresh, "removed.plan");
+        assert_success("save removal-only plan", &output);
+        assert!(matches!(
+            plan.plan.effects(),
+            [Effect::Remove { id }] if id.provider_instance.as_deref() == Some("east")
+        ));
+        assert!(
+            plan.current_states.is_empty(),
+            "removed rows must stay outside saved refresh snapshots"
+        );
+
+        let operation_log = scenario.project.join("removal-operations.log");
+        let apply = scenario
+            .carina(&["apply", "removed.plan", "--auto-approve"])
+            .env("CARINA_MOCK_OP_LOG", &operation_log)
+            .output()
+            .expect("apply saved removal-only plan");
+        assert_success("apply saved removal-only plan", &apply);
+        assert!(
+            scenario.state_json()["resources"]
+                .as_array()
+                .expect("state resources must be an array")
+                .is_empty()
+        );
+        assert_eq!(fs::read(&scenario.mock_state).ok(), provider_before);
+        assert_eq!(
+            fs::read_to_string(operation_log).unwrap_or_default(),
+            "",
+            "state-only removal must not call the provider"
+        );
+    }
+}
+
+#[test]
+fn saved_plan_removes_create_outcome_unknown_row() {
+    exercise_saved_plan_removal_of_create(true);
+}
+
+#[test]
+fn saved_plan_removes_create_in_flight_row() {
+    exercise_saved_plan_removal_of_create(false);
+}
+
 fn exercise_in_flight_cutover(resource: &str) {
     let scenario = Scenario::new(resource);
     scenario.init();

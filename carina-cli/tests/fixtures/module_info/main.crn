@@ -13,8 +13,8 @@ arguments {
 }
 
 attributes {
-  security_group_id: awscc.ec2.SecurityGroup = web_sg.id
-  instance_id      : awscc.ec2.Instance = web_instance.id
+  security_group_id = web_sg.id
+  instance_id       = web_instance.id
 }
 
 let web_sg = awscc.ec2.SecurityGroup {

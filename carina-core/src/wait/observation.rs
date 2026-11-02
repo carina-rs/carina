@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::resource::{ResourceId, Value};
+use crate::resource::{ResourceId, SnapshotValue as Value};
 use crate::wait::predicate::{AttrPath, WaitPredicate};
 
 /// Snapshot of what a Wait effect is observing during a single poll
@@ -76,6 +76,43 @@ impl<'a> WaitObservation<'a> {
     }
 }
 
+/// Project just the watched historical paths into live evaluation input.
+/// Unrelated hash leaves never enter the predicate evaluator.
+pub(crate) fn evaluation_inputs(
+    predicate: &WaitPredicate,
+    attributes: &HashMap<String, Value>,
+) -> Result<HashMap<String, crate::resource::Value>, crate::resource::UnavailableSecretError> {
+    use crate::resource::{AccessMissPolicy, ConcreteValue, PathSegment, SnapshotSelectionError};
+    let mut inputs = HashMap::new();
+    for path in predicate.watched_attrs() {
+        let (root, rest) = path
+            .segments()
+            .split_first()
+            .expect("attribute paths are nonempty");
+        let Some(snapshot) = attributes.get(root) else {
+            continue;
+        };
+        let segments = rest
+            .iter()
+            .map(|name| PathSegment::Field { name: name.clone() })
+            .collect::<Vec<_>>();
+        let mut value = match snapshot.select_path(&segments, root, AccessMissPolicy::Error) {
+            Ok(value) => value,
+            Err(SnapshotSelectionError::UnavailableSecret(error)) => return Err(error),
+            Err(SnapshotSelectionError::Access(_) | SnapshotSelectionError::DeferredMiss(_)) => {
+                continue;
+            }
+        };
+        for key in rest.iter().rev() {
+            value = crate::resource::Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from(
+                [(key.clone(), value)],
+            )));
+        }
+        inputs.insert(root.clone(), value);
+    }
+    Ok(inputs)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -83,7 +120,7 @@ mod tests {
     use indexmap::IndexMap;
 
     use super::WaitObservation;
-    use crate::resource::{ConcreteValue, ResourceId, Value};
+    use crate::resource::{ConcreteValue, ResourceId, SnapshotValue as Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     fn string_value(value: &str) -> Value {
@@ -91,7 +128,11 @@ mod tests {
     }
 
     fn equals_predicate(attr: AttrPath, value: &str) -> WaitPredicate {
-        WaitPredicate::equals(attr, string_value(value)).unwrap()
+        WaitPredicate::equals(
+            attr,
+            crate::resource::Value::Concrete(ConcreteValue::String(value.into())),
+        )
+        .unwrap()
     }
 
     #[test]

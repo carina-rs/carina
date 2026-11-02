@@ -13,6 +13,7 @@ fn snapshot_module_list_with_imports() {
 
     let config = config_loader::load_configuration(
         &carina_core::paths::ResolvedPath::new(&fixture_dir).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     let output = format_module_list(&config.parsed.uses);
@@ -27,6 +28,7 @@ fn snapshot_module_list_empty() {
 
     let config = config_loader::load_configuration(
         &carina_core::paths::ResolvedPath::new(&fixture_dir).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     let output = format_module_list(&config.parsed.uses);

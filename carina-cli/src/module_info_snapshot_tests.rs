@@ -25,6 +25,7 @@ fn module_info_output(fixture_name: &str) -> String {
 
     let parsed = module_resolver::load_module_from_directory(
         &carina_core::paths::ResolvedPath::new(&module_dir).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("failed to load fixture module");
     let module_name = module_resolver::derive_module_name(
@@ -33,7 +34,7 @@ fn module_info_output(fixture_name: &str) -> String {
     let signature = FileSignature::from_parsed_file_with_name(
         &parsed,
         &module_name,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     strip_ansi(&signature.display())
 }
@@ -48,6 +49,7 @@ fn module_info_dir_output(fixture_name: &str) -> String {
 
     let parsed = module_resolver::load_module_from_directory(
         &carina_core::paths::ResolvedPath::new(&dir_path).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("failed to load fixture dir");
     let module_name = module_resolver::derive_module_name(
@@ -56,7 +58,7 @@ fn module_info_dir_output(fixture_name: &str) -> String {
     let signature = FileSignature::from_parsed_file_with_name(
         &parsed,
         &module_name,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     strip_ansi(&signature.display())
 }

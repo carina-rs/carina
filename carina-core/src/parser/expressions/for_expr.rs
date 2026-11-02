@@ -7,7 +7,7 @@
 //! a later pass can finish the expansion once the upstream value
 //! resolves.
 
-use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandleMetadata};
 use crate::parser::expressions::primary::parse_postfix_eval;
 use crate::parser::grammar::ParserBindingName;
 use crate::parser::{
@@ -422,11 +422,13 @@ pub(crate) fn parse_for_expr(
                 let expansion_key = target.element_address(&element);
                 let mut iter_ctx = ctx.child_scope();
                 let metadata = match structural_handle_metadata.as_ref() {
-                    Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
+                    Some(UnexpandedStructuralHandleMetadata::List(items)) => {
+                        items.get(i).cloned().flatten()
+                    }
                     Some(
-                        StructuralHandleMetadata::Handle { .. }
-                        | StructuralHandleMetadata::Map(_)
-                        | StructuralHandleMetadata::ExpressionOperands(_),
+                        UnexpandedStructuralHandleMetadata::Handle { .. }
+                        | UnexpandedStructuralHandleMetadata::Map(_)
+                        | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -463,11 +465,13 @@ pub(crate) fn parse_for_expr(
                     Value::Concrete(ConcreteValue::Int(i as i64)),
                 );
                 let metadata = match structural_handle_metadata.as_ref() {
-                    Some(StructuralHandleMetadata::List(items)) => items.get(i).cloned().flatten(),
+                    Some(UnexpandedStructuralHandleMetadata::List(items)) => {
+                        items.get(i).cloned().flatten()
+                    }
                     Some(
-                        StructuralHandleMetadata::Handle { .. }
-                        | StructuralHandleMetadata::Map(_)
-                        | StructuralHandleMetadata::ExpressionOperands(_),
+                        UnexpandedStructuralHandleMetadata::Handle { .. }
+                        | UnexpandedStructuralHandleMetadata::Map(_)
+                        | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -508,11 +512,13 @@ pub(crate) fn parse_for_expr(
                     Value::Concrete(ConcreteValue::String(key.clone().into())),
                 );
                 let metadata = match structural_handle_metadata.as_ref() {
-                    Some(StructuralHandleMetadata::Map(entries)) => entries.get(key).cloned(),
+                    Some(UnexpandedStructuralHandleMetadata::Map(entries)) => {
+                        entries.get(key).cloned()
+                    }
                     Some(
-                        StructuralHandleMetadata::Handle { .. }
-                        | StructuralHandleMetadata::List(_)
-                        | StructuralHandleMetadata::ExpressionOperands(_),
+                        UnexpandedStructuralHandleMetadata::Handle { .. }
+                        | UnexpandedStructuralHandleMetadata::List(_)
+                        | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -600,7 +606,7 @@ pub(crate) fn parse_for_expr(
             }
             let iterable_type = if structural_handle_metadata
                 .as_ref()
-                .is_some_and(StructuralHandleMetadata::is_handle)
+                .is_some_and(UnexpandedStructuralHandleMetadata::is_handle)
             {
                 "resource handle inside a computed value".to_string()
             } else if let Some(binding) = structural_for_binding {
@@ -714,7 +720,7 @@ struct ParsedForIterable {
     bare_unbound_identifier: Option<String>,
     structural_for_binding: Option<String>,
     provisional_binding: Option<String>,
-    structural_handle_metadata: Option<StructuralHandleMetadata>,
+    structural_handle_metadata: Option<UnexpandedStructuralHandleMetadata>,
 }
 
 fn syntactic_bare_unbound_identifier(

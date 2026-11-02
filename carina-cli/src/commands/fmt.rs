@@ -4,11 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 use similar::{ChangeTag, TextDiff};
 
 use carina_core::config_loader::{
-    find_crn_files_in_dir, find_crn_files_recursive, load_configuration,
+    find_crn_files_in_dir, find_crn_files_recursive, load_configuration_with_config,
 };
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::{ProviderConfig as GenericProviderConfig, UseStatement};
@@ -45,17 +45,24 @@ impl FmtMode {
         }
     }
 
-    fn print_diff_if_requested(&self, file: &Path, original: &str, formatted: &str) {
+    fn print_diff_if_requested(
+        &self,
+        color_mode: crate::output_style::ColorMode,
+        file: &Path,
+        original: &str,
+        formatted: &str,
+    ) {
         match self {
             Self::Write | Self::Check { show_diff: false } => {}
             Self::Preview | Self::Check { show_diff: true } => {
-                print_diff(file, original, formatted);
+                print_diff(color_mode, file, original, formatted);
             }
         }
     }
 
     fn write_file_if_requested(
         &self,
+        color_mode: crate::output_style::ColorMode,
         file: &ResolvedPath,
         label: &Path,
         formatted: &str,
@@ -64,14 +71,18 @@ impl FmtMode {
             Self::Write => {
                 file.atomic_replace(formatted.as_bytes())
                     .map_err(|e| format!("Failed to write {}: {}", label.display(), e))?;
-                println!("{} {}", "Formatted:".green(), label.display());
+                println!("{} {}", "Formatted:".green(color_mode), label.display());
                 Ok(())
             }
             Self::Preview | Self::Check { .. } => Ok(()),
         }
     }
 
-    fn warn_if_providers_unavailable(&self, diagnostics: &BTreeSet<String>) {
+    fn warn_if_providers_unavailable(
+        &self,
+        color_mode: crate::output_style::ColorMode,
+        diagnostics: &BTreeSet<String>,
+    ) {
         match self {
             Self::Write => {}
             Self::Preview | Self::Check { .. } => {
@@ -79,7 +90,7 @@ impl FmtMode {
                     eprintln!(
                         "{}",
                         "Warning: provider(s) unavailable; block-syntax conversion skipped"
-                            .yellow()
+                            .yellow(color_mode)
                     );
                     for diagnostic in diagnostics {
                         eprintln!("  {diagnostic}");
@@ -102,8 +113,16 @@ struct FormattingDirectoryConfig {
     uses: Vec<UseStatement>,
 }
 
-fn load_formatting_directory_config(directory: &ResolvedPath) -> FormattingDirectoryConfig {
-    let Some(loaded) = load_configuration(directory).ok() else {
+fn load_formatting_directory_config(
+    directory: &ResolvedPath,
+    environment: &carina_core::EnvironmentSnapshot,
+) -> FormattingDirectoryConfig {
+    let Some(loaded) = load_configuration_with_config(
+        directory,
+        &carina_core::parser::ProviderContext::new(environment.clone()),
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .ok() else {
         return FormattingDirectoryConfig::default();
     };
     let parsed = loaded.parsed.into_parsed();
@@ -111,6 +130,24 @@ fn load_formatting_directory_config(directory: &ResolvedPath) -> FormattingDirec
         providers: parsed.providers,
         uses: parsed.uses,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn formatting_discovery_uses_environment_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "fn version() { env('MODE') }\nprovider mock { version = version() }\n",
+    )
+    .unwrap();
+    let environment = carina_core::EnvironmentSnapshot::new([("MODE".to_string(), "1.0.0".into())]);
+    let config = load_formatting_directory_config(
+        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &environment,
+    );
+    assert_eq!(config.providers.len(), 1);
+    assert_eq!(config.providers[0].name, "mock");
 }
 
 fn block_names_from_config<F>(
@@ -144,7 +181,8 @@ fn block_names_for_dir<F>(
 where
     F: FnMut(&[ProviderConfig], &ResolvedPath) -> Result<FormattingProviderLoad, AppError>,
 {
-    let config = load_formatting_directory_config(directory);
+    let config =
+        load_formatting_directory_config(directory, &carina_core::EnvironmentSnapshot::empty());
     block_names_from_config(directory, &config, &mut build_factories)
 }
 
@@ -155,6 +193,7 @@ fn invocation_directory_configs(
     root: &ResolvedPath,
     files: &[ResolvedPath],
     recursive: bool,
+    environment: &carina_core::EnvironmentSnapshot,
 ) -> Result<DirectoryConfigs, AppError> {
     let directories = if recursive {
         files
@@ -167,7 +206,7 @@ fn invocation_directory_configs(
     let mut configs = HashMap::new();
     for directory in directories {
         configs.entry(directory.identity()).or_insert_with(|| {
-            let config = load_formatting_directory_config(&directory);
+            let config = load_formatting_directory_config(&directory, environment);
             (directory, config)
         });
     }
@@ -274,21 +313,29 @@ where
 /// that invocation has no caller context, matching an LSP session opened
 /// without the caller workspace.
 pub fn run_fmt(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     mode: FmtMode,
     recursive: bool,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     // Schema-aware conversion costs one installed-WASM provider load per
     // provider-declaring directory visible to the invocation. The startup cost
     // is intentional: editor and CLI formatting correctness must win over the
     // old schema-free fast path.
-    run_fmt_with_factory_builder(path, mode, recursive, |providers, directory| {
-        FormattingProviderLoad::load(user_dirs, providers, directory)
-    })
+    run_fmt_with_factory_builder(
+        color_mode,
+        runtime.environment(),
+        path,
+        mode,
+        recursive,
+        |providers, directory| FormattingProviderLoad::load(runtime, providers, directory),
+    )
 }
 
 fn run_fmt_with_factory_builder<F>(
+    color_mode: crate::output_style::ColorMode,
+    environment: &carina_core::EnvironmentSnapshot,
     path: &Path,
     mode: FmtMode,
     recursive: bool,
@@ -313,13 +360,13 @@ where
     };
 
     if files.is_empty() {
-        println!("{}", "No .crn files found.".yellow());
+        println!("{}", "No .crn files found.".yellow(color_mode));
         return Ok(());
     }
 
     let mut needs_formatting = Vec::new();
     let mut errors = Vec::new();
-    let directory_configs = invocation_directory_configs(&root, &files, recursive)?;
+    let directory_configs = invocation_directory_configs(&root, &files, recursive, environment)?;
     let import_map = invocation_import_map(&directory_configs);
     let mut block_names_by_dir: HashMap<CanonicalPath, Arc<DirectoryBlockNames>> = HashMap::new();
     let mut provider_load_diagnostics = BTreeSet::new();
@@ -353,8 +400,8 @@ where
                 if content != formatted {
                     needs_formatting.push((label.clone(), content.clone(), formatted.clone()));
 
-                    mode.print_diff_if_requested(&label, &content, &formatted);
-                    mode.write_file_if_requested(file, &label, &formatted)?;
+                    mode.print_diff_if_requested(color_mode, &label, &content, &formatted);
+                    mode.write_file_if_requested(color_mode, file, &label, &formatted)?;
                 }
             }
             Err(e) => {
@@ -363,23 +410,26 @@ where
         }
     }
 
-    mode.warn_if_providers_unavailable(&provider_load_diagnostics);
+    mode.warn_if_providers_unavailable(color_mode, &provider_load_diagnostics);
 
     // Print summary
     match mode {
         FmtMode::Check { .. } => {
             if needs_formatting.is_empty() && errors.is_empty() {
-                println!("{}", "All files are properly formatted.".green());
+                println!("{}", "All files are properly formatted.".green(color_mode));
                 Ok(())
             } else {
                 if !needs_formatting.is_empty() {
-                    println!("{}", "The following files need formatting:".yellow());
+                    println!(
+                        "{}",
+                        "The following files need formatting:".yellow(color_mode)
+                    );
                     for (file, _, _) in &needs_formatting {
                         println!("  {}", file.display());
                     }
                 }
                 for (file, err) in &errors {
-                    eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
+                    eprintln!("{} {}: {}", "Error:".red(color_mode), file.display(), err);
                 }
                 Err(AppError::Validation(
                     "Some files are not properly formatted".to_string(),
@@ -387,55 +437,78 @@ where
             }
         }
         FmtMode::Preview => {
-            report_formatting_errors(&errors)?;
+            report_formatting_errors(color_mode, &errors)?;
             let count = needs_formatting.len();
             if count > 0 {
                 println!(
                     "{}",
                     format!("{} file(s) would be reformatted.", count)
-                        .yellow()
-                        .bold()
+                        .yellow(color_mode)
+                        .bold(color_mode)
                 );
             } else {
-                println!("{}", "All files are already properly formatted.".green());
+                println!(
+                    "{}",
+                    "All files are already properly formatted.".green(color_mode)
+                );
             }
             Ok(())
         }
         FmtMode::Write => {
-            report_formatting_errors(&errors)?;
+            report_formatting_errors(color_mode, &errors)?;
             let count = needs_formatting.len();
             if count > 0 {
-                println!("{}", format!("Formatted {} file(s).", count).green().bold());
+                println!(
+                    "{}",
+                    format!("Formatted {} file(s).", count)
+                        .green(color_mode)
+                        .bold(color_mode)
+                );
             } else {
-                println!("{}", "All files are already properly formatted.".green());
+                println!(
+                    "{}",
+                    "All files are already properly formatted.".green(color_mode)
+                );
             }
             Ok(())
         }
     }
 }
 
-fn report_formatting_errors(errors: &[(PathBuf, String)]) -> Result<(), AppError> {
+fn report_formatting_errors(
+    color_mode: crate::output_style::ColorMode,
+    errors: &[(PathBuf, String)],
+) -> Result<(), AppError> {
     if errors.is_empty() {
         return Ok(());
     }
 
     for (file, err) in errors {
-        eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
+        eprintln!("{} {}: {}", "Error:".red(color_mode), file.display(), err);
     }
     Err(AppError::Validation(
         "Some files had formatting errors".to_string(),
     ))
 }
 
-fn print_diff(file: &Path, original: &str, formatted: &str) {
-    println!("\n{} {}:", "Diff for".cyan().bold(), file.display());
+fn print_diff(
+    color_mode: crate::output_style::ColorMode,
+    file: &Path,
+    original: &str,
+    formatted: &str,
+) {
+    println!(
+        "\n{} {}:",
+        "Diff for".cyan(color_mode).bold(color_mode),
+        file.display()
+    );
 
     let diff = TextDiff::from_lines(original, formatted);
     for change in diff.iter_all_changes() {
         let sign = match change.tag() {
-            ChangeTag::Delete => "-".red(),
-            ChangeTag::Insert => "+".green(),
-            ChangeTag::Equal => " ".normal(),
+            ChangeTag::Delete => "-".red(color_mode),
+            ChangeTag::Insert => "+".green(color_mode),
+            ChangeTag::Equal => " ".normal(color_mode),
         };
         print!("{}{}", sign, change);
     }
@@ -445,9 +518,7 @@ fn print_diff(file: &Path, original: &str, formatted: &str) {
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
-    use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-    use indexmap::IndexMap;
 
     #[cfg(unix)]
     #[test]
@@ -458,9 +529,14 @@ mod tests {
         fs::create_dir(&real).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         fs::write(real.join("main.crn"), "provider mock {}\n").unwrap();
-        let error = run_fmt_with_factory_builder(&link, FmtMode::Preview, false, |_, directory| {
-            Err(AppError::Config(directory.display().to_string()))
-        })
+        let error = run_fmt_with_factory_builder(
+            crate::output_style::ColorMode::Plain,
+            &carina_core::EnvironmentSnapshot::empty(),
+            &link,
+            FmtMode::Preview,
+            false,
+            |_, directory| Err(AppError::Config(directory.display().to_string())),
+        )
         .unwrap_err()
         .to_string();
         assert!(error.contains(&link.display().to_string()), "{error}");
@@ -503,10 +579,6 @@ mod tests {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
         }
 
         fn create_provider(
@@ -579,6 +651,7 @@ mod tests {
                         block_name: "entry_from_factory",
                     })];
                 Ok(FormattingProviderLoad::for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
                     LoadedProviderFactory::for_test(factories),
                     providers,
                     HashMap::new(),
@@ -597,6 +670,7 @@ mod tests {
 
     #[test]
     fn file_path_is_rejected_before_factory_builder_runs() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("main.crn");
         std::fs::write(
@@ -609,14 +683,22 @@ mod tests {
         .unwrap();
         let mut builder_calls = 0;
 
-        let error = run_fmt_with_factory_builder(&file, FmtMode::Write, false, |providers, _| {
-            builder_calls += 1;
-            Ok(FormattingProviderLoad::for_test(
-                Vec::new(),
-                providers,
-                HashMap::new(),
-            ))
-        })
+        let error = run_fmt_with_factory_builder(
+            color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
+            &file,
+            FmtMode::Write,
+            false,
+            |providers, _| {
+                builder_calls += 1;
+                Ok(FormattingProviderLoad::for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    Vec::new(),
+                    providers,
+                    HashMap::new(),
+                ))
+            },
+        )
         .expect_err("a file path must be rejected");
 
         assert!(error.to_string().contains("expected directory, got file"));
@@ -625,16 +707,24 @@ mod tests {
 
     #[test]
     fn provider_factory_builder_error_fails_formatting_command() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.crn"), "provider example {}\n").unwrap();
 
-        let error = run_fmt_with_factory_builder(tmp.path(), FmtMode::Write, false, |_, _| {
-            Err(AppError::from(
-                carina_provider_resolver::GrantParseError::MissingSeparator {
-                    value: "not-a-grant".to_string(),
-                },
-            ))
-        })
+        let error = run_fmt_with_factory_builder(
+            color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
+            tmp.path(),
+            FmtMode::Write,
+            false,
+            |_, _| {
+                Err(AppError::from(
+                    carina_provider_resolver::GrantParseError::MissingSeparator {
+                        value: "not-a-grant".to_string(),
+                    },
+                ))
+            },
+        )
         .expect_err("invalid grant input must fail once provider loading begins");
 
         assert!(matches!(error, AppError::TrustedLocalGrant(_)));
@@ -649,6 +739,7 @@ mod tests {
             &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
             |providers, _| {
                 Ok(FormattingProviderLoad::for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
                     Vec::<LoadedProviderFactory>::new(),
                     providers,
                     HashMap::new(),
@@ -660,6 +751,7 @@ mod tests {
             &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
             |providers, _| {
                 Ok(FormattingProviderLoad::for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
                     Vec::<LoadedProviderFactory>::new(),
                     providers,
                     HashMap::from([(
@@ -715,6 +807,7 @@ let imported = use {{
 
     #[test]
     fn recursive_module_uses_lexicographically_first_callers_block_names() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let tmp = tempfile::tempdir().unwrap();
         let module = tmp.path().join("modules").join("m");
         let resource =
@@ -731,26 +824,34 @@ let imported = use {{
         );
         let mut built_for = Vec::new();
 
-        run_fmt_with_factory_builder(tmp.path(), FmtMode::Write, true, |providers, base_dir| {
-            let directory_name = base_dir
-                .display()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap();
-            built_for.push(directory_name.to_string());
-            let block_name = match directory_name {
-                "a-caller" => "entry_from_a",
-                "z-caller" => "entry_from_z",
-                other => panic!("unexpected provider directory: {other}"),
-            };
-            let factories: Vec<Box<dyn ProviderFactory>> =
-                vec![Box::new(FactoryWithBlockSchema { block_name })];
-            Ok(FormattingProviderLoad::for_test(
-                LoadedProviderFactory::for_test(factories),
-                providers,
-                HashMap::new(),
-            ))
-        })
+        run_fmt_with_factory_builder(
+            color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
+            tmp.path(),
+            FmtMode::Write,
+            true,
+            |providers, base_dir| {
+                let directory_name = base_dir
+                    .display()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap();
+                built_for.push(directory_name.to_string());
+                let block_name = match directory_name {
+                    "a-caller" => "entry_from_a",
+                    "z-caller" => "entry_from_z",
+                    other => panic!("unexpected provider directory: {other}"),
+                };
+                let factories: Vec<Box<dyn ProviderFactory>> =
+                    vec![Box::new(FactoryWithBlockSchema { block_name })];
+                Ok(FormattingProviderLoad::for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    LoadedProviderFactory::for_test(factories),
+                    providers,
+                    HashMap::new(),
+                ))
+            },
+        )
         .unwrap();
 
         let formatted = std::fs::read_to_string(resource).unwrap();
@@ -762,20 +863,29 @@ let imported = use {{
 
     #[test]
     fn non_recursive_module_without_caller_in_scope_stays_plain() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let tmp = tempfile::tempdir().unwrap();
         let module = tmp.path().join("module");
         let resource =
             write_convertible_module(&carina_core::paths::ResolvedPath::new(&module).unwrap());
         let mut builder_calls = 0;
 
-        run_fmt_with_factory_builder(&module, FmtMode::Write, false, |providers, _| {
-            builder_calls += 1;
-            Ok(FormattingProviderLoad::for_test(
-                Vec::new(),
-                providers,
-                HashMap::new(),
-            ))
-        })
+        run_fmt_with_factory_builder(
+            color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
+            &module,
+            FmtMode::Write,
+            false,
+            |providers, _| {
+                builder_calls += 1;
+                Ok(FormattingProviderLoad::for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    Vec::new(),
+                    providers,
+                    HashMap::new(),
+                ))
+            },
+        )
         .unwrap();
 
         let formatted = std::fs::read_to_string(resource).unwrap();
@@ -786,6 +896,7 @@ let imported = use {{
 
     #[test]
     fn recursive_format_memoizes_block_names_by_exact_directory() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let tmp = tempfile::tempdir().unwrap();
         let mut resources = Vec::new();
         for directory_name in ["a", "b"] {
@@ -809,26 +920,34 @@ let imported = use {{
         }
         let mut built_for = Vec::new();
 
-        run_fmt_with_factory_builder(tmp.path(), FmtMode::Write, true, |providers, base_dir| {
-            let directory_name = base_dir
-                .display()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap();
-            built_for.push(directory_name.to_string());
-            let block_name = match directory_name {
-                "a" => "entries_a",
-                "b" => "entries_b",
-                other => panic!("unexpected provider directory: {other}"),
-            };
-            let factories: Vec<Box<dyn ProviderFactory>> =
-                vec![Box::new(FactoryWithBlockSchema { block_name })];
-            Ok(FormattingProviderLoad::for_test(
-                LoadedProviderFactory::for_test(factories),
-                providers,
-                HashMap::new(),
-            ))
-        })
+        run_fmt_with_factory_builder(
+            color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
+            tmp.path(),
+            FmtMode::Write,
+            true,
+            |providers, base_dir| {
+                let directory_name = base_dir
+                    .display()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap();
+                built_for.push(directory_name.to_string());
+                let block_name = match directory_name {
+                    "a" => "entries_a",
+                    "b" => "entries_b",
+                    other => panic!("unexpected provider directory: {other}"),
+                };
+                let factories: Vec<Box<dyn ProviderFactory>> =
+                    vec![Box::new(FactoryWithBlockSchema { block_name })];
+                Ok(FormattingProviderLoad::for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    LoadedProviderFactory::for_test(factories),
+                    providers,
+                    HashMap::new(),
+                ))
+            },
+        )
         .unwrap();
 
         for (directory_name, resource) in resources {

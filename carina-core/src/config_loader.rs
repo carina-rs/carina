@@ -333,19 +333,31 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
     pub fn retry_unchecked_export_inference(
         &mut self,
         schemas: &crate::provider::ProviderLoadedSchemaRegistry,
+        context: &ProviderContext,
     ) -> crate::validation::inference::ExportsInferredWithLoadedProviderSchemas<'_> {
-        crate::validation::inference::retry_unchecked_export_inference(&mut self.parsed, schemas)
+        crate::validation::inference::retry_unchecked_export_inference(
+            &mut self.parsed,
+            schemas,
+            context,
+        )
     }
 
     /// Resolve root-owned type declarations while preserving this witness.
     pub fn resolve_type_exprs_report(
         &mut self,
-        config: &ProviderContext,
+        config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> crate::validation::FileTypeResolutionReport {
         crate::validation::resolve_file_type_exprs_report(&mut self.parsed, config, None)
     }
 
     /// Resolve root-relative resource references while preserving this witness.
+    pub fn resolve_resource_refs_in_session(
+        &mut self,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<(), parser::ParseError> {
+        parser::resolve_resource_refs_in_session(&mut self.parsed, session)
+    }
+
     pub fn resolve_resource_refs_with_config(
         &mut self,
         config: &ProviderContext,
@@ -527,7 +539,7 @@ fn collect_file_declarations(
         .filter(|name| !argument_names.contains(name) && !function_names.contains(name))
         .collect();
     for name in local_variable_names {
-        if parsed.variables.contains_key(name)
+        if parsed.variables.contains_key(name.as_str())
             && !binding_names.contains(name.as_str())
             && !argument_names.contains(name.as_str())
         {
@@ -580,8 +592,11 @@ pub fn find_duplicate_declarations_in_parsed_file(
 }
 
 /// Load configuration from a directory containing .crn files
-pub fn load_configuration(path: &ResolvedPath) -> Result<LoadedConfig, String> {
-    load_configuration_with_config(path, &ProviderContext::default(), &SchemaRegistry::new())
+pub fn load_configuration(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+) -> Result<LoadedConfig, String> {
+    load_configuration_with_config(path, config, &SchemaRegistry::new())
 }
 
 /// Load configuration from a directory containing .crn files.
@@ -698,7 +713,7 @@ pub fn load_configuration_with_config(
         // Phase transition: post-resolve, run rhs-driven inference over
         // every `exports { ... }` declaration so downstream consumers
         // retain origin and unchecked provenance per export (#2360 stage 2).
-        let inferred = crate::validation::inference::apply_inference(merged, schemas);
+        let inferred = crate::validation::inference::apply_inference(merged, schemas, config);
 
         Ok(LoadedConfig {
             parsed: RootDirectoryParse::new(inferred),
@@ -1104,7 +1119,7 @@ pub(crate) fn merge_parsed_file<E, B: BindingAddress>(
 #[derive(Clone, PartialEq)]
 struct DirectorySeedState {
     variables: IndexMap<String, parser::ParsedValue>,
-    metadata: crate::parser::ParserBindingMetadata,
+    metadata: crate::parser::ParserSeedMetadata,
 }
 
 #[derive(Debug)]
@@ -1201,7 +1216,12 @@ pub(crate) fn parse_directory_files_located_from_root(
     provisional_seeds.extend(
         directory_module_parameters
             .iter()
-            .map(|name| parser::BindingSeed::module_parameter(name)),
+            // The syntax-classification pass does not know an argument's
+            // declared type when parsing a sibling file. Preserve the bare
+            // name as a provisional reference here; the fixed-point union
+            // replaces it with either a typed structural handle (`Ref`) or a
+            // value-shaped module-argument placeholder before the final pass.
+            .map(|name| parser::BindingSeed::provisional(name)),
     );
 
     // Pass 1.a: classify declarations with the complete syntactic scope.
@@ -1224,15 +1244,16 @@ pub(crate) fn parse_directory_files_located_from_root(
         merge_parsed_file(&mut pass1_union, parsed);
     }
     let structural = pass1_union.structural_binding_names();
-    let module_parameters: HashSet<&str> = pass1_union
+    let module_parameters: HashMap<&str, &parser::TypeExpr> = pass1_union
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
     parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
         .map_err(LocatedParseError::directory_wide)?;
-    let mut seed_metadata = pass1_union.parser_binding_metadata.clone();
-    seed_metadata.clear_pending_function_type_checks();
+    let seed_metadata = pass1_union.parser_binding_metadata.binding_seed_snapshot();
+    let mut stable_structural_metadata = seed_metadata.clone();
+    stable_structural_metadata.retain(|name| !pass1_union.variables.contains_key(name.as_str()));
     let mut bindings_current = DirectorySeedState {
         variables: pass1_union.variables.clone(),
         metadata: seed_metadata,
@@ -1247,13 +1268,21 @@ pub(crate) fn parse_directory_files_located_from_root(
             &bindings_current.variables,
             &bindings_current.metadata,
         );
-        let bindings_next = parse_local_variable_union(
+        let mut bindings_next = parse_local_variable_union(
             files,
             config,
             &seeds,
             &pass_1a_local_variables,
             &directory_functions,
         )?;
+        // The fixed point recomputes value-shaped `let` bindings only.
+        // Resource handles, Ref-typed module arguments, and structural aliases
+        // are declarations rather than values, so carry their exact metadata
+        // across every iteration instead of degrading them to provisional or
+        // unknown seeds after the first pass.
+        let mut still_structural = stable_structural_metadata.clone();
+        still_structural.retain(|name| !bindings_next.variables.contains_key(name.as_str()));
+        bindings_next.metadata.extend(still_structural);
         parser::reject_cyclic_let_bindings_in_variables(&bindings_next.variables, &structural)
             .map_err(LocatedParseError::directory_wide)?;
 
@@ -1444,7 +1473,7 @@ fn parse_local_variable_union(
     user_functions: &HashMap<String, parser::UserFunction>,
 ) -> Result<DirectorySeedState, LocatedParseError> {
     let mut variables = IndexMap::new();
-    let mut metadata = crate::parser::ParserBindingMetadata::default();
+    let mut metadata = crate::parser::ParserSeedMetadata::default();
     for ((path, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
         let mut parsed = parser::parse_with_directory_context(
             content,
@@ -1461,11 +1490,8 @@ fn parse_local_variable_union(
         parsed
             .parser_binding_metadata
             .retain(|name| local_variables.contains(name.as_str()));
-        parsed
-            .parser_binding_metadata
-            .clear_pending_function_type_checks();
         variables.extend(parsed.variables);
-        metadata.extend(parsed.parser_binding_metadata);
+        metadata.extend(parsed.parser_binding_metadata.binding_seed_snapshot());
     }
     Ok(DirectorySeedState {
         variables,
@@ -1539,6 +1565,33 @@ mod tests {
     use crate::resource::{DeferredValue, Value};
     use std::fs;
 
+    #[test]
+    fn directory_load_preserves_resource_handle_export_type_for_boundary_validation() {
+        let directory = tempfile::tempdir().expect("temporary export fixture");
+        fs::write(
+            directory.path().join("main.crn"),
+            "let instance = mock.compute.Instance { name = \"instance\" }\nexports {\n  inferred = instance\n}\n",
+        )
+        .expect("write fixture");
+
+        let loaded = load_configuration_with_config(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            &SchemaRegistry::new(),
+        )
+        .expect("load handle export fixture");
+        assert!(
+            matches!(
+                loaded.parsed.export_params[0].static_type,
+                crate::static_type::ExportStaticType::Inferred(
+                    crate::static_type::StaticType::Known(crate::parser::TypeExpr::Ref(_))
+                )
+            ),
+            "directory inference lost the handle export: {:?}",
+            loaded.parsed.export_params[0].static_type,
+        );
+    }
+
     /// Helper to create a temporary directory for tests
     fn create_temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("carina_config_loader_test_{}", name));
@@ -1558,7 +1611,10 @@ mod tests {
         let dir = create_temp_dir("syntax_diagnostic");
         fs::write(dir.join("broken.crn"), "let =\n").unwrap();
 
-        let error = match load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()) {
+        let error = match load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        ) {
             Ok(_) => panic!("invalid syntax unexpectedly loaded"),
             Err(error) => error,
         };
@@ -1850,7 +1906,7 @@ mod tests {
 
         let loaded = load_configuration_with_config(
             &crate::paths::ResolvedPath::new(&dir).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &SchemaRegistry::new(),
         )
         .unwrap();
@@ -1879,7 +1935,7 @@ mod tests {
 
         let loaded = load_configuration_with_config(
             &crate::paths::ResolvedPath::new(&dir).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &SchemaRegistry::new(),
         )
         .unwrap();
@@ -1904,7 +1960,11 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
+        let config = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert_eq!(config.parsed.providers.len(), 1);
         assert!(config.backend_file.is_none());
         cleanup(&dir);
@@ -1924,7 +1984,11 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
+        let config = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert!(config.parsed.backend.is_some());
         assert!(config.backend_file.is_some());
         cleanup(&dir);
@@ -1933,7 +1997,10 @@ mod tests {
     #[test]
     fn load_configuration_nonexistent_path() {
         let path = PathBuf::from("/tmp/carina_config_loader_test_nonexistent_file_xyz");
-        let result = load_configuration(&crate::paths::ResolvedPath::new(&path).unwrap());
+        let result = load_configuration(
+            &crate::paths::ResolvedPath::new(&path).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         match result {
             Err(e) => assert!(e.contains("Path not found"), "unexpected error: {}", e),
             Ok(_) => panic!("expected error for nonexistent path"),
@@ -1943,7 +2010,10 @@ mod tests {
     #[test]
     fn load_configuration_empty_directory() {
         let dir = create_temp_dir("load_empty_dir");
-        let result = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap());
+        let result = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         match result {
             Err(e) => assert!(e.contains("No .crn files found"), "unexpected error: {}", e),
             Ok(_) => panic!("expected error for empty directory"),
@@ -1963,7 +2033,11 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
+        let config = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert_eq!(config.parsed.providers.len(), 1);
         assert!(config.backend_file.is_none());
         cleanup(&dir);
@@ -1991,27 +2065,23 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
+        let config = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert_eq!(config.parsed.providers.len(), 1);
         assert!(config.parsed.backend.is_some());
         assert!(config.backend_file.is_some());
         cleanup(&dir);
     }
 
-    fn unavailable_env_name() -> String {
-        format!(
-            "CARINA_TEST_ISSUE_3974_STRICT_MERGED_MISSING_{}",
-            std::process::id()
-        )
-    }
+    const UNAVAILABLE_ENV_NAME: &str = "CARINA_TEST_ISSUE_3974_STRICT_MERGED_MISSING";
 
     #[test]
     fn load_configuration_multi_file_rejects_unavailable_let_binding() {
         let dir = create_temp_dir("unavailable_let_binding");
-        let missing = unavailable_env_name();
-        unsafe {
-            std::env::remove_var(&missing);
-        }
+        let missing = UNAVAILABLE_ENV_NAME;
         fs::write(
             dir.join("value.crn"),
             format!("let token = env(\"{missing}\")\n"),
@@ -2019,7 +2089,10 @@ mod tests {
         .unwrap();
         fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
 
-        let error = match load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()) {
+        let error = match load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        ) {
             Ok(_) => panic!("the strict merged pass accepted an unavailable let binding"),
             Err(error) => error,
         };
@@ -2036,10 +2109,7 @@ mod tests {
     #[test]
     fn load_configuration_multi_file_rejects_unavailable_backend_attribute() {
         let dir = create_temp_dir("unavailable_backend_attribute");
-        let missing = unavailable_env_name();
-        unsafe {
-            std::env::remove_var(&missing);
-        }
+        let missing = UNAVAILABLE_ENV_NAME;
         fs::write(
             dir.join("backend.crn"),
             format!(
@@ -2054,7 +2124,10 @@ mod tests {
         .unwrap();
         fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
 
-        let error = match load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()) {
+        let error = match load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        ) {
             Ok(_) => panic!("the strict merged pass accepted an unavailable backend attribute"),
             Err(error) => error,
         };
@@ -2071,10 +2144,7 @@ mod tests {
     #[test]
     fn load_configuration_multi_file_does_not_open_secret_for_strict_evaluation() {
         let dir = create_temp_dir("unavailable_inside_secret");
-        let missing = unavailable_env_name();
-        unsafe {
-            std::env::remove_var(&missing);
-        }
+        let missing = UNAVAILABLE_ENV_NAME;
         fs::write(
             dir.join("value.crn"),
             format!("let token = secret(env(\"{missing}\"))\n"),
@@ -2082,8 +2152,11 @@ mod tests {
         .unwrap();
         fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
 
-        let loaded = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap())
-            .expect("the strict merged pass must not descend into a typed secret");
+        let loaded = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("the strict merged pass must not descend into a typed secret");
 
         assert!(matches!(
             loaded.parsed.variables.get("token"),
@@ -2106,7 +2179,11 @@ mod tests {
         .unwrap();
         fs::write(dir.join("notes.txt"), "not a crn file").unwrap();
 
-        let config = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
+        let config = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert_eq!(config.parsed.providers.len(), 1);
         cleanup(&dir);
     }
@@ -2116,7 +2193,10 @@ mod tests {
         let dir = create_temp_dir("load_dir_parse_error");
         fs::write(dir.join("bad.crn"), "this is not valid crn syntax {{{").unwrap();
 
-        let result = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap());
+        let result = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert!(result.is_err());
         cleanup(&dir);
     }
@@ -2135,7 +2215,10 @@ mod tests {
         fs::write(&functions, "fn g(r: String): String { r.name }\n").unwrap();
         fs::write(dir.join("providers.crn"), "provider mock {}\n").unwrap();
 
-        let error = match load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()) {
+        let error = match load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        ) {
             Ok(_) => panic!("invalid function body unexpectedly loaded"),
             Err(error) => error,
         };
@@ -2162,7 +2245,10 @@ mod tests {
         .unwrap();
         fs::write(dir.join("providers.crn"), "provider mock {}\n").unwrap();
 
-        let error = match load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()) {
+        let error = match load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        ) {
             Ok(_) => panic!("invalid function body unexpectedly loaded"),
             Err(error) => error,
         };
@@ -2188,7 +2274,10 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_configuration(&crate::paths::ResolvedPath::new(&file).unwrap());
+        let result = load_configuration(
+            &crate::paths::ResolvedPath::new(&file).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         match result {
             Err(e) => assert!(
                 e.contains("expected directory, got file"),
@@ -2206,7 +2295,10 @@ mod tests {
         let file = dir.join("bad.crn");
         fs::write(&file, "this is not valid crn syntax {{{").unwrap();
 
-        let result = load_configuration(&crate::paths::ResolvedPath::new(&file).unwrap());
+        let result = load_configuration(
+            &crate::paths::ResolvedPath::new(&file).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         match result {
             Err(e) => assert!(
                 e.contains("expected directory, got file"),
@@ -2242,7 +2334,11 @@ let _ = for unused_var in empty_list {
         )
         .unwrap();
 
-        let config = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
+        let config = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert!(
             !config.parsed.warnings.is_empty(),
             "fixture must produce at least one ParseWarning"
@@ -2274,15 +2370,23 @@ for account_id in orgs.accounts {
         )
         .unwrap();
 
-        let config = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap())
-            .expect("directory fixture loads");
-        let mut parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-            config.parsed,
+        let config = load_configuration(
             &crate::paths::ResolvedPath::new(&dir).unwrap(),
-            &ProviderContext::default(),
-            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
-        .expect("directory fixture crosses the module-resolution seam");
+        .expect("directory fixture loads");
+        let mut parsed = crate::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    config.parsed,
+                    &crate::paths::ResolvedPath::new(&dir).unwrap(),
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .expect("directory fixture crosses the module-resolution seam")
+            },
+        );
         assert_eq!(parsed.deferred_for_expressions().len(), 1);
         let deferred_line = parsed.deferred_for_expressions()[0].line();
         parsed.warnings.push(crate::parser::ParseWarning {
@@ -2310,11 +2414,16 @@ for account_id in orgs.accounts {
                 )]),
             )]));
         let mut parsed = parsed
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .expect("directory fixture must contain no parser placeholders");
-        parsed
-            .expand_deferred_for_expressions(&bindings)
-            .expect("resolved upstream iterable expands");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| parsed.expand_deferred_for_expressions(&bindings, session),
+        )
+        .expect("resolved upstream iterable expands");
 
         assert!(parsed.deferred_for_expressions().is_empty());
         assert!(
@@ -2340,7 +2449,11 @@ for account_id in orgs.accounts {
         )
         .unwrap();
 
-        let config = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
+        let config = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         // unresolved_parsed should also have the provider
         assert_eq!(config.unresolved_parsed.parsed.providers.len(), 1);
         cleanup(&dir);
@@ -2370,7 +2483,10 @@ for account_id in orgs.accounts {
         )
         .unwrap();
 
-        let result = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap());
+        let result = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         match result {
             Err(e) => assert!(
                 e.contains("multiple backend blocks defined"),
@@ -2408,7 +2524,7 @@ let orgs = upstream_state {
 
         let result = parse_directory(
             &crate::paths::ResolvedPath::new(&dir).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         cleanup(&dir);
         assert!(
@@ -2441,15 +2557,25 @@ let orgs = upstream_state {
         fixture: &tempfile::TempDir,
     ) -> Result<crate::parser::ModuleResolvedInferredFile, crate::module_resolver::ModuleError>
     {
-        let parsed = load_configuration(&crate::paths::ResolvedPath::new(fixture.path()).unwrap())
-            .expect("the parser-side deferred body must survive directory loading")
-            .parsed;
-        crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+        let parsed = load_configuration(
             &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-            &ProviderContext::default(),
-            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
+        .expect("the parser-side deferred body must survive directory loading")
+        .parsed;
+        crate::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    parsed,
+                    &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .map_err(Box::new)
+            },
+        )
+        .map_err(|error| *error)
     }
 
     #[test]
@@ -2465,8 +2591,11 @@ let orgs = upstream_state {
         )
         .expect("sibling values fixture");
 
-        let loaded = load_configuration(&crate::paths::ResolvedPath::new(fixture.path()).unwrap())
-            .expect("a sibling plan-time list must expand during the final parse pass");
+        let loaded = load_configuration(
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("a sibling plan-time list must expand during the final parse pass");
         let call_bindings = loaded
             .parsed
             .module_calls
@@ -2492,8 +2621,11 @@ let orgs = upstream_state {
              let names = ['alpha', 'beta']\n",
         );
 
-        let loaded = load_configuration(&crate::paths::ResolvedPath::new(fixture.path()).unwrap())
-            .expect("a later plan-time list must expand during the final parse pass");
+        let loaded = load_configuration(
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("a later plan-time list must expand during the final parse pass");
         assert_eq!(loaded.parsed.module_calls.len(), 2);
         assert_eq!(loaded.parsed.data_sources.len(), 2);
     }
@@ -2511,8 +2643,11 @@ let orgs = upstream_state {
         )
         .expect("sibling lookup fixture");
 
-        let loaded = load_configuration(&crate::paths::ResolvedPath::new(fixture.path()).unwrap())
-            .expect("provisional template errors must be retried in the final parse pass");
+        let loaded = load_configuration(
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("provisional template errors must be retried in the final parse pass");
         let names = loaded
             .parsed
             .resources
@@ -2534,9 +2669,11 @@ let orgs = upstream_state {
         let source = "let src = mock.test.resource { name = 'src' }\n\
                       let lookup = { one = 'A' }\n\
                       let resources = for name in src.list { mock.test.resource { name = lookup[name] } }\n";
-        let error =
-            parse_directory_files(&[(file, source.to_string())], &ProviderContext::default())
-                .expect_err("a dynamic template subscript must fail at the deferred-loop boundary");
+        let error = parse_directory_files(
+            &[(file, source.to_string())],
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a dynamic template subscript must fail at the deferred-loop boundary");
 
         let parser::ParseError::DeferredForBodyTemplate {
             line,
@@ -2824,7 +2961,10 @@ awscc.ec2.SecurityGroup {
         )
         .unwrap();
 
-        let result = load_configuration(&crate::paths::ResolvedPath::new(&dir).unwrap());
+        let result = load_configuration(
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         let loaded = result.expect("load should succeed");
         cleanup(&dir);
 
@@ -2857,7 +2997,7 @@ awscc.ec2.SecurityGroup {
 
         let result = parse_directory(
             &crate::paths::ResolvedPath::new(&dir).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         cleanup(&dir);
         let parsed = result.expect("parse_directory should not fail on undefined iterable");
@@ -2887,8 +3027,11 @@ awscc.ec2.SecurityGroup {
             ),
         ];
 
-        let error = parse_directory_files(&files, &ProviderContext::default())
-            .expect_err("the final seeded pass must reject mixed structural/value branches");
+        let error = parse_directory_files(
+            &files,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("the final seeded pass must reject mixed structural/value branches");
         assert!(
             error.to_string().contains(
                 "both branches of this `if` must be the same kind: the `then` branch declares resources/module calls but the `else` branch produces a value; make both branches values, or both branches resource/module declarations"
@@ -2914,7 +3057,7 @@ awscc.ec2.SecurityGroup {
 
         let directory = parse_directory_with_overrides_and_diagnostics(
             &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &HashMap::new(),
         )
         .expect("directory parse");
@@ -2965,8 +3108,11 @@ awscc.ec2.SecurityGroup {
                 fs::read_to_string(&exports_path).unwrap(),
             ),
         ];
-        let parsed =
-            parse_directory_files(&files, &ProviderContext::default()).expect("directory parse");
+        let parsed = parse_directory_files(
+            &files,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("directory parse");
         let attribute_file = parsed[0].1.parsed();
         let attribute = &attribute_file.attribute_params[0];
         assert_eq!(attribute.source_file(), attributes_path.as_path());
@@ -2994,8 +3140,11 @@ awscc.ec2.SecurityGroup {
             .iter()
             .map(|(name, source)| (dir.join(name), (*source).to_string()))
             .collect();
-        let parsed_files =
-            parse_directory_files(&files, &ProviderContext::default()).expect("parse directory");
+        let parsed_files = parse_directory_files(
+            &files,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse directory");
         find_duplicate_declarations(dir, &parsed_files)
             .iter()
             .map(ToString::to_string)
@@ -3158,7 +3307,7 @@ awscc.ec2.SecurityGroup {
                     rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
                 },
                 timeout_secs: None,
-                depends_on: Vec::new(),
+                depends_on: Default::default(),
                 line: 1,
             }],
             ..ParsedFile::default()
@@ -3271,8 +3420,11 @@ awscc.ec2.SecurityGroup {
             "arguments {\n  a: String = \"x\"\n}\nlet a = \"y\"\n".to_string(),
         )];
 
-        let error = parse_directory_files(&files, &ProviderContext::default())
-            .expect_err("an argument and let binding share the parser namespace");
+        let error = parse_directory_files(
+            &files,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("an argument and let binding share the parser namespace");
         assert!(
             matches!(error, parser::ParseError::DuplicateBinding { ref name, .. } if name == "a"),
             "expected DuplicateBinding for `a`, got: {error:?}",

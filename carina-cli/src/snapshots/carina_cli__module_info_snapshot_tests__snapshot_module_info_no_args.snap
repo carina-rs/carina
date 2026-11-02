@@ -14,4 +14,4 @@ Module: no_args
 
 === ATTRIBUTES ===
 
-  bucket_arn: awscc.s3.Bucket
+  bucket_arn

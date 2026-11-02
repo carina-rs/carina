@@ -4,4 +4,6 @@ expression: output
 ---
 awscc.ec2.Vpc vpc
 awscc.ec2.Subnet subnet
+awscc.ec2.Subnet subnet  (dependencies not yet migrated (legacy: vpc))
 awscc.ec2.RouteTable main-rt
+awscc.ec2.RouteTable main-rt  (dependencies not yet migrated (legacy: vpc))

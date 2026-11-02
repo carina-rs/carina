@@ -116,20 +116,20 @@ fn build_protocol_v2_component() -> Vec<u8> {
         .expect("copy provider types");
     let mut provider_wit =
         std::fs::read_to_string(current_wit.join("provider.wit")).expect("read provider WIT");
-    let resource_result = ") -> result<list<resource-def>, provider-error>;";
+    let resource_result = ") -> result<list<desired-resource>, provider-error>;";
     let state_result = ") -> result<list<tuple<string, persisted-state>>, provider-error>;";
     assert_eq!(
         provider_wit.matches(resource_result).count(),
         1,
-        "v4 WIT must have a result channel for desired-resource normalization"
+        "current WIT must have a result channel for desired-resource normalization"
     );
     assert_eq!(
         provider_wit.matches(state_result).count(),
         2,
-        "v4 WIT must have result channels for both state normalizers"
+        "current WIT must have result channels for both state normalizers"
     );
     provider_wit = provider_wit
-        .replace(resource_result, ") -> list<resource-def>;")
+        .replace(resource_result, ") -> list<desired-resource>;")
         .replace(state_result, ") -> list<tuple<string, persisted-state>>;");
     std::fs::write(wit_dir.join("provider.wit"), provider_wit).expect("write v2 provider WIT");
     std::fs::write(
@@ -570,10 +570,15 @@ async fn precompiled_factory_is_schema_only() {
 
     // `from_precompiled` is test-only and intentionally cannot mint the
     // consent witness required by credentialed runtime instances.
-    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &carina_core::parser::ExpandedInferredFile::default(),
-        &std::collections::HashMap::new(),
-        &carina_core::parser::ProviderContext::default(),
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &carina_core::parser::ExpandedInferredFile::default(),
+                &std::collections::HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("empty provider config set is resolved");
     let resolved = resolved.provider_or_implicit(factory.name());

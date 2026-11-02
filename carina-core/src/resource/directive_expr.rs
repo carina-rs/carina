@@ -1,6 +1,7 @@
 //! Authored lifecycle settings exist only before the value-expansion boundary.
 
 use super::*;
+use crate::resource::ValueKind;
 use std::convert::Infallible;
 
 // The directive names and typed assignment API have one definition. Every
@@ -39,15 +40,20 @@ mod resolved_phase {
     pub trait Sealed {}
     impl Sealed for super::NoPlaceholder {}
     impl Sealed for super::LoopSlot {}
+    impl<P: super::PlaceholderKind + Sealed> Sealed for super::SnapshotLeaf<P> {}
 }
 
 #[doc(hidden)]
 pub trait SerializableDirectivePhase<B: BindingAddress>:
-    PlaceholderKind + resolved_phase::Sealed
+    ValueKind + resolved_phase::Sealed
 {
 }
 impl<B: BindingAddress> SerializableDirectivePhase<B> for NoPlaceholder {}
 impl<B: BindingAddress> SerializableDirectivePhase<B> for LoopSlot {}
+impl<B: BindingAddress, P: PlaceholderKind + SerializableDirectivePhase<B>>
+    SerializableDirectivePhase<B> for SnapshotLeaf<P>
+{
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DirectiveArgumentSources(#[serde(with = "directive_sources")] Vec<DiagnosticSourceSpan>);
@@ -546,8 +552,7 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
             | DeferredValue::Coalesce { .. }
             | DeferredValue::ModuleIf(_)
             | DeferredValue::Unavailable { .. }
-            | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. },
+            | DeferredValue::Secret(_),
         ) => false,
     }
 }
@@ -571,9 +576,7 @@ fn directive_value_kind<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, 
             "got a resource reference (unknown until apply)".into()
         }
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown until apply".into(),
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
-            "got a secret value".into()
-        }
+        Value::Deferred(DeferredValue::Secret(_)) => "got a secret value".into(),
         Value::Deferred(_) => "got a deferred expression".into(),
     }
 }
@@ -918,13 +921,11 @@ impl<B: BindingAddress, P: PlaceholderKind> Directives<B, P> {
             LifecycleDirective,
             P::DirectivePreventDestroy<B>,
         ) -> Result<Q::DirectivePreventDestroy<C>, E>,
-        dependencies: impl FnOnce(&mut Context, Vec<B>) -> Result<Vec<C>, E>,
     ) -> Result<Directives<C, Q>, E> {
         let Self {
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on,
             depends_on_diagnostic_sources,
             ignore_changes,
             provider_instance,
@@ -941,7 +942,6 @@ impl<B: BindingAddress, P: PlaceholderKind> Directives<B, P> {
                 LifecycleDirective::PreventDestroy,
                 prevent_destroy,
             )?,
-            depends_on: dependencies(context, depends_on)?,
             depends_on_diagnostic_sources,
             ignore_changes,
             provider_instance,
@@ -963,7 +963,6 @@ impl<B: BindingAddress> Directives<B, ParserPlaceholder> {
 
     pub(crate) fn try_map_expressions<C: BindingAddress, E, F>(
         self,
-        dependencies: impl FnOnce(Vec<B>) -> Result<Vec<C>, E>,
         mut map: F,
     ) -> Result<Directives<C, ParserPlaceholder>, E>
     where
@@ -974,16 +973,14 @@ impl<B: BindingAddress> Directives<B, ParserPlaceholder> {
                 .map(|expression| map(name, expression))
                 .transpose()
         };
-        self.try_map(&mut map, map_option, map_option, |_, values| {
-            dependencies(values)
-        })
+        self.try_map(&mut map, map_option, map_option)
     }
 
     pub(crate) fn try_update_expressions<E>(
         &mut self,
         mut map: impl FnMut(LifecycleDirective, &mut DirectiveExpr<B>) -> Result<(), E>,
     ) -> Result<(), E> {
-        *self = std::mem::take(self).try_map_expressions(Ok, |name, mut expression| {
+        *self = std::mem::take(self).try_map_expressions(|name, mut expression| {
             map(name, &mut expression)?;
             Ok(expression)
         })?;
@@ -1005,11 +1002,12 @@ impl<B: BindingAddress> Directives<B, ParserPlaceholder> {
         loop_template: bool,
         element_type: Option<&crate::parser::TypeExpr>,
         iterable: Option<&Value<ParserPlaceholder, B>>,
+        context: &crate::parser::ProviderContext,
     ) -> Vec<DirectiveResolutionError> {
         let result = if loop_template {
             self.clone()
                 .into_loop_template(resource, schema, element_type)
-                .and_then(|template| template.validate_known_elements(resource, iterable))
+                .and_then(|template| template.validate_known_elements(resource, iterable, context))
         } else {
             self.clone().resolve(resource, schema).map(|_| ())
         };
@@ -1052,7 +1050,6 @@ impl<B: BindingAddress> Directives<B, ParserPlaceholder> {
                     .map(PreventDestroy::Explicit)
                     .unwrap_or(PreventDestroy::Unspecified))
             },
-            |_, dependencies| Ok(dependencies),
         ));
         if errors.is_empty() {
             Ok(resolved)
@@ -1095,7 +1092,6 @@ impl<B: BindingAddress> Directives<B, ParserPlaceholder> {
                     None => LoopDirective::Resolved(PreventDestroy::Unspecified),
                 })
             },
-            |_, dependencies| Ok(dependencies),
         ));
         if errors.is_empty() {
             Ok(resolved)
@@ -1182,6 +1178,7 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
         &self,
         resource: &ResourceId,
         iterable: Option<&Value<ParserPlaceholder, B>>,
+        context: &crate::parser::ProviderContext,
     ) -> Result<(), DirectiveResolutionErrors> {
         let Some(iterable) = iterable.filter(|value| value.is_fully_resolved()) else {
             return Ok(());
@@ -1200,6 +1197,7 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
                             key,
                             value,
                             AccessMissPolicy::Error,
+                            crate::resolver::RuntimeContext::Projection(context),
                         )
                     })
             {
@@ -1245,7 +1243,6 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
                 value.make_sources_relative(root);
                 Ok(value)
             },
-            |_, dependencies| Ok(dependencies),
         ));
     }
     pub(crate) fn map_expression_bindings(&mut self, map: &mut impl FnMut(B) -> B) {
@@ -1253,7 +1250,6 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
             map,
             |map, _, value| Ok(value.map_bindings(map)),
             |map, _, value| Ok(value.map_bindings(map)),
-            |_, dependencies| Ok(dependencies),
         ));
     }
 
@@ -1284,7 +1280,6 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
                     errors,
                 ))
             },
-            |_, dependencies| Ok(dependencies),
         ));
         if errors.is_empty() {
             Ok(resolved)
@@ -1302,7 +1297,6 @@ impl<B: BindingAddress> Directives<B> {
             &mut (),
             |_, _, value| Ok(LoopDirective::Resolved(value)),
             |_, _, value| Ok(LoopDirective::Resolved(value)),
-            |_, dependencies| Ok(dependencies),
         ))
     }
 }
@@ -1328,7 +1322,6 @@ pub(crate) fn rebind_loop_directives<B: BindingAddress, C: BindingAddress>(
         resolve,
         |resolve, _, value| Ok(value.map_bindings(resolve)),
         |resolve, _, value| Ok(value.map_bindings(resolve)),
-        |resolve, dependencies| Ok(dependencies.into_iter().map(resolve).collect()),
     ))
 }
 
@@ -1341,11 +1334,7 @@ pub(crate) fn rebind_authored_directives<B: BindingAddress, C: BindingAddress>(
             .map(|expression| expression.try_map_value(|value| Ok(value.map_bindings(resolve))))
             .transpose()
     };
-    infallible(
-        directives.try_map(resolve, expression, expression, |resolve, dependencies| {
-            Ok(dependencies.into_iter().map(resolve).collect())
-        }),
-    )
+    infallible(directives.try_map(resolve, expression, expression))
 }
 
 pub(crate) fn rebind_resolved_directives<B, C, P, Q>(
@@ -1358,12 +1347,7 @@ where
     P: PlaceholderKind<DirectiveBool<B> = bool, DirectivePreventDestroy<B> = PreventDestroy>,
     Q: PlaceholderKind<DirectiveBool<C> = bool, DirectivePreventDestroy<C> = PreventDestroy>,
 {
-    infallible(directives.try_map(
-        resolve,
-        |_, _, value| Ok(value),
-        |_, _, value| Ok(value),
-        |resolve, dependencies| Ok(dependencies.into_iter().map(resolve).collect()),
-    ))
+    infallible(directives.try_map(resolve, |_, _, value| Ok(value), |_, _, value| Ok(value)))
 }
 
 #[cfg(test)]
@@ -1523,28 +1507,47 @@ mod tests {
         let source = root.resolve(RelativeBindingName::new("source"));
         let mut authored: AuthoredDirectives<AbsoluteBindingAddress> =
             AuthoredDirectives::default();
-        authored.depends_on.push(source.clone());
         authored.force_delete = Some(DirectiveExpr::new(
             Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
                 DeferredValue::Placeholder(ParserPlaceholder::Loop(LoopSlot::Value)),
             )])),
             DiagnosticSourceSpan::authored("module.crn".into(), 3, 1, 3, 10),
         ));
-        let mut template = authored
+        let template = authored
             .into_loop_template(
                 &ResourceId::with_identity("mock.test.resource", "target"),
                 crate::resource::ProviderDirectiveSchema::Unavailable,
                 None,
             )
             .unwrap();
+        let mut resource = Resource::<ModuleSource, LoopSlot>::with_provider(
+            "mock",
+            "test.resource",
+            "target",
+            None,
+        );
+        resource.directives = template;
+        resource.dependencies.depends_on = crate::parser::UnexpandedDependencies::new(vec![
+            crate::parser::UnexpandedDependencyOperand::BareBinding(source),
+        ]);
         let mut visited = Vec::new();
-        template.map_absolute_bindings(&mut |binding| {
+        resource.map_absolute_bindings(&mut |binding| {
             visited.push(binding.to_string());
             root.resolve(RelativeBindingName::new(format!("remapped.{binding}")))
         });
         assert_eq!(visited, ["source"]);
-        assert_eq!(template.depends_on[0].as_str(), "remapped.source");
-        let LoopDirective::PerElement(expression) = &template.force_delete else {
+        assert_eq!(
+            resource
+                .dependencies
+                .depends_on
+                .iter()
+                .next()
+                .unwrap()
+                .binding_reference()
+                .as_str(),
+            "remapped.source"
+        );
+        let LoopDirective::PerElement(expression) = &resource.directives.force_delete else {
             panic!("expected a loop expression");
         };
         let mut references = Vec::new();
@@ -1671,7 +1674,10 @@ mod tests {
             );
             let decoded: Directives = serde_json::from_value(encoded).unwrap();
             assert_eq!(decoded, resolved);
-            let persisted = PersistedDirectives::from(&decoded);
+            let persisted = PersistedDirectives::from_resolved(
+                &decoded,
+                PersistedDestroyDependencies::default(),
+            );
             assert_eq!(
                 serde_json::to_value(&persisted).unwrap(),
                 serde_json::to_value(&decoded).unwrap()

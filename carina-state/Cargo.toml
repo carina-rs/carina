@@ -30,6 +30,7 @@ hostname = "0.4"
 log = "0.4"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 argon2 = "0.5"
 carina-core = { path = "../carina-core", features = ["test-utils"] }
 hex = "0.4"

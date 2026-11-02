@@ -196,7 +196,7 @@ let status_ready = wait cert {
     until = cert.status == aws.acm.Certificate.Status.bogus
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
 
@@ -221,7 +221,7 @@ let status_ready = wait cert {
     until = cert.status == aws.acm.Certificate.Status.issued
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
 
@@ -257,7 +257,7 @@ let renewed = wait cert {
     until = cert.renewal_summary.renewal_status == aws.acm.Certificate.RenewalStatus.success
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
 
@@ -286,7 +286,7 @@ let ready = wait job {
     until = job.labels.state == 'ready'
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
 
@@ -319,7 +319,7 @@ let ready = wait job {
     until = job.statuses.primary == test.job.Job.Status.ready
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
 
@@ -348,7 +348,7 @@ let ready = wait job {
     until = job.states.first == 'ready'
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
 
@@ -388,7 +388,7 @@ let found = wait lookup {
     until = lookup.status == test.lookup.Job.Status.found
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
 

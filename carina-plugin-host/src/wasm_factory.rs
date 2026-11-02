@@ -45,15 +45,15 @@ use carina_core::provider::{
     CreateFailureKind, CreateObservation, InFlightCreate, InFlightPersistence, ResumeFailureKind,
     UnobservedReason,
 };
-use carina_core::resource::{
-    Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
-    value_contains_unknown,
-};
+#[cfg(test)]
+use carina_core::resource::Resource;
+#[cfg(test)]
+use carina_core::resource::Value;
+use carina_core::resource::{ResourceId, ResourceIdentityState, SnapshotState, State};
 use carina_core::schema::{
     CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
     ValidatedResourceSchema,
 };
-use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
 use carina_provider_resolver::{
@@ -61,7 +61,7 @@ use carina_provider_resolver::{
     ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
 };
 
-use crate::{secret_seal, wasm_convert};
+use crate::{desired_normalization, wasm_convert};
 use carina_provider_protocol::http_trace::TraceUri;
 use carina_provider_protocol::types as proto;
 #[cfg(any(test, feature = "test-utils"))]
@@ -177,28 +177,26 @@ pub trait AwsCredentialProvisioner: Send + Sync {
     fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>>;
 }
 
-/// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
-/// the async `BoxFuture` shape used by `Provider`, preserving its typed cause.
-fn early_provider_err<T: 'static>(
-    operation: &'static str,
-    error: SerializationError,
-) -> BoxFuture<'static, ProviderResult<T>> {
-    Box::pin(async move { Err(wasm_value_encode_provider_error(operation, error)) })
-}
-
 #[derive(Debug)]
 struct WasmOperationError<E> {
     operation: &'static str,
     source: E,
 }
 
-impl<E: fmt::Display> fmt::Display for WasmOperationError<E> {
+impl<E> fmt::Display for WasmOperationError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "in operation {}: {}", self.operation, self.source)
+        write!(f, "in operation {}", self.operation)
     }
 }
 
-impl<E> std::error::Error for WasmOperationError<E> where E: std::error::Error + 'static {}
+impl<E> std::error::Error for WasmOperationError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 #[derive(Debug)]
 struct InvalidWasmCreateResult {
@@ -900,7 +898,6 @@ enum WasmProviderInstanceError {
         operation: &'static str,
         source: WallBudgetExceeded,
     },
-    InitializeValueEncode(SerializationError),
     InitializeCall(wasmtime::Error),
     Initialize(ProviderError),
     InitializeReferenceScope(proto::ReferenceScopeError),
@@ -927,9 +924,6 @@ impl WasmProviderInstanceError {
             WasmProviderInstanceError::InfoCall(error) => wasm_trap_provider_error("info", error),
             WasmProviderInstanceError::WallBudgetExceeded { operation, source } => {
                 wall_budget_provider_error(operation, source)
-            }
-            WasmProviderInstanceError::InitializeValueEncode(error) => {
-                wasm_value_encode_provider_error("initialize", error)
             }
             WasmProviderInstanceError::InitializeCall(error) => {
                 wasm_trap_provider_error("initialize", error)
@@ -1151,12 +1145,17 @@ struct EpochTicker {
 
 impl EpochTicker {
     fn start(engine: Engine) -> Self {
+        Self::start_with_tick_observer(engine, || {})
+    }
+
+    fn start_with_tick_observer(engine: Engine, on_tick: impl Fn() + Send + 'static) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let flag = shutdown.clone();
         let handle = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(EPOCH_TICK_INTERVAL);
                 engine.increment_epoch();
+                on_tick();
             }
         });
         EpochTicker {
@@ -2085,7 +2084,9 @@ pub(crate) mod version_checked_bindings {
 
     pub(crate) use aws::carina::provider::aws_credentials;
     pub(crate) use basic::carina::provider::types as wit_types;
-    pub(crate) use basic::exports::carina::provider::provider::PlanOp as WitPlanOp;
+    pub(crate) use basic::exports::carina::provider::provider::{
+        DesiredResource as WitDesiredResource, PlanOp as WitPlanOp,
+    };
 
     use basic::CarinaProvider;
     use http::CarinaProviderWithHttp;
@@ -2121,6 +2122,16 @@ pub(crate) mod version_checked_bindings {
     }
 
     struct ProtocolCheckedInstance {
+        instance: wasmtime::component::Instance,
+        info_json: String,
+    }
+
+    /// Dynamically addressed metadata exports shared by protocol v12 and v13.
+    ///
+    /// Keeping the component instance unbound is the important distinction
+    /// from [`WasmBindings`]: Wasmtime never attempts to interpret v12 CRUD or
+    /// initialization signatures as the v13 runtime world.
+    pub(super) struct SchemaOnlyBindings {
         instance: wasmtime::component::Instance,
         info_json: String,
     }
@@ -2171,6 +2182,14 @@ pub(crate) mod version_checked_bindings {
         store: &mut Store<HostState>,
         instance: &wasmtime::component::Instance,
     ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (String,)>> {
+        untyped_string_func(store, instance, "info")
+    }
+
+    fn untyped_string_func(
+        store: &mut Store<HostState>,
+        instance: &wasmtime::component::Instance,
+        export: &str,
+    ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (String,)>> {
         let provider = instance
             .get_export_index(&mut *store, None, PROVIDER_INTERFACE_EXPORT)
             .ok_or_else(|| {
@@ -2178,14 +2197,100 @@ pub(crate) mod version_checked_bindings {
                     "no exported instance named `{PROVIDER_INTERFACE_EXPORT}`"
                 ))
             })?;
-        let info = instance
-            .get_export_index(&mut *store, Some(&provider), "info")
+        let function = instance
+            .get_export_index(&mut *store, Some(&provider), export)
             .ok_or_else(|| {
                 wasmtime::Error::msg(format!(
-                    "instance export `{PROVIDER_INTERFACE_EXPORT}` does not have export `info`"
+                    "instance export `{PROVIDER_INTERFACE_EXPORT}` does not have export `{export}`"
                 ))
             })?;
-        instance.get_typed_func::<(), (String,)>(&mut *store, &info)
+        instance.get_typed_func::<(), (String,)>(&mut *store, &function)
+    }
+
+    fn untyped_identity_attributes_func(
+        store: &mut Store<HostState>,
+        instance: &wasmtime::component::Instance,
+    ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (Vec<String>,)>> {
+        let provider = instance
+            .get_export_index(&mut *store, None, PROVIDER_INTERFACE_EXPORT)
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "no exported instance named `{PROVIDER_INTERFACE_EXPORT}`"
+                ))
+            })?;
+        let function = instance
+            .get_export_index(&mut *store, Some(&provider), "identity-attributes")
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "instance export `{PROVIDER_INTERFACE_EXPORT}` does not have export `identity-attributes`"
+                ))
+            })?;
+        instance.get_typed_func::<(), (Vec<String>,)>(&mut *store, &function)
+    }
+
+    impl SchemaOnlyBindings {
+        pub(super) async fn instantiate(
+            store: &mut GuestStore,
+            component: &Component,
+            linker: &Linker<HostState>,
+        ) -> Result<Self, WasmBindingCreationError> {
+            let pre = linker
+                .instantiate_pre(component)
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let instance = store
+                .call(|store| pre.instantiate_async(store))
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "instantiate",
+                    source,
+                })?
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let info = store
+                .call(|store| std::future::ready(untyped_info_func(store, &instance)))
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "info",
+                    source,
+                })?
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let (info_json,) = store
+                .call(|store| info.call_async(store, ()))
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "info",
+                    source,
+                })?
+                .map_err(WasmBindingCreationError::InfoCall)?;
+            wasm_convert::check_schema_only_protocol_version(&info_json)
+                .map_err(WasmBindingCreationError::ProtocolVersion)?;
+            Ok(Self {
+                instance,
+                info_json,
+            })
+        }
+
+        pub(super) fn info_json(&self) -> &str {
+            &self.info_json
+        }
+
+        pub(super) async fn call_string_export(
+            &self,
+            store: &mut Store<HostState>,
+            export: &'static str,
+        ) -> wasmtime::Result<String> {
+            let function = untyped_string_func(store, &self.instance, export)?;
+            let (value,) = function.call_async(store, ()).await?;
+            Ok(value)
+        }
+
+        pub(super) async fn call_identity_attributes(
+            &self,
+            store: &mut Store<HostState>,
+        ) -> wasmtime::Result<Vec<String>> {
+            let function = untyped_identity_attributes_func(store, &self.instance)?;
+            let (value,) = function.call_async(store, ()).await?;
+            Ok(value)
+        }
     }
 
     impl WasmBindings {
@@ -2313,6 +2418,30 @@ pub(crate) mod version_checked_bindings {
                 RawWasmBindings::Http(b) => {
                     b.carina_provider_provider()
                         .call_validate_config(store, attrs)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_resolve_references(
+            &self,
+            store: &mut Store<HostState>,
+            requests: &[wit_types::ReferenceRequest],
+        ) -> wasmtime::Result<
+            Result<
+                Vec<Result<wit_types::ReferenceOutcome, wit_types::ReferenceError>>,
+                wit_types::ProviderError,
+            >,
+        > {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_resolve_references(store, requests)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_resolve_references(store, requests)
                         .await
                 }
             }
@@ -2593,80 +2722,19 @@ pub(crate) mod version_checked_bindings {
         pub(super) async fn call_normalize_desired(
             &self,
             store: &mut Store<HostState>,
-            desired: &secret_seal::SealedDesired,
-        ) -> wasmtime::Result<Result<secret_seal::GuestDesired, wit_types::ProviderError>> {
-            desired
-                .send(|resources, deferred| async move {
-                    match &self.raw {
-                        RawWasmBindings::Basic(b) => {
-                            let desired = resources
-                                .iter()
-                                .zip(deferred)
-                                .map(|(resource, deferred)| {
-                                    basic::exports::carina::provider::provider::DesiredResource {
-                                        resource: resource.clone(),
-                                        deferred: deferred.clone(),
-                                    }
-                                })
-                                .collect::<Vec<_>>();
-                            b.carina_provider_provider()
-                                .call_normalize_desired(store, &desired)
-                                .await
-                        }
-                        RawWasmBindings::Http(b) => {
-                            let desired = resources
-                                .iter()
-                                .zip(deferred)
-                                .map(|(resource, deferred)| {
-                                    http::exports::carina::provider::provider::DesiredResource {
-                                        resource: resource.clone(),
-                                        deferred: deferred.clone(),
-                                    }
-                                })
-                                .collect::<Vec<_>>();
-                            b.carina_provider_provider()
-                                .call_normalize_desired(store, &desired)
-                                .await
-                        }
-                    }
-                })
-                .await
-        }
-
-        #[cfg(test)]
-        pub(super) async fn call_normalize_desired_raw(
-            &self,
-            store: &mut Store<HostState>,
-            resources: &[wit_types::ResourceDef],
-        ) -> wasmtime::Result<Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError>>
-        {
+            resources: &[WitDesiredResource],
+        ) -> wasmtime::Result<Result<Vec<WitDesiredResource>, wit_types::ProviderError>> {
             match &self.raw {
-                RawWasmBindings::Basic(b) => {
-                    let desired = resources
-                        .iter()
-                        .map(|resource| {
-                            basic::exports::carina::provider::provider::DesiredResource {
-                                resource: resource.clone(),
-                                deferred: Vec::new(),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    b.carina_provider_provider()
-                        .call_normalize_desired(store, &desired)
+                RawWasmBindings::Basic(bindings) => {
+                    bindings
+                        .carina_provider_provider()
+                        .call_normalize_desired(store, resources)
                         .await
                 }
-                RawWasmBindings::Http(b) => {
-                    let desired = resources
-                        .iter()
-                        .map(|resource| {
-                            http::exports::carina::provider::provider::DesiredResource {
-                                resource: resource.clone(),
-                                deferred: Vec::new(),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    b.carina_provider_provider()
-                        .call_normalize_desired(store, &desired)
+                RawWasmBindings::Http(bindings) => {
+                    bindings
+                        .carina_provider_provider()
+                        .call_normalize_desired(store, resources)
                         .await
                 }
             }
@@ -2717,7 +2785,7 @@ pub(crate) mod version_checked_bindings {
     }
 }
 
-use version_checked_bindings::WasmBindings;
+use version_checked_bindings::{SchemaOnlyBindings, WasmBindings};
 
 impl version_checked_bindings::aws_credentials::Host for HostState {
     async fn current_credentials(
@@ -2860,6 +2928,40 @@ fn add_wasi_sans_sockets_to_linker<T: WasiView>(linker: &mut Linker<T>) -> wasmt
     Ok(())
 }
 
+/// Register host imports in one place for runtime and metadata-only loads.
+///
+/// Linking an interface does not grant its capabilities: schema-only stores
+/// use the same typed credential import, but its host implementation returns
+/// the no-credentials error without consulting a credential source.
+fn create_linker(
+    engine: &Engine,
+    network: &GuestNetwork,
+    world: InstantiationWorld,
+) -> Result<Linker<HostState>, WasmBindingCreationError> {
+    let mut linker = Linker::new(engine);
+    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
+    })?;
+    match world {
+        InstantiationWorld::Basic => {}
+        InstantiationWorld::HttpEnabled => {
+            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(
+                |error| {
+                    WasmBindingCreationError::Instantiation(
+                        error.context("Failed to add wasi:http to linker"),
+                    )
+                },
+            )?;
+        }
+    }
+    add_aws_credentials_to_linker(&mut linker, network).map_err(|error| {
+        WasmBindingCreationError::Instantiation(
+            error.context("Failed to add AWS credentials to linker"),
+        )
+    })?;
+    Ok(linker)
+}
+
 async fn create_instance(
     engine: &Engine,
     component: &Component,
@@ -2867,16 +2969,7 @@ async fn create_instance(
     network: GuestNetwork,
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let mut linker = Linker::new(engine);
-    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
-        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
-    })?;
-    add_aws_credentials_to_linker(&mut linker, &network).map_err(|error| {
-        WasmBindingCreationError::Instantiation(
-            error.context("Failed to add AWS credentials to linker"),
-        )
-    })?;
-
+    let linker = create_linker(engine, &network, InstantiationWorld::Basic)?;
     let mut store = GuestStore::new(engine, label, network, None, build_store_limits(), budget);
 
     let bindings = WasmBindings::instantiate_basic(&mut store, component, &linker)
@@ -3088,18 +3181,7 @@ async fn create_instance_with_http(
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let mut linker = Linker::new(engine);
-    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
-        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
-    })?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|error| {
-        WasmBindingCreationError::Instantiation(error.context("Failed to add wasi:http to linker"))
-    })?;
-    add_aws_credentials_to_linker(&mut linker, &network).map_err(|error| {
-        WasmBindingCreationError::Instantiation(
-            error.context("Failed to add AWS credentials to linker"),
-        )
-    })?;
+    let linker = create_linker(engine, &network, InstantiationWorld::HttpEnabled)?;
 
     let mut store = GuestStore::new_with_http_test_route(
         engine,
@@ -3117,6 +3199,40 @@ async fn create_instance_with_http(
             error.instantiation_context("Failed to instantiate WASM component (HTTP)")
         })?;
 
+    Ok((store, bindings))
+}
+
+/// Instantiate only the stable provider metadata interface.
+///
+/// The store is deliberately kind-less: it receives neither AWS nor GitHub
+/// credentials, and its HTTP hook rejects every destination. Linking the same
+/// host imports as the HTTP runtime world lets current and released providers
+/// instantiate without granting metadata calls credentials or network access.
+async fn create_schema_only_bindings(
+    engine: &Engine,
+    component: &Component,
+    label: Arc<ProviderLabel>,
+) -> Result<(GuestStore, SchemaOnlyBindings), WasmProviderLoadError> {
+    let budget = GuestCallBudget::PRODUCTION;
+    let network = GuestNetwork::SchemaOnly;
+    let linker =
+        create_linker(engine, &network, InstantiationWorld::HttpEnabled).map_err(|failure| {
+            single_attempt_load_error(engine, component, InstantiationWorld::HttpEnabled, failure)
+        })?;
+    let mut store = GuestStore::new_with_http_test_route(
+        engine,
+        label,
+        network,
+        Some(WasiHttpCtx::new()),
+        build_store_limits(),
+        budget,
+        None,
+    );
+    let bindings = SchemaOnlyBindings::instantiate(&mut store, component, &linker)
+        .await
+        .map_err(|failure| {
+            single_attempt_load_error(engine, component, InstantiationWorld::HttpEnabled, failure)
+        })?;
     Ok((store, bindings))
 }
 
@@ -3772,6 +3888,8 @@ impl<T> ReturnedGuestCreateCall<T> {
 /// [`FailFastSlot::Poisoned`]. Later plan/apply operations receive the original
 /// reason and never continue on a freshly configured instance (carina#3106).
 struct FailFastInstance {
+    #[cfg(any(test, feature = "test-utils"))]
+    observer: Option<PollObserverForTest>,
     slot: Mutex<FailFastSlot>,
     reference_scope: proto::ReferenceScope,
 }
@@ -3783,6 +3901,8 @@ impl FailFastInstance {
             reference_scope,
         } = initialized;
         Self {
+            #[cfg(any(test, feature = "test-utils"))]
+            observer: None,
             slot: Mutex::new(FailFastSlot::Live(Box::new(instance))),
             reference_scope,
         }
@@ -3792,8 +3912,26 @@ impl FailFastInstance {
         &self.reference_scope
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    fn with_observer_for_test(mut self, observer: Option<PollObserverForTest>) -> Self {
+        if let FailFastSlot::Live(live) = self.slot.get_mut() {
+            live.store.set_deadline_observer_for_test(observer.clone());
+        }
+        self.observer = observer;
+        self
+    }
+
     async fn acquire(&self, operation: &'static str) -> ProviderResult<LiveInstanceGuard<'_>> {
-        LiveInstanceGuard::from_slot(self.slot.lock().await, operation)
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(observer) = &self.observer {
+            observer(PollEventForTest::StoreQueued { operation });
+        }
+        let guard = LiveInstanceGuard::from_slot(self.slot.lock().await, operation)?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(observer) = &self.observer {
+            observer(PollEventForTest::StoreAcquired { operation });
+        }
+        Ok(guard)
     }
 }
 
@@ -4165,7 +4303,33 @@ enum CachedComponentAcquisition {
 
 type ProviderConfigCompletions = HashMap<String, Vec<CompletionValue>>;
 
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollEventForTest {
+    StoreQueued {
+        operation: &'static str,
+    },
+    StoreAcquired {
+        operation: &'static str,
+    },
+    GuestCallDeadlineCreated {
+        wall: std::time::Duration,
+    },
+    Sleep {
+        operation: &'static str,
+        delay: std::time::Duration,
+    },
+    Attempt {
+        operation: &'static str,
+    },
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+type PollObserverForTest = Arc<dyn Fn(PollEventForTest) + Send + Sync>;
+
 pub struct WasmProviderFactory {
+    #[cfg(any(test, feature = "test-utils"))]
+    poll_observer: Option<PollObserverForTest>,
     engine: Engine,
     component: Component,
     configured: ConfiguredProvider,
@@ -4201,6 +4365,21 @@ pub struct WasmProviderFactory {
     /// Background thread that ticks the epoch counter for timeout enforcement.
     /// Kept alive for the lifetime of the factory; dropped automatically.
     _epoch_ticker: EpochTicker,
+}
+
+/// Provider metadata loaded without constructing runtime protocol bindings.
+///
+/// This factory exists only for read-only configuration analysis. Its schema
+/// and identity methods are usable, while the runtime constructor fails
+/// closed. In particular, loading it calls neither `initialize` nor any CRUD
+/// export, and the kind-less guest store receives no provider credentials.
+pub struct SchemaOnlyWasmProviderFactory {
+    name: String,
+    display_name: String,
+    version: String,
+    schema_witness: Arc<ValidatedProviderSchemaWitness>,
+    cached_config_completions: ProviderConfigCompletions,
+    cached_identity_attributes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -4505,6 +4684,8 @@ impl WasmProviderFactory {
             http_test_route: None,
             init_instance,
             shared_instances: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            poll_observer: None,
             instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
             _epoch_ticker: epoch_ticker,
         })
@@ -4751,7 +4932,7 @@ impl WasmProviderFactory {
 
     async fn create_initialized_instance(
         &self,
-        attributes: &IndexMap<String, Value>,
+        config: &ProviderReadyConfig,
     ) -> Result<InitializedWasmInstance, WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
         // `initialize` and then read/create/update/delete). The kind was
@@ -4784,8 +4965,7 @@ impl WasmProviderFactory {
             self.http_test_route.clone(),
         )
         .await?;
-        let wit_attrs = wasm_convert::core_to_wit_value_map(attributes)
-            .map_err(WasmProviderInstanceError::InitializeValueEncode)?;
+        let wit_attrs = wasm_convert::checked_attributes_to_wit(config.wire_attributes());
         let initialize_result = live
             .store
             .call(|store| live.bindings.call_initialize(store, &wit_attrs))
@@ -4823,15 +5003,18 @@ impl WasmProviderFactory {
     async fn get_or_create_shared_instance(
         &self,
         binding: Option<&str>,
-        attributes: &IndexMap<String, Value>,
+        config: &ProviderReadyConfig,
     ) -> Result<Arc<FailFastInstance>, WasmProviderInstanceError> {
         let key: Option<String> = binding.map(|s| s.to_string());
         let mut guard = self.shared_instances.lock().await;
         if let Some(instance) = guard.get(&key) {
             return Ok(Arc::clone(instance));
         }
-        let initialized = self.create_initialized_instance(attributes).await?;
-        let instance = Arc::new(FailFastInstance::new(initialized));
+        let initialized = self.create_initialized_instance(config).await?;
+        let instance = FailFastInstance::new(initialized);
+        #[cfg(any(test, feature = "test-utils"))]
+        let instance = instance.with_observer_for_test(self.poll_observer.clone());
+        let instance = Arc::new(instance);
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
     }
@@ -4849,6 +5032,122 @@ impl WasmProviderFactory {
     }
 }
 
+impl SchemaOnlyWasmProviderFactory {
+    /// Load only schema metadata from resolver-verified provider bytes.
+    pub async fn from_bytes(
+        load: VerifiedLoad,
+        _user_dirs: &UserDirs,
+    ) -> Result<Self, WasmProviderLoadError> {
+        let configured = ConfiguredProvider::new(load.identity());
+        let engine = WasmProviderFactory::create_engine()?;
+        // A migration check is a literal read-only operation. Do not reuse the
+        // ordinary precompile cache: a cold cache would create directories and
+        // publish native code even though the command promises no writes.
+        let component =
+            WasmProviderFactory::load_component_from_bytes(&engine, load.bytes().as_bytes())?;
+        Self::bring_up_component(engine, component, configured).await
+    }
+
+    async fn bring_up_component(
+        engine: Engine,
+        component: Component,
+        configured: ConfiguredProvider,
+    ) -> Result<Self, WasmProviderLoadError> {
+        let _epoch_ticker = EpochTicker::start(engine.clone());
+        let (mut store, bindings) =
+            create_schema_only_bindings(&engine, &component, Arc::clone(&configured.label)).await?;
+        let info_json = bindings.info_json();
+        let protocol_version = wasm_convert::schema_only_protocol_version(info_json)
+            .map_err(WasmProviderLoadError::from)?;
+        let (reported_name, display_name, version) = wasm_convert::json_to_provider_info(info_json)
+            .map_err(|source| {
+                WasmProviderLoadError::metadata("Failed to decode provider info", source)
+            })?;
+        if reported_name != configured.label.name {
+            return Err(WasmProviderLoadError::ProviderNameMismatch {
+                configured: configured.label.name.clone(),
+                reported: reported_name,
+            });
+        }
+        let name = configured.label.name.clone();
+
+        let schemas_json = store
+            .call(|store| bindings.call_string_export(store, "schemas"))
+            .await
+            .map_err(|source| wall_budget_load_error("schemas", source))?
+            .map_err(|source| metadata_call_error(&name, &version, "schemas", source))?;
+        let config_completions_json = store
+            .call(|store| bindings.call_string_export(store, "provider-config-completions"))
+            .await
+            .map_err(|source| wall_budget_load_error("provider-config-completions", source))?
+            .map_err(|source| {
+                metadata_call_error(&name, &version, "provider-config-completions", source)
+            })?;
+        let cached_config_completions =
+            decode_config_completions_json(&config_completions_json, &name, &version)?;
+        let cached_identity_attributes = store
+            .call(|store| bindings.call_identity_attributes(store))
+            .await
+            .map_err(|source| wall_budget_load_error("identity-attributes", source))?
+            .map_err(|source| {
+                metadata_call_error(&name, &version, "identity-attributes", source)
+            })?;
+        let provider_config_types_json = store
+            .call(|store| bindings.call_string_export(store, "provider-config-attribute-types"))
+            .await
+            .map_err(|source| wall_budget_load_error("provider-config-attribute-types", source))?
+            .map_err(|source| {
+                metadata_call_error(&name, &version, "provider-config-attribute-types", source)
+            })?;
+        let provider_config_types = wasm_convert::json_to_schema_only_attribute_types(
+            &provider_config_types_json,
+            protocol_version,
+        )
+        .map_err(|source| {
+            WasmProviderLoadError::metadata(
+                format!(
+                    "provider '{name}' {version} emitted provider config attribute types this host cannot decode"
+                ),
+                source,
+            )
+        })?;
+        let schema_witness = wasm_convert::json_to_schema_only_provider_schema(
+            &schemas_json,
+            provider_config_types,
+            protocol_version,
+        )
+        .map_err(|error| provider_schema_decode_error(&name, &version, error))?;
+
+        Ok(Self {
+            name,
+            display_name,
+            version,
+            schema_witness: Arc::new(schema_witness),
+            cached_config_completions,
+            cached_identity_attributes,
+        })
+    }
+
+    pub fn verify_version(&self, constraint_raw: &str) -> Result<(), String> {
+        let requirement = semver::VersionReq::parse(constraint_raw)
+            .map_err(|error| format!("Invalid version constraint '{constraint_raw}': {error}"))?;
+        let actual = semver::Version::parse(&self.version).map_err(|error| {
+            format!(
+                "Provider '{}' reports invalid version '{}': {error}",
+                self.name, self.version
+            )
+        })?;
+        if requirement.matches(&actual) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Provider '{}' version {actual} does not satisfy constraint '{constraint_raw}'",
+                self.name
+            ))
+        }
+    }
+}
+
 impl WasmProviderFactory {
     /// Replace the runtime-instantiation mapper used at the `ProviderFactory`
     /// boundary. Installed-artifact loaders use this to attach resolver
@@ -4859,6 +5158,36 @@ impl WasmProviderFactory {
     {
         self.instantiation_error_mapper = Arc::new(mapper);
         self
+    }
+
+    /// Observe polling decisions without measuring scheduler time.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_poll_observer_for_test(
+        mut self,
+        observer: impl Fn(PollEventForTest) + Send + Sync + 'static,
+    ) -> Self {
+        self.poll_observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Hold the configured store lock while tests enqueue operations. No guest
+    /// call (and hence no guest-call timer) has started while this lock is held.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn hold_configured_instance_for_test(
+        &self,
+        entered: &tokio::sync::Notify,
+        release: &tokio::sync::Notify,
+    ) {
+        let instance = self
+            .shared_instances
+            .lock()
+            .await
+            .get(&None)
+            .cloned()
+            .expect("initialize the default provider before holding its store");
+        let _slot = instance.slot.lock().await;
+        entered.notify_one();
+        release.notified().await;
     }
 
     /// Override the per-guest-call compute and wall-clock budgets.
@@ -4926,6 +5255,67 @@ impl WasmProviderFactory {
     }
 }
 
+impl ProviderFactory for SchemaOnlyWasmProviderFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        self.schema_witness.config().clone()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &CanonicalProviderConfigAttributes,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    fn validate_custom_type(
+        &self,
+        _identity: &TypeIdentity,
+        _value: &CanonicalCustomTypeValue,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+        Box::pin(async {
+            Err(ProviderError::internal(
+                "schema-only provider metadata cannot initialize a provider runtime",
+            ))
+        })
+    }
+
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        self.schema_witness.resources().to_vec()
+    }
+
+    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+        self.schema_witness.as_ref().clone()
+    }
+
+    fn identity_attributes(&self) -> Vec<&str> {
+        self.cached_identity_attributes
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn config_completions(&self) -> HashMap<String, Vec<CompletionValue>> {
+        self.cached_config_completions.clone()
+    }
+}
+
 impl ProviderFactory for WasmProviderFactory {
     fn name(&self) -> &str {
         self.configured.label.name.as_str()
@@ -4943,8 +5333,7 @@ impl ProviderFactory for WasmProviderFactory {
         &self,
         attributes: &CanonicalProviderConfigAttributes,
     ) -> ProviderResult<()> {
-        let wit_attrs = wasm_convert::core_to_wit_value_map(attributes.attributes())
-            .map_err(|error| wasm_value_encode_provider_error("validate_config", error))?;
+        let wit_attrs = wasm_convert::checked_attributes_to_wit(attributes.wire_attributes());
         let context = self.init_instance.validate_config_context(&wit_attrs);
 
         tokio::task::block_in_place(|| {
@@ -4986,12 +5375,6 @@ impl ProviderFactory for WasmProviderFactory {
         })
     }
 
-    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String {
-        // Provider-ready config enums are already canonical host values;
-        // strings remain literal and are never shape-decoded here.
-        carina_core::utils::extract_region_from_attrs(attributes, "ap-northeast-1")
-    }
-
     fn config_completions(&self) -> HashMap<String, Vec<CompletionValue>> {
         self.cached_config_completions.clone()
     }
@@ -5009,14 +5392,15 @@ impl ProviderFactory for WasmProviderFactory {
         config: &ProviderReadyConfig,
         initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        let attrs = config.attributes().clone();
+        // The validated config witness shares its immutable payload; no deep clone.
+        let config = config.clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             // Provider init rejections still surface their user-actionable
             // message verbatim (for example, allowed_account_ids mismatch;
             // see #2407). Instantiation failures take the typed mapper path.
             let instance = self
-                .get_or_create_shared_instance(binding.as_deref(), &attrs)
+                .get_or_create_shared_instance(binding.as_deref(), &config)
                 .await
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
@@ -5033,6 +5417,8 @@ impl ProviderFactory for WasmProviderFactory {
                 proto::ReferenceScope::Unavailable => InitializeOutcome::unavailable(),
             };
             let provider: Box<dyn Provider> = Box::new(WasmProvider {
+                #[cfg(any(test, feature = "test-utils"))]
+                poll_observer: self.poll_observer.clone(),
                 instance,
                 name: self.configured.label.name.clone(),
                 schema_witness: Arc::clone(&self.schema_witness),
@@ -5046,11 +5432,12 @@ impl ProviderFactory for WasmProviderFactory {
         binding: Option<&str>,
         config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
-        let attrs = config.attributes().clone();
+        // The validated config witness shares its immutable payload; no deep clone.
+        let config = config.clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             let instance = self
-                .get_or_create_shared_instance(binding.as_deref(), &attrs)
+                .get_or_create_shared_instance(binding.as_deref(), &config)
                 .await
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
@@ -5071,6 +5458,8 @@ impl ProviderFactory for WasmProviderFactory {
 // -- WasmProvider --
 
 pub struct WasmProvider {
+    #[cfg(any(test, feature = "test-utils"))]
+    poll_observer: Option<PollObserverForTest>,
     instance: Arc<FailFastInstance>,
     name: String,
     schema_witness: Arc<ValidatedProviderSchemaWitness>,
@@ -5311,6 +5700,26 @@ struct OperationBudgets {
 }
 
 impl WasmProvider {
+    #[cfg(any(test, feature = "test-utils"))]
+    fn observe_poll(&self, event: PollEventForTest) {
+        if let Some(observer) = &self.poll_observer {
+            observer(event);
+        }
+    }
+
+    fn poll_sleep(
+        &self,
+        _operation: &'static str,
+        delay: std::time::Duration,
+    ) -> tokio::time::Sleep {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.observe_poll(PollEventForTest::Sleep {
+            operation: _operation,
+            delay,
+        });
+        tokio::time::sleep(delay)
+    }
+
     fn operation_budgets(
         &self,
         id: &ResourceId,
@@ -5397,6 +5806,7 @@ impl WasmProvider {
     }
 
     async fn drive_operation<Progress, Initial, Poll, PollFuture>(
+        &self,
         operation: &'static str,
         id: ResourceId,
         budgets: OperationBudgets,
@@ -5415,10 +5825,12 @@ impl WasmProvider {
             budgets.read_back,
             async move { initial.await.map(OperationProgress::into_step) },
             |pending, finality| {
+                #[cfg(any(test, feature = "test-utils"))]
+                self.observe_poll(PollEventForTest::Attempt { operation });
                 let next = poll(pending, finality);
                 async move { next.await.map(OperationProgress::into_step) }
             },
-            tokio::time::sleep,
+            |delay| self.poll_sleep(operation, delay),
         )
         .await
         .map_err(|error| match error {
@@ -6436,14 +6848,7 @@ impl WasmProvider {
         attempt: CreateAttempt,
     ) -> Result<CreateProgress, CreateFailure> {
         let wit_id = wasm_convert::core_to_wit_resource_id(&id);
-        let wit_request = match wasm_convert::core_to_wit_create_request(&request) {
-            Ok(request) => request,
-            Err(error) => {
-                return Err(attempt.untracked(
-                    wasm_value_encode_provider_error("create", error).for_resource(id),
-                ));
-            }
-        };
+        let wit_request = wasm_convert::core_to_wit_create_request(&request);
         let call_id = wit_id.clone();
         let call_request = wit_request.clone();
         let locked = match self.instance.acquire("create").await {
@@ -6639,9 +7044,13 @@ impl WasmProvider {
                 .into_step()
             },
             |pending, finality| async move {
+                #[cfg(any(test, feature = "test-utils"))]
+                self.observe_poll(PollEventForTest::Attempt {
+                    operation: "create",
+                });
                 self.call_poll_create(*pending, finality).await.into_step()
             },
-            tokio::time::sleep,
+            |delay| self.poll_sleep("create", delay),
         )
         .await;
         match outcome {
@@ -6670,14 +7079,7 @@ impl WasmProvider {
         let (resume, create_request) = request.into_parts();
         let id = resume.id().clone();
         let wit_id = wasm_convert::core_to_wit_resource_id(&id);
-        let wit_request = match wasm_convert::core_to_wit_create_request(&create_request) {
-            Ok(request) => request,
-            Err(error) => {
-                return Err(resume.preserve(
-                    wasm_value_encode_provider_error("resume_create", error).for_resource(id),
-                ));
-            }
-        };
+        let wit_request = wasm_convert::core_to_wit_create_request(&create_request);
         // Persisted resume state has no scheduling metadata, while WIT requires
         // both fields. This operation-phase placeholder allows saved read-back
         // tokens to resume with an identifier: SDK dispatch only rejects a
@@ -6701,7 +7103,7 @@ impl WasmProvider {
             |pending, finality| async move {
                 self.poll_resume_state(*pending, finality).await.into_step()
             },
-            tokio::time::sleep,
+            |delay| self.poll_sleep("resume_create", delay),
         )
         .await;
         match outcome {
@@ -6909,6 +7311,42 @@ impl Provider for WasmProvider {
         &self.name
     }
 
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [carina_core::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<
+                Result<
+                    carina_core::references::ReferenceOutcome,
+                    carina_core::references::ReferenceError,
+                >,
+            >,
+        >,
+    > {
+        let encoded: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let carina_core::references::ReferenceRequest { ty, value } = request;
+                version_checked_bindings::wit_types::ReferenceRequest {
+                    ty: wasm_convert::core_type_identity_to_wit(ty),
+                    value: value.clone(),
+                }
+            })
+            .collect();
+        Box::pin(async move {
+            let locked = self.instance.acquire("resolve_references").await?;
+            let result = locked
+                .call("resolve_references", async |bindings, store| {
+                    bindings.call_resolve_references(store, &encoded).await
+                })
+                .await?;
+            let results = result.map_err(wasm_convert::wit_to_core_provider_error)?;
+            Ok(wasm_convert::decode_reference_results(results))
+        })
+    }
+
     fn read(
         &self,
         id: &ResourceId,
@@ -6942,10 +7380,7 @@ impl Provider for WasmProvider {
         &self,
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        let wit_resource = match wasm_convert::core_data_source_to_wit_resource(resource) {
-            Ok(v) => v,
-            Err(e) => return early_provider_err("read_data_source", e),
-        };
+        let wit_resource = wasm_convert::core_data_source_to_wit_resource(resource);
         let id = resource.id.clone();
         Box::pin(async move {
             let locked = self.instance.acquire("read_data_source").await?;
@@ -6999,7 +7434,7 @@ impl Provider for WasmProvider {
         let budgets = self.operation_budgets(&id, carina_provider_protocol::OperationKind::Update);
         Box::pin(async move {
             let initial = self.call_update(id.clone(), identifier, request);
-            Self::drive_operation("update", id, budgets, initial, |pending, finality| {
+            self.drive_operation("update", id, budgets, initial, |pending, finality| {
                 self.call_poll_update(*pending, finality)
             })
             .await
@@ -7018,7 +7453,7 @@ impl Provider for WasmProvider {
         let budgets = self.operation_budgets(&id, carina_provider_protocol::OperationKind::Delete);
         Box::pin(async move {
             let initial = self.call_delete(id.clone(), identifier, request);
-            Self::drive_operation("delete", id, budgets, initial, |pending, _finality| {
+            self.drive_operation("delete", id, budgets, initial, |pending, _finality| {
                 self.call_poll_delete(*pending)
             })
             .await
@@ -7141,18 +7576,18 @@ impl std::error::Error for WasmNormalizerResultCountError {}
 type WitStateAttributeUpdate = (ResourceId, Vec<(String, wit_types::PersistedValue)>);
 
 trait StateValueAccess {
-    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State>;
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut SnapshotState>;
 }
 
 impl StateValueAccess for carina_core::provider::StateTransformMap {
-    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State> {
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut SnapshotState> {
         self.get_mut(id)
     }
 }
 
 #[cfg(test)]
-impl StateValueAccess for HashMap<ResourceId, State> {
-    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State> {
+impl StateValueAccess for HashMap<ResourceId, SnapshotState> {
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut SnapshotState> {
         self.get_mut(id)
     }
 }
@@ -7263,92 +7698,25 @@ fn apply_wit_state_attribute_updates<M: StateValueAccess>(
     Ok(())
 }
 
-/// One stripped attribute retained so it can be reinserted at its original
-/// position after WASM desired normalization returns.
-struct StrippedAttribute {
-    insert_index: usize,
-    key: String,
-    value: Value,
-}
-
-/// Attributes removed from a resource slice, grouped by slice position.
-struct StrippedAttributes(Vec<Vec<StrippedAttribute>>);
-
-impl StrippedAttributes {
-    /// Exact top-level names withheld from each resource, preserving resource
-    /// position and the resource's original attribute order.
-    fn deferred_names(&self) -> Vec<Vec<String>> {
-        self.0
-            .iter()
-            .map(|entries| entries.iter().map(|entry| entry.key.clone()).collect())
-            .collect()
+fn desired_normalization_provider_error<S, D>(
+    resources: &[carina_core::resource::Resource<
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    error: carina_provider_protocol::normalization::NormalizationError,
+    convert: impl FnOnce(carina_provider_protocol::normalization::NormalizationError) -> ProviderError,
+) -> ProviderError {
+    let id = error
+        .resource_index
+        .and_then(|index| resources.get(index))
+        .map(|resource| resource.id.clone());
+    let error = convert(error);
+    match id {
+        Some(id) => error.for_resource(id),
+        None => error,
     }
-}
-
-/// Strip every resource attribute that the WASM provider boundary refuses to
-/// serialize, retaining the original `IndexMap` positions for restoration.
-fn strip_provider_boundary_attributes<S>(resources: &mut [Resource<S>]) -> StrippedAttributes {
-    let mut out = Vec::with_capacity(resources.len());
-    for resource in resources.iter_mut() {
-        let mut stripped = Vec::new();
-        let to_remove: Vec<(usize, String)> = resource
-            .attributes
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, value))| value_contains_unknown(value) || contains_resource_ref(value))
-            .map(|(i, (key, _))| (i, key.clone()))
-            .collect();
-
-        for (insert_index, key) in to_remove.into_iter().rev() {
-            if let Some(value) = resource.attributes.shift_remove(&key) {
-                stripped.push(StrippedAttribute {
-                    insert_index,
-                    key,
-                    value,
-                });
-            }
-        }
-
-        stripped.sort_by_key(|entry| entry.insert_index);
-        out.push(stripped);
-    }
-    StrippedAttributes(out)
-}
-
-/// Reinsert attributes removed by [`strip_provider_boundary_attributes`] at
-/// their original positions.
-fn restore_stripped_attributes<S>(resources: &mut [Resource<S>], stripped: StrippedAttributes) {
-    for (resource, entries) in resources.iter_mut().zip(stripped.0) {
-        for entry in entries {
-            let target = entry.insert_index.min(resource.attributes.len());
-            resource
-                .attributes
-                .shift_insert(target, entry.key, entry.value);
-        }
-    }
-}
-
-/// Run one WASM desired-normalization boundary call with unsupported
-/// attributes temporarily removed.
-///
-/// The callback receives the names derived from the same stripping result that
-/// retains the values. Attributes are restored before returning on both
-/// success and error.
-async fn with_wasm_serializable_resources<S, F>(
-    resources: &mut [Resource<S>],
-    operation: F,
-) -> ProviderResult<()>
-where
-    F: for<'a> FnOnce(
-        &'a mut [Resource<S>],
-        &'a [Vec<String>],
-    ) -> BoxFuture<'a, ProviderResult<()>>,
-{
-    let stripped = strip_provider_boundary_attributes(resources);
-    let deferred_names = stripped.deferred_names();
-    let result = operation(resources, &deferred_names).await;
-    restore_stripped_attributes(resources, stripped);
-    result
 }
 
 impl ProviderNormalizer for WasmProviderNormalizer {
@@ -7358,39 +7726,32 @@ impl ProviderNormalizer for WasmProviderNormalizer {
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         let instance = Arc::clone(&self.instance);
         Box::pin(async move {
-            with_wasm_serializable_resources(resources, move |resources, deferred_names| {
-                Box::pin(async move {
-                    let (sealed, unsealer) =
-                        secret_seal::seal_with_deferred(resources, deferred_names).map_err(
-                            |error| wasm_value_encode_provider_error("normalize_desired", error),
-                        )?;
-
-                    // Plain `.await`, not a nested `block_on`: the guarded store is
-                    // acquired and dropped within this one polled future, so the
-                    // apply-path `renormalize` calling this once per resource cannot
-                    // self-deadlock (carina#3112).
-                    let result = {
-                        let locked = instance.acquire("normalize_desired").await?;
-                        let result = locked
-                            .call("normalize_desired", async |bindings, store| {
-                                bindings.call_normalize_desired(store, &sealed).await
-                            })
-                            .await?;
-                        result.map_err(wasm_convert::wit_to_core_provider_error)
-                    }?;
-
-                    // The scoped host helper hides ref/Unknown-bearing attributes only
-                    // while this WASM transport call is in flight and restores them on
-                    // every return path. Secret restoration filters mangled attributes
-                    // before guest values are written back.
-                    let restored = unsealer.try_restore(result).map_err(|error| {
-                        wasm_value_decode_provider_error("normalize_desired", error)
-                    })?;
-                    restored.apply_to(resources);
-                    Ok(())
+            let batch =
+                carina_core::desired::NormalizationBatch::new(resources).map_err(|error| {
+                    desired_normalization_provider_error(resources, error, |error| {
+                        wasm_value_encode_provider_error("normalize_desired", error)
+                    })
+                })?;
+            let sent = desired_normalization::encode(&batch).map_err(|error| {
+                desired_normalization_provider_error(resources, error, |error| {
+                    wasm_value_encode_provider_error("normalize_desired", error)
+                })
+            })?;
+            // Acquire and drop the guarded store in this future; never nest block_on.
+            let result = {
+                let locked = instance.acquire("normalize_desired").await?;
+                locked
+                    .call("normalize_desired", async |bindings, store| {
+                        bindings.call_normalize_desired(store, &sent).await
+                    })
+                    .await?
+                    .map_err(wasm_convert::wit_to_core_provider_error)
+            }?;
+            desired_normalization::apply(resources, batch, result).map_err(|error| {
+                desired_normalization_provider_error(resources, error, |error| {
+                    wasm_value_decode_provider_error("normalize_desired", error)
                 })
             })
-            .await
         })
     }
 
@@ -7604,16 +7965,134 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 mod tests {
     use super::*;
     use carina_core::provider::SentRecord;
-    use carina_core::resource::{
-        ApplyTimeUnknown, AuthoredAccessPath as AccessPath, ConcreteValue, Current, DeferredValue,
-        InterpolationPart, ModuleSource, absolute_binding_address_for_test,
-    };
+    use carina_core::resource::{ConcreteValue, Current, DeferredValue, ModuleSource};
+
     use std::borrow::Cow;
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use wasm_encoder::{Component as EncoderComponent, CustomSection};
     use wasmtime::component::ResourceTable;
     use wasmtime_wasi::WasiCtxView;
+
+    fn empty_ready_config(factory: &WasmProviderFactory) -> ProviderReadyConfig {
+        prepare_test_config(factory, IndexMap::new())
+            .expect("empty test configuration passes the provider boundary")
+    }
+
+    fn prepare_test_config(
+        factory: &WasmProviderFactory,
+        attributes: IndexMap<String, Value>,
+    ) -> Result<ProviderReadyConfig, carina_core::executor::ProviderConfigPreparationError> {
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+                parsed.providers = vec![carina_core::parser::ProviderConfig {
+                    name: factory.name().to_string(),
+                    attributes,
+                    default_tags: IndexMap::new(),
+                    source: None,
+                    version: None,
+                    revision: None,
+                    unresolved_attributes: IndexMap::new(),
+                    binding: None,
+                }];
+                let configs = carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    type_checks,
+                )
+                .expect("test configuration resolves");
+                carina_core::executor::prepare_provider_ready_config(
+                    factory,
+                    configs.iter().next().unwrap(),
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn normalization_operation_wrapper_preserves_sources_and_renders_float_once() {
+        use carina_provider_protocol::normalization::{NormalizationError, NormalizationErrorKind};
+        use std::error::Error;
+        let id = carina_provider_protocol::types::ResourceId {
+            provider: "mock".into(),
+            resource_type: "example".into(),
+            identity: "float-error".into(),
+        };
+        let source = NormalizationError::new(id, "value", NormalizationErrorKind::Conversion)
+            .with_source(carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat);
+        let error = wasm_value_encode_provider_error("normalize_desired", source);
+        let normalization = error
+            .detail()
+            .cause()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<NormalizationError>()
+            .unwrap();
+        assert!(
+            normalization
+                .source()
+                .unwrap()
+                .is::<carina_core::protocol_convert::ProtocolConvertError>()
+        );
+        let rendered = error.to_string();
+        let reason =
+            carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat.to_string();
+        assert_eq!(rendered.matches(&reason).count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn desired_normalization_errors_retain_the_original_provider_instance() {
+        use carina_core::desired::NormalizationBatch;
+        for encoding in [true, false] {
+            let mut resources: Vec<carina_core::resource::Resource> = ["east", "west"]
+                .into_iter()
+                .map(|instance| {
+                    carina_core::resource::Resource::with_provider(
+                        "mock",
+                        "example",
+                        "same-id",
+                        Some(instance.into()),
+                    )
+                    .with_attribute(
+                        "value",
+                        Value::Concrete(ConcreteValue::String("before".into())),
+                    )
+                })
+                .collect();
+            let error = if encoding {
+                resources[1].attributes.insert(
+                    "value".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                );
+                NormalizationBatch::new(&resources).err().unwrap()
+            } else {
+                let batch = NormalizationBatch::new(&resources).unwrap();
+                let mut returned = desired_normalization::encode(&batch).unwrap();
+                returned[1].attributes[0].1 = wit_types::DesiredValue::MapVal("[]".into());
+                desired_normalization::apply(&mut resources, batch, returned).unwrap_err()
+            };
+            assert_eq!(error.resource_index, Some(1));
+            let error = desired_normalization_provider_error(&resources, error, |error| {
+                if encoding {
+                    wasm_value_encode_provider_error("normalize_desired", error)
+                } else {
+                    wasm_value_decode_provider_error("normalize_desired", error)
+                }
+            });
+            assert_eq!(
+                error.detail().resource_id.as_deref(),
+                Some(&resources[1].id)
+            );
+            assert_ne!(
+                error.detail().resource_id.as_deref(),
+                Some(&resources[0].id)
+            );
+            assert!(error.detail().cause().is_some());
+        }
+    }
 
     const HTTP_TRACE_SECRET_URI: &str = "https://user:PASSSECRET@bucket.s3.amazonaws.com/key?X-Amz-Credential=AKIDSECRET%2F...&X-Amz-Signature=SIGSECRET&X-Amz-Security-Token=TOKSECRET#FRAGSECRET";
     const HTTP_TRACE_SAFE_URI: &str = "https://bucket.s3.amazonaws.com/key?X-Amz-Credential=<redacted>&X-Amz-Signature=<redacted>&X-Amz-Security-Token=<redacted>";
@@ -7880,6 +8359,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_only_factory_is_uncached_and_cannot_create_a_runtime() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return;
+        };
+        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        let user_dirs = carina_core::TestUserDirs::new();
+        assert!(!user_dirs.compiled_wasm_cache_dir().exists());
+
+        let factory = SchemaOnlyWasmProviderFactory::from_bytes(
+            VerifiedLoad::for_test(wasm_bytes, test_load_identity("mock")),
+            &user_dirs,
+        )
+        .await
+        .expect("schema-only mock provider should load");
+
+        assert_eq!(factory.name(), "mock");
+        assert!(!factory.schemas().is_empty());
+        assert!(
+            !user_dirs.compiled_wasm_cache_dir().exists(),
+            "metadata-only loading must not publish a precompile cache entry"
+        );
+
+        let saved_configs: carina_core::parser::SavedProviderConfigs =
+            serde_json::from_str("[]").expect("empty saved provider config fixture");
+        let configs = carina_core::parser::ResolvedProviderConfigs::try_from(saved_configs)
+            .expect("empty provider config fixture crosses the checked saved seam");
+        let config = carina_core::executor::prepare_provider_ready_config(
+            &factory,
+            configs.provider_or_implicit("mock").as_ref(),
+        )
+        .expect("empty mock config is provider-ready");
+        let error = match factory.create_initialized_provider(None, &config).await {
+            Ok(_) => panic!("schema-only metadata must not create a runtime provider"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("schema-only provider metadata cannot initialize a provider runtime")
+        );
+    }
+
+    #[tokio::test]
     async fn http_test_route_is_retained_for_validation_rebuilds() {
         let Some(factory) = rebuildable_state_test_factory().await else {
             return;
@@ -7905,7 +8436,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v16_wit_surface_compiles() {
+    fn protocol_v19_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::ReferenceScopeValues>();
@@ -7928,23 +8459,43 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
     }
 
-    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
-        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
-            .resolve_root_for_test()
-            .into_expanded()
-            .expect("root resource reference contains no placeholders")
-    }
-
     fn boundary_resource() -> (ResourceId, wit_types::ResourceId, wit_types::CreateRequest) {
-        let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
-        let mut resource = Resource::from_id(id.clone());
-        resource.set_attr("name", test_string_value("example"));
-        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
-        let wit_request = wit_types::CreateRequest {
-            res: wasm_convert::core_to_wit_resource(&resource)
-                .expect("boundary fixture must encode"),
-        };
-        (id, wit_id, wit_request)
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
+                let mut resource = Resource::from_id(id.clone());
+                resource.set_attr("name", test_string_value("example"));
+                let wit_id = wasm_convert::core_to_wit_resource_id(&id);
+                let bindings = carina_core::binding_index::ResolvedBindings::default();
+                let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+                let schemas = carina_core::schema::SchemaRegistry::new();
+                let context = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                // This fixture uses a ready no-op normalizer, so preparation has no
+                // pending I/O and can be polled once in both sync and async tests.
+                let mut prepare = std::pin::pin!(carina_core::executor::prepare_create_request(
+                    resource, &context
+                ));
+                let std::task::Poll::Ready(request) = prepare
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                else {
+                    panic!("no-op fixture preparation must complete immediately")
+                };
+                let wit_request = wasm_convert::core_to_wit_create_request(
+                    &request.expect("checked boundary fixture"),
+                );
+                (id, wit_id, wit_request)
+            },
+        )
     }
 
     fn sent_name_only() -> Sent {
@@ -8084,7 +8635,9 @@ mod tests {
             resource: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(
+                async move { Ok(State::<carina_core::resource::NoPlaceholder>::not_found(id)) },
+            )
         }
 
         fn create(
@@ -8159,49 +8712,61 @@ mod tests {
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
-        let preparation = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &carina_core::provider::NoopNormalizer,
-            &[],
-            &schemas,
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(Vec::new()),
+            schemas.clone(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
-        let request = carina_core::executor::prepare_create_request(resource, &preparation)
-            .await
-            .expect("fixture resource passes provider preparation");
-        let (create, _cancellation) =
-            carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request);
-        let failure = create.await.expect_err("fixture create remains pending");
-        let pending = match failure.into_kind() {
-            CreateFailureKind::InFlight {
-                pending,
-                error: _error,
-            } => pending
-                .into_fresh()
-                .unwrap_or_else(|_| panic!("fixture provider returned a persisted continuation")),
-            CreateFailureKind::Created {
-                created: _created,
-                error,
-            } => {
-                panic!("fixture create was created: {error}")
-            }
-            CreateFailureKind::Untracked(error) => {
-                panic!("fixture create was not pending: {error}")
-            }
-            CreateFailureKind::OutcomeUnknown { unknown, error } => {
-                panic!(
-                    "fixture create outcome was unknown for {}: {error}",
-                    unknown.id()
-                )
-            }
-        };
-        PendingCreate {
-            id,
-            wit_id,
-            wit_request,
-            pending,
-        }
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let request =
+                    carina_core::executor::prepare_create_request(resource, &preparation).await;
+                let request = request.expect("fixture resource passes provider preparation");
+                let (create, _cancellation) =
+                    carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request);
+                let failure = create.await.expect_err("fixture create remains pending");
+                let pending = match failure.into_kind() {
+                    CreateFailureKind::InFlight {
+                        pending,
+                        error: _error,
+                    } => pending.into_fresh().unwrap_or_else(|_| {
+                        panic!("fixture provider returned a persisted continuation")
+                    }),
+                    CreateFailureKind::Created {
+                        created: _created,
+                        error,
+                    } => {
+                        panic!("fixture create was created: {error}")
+                    }
+                    CreateFailureKind::Untracked(error) => {
+                        panic!("fixture create was not pending: {error}")
+                    }
+                    CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                        panic!(
+                            "fixture create outcome was unknown for {}: {error}",
+                            unknown.id()
+                        )
+                    }
+                };
+                PendingCreate {
+                    id,
+                    wit_id,
+                    wit_request,
+                    pending,
+                }
+            },
+        )
+        .await
     }
 
     fn pending_create_without_identifier() -> PendingCreate {
@@ -8277,21 +8842,34 @@ mod tests {
         let normalizer = carina_core::provider::NoopNormalizer;
         let factories = [];
         let schemas = carina_core::schema::SchemaRegistry::new();
-        let context = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &provider_configs,
-            &normalizer,
-            &factories,
-            &schemas,
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(Vec::new()),
+            schemas.clone(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
-        let request = carina_core::executor::prepare_create_request(resource, &context)
-            .await
-            .expect("resume fixture request must pass provider preparation");
-        let (resume, _request) = ResumeCreateRequest::for_test(pending, request)
-            .expect("resume fixture route must match")
-            .into_parts();
-        resume
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let context = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &provider_configs,
+                    &normalizer,
+                    &factories,
+                    &schemas,
+                    type_checks,
+                );
+                let request =
+                    carina_core::executor::prepare_create_request(resource, &context).await;
+                let request =
+                    request.expect("resume fixture request must pass provider preparation");
+                let (resume, _request) = ResumeCreateRequest::for_test(pending, request)
+                    .expect("resume fixture route must match")
+                    .into_parts();
+                resume
+            },
+        )
+        .await
     }
 
     fn assert_original_polled_record(
@@ -9078,370 +9656,6 @@ mod tests {
             .expect("migrated test document must retain its attribute")
     }
 
-    fn assert_value_structure_eq(actual: &Value, expected: &Value) {
-        match (actual, expected) {
-            (
-                Value::Deferred(DeferredValue::Unknown(actual)),
-                Value::Deferred(DeferredValue::Unknown(expected)),
-            ) => assert_eq!(actual, expected),
-            (
-                Value::Concrete(ConcreteValue::List(actual)),
-                Value::Concrete(ConcreteValue::List(expected)),
-            ) => {
-                assert_eq!(actual.len(), expected.len());
-                for (actual, expected) in actual.iter().zip(expected) {
-                    assert_value_structure_eq(actual, expected);
-                }
-            }
-            (
-                Value::Concrete(ConcreteValue::Map(actual)),
-                Value::Concrete(ConcreteValue::Map(expected)),
-            ) => {
-                assert_eq!(
-                    actual.keys().collect::<Vec<_>>(),
-                    expected.keys().collect::<Vec<_>>()
-                );
-                for (key, expected) in expected {
-                    assert_value_structure_eq(&actual[key], expected);
-                }
-            }
-            (
-                Value::Deferred(DeferredValue::Interpolation(actual)),
-                Value::Deferred(DeferredValue::Interpolation(expected)),
-            ) => {
-                assert_eq!(actual.len(), expected.len());
-                for (actual, expected) in actual.iter().zip(expected) {
-                    match (actual, expected) {
-                        (
-                            InterpolationPart::Literal(actual),
-                            InterpolationPart::Literal(expected),
-                        ) => assert_eq!(actual, expected),
-                        (InterpolationPart::Expr(actual), InterpolationPart::Expr(expected)) => {
-                            assert_value_structure_eq(actual, expected)
-                        }
-                        _ => panic!("interpolation part variants differ"),
-                    }
-                }
-            }
-            (
-                Value::Deferred(DeferredValue::FunctionCall {
-                    name: actual_name,
-                    args: actual_args,
-                    ..
-                }),
-                Value::Deferred(DeferredValue::FunctionCall {
-                    name: expected_name,
-                    args: expected_args,
-                    ..
-                }),
-            ) => {
-                assert_eq!(actual_name, expected_name);
-                assert_eq!(actual_args.len(), expected_args.len());
-                for (actual, expected) in actual_args.iter().zip(expected_args) {
-                    assert_value_structure_eq(
-                        actual.value().expect("serialized function argument value"),
-                        expected
-                            .value()
-                            .expect("serialized function argument value"),
-                    );
-                }
-            }
-            (
-                Value::Deferred(DeferredValue::Access(actual_access)),
-                Value::Deferred(DeferredValue::Access(expected_access)),
-            ) => {
-                assert_eq!(actual_access.step(), expected_access.step());
-                assert_value_structure_eq(actual_access.base(), expected_access.base());
-            }
-            (
-                Value::Deferred(DeferredValue::Secret(actual)),
-                Value::Deferred(DeferredValue::Secret(expected)),
-            ) => assert_value_structure_eq(actual, expected),
-            _ => assert_eq!(actual, expected),
-        }
-    }
-
-    #[test]
-    fn stripped_attributes_expose_exact_deferred_names_by_resource_position() {
-        let mut first = Resource::new("test.t", "first");
-        first.set_attr("known", test_string_value("known"));
-        first.set_attr(
-            "pending",
-            Value::Deferred(DeferredValue::Unknown(
-                ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding_address_for_test("pending"),
-                },
-            )),
-        );
-        first.set_attr("peer", root_resource_ref("peer", "identifier"));
-        let mut second = Resource::new("test.t", "second");
-        second.set_attr("known", test_string_value("known"));
-        let mut third = Resource::new("test.t", "third");
-        third.set_attr(
-            "nested",
-            Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-                DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding_address_for_test("nested"),
-                }),
-            )])),
-        );
-        let mut resources = vec![first, second, third];
-
-        let stripped = strip_provider_boundary_attributes(&mut resources);
-
-        assert_eq!(
-            stripped.deferred_names(),
-            vec![
-                vec!["pending".to_string(), "peer".to_string()],
-                Vec::new(),
-                vec!["nested".to_string()],
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn wasm_serializable_resources_restores_original_attribute_order() {
-        let mut resource = Resource::new("test.t", "n");
-        resource.set_attr("before", test_string_value("before"));
-        resource.set_attr(
-            "pending",
-            Value::Deferred(DeferredValue::Unknown(
-                ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding_address_for_test("pending"),
-                },
-            )),
-        );
-        resource.set_attr("middle", test_string_value("middle"));
-        resource.set_attr("peer", root_resource_ref("peer", "identifier"));
-        resource.set_attr("after", test_string_value("after"));
-        let mut resources = vec![resource];
-        let original_attributes = resources[0].attributes.clone();
-
-        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
-            Box::pin(async move {
-                assert_eq!(
-                    resources[0].attributes.keys().collect::<Vec<_>>(),
-                    vec!["before", "middle", "after"]
-                );
-                resources[0].set_attr("guest_added", test_string_value("new"));
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(
-            resources[0].attributes.keys().collect::<Vec<_>>(),
-            vec![
-                "before",
-                "pending",
-                "middle",
-                "peer",
-                "after",
-                "guest_added"
-            ],
-            "restoration must preserve original positions and trail guest-added attributes"
-        );
-        for (key, value) in original_attributes {
-            assert_value_structure_eq(
-                resources[0]
-                    .get_attr(&key)
-                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
-                &value,
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wasm_serializable_resources_restores_duplicate_resource_ids_by_position() {
-        let first_hidden: Value = Value::Deferred(DeferredValue::Unknown(
-            ApplyTimeUnknown::UpstreamAllExports {
-                binding: absolute_binding_address_for_test("pending"),
-            },
-        ));
-        let second_hidden = root_resource_ref("peer", "identifier");
-
-        let mut first = Resource::new("test.t", "shared");
-        first.set_attr("visible", test_string_value("first"));
-        first.set_attr("hidden", first_hidden.clone());
-
-        let mut second = Resource::new("test.t", "shared");
-        second.set_attr("visible", test_string_value("second"));
-        second.set_attr("hidden", second_hidden.clone());
-
-        assert_eq!(first.id, second.id, "the regression requires duplicate IDs");
-        let mut resources = vec![first, second];
-
-        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
-            Box::pin(async move {
-                for resource in resources {
-                    assert_eq!(
-                        resource.attributes.keys().collect::<Vec<_>>(),
-                        vec!["visible"]
-                    );
-                }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-        assert_value_structure_eq(
-            resources[0]
-                .get_attr("hidden")
-                .expect("the first resource's attribute must be restored"),
-            &first_hidden,
-        );
-        assert_value_structure_eq(
-            resources[1]
-                .get_attr("hidden")
-                .expect("the second resource's attribute must be restored"),
-            &second_hidden,
-        );
-    }
-
-    #[tokio::test]
-    async fn wasm_serializable_resources_strips_values_in_nested_wrappers() {
-        let upstream_path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
-            .resolve_root_for_test();
-        let unknown = || {
-            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-                path: upstream_path.clone(),
-            }))
-        };
-        let resource_ref = || root_resource_ref("admins", "group_id");
-
-        let mut resource = Resource::new("test.t", "n");
-        resource.set_attr("stable", test_string_value("visible"));
-        resource.set_attr(
-            "unknown_list",
-            Value::Concrete(ConcreteValue::List(vec![unknown()])),
-        );
-        resource.set_attr(
-            "unknown_map",
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                "nested".to_string(),
-                unknown(),
-            )]))),
-        );
-        resource.set_attr(
-            "unknown_interpolation",
-            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
-                unknown(),
-            )])),
-        );
-        resource.set_attr(
-            "unknown_function",
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: carina_core::builtins::BuiltinFunction::upper,
-                args: vec![unknown().into()],
-                source_line: 0.into(),
-            }),
-        );
-        resource.set_attr(
-            "unknown_secret",
-            Value::Deferred(DeferredValue::Secret(Box::new(unknown()))),
-        );
-        resource.set_attr(
-            "ref_map",
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                "nested".to_string(),
-                resource_ref(),
-            )]))),
-        );
-        resource.set_attr(
-            "ref_interpolation",
-            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
-                resource_ref(),
-            )])),
-        );
-        resource.set_attr(
-            "ref_function",
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: carina_core::builtins::BuiltinFunction::upper,
-                args: vec![resource_ref().into()],
-                source_line: 0.into(),
-            }),
-        );
-        resource.set_attr(
-            "ref_secret",
-            Value::Deferred(DeferredValue::Secret(Box::new(resource_ref()))),
-        );
-        let mut resources = vec![resource];
-        let original_attributes = resources[0].attributes.clone();
-
-        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
-            Box::pin(async move {
-                assert_eq!(
-                    resources[0].attributes.keys().collect::<Vec<_>>(),
-                    vec!["stable"],
-                    "the WASM transport operation must see only serializable attributes"
-                );
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(
-            resources[0].attributes.keys().collect::<Vec<_>>(),
-            original_attributes.keys().collect::<Vec<_>>()
-        );
-        for (key, value) in original_attributes {
-            assert_value_structure_eq(
-                resources[0]
-                    .get_attr(&key)
-                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
-                &value,
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wasm_serializable_resources_restores_attributes_on_error() {
-        let mut resource = Resource::new("test.t", "n");
-        resource.set_attr("stable", test_string_value("visible"));
-        resource.set_attr("peer", root_resource_ref("peer", "identifier"));
-        resource.set_attr(
-            "pending",
-            Value::Deferred(DeferredValue::Unknown(
-                ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding_address_for_test("pending"),
-                },
-            )),
-        );
-        let mut resources = vec![resource];
-        let before = resources[0].attributes.clone();
-
-        let error =
-            with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
-                Box::pin(async move {
-                    assert_eq!(
-                        resources[0].attributes.keys().collect::<Vec<_>>(),
-                        vec!["stable"]
-                    );
-                    Err(ProviderError::internal("boundary failed"))
-                })
-            })
-            .await
-            .expect_err("the boundary error must propagate");
-
-        assert_eq!(error.detail().context(), "boundary failed");
-        assert_eq!(
-            resources[0].attributes.keys().collect::<Vec<_>>(),
-            before.keys().collect::<Vec<_>>(),
-            "restored attributes must retain their original order"
-        );
-        for (key, value) in before {
-            assert_value_structure_eq(
-                resources[0]
-                    .get_attr(&key)
-                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
-                &value,
-            );
-        }
-    }
-
     #[test]
     fn malformed_config_completions_metadata_is_rejected() {
         let error = decode_config_completions_json("not json", "mock", "1.0.0")
@@ -9574,7 +9788,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn normalizer_guest_boundary_decode_error_is_structured_and_reentrant() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
@@ -9598,10 +9812,10 @@ mod tests {
         .await
         .expect("mock WASM provider should load");
         let instance = factory
-            .get_or_create_shared_instance(None, &IndexMap::new())
+            .get_or_create_shared_instance(None, &empty_ready_config(&factory))
             .await
             .expect("mock WASM provider should initialize");
-        let malformed = wit_types::ResourceDef {
+        let malformed = version_checked_bindings::WitDesiredResource {
             id: wit_types::ResourceId {
                 provider: "mock".to_string(),
                 resource_type: "test.resource".to_string(),
@@ -9609,7 +9823,7 @@ mod tests {
             },
             attributes: vec![(
                 "settings".to_string(),
-                wit_types::Value::ListVal("not-json".to_string()),
+                wit_types::DesiredValue::ListVal("not-json".to_string()),
             )],
         };
         let locked = instance
@@ -9619,7 +9833,7 @@ mod tests {
         let malformed = [malformed];
         let result = locked
             .call("normalize_desired", async |bindings, store| {
-                bindings.call_normalize_desired_raw(store, &malformed).await
+                bindings.call_normalize_desired(store, &malformed).await
             })
             .await
             .expect("the guest call should return its provider error");
@@ -9727,14 +9941,14 @@ mod tests {
         let mut states = HashMap::from([
             (
                 first_id.clone(),
-                State::existing(
+                SnapshotState::existing(
                     first_id.clone(),
                     HashMap::from([("value".to_string(), original_value.clone())]),
                 ),
             ),
             (
                 second_id.clone(),
-                State::existing(
+                SnapshotState::existing(
                     second_id.clone(),
                     HashMap::from([("value".to_string(), original_value)]),
                 ),
@@ -9798,9 +10012,10 @@ mod tests {
             .expect("migration produces a valid digest");
         let attributes = HashMap::from([(
             "comment".to_string(),
-            Value::Deferred(DeferredValue::RedactedSecret { hash }),
+            carina_core::resource::SnapshotValue::redacted(hash),
         )]);
-        let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
+        let mut states =
+            HashMap::from([(id.clone(), SnapshotState::existing(id.clone(), attributes))]);
         apply_wit_state_attribute_updates(
             "normalize_state",
             &mut states,
@@ -9811,8 +10026,9 @@ mod tests {
         )
         .expect("apply normalized state");
 
-        let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
-            states[&id].attributes.get("comment")
+        let Some(Value::Deferred(DeferredValue::Placeholder(
+            carina_core::resource::SnapshotLeaf::RedactedSecret { hash },
+        ))) = states[&id].attributes.get("comment")
         else {
             panic!("normalized legacy marker must remain a typed secret hash")
         };
@@ -11043,7 +11259,7 @@ mod tests {
         assert!(trap.downcast_ref::<EgressDenied>().is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dns_resolution_respects_connect_timeout() {
         use wasmtime_wasi::p2::Pollable;
         use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
@@ -11240,6 +11456,7 @@ mod tests {
                 match listener.accept() {
                     Ok(connection) => break connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // wall-clock-ok: hang guard for the real loopback server accept.
                         assert!(
                             std::time::Instant::now() < deadline,
                             "server accept timed out"
@@ -11289,6 +11506,7 @@ mod tests {
                 match listener.accept() {
                     Ok(connection) => break connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // wall-clock-ok: hang guard for the real loopback server accept.
                         assert!(
                             std::time::Instant::now() < deadline,
                             "server accept timed out"
@@ -11424,26 +11642,16 @@ mod tests {
     fn test_epoch_ticker_increments_epoch() {
         let config = build_engine_config();
         let engine = Engine::new(&config).unwrap();
-        let ticker = EpochTicker::start(engine.clone());
-
-        // Sleep for 2.5 seconds; the ticker should have incremented at least twice.
-        std::thread::sleep(std::time::Duration::from_millis(2500));
-
-        // Verify by setting a deadline of 1 on a store — if the epoch has
-        // advanced past 1, this deadline is already expired.
-        let mut store = GuestStore::new(
-            &engine,
-            local_provider_label("epoch-test"),
-            GuestNetwork::SchemaOnly,
-            None,
-            build_store_limits(),
-            GuestCallBudget::PRODUCTION,
-        );
-        store.set_epoch_deadline_for_test(1);
-
-        // The epoch should be at least 2 by now, so a deadline of 1 is expired.
-        // We can't easily check the epoch value directly, but we can verify
-        // the ticker didn't crash and drop works cleanly.
+        let (ticked, ticks) = std::sync::mpsc::channel();
+        let ticker = EpochTicker::start_with_tick_observer(engine, move || {
+            let _ = ticked.send(());
+        });
+        for _ in 0..2 {
+            // wall-clock-ok: hang guard for an actual increment from the real epoch ticker thread; no elapsed-speed assertion.
+            ticks
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("epoch ticker must increment the engine");
+        }
         drop(ticker);
     }
 
@@ -12011,26 +12219,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn initialization_value_encode_failure_keeps_typed_internal_error() {
-        let mapper: ProviderInstantiationErrorMapper =
-            Arc::new(default_provider_instantiation_error_mapper);
-        let provider_error =
-            WasmProviderInstanceError::InitializeValueEncode(SerializationError::NonFiniteFloat {
-                value: f64::NAN,
-                context: carina_core::value::SerializationContext::WasmBoundary,
-            })
-            .into_provider_error_with(&mapper);
-
-        assert_eq!(provider_error.variant_name(), "internal");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialization_values_fail_at_shared_wire_preparation_before_instance_creation() {
+        let factory = rebuildable_state_test_factory()
+            .await
+            .expect("mock WASM fixture is required");
+        let error = prepare_test_config(
+            &factory,
+            IndexMap::from([(
+                "extra".into(),
+                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+            )]),
+        )
+        .unwrap_err();
+        let carina_core::executor::ProviderConfigPreparationError::Wire(wire) = &error else {
+            panic!("expected shared wire rejection: {error}")
+        };
+        assert!(matches!(
+            wire.conversion_error(),
+            carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat
+        ));
+        assert_eq!(wire.attribute(), "extra");
         assert_eq!(
-            provider_error.detail().context(),
-            "failed to encode a WASM provider boundary value"
+            wire.target(),
+            &carina_core::provider::ProviderWireTarget::Configuration {
+                provider: "mock".into()
+            }
         );
         assert_eq!(
-            provider_error.to_string(),
-            "failed to encode a WASM provider boundary value: in operation initialize: cannot serialize at WASM provider boundary: non-finite float NaN"
+            error.to_string(),
+            "provider mock configuration: attribute `extra` cannot cross the provider wire: non-finite float cannot cross the provider protocol"
         );
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(factory.shared_instances.lock().await.is_empty());
     }
 
     #[test]
@@ -12222,6 +12443,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validation_suspends_after_two_timeouts_despite_other_input_successes() {
+        let context = ValidationContextFingerprint::validate_config(
+            &[0; 32],
+            &[("probe".to_string(), wit_types::Value::IntVal(1))],
+        );
+        let other = ValidationContextFingerprint::validate_config(
+            &[0; 32],
+            &[("probe".to_string(), wit_types::Value::IntVal(2))],
+        );
+        let reason = PoisonReason::WallClockTimeout {
+            operation: "validate_config",
+        };
+        let mut state = RebuildableState {
+            instance: ValidationInstanceState::Poisoned {
+                reason: reason.clone(),
+            },
+            input_health: IndexMap::new(),
+        };
+
+        for attempt in 1..=2 {
+            state.record_wall_clock_timeout(context.clone(), reason.clone());
+            state.record_success(&other);
+            assert_eq!(state.suspended_reason(&context).is_some(), attempt == 2);
+        }
+        let error = suspended_validation_error(state.suspended_reason(&context).unwrap(), &context);
+        assert_eq!(
+            error.detail().host_cause(),
+            Some(carina_core::provider::HostErrorCause::ValidationSuspended(
+                context.suspended_validation_id()
+            ))
+        );
+        assert!(state.suspended_reason(&other).is_none());
+        assert_eq!(state.input_health.len(), 1);
+    }
+
     #[tokio::test]
     async fn rebuildable_state_retains_timeout_history_across_other_input_successes() {
         let Some(factory) = rebuildable_state_test_factory().await else {
@@ -12258,12 +12515,10 @@ mod tests {
             .expect("the second call for X should use the live instance")
             .wall_clock_timeout();
 
-        let started = std::time::Instant::now();
         let suspended = match instance.acquire(context_x.clone()).await {
             Ok(_) => panic!("X must be suspended after its second timeout"),
             Err(error) => error,
         };
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(
             suspended.detail().host_cause(),
             Some(carina_core::provider::HostErrorCause::ValidationSuspended(
@@ -12402,7 +12657,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn returned_trap_poison_is_classified_inside_call() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
@@ -12426,7 +12681,7 @@ mod tests {
         .await
         .expect("mock WASM provider should load");
         let instance = factory
-            .get_or_create_shared_instance(None, &IndexMap::new())
+            .get_or_create_shared_instance(None, &empty_ready_config(&factory))
             .await
             .expect("mock WASM provider should initialize");
 

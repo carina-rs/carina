@@ -26,9 +26,7 @@
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-use indexmap::IndexMap;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -56,9 +54,6 @@ impl ProviderFactory for AwsccTestFactory {
         _value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
     fn create_provider(
         &self,
@@ -133,7 +128,11 @@ impl Provider for NoopProvider {
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
         let id = resource.id.clone();
-        Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })
+        Box::pin(async move {
+            Ok(carina_core::resource::State::<
+                carina_core::resource::NoPlaceholder,
+            >::existing(id, HashMap::new()))
+        })
     }
     fn create(
         &self,
@@ -305,14 +304,12 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
 
     let fixture = write_fixture();
     let caller = fixture.path().join("caller");
+    let project = carina_core::paths::ResolvedPath::new(&caller).unwrap();
 
-    let provider_context = ProviderContext::default();
-    let loaded = load_configuration_with_config(
-        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
-        &provider_context,
-        &SchemaRegistry::new(),
-    )
-    .expect("load should succeed");
+    let provider_context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let loaded =
+        load_configuration_with_config(&project, &provider_context, &SchemaRegistry::new())
+            .expect("load should succeed");
     let parsed = loaded.parsed;
 
     // `load_configuration_with_config` does not run nested module
@@ -320,15 +317,23 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     // Drive it explicitly here so the post-expansion shape (RolePolicy
     // in `resources`, `_virtual.bs.bootstrap` in `compositions`)
     // is in place for the assertion below.
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         &provider_context,
-        &SchemaRegistry::new(),
-    )
-    .expect("module expansion should succeed");
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                parsed,
+                &project,
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("module expansion should succeed")
+        },
+    );
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("module expansion must substitute every parser placeholder");
 
     // Sanity: module expansion produced both the RolePolicy resource
@@ -380,10 +385,16 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
             wait_aliases: &[],
         },
     );
-    carina_core::resolver::resolve_refs_for_plan(
-        &mut resources,
-        &bindings,
-        &std::collections::HashSet::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            carina_core::resolver::resolve_refs_for_plan(
+                &mut resources,
+                &bindings,
+                &std::collections::HashSet::new(),
+                session,
+            )
+        },
     )
     .expect("resolve_refs_for_plan should succeed");
 

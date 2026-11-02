@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
 use thiserror::Error;
@@ -21,18 +21,18 @@ use crate::module_resolver::{
 };
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
-    CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, UpdateRequest,
+    CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, ProviderWireError,
+    ProviderWireTarget, ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
 };
-#[cfg(test)]
-use crate::resource::NoPlaceholder;
 use crate::resource::{
-    BindingAddress, ConcreteValue, DataSource, DeferredValue, LiveComposition, ParserPlaceholder,
-    PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
-    RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
-    SavedComposition, Value,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DataSource, DeferredValue,
+    LiveComposition, NoPlaceholder, ParserPlaceholder, PlaceholderKind, ProviderDataSource,
+    ProviderModuleSource, ProviderResource, RelativeBindingName, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
+    ValidatedConfigSchema,
 };
 use crate::value::SerializationError;
 
@@ -49,25 +49,70 @@ use crate::value::SerializationError;
 /// let resolved = ResolvedResource::new(Resource::new("test", "example"));
 /// let _ready = ProviderReady { value: resolved }; // private fields
 /// ```
+///
+/// ```compile_fail
+/// use carina_core::provider::ProviderReadyResource;
+/// use carina_core::resource::{ProviderModuleSource, ResolvedResource};
+/// fn bypass(raw: ResolvedResource<ProviderModuleSource>) -> ProviderReadyResource {
+///     raw.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::provider::ProviderReadyResource;
+/// use carina_core::resource::Value;
+/// fn mutate(ready: &mut ProviderReadyResource, value: Value) {
+///     ready.as_resource().attributes.insert("unchecked".into(), value);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProviderReady<T> {
-    value: T,
+pub struct ProviderReady<T: ResourceWirePayload> {
+    value: WireReady<T>,
     directives: ProviderDirectives,
 }
 
-impl<T> ProviderReady<T> {
+impl<T: ResourceWirePayload> ProviderReady<T> {
+    fn settled(
+        pending: crate::validation::deferred_types::PendingProviderTypeChecks<
+            '_,
+            (T, ProviderDirectives),
+        >,
+    ) -> Result<Self, ProviderPreparationError> {
+        let mut diagnostics = Vec::new();
+        let (value, directives) = pending.publish(&mut diagnostics)?;
+        if !diagnostics.is_empty() {
+            let messages = diagnostics.into_iter().map(|diagnostic| match diagnostic {
+                crate::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning)
+                | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.message,
+            }).collect::<Vec<_>>();
+            return Err(ProviderPreparationError::Provider(
+                crate::provider::ProviderError::invalid_input(messages.join("\n")),
+            ));
+        }
+        let target = ProviderWireTarget::Resource(value.resource_id().clone());
+        Ok(Self {
+            value: WireReady::try_new(value, target)?,
+            directives,
+        })
+    }
+
     /// Borrow the checked payload.
     pub fn as_inner(&self) -> &T {
-        &self.value
+        self.value.as_inner()
     }
 
     /// Borrow the schema-resolved directives paired with this payload.
     pub fn directives(&self) -> &ProviderDirectives {
         &self.directives
     }
+
+    /// The complete projection checked before native or WASM dispatch.
+    pub fn wire_attributes(&self) -> &WireAttributes {
+        self.value.wire()
+    }
 }
 
-impl<T> Deref for ProviderReady<T> {
+impl<T: ResourceWirePayload> Deref for ProviderReady<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -89,12 +134,16 @@ pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource<ProviderModu
 /// checks and provider semantic validation before returning the value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalProviderConfigAttributes {
-    attributes: IndexMap<String, Value>,
+    attributes: WireReady<IndexMap<String, Value>>,
 }
 
 impl CanonicalProviderConfigAttributes {
     pub fn attributes(&self) -> &IndexMap<String, Value> {
-        &self.attributes
+        self.attributes.as_inner()
+    }
+
+    pub fn wire_attributes(&self) -> &WireAttributes {
+        self.attributes.wire()
     }
 }
 
@@ -133,13 +182,28 @@ impl Deref for CanonicalProviderConfigAttributes {
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderReadyConfig {
+    inner: Arc<ProviderReadyConfigInner>,
+}
+
+#[derive(Debug, PartialEq)]
+struct ProviderReadyConfigInner {
     attributes: CanonicalProviderConfigAttributes,
+    region: Option<String>,
 }
 
 impl ProviderReadyConfig {
     /// Borrow the checked provider configuration attributes.
     pub fn attributes(&self) -> &IndexMap<String, Value> {
-        self.attributes.attributes()
+        self.inner.attributes.attributes()
+    }
+
+    pub fn wire_attributes(&self) -> &WireAttributes {
+        self.inner.attributes.wire_attributes()
+    }
+
+    /// Borrow the resolved region when the provider config schema declares it.
+    pub fn region(&self) -> Option<&str> {
+        self.inner.region.as_deref()
     }
 }
 
@@ -158,6 +222,7 @@ pub struct ProviderPreparationContext<'a> {
     normalizer: &'a dyn ProviderNormalizer,
     custom_type_resolver:
         crate::provider::FactoryCustomTypeResolver<&'a [Box<dyn ProviderFactory>]>,
+    type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &'a SchemaRegistry,
 }
 
@@ -172,6 +237,7 @@ impl<'a> ProviderPreparationContext<'a> {
         normalizer: &'a dyn ProviderNormalizer,
         factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
+        type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Self {
         let custom_type_resolver = crate::provider::FactoryCustomTypeResolver::new(factories);
         Self {
@@ -181,7 +247,14 @@ impl<'a> ProviderPreparationContext<'a> {
             normalizer,
             custom_type_resolver,
             schemas,
+            type_checks,
         }
+    }
+
+    pub(super) fn type_checks(
+        &self,
+    ) -> &dyn crate::validation::deferred_types::ProviderTypeCheckContext {
+        self.type_checks
     }
 
     pub(super) fn bindings(&self) -> &ResolvedBindings {
@@ -200,10 +273,15 @@ impl<'a> ProviderPreparationContext<'a> {
 /// Whether a provider-bound value is still in its authored form or came from
 /// the plan after normalization. The latter always carries the authored
 /// snapshot; omitting it is not representable at the preparation seam.
-pub(super) enum CheckInput<T> {
+pub(super) enum CheckInput<T, A = T> {
     Authored(T),
-    PlanNormalized { resolved: T, authored: T },
+    PlanNormalized { resolved: T, authored: A },
 }
+
+pub(super) type ResourceCheckInput<S> =
+    CheckInput<Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>>;
+pub(super) type DataSourceCheckInput<S> =
+    CheckInput<DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>>;
 
 /// A resolved provider payload paired with the only valid schema-check scope.
 ///
@@ -239,19 +317,31 @@ impl<T> ResolvedCheckInput<T> {
     }
 }
 
-/// Aggregate returned by the module constraint gate.
+/// Resolution failures and evaluated violations remain distinct at every gate.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ModuleConstraintGateError {
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::module_resolver::ModuleConstraintResolutionError),
+    #[error(transparent)]
+    Violations(#[from] ModuleConstraintViolations),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleConstraintGateError {
+pub struct ModuleConstraintViolations {
     failures: Vec<ModuleConstraintFailure>,
 }
 
-impl ModuleConstraintGateError {
+impl ModuleConstraintViolations {
     pub fn failures(&self) -> &[ModuleConstraintFailure] {
         &self.failures
     }
+
+    pub fn into_failures(self) -> Vec<ModuleConstraintFailure> {
+        self.failures
+    }
 }
 
-impl fmt::Display for ModuleConstraintGateError {
+impl fmt::Display for ModuleConstraintViolations {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.failures.is_empty() {
             return f.write_str(
@@ -268,7 +358,7 @@ impl fmt::Display for ModuleConstraintGateError {
     }
 }
 
-impl std::error::Error for ModuleConstraintGateError {}
+impl std::error::Error for ModuleConstraintViolations {}
 
 /// Apply-time module constraint gate shared by one execution.
 ///
@@ -285,7 +375,7 @@ pub struct ModuleConstraintGate {
 
 enum ModuleConstraintCompositions {
     Live(Vec<LiveComposition>),
-    Saved(Vec<SavedComposition>),
+    Saved(Vec<SavedComposition<NoPlaceholder>>),
 }
 
 impl ModuleConstraintGate {
@@ -296,7 +386,7 @@ impl ModuleConstraintGate {
         }
     }
 
-    pub fn from_saved_compositions(compositions: &[SavedComposition]) -> Self {
+    pub fn from_saved_compositions(compositions: &[SavedComposition<NoPlaceholder>]) -> Self {
         Self {
             compositions: ModuleConstraintCompositions::Saved(compositions.to_vec()),
             reported_failures: Mutex::new(HashSet::new()),
@@ -307,13 +397,15 @@ impl ModuleConstraintGate {
         &self,
         bindings: &ResolvedBindings,
         terminal: bool,
-    ) -> Vec<ModuleConstraintFailure> {
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<Vec<ModuleConstraintFailure>, crate::module_resolver::ModuleConstraintResolutionError>
+    {
         match &self.compositions {
             ModuleConstraintCompositions::Live(compositions) => {
-                evaluate_live_pending_constraints(compositions, bindings, terminal)
+                evaluate_live_pending_constraints(compositions, bindings, terminal, session)
             }
             ModuleConstraintCompositions::Saved(compositions) => {
-                evaluate_saved_pending_constraints(compositions, bindings, terminal)
+                evaluate_saved_pending_constraints(compositions, bindings, terminal, session)
             }
         }
     }
@@ -329,8 +421,12 @@ impl ModuleConstraintGate {
     /// One ceiling remains: a cross-argument `require` over X and Y can still
     /// be pending when a consumer of X runs if Y is unknown. It is evaluated
     /// when Y becomes known at a later gate, or rejected by the terminal sweep.
-    pub fn check(&self, bindings: &ResolvedBindings) -> Result<(), ModuleConstraintGateError> {
-        let failures = self.evaluate(bindings, false);
+    pub fn check(
+        &self,
+        bindings: &ResolvedBindings,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<(), ModuleConstraintGateError> {
+        let failures = self.evaluate(bindings, false, session)?;
         if failures.is_empty() {
             return Ok(());
         }
@@ -346,9 +442,10 @@ impl ModuleConstraintGate {
 
         // An empty diagnostic still returns Err: reporting suppression must
         // never turn a known violation into permission to call a provider.
-        Err(ModuleConstraintGateError {
+        Err(ModuleConstraintViolations {
             failures: new_failures,
-        })
+        }
+        .into())
     }
 
     /// Evaluate every remaining constraint at the end of apply.
@@ -366,8 +463,9 @@ impl ModuleConstraintGate {
         &self,
         bindings: &ResolvedBindings,
         report_unresolved: bool,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleConstraintGateError> {
-        let failures = self.evaluate(bindings, report_unresolved);
+        let failures = self.evaluate(bindings, report_unresolved, session)?;
         self.report_new(failures)
     }
 
@@ -386,7 +484,7 @@ impl ModuleConstraintGate {
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(ModuleConstraintGateError { failures })
+            Err(ModuleConstraintViolations { failures }.into())
         }
     }
 }
@@ -394,27 +492,32 @@ impl ModuleConstraintGate {
 impl ProviderReadyResource {
     /// Borrow the provider-facing resource payload.
     pub fn as_resource(&self) -> &ProviderResource {
-        self.value.as_resource()
+        self.as_inner().as_resource()
     }
 }
 
 impl ProviderReadyDataSource {
     /// Borrow the provider-facing data-source payload.
     pub fn as_data_source(&self) -> &ProviderDataSource {
-        self.value.as_inner()
+        self.as_inner().as_inner()
     }
 }
 
 /// Failure while preparing a provider-facing resource.
 #[derive(Debug, Error)]
 pub enum ProviderPreparationError {
+    /// The complete provider input has no wire representation.
+    #[error("{0}")]
+    Wire(Box<ProviderWireError>),
+    #[error(transparent)]
+    TypeSettlement(#[from] crate::validation::deferred_types::ProviderTypeCheckFailure),
     /// An unresolved deferred value survived apply-time reference resolution.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
     /// A known value violates its resource schema or provider validator.
     #[error("{resource}: value constraint failed before provider dispatch: {errors}")]
     ValueConstraint {
-        resource: ResourceId,
+        resource: Box<ResourceId>,
         errors: ProviderValueConstraintErrors,
     },
     /// A pending module argument constraint became decidable and failed.
@@ -423,7 +526,7 @@ pub enum ProviderPreparationError {
     /// Authored lifecycle metadata could not be resolved against the managed
     /// schema before constructing the provider-ready resource.
     #[error(transparent)]
-    ResolvedResource(#[from] crate::resource::ResolvedResourceError),
+    ResolvedResource(Box<crate::resource::ResolvedResourceError>),
     /// The managed resource has no schema to classify write-only attributes.
     #[error("{resource}: no managed schema is registered")]
     MissingManagedSchema { resource: ResourceId },
@@ -431,9 +534,36 @@ pub enum ProviderPreparationError {
     /// current provider value is unobservable.
     #[error(transparent)]
     IgnoredWriteOnly(#[from] crate::provider::IgnoredWriteOnlyValueError),
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
     /// Provider-specific normalization failed before dispatch.
     #[error("{0}")]
     Provider(crate::provider::ProviderError),
+}
+
+impl From<crate::provider::UpdatePatchError> for ProviderPreparationError {
+    fn from(error: crate::provider::UpdatePatchError) -> Self {
+        match error {
+            crate::provider::UpdatePatchError::IgnoredWriteOnly(error) => {
+                Self::IgnoredWriteOnly(error)
+            }
+            crate::provider::UpdatePatchError::UnavailableSecret(error) => {
+                Self::UnavailableSecret(error)
+            }
+        }
+    }
+}
+
+impl From<ProviderWireError> for ProviderPreparationError {
+    fn from(error: ProviderWireError) -> Self {
+        Self::Wire(Box::new(error))
+    }
+}
+
+impl From<crate::resource::ResolvedResourceError> for ProviderPreparationError {
+    fn from(error: crate::resource::ResolvedResourceError) -> Self {
+        Self::ResolvedResource(Box::new(error))
+    }
 }
 
 impl From<crate::provider::ProviderError> for ProviderPreparationError {
@@ -467,6 +597,9 @@ impl ProviderConfigValidationError {
 /// Failure while preparing configuration for provider construction.
 #[derive(Debug, Error)]
 pub enum ProviderConfigPreparationError {
+    /// Provider semantic validation and initialization require wire values.
+    #[error("{0}")]
+    Wire(ProviderWireError),
     /// A concrete attribute violates its host-side type schema.
     #[error("provider {provider}: {attribute}: {error}")]
     InvalidAttribute {
@@ -482,10 +615,17 @@ pub enum ProviderConfigPreparationError {
     },
 }
 
+impl From<ProviderWireError> for ProviderConfigPreparationError {
+    fn from(error: ProviderWireError) -> Self {
+        Self::Wire(error)
+    }
+}
+
 impl ProviderConfigPreparationError {
     /// Attribute responsible for a host-side type/canonicalization failure.
     pub fn attribute(&self) -> Option<&str> {
         match self {
+            Self::Wire(error) => Some(error.attribute()),
             Self::InvalidAttribute { attribute, .. } => Some(attribute),
             Self::ProviderValidation { .. } => None,
         }
@@ -494,6 +634,7 @@ impl ProviderConfigPreparationError {
     /// Typed provider failure when provider-specific validation was reached.
     pub fn provider_error(&self) -> Option<&crate::provider::ProviderError> {
         match self {
+            Self::Wire(_) => None,
             Self::InvalidAttribute { .. } => None,
             Self::ProviderValidation { error, .. } => Some(error.provider_error()),
         }
@@ -526,6 +667,12 @@ fn validate_canonical_provider_config(
     provider_name: &str,
     attributes: IndexMap<String, Value>,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+    let attributes = WireReady::try_new(
+        attributes,
+        ProviderWireTarget::Configuration {
+            provider: provider_name.to_string(),
+        },
+    )?;
     let canonical = CanonicalProviderConfigAttributes { attributes };
     factory.validate_config(&canonical).map_err(|error| {
         let error = if canonical.values().any(crate::value::contains_secret) {
@@ -554,11 +701,11 @@ pub fn validate_and_canonicalize_provider_config(
     factory: &dyn ProviderFactory,
     provider_name: &str,
     attributes: &IndexMap<String, Value>,
+    config_schema: &ValidatedConfigSchema,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
-    let config_schema = factory.provider_config_attribute_types();
     let canonical =
-        canonicalize_provider_config_attributes(provider_name, attributes, &config_schema)?;
-    validate_provider_config_attributes(factory, provider_name, &canonical, &config_schema)?;
+        canonicalize_provider_config_attributes(provider_name, attributes, config_schema)?;
+    validate_provider_config_attributes(factory, provider_name, &canonical, config_schema)?;
 
     let serializable = canonical
         .into_iter()
@@ -619,11 +766,22 @@ pub fn prepare_provider_ready_config(
 ) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
     let provider_name = config.name();
     let attributes = config.attributes();
-    let canonical_attributes =
-        validate_and_canonicalize_provider_config(factory, provider_name, attributes)?;
+    let config_schema = factory.provider_config_attribute_types();
+    let canonical_attributes = validate_and_canonicalize_provider_config(
+        factory,
+        provider_name,
+        attributes,
+        &config_schema,
+    )?;
+    let region = config_schema
+        .rootless_type("region")
+        .and_then(|_| crate::utils::region_from_attrs(canonical_attributes.attributes()));
 
     Ok(ProviderReadyConfig {
-        attributes: canonical_attributes,
+        inner: Arc::new(ProviderReadyConfigInner {
+            attributes: canonical_attributes,
+            region,
+        }),
     })
 }
 
@@ -694,8 +852,13 @@ impl std::error::Error for ProviderValueConstraintErrors {}
 /// secrets for the provider, validates every newly known schema value
 /// (including provider custom types), re-runs the complete desired-side
 /// normalization pipeline, and finally proves no provider-ineligible deferred value remains.
-pub async fn prepare_provider_ready_resource(
-    resource: Resource,
+pub async fn prepare_provider_ready_resource<S: Clone, D: Clone + Default>(
+    resource: Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(
@@ -713,8 +876,13 @@ pub async fn prepare_provider_ready_resource(
 /// effect. This prevents provider normalization performed during planning
 /// from being mistaken for user input while still rerunning cross-attribute
 /// validators when at least one input became known now.
-pub(super) async fn prepare_provider_ready_resource_after_resolution<S: Clone>(
-    input: ResolvedCheckInput<Resource<S>>,
+pub(super) async fn prepare_provider_ready_resource_after_resolution<
+    S: Clone,
+    D: Clone + Default,
+>(
+    input: ResolvedCheckInput<
+        Resource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, D>,
+    >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(input, context).await
@@ -728,8 +896,10 @@ enum ResourceValueCheck {
     },
 }
 
-async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
-    input: ResolvedCheckInput<Resource<S>>,
+async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + Default>(
+    input: ResolvedCheckInput<
+        Resource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, D>,
+    >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -737,7 +907,9 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
         check: value_check,
     } = input;
     let resource = &mut value;
-    context.module_gate.check(context.bindings)?;
+    context
+        .module_gate
+        .check(context.bindings, context.type_checks)?;
     if let Some(schema) = context.schemas.get_for(resource) {
         match value_check {
             ResourceValueCheck::All => validate_known_provider_values(
@@ -778,10 +950,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
         SchemaKind::Resource,
         &resource.as_resource().directives,
     );
-    Ok(ProviderReady {
-        value: resource,
-        directives,
-    })
+    ProviderReady::settled(context.type_checks.pending((resource, directives)))
 }
 
 /// Validate and prepare a data source for provider dispatch.
@@ -806,8 +975,10 @@ pub fn prepare_provider_ready_data_source(
 /// authored inputs and derived which attributes became known during apply.
 /// Plan-normalized literal attributes are deliberately outside that check
 /// scope because they already passed the plan-time authored-value gate.
-pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
-    input: ResolvedCheckInput<DataSource<S>>,
+pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
+    input: ResolvedCheckInput<
+        DataSource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, D>,
+    >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -815,7 +986,9 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
         check: value_check,
     } = input;
     let resource = &mut value;
-    context.module_gate.check(context.bindings)?;
+    context
+        .module_gate
+        .check(context.bindings, context.type_checks)?;
     if let Some(schema) = context.schemas.get_for_data_source(resource) {
         match value_check {
             ResourceValueCheck::All => validate_known_provider_values(
@@ -853,7 +1026,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
         SchemaKind::DataSource,
         &value.as_inner().directives,
     );
-    Ok(ProviderReady { value, directives })
+    ProviderReady::settled(context.type_checks.pending((value, directives)))
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
@@ -866,9 +1039,14 @@ pub async fn prepare_create_request(
 }
 
 /// Look up the schema required to construct an update request.
-pub(super) fn managed_update_schema<'a, S>(
+pub(super) fn managed_update_schema<'a, S, D>(
     schemas: &'a SchemaRegistry,
-    resource: &Resource<S>,
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> Result<&'a ResourceSchema, ProviderPreparationError> {
     schemas
         .get_for(resource)
@@ -881,18 +1059,13 @@ pub(super) fn managed_update_schema<'a, S>(
 /// Prepare a checked update request through the provider-boundary gate.
 pub async fn prepare_update_request(
     resource: Resource,
-    from: crate::resource::State,
+    from: crate::resource::SnapshotState,
     changed_attributes: &[String],
     context: &ProviderPreparationContext<'_>,
 ) -> Result<UpdateRequest, ProviderPreparationError> {
     let resource = prepare_provider_ready_resource(resource, context).await?;
     let schema = managed_update_schema(context.schemas, resource.as_resource())?;
-    Ok(UpdateRequest::checked(
-        from,
-        changed_attributes,
-        &resource,
-        schema,
-    )?)
+    UpdateRequest::checked(from, changed_attributes, &resource, schema)
 }
 
 fn validate_known_provider_values(
@@ -906,7 +1079,7 @@ fn validate_known_provider_values(
     schema
         .validate_known_values_with_resolver(attributes, &is_string_literal, resolver)
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
-            resource: id.clone(),
+            resource: Box::new(id.clone()),
             errors: errors.into(),
         })
 }
@@ -928,7 +1101,7 @@ fn validate_selected_provider_values(
             resolver,
         )
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
-            resource: id.clone(),
+            resource: Box::new(id.clone()),
             errors: errors.into(),
         })
 }
@@ -1005,27 +1178,34 @@ mod provider_config_tests {
                 .validate()
                 .expect("valid test schema"),
         );
-        let context = ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &crate::provider::NoopNormalizer,
-            &[],
-            &schemas,
-        );
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
 
-        let request = prepare_create_request(resource, &context)
-            .await
-            .expect("provider preparation must use schema resolution");
+                let request = prepare_create_request(resource, &context)
+                    .await
+                    .expect("provider preparation must use schema resolution");
 
-        assert_eq!(request.resource().ignore_changes().iter().len(), 1);
-        assert!(request.directives().prevent_destroy());
+                assert_eq!(request.resource().ignore_changes().iter().len(), 1);
+                assert!(request.directives().prevent_destroy());
+            },
+        )
+        .await
     }
 
     #[tokio::test]
     async fn prepare_update_request_resolves_schema_default_directives() {
         let resource = Resource::with_provider("test", "widget", "example", None);
-        let from = crate::resource::State::existing(resource.id.clone(), HashMap::new());
+        let from = crate::resource::SnapshotState::existing(resource.id.clone(), HashMap::new());
         let bindings = ResolvedBindings::default();
         let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
         let mut schemas = SchemaRegistry::new();
@@ -1036,53 +1216,67 @@ mod provider_config_tests {
                 .validate()
                 .expect("valid test schema"),
         );
-        let context = ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &crate::provider::NoopNormalizer,
-            &[],
-            &schemas,
-        );
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
 
-        let request = prepare_update_request(resource, from, &[], &context)
-            .await
-            .expect("provider preparation must resolve directives against the schema");
+                let request = prepare_update_request(resource, from, &[], &context)
+                    .await
+                    .expect("provider preparation must resolve directives against the schema");
 
-        assert!(request.directives().prevent_destroy());
+                assert!(request.directives().prevent_destroy());
+            },
+        )
+        .await
     }
 
     #[tokio::test]
     async fn prepare_update_request_rejects_a_missing_managed_schema() {
         let resource = Resource::with_provider("test", "widget", "example", None);
         let id = resource.id.clone();
-        let from = crate::resource::State::existing(id.clone(), HashMap::new());
+        let from = crate::resource::SnapshotState::existing(id.clone(), HashMap::new());
         let bindings = ResolvedBindings::default();
         let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = SchemaRegistry::new();
-        let context = ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &crate::provider::NoopNormalizer,
-            &[],
-            &schemas,
-        );
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
 
-        let error = prepare_update_request(resource, from, &[], &context)
-            .await
-            .expect_err("updates without a managed schema must fail preparation");
+                let error = prepare_update_request(resource, from, &[], &context)
+                    .await
+                    .expect_err("updates without a managed schema must fail preparation");
 
-        assert!(matches!(
-            &error,
-            ProviderPreparationError::MissingManagedSchema { resource } if resource == &id
-        ));
-        let rendered = error.to_string();
-        assert!(rendered.contains(&id.to_string()), "{rendered}");
-        assert!(
-            rendered.contains("no managed schema is registered"),
-            "{rendered}"
-        );
+                assert!(matches!(
+                    &error,
+                    ProviderPreparationError::MissingManagedSchema { resource } if resource == &id
+                ));
+                let rendered = error.to_string();
+                assert!(rendered.contains(&id.to_string()), "{rendered}");
+                assert!(
+                    rendered.contains("no managed schema is registered"),
+                    "{rendered}"
+                );
+            },
+        )
+        .await
     }
 
     struct EnumConfigFactory;
@@ -1124,10 +1318,6 @@ mod provider_config_tests {
                     "expected canonical region, got {other:?}"
                 ))),
             }
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "ap-northeast-1".to_string()
         }
 
         fn create_provider(
@@ -1222,10 +1412,6 @@ mod provider_config_tests {
                 }
                 Some(_) | None => Ok(()),
             }
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
         }
 
         fn create_provider(
@@ -1402,7 +1588,7 @@ mod provider_config_tests {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
         let declaration =
             PatternAttributeType::refined_string(Some(identity.clone()), None, None, None);
-        let context = crate::parser::ProviderContext::default();
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "missing",
@@ -1488,6 +1674,7 @@ mod provider_config_tests {
                 SchemaTypeOwner::Provider("awscc".to_string()),
             ])
             .expect("two owners are non-empty"),
+            crate::schema::RefinedScalarKind::String,
         );
         let value = Value::Concrete(ConcreteValue::String("arn:accepted".into()));
 
@@ -1547,6 +1734,7 @@ mod provider_config_tests {
                 SchemaTypeOwner::Provider("one".to_string()),
             ])
             .expect("two owners are non-empty"),
+            crate::schema::RefinedScalarKind::String,
         );
         let value = Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.COMMON"));
 
@@ -1598,7 +1786,11 @@ mod provider_config_tests {
                 seen_values: None,
             })]);
         let validator = test_custom_type_validator(factories);
-        let owned = OwnedTypeIdentity::provider("owner", identity);
+        let owned = OwnedTypeIdentity::provider(
+            "owner",
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        );
         let value = Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.COMMON"));
 
         validator(CustomTypeValidationTarget::Annotation(&owned), &value)
@@ -1961,10 +2153,6 @@ mod provider_config_tests {
             }
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -1998,7 +2186,8 @@ mod provider_config_tests {
             Value::Concrete(ConcreteValue::String("valid".into())),
         )]);
 
-        validate_and_canonicalize_provider_config(&factory, "owner", &attributes)
+        let config_schema = factory.provider_config_attribute_types();
+        validate_and_canonicalize_provider_config(&factory, "owner", &attributes, &config_schema)
             .expect("the owning factory must validate its decoded refined config type");
 
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
@@ -2014,8 +2203,14 @@ mod provider_config_tests {
             Value::Concrete(ConcreteValue::String("valid".into())),
         )]);
 
-        validate_and_canonicalize_provider_config(&factory, "display-alias", &attributes)
-            .expect("the already-selected factory is the provider-config routing authority");
+        let config_schema = factory.provider_config_attribute_types();
+        validate_and_canonicalize_provider_config(
+            &factory,
+            "display-alias",
+            &attributes,
+            &config_schema,
+        )
+        .expect("the already-selected factory is the provider-config routing authority");
 
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
     }
@@ -2080,10 +2275,6 @@ mod provider_config_tests {
             }
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -2139,6 +2330,130 @@ mod provider_config_tests {
     }
 
     #[test]
+    fn prepare_provider_ready_config_has_no_region_without_schema_attribute() {
+        let factory = RefinedConfigFactory {
+            validate_calls: AtomicUsize::new(0),
+        };
+        let attributes = IndexMap::from([(
+            "endpoint".to_string(),
+            Value::Concrete(ConcreteValue::String("valid".into())),
+        )]);
+        let resolved = resolved_configs(attributes);
+
+        let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect("provider config without a region schema must be prepared");
+
+        assert_eq!(ready.region(), None);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_ignores_undeclared_region() {
+        let factory = RefinedConfigFactory {
+            validate_calls: AtomicUsize::new(0),
+        };
+        let resolved = resolved_configs(config(Value::Concrete(ConcreteValue::String(
+            "us-west-2".into(),
+        ))));
+
+        let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect("undeclared attributes must not imply a region schema");
+
+        assert_eq!(ready.region(), None);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_region_preserves_literal_string() {
+        struct StringRegionConfigFactory;
+
+        impl ProviderFactory for StringRegionConfigFactory {
+            fn name(&self) -> &str {
+                "test"
+            }
+
+            fn display_name(&self) -> &str {
+                "string region config test provider"
+            }
+
+            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::string(),
+                )]))
+                .expect("test provider config schema must be valid")
+            }
+
+            fn validate_config(
+                &self,
+                _attributes: &CanonicalProviderConfigAttributes,
+            ) -> ProviderResult<()> {
+                Ok(())
+            }
+
+            fn create_provider(
+                &self,
+                _binding: Option<&str>,
+                _config: &ProviderReadyConfig,
+                _initialize_outcome: crate::provider::InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>>
+            {
+                unreachable!("config preparation tests do not create providers")
+            }
+
+            fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+                crate::schema::ValidatedProviderSchemaWitness::new(
+                    self.schemas(),
+                    self.provider_config_attribute_types(),
+                    Default::default(),
+                )
+                .unwrap()
+            }
+
+            fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
+                Vec::new()
+            }
+        }
+
+        let factory = StringRegionConfigFactory;
+        for literal in ["us-west-2", "test.Region.us_west_2"] {
+            let resolved = resolved_configs(config(Value::Concrete(ConcreteValue::String(
+                literal.into(),
+            ))));
+
+            let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+                .expect("literal region must be prepared");
+
+            assert_eq!(ready.region(), Some(literal));
+        }
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_region_uses_canonical_enum_api_value() {
+        let resolved = resolved_configs(config(Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::enum_identity("Region", Some("test")),
+                "ap-northeast-1",
+            ),
+        ))));
+
+        let ready =
+            prepare_provider_ready_config(&EnumConfigFactory, resolved.iter().next().unwrap())
+                .expect("canonical region enum must be prepared");
+
+        assert_eq!(ready.region(), Some("ap-northeast-1"));
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_has_no_region_when_attribute_is_omitted() {
+        let factory = ConfigFactory::successful();
+        let resolved = resolved_configs(IndexMap::new());
+
+        let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect("provider config with an omitted region must be prepared");
+
+        assert_eq!(ready.region(), None);
+    }
+
+    #[test]
     fn parser_provider_config_skips_unexpandable_placeholder_without_panicking() {
         let factory = ConfigFactory::successful();
         let attributes = IndexMap::from([(
@@ -2179,6 +2494,7 @@ mod provider_config_tests {
             Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
                 if value.api_value() == "ap-northeast-1"
         ));
+        assert_eq!(ready.region(), Some("ap-northeast-1"));
     }
 
     #[test]

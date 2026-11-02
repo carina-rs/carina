@@ -12,6 +12,8 @@ mod private {
 
     pub trait Sealed: Sized {
         fn deferred_template(&self, authority: Derivation) -> Self;
+        fn selected_attribute(&self, attribute: &str, authority: Derivation) -> Self;
+        fn collection_binding(&self, index: usize, authority: Derivation) -> Self;
 
         fn with_index(&self, index: i64, authority: Derivation) -> Self;
 
@@ -151,6 +153,14 @@ impl AbsoluteBindingAddress {
         Self(value)
     }
 
+    /// Derive a selected module output while retaining its resolved scope.
+    pub(crate) fn with_attribute(&self, attribute: &str) -> Self {
+        Self(ValueString::derived_from(
+            format!("{}.{attribute}", self.as_str()),
+            [&self.0],
+        ))
+    }
+
     pub(crate) fn with_index(&self, index: i64) -> Self {
         Self(ValueString::derived_from(
             format!("{}[{index}]", self.as_str()),
@@ -242,6 +252,19 @@ pub trait BindingAddress:
 }
 
 impl private::Sealed for RelativeBindingName {
+    fn selected_attribute(&self, attribute: &str, _authority: private::Derivation) -> Self {
+        Self(ValueString::derived_from(
+            format!("{}.{attribute}", self.as_str()),
+            [&self.0],
+        ))
+    }
+    fn collection_binding(&self, index: usize, _authority: private::Derivation) -> Self {
+        Self(ValueString::derived_from(
+            self.as_str()[..index].to_owned(),
+            [&self.0],
+        ))
+    }
+
     fn deferred_template(&self, _authority: private::Derivation) -> Self {
         Self(ValueString::derived_from(
             format!("{}[?]", self.as_str()),
@@ -279,6 +302,19 @@ impl BindingAddress for RelativeBindingName {
 }
 
 impl private::Sealed for AbsoluteBindingAddress {
+    fn selected_attribute(&self, attribute: &str, _authority: private::Derivation) -> Self {
+        Self(ValueString::derived_from(
+            format!("{}.{attribute}", self.as_str()),
+            [&self.0],
+        ))
+    }
+    fn collection_binding(&self, index: usize, _authority: private::Derivation) -> Self {
+        Self(ValueString::derived_from(
+            self.as_str()[..index].to_owned(),
+            [&self.0],
+        ))
+    }
+
     fn deferred_template(&self, _authority: private::Derivation) -> Self {
         Self(ValueString::derived_from(
             format!("{}[?]", self.as_str()),
@@ -371,6 +407,13 @@ impl From<AbsoluteBindingAddress> for String {
     fn from(value: AbsoluteBindingAddress) -> Self {
         value.into_string()
     }
+}
+
+pub(crate) fn binding_selected_attribute<B: BindingAddress>(binding: &B, attribute: &str) -> B {
+    <B as private::Sealed>::selected_attribute(binding, attribute, private::Derivation)
+}
+pub(crate) fn binding_collection<B: BindingAddress>(binding: &B, index: usize) -> B {
+    <B as private::Sealed>::collection_binding(binding, index, private::Derivation)
 }
 
 #[cfg(test)]

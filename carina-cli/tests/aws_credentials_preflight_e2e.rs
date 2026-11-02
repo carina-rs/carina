@@ -94,6 +94,7 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Output {
         if let Some(status) = child.try_wait().expect("poll carina") {
             break status;
         }
+        // wall-clock-ok: hang guard: reap a stuck CLI process during the credential preflight test.
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();

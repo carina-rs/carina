@@ -5,7 +5,7 @@
 //! partial-application handling), variable references with field/index
 //! access chains, and value-position `if` expressions.
 
-use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandleMetadata};
 use crate::parser::ParsedValue as Value;
 use crate::parser::context::{ExpressionMode, ParseBindingRef};
 use crate::parser::expressions::if_expr::parse_if_value_expr_with_mode;
@@ -127,7 +127,7 @@ pub(crate) fn apply_postfix_path_segment(
 ) -> Result<EvalValue, ParseError> {
     let base = match value {
         EvalValue::User(base) => base,
-        EvalValue::StructuralHandle(handle) => {
+        EvalValue::UnexpandedStructuralHandle(handle) => {
             let binding = handle.canonical_binding_name();
             if let PathSegment::Subscript { index } = &step {
                 let binding = match index {
@@ -149,7 +149,7 @@ pub(crate) fn apply_postfix_path_segment(
         EvalValue::ProvisionalReference { binding } => {
             Value::Deferred(DeferredValue::BindingRef { binding })
         }
-        EvalValue::ComputedWithStructuralHandles {
+        EvalValue::ComputedWithUnexpandedStructuralHandles {
             value: base,
             metadata,
         } => {
@@ -447,7 +447,7 @@ pub(crate) fn parse_primary_eval_with_mode(
             let metadata = item_metadata
                 .iter()
                 .any(Option::is_some)
-                .then_some(StructuralHandleMetadata::List(item_metadata));
+                .then_some(UnexpandedStructuralHandleMetadata::List(item_metadata));
             Ok(EvalValue::computed(
                 Value::Concrete(ConcreteValue::List(items)),
                 metadata,
@@ -519,7 +519,7 @@ pub(crate) fn parse_primary_eval_with_mode(
                 map.insert(name, Value::Concrete(ConcreteValue::List(blocks)));
             }
             let metadata = (!structural_handles.is_empty())
-                .then_some(StructuralHandleMetadata::Map(structural_handles));
+                .then_some(UnexpandedStructuralHandleMetadata::Map(structural_handles));
             Ok(EvalValue::computed(
                 Value::Concrete(ConcreteValue::Map(map)),
                 metadata,
@@ -634,6 +634,19 @@ pub(crate) fn parse_primary_eval_with_mode(
             // Ref-typed arguments retain canonical handle bases even when a
             // different argument keeps the call deferred.
             if let Some(user_fn) = ctx.resolved_user_function(&func_name) {
+                if !ctx.config.custom_types_loaded() {
+                    let arguments = crate::parser::functions::lower_function_arguments(
+                        eval_args.clone(),
+                        line,
+                    )?;
+                    crate::parser::functions::record_deferred_function_type_check(
+                        &user_fn,
+                        &arguments,
+                        ctx,
+                        line,
+                        Some(column),
+                    );
+                }
                 if !ctx.seeded_user_functions.contains(&func_name)
                     && eval_args.iter().all(is_static_eval)
                 {
@@ -642,7 +655,11 @@ pub(crate) fn parse_primary_eval_with_mode(
                 }
                 let args = crate::parser::functions::lower_function_arguments(eval_args, line)?;
                 crate::parser::functions::record_deferred_function_type_check(
-                    &user_fn, &args, ctx, line,
+                    &user_fn,
+                    &args,
+                    ctx,
+                    line,
+                    Some(column),
                 );
                 return Ok(EvalValue::from_value(Value::Deferred(
                     DeferredValue::ResolvedFunctionCall {

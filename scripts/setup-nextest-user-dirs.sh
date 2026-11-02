@@ -17,6 +17,7 @@ esac
 
 runs_root="$target_dir/carina-nextest-home"
 mkdir -p "$runs_root"
+runs_root=$(CDPATH= cd -P -- "$runs_root" && pwd -P)
 # Setup scripts do not receive a teardown hook. Reclaim only completed run
 # directories old enough that an overlapping nextest invocation cannot own them.
 find "$runs_root" -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec rm -rf {} +

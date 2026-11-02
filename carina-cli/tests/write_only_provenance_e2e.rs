@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use carina_cli::commands::plan::PlanFile;
 use carina_core::resource::{ConcreteValue, Value};
 use carina_state::check_and_migrate;
 use tempfile::TempDir;
@@ -662,6 +663,30 @@ fn secret_write_only_refresh_and_saved_plan_apply_converge_without_sending_hash(
         persisted_password.get("$secret").is_some(),
         "write-only secret must be persisted as a RedactedSecret hash: {state:#}"
     );
+    let state_bytes = fs::read(&state_path).expect("read state bytes");
+    let decoded = check_and_migrate(std::str::from_utf8(&state_bytes).unwrap())
+        .expect("current state decodes")
+        .into_state();
+    assert_eq!(
+        carina_core::utils::pretty_with_newline_bytes(&decoded).unwrap(),
+        state_bytes
+    );
+    let snapshot = decoded.resources()[0]
+        .persisted_attributes()
+        .unwrap()
+        .get("password")
+        .expect("write-only state retains the secret hash");
+    assert!(
+        snapshot
+            .verify_secret(&Value::Concrete(ConcreteValue::String(
+                "secret-before".into()
+            )))
+            .expect("authored material is serializable")
+    );
+    assert_eq!(
+        snapshot.to_value_at("state.password").unwrap_err().path(),
+        "state.password"
+    );
     scenario.clear_write_only_metadata();
 
     assert_success(
@@ -881,7 +906,7 @@ fn saved_plan_apply_refills_ignored_readable_leaf_from_apply_time_read() {
     .expect("parse saved plan");
     assert_eq!(
         saved["version"],
-        serde_json::json!(carina_cli::commands::plan::PlanFile::CURRENT_VERSION)
+        serde_json::json!(PlanFile::CURRENT_VERSION)
     );
     assert!(
         !saved.to_string().contains("resolved_ignore_changes"),

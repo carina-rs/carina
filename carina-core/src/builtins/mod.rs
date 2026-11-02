@@ -232,9 +232,24 @@ pub struct BuiltinFunctionInfo {
 
 /// Register built-in functions in a single place.
 ///
-/// Generates both `evaluate_builtin()` (dispatch) and `builtin_functions()` (metadata)
+/// Generates both `evaluate_builtin_with_config()` (dispatch) and `builtin_functions()` (metadata)
 /// from one definition, ensuring they never get out of sync.
 macro_rules! register_builtins {
+    (@evaluate env, $handler:expr, $lowered:expr, $config:expr) => {
+        $handler(&$lowered, &$config.environment).map(EvalValue::from_expanded_value)
+    };
+    (@evaluate decrypt, $handler:expr, $lowered:expr, $config:expr) => {{
+        let (lowered, contained_secret) = peel_secret_arguments($lowered);
+        $handler(&lowered, $config).map(|value| {
+            EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
+        })
+    }};
+    (@evaluate $name:ident, $handler:expr, $lowered:expr, $config:expr) => {{
+        let (lowered, contained_secret) = peel_secret_arguments($lowered);
+        $handler(&lowered).map(|value| {
+            EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
+        })
+    }};
     (
         $(
             $name:ident ( $handler:expr, arity: $arity:expr ) {
@@ -330,19 +345,22 @@ macro_rules! register_builtins {
             BuiltinFunction::from_name(name).map(BuiltinFunction::arity)
         }
 
-        /// Evaluate a built-in function by name with the given arguments.
+        /// Evaluate a built-in function using the caller's runtime inputs.
         ///
         /// If fewer arguments than the arity are provided, returns an
         /// `EvalValue::Closure` capturing the partial arguments.
         /// Returns `Err` if the function is unknown, the arguments are
         /// invalid, or one of the supplied arguments is itself a closure.
-        pub(crate) fn evaluate_builtin<B: BindingAddress>(
+        pub(crate) fn evaluate_builtin_with_config<B: BindingAddress>(
             name: &str,
             args: &[EvalValue<B>],
+            config: &ProviderContext,
         ) -> Result<EvalValue<B>, String> {
-            match name {
+            let function = BuiltinFunction::from_name(name)
+                .ok_or_else(|| format!("Unknown built-in function: {name}"))?;
+            match function {
                 $(
-                    stringify!($name) => {
+                    BuiltinFunction::$name => {
                         let arity: usize = $arity;
                         if !args.is_empty() && args.len() < arity {
                             return Ok(EvalValue::closure(
@@ -364,17 +382,9 @@ macro_rules! register_builtins {
                                     .map_err(|error| format!("{name}: {error}"))
                             })
                             .collect();
-                        let (lowered, contained_secret) = peel_secret_arguments(lowered?);
-                        $handler(&lowered)
-                            .map(|value| {
-                                EvalValue::from_expanded_value(propagate_secret(
-                                    value,
-                                    contained_secret,
-                                ))
-                            })
+                        register_builtins!(@evaluate $name, $handler, lowered?, config)
                     }
                 )*
-                _ => Err(format!("Unknown built-in function: {name}")),
             }
         }
 
@@ -385,13 +395,14 @@ macro_rules! register_builtins {
         pub fn evaluate_builtin_to_value<B: BindingAddress>(
             name: &str,
             args: &[Value<NoPlaceholder, B>],
+            config: &ProviderContext,
         ) -> Result<Value<NoPlaceholder, B>, String> {
             let eval_args: Vec<EvalValue<B>> = args
                 .iter()
                 .cloned()
                 .map(EvalValue::from_expanded_value)
                 .collect();
-            let result = evaluate_builtin(name, &eval_args)?;
+            let result = evaluate_builtin_with_config(name, &eval_args, config)?;
             result.into_expanded_value()
         }
     };
@@ -408,7 +419,7 @@ register_builtins! {
         description: "Appends items to a list. Data-last: base_list |> concat(items).",
         return_type: BuiltinReturnType::List,
     },
-    decrypt(decrypt::builtin_decrypt, arity: 1) {
+    decrypt(decrypt::builtin_decrypt_with_config, arity: 1) {
         signature: "decrypt(ciphertext: String, key?: String) -> Secret",
         description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS) and marks the result as secret. Key is optional when embedded in ciphertext.",
         return_type: BuiltinReturnType::Secret,
@@ -499,7 +510,7 @@ register_builtins! {
 ///
 /// Merges `new_args` into the closure's captured args. If enough arguments
 /// are now present, evaluates the underlying built-in function (routing
-/// `decrypt` through the config-aware path). Otherwise returns a new
+/// `decrypt` and `env` through the config-aware path). Otherwise returns a new
 /// `EvalValue::Closure` with updated captured args and remaining arity.
 pub(crate) fn apply_closure_with_config<B: BindingAddress>(
     name: &str,
@@ -557,43 +568,6 @@ pub(crate) fn apply_closure_with_config<B: BindingAddress>(
     }
 }
 
-/// Evaluate a built-in function with parser configuration.
-///
-/// This dispatches `decrypt` to use the decryptor from the config instead of
-/// the global Mutex. All other builtins are delegated to [`evaluate_builtin`].
-pub(crate) fn evaluate_builtin_with_config<B: BindingAddress>(
-    name: &str,
-    args: &[EvalValue<B>],
-    config: &ProviderContext,
-) -> Result<EvalValue<B>, String> {
-    // Check for partial application before dispatching
-    if let Some(arity) = builtin_arity(name)
-        && !args.is_empty()
-        && args.len() < arity
-    {
-        return Ok(EvalValue::closure(name, args.to_vec(), arity - args.len()));
-    }
-    match name {
-        "decrypt" => {
-            // `decrypt` is the only handler that needs the parser config.
-            // It still operates on `&[Value]` so we lower the arguments.
-            let lowered: Result<Vec<Value<NoPlaceholder, B>>, String> = args
-                .iter()
-                .cloned()
-                .map(|arg| {
-                    arg.into_expanded_value()
-                        .map_err(|error| format!("decrypt: {error}"))
-                })
-                .collect();
-            let (lowered, contained_secret) = peel_secret_arguments(lowered?);
-            decrypt::builtin_decrypt_with_config(&lowered, config).map(|value| {
-                EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
-            })
-        }
-        _ => evaluate_builtin(name, args),
-    }
-}
-
 /// Check if a function name is a known built-in function.
 pub fn is_known_builtin(name: &str) -> bool {
     BuiltinFunction::from_name(name).is_some()
@@ -614,7 +588,24 @@ pub(crate) fn evaluate_builtin_for_tests<B: BindingAddress>(
         .cloned()
         .map(EvalValue::from_expanded_value)
         .collect();
-    evaluate_builtin(name, &eval_args)
+    evaluate_builtin_with_config(
+        name,
+        &eval_args,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+}
+
+/// Supply an explicit empty test context for pure-builtin assertions.
+#[cfg(test)]
+pub(crate) fn evaluate_builtin_to_value_for_tests<B: BindingAddress>(
+    name: &str,
+    args: &[Value<NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, String> {
+    evaluate_builtin_to_value(
+        name,
+        args,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
 }
 
 /// `evaluate_builtin_with_config`'s `Value`-friendly counterpart for
@@ -627,13 +618,7 @@ pub(crate) fn evaluate_builtin_with_config_to_value<B: BindingAddress>(
     args: &[Value<NoPlaceholder, B>],
     config: &ProviderContext,
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    let eval_args: Vec<EvalValue<B>> = args
-        .iter()
-        .cloned()
-        .map(EvalValue::from_expanded_value)
-        .collect();
-    let result = evaluate_builtin_with_config(name, &eval_args, config)?;
-    result.into_expanded_value()
+    evaluate_builtin_to_value(name, args, config)
 }
 
 /// Return a human-readable type name for a Value
@@ -661,7 +646,7 @@ fn value_type_name<B: BindingAddress>(value: &Value<NoPlaceholder, B>) -> &'stat
         Value::Deferred(DeferredValue::Unavailable { .. }) => "Unavailable",
         Value::Deferred(DeferredValue::Access(_)) => "Access",
         Value::Deferred(DeferredValue::Secret(_)) => "Secret",
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret",
+
         Value::Deferred(DeferredValue::Unknown(_)) => "Unknown",
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
@@ -672,6 +657,7 @@ mod tests {
 
     use indexmap::IndexMap;
 
+    use super::evaluate_builtin_to_value_for_tests as evaluate_builtin_to_value;
     use super::*;
 
     type Value = crate::resource::ExpandedValue;
@@ -693,16 +679,20 @@ mod tests {
     #[test]
     fn test_registry_and_dispatch_are_in_sync() {
         // Every function listed in builtin_functions() must be accepted by
-        // evaluate_builtin() (i.e. not return "Unknown built-in function").
+        // evaluate_builtin_with_config() (i.e. not return "Unknown built-in function").
         let args: Vec<EvalValue> = Vec::new();
         for func in builtin_functions() {
-            let result = evaluate_builtin(func.name, &args);
+            let result = evaluate_builtin_with_config(
+                func.name,
+                &args,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            );
             // The call may fail due to wrong arguments, but it must NOT fail
             // with "Unknown built-in function".
             if let Err(ref msg) = result {
                 assert!(
                     !msg.contains("Unknown built-in function"),
-                    "builtin_functions() lists '{}' but evaluate_builtin() does not handle it",
+                    "builtin_functions() lists '{}' but evaluate_builtin_with_config() does not handle it",
                     func.name,
                 );
             }
@@ -745,7 +735,11 @@ mod tests {
     #[test]
     fn test_unknown_function_is_rejected() {
         let args: Vec<EvalValue> = Vec::new();
-        let result = evaluate_builtin("nonexistent_function", &args);
+        let result = evaluate_builtin_with_config(
+            "nonexistent_function",
+            &args,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -808,9 +802,11 @@ mod tests {
     #[test]
     fn decrypt_accepts_a_secret_from_another_decrypt_without_double_wrapping() {
         let config = ProviderContext {
-            decryptor: Some(Box::new(|ciphertext, _| Ok(format!("plain:{ciphertext}")))),
+            decryptor: Some(std::sync::Arc::new(|ciphertext, _| {
+                Ok(format!("plain:{ciphertext}"))
+            })),
             resource_types: Default::default(),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let first =
             evaluate_builtin_with_config_to_value("decrypt", &[string("ciphertext")], &config)

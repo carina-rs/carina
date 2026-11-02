@@ -12,9 +12,7 @@ use std::sync::Arc;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-use indexmap::IndexMap;
 use tempfile::TempDir;
 
 struct AwsccTestFactory;
@@ -45,10 +43,6 @@ impl ProviderFactory for AwsccTestFactory {
         _value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
 
     fn create_provider(
@@ -172,7 +166,11 @@ impl Provider for NoopProvider {
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
         let id = resource.id.clone();
-        Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })
+        Box::pin(async move {
+            Ok(carina_core::resource::State::<
+                carina_core::resource::NoPlaceholder,
+            >::existing(id, HashMap::new()))
+        })
     }
 
     fn create(
@@ -656,6 +654,7 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories),
         carina_core::schema::SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     let provider_context = loaded_providers.provider_context();
     let schemas = loaded_providers.schemas();
@@ -664,25 +663,35 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
         provider_context,
     )
     .expect("parse directory-scoped fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_with_config(
-        parsed,
-        &carina_core::paths::ResolvedPath::new(carina_core::config_loader::get_base_dir(
-            &fixture.caller,
-        ))
-        .unwrap(),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         provider_context,
-        schemas.schemas(),
-    )
-    .expect("expand module call");
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_config(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(carina_core::config_loader::get_base_dir(
+                    &fixture.caller,
+                ))
+                .unwrap(),
+                session,
+                schemas.schemas(),
+            )
+            .expect("expand module call")
+        },
+    );
 
     // Exercise the same post-expansion inference + ref-validation seam used by
     // CLI validation, where both stages can otherwise report this one typo.
     let inferred_exports =
         carina_core::validation::inference::infer_export_params_with_loaded_provider_schemas(
-            &parsed, schemas,
+            &parsed,
+            schemas,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         );
-    let bindings =
-        carina_core::binding_index::BindingIndex::from_parsed(&parsed, schemas.schemas());
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        schemas.schemas(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    );
     let mut diagnostics = carina_core::validation::inference::attached_inference_failures(
         inferred_exports.checked_exports(),
     )
@@ -690,11 +699,11 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
         carina_core::validation::inference::format_inference_error(failure.name, failure.error)
     })
     .collect::<Vec<_>>();
-    if let Err(message) = carina_core::validation::validate_export_param_ref_types_with_bindings(
+    if let Err(errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
         inferred_exports.parameters(),
         &bindings,
     ) {
-        diagnostics.extend(message.lines().map(str::to_owned));
+        diagnostics.extend(errors.into_iter().map(|error| error.to_string()));
     }
 
     assert_eq!(

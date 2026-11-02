@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use carina_core::EnvironmentSnapshot;
 use carina_core::parser::{ProviderConfig, ProviderContext};
 use carina_core::provider::ProviderFactory;
 use carina_core::provider_source::ProviderSource;
@@ -180,9 +181,10 @@ async fn main() {
     });
     let user_dirs = std::sync::Arc::new(user_dirs);
 
-    let trusted_local_env = std::env::var_os("CARINA_TRUST_LOCAL_PROVIDER");
+    #[expect(clippy::disallowed_methods)]
+    let environment = EnvironmentSnapshot::capture_process();
     let trusted_local_grants =
-        trusted_local_grants_from_env(trusted_local_env.as_deref(), |error| {
+        trusted_local_grants_from_env(environment.get("CARINA_TRUST_LOCAL_PROVIDER"), |error| {
             log::error!("Ignoring invalid CARINA_TRUST_LOCAL_PROVIDER: {error}");
         });
     let trusted_local_grants = std::sync::Arc::new(trusted_local_grants);
@@ -191,11 +193,7 @@ async fn main() {
     let stdout = tokio::io::stdout();
 
     let (service, socket) = LspService::new(move |client| {
-        let provider_context = ProviderContext {
-            decryptor: None,
-            resource_types: Default::default(),
-            ..ProviderContext::default()
-        };
+        let provider_context = ProviderContext::new(environment.clone());
 
         // Pass factory builder callback — actual WASM loading happens asynchronously
         // after initialize, not during server construction.

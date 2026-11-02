@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-use indexmap::IndexMap;
 use tempfile::TempDir;
 
 struct AwsccTestFactory;
@@ -45,10 +43,6 @@ impl ProviderFactory for AwsccTestFactory {
         _value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
 
     fn create_provider(
@@ -129,7 +123,11 @@ impl Provider for NoopProvider {
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
         let id = resource.id.clone();
-        Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })
+        Box::pin(async move {
+            Ok(carina_core::resource::State::<
+                carina_core::resource::NoPlaceholder,
+            >::existing(id, HashMap::new()))
+        })
     }
 
     fn create(

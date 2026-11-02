@@ -11,8 +11,24 @@ use carina_core::schema::{
 mod basic;
 mod extended;
 
+impl CompletionProvider {
+    fn complete_for_test(
+        &self,
+        doc: &Document,
+        position: Position,
+        base_path: Option<&std::path::Path>,
+    ) -> Vec<CompletionItem> {
+        self.complete(doc, position, base_path, doc.provider_context())
+    }
+}
+
 pub(super) fn create_document(content: &str) -> Document {
-    Document::new(content.to_string(), Arc::new(ProviderContext::default()))
+    Document::new(
+        content.to_string(),
+        Arc::new(ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    )
 }
 
 pub(super) fn find_completion<'a>(
@@ -432,13 +448,6 @@ impl ProviderFactory for EnumShadowFactory {
         Ok(())
     }
 
-    fn extract_region(
-        &self,
-        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
-    ) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -479,6 +488,7 @@ pub(super) fn create_enum_shadow_document(content: &str) -> Document {
     Document::new(
         content.to_string(),
         Arc::new(ProviderContext {
+            environment: carina_core::EnvironmentSnapshot::empty(),
             decryptor: None,
             custom_types,
             resource_types,

@@ -287,8 +287,7 @@ fn collect_unsynchronized_refs<B: BindingAddress>(
         Value::Deferred(
             DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_)
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. },
+            | DeferredValue::BindingRef { .. },
         ) => {
             // BindingRef lacks the attribute path check_ref needs for deferred_populate.
             // Unknown is parser-deferred and likewise carries no resource attribute path.
@@ -368,8 +367,10 @@ fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSeg
             }
             PathSegment::Field { name } => {
                 match current_type.shape() {
+                    Shape::UnloadedSchemaType(_) => return false,
                     Shape::Struct { .. } | Shape::Union => {}
-                    Shape::String { .. }
+                    Shape::Reference { .. }
+                    | Shape::String { .. }
                     | Shape::Int { .. }
                     | Shape::Float { .. }
                     | Shape::Bool
@@ -615,7 +616,7 @@ mod tests {
                 )),
             },
             timeout_secs: None,
-            depends_on: vec![],
+            depends_on: Default::default(),
             line: 0,
         });
         let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());

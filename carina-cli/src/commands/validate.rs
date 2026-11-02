@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 use serde::Serialize;
 
 use carina_core::config_loader::{find_crn_files_in_dir, load_configuration_with_config};
@@ -29,6 +29,16 @@ struct ValidateWarning {
     file: Option<String>,
 }
 
+pub(crate) fn print_provider_type_warning(warning: &carina_core::parser::ParseWarning) {
+    eprintln!(
+        "  ⚠ {}:{}:{}: {}",
+        warning.file.as_deref().unwrap_or("<config>"),
+        warning.line,
+        warning.span.as_ref().map_or(1, |span| span.start_column),
+        warning.message
+    );
+}
+
 /// Test-only entry point for the validate pipeline (#2247).
 ///
 /// Runs the same pipeline `run_validate` runs (parse → resolve →
@@ -50,33 +60,58 @@ pub fn validate_with_factories(
     path: &carina_core::paths::ResolvedPath,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
-    let provider_context = ProviderContext::default();
+    let diagnostics = validate_diagnostics_with_factories(path, factories, Default::default());
+    for warning in &diagnostics.warnings {
+        print_provider_type_warning(warning);
+    }
+    diagnostics
+        .errors
+        .iter()
+        .map(|error| crate::error::format_error_with_source_chain(error))
+        .collect()
+}
+
+/// Typed output from the production validation report, before terminal rendering.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct ValidateDiagnostics {
+    pub errors: Vec<AppError>,
+    pub warnings: Vec<carina_core::parser::ParseWarning>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn validate_diagnostics_with_factories(
+    path: &carina_core::paths::ResolvedPath,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+    load_errors: std::collections::HashMap<String, String>,
+) -> ValidateDiagnostics {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let provider_context = ProviderContext::new(runtime.environment().clone());
     let loaded = match load_configuration_with_config(
         path,
         &provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     ) {
         Ok(l) => l,
-        Err(e) => return vec![e.to_string()],
+        Err(e) => {
+            return ValidateDiagnostics {
+                errors: vec![AppError::Config(e.to_string())],
+                warnings: Vec::new(),
+            };
+        }
     };
     let parsed = loaded.parsed;
     let base_dir = path;
-    let providers = ProviderLoad::for_test_with_provider_phase(factories, &parsed.providers);
-
-    let mut error_reports: Vec<String> = Vec::new();
-    error_reports.extend(
-        super::validate_and_resolve_errors(
-            &parsed,
-            base_dir,
-            &providers,
-            false,
-            &loaded.duplicate_declarations,
-        )
-        .iter()
-        .map(|error| crate::error::format_error_with_source_chain(error)),
+    let providers = ProviderLoad::for_test_with_load_errors(
+        &runtime,
+        factories,
+        &parsed.providers,
+        load_errors,
     );
 
-    error_reports
+    let (errors, warnings) = providers
+        .validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations)
+        .into_test_diagnostics();
+    ValidateDiagnostics { errors, warnings }
 }
 
 /// Test-support twin of [`validate_with_factories`] that returns the
@@ -93,7 +128,8 @@ pub fn validated_resource_ids_with_factories(
     path: &carina_core::paths::ResolvedPath,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
-    let provider_context = ProviderContext::default();
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let provider_context = ProviderContext::new(runtime.environment().clone());
     let loaded = match load_configuration_with_config(
         path,
         &provider_context,
@@ -104,7 +140,8 @@ pub fn validated_resource_ids_with_factories(
     };
     let parsed = loaded.parsed;
     let base_dir = path;
-    let providers = ProviderLoad::for_test_with_provider_phase(factories, &parsed.providers);
+    let providers =
+        ProviderLoad::for_test_with_provider_phase(&runtime, factories, &parsed.providers);
 
     // This adapter exercises only the resource-enumeration half of validate.
     // Keep the identical module/name-resolution seam, but do not reject a
@@ -244,7 +281,7 @@ fn validated_entries<E>(
 }
 
 pub fn run_validate(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     json: bool,
     provider_context: &ProviderContext,
@@ -252,11 +289,24 @@ pub fn run_validate(
     let project = carina_core::paths::ResolvedPath::new(path)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
-    let loaded = load_configuration_with_config(
+    let color_mode = runtime.color_mode();
+    let loaded = match load_configuration_with_config(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?;
+    ) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return crate::wiring::settle_type_checks(
+                crate::wiring::failed_configuration_report(
+                    base_dir,
+                    error.into(),
+                    runtime.environment().clone(),
+                ),
+                AppError::Validation,
+            );
+        }
+    };
     let parsed = loaded.parsed;
 
     // Collect every static error before reporting, so the user sees
@@ -273,14 +323,16 @@ pub fn run_validate(
     parsed.print_warnings();
 
     if !json {
-        println!("{}", "Validating...".cyan());
+        println!("{}", "Validating...".cyan(color_mode));
     }
 
     let (providers, provider_load_error) =
-        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+        ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
     let validation_report =
         providers.validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations);
+    // Publish unresolved provider checks even if another validation/load error
+    // prevents a resolved file from being returned.
     let (validation_result, schemas) = validation_report.into_parts();
     let parsed = match validation_result {
         Ok(parsed) => {
@@ -369,8 +421,8 @@ pub fn run_validate(
     println!(
         "{}",
         format!("✓ {} resources validated successfully.", entries.len())
-            .green()
-            .bold()
+            .green(color_mode)
+            .bold(color_mode)
     );
 
     for entry in &entries {
@@ -384,14 +436,14 @@ pub fn run_validate(
                 "⚠ Unused let binding '{}'. Consider using an anonymous resource instead.",
                 binding
             )
-            .yellow()
+            .yellow(color_mode)
         );
     }
 
     for (file_path, message) in &duplicate_warnings {
         println!(
             "{}",
-            format!("⚠ {}:{}", file_path.display(), message).yellow()
+            format!("⚠ {}:{}", file_path.display(), message).yellow(color_mode)
         );
     }
 
@@ -431,6 +483,94 @@ fn check_upstream_state_sources(
 mod tests {
     use super::*;
 
+    #[test]
+    fn validate_failed_provider_reports_deferred_type_checks_as_typed_warnings() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("main.crn");
+        std::fs::write(&path, "provider broken { source = 'file:///definitely-missing/broken.wasm' }\nfn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes {\n  x: AwsAccountId = '123'\n}\n").unwrap();
+        let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let project = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
+        let loaded = load_configuration_with_config(
+            &project,
+            &config,
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .unwrap();
+        let providers = ProviderLoad::for_test_with_load_errors(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
+            &loaded.parsed.providers,
+            std::collections::HashMap::from([(
+                "broken".into(),
+                "broken provider failed to load".into(),
+            )]),
+        );
+        let report = providers.validation_report(&loaded.parsed, &project, false, &[]);
+        let warnings = report.provider_type_warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:#?}");
+        for (warning, name, line) in [
+            (&warnings[0], "Arn", 2),
+            (&warnings[1], "Arn", 3),
+            (&warnings[2], "AwsAccountId", 5),
+        ] {
+            assert_eq!(
+                warning.kind,
+                carina_core::parser::WarningKind::ProviderSchemasNotLoaded
+            );
+            assert_eq!(warning.file.as_deref(), path.to_str());
+            assert_eq!(warning.line, line);
+            assert!(warning.message.contains(name), "{warning:?}");
+            assert!(
+                warning.message.contains("provider schemas were not loaded"),
+                "{warning:?}"
+            );
+        }
+        assert!(
+            report
+                .errors()
+                .iter()
+                .any(|error| error.to_string().contains("broken provider failed to load"))
+        );
+        assert!(
+            report.into_result().is_err(),
+            "a failed provider load keeps validate's failure convention"
+        );
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        assert!(run_validate(&runtime, fixture.path(), false, &config).is_err());
+    }
+
+    #[test]
+    fn validate_loaded_catalog_reports_unknown_types_without_unloaded_warnings() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("main.crn"), "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes { x: AwsAccountId = '123' }\n").unwrap();
+        let project = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
+        let loaded = load_configuration_with_config(
+            &project,
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .unwrap();
+        let providers = ProviderLoad::for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
+            &loaded.parsed.providers,
+        );
+        let report = providers.validation_report(&loaded.parsed, &project, false, &[]);
+        assert!(report.provider_type_warnings().is_empty());
+        for name in ["Arn", "AwsAccountId"] {
+            assert!(
+                report
+                    .errors()
+                    .iter()
+                    .any(|error| (matches!(error, AppError::TypeResolution(_)) || matches!(error, AppError::ModuleCall(finding) if finding.kind() == carina_core::validation::ModuleCallFindingKind::TypeResolution))
+                        && crate::error::format_error_with_source_chain(error)
+                            .contains(&format!("unknown custom type '{name}'"))),
+                "{:#?}",
+                report.errors()
+            );
+        }
+    }
+
     fn unknown_provider_instance_fixture() -> tempfile::TempDir {
         let fixture = tempfile::tempdir().expect("provider-routing fixture");
         std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
@@ -450,11 +590,17 @@ mod tests {
     fn resolve_file_for_test(
         parsed: carina_core::parser::ParsedFile,
     ) -> carina_core::parser::ModuleResolvedParsedFile {
-        carina_core::module_resolver::resolve_modules_providerless(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_providerless(
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+                    session,
+                )
+                .expect("test fixture crosses module resolution")
+            },
         )
-        .expect("test fixture crosses module resolution")
     }
 
     #[test]
@@ -501,7 +647,7 @@ mod tests {
 
     #[test]
     fn hard_provider_load_error_keeps_unrelated_static_validation_error() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(
             fixture.path().join("main.crn"),
@@ -524,10 +670,10 @@ backend s3 {
         .unwrap();
 
         let error = run_validate(
-            &user_dirs,
+            &runtime,
             fixture.path(),
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect_err("loader and backend validation errors must both fail validation")
         .to_string();
@@ -567,12 +713,15 @@ backend s3 {
         let fixture = unknown_provider_instance_fixture();
         let loaded = load_configuration_with_config(
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load provider-routing fixture");
-        let providers =
-            ProviderLoad::for_test_with_provider_phase(Vec::new(), &loaded.parsed.providers);
+        let providers = ProviderLoad::for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
+            &loaded.parsed.providers,
+        );
 
         let error = match providers.validate_config_pair(
             loaded.parsed,
@@ -612,7 +761,7 @@ backend s3 {
 
         let loaded = load_configuration_with_config(
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load merged undefined iterable fixture");
@@ -886,14 +1035,20 @@ let observed_names = roles.names
         let parsed = carina_core::parser::parse_file(
             src,
             std::path::Path::new("validate_fixture.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("fixture parses");
-        let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-        )
-        .expect("cross the deferred-body resolution seam");
+        let parsed = carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_providerless(
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+                    session,
+                )
+                .expect("cross the deferred-body resolution seam")
+            },
+        );
         // After the resolution seam the same-config provider-read loop is not
         // in `parsed.resources`; its resource-only template is ready for the
         // validate display path in `deferred_for_expressions`.

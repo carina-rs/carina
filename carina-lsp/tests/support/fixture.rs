@@ -6,13 +6,11 @@
 use std::sync::Arc;
 
 use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
-use carina_core::resource::Value;
 use carina_core::schema::{
     ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedResourceSchema,
 };
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
-use indexmap::IndexMap;
 use tempfile::TempDir;
 use tower_lsp::lsp_types::Diagnostic;
 
@@ -41,10 +39,6 @@ impl ProviderFactory for SchemaFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -68,7 +62,7 @@ impl ProviderFactory for SchemaFixtureFactory {
     }
 }
 
-fn factories_for(schemas: &SchemaRegistry) -> Vec<Box<dyn ProviderFactory>> {
+pub(super) fn factories_for(schemas: &SchemaRegistry) -> Vec<Box<dyn ProviderFactory>> {
     let mut by_provider = std::collections::HashMap::<String, Vec<ValidatedResourceSchema>>::new();
     for (provider, _resource_type, _kind, schema) in schemas.iter() {
         by_provider
@@ -104,7 +98,9 @@ pub fn analyze(engine: &DiagnosticEngine, fixture: &TempDir, file_name: &str) ->
     let doc = Document::new_with_path(
         text,
         path,
-        Arc::new(carina_core::parser::ProviderContext::default()),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     engine.analyze(&doc, Some(&fixture.path().join(file_name)))
 }
@@ -122,11 +118,12 @@ pub fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .collect();
     let factories = factories_for(&schemas);
     if provider_names.is_empty() {
-        DiagnosticEngine::without_loaded_provider_schemas()
+        DiagnosticEngine::without_loaded_provider_schemas(carina_core::EnvironmentSnapshot::empty())
     } else {
         let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(factories),
             SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
         DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
     }

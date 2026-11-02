@@ -6,7 +6,14 @@ use carina_cli::commands::plan::PlanFile;
 use carina_core::resource::{ConcreteValue, Resource, Value};
 use indexmap::IndexMap;
 
-fn tags<S>(resource: &Resource<S>) -> &IndexMap<String, Value> {
+fn tags<S, D>(
+    resource: &Resource<
+        S,
+        carina_core::resource::SnapshotLeaf,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> &IndexMap<String, carina_core::resource::SnapshotValue> {
     match resource.get_attr("tags") {
         Some(Value::Concrete(ConcreteValue::Map(tags))) => tags,
         other => panic!(

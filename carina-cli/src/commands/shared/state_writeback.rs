@@ -4,11 +4,15 @@
 //! `StateFile`: applying name overrides, building the post-apply state,
 //! resolving exports, and (for destroy) removing destroyed resources.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::output_style::Colorize;
 use carina_core::data_source_value::DataSourceValues;
-use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
+use carina_core::effect::{
+    DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration,
+    PriorInstanceDestroyDependencies,
+};
 use carina_core::executor::{AcceptedRequest, Applied, ExecutionResult};
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
 #[cfg(test)]
@@ -18,12 +22,13 @@ use carina_core::provider::{
     ObservedCreate, PersistedAttributes, ProviderRouter, ResolvedComparisonTable,
     UnknownCreateOutcome,
 };
-#[cfg(test)]
-use carina_core::resource::PersistedDirectiveField;
 use carina_core::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, ModuleSource, PersistedDirectiveFieldChange,
-    PersistedDirectives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+    PersistedDirectives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, SnapshotState,
+    Value,
 };
+#[cfg(test)]
+use carina_core::resource::{PersistedDirectiveField, State};
 use carina_core::schema::{CompiledResourceSchema as ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
 #[cfg(test)]
@@ -32,7 +37,6 @@ use carina_state::{
     BackendError, DeposedAttributes, DeposedInstance, DeposedKey, PreviousSecretHashAuthority,
     ResourceState, RowBasis, StateBackend, StateFile,
 };
-use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::plan::MovedOrigins;
@@ -133,7 +137,7 @@ pub(crate) fn persisted_directive_changes<S>(
                 return None;
             }
             let row = state_file.find_resource_for_id(&resource.id)?;
-            let desired = PersistedDirectives::desired_for(resource.as_resource());
+            let desired = PersistedDirectives::desired_for(resource);
             let fields = row.directives.field_changes_to(&desired);
 
             (!fields.is_empty()).then(|| PersistedDirectiveChange {
@@ -163,7 +167,7 @@ pub(crate) fn apply_persisted_directive_changes<S>(
                 resource_id: Box::new(change.resource_id.clone()),
             }
         })?;
-        let desired = PersistedDirectives::desired_for(resource.as_resource());
+        let desired = PersistedDirectives::desired_for(resource);
         if !state.update_resource_directives(&change.resource_id, desired) {
             return Err(AppError::PersistedDirectiveTargetMissingFromLockedState {
                 resource_id: Box::new(change.resource_id.clone()),
@@ -297,6 +301,7 @@ pub(crate) struct ApplyStateSaveInputs<S = ModuleSource> {
     schemas: SchemaRegistry,
     planned_secret_hashes: Option<HashMap<ResourceId, PersistedAttributes>>,
     comparisons: ResolvedComparisonTable,
+    references: Option<carina_core::references::ResolvedReferences>,
 }
 
 impl<S: Clone> ApplyStateSaveInputs<S> {
@@ -315,7 +320,16 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             schemas,
             planned_secret_hashes,
             comparisons,
+            references: None,
         })
+    }
+
+    pub(crate) fn with_reference_evidence(
+        mut self,
+        references: Option<carina_core::references::ResolvedReferences>,
+    ) -> Self {
+        self.references = references;
+        self
     }
 
     pub(crate) fn sorted_resources(&self) -> &[ResolvedResource<S>] {
@@ -365,6 +379,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             },
             self.planned_secret_hashes.as_ref(),
             &self.comparisons,
+            self.references.as_ref(),
         )
     }
 }
@@ -382,7 +397,12 @@ pub(crate) struct ExportResolutionInputs<'a> {
     /// Total post-read outcomes. Apply-time reads replace their deferred
     /// entries before this reaches export resolution.
     pub data_source_values: &'a DataSourceValues,
-    pub resources: &'a [Resource],
+    pub resources: &'a [Resource<
+        ModuleSource,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        (),
+    >],
     /// Loaded provider custom types used when post-apply bindings make a
     /// previously deferred export expression concrete.
     pub provider_context: &'a carina_core::parser::LoadedProviderContext,
@@ -525,11 +545,15 @@ impl ExportResolution {
     /// (carina#3710). This also prevents callers from reading only the resolved
     /// half and silently dropping skipped diagnostics
     /// (carina#3551 / CLAUDE.md "Long-term view alongside root-cause").
-    pub(crate) fn write_into(self, state: &mut StateFile) -> SkippedExports {
+    pub(crate) fn write_into(
+        self,
+        color_mode: crate::output_style::ColorMode,
+        state: &mut StateFile,
+    ) -> SkippedExports {
         let Self { resolved, skipped } = self;
         let mut next = HashMap::new();
         for skipped in &skipped {
-            println!("{}", render_skipped(skipped));
+            println!("{}", render_skipped(color_mode, skipped));
             if let Some(prior) = state.exports.get(&skipped.name) {
                 next.insert(skipped.name.clone(), prior.clone());
             }
@@ -550,10 +574,10 @@ impl ExportResolution {
     }
 }
 
-fn render_skipped(skipped: &SkippedExport) -> String {
+fn render_skipped(color_mode: crate::output_style::ColorMode, skipped: &SkippedExport) -> String {
     format!(
         "  {} export {} not written: {}",
-        "!".yellow(),
+        "!".yellow(color_mode),
         skipped.name,
         skipped.reason
     )
@@ -625,11 +649,16 @@ pub(crate) struct SkippedExport {
 /// and omitted from `state.exports` so the writeback still persists
 /// completed resources. Genuine serialization corruption, such as a
 /// non-finite float, remains an error and aborts writeback.
-pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
+pub(crate) struct ResolveExportValuesPostApplyInput<'a, D = ()> {
     pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
         carina_core::parser::ExpandedInferredExportParam,
     >,
-    pub sorted_resources: &'a [Resource],
+    pub sorted_resources: &'a [Resource<
+        ModuleSource,
+        carina_core::resource::NoPlaceholder,
+        AbsoluteBindingAddress,
+        D,
+    >],
     pub pre_resolve_compositions: &'a [carina_core::resource::LiveComposition],
     pub post_apply_states: &'a PostApplyStates,
     pub schemas: &'a SchemaRegistry,
@@ -637,75 +666,84 @@ pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
     pub provider_context: &'a carina_core::parser::LoadedProviderContext,
 }
 
-pub(crate) fn resolve_export_values_post_apply(
-    input: ResolveExportValuesPostApplyInput<'_>,
+pub(crate) fn resolve_export_values_post_apply<D>(
+    input: ResolveExportValuesPostApplyInput<'_, D>,
 ) -> Result<
     carina_core::validation::CheckedExportValues<carina_core::parser::ExpandedInferredExportParam>,
     AppError,
 > {
-    use carina_core::binding_index::ResolvedBindings;
-    use carina_core::resolver::resolve_live_composition_refs_post_apply;
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run(
+            input.provider_context,
+            |session| {
+                use carina_core::binding_index::ResolvedBindings;
+                use carina_core::resolver::resolve_live_composition_refs_post_apply;
 
-    // Step 1: the post-apply state view was assembled by
-    // [`PostApplyStates::from_current_and_state`] before this call.
-    // See that type's doc-comment for the merge rule that pins
-    // carina#3266 (data-source survives) and carina#3271 (state
-    // refresh path uses the same shape).
+                // Step 1: the post-apply state view was assembled by
+                // [`PostApplyStates::from_current_and_state`] before this call.
+                // See that type's doc-comment for the merge rule that pins
+                // carina#3266 (data-source survives) and carina#3271 (state
+                // refresh path uses the same shape).
 
-    // compositions: fresh clone of the **pre-resolve** snapshot. Their
-    // attributes still carry `ResourceRef`s, so the post-apply
-    // resolver below can pick up the post-apply state values for
-    // any managed sibling that was Replaced during apply
-    // (#3169 / #3177).
-    let mut compositions: Vec<carina_core::resource::LiveComposition> =
-        input.pre_resolve_compositions.to_vec();
+                // compositions: fresh clone of the **pre-resolve** snapshot. Their
+                // attributes still carry `ResourceRef`s, so the post-apply
+                // resolver below can pick up the post-apply state values for
+                // any managed sibling that was Replaced during apply
+                // (#3169 / #3177).
+                let mut compositions: Vec<carina_core::resource::LiveComposition> =
+                    input.pre_resolve_compositions.to_vec();
 
-    // Step 3: build the bindings view from the managed slice plus
-    // post-apply states, **with data sources but no compositions yet**.
-    // The compositions' attribute maps still hold pre-apply
-    // `ResourceRef`s and need to be re-resolved against the
-    // post-apply state in Step 4; only after that re-resolution can
-    // they be layered into the bindings view. We use `pre_apply`
-    // with `compositions: &[]` here, then call
-    // `layer_live_compositions_post_apply` once the re-resolution is done.
-    // (carina#3181, carina#3248)
-    let plan_input_current = carina_core::resource::into_plan_input_current_map(
-        input.post_apply_states.managed_current().clone(),
-        input.schemas,
-        input.sorted_resources,
-    );
-    let mut bindings =
-        ResolvedBindings::pre_apply_live(carina_core::binding_index::LivePreApplyInputs {
-            managed: input.sorted_resources,
-            compositions: &[],
-            managed_current: &plan_input_current,
-            data_source_values: input.post_apply_states.data_source_values(),
-            remote_bindings: &HashMap::new(),
-            wait_aliases: input.wait_aliases,
-        });
+                // Step 3: build the bindings view from the managed slice plus
+                // post-apply states, **with data sources but no compositions yet**.
+                // The compositions' attribute maps still hold pre-apply
+                // `ResourceRef`s and need to be re-resolved against the
+                // post-apply state in Step 4; only after that re-resolution can
+                // they be layered into the bindings view. We use `pre_apply`
+                // with `compositions: &[]` here, then call
+                // `layer_live_compositions_post_apply` once the re-resolution is done.
+                // (carina#3181, carina#3248)
+                let plan_input_current = carina_core::resource::into_plan_input_current_map(
+                    input.post_apply_states.managed_current().clone(),
+                    input.schemas,
+                    input.sorted_resources,
+                );
+                let mut bindings = ResolvedBindings::pre_apply_live(
+                    carina_core::binding_index::LivePreApplyInputs {
+                        managed: input.sorted_resources,
+                        compositions: &[],
+                        managed_current: &plan_input_current,
+                        data_source_values: input.post_apply_states.data_source_values(),
+                        remote_bindings: &HashMap::new(),
+                        wait_aliases: input.wait_aliases,
+                    },
+                );
 
-    // Step 4: re-resolve each composition's attributes against the
-    // post-apply bindings view. After this, a composition's
-    // `role_arn = role.arn` no longer holds the pre-apply
-    // `ResourceRef`; it holds the post-apply concrete value.
-    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)?;
+                // Step 4: re-resolve each composition's attributes against the
+                // post-apply bindings view. After this, a composition's
+                // `role_arn = role.arn` no longer holds the pre-apply
+                // `ResourceRef`; it holds the post-apply concrete value.
+                resolve_live_composition_refs_post_apply(&mut compositions, &bindings, session)?;
 
-    // Step 5: layer the re-resolved compositions onto the bindings view.
-    // Now `exports { foo = some_module.role_arn }` resolves against
-    // a binding whose `role_arn` is the post-apply value.
-    bindings.layer_live_compositions_post_apply(&compositions)?;
+                // Step 5: layer the re-resolved compositions onto the bindings view.
+                // Now `exports { foo = some_module.role_arn }` resolves against
+                // a binding whose `role_arn` is the post-apply value.
+                bindings.layer_live_compositions_post_apply(&compositions)?;
 
-    // Step 6: resolve the export expressions against the combined
-    // view. The input is already checked at the pre-apply boundary, but a
-    // reference can become concrete only after a successful mutation. Run the
-    // same constructor again so the post-apply value is checked before the
-    // serializer can observe it.
-    carina_core::validation::resolve_export_values_post_apply(
-        input.export_params,
-        &bindings,
-        input.provider_context,
+                // Step 6: resolve the export expressions against the combined
+                // view. The input is already checked at the pre-apply boundary, but a
+                // reference can become concrete only after a successful mutation. Run the
+                // same constructor again so the post-apply value is checked before the
+                // serializer can observe it.
+                carina_core::validation::resolve_export_values_post_apply(
+                    input.export_params,
+                    &bindings,
+                    session,
+                )
+                .map_err(AppError::Validation)
+            },
+        ),
+        AppError::Validation,
     )
-    .map_err(AppError::Validation)
 }
 
 /// Convert post-apply checked export values into the state writeback shape.
@@ -815,17 +853,17 @@ struct PlannedUpsert<'a, S = ModuleSource> {
 /// observed failure or continuation from taking the complete-state path.
 enum UpsertSource<'a> {
     Complete {
-        state: &'a State,
+        state: &'a SnapshotState,
         request: &'a AcceptedRequest,
     },
     Observed(&'a ObservedCreate),
     CreateInFlight(&'a InFlightCreate),
-    Imported(&'a State),
-    CurrentPresent(&'a State),
+    Imported(&'a SnapshotState),
+    CurrentPresent(&'a SnapshotState),
     CurrentCreateInFlight(&'a InFlightCreate),
     CreateOutcomeUnknown(&'a UnknownCreateOutcome),
     CurrentCreateOutcomeUnknown(&'a UnknownCreateOutcome),
-    CurrentMissingIdentifier(&'a State),
+    CurrentMissingIdentifier(&'a SnapshotState),
 }
 
 impl<'a> UpsertSource<'a> {
@@ -1043,7 +1081,7 @@ struct ReplacementDeleteInput<'a> {
     identifier: &'a str,
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
-    fallback_dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
+    prior_dependencies: carina_core::effect::PriorInstanceDestroyDependencies,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
 
@@ -1084,14 +1122,14 @@ fn classify_replacement_outcome<S>(
     moved_origins: &MovedOrigins,
     successfully_deleted: &HashSet<DeletedInstanceKey>,
     schemas: &SchemaRegistry,
-) -> ReplacementOutcome {
+) -> Result<ReplacementOutcome, AppError> {
     let create_upsert = match create_result {
         ReplacementCreateResult::Upsert(upsert) => Some(upsert),
-        ReplacementCreateResult::Ended => return ReplacementOutcome::CurrentRowOnly,
+        ReplacementCreateResult::Ended => return Ok(ReplacementOutcome::CurrentRowOnly),
         ReplacementCreateResult::Absent => None,
     };
     let create_result = create_upsert.filter(|upsert| upsert.source.is_create_result());
-    match create_result {
+    Ok(match create_result {
         Some(_upsert)
             if delete_succeeded(
                 successfully_deleted,
@@ -1105,7 +1143,7 @@ fn classify_replacement_outcome<S>(
         Some(upsert) => {
             let new_identifier = upsert.source.created_identifier();
             if new_identifier == Some(delete.identifier) {
-                return ReplacementOutcome::CurrentRowOnly;
+                return Ok(ReplacementOutcome::CurrentRowOnly);
             }
             ReplacementOutcome::CreateAppliedDeposeOld(planned_depose(
                 delete,
@@ -1116,7 +1154,7 @@ fn classify_replacement_outcome<S>(
                 state_file,
                 managed_current,
                 moved_origins,
-            ))
+            )?)
         }
         None if delete_succeeded(
             successfully_deleted,
@@ -1138,7 +1176,7 @@ fn classify_replacement_outcome<S>(
             ReplacementOutcome::DeleteSucceededCreateAbsent(delete.id.clone())
         }
         None => ReplacementOutcome::KeepOld,
-    }
+    })
 }
 
 fn replacement_create_result<'upsert, 'resource, S>(
@@ -1171,7 +1209,7 @@ fn planned_depose<S>(
     state_file: &StateFile,
     managed_current: &HashMap<ResourceId, Current>,
     moved_origins: &MovedOrigins,
-) -> PlannedDepose {
+) -> Result<PlannedDepose, AppError> {
     let existing = moved_origins.find_persisted_row_at_address(state_file, delete.id.as_inner());
     let current = managed_current.get(delete.id.as_inner());
     let current_state = current.and_then(|current| match current {
@@ -1209,18 +1247,24 @@ fn planned_depose<S>(
                 previous_hash_authority,
             )
         } else {
-            DeposedAttributes::default()
+            Ok(DeposedAttributes::default())
         }
-    };
+    }
+    .map_err(|source| {
+        AppError::from_resource_state_encoding(delete.id.as_inner().clone(), source)
+    })?;
 
+    let refreshed_dependencies = current_state
+        .map(PriorInstanceDestroyDependencies::from_refreshed_state)
+        .map(PriorInstanceDestroyDependencies::into_persisted)
+        .filter(|bindings| !bindings.is_empty());
     let dependency_bindings = existing
         .map(|rs| rs.dependency_bindings.clone())
         .filter(|bindings| !bindings.is_empty())
-        .or_else(|| current_state.map(|state| state.dependency_bindings.clone()))
-        .filter(|bindings| !bindings.is_empty())
-        .unwrap_or(delete.fallback_dependency_bindings);
+        .or(refreshed_dependencies)
+        .unwrap_or_else(|| delete.prior_dependencies.into_persisted());
 
-    PlannedDepose {
+    Ok(PlannedDepose {
         id: delete.id.clone(),
         instance: DeposedInstance::from_persisted_attributes(
             DeposedKey::new_unique(),
@@ -1229,18 +1273,18 @@ fn planned_depose<S>(
             attributes,
             dependency_bindings,
         ),
-    }
+    })
 }
 
 fn delete_input_from_effect<'a, S>(
     effect: &'a Effect<S>,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 ) -> Option<ReplacementDeleteInput<'a>> {
+    let prior_dependencies = effect.prior_instance_destroy_dependencies()?;
     let Effect::Delete {
         id,
         identifier,
         generation,
-        dependencies,
         ..
     } = effect
     else {
@@ -1251,8 +1295,8 @@ fn delete_input_from_effect<'a, S>(
         identifier: identifier.as_str(),
         provider_instance: id.as_inner().provider_instance.clone(),
         generation,
-        fallback_dependency_bindings: dependencies.iter().cloned().collect(),
         previous_attributes,
+        prior_dependencies,
     })
 }
 
@@ -1262,8 +1306,8 @@ fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDele
         identifier: delete.identifier.as_str(),
         provider_instance: delete.id.as_inner().provider_instance.clone(),
         generation: &CURRENT_GENERATION,
-        fallback_dependency_bindings: delete.dependencies.iter().cloned().collect(),
         previous_attributes: None,
+        prior_dependencies: delete.prior_instance_destroy_dependencies(),
     }
 }
 
@@ -1303,7 +1347,7 @@ fn plan_displaced_identifier_deposes<S>(
     wb: &mut WritebackPlan<'_, S>,
     input: &DecomposeInput<'_, '_, S>,
     moved_origins: &MovedOrigins,
-) {
+) -> Result<(), AppError> {
     let create_side_ids = create_side_upsert_ids(input.plan);
     for (id, upsert) in &wb.upserts {
         if !upsert.source.is_create_result() {
@@ -1362,8 +1406,8 @@ fn plan_displaced_identifier_deposes<S>(
                 identifier: displaced_identifier,
                 provider_instance: existing.directives.provider_instance.clone(),
                 generation: &EffectGeneration::Current,
-                fallback_dependency_bindings: existing.dependency_bindings.clone(),
                 previous_attributes: None,
+                prior_dependencies: PriorInstanceDestroyDependencies::default(),
             },
             upsert.resource,
             input
@@ -1373,8 +1417,9 @@ fn plan_displaced_identifier_deposes<S>(
             input.state_file,
             input.managed_current,
             moved_origins,
-        ));
+        )?);
     }
+    Ok(())
 }
 
 /// Build the typed writeback plan from the raw apply inputs.
@@ -1400,9 +1445,7 @@ struct DecomposeInput<'a, 's, S = ModuleSource> {
 }
 
 #[cfg(test)]
-fn decompose<'a, S>(
-    input: DecomposeInput<'a, '_, S>,
-) -> Result<WritebackPlan<'a, S>, WritebackConflict> {
+fn decompose<'a, S>(input: DecomposeInput<'a, '_, S>) -> Result<WritebackPlan<'a, S>, AppError> {
     let moved_origins = MovedOrigins::from_plan(input.plan);
     decompose_with_moved_origins(input, &moved_origins)
 }
@@ -1410,7 +1453,7 @@ fn decompose<'a, S>(
 fn decompose_with_moved_origins<'a, S>(
     input: DecomposeInput<'a, '_, S>,
     moved_origins: &MovedOrigins,
-) -> Result<WritebackPlan<'a, S>, WritebackConflict> {
+) -> Result<WritebackPlan<'a, S>, AppError> {
     let state_file = input.state_file;
     let sorted_resources = input.sorted_resources;
     let runtime_synthesized_resources = input.runtime_synthesized_resources;
@@ -1500,7 +1543,7 @@ fn decompose_with_moved_origins<'a, S>(
                     moved_origins,
                     successfully_deleted,
                     schemas,
-                );
+                )?;
                 wb.apply_replacement_outcome(outcome)?;
             }
             continue;
@@ -1519,7 +1562,7 @@ fn decompose_with_moved_origins<'a, S>(
                     moved_origins,
                     successfully_deleted,
                     schemas,
-                );
+                )?;
                 wb.apply_replacement_outcome(outcome)?;
             }
             continue;
@@ -1545,7 +1588,7 @@ fn decompose_with_moved_origins<'a, S>(
         }
     }
 
-    plan_displaced_identifier_deposes(&mut wb, &input, moved_origins);
+    plan_displaced_identifier_deposes(&mut wb, &input, moved_origins)?;
 
     Ok(wb)
 }
@@ -1596,6 +1639,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         },
         planned_secret_hashes,
         &comparisons,
+        None,
     )
 }
 
@@ -1603,6 +1647,7 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
     save: ApplyStateSave<'_, S>,
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
     comparisons: &ResolvedComparisonTable,
+    references: Option<&carina_core::references::ResolvedReferences>,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1641,74 +1686,88 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
             .comparison_for(&resource.id)
             .map_err(AppError::from)?;
         let owner_schema = resolved_comparison.owner_schema();
-        let comparison = resolved_comparison.context();
-        let schema = Some(owner_schema.schema().as_schema());
-        let mut resource_state = match &planned.source {
-            UpsertSource::Complete { state, request } => {
-                ResourceState::from_provider_state_for_resource_and_schema(
-                    resource,
-                    state,
-                    existing,
-                    schema,
-                    RowBasis::Applied(request),
-                    preferred_hashes,
-                    comparison,
-                )
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
-            }
-            UpsertSource::Imported(state) => {
-                // Import sends no resource attributes, so it establishes no
-                // write-only baseline. An updatable key is sent by the next
-                // plan; a create-only key remains subject to the #1232 guard.
-                ResourceState::from_provider_state_for_resource_and_schema(
-                    resource,
-                    state,
-                    existing,
-                    schema,
-                    RowBasis::Imported,
-                    preferred_hashes,
-                    comparison,
-                )
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
-            }
-            UpsertSource::CurrentPresent(state) | UpsertSource::CurrentMissingIdentifier(state) => {
-                ResourceState::from_provider_state_for_resource_and_schema(
-                    resource,
-                    state,
-                    existing,
-                    schema,
-                    RowBasis::Carried,
-                    preferred_hashes,
-                    comparison,
-                )
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
-            }
-            UpsertSource::Observed(created) => ResourceState::from_observation(
-                resource,
-                created,
-                existing,
-                schema,
-                preferred_hashes,
-                comparison,
-            )
-            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
-            UpsertSource::CreateInFlight(pending)
-            | UpsertSource::CurrentCreateInFlight(pending) => ResourceState::from_in_flight(
-                resource,
-                pending,
-                existing,
-                schema,
-                preferred_hashes,
-                comparison,
-            )
-            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
-            UpsertSource::CreateOutcomeUnknown(unknown)
-            | UpsertSource::CurrentCreateOutcomeUnknown(unknown) => {
-                ResourceState::from_unknown_create_outcome(
-                    resource, unknown, existing, schema, comparison,
-                )
-            }
-        };
+        let comparison_schema = resolved_comparison.context();
+        let mut resource_state =
+            comparison_schema.with_authoring(references, &resource.id, |comparison| {
+                let schema = Some(owner_schema.schema().as_schema());
+                Ok::<_, AppError>(match &planned.source {
+                    UpsertSource::Complete { state, request } => {
+                        ResourceState::from_provider_state_for_resource_and_schema(
+                            resource,
+                            state,
+                            existing,
+                            schema,
+                            RowBasis::Applied(request),
+                            preferred_hashes,
+                            comparison,
+                        )
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?
+                    }
+                    UpsertSource::Imported(state) => {
+                        // Import sends no resource attributes, so it establishes no
+                        // write-only baseline. An updatable key is sent by the next
+                        // plan; a create-only key remains subject to the #1232 guard.
+                        ResourceState::from_provider_state_for_resource_and_schema(
+                            resource,
+                            state,
+                            existing,
+                            schema,
+                            RowBasis::Imported,
+                            preferred_hashes,
+                            comparison,
+                        )
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?
+                    }
+                    UpsertSource::CurrentPresent(state)
+                    | UpsertSource::CurrentMissingIdentifier(state) => {
+                        ResourceState::from_provider_state_for_resource_and_schema(
+                            resource,
+                            state,
+                            existing,
+                            schema,
+                            RowBasis::Carried,
+                            preferred_hashes,
+                            comparison,
+                        )
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?
+                    }
+                    UpsertSource::Observed(created) => ResourceState::from_observation(
+                        resource,
+                        created,
+                        existing,
+                        schema,
+                        preferred_hashes,
+                        comparison,
+                    )
+                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
+                    UpsertSource::CreateInFlight(pending)
+                    | UpsertSource::CurrentCreateInFlight(pending) => {
+                        ResourceState::from_in_flight(
+                            resource,
+                            pending,
+                            existing,
+                            schema,
+                            preferred_hashes,
+                            comparison,
+                        )
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?
+                    }
+                    UpsertSource::CreateOutcomeUnknown(unknown)
+                    | UpsertSource::CurrentCreateOutcomeUnknown(unknown) => {
+                        ResourceState::from_unknown_create_outcome(
+                            resource, unknown, existing, schema, comparison,
+                        )
+                    }
+                })
+            })??;
         if planned.source.records_name_overrides()
             && let Some(overrides) = permanent_name_overrides.get(id)
         {
@@ -1849,10 +1908,10 @@ pub(crate) struct DestroyedInstance {
     pub generation: EffectGeneration,
 }
 
-/// Build a minimal `Resource` for an orphaned resource from the state file.
+/// Build an orphan's address and lifecycle resource for destroy planning.
 ///
-/// Provider attributes and host-owned metadata come from the same persisted
-/// row, so callers cannot join independently-built orphan views.
+/// Historical provider attributes stay in `Current`; the resource carries
+/// only the persisted row's routing and host-owned metadata.
 pub(crate) fn build_orphan_resource(
     sf: &carina_state::StateFile,
     id: &ResolvedResourceId,
@@ -1860,16 +1919,10 @@ pub(crate) fn build_orphan_resource(
     let rs = sf
         .find_resource(&id.provider, &id.resource_type, id.identity_str())
         .expect("orphan must exist in state file");
-    let attributes = rs
-        .persisted_attributes()
-        .map(PersistedAttributes::to_values)
-        .unwrap_or_default();
     let mut resource = Resource::from_id(id.as_inner().clone());
-    resource.attributes = attributes.into_iter().collect();
     resource.directives = rs.directives.clone().into();
     resource.prefixes = rs.prefixes.clone();
     resource.binding = rs.binding.clone();
-    resource.dependency_bindings = rs.dependency_bindings.clone();
     resource
 }
 
@@ -1907,10 +1960,13 @@ mod post_apply_states_tests {
         )];
         let data_source_values =
             DataSourceValues::from_data_sources(&data_sources, |data_source| {
-                carina_core::data_source_value::DataSourceValue::read(State::existing(
-                    data_source.id.clone(),
-                    ds_attrs.clone(),
-                ))
+                carina_core::data_source_value::DataSourceValue::read(
+                    (State::<carina_core::resource::NoPlaceholder>::existing(
+                        data_source.id.clone(),
+                        ds_attrs.clone(),
+                    ))
+                    .to_snapshot(),
+                )
             });
 
         // state.resources has no entry for the data source — that is
@@ -1924,7 +1980,10 @@ mod post_apply_states_tests {
             .read_states()
             .find_map(|(id, state)| (id == &ds_id).then_some(state))
             .expect("data-source entry must survive merge");
-        assert_eq!(entry.attributes.get("arns"), ds_attrs.get("arns"));
+        assert_eq!(
+            entry.attributes.get("arns").cloned(),
+            ds_attrs.get("arns").map(|value| value.to_snapshot()),
+        );
     }
 
     #[test]
@@ -1938,7 +1997,10 @@ mod post_apply_states_tests {
             Value::Concrete(ConcreteValue::String("Suspended".into())),
         );
         let mut managed_states = HashMap::new();
-        managed_states.insert(id.clone(), State::existing(id.clone(), pre_attrs));
+        managed_states.insert(
+            id.clone(),
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), pre_attrs),
+        );
 
         // state.resources carries the POST-apply value — this must win.
         let json = serde_json::json!({
@@ -1999,7 +2061,7 @@ mod post_apply_states_tests {
             "old-id".to_string(),
             None,
             HashMap::new(),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state = StateFile::new();
         state
@@ -2088,9 +2150,7 @@ mod apply_state_save_tests {
 
     use super::*;
     use carina_core::differ::create_plan_for_test as create_plan;
-    use carina_core::effect::{
-        DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes,
-    };
+    use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
     use carina_core::explicit::ExplicitFields;
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
@@ -2105,7 +2165,9 @@ mod apply_state_save_tests {
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     fn state_with_default_directives() -> StateFile {
@@ -2121,11 +2183,11 @@ mod apply_state_save_tests {
 
     #[test]
     fn persisted_directive_changes_describe_every_persisted_field() {
-        let changed = |resource: Resource, expected_field: PersistedDirectiveField| {
+        let changed = |resource: ResolvedResource, expected_field: PersistedDirectiveField| {
             let plan = Plan::new();
             let changes = persisted_directive_changes(
                 Some(&state_with_default_directives()),
-                &[resolved(resource)],
+                &[resource],
                 &plan,
             );
             assert_eq!(changes.len(), 1);
@@ -2139,43 +2201,66 @@ mod apply_state_save_tests {
 
         let mut force_delete = Resource::with_provider("mock", "test.Resource", "main", None);
         force_delete.directives.force_delete = true;
-        changed(force_delete, PersistedDirectiveField::ForceDelete);
+        changed(resolved(force_delete), PersistedDirectiveField::ForceDelete);
 
         let mut create_before_destroy =
             Resource::with_provider("mock", "test.Resource", "main", None);
         create_before_destroy.directives.create_before_destroy = true;
         changed(
-            create_before_destroy,
+            resolved(create_before_destroy),
             PersistedDirectiveField::CreateBeforeDestroy,
         );
 
         let mut prevent_destroy = Resource::with_provider("mock", "test.Resource", "main", None);
         prevent_destroy.directives.set_prevent_destroy(false);
-        changed(prevent_destroy, PersistedDirectiveField::PreventDestroy);
+        changed(
+            resolved(prevent_destroy),
+            PersistedDirectiveField::PreventDestroy,
+        );
 
-        let mut depends_on = Resource::with_provider("mock", "test.Resource", "main", None);
-        depends_on.directives.depends_on = vec![absolute_binding("dependency")];
+        let depends_on = Resource::with_provider("mock", "test.Resource", "main", None);
+        let dependency = ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.Dependency",
+            "dependency",
+            None,
+        );
+        let depends_on = ResolvedResource::new(depends_on.into_value_snapshot())
+            .with_saved_destroy_dependencies(
+                Default::default(),
+                crate::test_support::persisted([dependency]),
+            );
         changed(depends_on, PersistedDirectiveField::DependsOn);
 
         let mut provider_instance = Resource::with_provider("mock", "test.Resource", "main", None);
         provider_instance.directives.provider_instance = Some("secondary".to_string());
-        changed(provider_instance, PersistedDirectiveField::ProviderInstance);
+        changed(
+            resolved(provider_instance),
+            PersistedDirectiveField::ProviderInstance,
+        );
     }
 
     #[test]
     fn persisted_directive_changes_treat_depends_on_as_a_set() {
         let mut row = ResourceState::try_applied("test.Resource", "main", "mock", "provider-main")
             .expect("fixture identifier is valid");
-        row.directives.depends_on = vec![absolute_binding("first"), absolute_binding("second")];
+        let first =
+            ResolvedResourceId::with_provider_identity("mock", "test.Dependency", "first", None);
+        let second =
+            ResolvedResourceId::with_provider_identity("mock", "test.Dependency", "second", None);
+        row.directives.depends_on = crate::test_support::persisted([first.clone(), second.clone()]);
         let mut state = StateFile::new();
         state.upsert_resource(row).expect("fixture row is unique");
 
-        let mut resource = Resource::with_provider("mock", "test.Resource", "main", None);
-        resource.directives.depends_on =
-            vec![absolute_binding("second"), absolute_binding("first")];
+        let resource = Resource::with_provider("mock", "test.Resource", "main", None);
+        let resource = ResolvedResource::new(resource.into_value_snapshot())
+            .with_saved_destroy_dependencies(
+                Default::default(),
+                crate::test_support::persisted([second, first]),
+            );
 
         assert_eq!(
-            persisted_directive_changes(Some(&state), &[resolved(resource)], &Plan::new()),
+            persisted_directive_changes(Some(&state), &[resource], &Plan::new()),
             Vec::new(),
             "reordering an authored set must not produce a persisted directive change"
         );
@@ -2189,8 +2274,12 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(Effect::Update {
             from: Box::new(
-                State::existing(resource.id.clone(), HashMap::new())
-                    .with_identifier("provider-main"),
+                (State::<carina_core::resource::NoPlaceholder>::existing(
+                    resource.id.clone(),
+                    HashMap::new(),
+                )
+                .with_identifier("provider-main"))
+                .to_snapshot(),
             ),
             identifier: crate::fixture_applied_identifier("provider-main"),
             to: resource.clone(),
@@ -2327,7 +2416,11 @@ mod apply_state_save_tests {
         provider.add_provider(
             "mock".to_string(),
             carina_core::provider::InitializedProvider::unavailable(Box::new(
-                carina_provider_mock::MockProvider::new(),
+                carina_provider_mock::ConfiguredBuiltinMock::new(
+                    carina_provider_mock::MockBehavior::default(),
+                    carina_provider_mock::MockScope::memory(),
+                )
+                .create_provider(),
             )),
         );
 
@@ -2349,6 +2442,144 @@ mod apply_state_save_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn round3_writeback_pairs_reference_lists_with_prepared_identity_evidence() {
+        use carina_core::explicit::ExplicitFields;
+        use carina_core::provider::{InitializedProvider, RawSavedAttrs};
+        use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+        let schema = carina_core::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Rule",
+                        vec![
+                            StructField::optional(
+                                "reference",
+                                AttributeType::reference(
+                                    carina_provider_mock::references::identity(),
+                                    None,
+                                    None,
+                                ),
+                            )
+                            .build(),
+                            StructField::optional("provider_default", AttributeType::string())
+                                .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("mock", schema);
+        let runtime = crate::test_support::TestCommandRuntime::with_mock(
+            carina_provider_mock::MockBehavior::default().with_reference_table(
+                serde_json::from_value(serde_json::json!({
+                    "alias/live": {"Ok": {"Resolved": "key/a"}},
+                    "key/a": {"Ok": {"Resolved": "key/a"}},
+                }))
+                .unwrap(),
+            ),
+            carina_provider_mock::MockScope::memory(),
+        );
+        let mut provider = ProviderRouter::new();
+        provider.add_provider(
+            "mock".into(),
+            InitializedProvider::unavailable(Box::new(
+                runtime.builtin_mock().unwrap().create_provider(),
+            )),
+        );
+        let rules = |key: &str, default: bool| {
+            let mut fields = indexmap::IndexMap::from([(
+                "reference".into(),
+                Value::Concrete(ConcreteValue::String(key.into())),
+            )]);
+            if default {
+                fields.insert(
+                    "provider_default".into(),
+                    Value::Concrete(ConcreteValue::String("generated".into())),
+                );
+            }
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(fields),
+            )]))
+        };
+        let resource = resolved(
+            Resource::with_provider("mock", "keys.Resource", "example", None)
+                .with_attribute("rules", rules("alias/live", false)),
+        );
+        let id = resource.id.clone();
+        let previous = State::<carina_core::resource::NoPlaceholder>::existing(
+            id.clone(),
+            resource.resolved_attributes(),
+        )
+        .with_identifier("id-123");
+        let comparison = provider.comparison_for(&schemas, &id).unwrap();
+        let row = comparison
+            .context()
+            .with_observation(|observation| {
+                ResourceState::from_provider_state_for_resource_and_schema(
+                    &resource,
+                    &previous,
+                    None,
+                    Some(comparison.owner_schema().schema().as_schema()),
+                    RowBasis::Imported,
+                    None,
+                    observation,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let prior_explicit = row.explicit.clone();
+        let mut state = StateFile::new();
+        state.upsert_resource(row).unwrap();
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
+            id.clone(),
+            HashMap::from([("rules".into(), rules("key/a", true))]),
+        )
+        .with_identifier("id-123");
+        let current = HashMap::from([(id.clone(), Current::from_state(fresh.clone()))]);
+        let plan_current = carina_core::resource::into_plan_input_current_map(
+            current.clone(),
+            &schemas,
+            &[resource.as_resource().clone()],
+        );
+        let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+            id.clone(),
+            previous.to_snapshot().attributes,
+        )]))
+        .lift(&schemas);
+        let references = carina_core::references::ReferencePreparation::default()
+            .prepare(
+                std::slice::from_ref(&resource),
+                &plan_current,
+                &schemas,
+                &saved,
+                &provider,
+            )
+            .await
+            .unwrap();
+        let inputs =
+            ApplyStateSaveInputs::new(vec![resource], Plan::new(), schemas, None, &provider)
+                .unwrap()
+                .with_reference_evidence(Some(references));
+        let mut result = ExecutionResult::empty();
+        result.managed_current = current;
+        let state = inputs.build_state(state, &result).unwrap();
+        let row = state
+            .find_resource("mock", "keys.Resource", "example")
+            .unwrap();
+        assert_eq!(row.explicit, prior_explicit);
+        assert!(matches!(&row.explicit, ExplicitFields::Struct { .. }));
+        assert_eq!(
+            row.persisted_attributes().unwrap().to_values(),
+            fresh.to_snapshot().attributes,
+            "canonical identities must not replace provider observation bytes"
+        );
+    }
+
     #[test]
     fn apply_state_save_inputs_pre_resolve_deferred_runtime_comparisons() {
         let mut plan = Plan::new();
@@ -2366,9 +2597,9 @@ mod apply_state_save_tests {
             // provider instance and type before any runtime child exists.
             Resource::pending_with_provider("aws", "route53.Record", None),
         );
-        plan.add(Effect::DeferredCreate(
-            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
-        ));
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+            Box::new(template),
+        )));
         let runtime_id = ResourceId::with_provider_identity(
             "aws",
             "route53.Record",
@@ -2388,14 +2619,14 @@ mod apply_state_save_tests {
 
     fn complete_create(state: State) -> Applied {
         Applied::Complete {
-            state,
+            state: state.to_snapshot(),
             request: AcceptedRequest::create_for_test(),
         }
     }
 
     fn complete_update(state: State, sent: &[&str], removed: &[&str]) -> Applied {
         Applied::Complete {
-            state,
+            state: state.to_snapshot(),
             request: AcceptedRequest::update_for_test(sent, removed),
         }
     }
@@ -2419,7 +2650,7 @@ mod apply_state_save_tests {
     }
 
     fn applied_name_state(id: &ResourceId, name: &str) -> State {
-        State::existing(
+        State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -2569,7 +2800,7 @@ mod apply_state_save_tests {
                     "older-deposed-id".to_string(),
                     None,
                     HashMap::from([("name".to_string(), serde_json::json!("older"))]),
-                    BTreeSet::new(),
+                    Default::default(),
                 ),
             )
             .expect("older deposed fixture must be valid");
@@ -2585,7 +2816,7 @@ mod apply_state_save_tests {
                         "old-record-id".to_string(),
                         None,
                         HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-                        BTreeSet::new(),
+                        Default::default(),
                     ),
                 )
                 .expect("CBD old generation fixture must be valid");
@@ -2594,7 +2825,7 @@ mod apply_state_save_tests {
         let managed_current = HashMap::from([(id.clone(), state.build_state_for_resource(&id))]);
         let applied = match kind {
             ReplacementAppliedKind::Complete => complete_create(
-                State::existing(
+                State::<carina_core::resource::NoPlaceholder>::existing(
                     id.clone(),
                     HashMap::from([(
                         "name".to_string(),
@@ -2885,6 +3116,7 @@ mod apply_state_save_tests {
         )]);
         let plan_input = carina_core::resource::into_plan_input_current_map::<
             carina_core::resource::ModuleSource,
+            carina_core::resource::UnexpandedDependencyFields,
         >(current, schemas, &[]);
         let saved_attrs = state.build_saved_attrs().lift(schemas);
         create_plan(
@@ -2947,7 +3179,11 @@ mod apply_state_save_tests {
                 applied_states: &HashMap::from([(
                     id.clone(),
                     complete_create(
-                        State::existing(id, provider_attributes).with_identifier("provider-id"),
+                        State::<carina_core::resource::NoPlaceholder>::existing(
+                            id,
+                            provider_attributes,
+                        )
+                        .with_identifier("provider-id"),
                     ),
                 )]),
                 plan: &Plan::new(),
@@ -2998,7 +3234,9 @@ mod apply_state_save_tests {
             );
         let id = desired.id.clone();
         let existing = state_with_write_only_password(&id, "old");
-        let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let refreshed =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("provider-id");
         let schemas = write_only_password_schema();
 
         let saved = build_state_after_apply(
@@ -3304,7 +3542,7 @@ mod apply_state_save_tests {
             "create-only change must plan a replacement create: {plan:#?}"
         );
         let managed_current = HashMap::from([(id.clone(), existing.build_state_for_resource(&id))]);
-        let applied = State::existing(
+        let applied = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "replacement_key".to_string(),
@@ -3353,7 +3591,9 @@ mod apply_state_save_tests {
         existing
             .upsert_resource(legacy_row)
             .expect("legacy provider-echo row is valid");
-        let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let refreshed =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("provider-id");
         let schemas = write_only_password_schema();
 
         let saved = build_state_after_apply(
@@ -3403,7 +3643,7 @@ mod apply_state_save_tests {
             );
         let id = desired.id.clone();
         let existing = state_with_write_only_password(&id, "old");
-        let applied = State::existing(
+        let applied = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([
                 (
@@ -3450,7 +3690,9 @@ mod apply_state_save_tests {
             );
         let id = desired.id.clone();
         let existing = state_with_write_only_password(&id, "old");
-        let applied = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let applied =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("provider-id");
         let schemas = write_only_password_schema();
 
         let saved = build_state_after_apply(
@@ -3486,7 +3728,9 @@ mod apply_state_save_tests {
         let next_plan = plan_after_writeback(&desired, &existing, &schemas);
         assert_eq!(next_plan.mutation_count(), 0);
 
-        let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let refreshed =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("provider-id");
         let saved = build_state_after_apply(
             ApplyStateSave {
                 state_file: existing,
@@ -3506,9 +3750,13 @@ mod apply_state_save_tests {
         let stored = saved
             .find_resource_for_id(&id)
             .and_then(ResourceState::persisted_attributes)
-            .and_then(|attributes| attributes.redacted_secret_hash("password"))
+            .and_then(|attributes| attributes.get("password"))
             .expect("carried write-only secret must be stored as a hash");
-        assert!(stored.verify(serde_json::to_vec(&serde_json::json!("old")).unwrap()));
+        assert!(
+            stored
+                .verify_secret(&Value::Concrete(ConcreteValue::String("old".into())))
+                .expect("fixture secret material serializes")
+        );
     }
 
     #[test]
@@ -3516,7 +3764,7 @@ mod apply_state_save_tests {
         let desired = Resource::with_provider("mock", "test.resource", "removed-password", None);
         let id = desired.id.clone();
         let existing = state_with_write_only_password(&id, "old");
-        let applied = State::existing(
+        let applied = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
@@ -3591,7 +3839,7 @@ mod apply_state_save_tests {
             "the differ must include the removed write-only key: {changed_attributes:?}"
         );
         let managed_current = HashMap::from([(id.clone(), existing.build_state_for_resource(&id))]);
-        let applied = State::existing(
+        let applied = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "comment".to_string(),
@@ -3640,7 +3888,9 @@ mod apply_state_save_tests {
                 Value::Concrete(ConcreteValue::String("import-baseline".into())),
             );
         let id = desired.id.clone();
-        let imported = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let imported =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("provider-id");
         let schemas = write_only_password_schema();
 
         let saved = build_state_after_apply(
@@ -3649,7 +3899,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), Applied::Imported(imported))]),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    Applied::Imported(imported.to_snapshot()),
+                )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3690,7 +3943,9 @@ mod apply_state_save_tests {
                     Value::Concrete(ConcreteValue::String("cannot-update".into())),
                 );
         let id = desired.id.clone();
-        let imported = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        let imported =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("provider-id");
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
@@ -3710,7 +3965,10 @@ mod apply_state_save_tests {
                 sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id.clone(), Applied::Imported(imported))]),
+                applied_states: &HashMap::from([(
+                    id.clone(),
+                    Applied::Imported(imported.to_snapshot()),
+                )]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),
@@ -3752,14 +4010,16 @@ mod apply_state_save_tests {
         .expect("observed create writeback")
     }
 
-    fn assert_secret_matches(value: Value, plaintext: &str) {
-        let Value::Deferred(DeferredValue::RedactedSecret { hash }) = value else {
-            panic!("expected a redacted secret hash");
-        };
-        let material = serde_json::to_vec(&serde_json::json!(plaintext))
-            .expect("fixture secret material serializes");
+    fn assert_secret_matches(value: carina_core::resource::SnapshotValue, plaintext: &str) {
         assert!(
-            hash.verify(material),
+            value.secret_hash().is_some(),
+            "expected a redacted secret hash"
+        );
+        let material: Value = Value::Concrete(ConcreteValue::String(plaintext.into()));
+        assert!(
+            value
+                .verify_secret(&material)
+                .expect("fixture secret material serializes"),
             "secret hash did not match {plaintext:?}"
         );
     }
@@ -4173,7 +4433,7 @@ mod apply_state_save_tests {
                     .with_attribute("name", serde_json::json!("before")),
             )
             .expect("fixture row is valid");
-        let applied = State::existing(
+        let applied = State::<carina_core::resource::NoPlaceholder>::existing(
             destination.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -4185,7 +4445,12 @@ mod apply_state_save_tests {
         plan.add(Effect::Update {
             identifier: crate::fixture_applied_identifier("stable-id"),
             from: Box::new(
-                State::existing(source.clone(), HashMap::new()).with_identifier("stable-id"),
+                (State::<carina_core::resource::NoPlaceholder>::existing(
+                    source.clone(),
+                    HashMap::new(),
+                )
+                .with_identifier("stable-id"))
+                .to_snapshot(),
             ),
             to: destination_resource.clone(),
             changed_attributes: vec!["name".to_string()],
@@ -4548,7 +4813,14 @@ mod apply_state_save_tests {
                     "old-id".to_string(),
                     None,
                     HashMap::from([("name".to_string(), serde_json::json!("old"))]),
-                    BTreeSet::from(["dependency".to_string()]),
+                    carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                        ResolvedResourceId::with_provider_identity(
+                            "mock",
+                            "test.Dependency",
+                            "dependency",
+                            None,
+                        ),
+                    ]),
                 ),
             )
             .expect("deposed fixture is valid");
@@ -4620,7 +4892,7 @@ mod apply_state_save_tests {
                 Value::Concrete(ConcreteValue::String("before".into())),
             );
         let sibling_id = sibling.id.clone();
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "rules".to_string(),
@@ -4631,7 +4903,7 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("listener-id");
-        let sibling_state = State::existing(
+        let sibling_state = State::<carina_core::resource::NoPlaceholder>::existing(
             sibling_id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -4709,7 +4981,7 @@ mod apply_state_save_tests {
                 "name",
                 Value::Concrete(ConcreteValue::String("after".into())),
             );
-        let sibling_state = State::existing(
+        let sibling_state = State::<carina_core::resource::NoPlaceholder>::existing(
             sibling_id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -4877,7 +5149,7 @@ mod apply_state_save_tests {
                 Value::Concrete(ConcreteValue::String("_dns_record_name_".into())),
             );
         let child_id = runtime_child.id.clone();
-        let child_state = State::existing(
+        let child_state = State::<carina_core::resource::NoPlaceholder>::existing(
             child_id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -4937,9 +5209,9 @@ mod apply_state_save_tests {
                 generation: EffectGeneration::Current,
                 directives: Directives::default(),
                 binding: None,
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             });
         }
         let successfully_deleted =
@@ -4992,7 +5264,9 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             None,
             HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            BTreeSet::from(["cert".to_string()]),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None),
+            ]),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -5006,9 +5280,11 @@ mod apply_state_save_tests {
             generation: EffectGeneration::Deposed(deposed_key.clone()),
             directives: Directives::default(),
             binding: Some(absolute_binding("validation_records[0]")),
-            dependencies: HashSet::from([absolute_binding("cert")]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: crate::test_support::persisted([
+                ResolvedResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None),
+            ]),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         let template = DeferredForExpression::new(
             Some("main.crn".to_string()),
@@ -5023,9 +5299,9 @@ mod apply_state_save_tests {
             Resource::with_provider("aws", "route53.Record", "validation_records", None)
                 .with_test_binding("validation_records"),
         );
-        plan.add(Effect::DeferredCreate(
-            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
-        ));
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+            Box::new(template),
+        )));
         let successfully_deleted = HashSet::from([DeletedInstanceKey::new(
             id.clone(),
             EffectGeneration::Deposed(deposed_key),
@@ -5067,9 +5343,11 @@ mod apply_state_save_tests {
             identifier: crate::fixture_applied_identifier("old-record-id"),
             directives: Directives::default(),
             binding: Some(absolute_binding("validation_records[0]")),
-            dependencies: HashSet::from([absolute_binding("cert")]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: crate::test_support::persisted([
+                ResolvedResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None),
+            ]),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }
     }
 
@@ -5081,10 +5359,10 @@ mod apply_state_save_tests {
             id.provider_instance.clone(),
         )
         .with_test_binding("validation_records");
-        Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-            deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
+        Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
+            NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
-            template: Box::new(DeferredForExpression::new(
+            Box::new(DeferredForExpression::new(
                 Some("main.crn".to_string()),
                 1,
                 "for opt in cert.domain_validation_options".to_string(),
@@ -5096,7 +5374,7 @@ mod apply_state_save_tests {
                 ForBinding::Simple("opt".to_string()),
                 template_resource,
             )),
-        }))
+        )))
     }
 
     #[test]
@@ -5111,7 +5389,8 @@ mod apply_state_save_tests {
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
                 .with_test_binding("validation_records[0]");
         let applied_state =
-            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("new-record-id");
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::new();
@@ -5159,7 +5438,7 @@ mod apply_state_save_tests {
             Some("west".to_string()),
         )
         .with_test_binding("validation_records[0]");
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -5167,7 +5446,7 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("new-record-id");
-        let current_state = State::existing(
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -5184,9 +5463,13 @@ mod apply_state_save_tests {
         .expect("fixture identifier is non-empty")
         .with_attribute("name", serde_json::json!("old.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
-        existing
-            .dependency_bindings
-            .insert(absolute_binding("cert"));
+        existing.dependency_bindings =
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "aws",
+                "acm.Certificate",
+                "cert",
+                None,
+            )]);
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -5244,9 +5527,11 @@ mod apply_state_save_tests {
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
                 .with_test_binding("validation_records[0]");
         let applied_state =
-            State::existing(id.clone(), HashMap::new()).with_identifier("old-record-id");
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("old-record-id");
         let current_state =
-            State::existing(id.clone(), HashMap::new()).with_identifier("old-record-id");
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("old-record-id");
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
@@ -5297,7 +5582,7 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let from_state = State::existing(
+        let from_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -5305,7 +5590,7 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("vpc-canonical-old");
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -5316,8 +5601,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(Effect::Update {
             identifier: crate::fixture_applied_identifier("vpc-canonical-old"),
-            from: Box::new(from_state),
-            to: carina_core::resource::ResolvedResource::new(desired.clone()),
+            from: Box::new(from_state.to_snapshot()),
+            to: resolved(desired.clone()),
             changed_attributes: vec!["cidr_block".to_string()],
         });
 
@@ -5365,12 +5650,18 @@ mod apply_state_save_tests {
         let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
             .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
-        existing.dependency_bindings.insert(absolute_binding("igw"));
+        existing.dependency_bindings =
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.InternetGateway",
+                "igw",
+                None,
+            )]);
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -5380,7 +5671,7 @@ mod apply_state_save_tests {
         .with_identifier("vpc-new");
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(desired.clone()),
+            carina_core::resource::ResolvedResource::new((desired.clone()).into_value_snapshot()),
         ));
 
         let state = build_state_after_apply(
@@ -5411,10 +5702,16 @@ mod apply_state_save_tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("cidr_block"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("10.0.0.0/16"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             row.deposed[0].dependency_bindings,
-            BTreeSet::from([absolute_binding("igw")])
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.InternetGateway",
+                "igw",
+                None
+            )])
         );
     }
 
@@ -5434,8 +5731,9 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let current_state = State::not_found(id.clone()).with_identifier("vpc-old");
-        let applied_state = State::existing(
+        let current_state = State::<carina_core::resource::NoPlaceholder>::not_found(id.clone())
+            .with_identifier("vpc-old");
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -5445,7 +5743,7 @@ mod apply_state_save_tests {
         .with_identifier("vpc-new");
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(desired.clone()),
+            carina_core::resource::ResolvedResource::new((desired.clone()).into_value_snapshot()),
         ));
 
         let state = build_state_after_apply(
@@ -5495,7 +5793,7 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -5505,7 +5803,7 @@ mod apply_state_save_tests {
         .with_identifier("vpc-new");
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(desired.clone()),
+            carina_core::resource::ResolvedResource::new((desired.clone()).into_value_snapshot()),
         ));
 
         let state = build_state_after_apply(
@@ -5565,7 +5863,7 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             create_id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -5580,12 +5878,12 @@ mod apply_state_save_tests {
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some(absolute_binding("main")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(desired.clone()),
+            carina_core::resource::ResolvedResource::new((desired.clone()).into_value_snapshot()),
         ));
         let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "cidr_block".to_string(),
@@ -5603,8 +5901,16 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
             .expect("replacement metadata should deserialize");
+        let plan = carina_core::value::rehydrate_plan_desired_secrets(
+            &snapshot_plan,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
+        )
+        .expect("ordinary desired fixtures cross the snapshot boundary");
         let saved_desired =
             carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
         let successfully_deleted =
@@ -5657,7 +5963,7 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             create_id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -5666,9 +5972,7 @@ mod apply_state_save_tests {
         )
         .with_identifier("vpc-new");
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(desired.clone()),
-        ));
+        plan.add(Effect::Create(resolved(desired.clone())));
         let successfully_deleted = HashSet::from([DeletedInstanceKey::current(
             create_id.clone(),
             "shared-name",
@@ -5734,14 +6038,14 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             Some("west".to_string()),
             HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
 
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -5756,12 +6060,12 @@ mod apply_state_save_tests {
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some(absolute_binding("validation_records[0]")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(desired.clone()),
+            carina_core::resource::ResolvedResource::new((desired.clone()).into_value_snapshot()),
         ));
         let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "name".to_string(),
@@ -5779,8 +6083,16 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
             .expect("replacement metadata should deserialize");
+        let plan = carina_core::value::rehydrate_plan_desired_secrets(
+            &snapshot_plan,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
+        )
+        .expect("ordinary desired fixtures cross the snapshot boundary");
         let saved_desired =
             carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
 
@@ -5857,14 +6169,14 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             Some("west".to_string()),
             HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
 
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -5879,12 +6191,12 @@ mod apply_state_save_tests {
             generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some(absolute_binding("validation_records[0]")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.add(Effect::Create(
-            carina_core::resource::ResolvedResource::new(desired.clone()),
+            carina_core::resource::ResolvedResource::new((desired.clone()).into_value_snapshot()),
         ));
         let previous_attributes: HashMap<String, Value> = HashMap::from([(
             "name".to_string(),
@@ -5902,8 +6214,16 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
+        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
             .expect("replacement metadata should deserialize");
+        let plan = carina_core::value::rehydrate_plan_desired_secrets(
+            &snapshot_plan,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
+        )
+        .expect("ordinary desired fixtures cross the snapshot boundary");
         let saved_desired =
             carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
         let successfully_deleted =
@@ -5969,7 +6289,7 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let refreshed_state = State::existing(
+        let refreshed_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -6021,7 +6341,7 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let from_state = State::existing(
+        let from_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
@@ -6029,7 +6349,7 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("db-1");
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
@@ -6040,8 +6360,8 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(Effect::Update {
             identifier: crate::fixture_applied_identifier("db-1"),
-            from: Box::new(from_state),
-            to: carina_core::resource::ResolvedResource::new(desired.clone()),
+            from: Box::new(from_state.to_snapshot()),
+            to: resolved(desired.clone()),
             changed_attributes: vec!["password".to_string()],
         });
 
@@ -6072,6 +6392,7 @@ mod apply_state_save_tests {
                 .expect("row has applied attributes")
                 .get("password"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
+                .map(|value| value.to_snapshot())
         );
 
         let loaded = saved.build_state_for_resource(&id);
@@ -6092,11 +6413,9 @@ mod apply_state_save_tests {
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &crate::plan_input_current_from_states(
-                    current_states.clone(),
-                    &SchemaRegistry::new(),
-                    &[],
-                ),
+                &crate::plan_input_current_from_snapshots::<
+                    carina_core::resource::UnexpandedDependencyFields,
+                >(current_states.clone(), &SchemaRegistry::new(), &[]),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -6124,7 +6443,8 @@ mod apply_state_save_tests {
             );
         let id = desired.id.clone();
         let applied_state =
-            State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("provider-id");
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "mock",
@@ -6160,7 +6480,8 @@ mod apply_state_save_tests {
             row.persisted_attributes()
                 .expect("row has applied attributes")
                 .get("password"),
-            carina_core::value::json_to_dsl_value(&serde_json::json!(marker)),
+            carina_core::value::json_to_dsl_value(&serde_json::json!(marker))
+                .map(|value| value.to_snapshot()),
         );
     }
 
@@ -6178,13 +6499,17 @@ mod apply_state_save_tests {
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let from_state = State::existing(id.clone(), HashMap::new()).with_identifier("db-1");
-        let applied_state = State::existing(id.clone(), HashMap::new()).with_identifier("db-1");
+        let from_state =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("db-1");
+        let applied_state =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("db-1");
         let mut plan = Plan::new();
         plan.add(Effect::Update {
             identifier: crate::fixture_applied_identifier("db-1"),
-            from: Box::new(from_state),
-            to: carina_core::resource::ResolvedResource::new(desired.clone()),
+            from: Box::new(from_state.to_snapshot()),
+            to: resolved(desired.clone()),
             changed_attributes: vec!["password".to_string()],
         });
         let mut schemas = SchemaRegistry::new();
@@ -6226,6 +6551,7 @@ mod apply_state_save_tests {
                 .expect("row has applied attributes")
                 .get("password"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(row.write_only_attributes(), ["password"]);
 
@@ -6247,7 +6573,9 @@ mod apply_state_save_tests {
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
+                &crate::plan_input_current_from_snapshots::<
+                    carina_core::resource::UnexpandedDependencyFields,
+                >(current_states.clone(), &schemas, &[]),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -6262,6 +6590,79 @@ mod apply_state_save_tests {
             second_plan.mutation_count(),
             0,
             "second plan after write-only secret-to-plain demotion must be empty"
+        );
+    }
+
+    #[test]
+    fn cbd_deposed_generation_keeps_old_dependencies_in_precedence_order() {
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "main", None);
+        let old_dependency =
+            ResolvedResourceId::with_provider_identity("mock", "test.resource", "a", None);
+        let new_dependency =
+            ResolvedResourceId::with_provider_identity("mock", "test.resource", "b", None);
+        let desired = resolved(
+            Resource::with_provider("mock", "test.resource", "main", None)
+                .with_absolute_binding(absolute_binding("main")),
+        )
+        .with_saved_destroy_dependencies(
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                new_dependency,
+            ]),
+            carina_core::resource::PersistedDestroyDependencies::default(),
+        );
+        let existing =
+            ResourceState::try_applied("test.resource", "main", "mock", "old-provider-id")
+                .expect("fixture identifier");
+        let mut state_file = StateFile::new();
+        state_file
+            .upsert_resource(existing)
+            .expect("old row is unique");
+        let delete: Effect = Effect::Delete {
+            id: ResolvedResourceId::new(id.clone()),
+            identifier: crate::fixture_applied_identifier("old-provider-id"),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: Some(absolute_binding("main")),
+            dependencies: crate::test_support::persisted([old_dependency.clone()]),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
+        let plan = Plan::new();
+        let moved_origins = MovedOrigins::from_plan(&plan);
+        let expected =
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                old_dependency.clone(),
+            ]);
+
+        let refreshed =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("old-provider-id")
+                .with_dependency_bindings(crate::test_support::persisted([old_dependency]));
+        let managed_current =
+            crate::managed_current_from_states(HashMap::from([(id.clone(), refreshed)]));
+        let from_refreshed = planned_depose(
+            delete_input_from_effect(&delete, None).expect("delete input"),
+            &desired,
+            None,
+            &state_file,
+            &managed_current,
+            &moved_origins,
+        )
+        .expect("deposed attributes must encode");
+        assert_eq!(from_refreshed.instance.dependency_bindings, expected);
+
+        let from_delete = planned_depose(
+            delete_input_from_effect(&delete, None).expect("delete input"),
+            &desired,
+            None,
+            &state_file,
+            &HashMap::new(),
+            &moved_origins,
+        )
+        .expect("deposed attributes must encode");
+        assert_eq!(
+            from_delete.instance.dependency_bindings, expected,
+            "the new generation's B dependency must never replace old-generation A"
         );
     }
 
@@ -6281,7 +6682,7 @@ mod apply_state_save_tests {
                     Value::Concrete(ConcreteValue::String("new.example.com".into())),
                 )
                 .with_attribute("password", secret_string("new-password"));
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -6289,7 +6690,7 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("new-record-id");
-        let current_state = State::existing(
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -6369,7 +6770,7 @@ mod apply_state_save_tests {
             );
         desired.directives.create_before_destroy = true;
         let id = desired.id.clone();
-        let current_state = State::existing(
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([
                 (
@@ -6411,7 +6812,9 @@ mod apply_state_save_tests {
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
+                &crate::plan_input_current_from_states::<
+                    carina_core::resource::UnexpandedDependencyFields,
+                >(current_states.clone(), &schemas, &[]),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -6427,7 +6830,7 @@ mod apply_state_save_tests {
                 .is_some_and(|replacement| replacement.create_before_destroy),
             "fixture must exercise the create-before-destroy replacement fallback"
         );
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "replacement_key".to_string(),
@@ -6483,8 +6886,9 @@ mod apply_state_save_tests {
                     )))),
                 );
         let applied_state =
-            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
-        let current_state = State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("new-record-id");
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([
                 (
@@ -6563,7 +6967,7 @@ mod apply_state_save_tests {
                     "password",
                     Value::Concrete(ConcreteValue::String("plain-new".into())),
                 );
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
@@ -6571,7 +6975,7 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier("new-record-id");
-        let current_state = State::existing(
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
@@ -6644,8 +7048,9 @@ mod apply_state_save_tests {
                     Value::Concrete(ConcreteValue::String("new.example.com".into())),
                 );
         let applied_state =
-            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
-        let current_state = State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("new-record-id");
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([
                 (
@@ -6698,6 +7103,7 @@ mod apply_state_save_tests {
         assert_eq!(
             deposed.persisted_attributes().get("name"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("old.example.com"))
+                .map(|value| value.to_snapshot())
         );
         assert!(
             !deposed.persisted_attributes().contains_key("password"),
@@ -6729,7 +7135,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-                    BTreeSet::from(["cert".to_string()]),
+                    carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                        ResolvedResourceId::with_provider_identity(
+                            "aws",
+                            "acm.Certificate",
+                            "cert",
+                            None,
+                        ),
+                    ]),
                 ),
             },
         )
@@ -6764,7 +7177,9 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             Some("east".to_string()),
             HashMap::from([("name".to_string(), serde_json::json!("stale"))]),
-            BTreeSet::from(["old".to_string()]),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("mock", "test.Dependency", "old", None),
+            ]),
         ));
         let mut state = StateFile::new();
         state
@@ -6780,7 +7195,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("fresh"))]),
-                    BTreeSet::from(["new".to_string()]),
+                    carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                        ResolvedResourceId::with_provider_identity(
+                            "mock",
+                            "test.Dependency",
+                            "new",
+                            None,
+                        ),
+                    ]),
                 ),
             },
         )
@@ -6808,7 +7230,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("newer"))]),
-                    BTreeSet::from(["newer".to_string()]),
+                    carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                        ResolvedResourceId::with_provider_identity(
+                            "mock",
+                            "test.Dependency",
+                            "newer",
+                            None,
+                        ),
+                    ]),
                 ),
             },
         )
@@ -6825,10 +7254,16 @@ mod apply_state_save_tests {
         assert_eq!(
             deposed.persisted_attributes().get("name"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("newer"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             deposed.dependency_bindings,
-            BTreeSet::from([absolute_binding("newer")])
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Dependency",
+                "newer",
+                None
+            )])
         );
     }
 
@@ -6844,8 +7279,9 @@ mod apply_state_save_tests {
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
                 .with_test_binding("validation_records[0]");
         let applied_state =
-            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
-        let current_state = State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("new-record-id");
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -6867,7 +7303,9 @@ mod apply_state_save_tests {
             "older-record-id".to_string(),
             None,
             HashMap::from([("name".to_string(), serde_json::json!("older"))]),
-            BTreeSet::from(["cert".to_string()]),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None),
+            ]),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -6950,7 +7388,7 @@ mod apply_state_save_tests {
         );
         let id = resource.id.clone();
         let sorted_resources = vec![resolved(resource)];
-        let current_state = State::existing(
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
@@ -6975,11 +7413,9 @@ mod apply_state_save_tests {
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &crate::plan_input_current_from_states(
-                    current_states.clone(),
-                    &SchemaRegistry::new(),
-                    &[],
-                ),
+                &crate::plan_input_current_from_states::<
+                    carina_core::resource::UnexpandedDependencyFields,
+                >(current_states.clone(), &SchemaRegistry::new(), &[]),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -7027,7 +7463,7 @@ mod apply_state_save_tests {
         resource.directives.create_before_destroy = true;
         let id = resource.id.clone();
         let sorted_resources = vec![resolved(resource)];
-        let current_state = State::existing(
+        let current_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([
                 (
@@ -7064,7 +7500,9 @@ mod apply_state_save_tests {
             &[],
             &ProviderRouter::new(),
             carina_core::differ::PlanPriorStates::new(
-                &crate::plan_input_current_from_states(current_states.clone(), &schemas, &[]),
+                &crate::plan_input_current_from_states::<
+                    carina_core::resource::UnexpandedDependencyFields,
+                >(current_states.clone(), &schemas, &[]),
                 &carina_core::differ::Orphans::new(),
             ),
             &HashMap::new(),
@@ -7084,21 +7522,34 @@ mod apply_state_save_tests {
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let unresolved_upstreams: HashSet<&str> = HashSet::new();
 
-        let raw_sorted_resources: Vec<Resource> = sorted_resources
+        let raw_sorted_resources: Vec<_> = sorted_resources
             .iter()
             .map(|resource| resource.as_resource().clone())
             .collect();
-        crate::wiring::add_state_block_effects(
-            &mut plan,
-            &state_blocks,
-            &state_file_for_wiring,
-            &[(
-                ResolvedResourceId::new(from_id.clone()),
-                ResolvedResourceId::new(id.clone()),
-            )],
-            &raw_sorted_resources,
-            &bindings,
-            &unresolved_upstreams,
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                crate::wiring::add_state_block_effects(
+                    &mut plan,
+                    &state_blocks,
+                    &state_file_for_wiring,
+                    &[(
+                        ResolvedResourceId::new(from_id.clone()),
+                        ResolvedResourceId::new(id.clone()),
+                    )],
+                    &raw_sorted_resources,
+                    crate::wiring::StateBlockEvaluationContext {
+                        removed: &carina_state::ResolvedRemovedClaims::resolve(
+                            &state_blocks,
+                            state_file_for_wiring.as_ref(),
+                        ),
+                        bindings: &bindings,
+                        unresolved_upstream_bindings: &unresolved_upstreams,
+                        session,
+                    },
+                )
+                .expect("state block identifiers resolve")
+            },
         );
 
         assert_eq!(
@@ -7114,9 +7565,11 @@ mod apply_state_save_tests {
         );
 
         let persisted_secret = PersistedValue::encode_provider_value(
-            &Value::Deferred(carina_core::resource::DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("previously-secret".into())),
-            ))),
+            &Value::<carina_core::resource::NoPlaceholder>::Deferred(
+                carina_core::resource::DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("previously-secret".into()),
+                ))),
+            ),
             None,
         )
         .expect("persist previous secret marker");
@@ -7125,14 +7578,18 @@ mod apply_state_save_tests {
                 .expect("fixture identifier is non-empty")
                 .with_attribute("bucket_name", serde_json::json!("old-name"))
                 .with_attribute("comment", persisted_secret.as_json().clone());
-        existing
-            .dependency_bindings
-            .insert(absolute_binding("logs"));
+        existing.dependency_bindings =
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "s3.Bucket",
+                "logs",
+                None,
+            )]);
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let applied_state = State::existing(
+        let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "bucket_name".to_string(),
@@ -7171,6 +7628,7 @@ mod apply_state_save_tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("bucket_name"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("old-name"))
+                .map(|value| value.to_snapshot())
         );
         let deposed_attributes = serde_json::to_value(row.deposed[0].persisted_attributes())
             .expect("serialize deposed attributes");
@@ -7192,7 +7650,8 @@ mod apply_state_save_tests {
         let desired =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None);
         let applied_state =
-            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("new-record-id");
         let mut plan = Plan::new();
         plan.add(Effect::Move {
             from: carina_core::resource::ResolvedResourceId::new(id.clone()),
@@ -7227,7 +7686,13 @@ mod apply_state_save_tests {
             Err(err) => err,
         };
 
-        assert!(matches!(err, WritebackConflict::UpsertCleanupOverlap { id: got } if got == id));
+        let AppError::Validation(message) = err else {
+            panic!("overlapping writeback claims must remain a validation error: {err:?}");
+        };
+        assert_eq!(
+            message,
+            WritebackConflict::UpsertCleanupOverlap { id }.to_string()
+        );
     }
 }
 
@@ -7247,9 +7712,9 @@ mod export_writeback_tests {
         name: &str,
         value: Value<NoPlaceholder, RelativeBindingName>,
     ) -> ExpandedInferredExportParam {
-        InferredExportParam::<NoPlaceholder, RelativeBindingName> {
-            name: name.to_string(),
-            static_type: carina_core::static_type::ExportStaticType::Inferred(
+        InferredExportParam::<NoPlaceholder, RelativeBindingName>::for_test(
+            name.to_string(),
+            carina_core::static_type::ExportStaticType::Inferred(
                 carina_core::static_type::StaticType::Unchecked(
                     carina_core::static_type::InferredUncheckedReason::NotInferable(
                         carina_core::static_type::NotInferableReason::SchemaUnavailable {
@@ -7258,8 +7723,8 @@ mod export_writeback_tests {
                     ),
                 ),
             ),
-            value: Some(value),
-        }
+            Some(value),
+        )
         .resolve_root_for_test()
     }
 
@@ -7272,13 +7737,20 @@ mod export_writeback_tests {
             &DataSourceValues::empty(),
             &state,
         );
-        let checked = carina_core::validation::check_export_values_pre_apply(
-            export_params,
-            &carina_core::binding_index::ResolvedBindings::default(),
+        let checked = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::validation::check_export_values_pre_apply(
+                    export_params,
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                    session,
+                )
+            },
         )
         .expect("test exports must pass the secret boundary");
-        let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
+        let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput::<
+            carina_core::resource::UnexpandedDependencyFields,
+        > {
             export_params: &checked,
             sorted_resources: &[],
             pre_resolve_compositions: &[],
@@ -7296,7 +7768,9 @@ mod export_writeback_tests {
     #[test]
     fn partial_read_row_keeps_runtime_unknown_out_of_persisted_exports() {
         let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
-        let provider_state = State::existing(id.clone(), HashMap::new()).with_identifier("main-id");
+        let provider_state =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("main-id");
         let mut row =
             ResourceState::from_provider_state("test.Resource", "main", "mock", &provider_state)
                 .expect("partial-read fixture must encode");
@@ -7307,10 +7781,16 @@ mod export_writeback_tests {
                 PendingReRead::incomplete(
                     "provider read after create did not return every attribute",
                 ),
-                BTreeSet::from(["computed".to_string()]),
+                std::collections::BTreeSet::from(["computed".to_string()]),
             )),
         );
-        row.dependency_bindings = BTreeSet::from([absolute_binding("upstream")]);
+        row.dependency_bindings =
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Resource",
+                "upstream",
+                None,
+            )]);
         let mut state = StateFile::new();
         state
             .upsert_resource(row)
@@ -7324,10 +7804,15 @@ mod export_writeback_tests {
             vec![],
         );
         let export_params = [export_param("computed", reference.clone())];
-        let checked = carina_core::validation::check_export_values_pre_apply(
-            &export_params,
-            &carina_core::binding_index::ResolvedBindings::default(),
+        let checked = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::validation::check_export_values_pre_apply(
+                    &export_params,
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                    session,
+                )
+            },
         )
         .expect("test export must pass the secret boundary");
         let post_apply_states = PostApplyStates::from_current_and_state(
@@ -7348,7 +7833,12 @@ mod export_writeback_tests {
                 ));
                 assert_eq!(
                     present.state().dependency_bindings,
-                    BTreeSet::from([absolute_binding("upstream")])
+                    crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.Resource",
+                        "upstream",
+                        None
+                    )])
                 );
             }
             Current::MissingIdentifier(state) => {
@@ -7393,6 +7883,7 @@ mod export_writeback_tests {
 
     #[test]
     fn unresolved_export_is_skipped_without_dropping_resolved_exports() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let export_params = vec![
             export_param(
                 "target_group_arn",
@@ -7430,7 +7921,7 @@ mod export_writeback_tests {
             skipped[0]
         );
         assert_eq!(
-            render_skipped(&skipped[0]),
+            render_skipped(color_mode, &skipped[0]),
             "  ! export target_group_arn not written: unresolved reference registry_publish.target_group.arn"
         );
     }
@@ -7517,6 +8008,7 @@ mod export_writeback_tests {
 
     #[test]
     fn write_into_preserves_prior_skipped_exports_and_drops_orphans() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         state.insert_export_json_for_test("ax", serde_json::json!("old-a"));
         state.insert_export_json_for_test("bx", serde_json::json!("old-b"));
@@ -7532,7 +8024,7 @@ mod export_writeback_tests {
                 reason: "unresolved reference b.name".to_string(),
             }],
         }
-        .write_into(&mut state);
+        .write_into(color_mode, &mut state);
 
         assert_eq!(skipped.len(), 1);
         assert_eq!(state.exports.len(), 2);
@@ -7736,7 +8228,10 @@ mod stage4_unknown_err_tests {
     fn enum_shaped_user_map_round_trips_through_attribute_and_export_writeback() {
         let value = enum_shaped_user_map();
         let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
-        let state = State::existing(id, HashMap::from([("payload".to_string(), value.clone())]));
+        let state = State::<carina_core::resource::NoPlaceholder>::existing(
+            id,
+            HashMap::from([("payload".to_string(), value.clone())]),
+        );
         let row = ResourceState::from_provider_state("test.Resource", "main", "mock", &state)
             .expect("attribute writeback succeeds");
 
@@ -7744,7 +8239,7 @@ mod stage4_unknown_err_tests {
             row.persisted_attributes()
                 .expect("row has applied attributes")
                 .get("payload"),
-            Some(value.clone())
+            Some(value.to_snapshot())
         );
 
         let export_json = PersistedExportValue::encode(&value).expect("export writeback succeeds");

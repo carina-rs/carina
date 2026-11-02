@@ -34,8 +34,6 @@
 //!   compositions, or [`TryFrom<GraphNode>`](LeafNode#impl-TryFrom<GraphNode>-for-LeafNode)
 //!   for single-node conversion that surfaces the failure.
 
-use serde::Serialize;
-
 use super::{DataSource, GraphNode, LiveComposition, Resource, ResourceId};
 
 /// An owned post-expansion IR node — either a resource (CRUD) or a
@@ -47,7 +45,7 @@ use super::{DataSource, GraphNode, LiveComposition, Resource, ResourceId};
 /// [`TryFrom<GraphNode>`](#impl-TryFrom<GraphNode>-for-LeafNode) (for
 /// a single node where the caller wants to handle the composition
 /// case) or [`expand_to_leaves`] (to drop compositions in bulk).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LeafNode {
     Resource(Resource),
     DataSource(DataSource),
@@ -172,7 +170,7 @@ mod tests {
 
     fn sample_composition() -> LiveComposition {
         use indexmap::IndexMap;
-        use std::collections::{BTreeSet, HashSet};
+        use std::collections::HashSet;
         LiveComposition {
             id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "m")),
             signature: super::super::LiveCompositionSignature {
@@ -181,7 +179,7 @@ mod tests {
                 pending_constraints: Vec::new(),
             },
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "m".to_string(),
             instance: "i".to_string(),
             call_path: Default::default(),
@@ -252,18 +250,19 @@ mod tests {
     /// at the type level (no `LeafNode::LiveComposition` variant exists)
     /// is the core guarantee of this enum.
     ///
-    /// ```compile_fail
-    /// use carina_core::resource::{LeafNode, LiveComposition, ResourceId, LiveCompositionSignature};
+    /// ```compile_fail,E0277
+    /// use carina_core::resource::{LeafNode, LiveComposition, ResolvedResourceId, LiveCompositionSignature};
     /// use indexmap::IndexMap;
     /// use std::collections::{BTreeSet, HashSet};
-    /// let c = LiveComposition {
-    ///     id: ResourceId::with_identity("_virtual", "m"),
+    /// let c: LiveComposition = LiveComposition {
+    ///     id: ResolvedResourceId::with_identity("_virtual", "m"),
     ///     signature: LiveCompositionSignature {
     ///         arguments: IndexMap::new(),
     ///         attributes: IndexMap::new(),
+    ///         pending_constraints: Vec::new(),
     ///     },
     ///     binding: None,
-    ///     dependency_bindings: BTreeSet::new(),
+    ///     dependency_bindings: Default::default(),
     ///     module_name: "m".to_string(),
     ///     instance: "i".to_string(),
     ///     call_path: Default::default(),

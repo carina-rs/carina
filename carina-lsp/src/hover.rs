@@ -288,7 +288,8 @@ impl HoverProvider {
 
         // Load the module to get its definition
         let module_path = base_path.join(&import_path).ok()?;
-        let module_parsed = carina_core::module_resolver::load_module(&module_path)?;
+        let module_parsed =
+            carina_core::module_resolver::load_module(&module_path, doc.provider_context())?;
 
         let mut content = format!("## {}\n\n`{}`\n", word, import_path);
 
@@ -347,7 +348,8 @@ impl HoverProvider {
 
         // Load the module to get argument definitions
         let module_path = base_path.join(&import_path).ok()?;
-        let module_parsed = carina_core::module_resolver::load_module(&module_path)?;
+        let module_parsed =
+            carina_core::module_resolver::load_module(&module_path, doc.provider_context())?;
 
         // Find the argument matching the word
         let arg = module_parsed.arguments.iter().find(|a| a.name == word)?;
@@ -871,7 +873,12 @@ mod tests {
         std::fs::write(consumer_dir.join("main.crn"), text).unwrap();
 
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let content = hover_markdown(
             &provider,
             &doc,
@@ -880,6 +887,42 @@ mod tests {
         )
         .unwrap_or_else(|| panic!("module argument should have hover in:\n{text}"));
         assert!(content.contains("mymod.arg"), "{text}\n{content}");
+    }
+
+    #[test]
+    fn module_and_argument_hover_use_environment_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let module = directory.path().join("module");
+        std::fs::create_dir(&module).unwrap();
+        std::fs::write(module.join("arguments.crn"), "arguments { name: String }\n").unwrap();
+        std::fs::write(
+            module.join("provider.crn"),
+            "fn version() { env('MODE') }\nprovider mock { version = version() }\n",
+        )
+        .unwrap();
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+            "MODE".to_string(),
+            "1.0.0".into(),
+        )]));
+        let source = "let service = use { source = './module' }\nservice {\n  name = 'value'\n}\n";
+        let doc = Document::new_with_path(
+            source.to_string(),
+            directory.path().join("main.crn"),
+            Arc::new(context),
+        );
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        for (word, occurrence, expected) in
+            [("service", 1, "## service"), ("name", 0, "## service.name")]
+        {
+            let content = hover_markdown(
+                &provider,
+                &doc,
+                hover_position(source, word, occurrence),
+                Some(directory.path()),
+            )
+            .expect("module hover must retain the captured environment");
+            assert!(content.contains(expected), "{content}");
+        }
     }
 
     #[test]
@@ -949,7 +992,9 @@ mod tests {
         // the resolver has the schema context to anchor on (see #1988).
         let doc = Document::new(
             "ec2.nat_gateway {\n  secondary_allocation_ids\n}\n".to_string(),
-            Arc::new(ProviderContext::default()),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
         // Hover on the attribute name (line 1, inside the identifier).
         let hover = provider
@@ -1080,7 +1125,9 @@ awscc.ec2.vpc_gateway_attachment {
 }
 "#
             .to_string(),
-            Arc::new(ProviderContext::default()),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
 
         // Hover over "internet_gateway_id" on line 5 (0-indexed), column 10
@@ -1153,7 +1200,9 @@ awscc.ec2.vpc_gateway_attachment {
 }
 "#
             .to_string(),
-            Arc::new(ProviderContext::default()),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
 
         // Hover on the `account_id` token in `target_id = account_id`
@@ -1201,7 +1250,12 @@ aws.route53.RecordSet {
         .unwrap();
 
         let provider = nested_attribute_hover_provider();
-        let doc = Document::new(main_text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            main_text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let nested_zone = hover_markdown(
             &provider,
@@ -1272,7 +1326,12 @@ aws.route53.RecordSet {
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let content = hover_markdown(
             &provider,
@@ -1320,7 +1379,12 @@ aws.route53.RecordSet {
   ]
 }
 "#;
-        let list_doc = Document::new(list_text.to_string(), Arc::new(ProviderContext::default()));
+        let list_doc = Document::new(
+            list_text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let list_content = hover_markdown(
             &provider,
             &list_doc,
@@ -1340,7 +1404,12 @@ aws.route53.RecordSet {
   }
 }
 "#;
-        let block_doc = Document::new(block_text.to_string(), Arc::new(ProviderContext::default()));
+        let block_doc = Document::new(
+            block_text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let block_content = hover_markdown(
             &provider,
             &block_doc,
@@ -1389,7 +1458,12 @@ aws.route53.RecordSet {
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let content = hover_markdown(&provider, &doc, hover_position(text, "leaf", 0), None)
             .expect("field reached through two Ref-backed struct levels should have hover");
@@ -1422,7 +1496,12 @@ aws.route53.RecordSet {
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let hover = provider.hover(&doc, hover_position(text, "foo_binding", 0));
         assert!(
@@ -1442,7 +1521,12 @@ aws.route53.RecordSet {
 "#,
             "aws.route53.RecordSet { alias_target = { hosted_zone_id = 'Z0123456789ABC' } }",
         ] {
-            let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+            let doc = Document::new(
+                text.to_string(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
             let content = hover_markdown(
                 &provider,
                 &doc,
@@ -1466,7 +1550,12 @@ aws.route53.RecordSet {
   hosted_zone_id = 'Z0123456789ABC'
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let content = hover_markdown(
             &provider,
@@ -1482,7 +1571,12 @@ aws.route53.RecordSet {
     fn crlf_lines_keep_lexer_and_walker_positions_aligned() {
         let provider = nested_attribute_hover_provider();
         let text = "aws.route53.RecordSet {\r\n  hosted_zone_id = 'Z0123456789ABC'\r\n}\r\n";
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let content = hover_markdown(
             &provider,
@@ -1504,7 +1598,12 @@ EOT
   hosted_zone_id = 'Z0123456789ABC'
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let content = hover_markdown(
             &provider,
@@ -1526,7 +1625,12 @@ EOT
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let content = hover_markdown(
             &provider,
@@ -1569,7 +1673,12 @@ EOT
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let content = hover_markdown(
             &provider,
@@ -1609,7 +1718,12 @@ EOT
 "#;
         std::fs::write(consumer_dir.join("main.crn"), text).unwrap();
         let provider = nested_attribute_hover_provider();
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let hover = provider.hover_with_base_path(
             &doc,
@@ -1652,7 +1766,12 @@ EOT
             "test.Review {\n  outer = for value in values {\n    field = value\n  }\n}\n",
             "test.Review {\n  x = merge(y, {\n    field = 'value'\n  })\n}\n",
         ] {
-            let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+            let doc = Document::new(
+                text.to_string(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
             let content = hover_markdown(&provider, &doc, hover_position(text, "field", 0), None)
                 .expect("field in an assignment expression should have nested hover");
             assert!(content.contains("NESTED expression field"), "{content}");
@@ -1662,7 +1781,9 @@ EOT
         let control_text = "test.Review {\n  if true {\n    field = 'value'\n  }\n}\n";
         let control_doc = Document::new(
             control_text.to_string(),
-            Arc::new(ProviderContext::default()),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
         let content = hover_markdown(
             &provider,
@@ -1698,7 +1819,12 @@ EOT
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let hover = provider.hover(&doc, hover_position(text, "description", 0));
         assert!(
@@ -1716,7 +1842,12 @@ EOT
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let hover = provider.hover(&doc, hover_position(text, "description", 0));
         assert!(
@@ -1733,7 +1864,12 @@ EOT
             "let x = read aws.ec2.Vpc {\n  description = 'read'\n}\n",
             "for item in items {\n  aws.ec2.SecurityGroup {\n    description = item\n  }\n}\n",
         ] {
-            let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+            let doc = Document::new(
+                text.to_string(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
             let content = hover_markdown(
                 &provider,
                 &doc,
@@ -1756,7 +1892,12 @@ EOT
   )
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let hover = provider.hover(&doc, hover_position(text, "field", 0));
         assert!(
@@ -1776,7 +1917,12 @@ EOT
   })
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let hover = provider.hover(&doc, hover_position(text, "field", 0));
         assert!(
@@ -1798,7 +1944,12 @@ EOT
   )
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let hover = provider.hover(&doc, hover_position(text, "name", 0));
         assert!(
@@ -1827,7 +1978,12 @@ EOT
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let content = hover_markdown(
             &provider,
@@ -1859,7 +2015,12 @@ EOT
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         for occurrence in [1, 2] {
             let content = hover_markdown(
@@ -1885,7 +2046,12 @@ EOT
   }
 }
 "#;
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
 
         let hover = provider.hover(&doc, hover_position(text, "hosted_zone_id", 0));
         assert!(
@@ -1897,7 +2063,12 @@ EOT
     #[test]
     fn test_builtin_function_hover_join() {
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
-        let doc = Document::new("join".to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            "join".to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let hover = provider
             .hover(&doc, Position::new(0, 1))
             .expect("Should find hover for 'join'");
@@ -1928,7 +2099,9 @@ EOT
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let doc = Document::new(
             "cidr_subnet".to_string(),
-            Arc::new(ProviderContext::default()),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
         let hover = provider
             .hover(&doc, Position::new(0, 3))
@@ -1951,7 +2124,9 @@ EOT
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let doc = Document::new(
             "not_a_function".to_string(),
-            Arc::new(ProviderContext::default()),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
         let hover = provider.hover(&doc, Position::new(0, 3));
         assert!(hover.is_none(), "Unknown function should not show hover");
@@ -1982,7 +2157,12 @@ EOT
             "values",
         ];
         for name in &names {
-            let doc = Document::new(name.to_string(), Arc::new(ProviderContext::default()));
+            let doc = Document::new(
+                name.to_string(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
             let hover = provider.hover(&doc, Position::new(0, 1));
             assert!(
                 hover.is_some(),
@@ -2113,7 +2293,9 @@ EOT
         // Position on "map" → should NOT show function hover
         let doc = Document::new(
             "exports {\n  accounts: map(AwsAccountId) = {}\n}".to_string(),
-            Arc::new(ProviderContext::default()),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
         // Column 14 is inside "map" on line 1
         let hover = provider.hover(&doc, Position::new(1, 14));
@@ -2130,7 +2312,9 @@ EOT
         // Normal function call (no preceding ':') — should show hover
         let doc = Document::new(
             "let x = map(\".id\", items)".to_string(),
-            Arc::new(ProviderContext::default()),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         );
         let hover = provider.hover(&doc, Position::new(0, 10));
         assert!(
@@ -2178,7 +2362,12 @@ EOT
         .unwrap();
         let main_text = "github {\n  github_repo = 'carina-rs/infra'\n}\n";
         std::fs::write(consumer_dir.join("main.crn"), main_text).unwrap();
-        let doc = Document::new(main_text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            main_text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         (tmp, consumer_dir, doc, provider)
     }
@@ -2252,7 +2441,12 @@ EOT
 }
 "#;
         std::fs::write(consumer_dir.join("main.crn"), text).unwrap();
-        let doc = Document::new(text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
 
         let nested_hover =
@@ -2303,7 +2497,12 @@ EOT
         let main_text = "let github = use { source = '../modules/github-oidc' }\ngithub {\n  github_repo = 'x'\n}\n";
         std::fs::write(consumer_dir.join("main.crn"), main_text).unwrap();
 
-        let doc = Document::new(main_text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            main_text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
 
         // Hover on `github_repo` at line 2, column 4 (inside the identifier).
@@ -2346,7 +2545,12 @@ EOT
         let main_text = "let github = use { source = '../modules/github-oidc' }\ngithub {\n  github_repo = 'x'\n}\n";
         std::fs::write(consumer_dir.join("main.crn"), main_text).unwrap();
 
-        let doc = Document::new(main_text.to_string(), Arc::new(ProviderContext::default()));
+        let doc = Document::new(
+            main_text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
 
         // Hover on `github` at line 1 (the call site, not the let).
@@ -2371,7 +2575,12 @@ EOT
         // Document with a typo'd alias that has no matching `use` decl
         // anywhere in the directory.
         let bad_text = "githubb {\n  github_repo = 'x'\n}\n";
-        let bad_doc = Document::new(bad_text.to_string(), Arc::new(ProviderContext::default()));
+        let bad_doc = Document::new(
+            bad_text.to_string(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
         let hover =
             provider.hover_with_base_path(&bad_doc, Position::new(0, 2), Some(&consumer_dir));
         assert!(

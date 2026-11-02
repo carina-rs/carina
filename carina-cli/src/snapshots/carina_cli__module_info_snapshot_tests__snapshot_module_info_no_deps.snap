@@ -16,5 +16,5 @@ Module: no_deps
 
 === ATTRIBUTES ===
 
-  bucket_id: awscc.s3.Bucket
-  queue_url: awscc.sqs.Queue
+  bucket_id
+  queue_url

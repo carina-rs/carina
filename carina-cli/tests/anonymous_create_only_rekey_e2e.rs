@@ -7,12 +7,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+use carina_core::resource::{PersistedDestroyDependencies, ResolvedResourceId};
 use carina_state::{ResourceState, StateFile, check_and_migrate};
 use tempfile::TempDir;
-
-fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
-    carina_core::resource::absolute_binding_address_for_test(name)
-}
 
 struct Scenario {
     _temp: TempDir,
@@ -179,6 +176,21 @@ mock.compute.Instance {{
         rows[0].clone()
     }
 
+    fn cluster_dependency(&self) -> ResolvedResourceId {
+        let state = self.state();
+        let row = state
+            .resources()
+            .iter()
+            .find(|row| row.binding.as_ref().map(|binding| binding.as_str()) == Some("cluster"))
+            .expect("state must contain the bound cluster resource");
+        ResolvedResourceId::with_provider_identity(
+            row.provider.clone(),
+            row.resource_type.clone(),
+            row.identity.clone(),
+            row.directives.provider_instance.clone(),
+        )
+    }
+
     fn anonymous_test_resource(&self) -> ResourceState {
         let state = self.state();
         let rows: Vec<_> = state
@@ -313,7 +325,10 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let initial_identity = initial_row.identity.as_str().to_string();
     assert_eq!(
         initial_row.dependency_bindings,
-        [absolute_binding("cluster")].into_iter().collect(),
+        PersistedDestroyDependencies::decode_persisted(
+            [changed.cluster_dependency()].into_iter().collect()
+        )
+        .unwrap(),
         "the anonymous row must retain its dependency metadata before the move"
     );
 
@@ -328,7 +343,10 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     );
     assert_eq!(
         refreshed_row.dependency_bindings,
-        [absolute_binding("cluster")].into_iter().collect(),
+        PersistedDestroyDependencies::decode_persisted(
+            [changed.cluster_dependency()].into_iter().collect()
+        )
+        .unwrap(),
     );
 
     let replacement_plan = changed.carina(&["plan"]);
@@ -360,7 +378,10 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let replaced_identity = replaced_row.identity.as_str().to_string();
     assert_eq!(
         replaced_row.dependency_bindings,
-        [absolute_binding("cluster")].into_iter().collect(),
+        PersistedDestroyDependencies::decode_persisted(
+            [changed.cluster_dependency()].into_iter().collect()
+        )
+        .unwrap(),
         "Move+Replace writeback must preserve dependency metadata on the re-keyed row"
     );
 
@@ -381,7 +402,10 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let fresh_identity = fresh_row.identity.as_str().to_string();
     assert_eq!(
         fresh_row.dependency_bindings,
-        [absolute_binding("cluster")].into_iter().collect(),
+        PersistedDestroyDependencies::decode_persisted(
+            [fresh.cluster_dependency()].into_iter().collect()
+        )
+        .unwrap(),
     );
 
     assert_eq!(

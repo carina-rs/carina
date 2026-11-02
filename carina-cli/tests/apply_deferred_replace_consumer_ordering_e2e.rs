@@ -1,6 +1,6 @@
 //! CLI-level regression coverage for DeferredReplace consumer update ordering.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -25,7 +25,37 @@ use tempfile::TempDir;
 const UPDATE_DELAY_MS: &str = "200";
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    {
+        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+        let mut dependencies = resource.dependencies.value_bindings.clone();
+        for value in resource.attributes.values() {
+            value.visit_resource_refs(&mut |path| {
+                dependencies.insert(path.binding_address().clone());
+            });
+            value.visit_binding_refs(&mut |binding| {
+                dependencies.insert(binding.clone());
+            });
+        }
+        configuration.resources = dependencies
+            .into_iter()
+            .map(|binding| {
+                Resource::with_provider(
+                    "mock",
+                    "test.resource",
+                    carina_core::resource::ResourceIdentity::try_from(binding.as_str().to_owned())
+                        .unwrap(),
+                    None,
+                )
+                .with_absolute_binding(binding)
+            })
+            .collect();
+        configuration.resources.push(resource.clone());
+        let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
+            .expect("explicit fixture rows");
+        graph
+            .resolve_resource(resource, &carina_core::schema::SchemaRegistry::new())
+            .expect("fixture dependency resolution")
+    }
 }
 
 fn absolute_binding(name: &str) -> AbsoluteBindingAddress {
@@ -44,10 +74,15 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }];
-    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
-        &ProviderContext::default(),
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider config must resolve");
     SavedProviderConfigs::from(&resolved)
@@ -64,7 +99,12 @@ fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }];
-    let providers = ValidatedConfig::for_test((), Vec::<LoadedProviderFactory>::new(), &configs);
+    let providers = ValidatedConfig::for_test(
+        &carina_cli::test_support::TestCommandRuntime::new(),
+        (),
+        Vec::<LoadedProviderFactory>::new(),
+        &configs,
+    );
     contents
         .record_for_test(&providers, Vec::new())
         .expect("mock plan provider evidence must be valid")
@@ -123,9 +163,20 @@ provider mock {}
         .with_attribute("name", serde_json::json!("old-validation-token"))
         .with_attribute("identifier", serde_json::json!("old-validation-id"));
         validation.binding = Some(absolute_binding("validation_records[0]"));
-        validation
-            .dependency_bindings
-            .insert(absolute_binding("cert"));
+        validation.dependency_bindings =
+            carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                [
+                    carina_core::resource::ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.resource",
+                        "cert",
+                        None,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
         state
             .upsert_resource(validation)
             .expect("test state setup must be valid");
@@ -137,9 +188,20 @@ provider mock {}
                 .with_attribute("identifier", serde_json::json!("consumer-id"))
                 .with_attribute("web_acl_arn", serde_json::json!("old-validation-id"));
         consumer.binding = Some(absolute_binding("consumer"));
-        consumer
-            .dependency_bindings
-            .insert(absolute_binding("validation_records[0]"));
+        consumer.dependency_bindings =
+            carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                [
+                    carina_core::resource::ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.resource",
+                        "validation_records[0]",
+                        None,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
         state
             .upsert_resource(consumer)
             .expect("test state setup must be valid");
@@ -219,16 +281,15 @@ fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.to_string().into()))
 }
 
-fn identity(value: &str) -> ResourceIdentity {
-    ResourceIdentity::try_from(value.to_string()).unwrap()
-}
-
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {
-    CurrentStateEntry::managed(resource.id.clone(), State::not_found(resource.id.clone()))
+    CurrentStateEntry::managed(
+        resource.id.clone(),
+        State::<NoPlaceholder>::not_found(resource.id.clone()),
+    )
 }
 
 fn consumer_current_state(id: &ResourceId) -> State {
-    State::existing(
+    State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([
             ("name".to_string(), string("consumer")),
@@ -260,7 +321,8 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             .resolve_root_for_test(),
         );
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("validation_records[0]"));
     let consumer_from = consumer_current_state(&consumer.id);
 
@@ -296,28 +358,46 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         template_resource,
     );
 
+    let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+    configuration.resources = vec![cert.clone()];
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
+        .expect("deferred producer graph");
+    let (template, dependency_template) = graph
+        .compile_deferred_for(template)
+        .expect("deferred dependencies");
     let validation_id =
         ResourceId::with_provider_identity("mock", "test.resource", "validation_records[0]", None);
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(cert.clone())));
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+        dependency_template,
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
             identifier: AppliedIdentifier::new("old-validation-id")
                 .expect("fixture identifier is non-empty"),
             directives: Directives::default(),
             binding: Some(absolute_binding("validation_records[0]")),
-            dependencies: HashSet::from([absolute_binding("cert")]),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::from([identity("consumer")]),
+            dependencies: carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                [carina_core::resource::ResolvedResourceId::new(
+                    cert.id.clone(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: std::iter::once(carina_core::resource::ResolvedResourceId::new(
+                consumer.id.clone(),
+            ))
+            .collect(),
         }])
         .expect("fixture has one delete"),
         template: Box::new(template),
     })));
     plan.add(Effect::Update {
         identifier: AppliedIdentifier::new("consumer-id").expect("fixture identifier is non-empty"),
-        from: Box::new(consumer_from.clone()),
+        from: Box::new(consumer_from.clone().to_snapshot()),
         to: resolved(consumer.clone()),
         changed_attributes: vec!["web_acl_arn".to_string()],
     });
@@ -345,9 +425,29 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             )]),
             attribute_spans: Default::default(),
         }),
-        plan,
-        sorted_resources: sorted_resources.clone(),
-        unresolved_resources: sorted_resources,
+        plan: plan.to_snapshot(),
+        sorted_resources: sorted_resources
+            .iter()
+            .cloned()
+            .map(|resource| resolved(resource).into_inner())
+            .map(|value| value.to_snapshot())
+            .collect(),
+        sorted_value_destroy_dependencies: sorted_resources
+            .iter()
+            .cloned()
+            .map(|resource| {
+                resolved(resource)
+                    .persisted_value_destroy_dependencies()
+                    .clone()
+            })
+            .collect(),
+        sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
+        legacy_dependency_classification: None,
+        unresolved_resources: sorted_resources
+            .into_iter()
+            .map(Resource::into_value_snapshot)
+            .map(|value| value.to_snapshot())
+            .collect(),
         compositions: vec![],
         data_sources: vec![],
         data_source_origins: vec![],

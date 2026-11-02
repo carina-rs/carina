@@ -20,7 +20,7 @@
 #[cfg(test)]
 use std::path::Path;
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendDriftStatus, BackendSelection, MigrationBackends,
@@ -161,6 +161,7 @@ async fn perform_state_migration(
 /// then rewrites the lock. A no-op (returns [`MigrationOutcome::NotNeeded`])
 /// when they already match.
 pub async fn run_init_migrate_state(
+    color_mode: crate::output_style::ColorMode,
     project_dir: &carina_core::paths::ResolvedPath,
     backend_config: Option<&carina_core::parser::BackendConfig>,
     force: bool,
@@ -180,8 +181,8 @@ pub async fn run_init_migrate_state(
     println!(
         "{}",
         "Backend configuration changed; migrating state:"
-            .cyan()
-            .bold()
+            .cyan(color_mode)
+            .bold(color_mode)
     );
     println!("{}", drift.existing().describe_diff(drift.configured()));
 
@@ -195,7 +196,7 @@ pub async fn run_init_migrate_state(
     let state = perform_state_migration(&backends, force, project_dir).await?;
     println!(
         "  {} copied {} resource(s) to the configured backend",
-        "✓".green(),
+        "✓".green(color_mode),
         state.resources().len()
     );
 
@@ -217,7 +218,7 @@ pub async fn run_init_migrate_state(
         .configured()
         .save(project_dir)
         .map_err(AppError::Backend)?;
-    println!("  {} updated backend lock", "✓".green());
+    println!("  {} updated backend lock", "✓".green(color_mode));
 
     // A local source is deleted after the commit (matches the retired
     // `state migrate`); a remote source is kept as a recoverable backup
@@ -232,14 +233,17 @@ pub async fn run_init_migrate_state(
         } else {
             match path.remove() {
                 Ok(()) => {
-                    println!("  {} deleted source local state file", "✓".green());
+                    println!(
+                        "  {} deleted source local state file",
+                        "✓".green(color_mode)
+                    );
                     SourceDisposition::Deleted
                 }
                 Err(e) => {
                     eprintln!(
                         "  {} migration committed, but the old state file {} \
                          could not be removed ({e}); delete it manually.",
-                        "warning:".yellow(),
+                        "warning:".yellow(color_mode),
                         path.display()
                     );
                     SourceDisposition::DeleteFailed
@@ -480,12 +484,14 @@ mod tests {
 
     #[tokio::test]
     async fn not_needed_when_lock_matches_configured_local() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let tmp = tempfile::tempdir().unwrap();
         // Lock = local_default; configured = None (also local default).
         BackendLock::local_default()
             .save(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
             .unwrap();
         let outcome = run_init_migrate_state(
+            color_mode,
             &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
             None,
             false,
@@ -497,6 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_to_local_migration_deletes_source() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
         // Locked = local default (carina.state.json under base_dir).
@@ -528,6 +535,7 @@ mod tests {
         };
 
         let outcome = run_init_migrate_state(
+            color_mode,
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             Some(&cfg),
             false,
@@ -555,6 +563,7 @@ mod tests {
 
         // Lock now reflects the configured backend ⇒ a second run is a no-op.
         let second = run_init_migrate_state(
+            color_mode,
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             Some(&cfg),
             false,
@@ -573,6 +582,7 @@ mod tests {
     /// before rewriting the lock.)
     #[tokio::test]
     async fn lock_is_committed_before_source_removal() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
         BackendLock::local_default()
@@ -599,6 +609,7 @@ mod tests {
         };
 
         run_init_migrate_state(
+            color_mode,
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             Some(&cfg),
             false,
@@ -620,6 +631,7 @@ mod tests {
         // committed lock and is a clean no-op.
         assert!(!base.join(LocalBackend::DEFAULT_STATE_FILE).exists());
         let again = run_init_migrate_state(
+            color_mode,
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             Some(&cfg),
             false,
