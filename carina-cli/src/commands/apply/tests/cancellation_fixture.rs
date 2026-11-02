@@ -51,7 +51,7 @@ impl ApplyCancellationFixture {
     pub(super) fn new() -> Self {
         Self {
             base: CancellationFixtureBase::new(),
-            provider_context: ProviderContext::default(),
+            provider_context: ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             cancel_after_successes: None,
             success_count: Arc::new(AtomicUsize::new(0)),
             provider_ready_path: None,

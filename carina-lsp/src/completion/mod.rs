@@ -125,7 +125,9 @@ impl CompletionProvider {
         // schema for postfix access. Detect the depth-2 shape before the
         // generic value-position dispatcher, which otherwise sees only the
         // module-call binding and falls back to in-scope names.
-        if let Some(completions) = self.module_handle_dot_completions(&text, position, base_path) {
+        if let Some(completions) =
+            self.module_handle_dot_completions(&text, position, base_path, provider_ctx)
+        {
             return completions;
         }
 
@@ -175,14 +177,16 @@ impl CompletionProvider {
         let context = self.get_completion_context(&text, position);
 
         match context {
-            CompletionContext::TopLevel => self.top_level_completions(position, &text, base_path),
+            CompletionContext::TopLevel => {
+                self.top_level_completions(position, &text, base_path, provider_ctx.catalog())
+            }
             CompletionContext::InsideResourceBlock { resource_type } => {
                 self.attribute_completions_for_type(&resource_type)
             }
             CompletionContext::InsideUpstreamStateBlock => self.upstream_state_block_completions(),
             CompletionContext::InsideUseBlock => self.use_block_completions(),
             CompletionContext::InsideModuleCall { module_name } => {
-                self.module_parameter_completions(&module_name, &text, base_path)
+                self.module_parameter_completions(&module_name, &text, base_path, provider_ctx)
             }
             CompletionContext::AfterEquals {
                 target,

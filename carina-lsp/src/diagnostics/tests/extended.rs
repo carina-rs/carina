@@ -1708,7 +1708,7 @@ fn render_value_type_error(
     value: &Value,
 ) -> Option<String> {
     carina_core::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             let result = match engine.provider_context.loaded() {
                 Some(provider_context) => {
@@ -2478,7 +2478,7 @@ let orphan = mock.test.resource {
         let lsp_unused = unused_binding_names(&diagnostics);
         let loaded = carina_core::config_loader::load_configuration_with_config(
             fixture.path(),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &schemas,
         )
         .unwrap();
@@ -2553,7 +2553,7 @@ let orphan = mock.test.resource {
     let directory_parse =
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             fixture.path(),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &std::collections::HashMap::new(),
         );
     assert!(
@@ -2869,7 +2869,7 @@ mock.test.resource {
 
 #[test]
 fn missing_provider_schema_suppresses_attribute_derived_identity_conflict() {
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let source = r#"awscc.iam.role {
   role_name = "one"
 }
@@ -3010,14 +3010,14 @@ mock.test.Thing {
     let parsed = carina_core::parser::parse_file(
         source,
         std::path::Path::new("module.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("module source parses");
     let core_error = carina_core::validation::validate_resources(
         &parsed,
         &schemas,
         &std::collections::HashSet::from(["mock".to_string()]),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect_err("core validation rejects Count");
     assert!(
@@ -4059,21 +4059,20 @@ fn resource_scalar_mismatches_never_display_environment_plaintext() {
     let engine = custom_engine(schemas);
     let variable = "CARINA_LSP_ATTRIBUTE_SECRET";
     let plaintext = "hunter2SECRET";
-    unsafe {
-        std::env::set_var(variable, plaintext);
-    }
-    let doc = create_document(&format!(
-        r#"mock.test.resource {{
+    let environment =
+        carina_core::EnvironmentSnapshot::new([(variable.to_string(), plaintext.into())]);
+    let doc = create_document_with_environment(
+        &format!(
+            r#"mock.test.resource {{
   enabled = env('{variable}')
   count   = env('{variable}')
   ratio   = env('{variable}')
 }}"#
-    ));
+        ),
+        environment,
+    );
 
     let diagnostics = engine.analyze(&doc, None);
-    unsafe {
-        std::env::remove_var(variable);
-    }
     let mismatches = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("Type mismatch: expected"))
@@ -5925,7 +5924,7 @@ fn warning_when_provider_loaded_but_schema_missing() {
 
 #[test]
 fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let doc = create_document(
         r#"awscc.iam.role {
   role_name = 'test'
@@ -5966,7 +5965,7 @@ fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
 
 #[test]
 fn export_inference_without_loaded_providers_does_not_report_provider_checked_failure() {
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let doc = create_document("exports {\n  value = missing.attribute\n}\n");
 
     let diagnostics = engine.analyze(&doc, None);
@@ -6015,7 +6014,7 @@ fn no_undefined_resource_for_declared_but_uninstalled_provider() {
     // awscc = aws...'` — which is both wrong (awscc is a namespace, not a let
     // binding) and actively misleading (following the fix breaks valid DSL).
     // Nothing installed — simulates missing .carina/.
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -6041,7 +6040,7 @@ fn undefined_resource_still_fires_when_identifier_is_not_a_declared_provider() {
     // binding diagnostics. When the root identifier is not a declared provider
     // and not a defined binding, the existing "Undefined resource" message
     // should still fire.
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
   region = totally_unknown.some_attr
@@ -6790,7 +6789,7 @@ fn exports_type_warning_for_literal_mismatch() {
 
 #[test]
 fn unloaded_bare_attribute_interpolation_reports_only_providers_not_loaded() {
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let doc = create_document(
         r#"
 arguments { x: String }
@@ -6824,7 +6823,7 @@ attributes {
 
 #[test]
 fn orphan_exports_check_builtins_without_calling_unloaded_custom_types() {
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let doc = create_document(
         r#"exports {
   flag: Bool = 'hello'
@@ -6861,7 +6860,7 @@ attributes {
 
 #[test]
 fn orphan_export_dotted_annotation_defers_ambiguous_scalar_kind() {
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let doc = create_document(
         r#"exports {
   x: aws.AccountId = 42
@@ -6887,7 +6886,7 @@ fn orphan_export_dotted_annotation_defers_ambiguous_scalar_kind() {
 
 #[test]
 fn orphan_attribute_nested_dotted_unresolved_shape_mismatch_warns_without_loaded_providers() {
-    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let engine = test_engine();
     let doc = create_document(
         r#"attributes {
   x: map(aws.AccountId) = ['a']
@@ -7517,12 +7516,12 @@ fn consumer_attribute_resolution_marks_unnameable_type_unchecked() {
     let parsed = carina_core::parser::parse_file(
         "attributes {\n  out: missing.types.Identifier = 'value'\n}\n",
         std::path::Path::new("module.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("open-module fixture must parse");
     let parameters = carina_core::validation::resolve_attribute_static_types_for_consumer(
         &parsed.attribute_params,
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
 
     assert!(matches!(
@@ -7678,7 +7677,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         let engine = module_boundary_identity_engine();
         let nominal = carina_core::parser::parse_type_expr_str(
             &format!("aws.{path}.Id"),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
         let resolved =
@@ -7694,7 +7693,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
     fn consumer_type(type_expr: TypeExpr) -> carina_core::static_type::ConsumerStaticType {
         carina_core::validation::resolve_consumer_static_type_for_signature(
             &type_expr,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
     }
 
@@ -7706,7 +7705,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         let parsed = carina_core::parser::parse_file(
             "let missing = use { source = '../missing' }\nmissing {}\n",
             &source_file,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("parse synthetic composition call");
         let call = CompositionCall {
@@ -7770,13 +7769,14 @@ let first = unrelated { }
     let bindings = BindingIndex::from_parsed(
         &binding_input,
         &engine.schemas,
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let findings = carina_core::validation::check_expanded_module_calls(
         carina_core::validation::ExpandedModuleCallCheckInput::References {
             compositions: &binding_input.compositions,
             bindings: &bindings,
         },
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let diagnostics = render_module_call_findings(&doc, doc.source_file(), &findings);
 
@@ -9830,11 +9830,27 @@ fn analyze_with_buffer(
     filename: &str,
     buffer: &str,
 ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    analyze_with_buffer_and_environment(
+        engine,
+        base,
+        filename,
+        buffer,
+        carina_core::EnvironmentSnapshot::empty(),
+    )
+}
+
+fn analyze_with_buffer_and_environment(
+    engine: &DiagnosticEngine,
+    base: &std::path::Path,
+    filename: &str,
+    buffer: &str,
+    environment: carina_core::EnvironmentSnapshot,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     let path = base.join(filename);
     let doc = crate::document::Document::new_with_path(
         buffer.to_string(),
         path.clone(),
-        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::new(environment)),
     );
     engine.analyze(&doc, Some(&path))
 }
@@ -13782,13 +13798,18 @@ fn environment_plaintext_is_redacted_across_lsp_directory_typecheck_paths() {
         ),
     ];
 
-    unsafe {
-        std::env::set_var("LEAKX", "hunter2SECRET");
-    }
+    let environment =
+        carina_core::EnvironmentSnapshot::new([("LEAKX".to_string(), "hunter2SECRET".into())]);
     for (label, filename, files) in cases {
         let temp = write_tag_key_fixture(files);
         let buffer = std::fs::read_to_string(temp.path().join(filename)).unwrap();
-        let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), filename, &buffer);
+        let diagnostics = analyze_with_buffer_and_environment(
+            &test_engine(),
+            temp.path(),
+            filename,
+            &buffer,
+            environment.clone(),
+        );
 
         assert!(
             diagnostics
@@ -13802,9 +13823,6 @@ fn environment_plaintext_is_redacted_across_lsp_directory_typecheck_paths() {
                 .all(|diagnostic| !diagnostic.message.contains("hunter2SECRET")),
             "{label} leaked env plaintext: diagnostics={diagnostics:#?}"
         );
-    }
-    unsafe {
-        std::env::remove_var("LEAKX");
     }
 }
 
@@ -14240,7 +14258,7 @@ for x in ['a', 'b', 'c'] {
     let parsed = carina_core::parser::parse_file(
         main,
         std::path::Path::new("main.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     assert_eq!(parsed.module_calls.len(), 3);
@@ -15097,7 +15115,9 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
     let call_doc = crate::document::Document::new_with_path(
         call_source.to_string(),
         call_path,
-        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     let merged = engine
         .with_run_for_test(|run| {
@@ -15132,7 +15152,9 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
     let module_doc = crate::document::Document::new_with_path(
         module_source.to_string(),
         module_path.clone(),
-        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     let diagnostics = engine.with_run_for_test(|run| {
         run.module_resolver_error_diagnostics(
@@ -16032,7 +16054,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
     let mut merged_result =
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             temp.path(),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &std::collections::HashMap::new(),
         )
         .expect("directory fixture must parse");
@@ -16361,7 +16383,7 @@ fn providerless_orphan_reports_deferred_function_and_attribute_type_checks() {
     let doc = create_document_at(source, path.clone());
 
     let terminal = carina_core::validation::deferred_types::TypeCheckSession::run(
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |context| {
             let mut parsed = doc.parsed().unwrap().clone();
             assert!(
@@ -16787,9 +16809,11 @@ fn settlement_loaded_error_from_another_file_stays_out_of_the_current_document()
     let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
 
     let terminal = TypeCheckSession::run(&catalog, |session| {
-        let expected =
-            carina_core::parser::parse_type_expr_str("Missing", &ProviderContext::default())
-                .unwrap();
+        let expected = carina_core::parser::parse_type_expr_str(
+            "Missing",
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         session.record(
             &expected,
             ProviderTypeCheckSite::at_line(Path::new("/project/other.crn"), 9, 3, "foreign check"),

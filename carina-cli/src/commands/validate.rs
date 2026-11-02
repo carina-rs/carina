@@ -87,7 +87,8 @@ pub fn validate_diagnostics_with_factories(
     factories: Vec<crate::wiring::LoadedProviderFactory>,
     load_errors: std::collections::HashMap<String, String>,
 ) -> ValidateDiagnostics {
-    let provider_context = ProviderContext::default();
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let provider_context = ProviderContext::new(runtime.environment().clone());
     let loaded = match load_configuration_with_config(
         path,
         &provider_context,
@@ -104,7 +105,7 @@ pub fn validate_diagnostics_with_factories(
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
     let providers = ProviderLoad::for_test_with_load_errors(
-        &crate::test_support::TestCommandRuntime::new(),
+        &runtime,
         factories,
         &parsed.providers,
         load_errors,
@@ -130,7 +131,8 @@ pub fn validated_resource_ids_with_factories(
     path: &Path,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
-    let provider_context = ProviderContext::default();
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let provider_context = ProviderContext::new(runtime.environment().clone());
     let loaded = match load_configuration_with_config(
         path,
         &provider_context,
@@ -141,11 +143,8 @@ pub fn validated_resource_ids_with_factories(
     };
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::for_test_with_provider_phase(
-        &crate::test_support::TestCommandRuntime::new(),
-        factories,
-        &parsed.providers,
-    );
+    let providers =
+        ProviderLoad::for_test_with_provider_phase(&runtime, factories, &parsed.providers);
 
     // This adapter exercises only the resource-enumeration half of validate.
     // Keep the identical module/name-resolution seam, but do not reject a
@@ -299,7 +298,11 @@ pub fn run_validate(
         Ok(loaded) => loaded,
         Err(error) => {
             return crate::wiring::settle_type_checks(
-                crate::wiring::failed_configuration_report(path, error.into()),
+                crate::wiring::failed_configuration_report(
+                    path,
+                    error.into(),
+                    runtime.environment().clone(),
+                ),
                 AppError::Validation,
             );
         }
@@ -483,7 +486,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("main.crn");
         std::fs::write(&path, "provider broken { source = 'file:///definitely-missing/broken.wasm' }\nfn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes {\n  x: AwsAccountId = '123'\n}\n").unwrap();
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let loaded = load_configuration_with_config(
             fixture.path(),
             &config,
@@ -539,7 +542,7 @@ mod tests {
         std::fs::write(fixture.path().join("main.crn"), "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes { x: AwsAccountId = '123' }\n").unwrap();
         let loaded = load_configuration_with_config(
             fixture.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .unwrap();
@@ -659,9 +662,14 @@ backend s3 {
         )
         .unwrap();
 
-        let error = run_validate(&runtime, fixture.path(), false, &ProviderContext::default())
-            .expect_err("loader and backend validation errors must both fail validation")
-            .to_string();
+        let error = run_validate(
+            &runtime,
+            fixture.path(),
+            false,
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("loader and backend validation errors must both fail validation")
+        .to_string();
 
         assert!(
             error.contains("declared more than once with a source"),
@@ -695,7 +703,7 @@ backend s3 {
         let fixture = unknown_provider_instance_fixture();
         let loaded = load_configuration_with_config(
             fixture.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load provider-routing fixture");
@@ -743,7 +751,7 @@ backend s3 {
 
         let loaded = load_configuration_with_config(
             fixture.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load merged undefined iterable fixture");
@@ -996,7 +1004,7 @@ let observed_names = roles.names
         let parsed = carina_core::parser::parse_file(
             src,
             std::path::Path::new("validate_fixture.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("fixture parses");
         let parsed = carina_core::validation::deferred_types::with_session_for_test(

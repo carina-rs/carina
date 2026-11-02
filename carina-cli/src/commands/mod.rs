@@ -486,6 +486,7 @@ fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>
         P,
         carina_core::resource::AbsoluteBindingAddress,
     >],
+    provider_context: &carina_core::parser::ProviderContext,
 ) {
     extend_module_call_errors(
         errors,
@@ -494,6 +495,7 @@ fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>
                 binding_use_report: report,
                 compositions,
             },
+            provider_context,
         ),
     );
 }
@@ -514,7 +516,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
-    let module_walk = ModuleWalk::load(parsed.parsed(), base_dir);
+    let module_walk = ModuleWalk::load(
+        parsed.parsed(),
+        base_dir,
+        &enriched_context.catalog().environment,
+    );
 
     let mut errors: Vec<AppError> = Vec::new();
     if !skip_resource_validation {
@@ -536,8 +542,10 @@ pub(crate) fn validate_and_resolve_errors_inner(
     }
 
     if !skip_resource_validation {
-        let schema_checked_exports =
-            parsed.retry_unchecked_export_inference(ctx.loaded_provider_schemas());
+        let schema_checked_exports = parsed.retry_unchecked_export_inference(
+            ctx.loaded_provider_schemas(),
+            enriched_context.catalog(),
+        );
         errors.extend(
             carina_core::validation::inference::attached_inference_failures(schema_checked_exports)
                 .map(|failure| {
@@ -774,7 +782,12 @@ pub(crate) fn validate_and_resolve_errors_inner(
         &enriched_context.type_context(&parsed, ctx.schemas(), &imported_module_signatures),
     );
     extend_binding_use_errors(&mut errors, &binding_use_report);
-    extend_expanded_binding_use_errors(&mut errors, &binding_use_report, &parsed.compositions);
+    extend_expanded_binding_use_errors(
+        &mut errors,
+        &binding_use_report,
+        &parsed.compositions,
+        enriched_context.catalog(),
+    );
     if !binding_use_report.is_ready() {
         return Err(non_empty_validation_failure(errors));
     }
@@ -815,7 +828,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
     };
-    for error in parsed.directive_resolution_errors(placeholder_boundary, ctx.schemas()) {
+    for error in parsed.directive_resolution_errors(
+        placeholder_boundary,
+        ctx.schemas(),
+        enriched_context.catalog(),
+    ) {
         errors.push(AppError::from(carina_core::resource::ExpansionError::from(
             error,
         )));
@@ -884,6 +901,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
                     compositions: &parsed.compositions,
                     bindings: &bindings,
                 },
+                enriched_context.catalog(),
             ),
         );
         if let Err(message) = carina_core::validation::validate_resource_ref_types(
@@ -1234,7 +1252,7 @@ mod tests {
                 region = true
             }"#,
             std::path::Path::new("backend.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
         let mut parsed = empty_parsed_file();
@@ -1367,7 +1385,7 @@ exports {
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
             &base,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
@@ -1414,7 +1432,7 @@ exports {
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
             base.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
@@ -1467,7 +1485,7 @@ attributes { loaded: Bool = true }
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
             fixture.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load fixture");
@@ -1513,7 +1531,7 @@ let child = use { source = "./child" }
 child { values = [source] }
 "#,
             std::path::Path::new("recovery-binding.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
         let signatures = HashMap::from([(
@@ -1524,7 +1542,7 @@ child { values = [source] }
                     static_type:
                         carina_core::validation::resolve_consumer_static_type_for_signature(
                             &TypeExpr::List(Box::new(TypeExpr::String)),
-                            &ProviderContext::default(),
+                            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
                         ),
                     default: None,
                     description: None,
@@ -1540,7 +1558,7 @@ child { values = [source] }
             &carina_core::validation::ValidationTypeContext::new_providerless(
                 &parsed,
                 &schemas,
-                &ProviderContext::default(),
+                &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
                 &signatures,
             ),
         );
@@ -1553,6 +1571,7 @@ child { values = [source] }
             &[] as &[carina_core::resource::LiveComposition<
                 carina_core::resource::ParserPlaceholder,
             >],
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         );
         assert!(
             errors.iter().any(|error| {
@@ -1581,7 +1600,7 @@ child { values = [source] }
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
             base.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");

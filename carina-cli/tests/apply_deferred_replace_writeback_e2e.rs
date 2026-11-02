@@ -73,7 +73,7 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
         binding: None,
     }];
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,

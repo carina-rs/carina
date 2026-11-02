@@ -98,7 +98,9 @@ pub fn analyze(engine: &DiagnosticEngine, fixture: &TempDir, file_name: &str) ->
     let doc = Document::new_with_path(
         text,
         path,
-        Arc::new(carina_core::parser::ProviderContext::default()),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     engine.analyze(&doc, Some(&fixture.path().join(file_name)))
 }
@@ -116,11 +118,12 @@ pub fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .collect();
     let factories = factories_for(&schemas);
     if provider_names.is_empty() {
-        DiagnosticEngine::without_loaded_provider_schemas()
+        DiagnosticEngine::without_loaded_provider_schemas(carina_core::EnvironmentSnapshot::empty())
     } else {
         let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(factories),
             SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
         DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
     }

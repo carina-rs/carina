@@ -2164,9 +2164,11 @@ impl DiagnosticRun<'_> {
                 ));
             }
         }
-        for type_error in
-            carina_core::validation::validate_deferred_for_iterable_types(merged, &self.schemas)
-        {
+        for type_error in carina_core::validation::validate_deferred_for_iterable_types(
+            merged,
+            &self.schemas,
+            self.provider_context.catalog(),
+        ) {
             if !source_file_is_current(type_error.file.as_deref(), current_file_name) {
                 continue;
             }
@@ -2738,6 +2740,7 @@ impl DiagnosticRun<'_> {
                 infer_export_params_with_loaded_provider_schemas(
                     inference_input,
                     loaded_providers.schemas(),
+                    self.provider_context.catalog(),
                 );
             // Surface inference failures as "type annotation required"
             // diagnostics, anchored at the export name. Errors for
@@ -2822,7 +2825,11 @@ impl DiagnosticRun<'_> {
     where
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
+        carina_core::validation::inference::infer_export_params(
+            parsed,
+            &self.schemas,
+            self.provider_context.catalog(),
+        )
     }
 
     /// Find the position of an exports parameter name in the document.

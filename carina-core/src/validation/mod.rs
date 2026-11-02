@@ -1559,7 +1559,7 @@ pub fn resolve_bare_binding_uses<
             ValidationTypeContext::new(&file, schemas, provider_context, module_signatures);
         check_expanded_bare_binding_uses(&file, &context)
     };
-    finish_binding_resolution(file, report, schemas)
+    finish_binding_resolution(file, report, schemas, provider_context)
 }
 
 /// Consume a bootstrap/recovery file using the same incomplete catalog that
@@ -1578,20 +1578,21 @@ pub fn resolve_bare_binding_uses_in_session<
             ValidationTypeContext::in_session(&file, schemas, provider_context, module_signatures);
         check_expanded_bare_binding_uses(&file, &context)
     };
-    finish_binding_resolution(file, report, schemas)
+    finish_binding_resolution(file, report, schemas, provider_context.catalog())
 }
 
 fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>(
     file: crate::parser::ModuleResolvedFile<E>,
     report: BindingUseReport,
     schemas: &SchemaRegistry,
+    provider_context: &ProviderContext,
 ) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
     if !report.is_ready() {
         return Err(report.into());
     }
 
     Ok(ResolvedFile {
-        inner: file.into_expanded(schemas)?,
+        inner: file.into_expanded(schemas, provider_context)?,
     })
 }
 
@@ -4398,9 +4399,14 @@ fn validate_resource_ref_types_inner<
     }
 
     all_errors.extend(
-        validate_deferred_for_iterable_types_with_bindings(parsed, registry, &inference_bindings)
-            .into_iter()
-            .map(|diagnostic| diagnostic.to_string()),
+        validate_deferred_for_iterable_types_with_bindings(
+            parsed,
+            registry,
+            &inference_bindings,
+            bindings.provider_context(),
+        )
+        .into_iter()
+        .map(|diagnostic| diagnostic.to_string()),
     );
 
     if all_errors.is_empty() {
@@ -4429,17 +4435,23 @@ fn deferred_iterable_shape(
     bindings: &inference::InferenceBindings<ParserPlaceholder>,
     schemas: &SchemaRegistry,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
-    deferred_iterable_shape_for_phase(value, bindings, schemas)
+    deferred_iterable_shape_for_phase(
+        value,
+        bindings,
+        schemas,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
 }
 
 fn deferred_iterable_shape_for_phase<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
+    provider_context: &ProviderContext,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
     match value {
         GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(_)) => {
-            infer_type_from_value_to_iterable_shape(value, bindings, schemas)
+            infer_type_from_value_to_iterable_shape(value, bindings, schemas, provider_context)
         }
         GenericValue::Concrete(crate::resource::ConcreteValue::List(_items)) => {
             Ok(DeferredIterableShape::List)
@@ -4471,7 +4483,7 @@ fn deferred_iterable_shape_for_phase<B: BindingAddress>(
             | crate::resource::DeferredValue::Coalesce { .. }
             | crate::resource::DeferredValue::Unknown(_)
             | crate::resource::DeferredValue::Placeholder(_),
-        ) => infer_type_from_value_to_iterable_shape(value, bindings, schemas),
+        ) => infer_type_from_value_to_iterable_shape(value, bindings, schemas, provider_context),
     }
 }
 
@@ -4479,23 +4491,26 @@ fn infer_type_from_value_to_iterable_shape<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
+    provider_context: &ProviderContext,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
-    inference::infer_type_from_value(value, bindings, schemas).map(|inferred| match inferred {
-        TypeExpr::List(_element) => DeferredIterableShape::List,
-        TypeExpr::Map(_element) => DeferredIterableShape::Map,
-        non_iterable @ (TypeExpr::String
-        | TypeExpr::Bool
-        | TypeExpr::Int
-        | TypeExpr::Float
-        | TypeExpr::Duration
-        | TypeExpr::Simple(_)
-        | TypeExpr::UnloadedSchemaType(_)
-        | TypeExpr::Ref(_)
-        | TypeExpr::DottedUnresolved(_)
-        | TypeExpr::SchemaType { .. }
-        | TypeExpr::Struct { .. }
-        | TypeExpr::StringLiteral(_)
-        | TypeExpr::Union(_)) => DeferredIterableShape::NonIterable(non_iterable),
+    inference::infer_type_from_value(value, bindings, schemas, provider_context).map(|inferred| {
+        match inferred {
+            TypeExpr::List(_element) => DeferredIterableShape::List,
+            TypeExpr::Map(_element) => DeferredIterableShape::Map,
+            non_iterable @ (TypeExpr::String
+            | TypeExpr::Bool
+            | TypeExpr::Int
+            | TypeExpr::Float
+            | TypeExpr::Duration
+            | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
+            | TypeExpr::Ref(_)
+            | TypeExpr::DottedUnresolved(_)
+            | TypeExpr::SchemaType { .. }
+            | TypeExpr::Struct { .. }
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::Union(_)) => DeferredIterableShape::NonIterable(non_iterable),
+        }
     })
 }
 
@@ -4530,9 +4545,10 @@ impl std::fmt::Display for DeferredForIterableTypeDiagnostic {
 pub fn validate_deferred_for_iterable_types<E>(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
+    provider_context: &ProviderContext,
 ) -> Vec<DeferredForIterableTypeDiagnostic> {
     let bindings = inference::bindings_from_parsed(parsed);
-    validate_deferred_for_iterable_types_with_bindings(parsed, schemas, &bindings)
+    validate_deferred_for_iterable_types_with_bindings(parsed, schemas, &bindings, provider_context)
 }
 
 fn validate_deferred_for_iterable_types_with_bindings<
@@ -4543,6 +4559,7 @@ fn validate_deferred_for_iterable_types_with_bindings<
     parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &SchemaRegistry,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
+    provider_context: &ProviderContext,
 ) -> Vec<DeferredForIterableTypeDiagnostic> {
     let mut diagnostics = Vec::new();
     for deferred in parsed.deferred_for_sites() {
@@ -4556,6 +4573,7 @@ fn validate_deferred_for_iterable_types_with_bindings<
                 expected,
                 bindings,
                 schemas,
+                provider_context,
                 file: deferred.file,
                 line: deferred.line,
                 expression: deferred.iterable,
@@ -4579,6 +4597,7 @@ struct DeferredIterableValidationContext<'a, B: BindingAddress> {
     expected: DeferredIterableKind,
     bindings: &'a inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &'a SchemaRegistry,
+    provider_context: &'a ProviderContext,
     file: Option<&'a str>,
     line: usize,
     expression: &'a GenericValue<ParserPlaceholder, B>,
@@ -4610,8 +4629,12 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         _ => {}
     }
 
-    let inferred = match deferred_iterable_shape_for_phase(value, context.bindings, context.schemas)
-    {
+    let inferred = match deferred_iterable_shape_for_phase(
+        value,
+        context.bindings,
+        context.schemas,
+        context.provider_context,
+    ) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
             inference::InferenceError::IncompatibleCoalesceTypes { left, default },
@@ -7471,11 +7494,16 @@ impl ModuleCallChecker<'_> {
             }
             if let ResolvedParameterType::Handle(expected) = &resolved_parameter {
                 let infer_actual = || {
-                    inference::infer_type_from_value(value, &inference_bindings, self.schemas)
-                        .map_or_else(
-                            |_error| typecheck::value_kind_name(value).to_string(),
-                            |actual| actual.to_string(),
-                        )
+                    inference::infer_type_from_value(
+                        value,
+                        &inference_bindings,
+                        self.schemas,
+                        self.provider_context.as_provider_context(),
+                    )
+                    .map_or_else(
+                        |_error| typecheck::value_kind_name(value).to_string(),
+                        |actual| actual.to_string(),
+                    )
                 };
                 let reference_check = match value {
                     crate::resource::Value::Deferred(
@@ -7686,8 +7714,17 @@ impl ModuleCallChecker<'_> {
             &module_dir,
             self.provider_context.as_provider_context(),
         )
-        .or_else(|| crate::module_resolver::load_module(&module_dir))
-        {
+        .or_else(|| {
+            crate::module_resolver::load_module(
+                &module_dir,
+                &ProviderContext::new(
+                    self.provider_context
+                        .as_provider_context()
+                        .environment
+                        .clone(),
+                ),
+            )
+        }) {
             let resolution_errors = resolve_file_type_exprs(
                 &mut module,
                 self.provider_context
@@ -8228,11 +8265,11 @@ fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
 /// Collect only findings whose authoritative inputs exist after expansion.
 pub fn check_expanded_module_calls<P: PlaceholderKind>(
     input: ExpandedModuleCallCheckInput<'_, '_, P>,
+    provider_context: &ProviderContext,
 ) -> Vec<ModuleCallFinding> {
-    let provider_context = ProviderContext::default();
     let schemas = SchemaRegistry::new();
     let mut checker = ModuleCallChecker {
-        provider_context: typecheck::TypecheckProviderContext::providerless(&provider_context),
+        provider_context: typecheck::TypecheckProviderContext::providerless(provider_context),
         schemas: &schemas,
         findings: Vec::new(),
         active_modules: HashSet::new(),

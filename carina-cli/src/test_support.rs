@@ -3,7 +3,7 @@ use crate::cursor::CursorState;
 use crate::output_style::ColorMode;
 use crate::runtime::{BuiltinMockInputs, CommandInputs, CommandRuntime, InvocationHooks};
 use crate::wiring::TrustedLocalGrantInputs;
-use carina_core::TestUserDirs;
+use carina_core::{EnvironmentSnapshot, TestUserDirs};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use std::sync::{Arc, OnceLock};
 
@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 /// Reconfiguration starts a new invocation; existing runtime clones stay valid.
 /// Installed hooks belong to the fixture and survive invocation rebuilds.
 pub struct TestCommandRuntime {
+    environment: EnvironmentSnapshot,
     dirs: Arc<TestUserDirs>,
     behavior: MockBehavior,
     scope: MockScope,
@@ -34,6 +35,7 @@ impl TestCommandRuntime {
     }
     pub fn with_mock(behavior: MockBehavior, scope: MockScope) -> Self {
         Self {
+            environment: EnvironmentSnapshot::empty(),
             dirs: Arc::new(TestUserDirs::new()),
             behavior,
             scope,
@@ -47,11 +49,17 @@ impl TestCommandRuntime {
         self.runtime.take();
         self
     }
+    pub fn with_environment(mut self, environment: EnvironmentSnapshot) -> Self {
+        self.environment = environment;
+        self.runtime.take();
+        self
+    }
     fn build(&self) -> CommandRuntime {
         let configured = ConfiguredBuiltinMock::new(self.behavior.clone(), self.scope.clone());
         let mut runtime = CommandRuntime::new(
             (**self.dirs).clone(),
             CommandInputs {
+                environment: self.environment.clone(),
                 builtin_mock: BuiltinMockInputs::deferred(move || Ok(configured)),
                 trusted_local_grants: TrustedLocalGrantInputs::new(Vec::new(), None),
                 accepted_egress: Default::default(),

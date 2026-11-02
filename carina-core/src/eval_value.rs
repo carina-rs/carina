@@ -626,7 +626,7 @@ pub(crate) enum EvalValue<B: BindingAddress = RelativeBindingName> {
     DeferredForValue { binding: String, slot: LoopSlot },
 
     /// A partially applied function. Lives strictly inside the evaluator.
-    /// Constructed when `evaluate_builtin` or a user-function call sees
+    /// Constructed when `evaluate_builtin_with_config` or a user-function call sees
     /// fewer arguments than the function's arity; consumed by the next
     /// pipe or call that finishes the application.
     Closure {

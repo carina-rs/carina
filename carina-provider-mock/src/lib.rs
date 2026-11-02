@@ -1894,6 +1894,7 @@ mod tests {
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             std::sync::Arc::new(Vec::new()),
             schemas.clone(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),
@@ -2141,8 +2142,11 @@ mod tests {
             ("malformed_pending", "in_flight"),
         ] {
             let provider = ConfiguredBuiltinMock::new(
-                decode_controls(&[("CARINA_MOCK_CREATE_MODE".to_owned(), mode.into())].into())
-                    .behavior,
+                decode_controls(&carina_core::EnvironmentSnapshot::new([(
+                    "CARINA_MOCK_CREATE_MODE".to_owned(),
+                    mode.into(),
+                )]))
+                .behavior,
                 provider.scope.clone(),
             )
             .create_provider();
@@ -2256,8 +2260,11 @@ mod tests {
             ("resend", "resent"),
         ] {
             let provider = ConfiguredBuiltinMock::new(
-                decode_controls(&[("CARINA_MOCK_RESUME_MODE".to_owned(), mode.into())].into())
-                    .behavior,
+                decode_controls(&carina_core::EnvironmentSnapshot::new([(
+                    "CARINA_MOCK_RESUME_MODE".to_owned(),
+                    mode.into(),
+                )]))
+                .behavior,
                 provider.scope.clone(),
             )
             .create_provider();
@@ -2269,6 +2276,7 @@ mod tests {
                 let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
                     std::sync::Arc::new(Vec::new()),
                     schemas.clone(),
+                    carina_core::EnvironmentSnapshot::empty(),
                 );
                 carina_core::validation::deferred_types::with_session_for_test_async(
                     provider_types.provider_context(),
@@ -2359,10 +2367,13 @@ mod tests {
         carina_core::parser::parse_file(
             "provider mock {}\n",
             std::path::Path::new("mock_provider_config.crn"),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap()
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("mock provider fixture must not retain parser placeholders")
         .providers
         .into_iter()
@@ -2835,6 +2846,7 @@ mod tests {
             let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
                 std::sync::Arc::new(Vec::new()),
                 schemas.clone(),
+                carina_core::EnvironmentSnapshot::empty(),
             );
             carina_core::validation::deferred_types::with_session_for_test_async(
                 provider_types.provider_context(),

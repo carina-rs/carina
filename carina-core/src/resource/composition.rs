@@ -1961,7 +1961,7 @@ mod tests {
     fn resolved_type(type_expr: TypeExpr) -> ConsumerStaticType {
         crate::validation::resolve_consumer_static_type_for_signature(
             &type_expr,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
     }
 
@@ -2275,7 +2275,7 @@ mod tests {
         let parsed = crate::parser::parse_file(
             "let module = use { source = './module' }\nmodule {}\n",
             &source_file,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse external module call");
         let call = &parsed.module_calls[0];
@@ -2340,7 +2340,7 @@ mod tests {
         let parsed = crate::parser::parse_file(
             "let module = use { source = './module' }\nmodule {}\n",
             &missing,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse call with a missing source identity");
         let call = &parsed.module_calls[0];

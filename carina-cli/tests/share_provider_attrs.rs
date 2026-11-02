@@ -23,7 +23,11 @@ fn share_provider_attrs_resolves_default_tags() {
     .iter()
     .collect();
 
-    let config = load_configuration(&fixture).expect("load_configuration");
+    let config = load_configuration(
+        &fixture,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("load_configuration");
     let runtime = carina_cli::test_support::TestCommandRuntime::new();
 
     // Run the CLI's full validate-and-resolve pipeline so module

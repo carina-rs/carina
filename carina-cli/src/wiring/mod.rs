@@ -870,9 +870,10 @@ struct CliTypeCheckSink {
 pub(crate) fn failed_configuration_report<T>(
     path: &Path,
     error: AppError,
+    environment: carina_core::EnvironmentSnapshot,
 ) -> carina_core::validation::deferred_types::ProviderTypeCheckResult<Result<T, AppError>> {
     carina_core::validation::deferred_types::TypeCheckSession::run(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(environment),
         |session| {
             let mut errors = vec![error.to_string()];
             let files = if path.is_file() {
@@ -2565,6 +2566,7 @@ impl WiringContext {
         let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
             Arc::clone(&factories),
             schemas,
+            runtime.environment().clone(),
         ));
         Ok(Self {
             loaded_providers,
@@ -2667,9 +2669,10 @@ impl WiringContext {
         let unavailable = self.unavailable_provider_kinds(providers, load_errors);
         let loaded = self.provider_context();
         carina_core::parser::ProviderContext {
+            environment: self.runtime.environment().clone(),
+            decryptor: None,
             custom_types: loaded.custom_types.with_failed_providers(unavailable),
             resource_types: loaded.resource_types.clone(),
-            ..Default::default()
         }
     }
 
@@ -3534,7 +3537,10 @@ fn reconcile_anonymous_identifiers_with_ctx(
     Ok(identifier::reconcile_anonymous_identifiers(
         resources,
         data_sources,
-        ctx.schemas(),
+        identifier::IdentityEvaluationContext {
+            schemas: ctx.schemas(),
+            provider_context: ctx.provider_context().as_provider_context(),
+        },
         comparison_provider,
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
@@ -3553,7 +3559,10 @@ fn detect_legacy_loop_moves_with_ctx(
 ) -> Result<Vec<ResolvedMove>, AppError> {
     Ok(identifier::detect_legacy_loop_address_moves(
         resources,
-        ctx.schemas(),
+        identifier::IdentityEvaluationContext {
+            schemas: ctx.schemas(),
+            provider_context: ctx.provider_context().as_provider_context(),
+        },
         comparison_provider,
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
@@ -3579,7 +3588,10 @@ fn detect_anonymous_to_named_moves_with_ctx(
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
         candidates,
-        ctx.schemas(),
+        identifier::IdentityEvaluationContext {
+            schemas: ctx.schemas(),
+            provider_context: ctx.provider_context().as_provider_context(),
+        },
         comparison_provider,
         identifier::AnonymousToNamedStateLookup::new(
             &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
@@ -7557,7 +7569,8 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
 
                 let (residual_deferred_for, deferred_create_targets) = target
                     .expand_partitioned(&iterable_bindings, session, |deferred| {
-                        match iterable_bindings.resolve_value(&deferred.iterable) {
+                        match iterable_bindings.resolve_value(&deferred.iterable, session.catalog())
+                        {
                             Ok(carina_core::resolver::ValueResolution::Present(value))
                                 if is_value_fully_concrete_for_expansion(&value) =>
                             {
@@ -10358,7 +10371,7 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     errors_to_legacy_result(validate_resources_with_ctx(
         &ctx,
         &parsed,
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     ))
 }
 

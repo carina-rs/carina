@@ -257,11 +257,11 @@ fn anonymous_deferred_collision_fixture() -> (
                    mock.test.Child { identity_input = value }\n\
                  }\n",
                 std::path::Path::new("main.crn"),
-                &crate::parser::ProviderContext::default(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .expect("unbound deferred loop parses");
             let parsed = crate::validation::deferred_types::with_session_for_test(
-                &crate::parser::ProviderContext::default(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |session| {
                     crate::module_resolver::resolve_modules_providerless(
                         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -273,7 +273,10 @@ fn anonymous_deferred_collision_fixture() -> (
             )
             .map_err(|error| *error)
             .expect("deferred fixture crosses the module-resolution seam")
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .expect("deferred-loop fixture contains no parser placeholders");
             let raw_template = parsed.deferred_for_expressions()[0].clone();
             let graph = crate::resolved_graph::resolve_expanded_graph(parsed.into())
@@ -4588,7 +4591,9 @@ fn pending_module_composition(
                             value,
                             crate::validation::resolve_consumer_static_type_for_signature(
                                 &TypeExpr::String,
-                                &crate::parser::ProviderContext::default(),
+                                &crate::parser::ProviderContext::new(
+                                    crate::EnvironmentSnapshot::empty(),
+                                ),
                             ),
                             crate::parser::ArgumentOrigin::Defaulted,
                         ),
@@ -7636,13 +7641,16 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
             let r0 = roles[0]
             let consumer = mock.test.Thing { name = r0.identifier }
         "#,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("reference alias source parses");
-    crate::parser::resolve_resource_refs(&mut parsed)
-        .expect("pre-apply reference resolution succeeds");
+    crate::parser::resolve_resource_refs(
+        &mut parsed,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("pre-apply reference resolution succeeds");
     let parsed = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -7652,7 +7660,10 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
             .expect("reference alias fixture crosses the module-resolution seam")
         },
     )
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("reference alias fixture contains no parser placeholders");
 
     let role = parsed

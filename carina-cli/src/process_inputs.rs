@@ -1,6 +1,4 @@
 //! Executable-only adapter from process inputs to owned library inputs.
-use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,12 +12,13 @@ use carina_cli::plan_image::{
 };
 use carina_cli::runtime::{BuiltinMockInputs, CommandInputs, CommandRuntime, InvocationHooks};
 use carina_cli::wiring::TrustedLocalGrantInputs;
+use carina_core::EnvironmentSnapshot;
 use carina_provider_mock::{
     ConfiguredBuiltinMock, DecodedMockControls, MockScope, decode_controls,
 };
 
 pub(super) struct ProcessInputs {
-    values: BTreeMap<String, OsString>,
+    environment: EnvironmentSnapshot,
     cwd: Arc<dyn Fn() -> std::io::Result<PathBuf> + Send + Sync>,
     cli_grants: Vec<String>,
     stdout_is_terminal: bool,
@@ -28,12 +27,15 @@ pub(super) struct ProcessInputs {
 }
 
 impl ProcessInputs {
+    pub fn environment(&self) -> &EnvironmentSnapshot {
+        &self.environment
+    }
+
     pub fn capture(cli_grants: Vec<String>) -> Self {
-        let values = std::env::vars_os()
-            .filter_map(|(key, value)| key.into_string().ok().map(|key| (key, value)))
-            .collect();
-        Self::from_values(
-            values,
+        #[expect(clippy::disallowed_methods)]
+        let environment = EnvironmentSnapshot::capture_process();
+        Self::from_environment(
+            environment,
             std::env::current_dir,
             cli_grants,
             std::io::stdout().is_terminal(),
@@ -51,7 +53,7 @@ impl ProcessInputs {
             inline,
             theme,
             |name| {
-                self.values
+                self.environment
                     .get(name)
                     .and_then(|value| value.to_str())
                     .map(str::to_owned)
@@ -60,20 +62,20 @@ impl ProcessInputs {
         )
     }
 
-    fn from_values(
-        values: BTreeMap<String, OsString>,
+    fn from_environment(
+        environment: EnvironmentSnapshot,
         cwd: impl Fn() -> std::io::Result<PathBuf> + Send + Sync + 'static,
         cli_grants: Vec<String>,
         terminal: bool,
     ) -> Self {
         let color_mode = ColorMode::resolve(
             terminal,
-            values.get("NO_COLOR").map(OsString::as_os_str),
-            values.get("CLICOLOR").map(OsString::as_os_str),
-            values.get("CLICOLOR_FORCE").map(OsString::as_os_str),
+            environment.get("NO_COLOR"),
+            environment.get("CLICOLOR"),
+            environment.get("CLICOLOR_FORCE"),
         );
         Self {
-            values,
+            environment,
             cwd: Arc::new(cwd),
             cli_grants,
             stdout_is_terminal: terminal,
@@ -106,7 +108,7 @@ impl ProcessInputs {
         let DecodedMockControls {
             state_file,
             behavior,
-        } = decode_controls(&self.values);
+        } = decode_controls(&self.environment);
         let cwd = self.cwd.clone();
         let builtin_mock = BuiltinMockInputs::deferred(move || {
             let state_file = state_file.unwrap_or_else(|| PathBuf::from(".carina/state.json"));
@@ -128,9 +130,7 @@ impl ProcessInputs {
         let accepted_egress = if let Some((project, accepted)) = consent {
             carina_provider_resolver::AcceptedEgressSources::parse_os(
                 accepted,
-                self.values
-                    .get("CARINA_ACCEPT_EGRESS")
-                    .map(OsString::as_os_str),
+                self.environment.get("CARINA_ACCEPT_EGRESS"),
                 project,
             )
             .map_err(carina_cli::commands::init::InitError::AcceptedEgress)
@@ -141,21 +141,24 @@ impl ProcessInputs {
         Ok(CommandRuntime::new(
             user_dirs,
             CommandInputs {
+                environment: self.environment.clone(),
                 builtin_mock,
                 trusted_local_grants: TrustedLocalGrantInputs::new(
                     self.cli_grants.clone(),
-                    self.values.get("CARINA_TRUST_LOCAL_PROVIDER").cloned(),
+                    self.environment
+                        .get("CARINA_TRUST_LOCAL_PROVIDER")
+                        .map(std::ffi::OsStr::to_os_string),
                 ),
                 accepted_egress,
                 color_mode: self.color_mode,
                 cursor: self.cursor.clone(),
                 hooks: InvocationHooks {
                     plan_drift_handshake_dir: self
-                        .values
+                        .environment
                         .get("CARINA_TEST_PLAN_DRIFT_HANDSHAKE_DIR")
                         .map(PathBuf::from),
                     capture_live_apply_plan: self
-                        .values
+                        .environment
                         .get("CARINA_TEST_CAPTURE_LIVE_APPLY_PLAN")
                         .map(PathBuf::from),
                 },
@@ -167,6 +170,43 @@ impl ProcessInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+
+    impl ProcessInputs {
+        fn from_values(
+            values: BTreeMap<String, OsString>,
+            cwd: impl Fn() -> std::io::Result<PathBuf> + Send + Sync + 'static,
+            cli_grants: Vec<String>,
+            terminal: bool,
+        ) -> Self {
+            Self::from_environment(EnvironmentSnapshot::new(values), cwd, cli_grants, terminal)
+        }
+    }
+
+    #[test]
+    fn environment_snapshot_reaches_the_command_runtime() {
+        let inputs = ProcessInputs::from_values(
+            [("CARINA_ENV_SNAPSHOT".to_owned(), OsString::from("captured"))].into(),
+            || panic!("environment evaluation does not need startup cwd"),
+            Vec::new(),
+            false,
+        );
+        let dirs = carina_core::TestUserDirs::new();
+        let runtime = inputs.runtime((*dirs).clone()).unwrap();
+        let context = carina_core::parser::ProviderContext::new(runtime.environment().clone());
+        let mut parsed = carina_core::parser::parse_file(
+            "let value = env('CARINA_ENV_SNAPSHOT')",
+            Path::new("test.crn"),
+            &context,
+        )
+        .unwrap();
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
+        assert_eq!(
+            carina_core::value::format_value(&parsed.variables["value"]),
+            "'captured'",
+        );
+    }
 
     #[test]
     fn plan_image_options_use_supplied_environment_and_terminal_flag() {
@@ -234,7 +274,7 @@ mod tests {
             &runtime,
             project.path(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
         )
         .expect_err("relative mock storage must report the missing startup cwd");
         assert!(matches!(error, AppError::CommandInput(_)), "{error:?}");
@@ -265,7 +305,7 @@ mod tests {
             &runtime,
             project.path(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
         )
         .expect("absolute mock storage must work without startup cwd");
     }
@@ -299,7 +339,7 @@ mod tests {
                 &runtime,
                 project.path(),
                 false,
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
             )
             .expect_err("selecting either builtin mock route must reject invalid storage");
             assert!(matches!(error, AppError::CommandInput(_)), "{error:?}");

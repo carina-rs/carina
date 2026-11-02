@@ -999,11 +999,12 @@ impl<B: BindingAddress> Directives<B, ParserPlaceholder> {
         loop_template: bool,
         element_type: Option<&crate::parser::TypeExpr>,
         iterable: Option<&Value<ParserPlaceholder, B>>,
+        context: &crate::parser::ProviderContext,
     ) -> Vec<DirectiveResolutionError> {
         let result = if loop_template {
             self.clone()
                 .into_loop_template(resource, schema, element_type)
-                .and_then(|template| template.validate_known_elements(resource, iterable))
+                .and_then(|template| template.validate_known_elements(resource, iterable, context))
         } else {
             self.clone().resolve(resource, schema).map(|_| ())
         };
@@ -1174,6 +1175,7 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
         &self,
         resource: &ResourceId,
         iterable: Option<&Value<ParserPlaceholder, B>>,
+        context: &crate::parser::ProviderContext,
     ) -> Result<(), DirectiveResolutionErrors> {
         let Some(iterable) = iterable.filter(|value| value.is_fully_resolved()) else {
             return Ok(());
@@ -1192,7 +1194,7 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
                             key,
                             value,
                             AccessMissPolicy::Error,
-                            None,
+                            crate::resolver::RuntimeContext::Projection(context),
                         )
                     })
             {

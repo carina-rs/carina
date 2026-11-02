@@ -2688,7 +2688,7 @@ mod tests {
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         let parsed = carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::module_resolver::resolve_modules_with_providerless_config(
                     carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
@@ -2699,7 +2699,10 @@ mod tests {
                 .expect("test fixture crosses module resolution")
             },
         )
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
@@ -2735,7 +2738,7 @@ mod tests {
             false,
             true,
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2781,7 +2784,7 @@ mod tests {
             false,
             true,
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2829,7 +2832,7 @@ mod tests {
             false,
             true,
             project.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2869,7 +2872,7 @@ mod tests {
             false,
             true,
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2904,7 +2907,7 @@ mod tests {
             false,
             true,
             &base_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -2929,7 +2932,7 @@ mod tests {
             false,
             true,
             &base_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
         )
@@ -3121,7 +3124,7 @@ mod tests {
                 for run in 1..=2 {
                     let parsed = load_configuration_with_config(
                         config_path,
-                        &ProviderContext::default(),
+                        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
                         &carina_core::schema::SchemaRegistry::new(),
                     )
                     .unwrap()
@@ -3140,7 +3143,7 @@ mod tests {
                         refresh,
                         false,
                         config_path,
-                        &ProviderContext::default(),
+                        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
                         NonZeroUsize::new(1).unwrap(),
                         ShutdownToken::running(),
                     )

@@ -71,15 +71,17 @@ impl From<&DiscoveredProviderConfig> for ProviderInstanceKey {
 /// order wins.
 pub(crate) fn discover_providers_by_dir(
     workspace_root: &Path,
+    environment: &carina_core::EnvironmentSnapshot,
 ) -> HashMap<PathBuf, Vec<DiscoveredProviderConfig>> {
     let mut result: HashMap<PathBuf, Vec<DiscoveredProviderConfig>> = HashMap::new();
-    discover_by_dir_recursive(workspace_root, &mut result);
+    discover_by_dir_recursive(workspace_root, &mut result, environment);
     result
 }
 
 fn discover_by_dir_recursive(
     dir: &Path,
     result: &mut HashMap<PathBuf, Vec<DiscoveredProviderConfig>>,
+    environment: &carina_core::EnvironmentSnapshot,
 ) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -90,11 +92,11 @@ fn discover_by_dir_recursive(
 
     for path in paths {
         if path.is_dir() {
-            discover_by_dir_recursive(&path, result);
+            discover_by_dir_recursive(&path, result, environment);
         } else if path.extension().is_some_and(|ext| ext == "crn")
             && let Ok(content) = fs::read_to_string(&path)
         {
-            let ctx = ProviderContext::default();
+            let ctx = ProviderContext::new(environment.clone());
             if let Ok(parsed) = parser::parse_file(&content, &path, &ctx)
                 && !parsed.providers.is_empty()
             {
@@ -121,13 +123,20 @@ fn discover_by_dir_recursive(
 /// the relative paths to absolute module directories, and maps each module
 /// to the directories that import it. This allows module files to inherit
 /// their callers' provider schemas.
-pub fn discover_import_map(workspace_root: &Path) -> HashMap<PathBuf, BTreeSet<PathBuf>> {
+pub fn discover_import_map(
+    workspace_root: &Path,
+    environment: &carina_core::EnvironmentSnapshot,
+) -> HashMap<PathBuf, BTreeSet<PathBuf>> {
     let mut result: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
-    discover_imports_recursive(workspace_root, &mut result);
+    discover_imports_recursive(workspace_root, &mut result, environment);
     result
 }
 
-fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, BTreeSet<PathBuf>>) {
+fn discover_imports_recursive(
+    dir: &Path,
+    result: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+    environment: &carina_core::EnvironmentSnapshot,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -137,11 +146,11 @@ fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, BTreeSet
 
     for path in paths {
         if path.is_dir() {
-            discover_imports_recursive(&path, result);
+            discover_imports_recursive(&path, result, environment);
         } else if path.extension().is_some_and(|ext| ext == "crn")
             && let Ok(content) = fs::read_to_string(&path)
         {
-            let ctx = ProviderContext::default();
+            let ctx = ProviderContext::new(environment.clone());
             if let Ok(parsed) = parser::parse_file(&content, &path, &ctx) {
                 let caller_dir = path.parent().unwrap_or(dir);
                 for import in &parsed.uses {
@@ -180,6 +189,27 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn discovery_uses_environment_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let module = dir.path().join("module");
+        fs::create_dir(&module).unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            "fn version() { env('MODE') }\nprovider mock { version = version() }\nlet module = use { source = './module' }\n",
+        )
+        .unwrap();
+        let environment =
+            carina_core::EnvironmentSnapshot::new([("MODE".to_string(), "1.0.0".into())]);
+
+        let providers = discover_providers_by_dir(dir.path(), &environment);
+        assert_eq!(providers[dir.path()][0].name, "mock");
+        let imports = discover_import_map(dir.path(), &environment);
+        assert!(
+            imports[&module.canonicalize().unwrap()].contains(&dir.path().canonicalize().unwrap())
+        );
+    }
+
+    #[test]
     fn discover_by_dir_from_crn_files() {
         let dir = TempDir::new().unwrap();
         fs::write(
@@ -188,7 +218,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         let providers = &by_dir[dir.path()];
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "aws");
@@ -208,7 +239,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         let providers = &by_dir[dir.path()];
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].name, "aws");
@@ -224,7 +256,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         assert!(by_dir.is_empty());
     }
 
@@ -238,7 +271,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         let providers = &by_dir[dir.path()];
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "awscc");
@@ -253,7 +287,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         assert!(by_dir.is_empty());
     }
 
@@ -268,7 +303,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         let providers = &by_dir[&nested];
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "awscc");
@@ -276,7 +312,10 @@ mod tests {
 
     #[test]
     fn discover_by_dir_nonexistent_directory() {
-        let by_dir = discover_providers_by_dir(Path::new("/nonexistent/path"));
+        let by_dir = discover_providers_by_dir(
+            Path::new("/nonexistent/path"),
+            &carina_core::EnvironmentSnapshot::empty(),
+        );
         assert!(by_dir.is_empty());
     }
 
@@ -299,7 +338,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         assert_eq!(by_dir.len(), 2);
         assert_eq!(by_dir[&env_a].len(), 1);
         assert_eq!(by_dir[&env_a][0].name, "aws");
@@ -327,7 +367,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         assert_eq!(by_dir.len(), 2);
         assert!(by_dir.contains_key(&env_a));
         assert!(by_dir.contains_key(&env_b));
@@ -348,7 +389,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         assert_eq!(by_dir.len(), 1);
         assert_eq!(by_dir[dir.path()].len(), 1);
         assert_eq!(by_dir[dir.path()][0].name, "aws");
@@ -372,7 +414,8 @@ mod tests {
             )
             .unwrap();
 
-            let by_dir = discover_providers_by_dir(dir.path());
+            let by_dir =
+                discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
             let providers = &by_dir[dir.path()];
 
             assert_eq!(
@@ -407,7 +450,8 @@ mod tests {
         )
         .unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         let bindings: Vec<&str> = by_dir[dir.path()]
             .iter()
             .filter_map(|provider| provider.binding.as_deref())
@@ -422,7 +466,8 @@ mod tests {
         fs::write(dir.path().join("a_aws.crn"), "provider aws {}\n").unwrap();
         fs::write(dir.path().join("z_awscc.crn"), "provider awscc {}\n").unwrap();
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         let providers = &by_dir[dir.path()];
 
         assert_eq!(providers.len(), 2);
@@ -442,7 +487,8 @@ mod tests {
             .unwrap();
         }
 
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         let providers = &by_dir[dir.path()];
 
         assert_eq!(providers.len(), 1);
@@ -455,7 +501,8 @@ mod tests {
     #[test]
     fn discover_by_dir_empty_workspace() {
         let dir = TempDir::new().unwrap();
-        let by_dir = discover_providers_by_dir(dir.path());
+        let by_dir =
+            discover_providers_by_dir(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         assert!(by_dir.is_empty());
     }
 
@@ -476,7 +523,8 @@ mod tests {
         // Module has arguments (no provider)
         fs::write(module.join("main.crn"), "arguments {\n  repo: String\n}\n").unwrap();
 
-        let import_map = discover_import_map(dir.path());
+        let import_map =
+            discover_import_map(dir.path(), &carina_core::EnvironmentSnapshot::empty());
 
         let module_canonical = module.canonicalize().unwrap();
         assert!(
@@ -510,7 +558,8 @@ mod tests {
             fs::write(caller.join("a_import.crn"), import).unwrap();
         }
 
-        let import_map: HashMap<PathBuf, BTreeSet<PathBuf>> = discover_import_map(dir.path());
+        let import_map: HashMap<PathBuf, BTreeSet<PathBuf>> =
+            discover_import_map(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         let module = module.canonicalize().unwrap();
         let expected: BTreeSet<PathBuf> = ["alpha", "middle", "zeta"]
             .into_iter()
@@ -523,7 +572,8 @@ mod tests {
     #[test]
     fn discover_import_map_empty_workspace() {
         let dir = TempDir::new().unwrap();
-        let import_map = discover_import_map(dir.path());
+        let import_map =
+            discover_import_map(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         assert!(import_map.is_empty());
     }
 }

@@ -281,6 +281,7 @@ impl CompletionProvider {
         text: &str,
         position: Position,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<Vec<CompletionItem>> {
         let line = text.lines().nth(position.line as usize)?;
         let prefix = line
@@ -324,7 +325,7 @@ impl CompletionProvider {
             .find(|segment| !segment.is_empty())?;
         let header = format!("let {call_binding} = {call_expression} {{");
         let module_name = crate::enclosing_block::named_module_call_name(header.trim())?;
-        let parsed = self.load_called_module(module_name, text, base_path)?;
+        let parsed = self.load_called_module(module_name, text, base_path, provider_ctx)?;
         let output = parsed
             .attribute_params
             .iter()
@@ -1996,7 +1997,8 @@ impl CompletionProvider {
             else {
                 continue;
             };
-            let Some(parsed) = self.load_called_module(module_name, text, base_path) else {
+            let Some(parsed) = self.load_called_module(module_name, text, base_path, provider_ctx)
+            else {
                 continue;
             };
             for export in &parsed.export_params {
@@ -2725,7 +2727,8 @@ mod return_type_fits_tests {
 
     #[test]
     fn unloaded_module_export_candidates_use_nominal_identity() {
-        let context = carina_core::parser::ProviderContext::default();
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let nominal = |name: &str| {
             let parsed = carina_core::parser::parse_type_expr_str(name, &context).unwrap();
             let resolved = carina_core::validation::resolve_type_expr(&parsed, &context).unwrap();
@@ -2737,7 +2740,9 @@ mod return_type_fits_tests {
         let schemas = SchemaRegistry::new();
         assert!(
             carina_core::validation::deferred_types::with_session_for_test(
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty()
+                ),
                 |session| type_expr_source_is_assignable_to(
                     &source,
                     &nominal("KmsKeyArn"),
@@ -2749,7 +2754,9 @@ mod return_type_fits_tests {
         );
         assert!(
             !carina_core::validation::deferred_types::with_session_for_test(
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty()
+                ),
                 |session| type_expr_source_is_assignable_to(
                     &source,
                     &nominal("Arn"),
@@ -2761,7 +2768,9 @@ mod return_type_fits_tests {
         );
         assert!(
             carina_core::validation::deferred_types::with_session_for_test(
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty()
+                ),
                 |session| type_expr_source_is_assignable_to(
                     &source,
                     &AttributeType::string(),
@@ -2773,7 +2782,9 @@ mod return_type_fits_tests {
         );
         assert!(
             !carina_core::validation::deferred_types::with_session_for_test(
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty()
+                ),
                 |session| type_expr_source_is_assignable_to(
                     &source,
                     &nominal("PositiveInt"),
@@ -2785,7 +2796,9 @@ mod return_type_fits_tests {
         );
         assert!(
             !carina_core::validation::deferred_types::with_session_for_test(
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty()
+                ),
                 |session| type_expr_source_is_assignable_to(
                     &TypeExpr::String,
                     &nominal("KmsKeyArn"),
@@ -2806,7 +2819,7 @@ mod return_type_fits_tests {
             reason,
         )) = carina_core::validation::resolve_export_static_type_for_consumer(
             declared,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         else {
             panic!("unknown consumer type must resolve to an unchecked reason");

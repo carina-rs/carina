@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use carina_core::config_loader::{get_base_dir, load_configuration};
+use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::UnresolvedResource;
@@ -372,7 +372,12 @@ where
     let fixture_pathbuf = fixture_path.to_path_buf();
     let state_path = fixture_path.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
 
-    let loaded = load_configuration(&fixture_pathbuf).unwrap();
+    let loaded = load_configuration_with_config(
+        &fixture_pathbuf,
+        &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
     let duplicate_declarations = loaded.duplicate_declarations;
     let unresolved_parsed = loaded.unresolved_parsed;
     let parsed = loaded.parsed;
@@ -484,7 +489,7 @@ where
         remote_bindings.insert(us.binding.to_string(), bindings);
     }
     let resolved_provider_configs = carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 parsed,
@@ -1571,6 +1576,7 @@ mod tests {
         let runtime = CommandRuntime::new(
             (*dirs).clone(),
             CommandInputs {
+                environment: carina_core::EnvironmentSnapshot::empty(),
                 builtin_mock: BuiltinMockInputs::deferred(|| {
                     let path = PathBuf::from("/");
                     let scope = MockScope::file(path.clone())

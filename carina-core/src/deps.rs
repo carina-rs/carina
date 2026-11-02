@@ -615,7 +615,11 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let creation_order: Vec<String> = sorted
             .iter()
@@ -702,7 +706,11 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let creation_order: Vec<String> = sorted
             .iter()

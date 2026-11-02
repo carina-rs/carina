@@ -481,7 +481,7 @@ mod tests {
         let parsed = carina_core::parser::parse_file(
             source,
             std::path::Path::new("backend.crn"),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("backend fixture must parse");
         BackendConfig::try_from(parsed.backend.as_ref().expect("backend fixture"))
@@ -731,9 +731,6 @@ mod tests {
     fn environment_strings_remain_usable_and_redacted() {
         let variable = "CARINA_3880_BACKEND_BUCKET";
         let plaintext = "bucket-from-env";
-        unsafe {
-            std::env::set_var(variable, plaintext);
-        }
         let source = format!(
             r#"backend s3 {{
                 bucket = env('{variable}')
@@ -741,16 +738,14 @@ mod tests {
             }}"#
         );
 
-        let context = carina_core::parser::ProviderContext::default();
+        let context = carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::new([(variable.to_string(), plaintext.into())]),
+        );
         let mut parsed =
             carina_core::parser::parse_file(&source, std::path::Path::new("backend.crn"), &context)
                 .unwrap();
         carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
         let resolved = BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
-        unsafe {
-            std::env::remove_var(variable);
-        }
-
         let settings = resolved.as_s3().unwrap();
         assert_eq!(settings.bucket(), plaintext);
         assert_eq!(settings.bucket_diagnostic_literal(), None);

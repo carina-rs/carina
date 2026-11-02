@@ -18,9 +18,9 @@ pub struct LoadedModule {
 }
 
 /// Get parsed file info for display (supports both module definitions and root configs)
-pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
+pub fn get_parsed_file(path: &Path, config: &ProviderContext) -> Result<ParsedFile, ModuleError> {
     let content = fs::read_to_string(path)?;
-    let parsed = crate::parser::parse_file(&content, path, &ProviderContext::default())?;
+    let parsed = crate::parser::parse_file(&content, path, config)?;
     Ok(parsed)
 }
 
@@ -31,8 +31,8 @@ pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
 ///
 /// Returns `None` if `path` is not a directory, cannot be read/parsed, or
 /// contains no module definitions (no inputs or outputs).
-pub fn load_module(path: &Path) -> Option<ParsedFile> {
-    load_module_with_diagnostics(path).map(|loaded| loaded.parsed)
+pub fn load_module(path: &Path, config: &ProviderContext) -> Option<ParsedFile> {
+    load_module_with_diagnostics(path, config).map(|loaded| loaded.parsed)
 }
 
 /// Load a module signature using the caller's provider catalog.
@@ -43,18 +43,15 @@ pub fn load_module(path: &Path) -> Option<ParsedFile> {
 /// that context while parsing, or a valid bare handle in `depends_on` can be
 /// rejected before the signature is available to diagnose its call site.
 pub(crate) fn load_module_with_config(path: &Path, config: &ProviderContext) -> Option<ParsedFile> {
-    if !path.is_dir() {
-        return None;
-    }
-    load_directory_module_with_diagnostics_and_config(path, config).map(|loaded| loaded.parsed)
+    load_module(path, config)
 }
 
 /// Diagnostic-preserving variant of [`load_module`].
-pub fn load_module_with_diagnostics(path: &Path) -> Option<LoadedModule> {
+pub fn load_module_with_diagnostics(path: &Path, config: &ProviderContext) -> Option<LoadedModule> {
     if !path.is_dir() {
         return None;
     }
-    load_directory_module_with_diagnostics_and_config(path, &ProviderContext::default())
+    load_directory_module_with_diagnostics_and_config(path, config)
 }
 
 /// Collect `.crn` file paths directly inside `dir_path`, sorted by path.
@@ -81,13 +78,8 @@ pub(super) fn sorted_crn_paths_in(dir_path: &Path) -> std::io::Result<Vec<PathBu
 /// Routed through [`crate::config_loader::parse_directory_files`] so
 /// every file's `ParseContext` is seeded with the binding-name union
 /// from sibling `.crn` files (#2817).
-pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
-    load_directory_module_with_diagnostics(dir_path).map(|loaded| loaded.parsed)
-}
-
-/// Diagnostic-preserving variant of [`load_directory_module`].
-fn load_directory_module_with_diagnostics(dir_path: &Path) -> Option<LoadedModule> {
-    load_directory_module_with_diagnostics_and_config(dir_path, &ProviderContext::default())
+pub fn load_directory_module(dir_path: &Path, config: &ProviderContext) -> Option<ParsedFile> {
+    load_directory_module_with_diagnostics_and_config(dir_path, config).map(|loaded| loaded.parsed)
 }
 
 fn load_directory_module_with_diagnostics_and_config(
@@ -160,7 +152,10 @@ pub fn derive_module_name(path: &Path) -> String {
 ///
 /// Routed through [`crate::config_loader::parse_directory_files`] for
 /// directory-aware parse (#2817).
-pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
+pub fn load_module_from_directory(
+    dir: &Path,
+    config: &ProviderContext,
+) -> Result<ParsedFile, String> {
     let paths = sorted_crn_paths_in(dir)
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
 
@@ -171,9 +166,8 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         files.push((path, content));
     }
 
-    let parsed_files =
-        crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-            .map_err(|e| format!("Failed to parse directory {}: {}", dir.display(), e))?;
+    let parsed_files = crate::config_loader::parse_directory_files(&files, config)
+        .map_err(|e| format!("Failed to parse directory {}: {}", dir.display(), e))?;
 
     let mut merged = ParsedFile::default();
     for (_, parsed) in parsed_files {
@@ -193,8 +187,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         fs::write(tmp.path().join("broken.crn"), "let =\n").unwrap();
 
-        let error = load_module_from_directory(tmp.path())
-            .expect_err("invalid module syntax must fail to load");
+        let error = load_module_from_directory(
+            tmp.path(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("invalid module syntax must fail to load");
 
         assert!(error.contains("Syntax error"), "{error}");
         assert!(error.contains("--> 1:"), "missing pest location: {error}");
@@ -225,7 +222,11 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = load_module(dir).expect("module should load when arguments are declared");
+        let parsed = load_module(
+            dir,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("module should load when arguments are declared");
         assert_eq!(parsed.arguments.len(), 1);
         assert_eq!(parsed.arguments[0].name, "env");
         assert_eq!(parsed.export_params.len(), 1);
@@ -244,7 +245,11 @@ mod tests {
         fs::write(dir.join("a_first.crn"), "arguments {\n  a: String\n}\n").unwrap();
         fs::write(dir.join("m_middle.crn"), "arguments {\n  b: String\n}\n").unwrap();
 
-        let parsed = load_module(dir).expect("module should load");
+        let parsed = load_module(
+            dir,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("module should load");
         let names: Vec<&str> = parsed.arguments.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
     }
@@ -265,7 +270,11 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_module_with_diagnostics(dir).expect("module should load");
+        let loaded = load_module_with_diagnostics(
+            dir,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("module should load");
         let messages: Vec<String> = loaded
             .duplicate_declarations
             .iter()
@@ -286,7 +295,13 @@ mod tests {
         let tmp = tempdir().unwrap();
         let single = tmp.path().join("solo.crn");
         fs::write(&single, "arguments {\n  x: String\n}\n").unwrap();
-        assert!(load_module(&single).is_none());
+        assert!(
+            load_module(
+                &single,
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -297,7 +312,11 @@ mod tests {
         fs::write(dir.join("a.crn"), "arguments {\n  a: String\n}\n").unwrap();
         fs::write(dir.join("b.crn"), "arguments {\n  b: String\n}\n").unwrap();
 
-        let parsed = load_module_from_directory(dir).expect("dir should load");
+        let parsed = load_module_from_directory(
+            dir,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("dir should load");
         assert_eq!(parsed.arguments.len(), 2);
     }
 

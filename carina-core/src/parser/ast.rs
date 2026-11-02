@@ -1634,6 +1634,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
         self,
         schemas: &crate::schema::SchemaRegistry,
         bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
+        context: &super::ProviderContext,
     ) -> Result<DeferredForExpression<S, NoPlaceholder, LoopSlot, B>, crate::resource::ExpansionError>
     {
         let Self {
@@ -1645,7 +1646,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             template_resource,
             deferred_effect_id: _,
         } = self;
-        let element_type = directive_element_type(&iterable, bindings, schemas);
+        let element_type = directive_element_type(&iterable, bindings, schemas, context);
         let template_resource = template_resource.try_map_resource(|resource| {
             resource.into_loop_template(schemas, element_type.as_ref())
         })?;
@@ -6958,6 +6959,7 @@ where
     pub fn into_expanded(
         self,
         schemas: &crate::schema::SchemaRegistry,
+        context: &super::ProviderContext,
     ) -> Result<
         ExpandedFile<<E::Absolute as IntoExpandedExportParam<AbsoluteBindingAddress>>::Expanded>,
         crate::resource::ExpansionError,
@@ -6986,7 +6988,7 @@ where
             errors.is_empty(),
             "test fixture bypassed deferred-body finalization with unsupported bodies: {errors:?}"
         );
-        resolved.into_expanded(schemas)
+        resolved.into_expanded(schemas, context)
     }
 }
 
@@ -7192,8 +7194,11 @@ fn directive_element_type<B: BindingAddress>(
     iterable: &Value<ParserPlaceholder, B>,
     bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &crate::schema::SchemaRegistry,
+    context: &super::ProviderContext,
 ) -> Option<TypeExpr> {
-    match crate::validation::inference::infer_type_from_value(iterable, bindings, schemas).ok()? {
+    match crate::validation::inference::infer_type_from_value(iterable, bindings, schemas, context)
+        .ok()?
+    {
         TypeExpr::List(element) | TypeExpr::Map(element) => Some(*element),
         _ => None,
     }
@@ -7209,6 +7214,7 @@ where
         &self,
         boundary: ParserPlaceholderBoundary,
         schemas: &crate::schema::SchemaRegistry,
+        context: &super::ProviderContext,
     ) -> Vec<crate::resource::DirectiveResolutionError> {
         let allow_arguments = boundary == ParserPlaceholderBoundary::ModuleDefinition;
         let arguments = self
@@ -7254,7 +7260,7 @@ where
                             Some(resource.directives()),
                             crate::schema::SchemaKind::Resource,
                             true,
-                            directive_element_type(iterable, &bindings, schemas),
+                            directive_element_type(iterable, &bindings, schemas, context),
                             super::contains_module_argument_matching(iterable, &mut |_| true),
                             Some(iterable),
                         )
@@ -7278,6 +7284,7 @@ where
                             loop_template && !allow_arguments,
                             element_type.as_ref(),
                             iterable,
+                            context,
                         )
                     })
                     .filter_map(|mut error| {
@@ -8048,9 +8055,13 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
     pub fn into_expanded(
         self,
         schemas: &crate::schema::SchemaRegistry,
+        context: &super::ProviderContext,
     ) -> Result<ExpandedFile<E::Expanded>, crate::resource::ExpansionError> {
-        let directive_errors =
-            self.directive_resolution_errors(ParserPlaceholderBoundary::ExpandedFile, schemas);
+        let directive_errors = self.directive_resolution_errors(
+            ParserPlaceholderBoundary::ExpandedFile,
+            schemas,
+            context,
+        );
         if !directive_errors.is_empty() {
             return Err(crate::resource::DirectiveResolutionErrors::new(directive_errors).into());
         }
@@ -8140,7 +8151,9 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
                     deferred_for_phase
                         .expressions
                         .into_iter()
-                        .map(|expression| expression.into_expanded(schemas, &directive_bindings))
+                        .map(|expression| {
+                            expression.into_expanded(schemas, &directive_bindings, context)
+                        })
                         .collect::<Result<_, _>>()?,
                 ),
             },
@@ -8189,18 +8202,17 @@ impl<E> ExpandedFile<E> {
         let mut new_warnings: Vec<ParseWarning> = Vec::new();
 
         for (idx, deferred) in self.deferred_for_phase.expressions.iter().enumerate() {
-            let iterable_value =
-                match bindings
-                    .resolve_value(&deferred.iterable)
-                    .map_err(|message| DeferredForExpansionError::Resolution {
-                        line: deferred.line(),
-                        expression: crate::value::format_value(&deferred.iterable),
-                        message,
-                    })? {
-                    crate::resolver::ValueResolution::Present(value) => value,
-                    crate::resolver::ValueResolution::Absent
-                    | crate::resolver::ValueResolution::Unknown(_) => continue,
-                };
+            let iterable_value = match bindings
+                .resolve_value(&deferred.iterable, type_checks.catalog())
+                .map_err(|message| DeferredForExpansionError::Resolution {
+                    line: deferred.line(),
+                    expression: crate::value::format_value(&deferred.iterable),
+                    message,
+                })? {
+                crate::resolver::ValueResolution::Present(value) => value,
+                crate::resolver::ValueResolution::Absent
+                | crate::resolver::ValueResolution::Unknown(_) => continue,
+            };
             let miss_policy = bindings.access_miss_policy(&deferred.iterable);
 
             match (&deferred.binding, &iterable_value) {
@@ -8525,7 +8537,7 @@ fn substitute_attrs<S, D>(
                     key,
                     value,
                     miss_policy,
-                    Some(type_checks),
+                    crate::resolver::RuntimeContext::Session(type_checks),
                 )
             },
         )
@@ -8558,25 +8570,27 @@ pub(crate) fn resolve_loop_directive_value<B: BindingAddress>(
     key: Option<&str>,
     value: &Value<NoPlaceholder, B>,
     miss_policy: crate::resource::AccessMissPolicy,
-    type_checks: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    context: crate::resolver::RuntimeContext<'_>,
 ) -> Result<Value<NoPlaceholder, B>, PlaceholderAccessError> {
     let expression =
         substitute_placeholder_with_policy(expression, index, key, value, miss_policy)?
             .canonicalize();
     let bindings = crate::binding_index::ResolvedBindings::default();
-    match type_checks {
-        Some(type_checks) => {
+    match context {
+        crate::resolver::RuntimeContext::Session(type_checks) => {
             crate::resolver::resolve_ref_value(&expression, &bindings, type_checks)
         }
         // A syntax preview cannot evaluate annotated calls. The real expansion
         // borrows its run session and checks them before returning children.
-        None => crate::resolver::project_ref_value_status(&expression, &bindings).map(|value| {
-            match value {
-                crate::resolver::ValueResolution::Present(value)
-                | crate::resolver::ValueResolution::Unknown(value) => value,
-                crate::resolver::ValueResolution::Absent => expression,
-            }
-        }),
+        crate::resolver::RuntimeContext::Projection(context) => {
+            crate::resolver::project_ref_value_status(&expression, &bindings, context).map(
+                |value| match value {
+                    crate::resolver::ValueResolution::Present(value)
+                    | crate::resolver::ValueResolution::Unknown(value) => value,
+                    crate::resolver::ValueResolution::Absent => expression,
+                },
+            )
+        }
     }
     .map_err(|message| PlaceholderAccessError {
         line: 0,
@@ -9136,7 +9150,7 @@ mod substitute_placeholder_tests {
         );
 
         let err = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 expand_deferred_children(
                     &deferred,
@@ -9176,7 +9190,7 @@ mod substitute_placeholder_tests {
         );
 
         let children = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 expand_deferred_children(
                     &deferred,
@@ -9242,7 +9256,7 @@ mod substitute_placeholder_tests {
         let encoded = serde_json::to_value(&saved).unwrap();
         let restored: SavedDeferredForExpression = serde_json::from_value(encoded).unwrap();
         let error = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 expand_deferred_children(
                     &restored,
@@ -9287,7 +9301,7 @@ mod substitute_placeholder_tests {
             "child".to_string(),
         ));
         let list_children = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 expand_deferred_children(
                     &list_deferred,
@@ -9311,7 +9325,7 @@ mod substitute_placeholder_tests {
 
         let map_deferred = deferred(ForBinding::Map("key".to_string(), "child".to_string()));
         let map_children = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 expand_deferred_children(
                     &map_deferred,
@@ -9347,11 +9361,11 @@ mod substitute_placeholder_tests {
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
              }\n",
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("deferred unbound loop parses");
         let parsed = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -9361,11 +9375,14 @@ mod substitute_placeholder_tests {
                 .expect("deferred fixture crosses the module-resolution seam")
             },
         )
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("template must expand");
         let deferred = &parsed.deferred_for_expressions()[0];
         let children = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 expand_deferred_children(
                     deferred,
@@ -9523,6 +9540,7 @@ mod substitute_placeholder_tests {
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),
                 &std::collections::HashMap::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
         assert_eq!(expression.location(), &location);
@@ -9555,11 +9573,14 @@ mod substitute_placeholder_tests {
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
              }\n",
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("unbound deferred loop parses");
         let parsed = parsed
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .expect("template must expand");
         let deferred = &parsed.deferred_for_expressions()[0];
 
@@ -9870,10 +9891,13 @@ mod substitute_placeholder_tests {
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
              }\n",
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("unbound deferred loop parses")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("template must expand");
         let mut json =
             serde_json::to_value(parsed.deferred_for_expressions()[0].clone().into_compiled())
@@ -10055,11 +10079,11 @@ mod substitute_placeholder_tests {
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
              }\n",
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("deferred unbound loop parses");
         let parsed = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),

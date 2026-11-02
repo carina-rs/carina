@@ -16,6 +16,7 @@ impl CompletionProvider {
         position: Position,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &parser::ProviderContext,
     ) -> Vec<CompletionItem> {
         // Calculate the range for resource type replacements
         // Find where the current word/prefix starts on this line
@@ -215,7 +216,13 @@ impl CompletionProvider {
             if !(after_eq.starts_with("use ") || after_eq.starts_with("use{")) {
                 continue;
             }
-            let snippet = self.build_module_call_snippet(&binding, &after_eq, merged, base_path);
+            let snippet = self.build_module_call_snippet(
+                &binding,
+                &after_eq,
+                merged,
+                base_path,
+                provider_ctx,
+            );
             completions.push(CompletionItem {
                 label: binding.clone(),
                 kind: Some(CompletionItemKind::MODULE),
@@ -359,16 +366,19 @@ impl CompletionProvider {
         module_name: &str,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::parser::ParsedFile> {
         let import_path = self.find_module_import_path(module_name, text, base_path)?;
         let base = base_path?;
         let module_path = base.join(&import_path);
         let provider_context = carina_core::parser::ProviderContext {
+            environment: provider_ctx.catalog().environment.clone(),
+            decryptor: None,
+            custom_types: carina_core::parser::ProviderCustomTypes::default(),
             resource_types:
                 carina_core::parser::ProviderContext::resource_types_from_schema_registry(
                     &self.schemas,
                 ),
-            ..carina_core::parser::ProviderContext::default()
         };
         carina_core::config_loader::parse_directory(&module_path, &provider_context)
             .ok()
@@ -381,10 +391,11 @@ impl CompletionProvider {
         module_name: &str,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
-        if let Some(parsed) = self.load_called_module(module_name, text, base_path) {
+        if let Some(parsed) = self.load_called_module(module_name, text, base_path, provider_ctx) {
             for input in &parsed.arguments {
                 let type_str = self.format_type_expr(&input.static_type);
                 let required_marker = if input.default.is_some() {
@@ -440,7 +451,8 @@ impl CompletionProvider {
         base_path: Option<&Path>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
-        let Some(parsed) = self.load_called_module(module_name, text, base_path) else {
+        let Some(parsed) = self.load_called_module(module_name, text, base_path, provider_ctx)
+        else {
             return Vec::new();
         };
         let Some(arg) = parsed.arguments.iter().find(|a| a.name == arg_name) else {
@@ -566,6 +578,7 @@ impl CompletionProvider {
         after_eq: &str,
         merged: &str,
         base_path: Option<&Path>,
+        provider_ctx: &parser::ProviderContext,
     ) -> String {
         // Try the same-line shape first (`use { source = '...' }` on the
         // `let` line). Falls back to scanning the merged text so the
@@ -576,7 +589,8 @@ impl CompletionProvider {
 
         if let Some(path) = import_path.as_deref()
             && let Some(base) = base_path
-            && let Some(parsed) = carina_core::module_resolver::load_module(&base.join(path))
+            && let Some(parsed) =
+                carina_core::module_resolver::load_module(&base.join(path), provider_ctx)
             && !parsed.arguments.is_empty()
         {
             let mut snippet = format!("{} {{\n", binding);

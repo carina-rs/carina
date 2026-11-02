@@ -113,7 +113,7 @@ pub(crate) fn provider_upstream_fixture() -> (tempfile::TempDir, PathBuf, Inferr
     .unwrap();
     let parsed = load_configuration_with_config(
         &downstream,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &SchemaRegistry::new(),
     )
     .unwrap()

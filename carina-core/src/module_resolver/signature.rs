@@ -97,7 +97,12 @@ pub fn load_resolved_module_signatures<E, B: crate::resource::BindingAddress, D>
             // arguments still need the signature so their independent
             // boundary errors are reported alongside the body diagnostic.
             super::loader::load_module_with_config(&path, config)
-                .or_else(|| super::loader::load_module(&path))
+                .or_else(|| {
+                    super::loader::load_module(
+                        &path,
+                        &ProviderContext::new(config.environment.clone()),
+                    )
+                })
                 .map(|module| (import.alias.clone(), resolved_signature(&module, config)))
         })
         .collect()

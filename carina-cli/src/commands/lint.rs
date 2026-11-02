@@ -288,7 +288,11 @@ fn lint_result(
         Ok(loaded) => loaded,
         Err(error) => {
             return Ok(LintResult::settle(
-                crate::wiring::failed_configuration_report(path, error.into()),
+                crate::wiring::failed_configuration_report(
+                    path,
+                    error.into(),
+                    runtime.environment().clone(),
+                ),
             ));
         }
     };
@@ -296,7 +300,7 @@ fn lint_result(
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    let module_walk = ModuleWalk::load(&parsed, base_dir);
+    let module_walk = ModuleWalk::load(&parsed, base_dir, &provider_context.environment);
     let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
     module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_backend_in_modules(&module_walk));
@@ -534,7 +538,12 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(fixture.path().join("main.crn"), "provider broken { source = 'file:///definitely-missing/broken.wasm' }\nprovider broken { source = 'file:///definitely-missing/broken.wasm' }\nprovider missing {}\n").unwrap();
         let runtime = crate::test_support::TestCommandRuntime::new();
-        let result = lint_result(&runtime, fixture.path(), &ProviderContext::default()).unwrap();
+        let result = lint_result(
+            &runtime,
+            fixture.path(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let mut sink = LintTypeCheckSink {
             path: fixture.path(),
             warnings: Vec::new(),
@@ -608,7 +617,12 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(fixture.path().join("main.crn"), "provider broken { source = 'file:///definitely-missing/broken.wasm' }\nfn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes { x: AwsAccountId = '123' }\n").unwrap();
         let runtime = crate::test_support::TestCommandRuntime::new();
-        let error = run_lint(&runtime, fixture.path(), &ProviderContext::default()).unwrap_err();
+        let error = run_lint(
+            &runtime,
+            fixture.path(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
+        .unwrap_err();
         assert!(
             matches!(&error, AppError::Validation(message) if message == "Found 4 lint warning(s)."),
             "{error}"
@@ -628,8 +642,12 @@ mod tests {
         .unwrap();
         std::fs::write(module_dir.join("main.crn"), "let =\n").unwrap();
 
-        let error = run_lint(&runtime, temp.path(), &ProviderContext::default())
-            .expect_err("invalid imported module syntax must fail lint");
+        let error = run_lint(
+            &runtime,
+            temp.path(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("invalid imported module syntax must fail lint");
         let rendered = error.to_string();
 
         assert!(rendered.contains("Module resolution error"), "{rendered}");
@@ -663,8 +681,12 @@ attributes {
         )
         .unwrap();
 
-        run_lint(&runtime, temp.path(), &ProviderContext::default())
-            .expect("lint must inspect reusable module templates without publishing them");
+        run_lint(
+            &runtime,
+            temp.path(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
+        .expect("lint must inspect reusable module templates without publishing them");
     }
 
     fn parsed_with_uses(uses: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {
@@ -678,7 +700,7 @@ attributes {
         carina_core::parser::parse_file(
             &source,
             std::path::Path::new("lint_fixture.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("test fixture must parse")
     }

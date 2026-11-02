@@ -1559,7 +1559,7 @@ mod provider_config_tests {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
         let declaration =
             PatternAttributeType::refined_string(Some(identity.clone()), None, None, None);
-        let context = crate::parser::ProviderContext::default();
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "missing",

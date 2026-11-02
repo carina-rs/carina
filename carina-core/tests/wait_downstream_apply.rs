@@ -334,14 +334,23 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let parsed = parse_directory(&caller, &ProviderContext::default())
-        .expect("parse_directory should succeed for the caller fixture");
+    let parsed = parse_directory(
+        &caller,
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("parse_directory should succeed for the caller fixture");
 
-    let parsed = with_type_check_session(&ProviderContext::default(), |session| {
-        resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
-    });
+    let parsed = with_type_check_session(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
+        },
+    );
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded module fixture contains no parser placeholders");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
@@ -418,6 +427,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         std::sync::Arc::new(Vec::new()),
         registry.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
@@ -548,14 +558,24 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     root.push("tests/fixtures/wait/module_wait_nested/root");
 
-    let parsed = parse_directory(&root, &ProviderContext::default())
-        .expect("parse_directory should succeed for the nested root fixture");
+    let parsed = parse_directory(
+        &root,
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("parse_directory should succeed for the nested root fixture");
 
-    let parsed = with_type_check_session(&ProviderContext::default(), |session| {
-        resolve_modules(parsed, &root, session).expect("nested module resolution should succeed")
-    });
+    let parsed = with_type_check_session(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            resolve_modules(parsed, &root, session)
+                .expect("nested module resolution should succeed")
+        },
+    );
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded nested module fixture contains no parser placeholders");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
@@ -612,6 +632,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         std::sync::Arc::new(Vec::new()),
         registry.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
@@ -744,13 +765,22 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let parsed = parse_directory(&caller, &ProviderContext::default())
-        .expect("parse_directory should succeed");
-    let parsed = with_type_check_session(&ProviderContext::default(), |session| {
-        resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
-    });
+    let parsed = parse_directory(
+        &caller,
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("parse_directory should succeed");
+    let parsed = with_type_check_session(
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        |session| {
+            resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
+        },
+    );
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded module fixture contains no parser placeholders");
 
     let sorted_resources =
@@ -786,6 +816,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         std::sync::Arc::new(Vec::new()),
         registry.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     {
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(

@@ -109,7 +109,7 @@ fn parse_root_and_resolve(source: &str) -> carina_core::parser::ExpandedParsedFi
     std::fs::write(root.path().join("canonicalize.crn"), source)
         .expect("write canonicalization fixture");
     TypeCheckSession::run(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             let parsed =
                 carina_core::config_loader::parse_directory(root.path(), session.catalog())
@@ -119,7 +119,10 @@ fn parse_root_and_resolve(source: &str) -> carina_core::parser::ExpandedParsedFi
         },
     )
     .publish(&mut TestTypeCheckSink)
-    .into_expanded(&carina_core::schema::SchemaRegistry::new())
+    .into_expanded(
+        &carina_core::schema::SchemaRegistry::new(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
     .expect("canonicalization fixture contains no parser placeholders")
 }
 

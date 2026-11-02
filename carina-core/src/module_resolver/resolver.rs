@@ -549,7 +549,7 @@ mod diagnostic_status_tests {
         )
         .expect("write module attributes");
 
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let schemas = SchemaRegistry::new();
         let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
             .expect("parse directory fixture");
@@ -591,7 +591,7 @@ mod diagnostic_status_tests {
         let parsed = crate::parser::parse_file(
             "let child = use { source = './child' }\nchild {}\n",
             std::path::Path::new("root.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture parse");
         let signatures = HashMap::from([(
@@ -601,7 +601,7 @@ mod diagnostic_status_tests {
                     name: "required".to_string(),
                     static_type: crate::validation::resolve_consumer_static_type_for_signature(
                         &crate::parser::TypeExpr::String,
-                        &ProviderContext::default(),
+                        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     ),
                     default: None,
                     description: None,
@@ -613,7 +613,7 @@ mod diagnostic_status_tests {
         )]);
         let schemas = SchemaRegistry::new();
         crate::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |provider_context| {
                 let binding_use_report = crate::validation::check_bare_binding_uses(
                     &parsed,
@@ -707,7 +707,7 @@ mod diagnostic_status_tests {
 ///
 /// let mut first = ParsedFile::default();
 /// let mut second = ParsedFile::default();
-/// let config = ProviderContext::default();
+/// let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
 /// let schemas = SchemaRegistry::new();
 /// let checked = RefCheckedModuleGraph::check(
 ///     &mut first,
@@ -1644,7 +1644,7 @@ pub fn prepare_root_export_validation(
 /// use carina_core::validation::deferred_types::TypeCheckSession;
 ///
 /// let parsed = ParsedFile::default();
-/// let checks = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let checks = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     resolve_modules_providerless(parsed, Path::new("."), session)
 /// });
 /// checks.publish(&mut Vec::new());
@@ -1839,6 +1839,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
             compositions: &graph.compositions,
             constraint_reports: &constraint_reports,
         },
+        resolver.session.catalog(),
     );
     let resolution_failed = !errors.is_empty();
     let errors = errors
@@ -2243,7 +2244,7 @@ mod type_resolution_policy_tests {
     #[test]
     fn resolver_constructors_choose_distinct_type_resolution_policies() {
         crate::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |config| {
                 let schemas = SchemaRegistry::new();
 

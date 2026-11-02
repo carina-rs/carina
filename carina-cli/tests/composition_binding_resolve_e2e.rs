@@ -298,7 +298,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     let fixture = write_fixture();
     let caller = fixture.path().join("caller");
 
-    let provider_context = ProviderContext::default();
+    let provider_context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let loaded = load_configuration_with_config(&caller, &provider_context, &SchemaRegistry::new())
         .expect("load should succeed");
     let parsed = loaded.parsed;
@@ -321,7 +321,10 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
         },
     );
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("module expansion must substitute every parser placeholder");
 
     // Sanity: module expansion produced both the RolePolicy resource

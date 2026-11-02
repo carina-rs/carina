@@ -35,7 +35,10 @@ fn local_type(type_expr: TypeExpr) -> TypeExpr {
 }
 
 fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
-    resolve_consumer_static_type_for_signature(&type_expr, &ProviderContext::default())
+    resolve_consumer_static_type_for_signature(
+        &type_expr,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
 }
 
 fn module_arguments(
@@ -135,7 +138,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
 
     let argument = resolve_consumer_static_type(
         &parsed.arguments[0].static_type,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(matches!(
         &argument,
@@ -148,7 +151,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     ));
     let attributes = resolve_attribute_static_types_for_consumer(
         &parsed.attribute_params,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(matches!(
         &attributes[0].static_type,
@@ -159,7 +162,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
             .static_type
             .as_ref()
             .expect("declared export type"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(matches!(
         &parsed_export,
@@ -189,7 +192,10 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     });
 
     let mut resolved = inferred.export_params.into_iter().map(|export| {
-        resolve_export_static_type_for_consumer(export.static_type, &ProviderContext::default())
+        resolve_export_static_type_for_consumer(
+            export.static_type,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
     });
 
     assert!(matches!(
@@ -215,7 +221,7 @@ fn rendered_struct_typecheck_result(
             fields: fields.to_vec(),
         },
         &Value::Concrete(ConcreteValue::Map(entries.clone())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
 }
 
@@ -260,7 +266,7 @@ for item in upstream.items {
     mock.test.Thing { name = item.name }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture parses");
     assert_eq!(parsed.iter_top_level_resources().count(), 2);
@@ -270,7 +276,7 @@ for item in upstream.items {
         &parsed,
         &SchemaRegistry::new(),
         &HashSet::new(),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("an unloaded provider cannot derive anonymous identities");
 
@@ -299,7 +305,7 @@ fn module_call_findings_for_test(
         parsed,
         &schemas,
         signatures,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     crate::validation::deferred_types::with_session_for_test(provider_context, |session| {
         check_module_calls(ModuleCallCheckInput {
@@ -317,8 +323,11 @@ fn module_call_findings_for_test(
 }
 
 fn authored_binding_view(source: &str) -> crate::config_loader::AuthoredBindingView {
-    crate::config_loader::AuthoredBindingView::parse_source(source, &ProviderContext::default())
-        .expect("fixture must parse")
+    crate::config_loader::AuthoredBindingView::parse_source(
+        source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse")
 }
 
 #[test]
@@ -351,7 +360,7 @@ fn validate_resource_ref_types_for_test<
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
             let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(parsed, schemas, None, &signatures, session);
@@ -373,7 +382,7 @@ let source = mock.test.Source {}
 let invalid = source.ratio + 1
 let sink = mock.test.Consumer { count = invalid }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse before schema-aware validation");
     let mut schemas = SchemaRegistry::new();
@@ -409,11 +418,14 @@ let sink = mock.test.Consumer { count = invalid }
 fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
     use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
 
-    let unknown =
-        crate::parser::parse_type_expr_str("UndeclaredCount", &ProviderContext::default()).unwrap();
+    let unknown = crate::parser::parse_type_expr_str(
+        "UndeclaredCount",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let parsed = ParsedFile::default();
     let schemas = SchemaRegistry::new();
-    let config = loaded_context_for_test(ProviderContext::default());
+    let config = loaded_context_for_test(ProviderContext::new(crate::EnvironmentSnapshot::empty()));
     let index = BindingIndex::from_parsed(&parsed, &schemas, &config);
     let bindings = inference::InferenceBindings::from([(
         "count".into(),
@@ -452,7 +464,7 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
 fn composition_reference_reports_declared_type_resolution_failure() {
     let parsed = crate::parser::parse(
         "let source = mock.test.Source {}",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     let mut schemas = SchemaRegistry::new();
@@ -466,11 +478,13 @@ fn composition_reference_reports_declared_type_resolution_failure() {
             .validate()
             .unwrap(),
     );
-    let config = loaded_context_for_test(ProviderContext::default());
+    let config = loaded_context_for_test(ProviderContext::new(crate::EnvironmentSnapshot::empty()));
     let index = BindingIndex::from_parsed(&parsed, &schemas, &config);
-    let declared =
-        crate::parser::parse_type_expr_str("UndeclaredAccountId", &ProviderContext::default())
-            .unwrap();
+    let declared = crate::parser::parse_type_expr_str(
+        "UndeclaredAccountId",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let path = crate::resource::AuthoredAccessPath::new("source", "value");
     let result = composition_ref_error_kind(
         (&path).into(),
@@ -494,7 +508,7 @@ fn refined_int_resource_operand_is_still_an_int_operand() {
 let source = mock.test.Source {}
 let valid = source.count + 1
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse before schema-aware validation");
     let mut schemas = SchemaRegistry::new();
@@ -523,7 +537,7 @@ fn refined_string_resource_operand_is_not_an_int_operand() {
 let source = mock.test.Source {}
 let invalid = source.count + 1
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse before schema-aware validation");
     let mut schemas = SchemaRegistry::new();
@@ -555,7 +569,7 @@ let invalid = source.count + 1
 fn deferred_string_resource_attribute_is_not_an_int_operand() {
     let parsed = crate::parser::parse(
         "let source = mock.test.Source {}\nlet invalid = source.label + 1\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse before schema-aware validation");
     let mut schemas = SchemaRegistry::new();
@@ -582,7 +596,7 @@ fn integer_arithmetic_result_obeys_the_declared_resource_sink() {
 let source = mock.test.Source {}
 let invalid = mock.test.Consumer { label = source.count + 1 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("sink fixture must parse before schema-aware validation");
     let mut schemas = SchemaRegistry::new();
@@ -618,7 +632,7 @@ let invalid = mock.test.Consumer { label = source.count + 1 }
 fn module_attribute_integer_arithmetic_keeps_unliftable_sink_unchecked() {
     let parsed = crate::parser::parse(
         "arguments { a: Int = 1 }\nattributes { p: Port = a + 1 }\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("an unloaded custom-type annotation must parse");
 
@@ -633,7 +647,7 @@ fn module_attribute_integer_arithmetic_uses_declared_argument_types() {
 arguments { count: Int }
 attributes { doubled: Int = count * 2 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("valid module fixture must parse");
     validate_resource_ref_types_for_test(&valid, &SchemaRegistry::new())
@@ -644,7 +658,7 @@ attributes { doubled: Int = count * 2 }
 arguments { ratio: Float }
 attributes { rounded: Int = ratio + 1 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("invalid module fixture must parse before type validation");
     let error = validate_resource_ref_types_for_test(&invalid, &SchemaRegistry::new())
@@ -656,7 +670,7 @@ attributes { rounded: Int = ratio + 1 }
 fn unused_function_integer_arithmetic_uses_declared_parameter_types() {
     let valid = crate::parser::parse(
         "fn doubled(value: Int): Int { value * 2 }\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("valid function fixture must parse");
     validate_resource_ref_types_for_test(&valid, &SchemaRegistry::new())
@@ -664,7 +678,7 @@ fn unused_function_integer_arithmetic_uses_declared_parameter_types() {
 
     let invalid = crate::parser::parse(
         "fn rounded(value: Float): Int { value + 1 }\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("invalid function fixture must parse before type validation");
     let error = validate_resource_ref_types_for_test(&invalid, &SchemaRegistry::new())
@@ -673,7 +687,7 @@ fn unused_function_integer_arithmetic_uses_declared_parameter_types() {
 
     let invalid_return = crate::parser::parse(
         "fn mislabeled(value: Int): String { value + 1 }\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("return-sink fixture must parse before directory type validation");
     let error = validate_resource_ref_types_for_test(&invalid_return, &SchemaRegistry::new())
@@ -685,7 +699,7 @@ fn unused_function_integer_arithmetic_uses_declared_parameter_types() {
 
     let untyped = crate::parser::parse(
         "fn unproven(value): Int { value + 1 }\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("untyped-parameter fixture must parse before directory type validation");
     let error = validate_resource_ref_types_for_test(&untyped, &SchemaRegistry::new())
@@ -717,14 +731,14 @@ let r = mock.test.resource { name = "r" }
 fn f(x: Int) { "fixed" }
 mock.test.resource { name = f(r.name) }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     let schemas = function_ref_schema();
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
@@ -746,7 +760,7 @@ let generated = for item in pending.items {
     mock.test.resource { name = f(r.name) }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
@@ -754,7 +768,7 @@ let generated = for item in pending.items {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
@@ -773,14 +787,14 @@ let r = mock.test.resource { name = "r" }
 fn f(): Int { r.name }
 let r2 = mock.test.resource { name = f() }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     let schemas = function_ref_schema();
     let mismatch_bindings = crate::binding_index::BindingIndex::from_parsed(
         &mismatch,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let error = validate_user_function_ref_types_with_bindings(&mismatch, &mismatch_bindings)
         .expect_err("String function result passed to Int must be rejected");
@@ -795,13 +809,13 @@ let r = mock.test.resource { name = "r" }
 fn f(): String { r.name }
 let r2 = mock.test.resource { name = f() }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     let matching_bindings = crate::binding_index::BindingIndex::from_parsed(
         &matching,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(validate_user_function_ref_types_with_bindings(&matching, &matching_bindings).is_ok());
 }
@@ -811,7 +825,7 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
     fn parsed_with_nested_call(g_return: &str) -> ParsedFile {
         let mut parsed = crate::parser::parse(
             &format!("fn f(x: Int): String {{ 'ok' }}\nfn g(y: Int): {g_return} {{ y }}\n"),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("function declarations must parse");
         parsed.variables.insert(
@@ -839,7 +853,7 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
     let bindings = BindingIndex::from_parsed(
         &mismatch,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let error = validate_user_function_ref_types_with_bindings(&mismatch, &bindings)
         .expect_err("g(): String must not satisfy f(Int)");
@@ -854,7 +868,7 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
     let bindings = BindingIndex::from_parsed(
         &matching,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(validate_user_function_ref_types_with_bindings(&matching, &bindings).is_ok());
 }
@@ -980,7 +994,7 @@ fn context_with_iam_policy_arn_validator() -> LoadedProviderContext {
                 }
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     })
 }
 
@@ -1006,7 +1020,7 @@ fn context_with_known_custom_types(
                 )
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     })
 }
 
@@ -1018,7 +1032,7 @@ fn context_with_accepting_custom_type_resolver(
             known,
             Box::new(|_target, _value| Ok(())),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     })
 }
 
@@ -1178,7 +1192,7 @@ fn lift_schema_type_preserves_int_kind_without_registry() {
 
 #[test]
 fn lift_unloaded_schema_nominals_preserves_identity_without_guessing_kind() {
-    let context = ProviderContext::default();
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let nominal = crate::parser::parse_type_expr_str("KmsKeyArn", &context).unwrap();
     let same = crate::parser::parse_type_expr_str("KmsKeyArn", &context).unwrap();
     let different = crate::parser::parse_type_expr_str("Arn", &context).unwrap();
@@ -1216,9 +1230,12 @@ fn lift_unloaded_schema_nominals_preserves_identity_without_guessing_kind() {
 #[test]
 fn unloaded_schema_nominals_compare_whole_identity_and_round_trip() {
     let nominal = |identity: TypeIdentity| {
-        crate::parser::resolve_custom_type_identity(&identity, &ProviderContext::default())
-            .unwrap()
-            .unwrap()
+        crate::parser::resolve_custom_type_identity(
+            &identity,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap()
+        .unwrap()
     };
     let original = nominal(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn"));
     let decoded: TypeExpr =
@@ -1260,10 +1277,12 @@ fn unloaded_schema_nominals_use_identity_relation_with_loaded_types() {
     use crate::schema::{TypeAssignability, TypeInSchema};
 
     let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
-    let nominal =
-        crate::parser::resolve_custom_type_identity(&identity, &ProviderContext::default())
-            .unwrap()
-            .unwrap();
+    let nominal = crate::parser::resolve_custom_type_identity(
+        &identity,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .unwrap();
     let unloaded = lift_type_expr(&nominal).unwrap();
     let unloaded = TypeInSchema::schemaless(&unloaded);
     // No scalar kind is required to compare the same nominal identity.
@@ -1293,7 +1312,7 @@ fn unloaded_schema_nominals_use_identity_relation_with_loaded_types() {
 
     let nominal = crate::parser::resolve_custom_type_identity(
         &TypeIdentity::new(Some("test"), ["Counter"], "PositiveInt"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap()
     .unwrap();
@@ -1311,7 +1330,7 @@ fn unloaded_schema_nominals_use_identity_relation_with_loaded_types() {
 
 #[test]
 fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
-    let context = ProviderContext::default();
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse(
         "arguments { count: Count }\nattributes { next: Int = (count + 1) * 2 }",
         &context,
@@ -1366,7 +1385,7 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
             HashSet::from([owned.clone()]),
             Box::new(|_, _| Ok(())),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     assert_eq!(
         resolve_type_expr(&ty, &loaded).unwrap(),
@@ -1762,7 +1781,11 @@ fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
             }
         }
     "#;
-    let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        src,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     assert!(check_unused_bindings(&authored_binding_view(src)).is_empty());
@@ -1787,7 +1810,7 @@ fn seeded_bare_structural_binding_is_a_typed_pending_slot() {
     );
     let parsed = crate::parser::parse_with_seeded_bindings(
         src,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         &[crate::parser::BindingSeed::typed_structural(
             "role", &handle,
         )],
@@ -1826,14 +1849,14 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     );
     let parsed = crate::parser::parse_with_seeded_bindings(
         src,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         &[crate::parser::BindingSeed::typed_structural(
             "role", &handle,
         )],
     )
     .expect("a seeded structural handle reaches typed validation");
     let schemas = SchemaRegistry::new();
-    let provider_context = ProviderContext::default();
+    let provider_context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
     let context = ValidationTypeContext::new_providerless(
         &parsed,
@@ -1870,7 +1893,7 @@ let generated = for item in items {
     mock.test.resource { name = value }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
@@ -2011,7 +2034,11 @@ let route = awscc.ec2.route {
   gateway_id             = igw_attachment.internet_gateway_id
 }
 "#;
-    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // Check the route resource's gateway_id is a ResourceRef to igw_attachment
     let route = parsed
@@ -2053,7 +2080,11 @@ cidr_block = "10.0.0.0/16"
   }
 }
 "#;
-    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(
         parsed.structural_bindings.contains("vpc"),
         "vpc should be in structural_bindings"
@@ -2078,7 +2109,11 @@ cidr_block = cidr_subnet("10.0.0.0/8", 8, i)
   }
 }
 "#;
-    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(
         parsed.structural_bindings.contains("vpcs"),
         "vpcs should be in structural_bindings"
@@ -2122,7 +2157,11 @@ provider aws {
 
 let caller = read aws.sts.caller_identity {}
 "#;
-    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(
         parsed.structural_bindings.contains("caller"),
         "caller should be in structural_bindings"
@@ -2194,7 +2233,7 @@ mock.test.Consumer { name = shared }
     )
     .expect("write module fixture");
 
-    let config = ProviderContext::default();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let schemas = SchemaRegistry::new();
     let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
         .expect("load module fixture");
@@ -2546,7 +2585,7 @@ fn parenthesized_for_address_reports_the_same_unknown_field_as_direct_path() {
                 grouped = (roles[0]).nope
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("both reference spellings parse");
     let consumer = parsed
@@ -2688,7 +2727,7 @@ fn secret_preserves_its_argument_type_through_postfix_access() {
                 value = secret(split("-", q.identifier))[0]
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("secret-wrapped computed collection must parse");
     let (_, schemas) = postfix_access_validation_fixture(
@@ -2712,7 +2751,7 @@ fn resource_reference_segments_reject_wrong_shape_like_computed_access() {
                 value = [q.identifier][0][0]
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("wrong-shape reference paths remain parseable for schema validation");
     let (_, schemas) = postfix_access_validation_fixture(
@@ -2961,7 +3000,7 @@ let sink = test.r.sink {
     target = source.value
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -3005,7 +3044,7 @@ let sink = test.r.sink {
     target = source.value
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -3060,7 +3099,7 @@ let sink = test.r.sink {
     target = source.value
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -3325,7 +3364,11 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
             }
         }
     "#;
-    let parsed = crate::parser::parse(src, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let mut schemas = SchemaRegistry::new();
     // test.r.vpc exposes `vpc_id: Int`
@@ -3443,7 +3486,11 @@ fn module_without_provider_ok() {
 }
 
 fn parse_state_blocks(source: &str) -> ParsedFile {
-    crate::parser::parse(source, &ProviderContext::default()).expect("valid state block fixture")
+    crate::parser::parse(
+        source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("valid state block fixture")
 }
 
 #[test]
@@ -3616,8 +3663,11 @@ fn module_without_backend_ok() {
 }
 
 fn parse_root_owned_declaration(source: &str) -> ParsedFile {
-    crate::parser::parse(source, &ProviderContext::default())
-        .expect("valid root-owned declaration fixture")
+    crate::parser::parse(
+        source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("valid root-owned declaration fixture")
 }
 
 #[test]
@@ -3805,7 +3855,9 @@ fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
         let error = typecheck::check_type_expr_value_with_context(
             &expected,
             &value,
-            typecheck::TypecheckProviderContext::for_parser(&ProviderContext::default()),
+            typecheck::TypecheckProviderContext::for_parser(&ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            )),
             typecheck::TypecheckInference::Unavailable,
         )
         .require_provider_schemas()
@@ -3852,7 +3904,7 @@ fn bare_builtin_custom_types_run_declared_validators() {
         let error = rendered_typecheck_result(
             &expected,
             &Value::Concrete(invalid),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("the declaration's validator must reject invalid values of the right kind");
         assert!(error.contains(message), "{name}: {error}");
@@ -3860,7 +3912,7 @@ fn bare_builtin_custom_types_run_declared_validators() {
             rendered_typecheck_result(
                 &expected,
                 &Value::Concrete(valid),
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .is_none(),
             "{name}: valid value must pass"
@@ -3878,7 +3930,7 @@ fn bare_builtin_custom_types_validate_enum_identifier_text() {
         let error = rendered_typecheck_result(
             &crate::parser::bare_type_for_test(name.to_string()),
             &Value::Concrete(ConcreteValue::enum_identifier(text.to_string())),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(error.is_none(), valid, "{name}: {text}: {error:?}");
         if let Some(error) = error {
@@ -3892,7 +3944,7 @@ fn rendered_typecheck_result_error_uses_pascal_case() {
     let msg = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::Int(42)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("should error");
     assert!(msg.contains("expected String"), "got: {msg}");
@@ -3909,7 +3961,7 @@ fn validate_type_expr_struct_error_uses_pascal_case_in_field_type() {
     let msg = rendered_typecheck_result(
         &TypeExpr::Struct { fields },
         &Value::Concrete(ConcreteValue::Map(map)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("should error");
     assert!(
@@ -3923,7 +3975,7 @@ fn rendered_typecheck_result_ipv4_cidr_valid() {
     let result = rendered_typecheck_result(
         &crate::parser::bare_type_for_test("ipv4_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_none());
 }
@@ -3933,7 +3985,7 @@ fn rendered_typecheck_result_ipv4_cidr_invalid() {
     let result = rendered_typecheck_result(
         &crate::parser::bare_type_for_test("ipv4_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("not-a-cidr".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
 }
@@ -3943,7 +3995,7 @@ fn rendered_typecheck_result_ipv4_address_valid() {
     let result = rendered_typecheck_result(
         &crate::parser::bare_type_for_test("ipv4_address".to_string()),
         &Value::Concrete(ConcreteValue::String("192.168.1.1".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_none());
 }
@@ -3953,7 +4005,7 @@ fn rendered_typecheck_result_ipv4_address_invalid() {
     let result = rendered_typecheck_result(
         &crate::parser::bare_type_for_test("ipv4_address".to_string()),
         &Value::Concrete(ConcreteValue::String("999.999.999.999".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
 }
@@ -3963,7 +4015,7 @@ fn rendered_typecheck_result_ipv6_cidr_valid() {
     let result = rendered_typecheck_result(
         &crate::parser::bare_type_for_test("ipv6_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("2001:db8::/32".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_none());
 }
@@ -3973,7 +4025,7 @@ fn rendered_typecheck_result_ipv6_cidr_invalid() {
     let result = rendered_typecheck_result(
         &crate::parser::bare_type_for_test("ipv6_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("not-ipv6-cidr".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
 }
@@ -3983,7 +4035,7 @@ fn rendered_typecheck_result_ipv6_address_valid() {
     let result = rendered_typecheck_result(
         &crate::parser::bare_type_for_test("ipv6_address".to_string()),
         &Value::Concrete(ConcreteValue::String("2001:db8::1".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_none());
 }
@@ -3993,7 +4045,7 @@ fn rendered_typecheck_result_ipv6_address_invalid() {
     let result = rendered_typecheck_result(
         &crate::parser::bare_type_for_test("ipv6_address".to_string()),
         &Value::Concrete(ConcreteValue::String("zzz::zzz".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
 }
@@ -4003,7 +4055,7 @@ fn rendered_typecheck_result_bool_mismatch() {
     let result = rendered_typecheck_result(
         &TypeExpr::Bool,
         &Value::Concrete(ConcreteValue::String("yes".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected Bool"));
@@ -4014,7 +4066,7 @@ fn rendered_typecheck_result_int_mismatch() {
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
         &Value::Concrete(ConcreteValue::String("42".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected Int"));
@@ -4025,7 +4077,7 @@ fn rendered_typecheck_result_float_mismatch() {
     let result = rendered_typecheck_result(
         &TypeExpr::Float,
         &Value::Concrete(ConcreteValue::String("3.14".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected Float"));
@@ -4042,7 +4094,7 @@ fn rendered_typecheck_result_list_of_ipv4_address() {
             "ipv4_address".to_string(),
         ))),
         &Value::Concrete(ConcreteValue::List(items)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("list element 1"));
@@ -4053,7 +4105,7 @@ fn rendered_typecheck_result_string_type_accepts_string() {
     let result = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::String("hello".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_none());
 }
@@ -4063,7 +4115,7 @@ fn rendered_typecheck_result_string_got_bool() {
     let result = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::Bool(true)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected String, got bool"));
@@ -4074,7 +4126,7 @@ fn rendered_typecheck_result_string_got_int() {
     let result = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::Int(42)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected String, got int"));
@@ -4085,7 +4137,7 @@ fn rendered_typecheck_result_string_got_float() {
     let result = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::Float(1.5)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected String, got float"));
@@ -4096,7 +4148,7 @@ fn rendered_typecheck_result_bool_got_int() {
     let result = rendered_typecheck_result(
         &TypeExpr::Bool,
         &Value::Concrete(ConcreteValue::Int(1)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected Bool, got int"));
@@ -4107,7 +4159,7 @@ fn rendered_typecheck_result_int_got_bool() {
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
         &Value::Concrete(ConcreteValue::Bool(true)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected Int, got bool"));
@@ -4118,7 +4170,7 @@ fn rendered_typecheck_result_float_got_bool() {
     let result = rendered_typecheck_result(
         &TypeExpr::Float,
         &Value::Concrete(ConcreteValue::Bool(false)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected Float, got bool"));
@@ -4130,7 +4182,7 @@ fn rendered_typecheck_result_bool_got_float_is_rejected() {
     let result = rendered_typecheck_result(
         &TypeExpr::Bool,
         &Value::Concrete(ConcreteValue::Float(1.5)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected Bool, got float"));
@@ -4142,7 +4194,7 @@ fn rendered_typecheck_result_int_got_float_is_rejected() {
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
         &Value::Concrete(ConcreteValue::Float(1.5)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected Int, got float"));
@@ -4153,7 +4205,7 @@ fn rendered_typecheck_result_escapes_string_literal_value() {
     let result = rendered_typecheck_result(
         &TypeExpr::Bool,
         &Value::Concrete(ConcreteValue::String("yes\"\nno".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     assert_eq!(
@@ -4167,7 +4219,7 @@ fn rendered_typecheck_result_preserves_float_fraction() {
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
         &Value::Concrete(ConcreteValue::Float(1.0)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     assert_eq!(result.as_deref(), Some("expected Int, got float (1.0)"));
@@ -4181,7 +4233,7 @@ fn rendered_typecheck_result_struct_got_string_includes_literal() {
     let result = rendered_typecheck_result(
         &type_expr,
         &Value::Concrete(ConcreteValue::String("production".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let message = result.expect("a string must not satisfy a struct type");
@@ -4197,7 +4249,7 @@ fn rendered_typecheck_result_float_got_int_is_accepted() {
     let result = rendered_typecheck_result(
         &TypeExpr::Float,
         &Value::Concrete(ConcreteValue::Int(42)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_none());
 }
@@ -4233,7 +4285,7 @@ fn rendered_typecheck_result_schema_type_rejects_bool() {
     let result = rendered_typecheck_result(
         &schema_type,
         &Value::Concrete(ConcreteValue::Bool(true)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected awscc.ec2.VpcId"));
@@ -4251,7 +4303,7 @@ fn rendered_typecheck_result_schema_type_rejects_int() {
     let result = rendered_typecheck_result(
         &schema_type,
         &Value::Concrete(ConcreteValue::Int(42)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("expected awscc.ec2.VpcId"));
@@ -4330,7 +4382,7 @@ fn validate_type_expr_struct_accepts_well_formed_map() {
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::Map(map)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_none(), "got error: {:?}", result);
 }
@@ -4345,7 +4397,7 @@ fn validate_type_expr_struct_rejects_missing_field() {
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::Map(map)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert_eq!(
         result.as_deref(),
@@ -4368,7 +4420,7 @@ fn validate_type_expr_struct_rejects_unknown_field() {
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::Map(map)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert_eq!(
         result.as_deref(),
@@ -4390,7 +4442,7 @@ fn validate_type_expr_struct_rejects_wrong_field_type() {
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::Map(map)),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     let msg = result.unwrap();
@@ -4402,7 +4454,7 @@ fn validate_type_expr_struct_rejects_non_map_value() {
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::String("oops".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
     assert!(result.unwrap().contains("struct"));
@@ -4676,7 +4728,7 @@ fn lifted_simple_vpc_id_accepts_matching_custom_identity() {
 
 #[test]
 fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
-    let config = ProviderContext::default();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let module = crate::parser::parse("arguments { count: Count }", &config).unwrap();
     let parsed =
         crate::parser::parse("let m = use { source = './m' }\nm { count = 3 }", &config).unwrap();
@@ -4928,7 +4980,7 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
     let parsed = crate::parser::parse_file(
         "let child = use { source = \"./child\" }\nchild {}\n",
         &root_path,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("root fixture must parse");
     let provider_context = context_with_known_custom_types(HashSet::new());
@@ -4946,7 +4998,7 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
         &parsed,
         &schemas,
         &signatures,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let findings =
@@ -4988,7 +5040,7 @@ delta
 EOT
 let inst = m { n = 'abc' }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     let imported_modules = HashMap::from([(
@@ -5030,7 +5082,7 @@ child {
 }
 child {}
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     let signatures = HashMap::from([(
@@ -5102,7 +5154,7 @@ for item in ["first", "second"] {
   child { count = item }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     assert_eq!(parsed.module_calls.len(), 2);
@@ -5150,7 +5202,7 @@ fn check_module_calls_pending_binding_slot_owns_missing_argument_suppression() {
 let child = use { source = "./child" }
 child { values = [vpc] }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     let signatures = HashMap::from([(
@@ -5199,7 +5251,7 @@ fn expanded_module_argument_binding_findings_block_recovery_pipeline() {
 let child = use { source = "./child" }
 child { values = [vpc] }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     let signatures = HashMap::from([(
@@ -5222,7 +5274,7 @@ child { values = [vpc] }
         &ValidationTypeContext::new_providerless(
             &parsed,
             &schemas,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &signatures,
         ),
     );
@@ -5233,6 +5285,7 @@ child { values = [vpc] }
             binding_use_report: &report,
             compositions: &[],
         },
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
@@ -5250,7 +5303,7 @@ let child_module = use { source = "./child" }
 let child = child_module { value = forwarded }
 "#,
         std::path::Path::new("calls.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("binding-reference fixture must parse");
     let mut schemas = SchemaRegistry::new();
@@ -5282,7 +5335,7 @@ let child = child_module { value = forwarded }
         &ValidationTypeContext::new_providerless(
             &parsed,
             &schemas,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &signatures,
         ),
     );
@@ -5295,10 +5348,10 @@ let child = child_module { value = forwarded }
         &parsed,
         &schemas,
         &signatures,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let authored = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             check_module_calls_providerless(ModuleCallCheckInput {
                 authored: &parsed,
@@ -5318,6 +5371,7 @@ let child = child_module { value = forwarded }
             binding_use_report: &report,
             compositions: &[],
         },
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert_eq!(
         authored.len(),
@@ -5355,7 +5409,7 @@ fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() 
 
     let parsed = crate::parser::parse(
         "let name = 'compatible'\nlet inner = use { source = './inner' }\ninner { name = name }\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
     let imported_modules = HashMap::from([(
@@ -5433,7 +5487,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
             }),
         ),
         resource_types: HashSet::from([("test".to_string(), "widget".to_string())]),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
     let mut module_parsed = empty_parsed();
@@ -5562,7 +5616,7 @@ fn attribute_param_ref_type_mismatch_detected() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     // Attribute param: role_arn: iam_role_arn = role.role_name (MISMATCH: String vs iam_role_arn)
@@ -5635,7 +5689,7 @@ fn attribute_param_ref_type_resolves_terminal_schema_ref() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let params = vec![AttributeParameter::dummy(
         "value".to_string(),
@@ -5686,7 +5740,7 @@ fn attribute_param_ref_existence_checks_composition_attribute_membership_only() 
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
@@ -5738,7 +5792,7 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
@@ -5787,7 +5841,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let err = errors
@@ -5864,7 +5918,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -5897,7 +5951,7 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let err = errors
@@ -5954,7 +6008,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -6014,7 +6068,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let declaration_errors: Vec<_> = errors
@@ -6082,7 +6136,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -6145,7 +6199,7 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let call = ModuleCall::test(
@@ -6222,7 +6276,7 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let call = ModuleCall::test(
         "consumer".to_string(),
@@ -6298,7 +6352,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
     assert!(
@@ -6365,7 +6419,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
     assert!(
@@ -6413,7 +6467,7 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let result = validate_attribute_param_ref_types_with_bindings(&params, &bindings);
     assert!(
@@ -6446,7 +6500,7 @@ fn validate_attribute_params_against_target_group(
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     validate_attribute_param_ref_types_with_bindings(params, &bindings)
@@ -6493,7 +6547,7 @@ fn validate_attribute_params_against_target_group_tags(
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     validate_attribute_param_ref_types_with_bindings(params, &bindings)
@@ -6717,7 +6771,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
         ))),
     };
     let error = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             check_export_values_pre_apply_providerless(
                 std::slice::from_ref(&builtin),
@@ -6747,7 +6801,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
         ))),
     };
     crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             check_export_values_pre_apply_providerless(
                 std::slice::from_ref(&custom),
@@ -6769,7 +6823,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
         ))),
     };
     crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             check_export_values_pre_apply_providerless(
                 std::slice::from_ref(&builtin_custom),
@@ -6846,7 +6900,7 @@ fn validate_export_params_skips_unchecked_inference() {
     };
 
     // Unchecked exports do not invent a real type for value validation.
-    let config = loaded_context_for_test(ProviderContext::default());
+    let config = loaded_context_for_test(ProviderContext::new(crate::EnvironmentSnapshot::empty()));
     let exports = vec![InferredExportParam::for_test(
         "raw",
         ExportStaticType::Inferred(StaticType::Unchecked(
@@ -6862,7 +6916,7 @@ fn validate_export_params_skips_unchecked_inference() {
 fn validate_export_params_rejects_type_mismatch() {
     use crate::parser::InferredExportParam;
 
-    let config = loaded_context_for_test(ProviderContext::default());
+    let config = loaded_context_for_test(ProviderContext::new(crate::EnvironmentSnapshot::empty()));
     let exports = vec![InferredExportParam::for_test(
         "flag",
         crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::Bool)),
@@ -6880,7 +6934,7 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
     let plaintext = "hunter2SECRET";
     let config = loaded_context_for_test(ProviderContext {
         decryptor: Some(std::sync::Arc::new(move |_, _| Ok(plaintext.to_string()))),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
     let value = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
@@ -6915,13 +6969,13 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
             "topsecretXYZ".into(),
         )))
     };
-    let builtin = crate::builtins::evaluate_builtin_to_value("upper", &[secret_string()])
+    let builtin = crate::builtins::evaluate_builtin_to_value_for_tests("upper", &[secret_string()])
         .expect("upper(secret(...)) must evaluate");
     let config = loaded_context_for_test(ProviderContext {
         decryptor: Some(std::sync::Arc::new(|_, _| {
             Ok("decrypted-secret".to_string())
         })),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
     let decrypt = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
@@ -7041,7 +7095,8 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
         static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
         value: Some(RuntimeValue::root_resource_ref("r", "identifier", vec![])),
     }];
-    let provider_context = loaded_context_for_test(ProviderContext::default());
+    let provider_context =
+        loaded_context_for_test(ProviderContext::new(crate::EnvironmentSnapshot::empty()));
     let pre_apply =
         crate::validation::deferred_types::with_session_for_test(&provider_context, |session| {
             check_export_values_pre_apply(&exports, &bindings("alpha-id"), session)
@@ -7376,7 +7431,7 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
@@ -7432,7 +7487,7 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
@@ -7488,7 +7543,7 @@ fn export_param_ref_type_mismatch_displays_resolved_nested_ref_names() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let error = validate_export_param_ref_types_with_bindings(&exports, &bindings)
@@ -7541,7 +7596,7 @@ fn export_param_ref_types_flags_unknown_attribute() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings)
         .unwrap_err()
@@ -7587,7 +7642,7 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings)
@@ -7663,7 +7718,7 @@ fn unchecked_export_checks_existence_and_attached_failure_skips_duplicate_walk()
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
     let all_errors = validate_export_param_ref_types_with_bindings(&exports, &bindings)
@@ -7764,7 +7819,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
@@ -7821,7 +7876,7 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings)
         .unwrap_err()
@@ -7872,7 +7927,7 @@ fn validate_export_param_ref_types_skips_attached_inference_failure() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
@@ -7923,7 +7978,7 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(
         &parsed,
         &schemas,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(result.is_ok(), "got {:?}", result);
@@ -7970,7 +8025,12 @@ fn validate_resources_accepts_resource_ref_in_list_position() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(record_set); // allow: direct — fixture test inspection
-    let result = validate_resources(&parsed, &schemas, &known, &ProviderContext::default());
+    let result = validate_resources(
+        &parsed,
+        &schemas,
+        &known,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "ResourceRef in List<String> position must not produce a schema-level \
@@ -8021,7 +8081,12 @@ fn validate_resources_accepts_resource_ref_in_struct_field_position() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(holder); // allow: direct — fixture test inspection
-    let result = validate_resources(&parsed, &schemas, &known, &ProviderContext::default());
+    let result = validate_resources(
+        &parsed,
+        &schemas,
+        &known,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "ResourceRef in Struct field position must not produce a schema-level type \
@@ -8060,7 +8125,12 @@ fn validate_resources_accepts_resource_ref_in_map_position() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(holder); // allow: direct — fixture test inspection
-    let result = validate_resources(&parsed, &schemas, &known, &ProviderContext::default());
+    let result = validate_resources(
+        &parsed,
+        &schemas,
+        &known,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "ResourceRef in Map position must not produce a schema-level type mismatch \
@@ -8090,8 +8160,13 @@ fn validate_resources_checks_secret_literals_without_revealing_them() {
     .unwrap();
     let known = HashSet::from(["test".to_string()]);
 
-    let error = validate_resources(&parsed, &schemas, &known, &ProviderContext::default())
-        .expect_err("the known value inside secret() must be length-checked");
+    let error = validate_resources(
+        &parsed,
+        &schemas,
+        &known,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("the known value inside secret() must be length-checked");
 
     assert!(error.contains("(secret)"), "error: {error}");
     assert!(
@@ -8129,8 +8204,13 @@ fn validate_resources_rejects_missing_exactly_one_field_group() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
-    let err =
-        validate_resources(&parsed, &schemas, &known, &ProviderContext::default()).unwrap_err();
+    let err = validate_resources(
+        &parsed,
+        &schemas,
+        &known,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     assert!(
         err.contains("exactly one of [cidr_block, ipv4_ipam_pool_id] must be set"),
         "expected field-group error, got: {err}"
@@ -8153,7 +8233,11 @@ fn enum_membership_violation_in_for_body_is_flagged() {
             }
         }
     "#;
-    let parsed = crate::parser::parse(src, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -8178,7 +8262,12 @@ fn enum_membership_violation_in_for_body_is_flagged() {
     let mut known = HashSet::new();
     known.insert("test".to_string());
 
-    let result = validate_resources(&parsed, &schemas, &known, &ProviderContext::default());
+    let result = validate_resources(
+        &parsed,
+        &schemas,
+        &known,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err(), "expected enum-mismatch error in for body");
     let err = result.unwrap_err();
     assert!(
@@ -8233,7 +8322,11 @@ fn mode_context() -> LoadedProviderContext {
 }
 
 fn parse_mode(src: &str) -> ParsedFile {
-    crate::parser::parse(src, &ProviderContext::default()).unwrap()
+    crate::parser::parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -8251,7 +8344,7 @@ fn quoted_literal_enum_value_yields_string_literal_diagnostic() {
         &parsed,
         &mode_schema(),
         &mode_known(),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap_err();
     assert!(
@@ -8284,7 +8377,7 @@ fn bare_invalid_enum_value_keeps_invalid_variant_diagnostic() {
         &parsed,
         &mode_schema(),
         &mode_known(),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap_err();
     assert!(
@@ -8358,15 +8451,20 @@ fn read_against_managed_only_type_is_rejected() {
             cidr_block = "10.0.0.0/16"
         }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
     let mut known = HashSet::new();
     known.insert("awscc".to_string());
 
-    let err =
-        validate_resources(&parsed, &schemas, &known, &ProviderContext::default()).unwrap_err();
+    let err = validate_resources(
+        &parsed,
+        &schemas,
+        &known,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     assert!(
         err.contains("is a managed resource, not a data source"),
         "expected managed-only diagnostic, got: {err}"
@@ -8391,7 +8489,7 @@ fn rendered_typecheck_result_skips_value_unknown() {
             binding: "upstream".into(),
         },
     ));
-    let cfg = ProviderContext::default();
+    let cfg = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
     assert!(rendered_typecheck_result(&TypeExpr::String, &unknown, &cfg).is_none());
     assert!(rendered_typecheck_result(&TypeExpr::Int, &unknown, &cfg).is_none());
@@ -9043,8 +9141,12 @@ fn resolve_file_type_exprs_rejects_unknown_in_arguments() {
 fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
     let source_file = std::path::Path::new("arguments.crn");
     let source = "arguments {\n  bad_arg: TotallyMadeUpType\n}\n";
-    let mut parsed = crate::parser::parse_file(source, source_file, &ProviderContext::default())
-        .expect("bootstrap parsing must retain the unresolved declaration");
+    let mut parsed = crate::parser::parse_file(
+        source,
+        source_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("bootstrap parsing must retain the unresolved declaration");
     let enriched_context = enriched_context_with_iam_policy_arn();
     let strict_error = crate::parser::parse_file(source, source_file, &enriched_context)
         .expect_err("enriched parsing must emit a typed unresolved declaration");
@@ -9063,7 +9165,7 @@ fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
     };
 
     let bootstrap_report = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             resolve_file_type_exprs_report(
                 &mut parsed,
@@ -9217,7 +9319,7 @@ fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded
 
     // Bootstrap parsing has no authoritative provider catalog, so the live
     // resolver must retain the provisional simple type without diagnosing it.
-    let ctx = ProviderContext::default();
+    let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     assert!(!ctx.custom_types_loaded());
     assert!(ctx.known_custom_types().is_empty());
     let findings = crate::validation::deferred_types::with_session_for_test(&ctx, |session| {
@@ -9242,7 +9344,7 @@ fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded
 fn resolve_type_expr_accepts_registered_resource_ref() {
     use crate::parser::{ResourceTypePath, TypeExpr};
 
-    let mut ctx = ProviderContext::default();
+    let mut ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     ctx.resource_types
         .insert(("aws".to_string(), "vpc".to_string()));
 
@@ -9320,7 +9422,7 @@ fn consumer_export_resolution_retains_a_multi_owner_identity() {
     ]));
     let parsed = crate::parser::parse(
         "exports {\n  roles: list(aws.iam.Role.Arn) = [\"arn:one\"]\n}\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("multi-file export fixture syntax must parse");
 
@@ -9366,11 +9468,15 @@ fn parameter_handle_classification_requires_a_resolved_type() {
 
     let unresolved = TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.Vpc"));
     assert!(
-        resolve_parameter_type(&unresolved, &ProviderContext::default()).is_err(),
+        resolve_parameter_type(
+            &unresolved,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty())
+        )
+        .is_err(),
         "a bootstrap context must preserve uncertainty instead of guessing value vs handle",
     );
 
-    let mut enriched = ProviderContext::default();
+    let mut enriched = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     enriched
         .resource_types
         .insert(("aws".to_string(), "ec2.Vpc".to_string()));
@@ -9440,13 +9546,13 @@ fn module_reference_coverage_uses_typed_call_identity_not_display_text() {
     let first = crate::parser::parse_file(
         source,
         std::path::Path::new("first.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("first fixture parse");
     let second = crate::parser::parse_file(
         source,
         std::path::Path::new("second.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("second fixture parse");
     let kind = ModuleCallRefErrorKind::TypeMismatch {
@@ -9614,11 +9720,11 @@ fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
             )]),
             Box::new(|_target, _value| Ok(())),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let mut parsed = crate::parser::parse(
         "arguments { rec: aws.iam.Policy.Arn r: mock.test.resource }\nlet consumer = mock.test.resource { directives { depends_on = [rec, r] } }\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     ).unwrap();
     assert!(matches!(
         parsed.arguments[0].static_type,
@@ -9653,7 +9759,7 @@ let consumer = mock.test.resource {
   directives { depends_on = [bad, bad, value, handle, missing, consumer] }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     let context = ProviderContext {
@@ -9666,7 +9772,7 @@ let consumer = mock.test.resource {
             )]),
             Box::new(|_target, _value| Ok(())),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let report = crate::validation::deferred_types::with_session_for_test(&context, |session| {
         resolve_file_type_exprs_report(&mut parsed, session, None)

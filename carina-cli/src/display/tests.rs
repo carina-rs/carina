@@ -1046,7 +1046,7 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
     let parsed = carina_core::parser::parse_file(
         source,
         std::path::Path::new("deferred-progress.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("unbound loop parses");
     let parsed = carina_core::validation::deferred_types::with_session_for_test(
@@ -1060,7 +1060,10 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
             .expect("root bindings resolve")
         },
     )
-    .into_expanded(&carina_core::schema::SchemaRegistry::new())
+    .into_expanded(
+        &carina_core::schema::SchemaRegistry::new(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
     .expect("loop slots finalize");
     let deferred = parsed
         .deferred_for_expressions()
@@ -1921,20 +1924,24 @@ fn modified_plan_export_formats_old_and_new_floats_identically() {
 #[test]
 fn plan_export_shows_env_plaintext() {
     let name = "CARINA_TEST_ENV_EXPORT_PLAN_DISPLAY";
-    unsafe {
-        std::env::set_var(name, "hunter2SECRET");
-    }
-    let value = carina_core::builtins::evaluate_builtin_to_value(
-        "env",
-        &[concrete(ConcreteValue::String(name.into()))],
+    let context = carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::new(
+        [(name.to_string(), "hunter2SECRET".into())],
+    ));
+    let mut parsed = carina_core::parser::parse_file(
+        &format!("let value = env('{name}')"),
+        std::path::Path::new("test.crn"),
+        &context,
     )
     .expect("env value");
+    carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context)
+        .expect("resolve env value");
+    let value = parsed.variables["value"]
+        .clone()
+        .into_expanded()
+        .expect("expanded env value")
+        .resolve_root_for_test();
 
     assert_eq!(render_value(&value).plain(), "'hunter2SECRET'");
-
-    unsafe {
-        std::env::remove_var(name);
-    }
 }
 
 #[test]
