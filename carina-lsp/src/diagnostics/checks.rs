@@ -21,6 +21,7 @@ use carina_core::resource::{
 };
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
+use carina_core::validation::depends_on::{DependsOnLocation, DependsOnOwner};
 use carina_core::validation::typecheck::{self, TypecheckInference};
 
 use super::{
@@ -3212,10 +3213,9 @@ impl DiagnosticRun<'_> {
     }
 
     /// Mirror `validate_depends_on` errors/warnings in the editor.
-    /// Per-diagnostic anchoring uses the structured `binding_name` /
-    /// `dep_name` hints carried by `DependsOnDiagnostic` (#2874) to
-    /// resolve a precise span. Falls back to whole-buffer scan only
-    /// for diagnostics that have no hints (e.g. cycle errors).
+    /// Per-diagnostic anchoring uses the structured `location` carried by
+    /// `DependsOnDiagnostic` (#2874) to resolve a precise span. Falls back to
+    /// a whole-buffer scan for diagnostics without a location (e.g. cycle errors).
     pub(super) fn check_depends_on(
         &self,
         doc: &Document,
@@ -3235,8 +3235,7 @@ impl DiagnosticRun<'_> {
                     Severity::Error => DiagnosticSeverity::ERROR,
                     Severity::Warning => DiagnosticSeverity::WARNING,
                 };
-                let (line, col, end_col) =
-                    anchor_for_diagnostic(&text, d.binding_name.as_deref(), d.dep_name.as_deref());
+                let (line, col, end_col) = anchor_for_diagnostic(&text, d.location.as_ref());
                 carina_diagnostic(line, col, end_col, severity, d.message)
             })
             .collect()
@@ -3399,25 +3398,27 @@ fn wait_until_rhs_anchor(text: &str, binding: &str, rhs: &str) -> (u32, u32, u32
 /// Resolve the source anchor for a depends_on diagnostic.
 ///
 /// Strategy:
-/// 1. Find the `let <binding_name> =` line for the offending binding
+/// 1. Find the `let <binding> =` line for the offending binding
 ///    (or the resource's opening line if unbound).
-/// 2. From there, scan forward for the `directives` block.
-/// 3. If `dep_name` is given, find the matching identifier inside
+/// 2. For resources, find `directives` before looking for `depends_on`.
+///    For waits, look directly for `depends_on` after the binding.
+/// 3. If `location.dep` is given, find the matching identifier inside
 ///    the `depends_on = [...]` list. Otherwise anchor at `depends_on`.
 /// 4. Fall back to first-`depends_on` whole-buffer scan when the
 ///    diagnostic carries no hints (cycle errors), or `(0, 0, 0)` if
 ///    even that fails.
-fn anchor_for_diagnostic(
-    text: &str,
-    binding_name: Option<&str>,
-    dep_name: Option<&str>,
-) -> (u32, u32, u32) {
+fn anchor_for_diagnostic(text: &str, location: Option<&DependsOnLocation>) -> (u32, u32, u32) {
     let lines: Vec<&str> = text.lines().collect();
 
-    let binding_line = binding_name.and_then(|b| find_binding_line(&lines, b));
+    let binding_line = location.and_then(|location| find_binding_line(&lines, &location.binding));
     let search_start = binding_line.unwrap_or(0);
 
-    let directives_line = find_token_after(&lines, search_start, "directives");
+    let directives_line = if location.is_some_and(|location| location.owner == DependsOnOwner::Wait)
+    {
+        None
+    } else {
+        find_token_after(&lines, search_start, "directives")
+    };
     let depends_on_line = directives_line
         .and_then(|d| find_token_after(&lines, d, "depends_on"))
         .or_else(|| find_token_after(&lines, search_start, "depends_on"))
@@ -3427,7 +3428,7 @@ fn anchor_for_diagnostic(
         return (0, 0, 0);
     };
 
-    if let Some(dep) = dep_name
+    if let Some(dep) = location.and_then(|location| location.dep.as_deref())
         && let Some((line_idx, col, end_col)) =
             find_word_in_lines(&lines, dep_on_idx, dep_on_idx + 5, dep)
     {
@@ -3511,9 +3512,30 @@ mod depends_on_anchor_tests {
     use super::*;
 
     #[test]
+    fn resource_depends_on_anchor_ignores_description_before_directives() {
+        let text = "let bucket = aws.s3.Bucket {\n  description = \"depends_on = [missing]\"\n  # depends_on = [missing]\n  directives {\n    depends_on = [missing]\n  }\n}\n";
+        let (line, col, end_col) = anchor_for_diagnostic(
+            text,
+            Some(&DependsOnLocation {
+                owner: DependsOnOwner::Resource,
+                binding: "bucket".to_string(),
+                dep: Some("missing".to_string()),
+            }),
+        );
+        assert_eq!((line, col, end_col), (4, 18, 25));
+    }
+
+    #[test]
     fn anchor_for_diagnostic_finds_specific_element_by_dep_name() {
         let text = "let role = aws.iam.Role { role_name = \"r\" }\nlet bucket = aws.s3.Bucket {\n  bucket_name = \"x\"\n  directives {\n    depends_on = [role, kms]\n  }\n}\n";
-        let (line, col, end_col) = anchor_for_diagnostic(text, Some("bucket"), Some("kms"));
+        let (line, col, end_col) = anchor_for_diagnostic(
+            text,
+            Some(&DependsOnLocation {
+                owner: DependsOnOwner::Resource,
+                binding: "bucket".to_string(),
+                dep: Some("kms".to_string()),
+            }),
+        );
         assert_eq!(line, 4, "should anchor on the depends_on list line");
         let line_text = text.lines().nth(4).unwrap();
         let kms_col = line_text.find("kms").unwrap() as u32;
@@ -3524,8 +3546,22 @@ mod depends_on_anchor_tests {
     #[test]
     fn anchor_for_diagnostic_distinguishes_two_resources() {
         let text = "let role = aws.iam.Role { role_name = \"r\" }\nlet bucket1 = aws.s3.Bucket {\n  bucket_name = \"x1\"\n  directives { depends_on = [bad1] }\n}\nlet bucket2 = aws.s3.Bucket {\n  bucket_name = \"x2\"\n  directives { depends_on = [bad2] }\n}\n";
-        let a = anchor_for_diagnostic(text, Some("bucket1"), Some("bad1"));
-        let b = anchor_for_diagnostic(text, Some("bucket2"), Some("bad2"));
+        let a = anchor_for_diagnostic(
+            text,
+            Some(&DependsOnLocation {
+                owner: DependsOnOwner::Resource,
+                binding: "bucket1".to_string(),
+                dep: Some("bad1".to_string()),
+            }),
+        );
+        let b = anchor_for_diagnostic(
+            text,
+            Some(&DependsOnLocation {
+                owner: DependsOnOwner::Resource,
+                binding: "bucket2".to_string(),
+                dep: Some("bad2".to_string()),
+            }),
+        );
         assert_ne!(
             a.0, b.0,
             "two resources must anchor on different lines: {a:?} {b:?}"
@@ -3537,7 +3573,7 @@ mod depends_on_anchor_tests {
     #[test]
     fn anchor_for_diagnostic_falls_back_when_no_hints() {
         let text = "let bucket = aws.s3.Bucket {\n  directives { depends_on = [role] }\n}\n";
-        let (line, _, _) = anchor_for_diagnostic(text, None, None);
+        let (line, _, _) = anchor_for_diagnostic(text, None);
         assert_eq!(line, 1, "fallback should land on the depends_on line");
     }
 

@@ -9796,7 +9796,13 @@ let consumer = mock.test.resource {
     assert!(
         diagnostics.iter().all(|diagnostic| {
             diagnostic.severity != depends_on::Severity::Error
-                || !matches!(diagnostic.dep_name.as_deref(), Some("bad" | "handle"))
+                || !matches!(
+                    diagnostic
+                        .location
+                        .as_ref()
+                        .and_then(|location| location.dep.as_deref()),
+                    Some("bad" | "handle")
+                )
         }),
         "only the unresolved argument's handle-kind check must be skipped: {diagnostics:#?}"
     );

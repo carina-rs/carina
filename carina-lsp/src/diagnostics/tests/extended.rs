@@ -13367,6 +13367,107 @@ fn lsp_rejects_sibling_data_source_wait_target_at_target_anchor() {
     assert_eq!(diagnostic.range.end.character, 23);
 }
 
+fn wait_depends_on_diagnostics(dependency: &str) -> (String, Vec<Diagnostic>) {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    std::fs::write(
+        fixture.path().join("resources.crn"),
+        r#"let cert = aws.acm.Certificate { domain_name = "example.com" }
+let dependency = aws.acm.Certificate { domain_name = "dependency.example.com" }
+let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
+"#,
+    )
+    .unwrap();
+    let source = format!(
+        "let ready = wait cert {{\n    until = cert.status == \"ISSUED\"\n    depends_on = [\n        {dependency}\n    ]\n}}\n\nlet later = aws.acm.Certificate {{\n    domain_name = \"later.example.com\"\n    directives {{ depends_on = [dependency] }}\n}}\n"
+    );
+    std::fs::write(fixture.path().join("wait.crn"), &source).unwrap();
+    let diagnostics = analyze_with_buffer(
+        &test_engine_with_wait_target(),
+        fixture.path(),
+        "wait.crn",
+        &source,
+    );
+    (source, diagnostics)
+}
+
+#[test]
+fn lsp_flags_wait_unknown_depends_on_at_offending_element() {
+    let (source, diagnostics) = wait_depends_on_diagnostics("nope");
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("binding 'nope' is not declared in this scope")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    let diagnostic = matching[0];
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostic.range.start, Position::new(3, 8));
+    assert_eq!(diagnostic.range.end, Position::new(3, 12));
+    let line = source
+        .lines()
+        .nth(diagnostic.range.start.line as usize)
+        .unwrap();
+    assert_eq!(
+        &line[diagnostic.range.start.character as usize..diagnostic.range.end.character as usize],
+        "nope"
+    );
+}
+
+#[test]
+fn lsp_flags_wait_value_argument_depends_on_at_offending_element() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("arguments.crn"),
+        "arguments { rec: aws.route53.RecordSet.Id }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("resources.crn"),
+        "let cert = aws.route53.RecordSet { name = 'cert' }\n",
+    )
+    .unwrap();
+    let source = "let ready = wait cert {\n    until = cert.name == 'ready'\n    depends_on = [\n        rec\n    ]\n}\nlet later = aws.route53.RecordSet {\n    name = 'later'\n    directives { depends_on = [cert] }\n}\n";
+    std::fs::write(fixture.path().join("wait.crn"), source).unwrap();
+    let diagnostics = analyze_with_buffer(
+        &custom_value_depends_on_engine(),
+        fixture.path(),
+        "wait.crn",
+        source,
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message
+                == "wait.depends_on: expected a managed resource handle; got aws.route53.RecordSet.Id"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    let diagnostic = matching[0];
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostic.range.start, Position::new(3, 8));
+    assert_eq!(diagnostic.range.end, Position::new(3, 11));
+    let line = source
+        .lines()
+        .nth(diagnostic.range.start.line as usize)
+        .unwrap();
+    assert_eq!(
+        &line[diagnostic.range.start.character as usize..diagnostic.range.end.character as usize],
+        "rec"
+    );
+}
+
+#[test]
+fn lsp_accepts_wait_depends_on_resource_and_data_source_in_sibling_file() {
+    for dependency in ["dependency", "lookup"] {
+        let (_, diagnostics) = wait_depends_on_diagnostics(dependency);
+        assert!(diagnostics.is_empty(), "{dependency}: {diagnostics:#?}");
+    }
+}
+
 #[test]
 fn lsp_flags_wait_unknown_attribute() {
     let engine = test_engine_with_wait_target();
