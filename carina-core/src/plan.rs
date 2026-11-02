@@ -305,6 +305,28 @@ impl PlanErrorKind {
         f: &mut std::fmt::Formatter<'_>,
         project_dir: &Path,
     ) -> std::fmt::Result {
+        struct Context<'a> {
+            kind: &'a PlanErrorKind,
+            project_dir: &'a Path,
+        }
+        impl std::fmt::Display for Context<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.kind.fmt_context(f, self.project_dir)
+            }
+        }
+        std::fmt::Display::fmt(
+            &crate::provider_text::ProviderText::new(
+                Context {
+                    kind: self,
+                    project_dir,
+                }
+                .to_string(),
+            ),
+            f,
+        )
+    }
+
+    fn fmt_context(&self, f: &mut std::fmt::Formatter<'_>, project_dir: &Path) -> std::fmt::Result {
         match self {
             Self::PreventDestroy { action, source } => match source {
                 PreventDestroySource::ExplicitDirective => {
@@ -1422,6 +1444,20 @@ mod tests {
             .strip_prefix(&prefix)
             .expect("ordinary plan errors include their resource address")
             .to_string()
+    }
+
+    #[test]
+    fn provider_text_plan_constraint_projection_sanitizes_metadata_labels() {
+        let raw = format!("field\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let kind = PlanErrorKind::ResolvedValueConstraint {
+            attributes: vec![raw.clone()],
+            origins: vec![],
+            message: "invalid value".into(),
+        };
+        let rendered = render_plan_error_kind(kind);
+        assert!(!rendered.contains(['\x1b', '\u{9b}']));
+        assert!(rendered.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert!(rendered.contains("truncated,"));
     }
 
     #[test]

@@ -1090,7 +1090,8 @@ pub enum PatchOp {
 /// current provider value cannot be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "resource '{resource}' cannot send attribute '{attribute}' because ignored write-only path '{path}' must be preserved, but its current value cannot be known"
+    "resource '{resource}' cannot send attribute '{attribute}' because ignored write-only path '{path}' must be preserved, but its current value cannot be known",
+    resource = ProviderText::new(resource.to_string()), attribute = ProviderText::new(attribute), path = ProviderText::new(path.to_string())
 )]
 pub struct IgnoredWriteOnlyValueError {
     resource: Box<ResourceId>,
@@ -1392,8 +1393,11 @@ impl std::fmt::Display for PersistedAttributeDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "persisted attribute {:?} is not valid persisted JSON",
-            self.attribute_key
+            "{}",
+            ProviderText::new(format!(
+                "persisted attribute {:?} is not valid persisted JSON",
+                self.attribute_key
+            ))
         )
     }
 }
@@ -1415,8 +1419,11 @@ impl std::fmt::Display for PersistedWireValueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "persisted wire attribute {:?} cannot be encoded",
-            self.attribute_key
+            "{}",
+            ProviderText::new(format!(
+                "persisted wire attribute {:?} cannot be encoded",
+                self.attribute_key
+            ))
         )
     }
 }
@@ -4198,7 +4205,7 @@ impl FinishingCreate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("cannot resume create for {desired}; persisted operation belongs to {persisted}")]
+#[error("cannot resume create for {desired}; persisted operation belongs to {persisted}", desired = ProviderText::new(desired.to_string()), persisted = ProviderText::new(persisted.to_string()))]
 pub struct ResumeRoutingMismatch {
     persisted: Box<ResourceId>,
     desired: Box<ResourceId>,
@@ -5440,7 +5447,9 @@ impl std::fmt::Display for DefaultTagEncodingError {
         write!(
             f,
             "key '{}' of provider '{}': {}",
-            self.key, self.provider_name, self.source
+            ProviderText::new(&self.key),
+            ProviderText::new(&self.provider_name),
+            self.source
         )
     }
 }
@@ -7924,6 +7933,20 @@ impl Provider for Box<dyn Provider> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_text_persisted_attribute_error_labels_are_capped_with_safe_sources() {
+        let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let error = super::PersistedWireValueError {
+            attribute_key: raw.clone(),
+            error: crate::value::SerializationError::UnresolvedEnumIdentifier {
+                value: raw,
+                context: crate::value::SerializationContext::WasmBoundary,
+            },
+        };
+        assert!(error.to_string().len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert!(!crate::executor::render_error_chain(&error).contains(['\x1b', '\u{9b}']));
+    }
+
     use crate::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };

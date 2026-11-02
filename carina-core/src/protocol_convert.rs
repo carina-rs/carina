@@ -229,7 +229,8 @@ impl fmt::Display for ProtocolConvertError {
             } => write!(
                 formatter,
                 "closed enum `{identity}` has {base_kind} base metadata that StringEnum cannot represent",
-                identity = ProviderText::new(identity.to_string())
+                identity = ProviderText::new(identity.to_string()),
+                base_kind = ProviderText::new(base_kind)
             ),
             Self::LegacyCustomUnsupportedBase {
                 identity,
@@ -633,7 +634,7 @@ impl Error for SchemaDecodeError {
                 .as_deref()
                 .map(|source| source as &(dyn Error + 'static)),
             Self::DuplicateReferenceForm { identity: _ } => None,
-            Self::InvalidProviderSchema(error) => Some(error),
+            Self::InvalidProviderSchema(_error) => None,
         }
     }
 }
@@ -2826,6 +2827,20 @@ mod tests {
     use crate::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };
+
+    #[test]
+    fn provider_text_invalid_provider_schema_child_is_rendered_once() {
+        let child = crate::schema::ProviderSchemaValidationError::DanglingReferenceForm {
+            identity: crate::schema::TypeIdentity::bare("missing\x1b[2J"),
+        };
+        let error = super::SchemaDecodeError::InvalidProviderSchema(child);
+        let rendered = crate::executor::render_error_chain(&error);
+        assert_eq!(
+            rendered.matches("is not declared by this provider").count(),
+            1
+        );
+        assert!(!rendered.contains('\x1b'));
+    }
 
     #[test]
     fn decode_rejects_uncompilable_string_patterns() {

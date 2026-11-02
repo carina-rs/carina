@@ -40,11 +40,12 @@ pub fn satisfier_augmentation(
                 attr,
                 from,
             } => {
+                let diagnostic = crate::provider_text::ProviderText::new(format!(
+                    "resource_type={resource_type} attr={attr:?} from={from:?}"
+                ));
                 tracing::debug!(
                     target = "carina_core::wait::augment",
-                    %resource_type,
-                    attr = ?attr,
-                    from = ?from,
+                    %diagnostic,
                     "skipping state-dependent wait satisfier hint"
                 );
             }

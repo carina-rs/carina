@@ -46,7 +46,10 @@ pub struct ModuleInfoApp {
 
 impl ModuleInfoApp {
     fn type_label(static_type: &ConsumerStaticType) -> String {
-        consumer_static_type_label(static_type).to_string()
+        carina_core::provider_text::ProviderText::new(
+            consumer_static_type_label(static_type).to_string(),
+        )
+        .to_string()
     }
 
     pub fn new(signature: &FileSignature) -> Self {
@@ -302,4 +305,23 @@ fn format_dep_detail(deps: &[TypedDependency]) -> String {
         })
         .collect();
     format!("depends on: {}", dep_names.join(", "))
+}
+
+#[cfg(test)]
+mod provider_text_tests {
+    use super::*;
+
+    #[test]
+    fn provider_text_module_info_type_label_keeps_raw_signature_metadata() {
+        let raw = format!("Type\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let ty = carina_core::parser::TypeExpr::StringLiteral(raw.clone());
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let resolved =
+            carina_core::validation::resolve_consumer_static_type_for_signature(&ty, &context);
+        let label = ModuleInfoApp::type_label(&resolved);
+        assert!(!label.contains(['\x1b', '\u{9b}']));
+        assert!(label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert_eq!(consumer_static_type_label(&resolved), &ty);
+    }
 }

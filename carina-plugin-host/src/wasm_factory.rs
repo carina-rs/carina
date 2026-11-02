@@ -1278,8 +1278,11 @@ impl fmt::Display for EgressDenied {
                 | DestinationDenied::PrivateAddressDenied(_),
             ) => write!(
                 formatter,
-                "provider '{}' ({}) request to {} was denied: {}",
-                self.label.name, self.label.source, self.destination, self.reason
+                "{}",
+                ProviderText::new(format!(
+                    "provider '{}' ({}) request to {} was denied: {}",
+                    self.label.name, self.label.source, self.destination, self.reason
+                ))
             ),
         }
     }
@@ -1728,18 +1731,11 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 )
                 .await
                 .map_err(|_| {
-                    log::warn!(
-                        "WASM plugin HTTP request timed out resolving host {:?}",
-                        host,
-                    );
+                    log::warn!("{}", http_resolution_warning(host, None));
                     ErrorCode::ConnectionTimeout
                 })?
                 .map_err(|error| {
-                    log::warn!(
-                        "WASM plugin HTTP request failed to resolve host {:?}: {}",
-                        host,
-                        error,
-                    );
+                    log::warn!("{}", http_resolution_warning(host, Some(&error)));
                     dns_error_code()
                 })?;
                 Ok::<_, ErrorCode>(ResolvedAddresses::Standard(addresses))
@@ -1819,6 +1815,13 @@ fn trace_http_enabled() -> bool {
     })
 }
 
+fn http_resolution_warning(host: &str, error: Option<&dyn fmt::Display>) -> ProviderText {
+    ProviderText::new(match error {
+        Some(error) => format!("WASM plugin HTTP request failed to resolve host {host:?}: {error}"),
+        None => format!("WASM plugin HTTP request timed out resolving host {host:?}"),
+    })
+}
+
 fn http_trace_line(
     method: &str,
     uri: TraceUri<'_>,
@@ -1826,19 +1829,21 @@ fn http_trace_line(
     handler_ms: u128,
     status: &str,
 ) -> String {
-    format!(
+    ProviderText::new(format!(
         "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
         method, uri, queue_ms, handler_ms, status,
-    )
+    ))
+    .to_string()
 }
 
 fn http_trace_phases_line(method: &str, uri: TraceUri<'_>, phases_ms: [u128; 4]) -> String {
     let [tcp_connect, tls_handshake, http_handshake, send_request] = phases_ms;
-    format!(
+    ProviderText::new(format!(
         "carina-host-http-trace-phases method={} uri={} \
          tcp_connect_ms={} tls_handshake_ms={} http_handshake_ms={} send_request_ms={}",
         method, uri, tcp_connect, tls_handshake, http_handshake, send_request,
-    )
+    ))
+    .to_string()
 }
 
 /// Local copy of `wasmtime_wasi_http::p2::default_send_request_handler` that
@@ -3564,22 +3569,22 @@ enum PoisonReason {
     Trap {
         operation: &'static str,
         trap: Option<wasmtime::Trap>,
-        root_cause: Box<str>,
+        root_cause: ProviderText,
+        root_is_trap: bool,
     },
 }
 
 impl PoisonReason {
     fn from_trap(operation: &'static str, error: &wasmtime::Error) -> Self {
         let root_cause = error.root_cause().to_string();
-        let root_cause = root_cause
-            .lines()
-            .next()
-            .unwrap_or("unknown WASM trap")
-            .into();
+        let root_cause = root_cause.lines().next().unwrap_or("unknown WASM trap");
+        let trap = error.downcast_ref::<wasmtime::Trap>().copied();
+        let root_is_trap = trap.is_some_and(|trap| trap.to_string() == root_cause);
         Self::Trap {
             operation,
-            trap: error.downcast_ref::<wasmtime::Trap>().copied(),
-            root_cause,
+            trap,
+            root_cause: ProviderText::new(root_cause),
+            root_is_trap,
         }
     }
 
@@ -3605,13 +3610,14 @@ impl fmt::Display for PoisonReason {
                 operation,
                 trap,
                 root_cause,
+                root_is_trap,
             } => {
                 write!(
                     f,
                     "WASM provider instance unusable after trap in {operation}: "
                 )?;
                 match trap {
-                    Some(trap) if trap.to_string() == root_cause.as_ref() => trap.fmt(f),
+                    Some(trap) if *root_is_trap => trap.fmt(f),
                     Some(trap) => write!(f, "{trap}: {root_cause}"),
                     None => f.write_str(root_cause),
                 }
@@ -4886,14 +4892,16 @@ impl WasmProviderFactory {
     /// The tempfile path includes the current process ID so that multiple
     /// processes racing to precompile the same component don't clobber each
     /// other's in-progress writes.
-    pub fn precompile(wasm_bytes: &[u8], cwasm_path: &Path) -> Result<(), String> {
+    pub fn precompile(wasm_bytes: &[u8], cwasm_path: &Path) -> Result<(), ProviderText> {
         let config = build_engine_config();
-        let engine = Engine::new(&config).map_err(|e| format!("Engine error: {e}"))?;
+        let engine =
+            Engine::new(&config).map_err(|e| ProviderText::new(format!("Engine error: {e}")))?;
         let serialized = engine
             .precompile_component(wasm_bytes)
-            .map_err(|e| format!("Precompile error: {e}"))?;
+            .map_err(|e| ProviderText::new(format!("Precompile error: {e:#}")))?;
         if let Some(parent) = cwasm_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ProviderText::new(format!("Mkdir error: {e}")))?;
             // Tempfile + atomic rename; preserves any live mmap held by a
             // previously-loaded Component (see doc comment above for why).
             let tmp_path = parent.join(format!(
@@ -4904,10 +4912,13 @@ impl WasmProviderFactory {
                     .unwrap_or("cwasm"),
                 std::process::id()
             ));
-            std::fs::write(&tmp_path, &serialized).map_err(|e| format!("Write error: {e}"))?;
-            std::fs::rename(&tmp_path, cwasm_path).map_err(|e| format!("Rename error: {e}"))?;
+            std::fs::write(&tmp_path, &serialized)
+                .map_err(|e| ProviderText::new(format!("Write error: {e}")))?;
+            std::fs::rename(&tmp_path, cwasm_path)
+                .map_err(|e| ProviderText::new(format!("Rename error: {e}")))?;
         } else {
-            std::fs::write(cwasm_path, &serialized).map_err(|e| format!("Write error: {e}"))?;
+            std::fs::write(cwasm_path, &serialized)
+                .map_err(|e| ProviderText::new(format!("Write error: {e}")))?;
         }
         Ok(())
     }
@@ -10105,6 +10116,42 @@ mod tests {
             let error = error.context("top");
             assert_eq!(WasmDiagnostic::new(error, true).to_string(), expected);
         }
+    }
+
+    #[test]
+    fn provider_text_poison_reason_sanitizes_rebuild_warning_at_construction() {
+        let raw = format!("\x1b[2J\x07\u{9b}{}", "x".repeat(20 * 1024));
+        let reason = PoisonReason::from_trap("read", &wasmtime::Error::msg(raw));
+        let rendered = reason.to_string();
+        assert!(!rendered.contains(['\x1b', '\x07', '\u{9b}']));
+        assert!(rendered.contains("\\u{1b}[2J\\u{7}\\u{9b}"));
+        assert!(rendered.contains("truncated,"));
+    }
+
+    #[test]
+    fn provider_text_precompile_error_sanitizes_hostile_component_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let component = format!(
+            "(component (type $t (func)) (import \"bad\\1b[2J\\07{}\" (func (type $t))))",
+            "x".repeat(20 * 1024)
+        );
+        let error = WasmProviderFactory::precompile(
+            component.as_bytes(),
+            &directory.path().join("test.cwasm"),
+        )
+        .unwrap_err();
+        let rendered = error.to_string();
+        assert!(!rendered.contains(['\x1b', '\x07']));
+        assert!(rendered.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert!(rendered.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn provider_text_http_trace_sanitizes_guest_status_and_method() {
+        let raw = format!("\x1b[2J\x07\u{9b}{}", "x".repeat(20 * 1024));
+        let rendered = http_trace_line(&raw, TraceUri::new("https://example.com"), 0, 0, &raw);
+        assert!(!rendered.contains(['\x1b', '\x07', '\u{9b}']));
+        assert!(rendered.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
     }
 
     #[test]

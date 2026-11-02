@@ -30,7 +30,7 @@ use carina_core::resource::{
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
-use carina_core::value::format_value;
+use carina_core::value::{RenderedKey, render_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedKey, LoadedOrphans,
     LocalStateFile, LockInfo, ResourceState, RowBasis, StateBackend, StateFile, StateUrl,
@@ -555,7 +555,7 @@ fn format_state_forget_target(
         lines.extend(row.deposed.iter().map(|deposed| {
             format!(
                 "  - identifier `{}` (generation `{}`, provider instance `{}`)",
-                deposed.identifier,
+                carina_core::provider_text::ProviderText::new(&deposed.identifier),
                 deposed.key,
                 deposed.provider_instance.as_deref().unwrap_or("default")
             )
@@ -1001,7 +1001,8 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
 }
 
 fn deposed_state_marker(key: &DeposedKey, identifier: &str) -> String {
-    format!("(deposed {key} {identifier})")
+    carina_core::provider_text::ProviderText::new(format!("(deposed {key} {identifier})"))
+        .to_string()
 }
 
 /// Run state list command
@@ -1394,7 +1395,12 @@ fn format_attributes_for_show(
     keys.sort();
     for key in keys {
         let value = &attributes[key];
-        output.push_str(&format!("{}{} = {}\n", indent, key, format_value(value)));
+        output.push_str(&format!(
+            "{}{} = {}\n",
+            indent,
+            RenderedKey::from_raw(key),
+            render_value(value)
+        ));
     }
 }
 
@@ -2916,10 +2922,10 @@ fn diff_display_update_resource_with_provider(
                     changes.push(format!(
                         "    {} {}: {} {} {}",
                         "~".yellow(color_mode),
-                        key,
-                        format_value(old).red(color_mode),
+                        RenderedKey::from_raw(key),
+                        render_value(old).to_string().red(color_mode),
                         "\u{2192}".dimmed(color_mode),
-                        format_value(new).green(color_mode),
+                        render_value(new).to_string().green(color_mode),
                     ));
                 }
                 (Some(old), None) => {
@@ -2927,8 +2933,8 @@ fn diff_display_update_resource_with_provider(
                     changes.push(format!(
                         "    {} {}: {}",
                         "-".red(color_mode),
-                        key,
-                        format_value(old).red(color_mode),
+                        RenderedKey::from_raw(key),
+                        render_value(old).to_string().red(color_mode),
                     ));
                 }
                 (None, Some(new)) => {
@@ -2936,8 +2942,8 @@ fn diff_display_update_resource_with_provider(
                     changes.push(format!(
                         "    {} {}: {}",
                         "+".green(color_mode),
-                        key,
-                        format_value(new).green(color_mode),
+                        RenderedKey::from_raw(key),
+                        render_value(new).to_string().green(color_mode),
                     ));
                 }
                 _ => {}
@@ -3000,6 +3006,24 @@ fn diff_display_update_resource(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_text_state_attribute_display_sanitizes_keys_and_enum_values() {
+        let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let mut output = String::new();
+        super::format_attributes_for_show(
+            &mut output,
+            std::collections::HashMap::from([(
+                raw.clone(),
+                carina_core::resource::Value::Concrete(
+                    carina_core::resource::ConcreteValue::enum_identifier(&raw),
+                ),
+            )]),
+            "",
+        );
+        assert!(!output.contains(['\x1b', '\u{9b}']));
+        assert!(output.contains("truncated,"));
+    }
+
     use super::*;
     use crate::commands::shared::cancellation_test_support::{
         CancellationFixtureBase, install_refresh_drain_barrier,

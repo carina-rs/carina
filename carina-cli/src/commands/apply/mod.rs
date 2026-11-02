@@ -33,7 +33,7 @@ use carina_core::resource::{
     State, Value,
 };
 use carina_core::shutdown::ShutdownToken;
-use carina_core::value::format_value;
+use carina_core::value::{RenderedKey, render_value};
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
 #[cfg(test)]
@@ -1518,9 +1518,9 @@ pub(crate) async fn detect_drift<S: Clone>(
                             );
                             attr_diffs.push(format!(
                                 "      {}: {} → {}",
-                                key,
-                                format_value(&masked_planned),
-                                format_value(&masked)
+                                RenderedKey::from_raw(key),
+                                render_value(&masked_planned),
+                                render_value(&masked)
                             ));
                         }
                         Some(actual_val)
@@ -1538,16 +1538,16 @@ pub(crate) async fn detect_drift<S: Clone>(
                             );
                             attr_diffs.push(format!(
                                 "      {}: {} → {}",
-                                key,
-                                format_value(&masked_planned),
-                                format_value(&masked)
+                                RenderedKey::from_raw(key),
+                                render_value(&masked_planned),
+                                render_value(&masked)
                             ));
                         }
                         None => {
                             attr_diffs.push(format!(
                                 "      {}: {} → (removed)",
-                                key,
-                                format_value(&masked_planned)
+                                RenderedKey::from_raw(key),
+                                render_value(&masked_planned)
                             ));
                         }
                         _ => {}
@@ -1557,8 +1557,8 @@ pub(crate) async fn detect_drift<S: Clone>(
                     if !planned_comparison.contains_key(key) {
                         attr_diffs.push(format!(
                             "      {}: (none) → {}",
-                            key,
-                            format_value(actual_val)
+                            RenderedKey::from_raw(key),
+                            render_value(actual_val)
                         ));
                     }
                 }

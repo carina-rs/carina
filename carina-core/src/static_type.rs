@@ -55,11 +55,11 @@ impl<R> StaticType<R, ConsumerResolvedType> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum StaticTypeResolutionError {
-    #[error("unknown custom type '{name}'")]
+    #[error("unknown custom type '{name}'", name = crate::provider_text::ProviderText::new(name))]
     UnknownCustomType { name: String },
-    #[error("unknown custom type '{name}'; suggestion: use '{suggestion}'")]
+    #[error("unknown custom type '{name}'; suggestion: use '{suggestion}'", name = crate::provider_text::ProviderText::new(name), suggestion = crate::provider_text::ProviderText::new(suggestion))]
     UnknownCustomTypeWithSuggestion { name: String, suggestion: String },
-    #[error("custom type '{name}' has conflicting scalar kinds: {first_kind} and {second_kind}")]
+    #[error("custom type '{name}' has conflicting scalar kinds: {first_kind} and {second_kind}", name = crate::provider_text::ProviderText::new(name))]
     ConflictingScalarKinds {
         name: String,
         first_kind: crate::schema::RefinedScalarKind,
@@ -122,16 +122,16 @@ pub fn consumer_static_type_label(static_type: &ConsumerStaticType) -> &TypeExpr
 pub enum NotInferableReason {
     #[error("missing value")]
     MissingValue,
-    #[error("binding `{binding}` is not inferable in this context")]
+    #[error("binding `{binding}` is not inferable in this context", binding = crate::provider_text::ProviderText::new(binding))]
     NonInferableBinding { binding: String },
-    #[error("schema is unavailable for binding `{binding}`")]
+    #[error("schema is unavailable for binding `{binding}`", binding = crate::provider_text::ProviderText::new(binding))]
     SchemaUnavailable { binding: String },
     /// The parser slot has not yet been substituted and no declaration in the
     /// current inference scope establishes its type. This is unavailable
     /// authority, not evidence of an invalid type or invalid postfix access.
-    #[error("type authority is unavailable for parser placeholder `{placeholder}`")]
+    #[error("type authority is unavailable for parser placeholder `{placeholder}`", placeholder = crate::provider_text::ProviderText::new(placeholder))]
     PlaceholderTypeUnavailable { placeholder: String },
-    #[error("provider schema is unavailable for type `{identity}`")]
+    #[error("provider schema is unavailable for type `{identity}`", identity = crate::provider_text::ProviderText::new(identity.to_string()))]
     CustomTypeSchemaUnavailable {
         identity: crate::schema::TypeIdentity,
     },
@@ -139,29 +139,29 @@ pub enum NotInferableReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InferenceError {
-    #[error("{reason}")]
+    #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
     UnknownType { reason: String },
-    #[error("{reason}")]
+    #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
     HeterogeneousCollection { reason: String },
-    #[error("coalesce default type `{default}` does not match left type `{left}`")]
+    #[error("coalesce default type `{default}` does not match left type `{left}`", default = crate::provider_text::ProviderText::new(default), left = crate::provider_text::ProviderText::new(left))]
     IncompatibleCoalesceTypes { left: String, default: String },
-    #[error("operator '{op}': {side} operand must be Int, got {actual}")]
+    #[error("operator '{op}': {side} operand must be Int, got {actual}", actual = crate::provider_text::ProviderText::new(actual))]
     InvalidIntegerArithmeticOperand {
         op: crate::integer_arithmetic::IntegerOp,
         side: crate::integer_arithmetic::IntegerOperandSide,
         actual: String,
         operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
     },
-    #[error("unknown binding `{binding}`")]
+    #[error("unknown binding `{binding}`", binding = crate::provider_text::ProviderText::new(binding))]
     UnknownBinding { binding: String },
-    #[error("unknown attribute `{attribute}` on `{binding}`")]
+    #[error("unknown attribute `{attribute}` on `{binding}`", binding = crate::provider_text::ProviderText::new(binding), attribute = crate::provider_text::ProviderText::new(attribute))]
     UnknownAttribute { binding: String, attribute: String },
-    #[error("cannot apply access {step} to {base_type}")]
+    #[error("cannot apply access {step} to {base_type}", base_type = crate::provider_text::ProviderText::new(base_type), step = crate::provider_text::ProviderText::new(step.to_string()))]
     InvalidAccess {
         base_type: String,
         step: PathSegment,
     },
-    #[error("cyclic composition binding chain: {}", cycle.join(" -> "))]
+    #[error("cyclic composition binding chain: {}", crate::provider_text::ProviderText::new(cycle.join(" -> ")))]
     CyclicVirtualBinding { cycle: Vec<String> },
 }
 
@@ -275,5 +275,32 @@ impl ConsumerExportStaticType {
                 ConsumerInferredUncheckedReason::UnnameableInConsumer(_reason),
             )) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_text_tests {
+    use super::*;
+
+    #[test]
+    fn provider_text_inference_and_resolution_errors_keep_raw_metadata() {
+        let raw = format!("Type\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let error = StaticTypeResolutionError::UnknownCustomType { name: raw.clone() };
+        assert!(!error.to_string().contains(['\x1b', '\u{9b}']));
+        assert!(error.to_string().contains("truncated,"));
+        assert!(
+            matches!(error, StaticTypeResolutionError::UnknownCustomType { name } if name == raw)
+        );
+        let error = InferenceError::InvalidIntegerArithmeticOperand {
+            op: crate::integer_arithmetic::IntegerOp::Add,
+            side: crate::integer_arithmetic::IntegerOperandSide::Left,
+            actual: raw.clone(),
+            operator_span: crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        };
+        assert!(!error.to_string().contains(['\x1b', '\u{9b}']));
+        let error = NotInferableReason::CustomTypeSchemaUnavailable {
+            identity: crate::schema::TypeIdentity::bare(raw),
+        };
+        assert!(!error.to_string().contains(['\x1b', '\u{9b}']));
     }
 }

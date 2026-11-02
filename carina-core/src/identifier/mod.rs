@@ -3629,13 +3629,13 @@ fn desired_comparable_values<'attribute, S, D>(
                 Err(error) => {
                     match error {
                         UnresolvedReason::NotComparable => tracing::debug!(
-                            attribute,
+                            attribute = %crate::provider_text::ProviderText::new(attribute),
                             reason = "value has no stable comparison form",
                             "stable value is not available for identity comparison"
                         ),
                         UnresolvedReason::Type(error) => tracing::debug!(
-                            attribute,
-                            error = ?error,
+                            attribute = %crate::provider_text::ProviderText::new(attribute),
+                            error = %crate::provider_text::ProviderText::new(error.to_string()),
                             "stable value is not available for identity comparison"
                         ),
                     }

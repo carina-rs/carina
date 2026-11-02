@@ -15,7 +15,7 @@ use carina_core::provider::{
 };
 #[cfg(test)]
 use carina_core::provider::{PatchOp as CorePatchOp, ProviderDirectiveSchema};
-use carina_core::provider_text::{ProviderString, ProviderText};
+use carina_core::provider_text::{ProviderDiagnostic, ProviderString, ProviderText};
 use carina_core::resource::{
     ConcreteValue, DeferredValue, RedactedSecretHash, ResourceId as CoreResourceId,
     ResourceIdentityState, State as CoreState, Value as CoreValue,
@@ -52,13 +52,13 @@ use crate::wasm_factory::version_checked_bindings::{WitPlanOp, wit_types as wit}
 /// of panics so callers can attach provider context.
 #[derive(Debug)]
 pub enum SchemaDecodeError {
-    JsonParse(serde_json::Error),
+    JsonParse(ProviderDiagnostic),
     Protocol(carina_core::protocol_convert::SchemaDecodeError),
 }
 
 impl SchemaDecodeError {
     fn schema_json_parse(err: serde_json::Error) -> Self {
-        Self::JsonParse(err)
+        Self::JsonParse(ProviderDiagnostic::new(err))
     }
 
     fn protocol_conversion(err: carina_core::protocol_convert::SchemaDecodeError) -> Self {
@@ -150,7 +150,11 @@ impl fmt::Display for WasmValueDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "failed to decode WIT {}", self.wit_variant)?;
         if !self.attribute_path.is_empty() {
-            write!(f, " attribute '{}'", self.attribute_path.join("."))?;
+            write!(
+                f,
+                " attribute '{}'",
+                ProviderText::new(self.attribute_path.join("."))
+            )?;
         }
         match &self.kind {
             WasmValueDecodeErrorKind::InvalidJson(error) => {
@@ -2067,13 +2071,13 @@ pub(crate) fn core_type_identity_to_wit(
 /// Deserialize JSON to (name, display_name, version) tuple from ProviderInfo.
 pub fn json_to_provider_info(
     json: &str,
-) -> Result<(String, ProviderText, ProviderString), serde_json::Error> {
+) -> Result<(String, ProviderText, ProviderString), ProviderDiagnostic> {
     let proto::ProviderInfo {
         name,
         display_name,
         capabilities: _capabilities,
         version,
-    } = serde_json::from_str(json)?;
+    } = serde_json::from_str(json).map_err(ProviderDiagnostic::new)?;
     Ok((name, display_name.into(), version.into()))
 }
 
@@ -6233,6 +6237,16 @@ mod tests {
     }
 
     #[test]
+    fn provider_text_schema_json_error_chain_sanitizes_unknown_guest_variant() {
+        let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let input = serde_json::json!({"value": {"type": raw}}).to_string();
+        let error = json_to_attribute_types(&input).unwrap_err();
+        let rendered = render_error_chain(&error);
+        assert!(!rendered.contains(['\x1b', '\u{9b}']));
+        assert!(rendered.contains("truncated,"));
+    }
+
+    #[test]
     fn json_to_attribute_types_rejects_malformed_json() {
         let error = json_to_attribute_types("not json").unwrap_err();
         let rendered = render_error_chain(&error);
@@ -6240,9 +6254,10 @@ mod tests {
         assert!(rendered.contains("expected ident"), "{rendered}");
         assert!(
             std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<serde_json::Error>())
+                .and_then(|source| source.downcast_ref::<ProviderDiagnostic>())
+                .and_then(|source| source.error().downcast_ref::<serde_json::Error>())
                 .is_some(),
-            "JSON parse error must remain reachable through Error::source"
+            "JSON parse error must remain available for typed inspection"
         );
     }
 

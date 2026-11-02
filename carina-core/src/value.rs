@@ -64,7 +64,7 @@ pub enum SerializationError {
     /// must strip / resolve it before this point — see
     /// [`crate::resource::value_contains_unknown`] for recursive
     /// detection before crossing a serialization boundary.
-    #[error("cannot serialize at {context}: value is not yet known ({reason})")]
+    #[error("cannot serialize at {context}: value is not yet known ({reason})", reason = crate::provider_text::ProviderText::new(reason.to_string()))]
     UnknownNotAllowed {
         reason: Box<ApplyTimeUnknown>,
         context: SerializationContext,
@@ -87,7 +87,7 @@ pub enum SerializationError {
     /// consumed only via `Display`; programmatic path inspection has
     /// no callers today. Lift to `AccessPath` if a future caller needs
     /// it.
-    #[error("cannot serialize at {context}: unresolved reference {path}")]
+    #[error("cannot serialize at {context}: unresolved reference {path}", path = crate::provider_text::ProviderText::new(path))]
     UnresolvedResourceRef {
         path: String,
         context: SerializationContext,
@@ -101,14 +101,14 @@ pub enum SerializationError {
     /// A `Value::Deferred(DeferredValue::FunctionCall)` reached a serialization boundary. The
     /// resolver should evaluate the function (built-in or user-defined)
     /// before this point; reaching this arm is a resolver bug.
-    #[error("cannot serialize at {context}: unresolved function call {name}(...)")]
+    #[error("cannot serialize at {context}: unresolved function call {name}(...)", name = crate::provider_text::ProviderText::new(name))]
     UnresolvedFunctionCall {
         name: String,
         context: SerializationContext,
     },
     /// A deferred postfix field/index access reached a concrete-only
     /// serialization boundary before its base resolved.
-    #[error("cannot serialize at {context}: unresolved access {expression}")]
+    #[error("cannot serialize at {context}: unresolved access {expression}", expression = crate::provider_text::ProviderText::new(expression))]
     UnresolvedAccess {
         expression: String,
         context: SerializationContext,
@@ -124,7 +124,7 @@ pub enum SerializationError {
     /// A parser-authored enum identifier reached a serialization boundary
     /// without schema resolution. Provider transports accept only
     /// [`CanonicalEnumValue`] API spellings; plain strings remain literals.
-    #[error("cannot serialize at {context}: unresolved enum identifier {value}")]
+    #[error("cannot serialize at {context}: unresolved enum identifier {value}", value = crate::provider_text::ProviderText::new(value))]
     UnresolvedEnumIdentifier {
         value: String,
         context: SerializationContext,
@@ -137,7 +137,7 @@ pub enum SerializationError {
     SecretNotAllowed { context: SerializationContext },
     /// A secret was found in a named saved-plan field that cannot safely
     /// persist plaintext or a placeholder.
-    #[error("cannot serialize saved-plan field {location}: secret values are not allowed")]
+    #[error("cannot serialize saved-plan field {location}: secret values are not allowed", location = crate::provider_text::ProviderText::new(location))]
     SavedPlanFieldSecretNotAllowed { location: String },
     /// A typed redacted-secret placeholder reached a serialization boundary
     /// that accepts only ordinary or plaintext values.
@@ -312,7 +312,7 @@ impl JsonEncoding {
 /// A persisted JSON object used the host-reserved `$` namespace incorrectly.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PersistedValueDecodeError {
-    #[error("invalid host-reserved persisted JSON object with keys {keys:?}")]
+    #[error("invalid host-reserved persisted JSON object with keys {}", crate::provider_text::ProviderText::new(format!("{keys:?}")))]
     InvalidHostObject { keys: Vec<String> },
     #[error("malformed {PERSISTED_ENUM_KEY} persisted enum payload")]
     MalformedEnum,
@@ -1257,7 +1257,7 @@ impl ValueSpan {
 /// structure for frontends to style it without re-parsing the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedValue {
-    plain: String,
+    plain: crate::provider_text::ProviderText,
     spans: Vec<ValueSpan>,
 }
 
@@ -1285,18 +1285,14 @@ impl std::fmt::Display for RenderedValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedKey {
     raw: String,
-    text: String,
+    text: crate::provider_text::ProviderText,
 }
 
 impl RenderedKey {
     pub fn from_raw(key: &str) -> Self {
         Self {
             raw: key.to_string(),
-            text: if is_identifier_safe(key) {
-                key.to_string()
-            } else {
-                display_string_literal(key)
-            },
+            text: render_single_span(ValueSpanKind::Key, encode_map_key(key)).plain,
         }
     }
 
@@ -1345,7 +1341,7 @@ impl PrettyValue {
 pub fn render_value(value: &Value) -> RenderedValue {
     let mut sink = SpanSink::default();
     format_value_into(value, &mut sink).expect("SpanSink writes are infallible");
-    sink.rendered
+    sink.finish()
 }
 
 /// Render a persisted export without assigning secret semantics to strings.
@@ -1362,7 +1358,7 @@ fn render_persisted_json(value: PersistedView<'_>) -> RenderedValue {
     let value = decode_persisted_json(value.encoded, PersistedPurpose::Export)
         .expect("persisted value types validate the reserved namespace at construction");
     format_decoded_persisted_json_into(&value, &mut sink).expect("SpanSink writes are infallible");
-    sink.rendered
+    sink.finish()
 }
 
 /// Render a value for a deferred-for template, replacing typed upstream
@@ -1378,19 +1374,14 @@ pub(crate) fn render_value_with_upstream_deferred_label<P: PlaceholderKind, B: B
         upstream_deferred_label: Some((upstream_binding, verb)),
     };
     format_value_into_context(value, &mut sink, context).expect("SpanSink writes are infallible");
-    sink.rendered
+    sink.finish()
 }
 
 fn render_single_span(kind: ValueSpanKind, text: impl Into<String>) -> RenderedValue {
-    let text = text.into();
-    let spans = (!text.is_empty())
-        .then(|| ValueSpan {
-            kind,
-            text: text.clone(),
-        })
-        .into_iter()
-        .collect();
-    RenderedValue { plain: text, spans }
+    let mut sink = SpanSink::default();
+    sink.write_token(kind, &text.into())
+        .expect("SpanSink writes are infallible");
+    sink.finish()
 }
 
 /// Wrap display-only text that is not a Carina value literal in the typed
@@ -1481,36 +1472,48 @@ impl FormatSink for StringSink {
     }
 }
 
+#[derive(Default)]
 struct SpanSink {
-    rendered: RenderedValue,
+    sanitizer: crate::provider_text::ProviderTextBuilder,
+    spans: Vec<(ValueSpanKind, std::ops::Range<usize>)>,
 }
 
-impl Default for SpanSink {
-    fn default() -> Self {
-        Self {
-            rendered: RenderedValue {
-                plain: String::new(),
-                spans: Vec::new(),
-            },
+impl SpanSink {
+    fn finish(self) -> RenderedValue {
+        let (plain, retained) = self.sanitizer.finish_with_prefix_len();
+        let mut spans = Vec::new();
+        for (kind, range) in self.spans {
+            if range.start >= retained {
+                break;
+            }
+            spans.push(ValueSpan {
+                kind,
+                text: plain.as_str()[range.start..range.end.min(retained)].to_string(),
+            });
         }
+        if retained < plain.len() {
+            spans.push(ValueSpan {
+                kind: ValueSpanKind::Other,
+                text: plain.as_str()[retained..].to_string(),
+            });
+        }
+        RenderedValue { plain, spans }
     }
 }
 
 impl FormatSink for SpanSink {
     fn write_token(&mut self, kind: ValueSpanKind, s: &str) -> Result<(), Overflow> {
-        if s.is_empty() {
-            return Ok(());
-        }
-        self.rendered.plain.push_str(s);
-        if let Some(last) = self.rendered.spans.last_mut()
-            && last.kind == kind
-        {
-            last.text.push_str(s);
-        } else {
-            self.rendered.spans.push(ValueSpan {
-                kind,
-                text: s.to_string(),
-            });
+        let start = self.sanitizer.retained_len();
+        self.sanitizer.push_str(s);
+        let end = self.sanitizer.retained_len();
+        if start != end {
+            if let Some((last_kind, range)) = self.spans.last_mut()
+                && *last_kind == kind
+            {
+                range.end = end;
+            } else {
+                self.spans.push((kind, start..end));
+            }
         }
         Ok(())
     }
@@ -1545,9 +1548,16 @@ impl FormatSink for WidthCounter {
     }
 }
 
+fn encode_map_key(key: &str) -> String {
+    if is_identifier_safe(key) {
+        key.to_string()
+    } else {
+        display_string_literal(key)
+    }
+}
+
 fn write_map_key<S: FormatSink + ?Sized>(key: &str, sink: &mut S) -> Result<(), Overflow> {
-    let rendered = RenderedKey::from_raw(key);
-    sink.write_token(ValueSpanKind::Key, rendered.plain())
+    sink.write_token(ValueSpanKind::Key, &encode_map_key(key))
 }
 
 /// Render a `Duration` to its canonical surface form.
@@ -5027,7 +5037,7 @@ impl PrettyLayout {
 pub(crate) fn render_value_pretty(value: &Value, layout: PrettyLayout) -> RenderedValue {
     let mut sink = SpanSink::default();
     render_value_pretty_into(value, layout, &mut sink).expect("SpanSink writes are infallible");
-    sink.rendered
+    sink.finish()
 }
 
 fn render_value_pretty_into<S: FormatSink>(
@@ -6558,7 +6568,7 @@ impl<'a, S, H: PlaceholderKind, B: BindingAddress, D> CanonicalizedResources<'a,
 /// The structured [`crate::schema::TypeError`] is retained as typed data while
 /// this terminal diagnostic renders it exactly once.
 #[derive(Debug, Error)]
-#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {error}")]
+#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {error}", resource = crate::provider_text::ProviderText::new(resource.to_string()), attribute = crate::provider_text::ProviderText::new(attribute))]
 pub struct EnumCanonicalizationError {
     resource: Box<crate::resource::ResourceId>,
     attribute: String,
@@ -6827,7 +6837,7 @@ pub(crate) fn canonicalize_provider_config_with_type_and_ancestry<
 /// A provider configuration value could not be resolved through the
 /// provider-declared attribute type.
 #[derive(Debug, Error)]
-#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {error}")]
+#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {error}", provider = crate::provider_text::ProviderText::new(provider), attribute = crate::provider_text::ProviderText::new(attribute))]
 pub struct ProviderConfigCanonicalizationError {
     provider: String,
     attribute: String,
@@ -8298,6 +8308,49 @@ mod tests {
                 crate::parser::display_string_literal(text)
             );
         }
+    }
+
+    #[test]
+    fn provider_text_value_display_projection_sanitizes_spans_and_caps_whole_value() {
+        let raw = format!(
+            "\x1b]52;c;ZXZpbA==\x07\x1b[2J\u{9b}{}",
+            "x".repeat(20 * 1024)
+        );
+        let value = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::TypeIdentity::bare("Mode"),
+                raw.clone(),
+            ),
+        ));
+        for rendered in [
+            render_value(&value),
+            PrettyValue::new(value.clone()).render(PrettyLayout::for_attribute(0, "mode")),
+        ] {
+            assert!(!rendered.plain().contains(['\x1b', '\x07', '\u{9b}']));
+            assert!(
+                rendered
+                    .plain()
+                    .contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J\\u{9b}")
+            );
+            assert!(rendered.plain().len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+            assert!(rendered.plain().contains("truncated,"));
+            assert_eq!(
+                rendered
+                    .spans()
+                    .iter()
+                    .map(ValueSpan::text)
+                    .collect::<String>(),
+                rendered.plain()
+            );
+        }
+        assert!(format_value(&value).contains(&raw));
+    }
+
+    #[test]
+    fn provider_text_display_string_literal_escapes_c1_controls() {
+        let value = Value::Concrete(ConcreteValue::String("\u{80}\u{9b}\u{9f}".into()));
+        let rendered = render_value(&value);
+        assert_eq!(rendered.plain(), "\"\\u{80}\\u{9b}\\u{9f}\"");
     }
 
     #[test]

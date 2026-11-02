@@ -770,7 +770,7 @@ fn render_app_error(
                     &error::format_error_with_source_chain(seed_error.as_ref())
                 ),
                 seed_error.resource_address(),
-                carina_core::parser::display_string_literal(seed_error.identifier()),
+                seed_error.identifier_literal(),
             );
             AppErrorRendering {
                 stderr,
@@ -904,6 +904,25 @@ mod error_format_tests {
             "typed source must not be duplicated: {}",
             rendered.stderr,
         );
+    }
+
+    #[test]
+    fn provider_text_seed_import_literal_is_bounded_while_identifier_stays_raw() {
+        let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let error = error::AppError::StateBucketSeed(Box::new(error::StateBucketSeedError::new(
+            raw.clone(),
+            "test.Bucket 'state'".into(),
+            carina_state::BackendError::Configuration("seed write failed".into()),
+        )));
+        let rendered = render_app_error(carina_cli::output_style::ColorMode::Plain, &error);
+        assert!(!rendered.stderr.contains(['\x1b', '\u{9b}']));
+        assert!(
+            rendered.stderr.len() <= 2 * carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES + 1024
+        );
+        let error::AppError::StateBucketSeed(error) = error else {
+            unreachable!()
+        };
+        assert_eq!(error.identifier(), raw);
     }
 
     #[test]

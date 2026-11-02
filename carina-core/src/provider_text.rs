@@ -123,12 +123,22 @@ impl ProviderTextBuilder {
         }
     }
 
-    pub fn finish(mut self) -> ProviderText {
+    pub(crate) fn retained_len(&self) -> usize {
+        self.prefix.len()
+    }
+
+    pub fn finish(self) -> ProviderText {
+        self.finish_with_prefix_len().0
+    }
+
+    pub(crate) fn finish_with_prefix_len(mut self) -> (ProviderText, usize) {
+        let mut retained = self.prefix.len();
         if self.sanitized_bytes > MAX_PROVIDER_TEXT_BYTES {
             let mut end = self.prefix.len();
             loop {
                 let marker = format!("… (truncated, {} bytes)", self.sanitized_bytes - end);
                 if end + marker.len() <= MAX_PROVIDER_TEXT_BYTES {
+                    retained = end;
                     self.prefix.truncate(end);
                     self.prefix.push_str(&marker);
                     break;
@@ -139,7 +149,7 @@ impl ProviderTextBuilder {
                 }
             }
         }
-        ProviderText(self.prefix)
+        (ProviderText(self.prefix), retained)
     }
 }
 
